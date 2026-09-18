@@ -1,6 +1,6 @@
 //! Cloud sockets carry authenticated principals through the shared executor mux.
 
-use super::{CLIENT_QUEUE, Client, ClientOutput, Incoming, MAX_FRAME, MAX_PENDING};
+use super::{Client, ClientOutput, Incoming, MAX_FRAME, MAX_PENDING};
 use crate::rc::{
     cloud::{host, ingress},
     diagnostics::Log,
@@ -54,17 +54,8 @@ pub(super) fn attach(
 ) -> Client {
     let (mut sink, mut source) = accepted.connection.split();
     let mut lifetime = accepted.stopped;
-    let (sender, mut messages) = mpsc::channel::<(
-        String,
-        tokio::sync::OwnedSemaphorePermit,
-        Option<super::Work>,
-    )>(CLIENT_QUEUE);
     let (stop, mut stopped) = watch::channel(());
-    let output = ClientOutput {
-        sender,
-        bytes: Arc::new(tokio::sync::Semaphore::new(MAX_FRAME * 2)),
-        stop: Some(stop),
-    };
+    let (output, mut messages) = ClientOutput::channel(Some(stop));
     let projection = guard.clone();
     let lease = guard.lease();
     let renewal = accepted.renewal;
@@ -86,8 +77,8 @@ pub(super) fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let write = async {
-            while let Some((record, _permit, _work)) = messages.recv().await {
-                if let Some(text) = projection.project(&record)? {
+            while let Some(message) = messages.next().await? {
+                if let Some(text) = projection.project(&message.record)? {
                     let frame_bytes = text.len();
                     let started = std::time::Instant::now();
                     if frame_bytes >= 16 * 1024

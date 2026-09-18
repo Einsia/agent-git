@@ -1,6 +1,9 @@
 //! Shared executor endpoint routing keeps transport admission outside the executor.
 
 mod cloud;
+mod output;
+
+use output::ClientOutput;
 
 use super::admission::{Admission, Work};
 use super::local::{Listener, Stream};
@@ -116,78 +119,6 @@ impl Drop for Client {
     }
 }
 
-#[derive(Clone)]
-struct ClientOutput {
-    sender: mpsc::Sender<(String, tokio::sync::OwnedSemaphorePermit, Option<Work>)>,
-    bytes: std::sync::Arc<tokio::sync::Semaphore>,
-    stop: Option<tokio::sync::watch::Sender<()>>,
-}
-impl ClientOutput {
-    async fn send_timeout(&self, record: String, timeout: std::time::Duration) -> Result<(), ()> {
-        self.send_inner(record, timeout, None).await
-    }
-    async fn send_work(
-        &self,
-        record: String,
-        timeout: std::time::Duration,
-        work: Work,
-    ) -> Result<(), ()> {
-        self.send_inner(record, timeout, Some(work)).await
-    }
-    async fn send_inner(
-        &self,
-        record: String,
-        timeout: std::time::Duration,
-        work: Option<Work>,
-    ) -> Result<(), ()> {
-        // A remote reader cannot stall owner RPC or the shared executor fanout.
-        if self.stop.is_some() {
-            return self.try_send_inner(record, work);
-        }
-        tokio::time::timeout(timeout, async {
-            let count = u32::try_from(record.len().max(1)).map_err(|_| ())?;
-            let permit = self
-                .bytes
-                .clone()
-                .acquire_many_owned(count)
-                .await
-                .map_err(|_| ())?;
-            self.sender
-                .send((record, permit, work))
-                .await
-                .map_err(|_| ())
-        })
-        .await
-        .map_err(|_| ())?
-    }
-    #[cfg(test)]
-    fn try_send(&self, record: String) -> Result<(), ()> {
-        self.try_send_inner(record, None)
-    }
-    fn try_send_work(&self, record: String, work: Work) -> Result<(), ()> {
-        self.try_send_inner(record, Some(work))
-    }
-    fn try_send_inner(&self, record: String, work: Option<Work>) -> Result<(), ()> {
-        let result = self.enqueue(record, work);
-        if result.is_err()
-            && let Some(stop) = &self.stop
-        {
-            let _ = stop.send(());
-        }
-        result
-    }
-
-    fn enqueue(&self, record: String, work: Option<Work>) -> Result<(), ()> {
-        let count = u32::try_from(record.len().max(1)).map_err(|_| ())?;
-        let permit = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(count)
-            .map_err(|_| ())?;
-        self.sender.try_send((record, permit, work)).map_err(|_| ())
-    }
-}
-
 fn attach(
     socket: Stream,
     client: u64,
@@ -195,13 +126,7 @@ fn attach(
     controller: &agit_controller::Controller,
 ) -> Client {
     let (reader, mut writer) = tokio::io::split(socket);
-    let (sender, mut messages) =
-        mpsc::channel::<(String, tokio::sync::OwnedSemaphorePermit, Option<Work>)>(CLIENT_QUEUE);
-    let output = ClientOutput {
-        sender,
-        bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FRAME * 2)),
-        stop: None,
-    };
+    let (output, mut messages) = ClientOutput::channel(None);
     let peers = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashSet::<String>::new(),
     ));
@@ -220,8 +145,8 @@ fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let write = async {
-            while let Some((record, _permit, _work)) = messages.recv().await {
-                writer.write_all(record.as_bytes()).await?;
+            while let Some(message) = messages.next().await? {
+                writer.write_all(message.record.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
             }
             Ok::<_, anyhow::Error>(())
@@ -514,8 +439,10 @@ async fn serve_described(
                 }
             },
             write = outbound.next_write() => {
-                let Some(write) = write else { break };
+                let Some(mut write) = write else { break };
                 let mut frame = write.frame().clone();
+                let replay = write.take_replay();
+                write.commit();
                 if let Some(id) = &frame.id {
                     if let Some((client, original, key, work)) = pending.remove(id) {
                         if let Some(log) = &diagnostics {
@@ -533,8 +460,24 @@ async fn serve_described(
                             }
                         }
                         frame.id = Some(original);
-                        if let Some(peer) = clients.get(&client)
-                            && peer.output.send_work(frame.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
+                        if let Some(peer) = clients.get(&client) {
+                            let result = if let Some(replay) = replay {
+                                let frames = replay.frames.len();
+                                let result = peer.output.send_replay(frame.to_json(), replay, work);
+                                if let Some(log) = &diagnostics {
+                                    log.record("executor.replay_queued", serde_json::json!({"client_id":client,"request_id":frame.id,"frames":frames,"succeeded":result.is_ok()}));
+                                }
+                                result
+                            } else {
+                                peer.output.send_work(frame.to_json(), std::time::Duration::from_secs(2), work).await
+                            };
+                            if result.is_err() {
+                                if let Some(log) = &diagnostics {
+                                    log.record("executor.client_closed", serde_json::json!({"client_id":client,"reason":"response_output_capacity"}));
+                                }
+                                clients.remove(&client);
+                            }
+                        }
                     }
                 } else {
                     if frame.method() == crate::protocol::method::SESSION_STATUS
@@ -544,16 +487,17 @@ async fn serve_described(
                     let record = frame.to_json();
                     let mut closed = Vec::new();
                     for (id, peer) in &clients {
-                        // Replay can fill the bounded queue before the socket task
-                        // gets scheduled. Apply bounded backpressure rather than
-                        // disconnecting a healthy reader on the first full queue.
+                        // Subscription replay stays in its requester's writer. Only live
+                        // notifications consume each client's event queue here.
                         if peer.output.send_timeout(record.clone(), std::time::Duration::from_secs(2)).await.is_err() {
+                            if let Some(log) = &diagnostics {
+                                log.record("executor.client_closed", serde_json::json!({"client_id":id,"reason":"event_output_capacity","stream":frame.stream,"seq":frame.seq}));
+                            }
                             closed.push(*id);
                         }
                     }
                     for id in closed { clients.remove(&id); }
                 }
-                write.commit();
             }
         }
     }
@@ -617,7 +561,7 @@ mod tests {
         // Queue a closed peer before the accept loop can inspect credentials.
         drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
         let (_out, outbound) = super::super::outbound::channel();
-        let (events, _requests) = mpsc::channel(16);
+        let (events, mut requests) = mpsc::channel(16);
         let server = tokio::spawn(serve_described(
             listener,
             outbound,
@@ -748,64 +692,6 @@ mod tests {
                 .contains("different content")
         );
         assert!(requests.try_recv().is_err());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_healthy_reader_survives_replay_larger_than_its_socket_queue() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("rpc");
-        let listener = UnixListener::bind(&path).unwrap();
-        let (out, outbound) = super::super::outbound::channel();
-        let (events, _requests) = mpsc::channel(16);
-        let server = tokio::spawn(serve_described(
-            listener,
-            outbound,
-            events,
-            serde_json::json!({}),
-            super::super::peers::controller().unwrap(),
-            None,
-            None,
-            Admission::default(),
-        ));
-        let mut client = BufReader::new(UnixStream::connect(&path).await.unwrap());
-        client
-            .get_mut()
-            .write_all(
-                format!(
-                    "{}\n",
-                    Frame::request("machine.describe", serde_json::json!({})).to_json()
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let mut line = String::new();
-        client.read_line(&mut line).await.unwrap();
-        let frames = (1..=1024)
-            .map(|seq| {
-                let mut frame =
-                    Frame::notification("item.delta", serde_json::json!({"text":"x".repeat(4096)}));
-                frame.seq = Some(seq);
-                frame.stream = Some("test-stream".into());
-                frame
-            })
-            .collect();
-        let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .unwrap();
-        out.send_replay_batch(frames, slot);
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            for seq in 1..=1024 {
-                line.clear();
-                assert!(client.read_line(&mut line).await.unwrap() > 0);
-                assert_eq!(serde_json::from_str::<Frame>(&line).unwrap().seq, Some(seq));
-            }
-        })
-        .await
-        .unwrap();
         server.abort();
     }
 }

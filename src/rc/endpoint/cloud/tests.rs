@@ -138,6 +138,70 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         Some("visible")
     );
 
+    let mut owner = BufReader::new(UnixStream::connect(&path).await.unwrap());
+    owner
+        .get_mut()
+        .write_all(format!("{}\n", describe.to_json()).as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    owner.read_line(&mut response).await.unwrap();
+
+    let subscribe = Frame::request("session.subscribe", json!({"session_id":"visible"}));
+    sink.send(Packet::Text(subscribe.to_json())).await.unwrap();
+    let Some(crate::rc::link::LinkEvent::Frame { frame, .. }) = requests.recv().await else {
+        panic!("missing subscription request")
+    };
+    let replay_count = super::super::CLIENT_QUEUE * 2;
+    let frames = (1..=replay_count)
+        .map(|seq| {
+            let mut event =
+                Frame::notification("item.delta", json!({"text":"x".repeat(40 * 1024)}));
+            event.stream = Some("visible".into());
+            event.seq = Some(seq as u64);
+            event
+        })
+        .collect();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    out.send_replay_response(
+        Frame::response(frame.id.unwrap(), json!({})),
+        frames,
+        slots.clone().try_acquire_owned().unwrap(),
+    );
+    let mut live = Frame::notification("item.completed", json!({}));
+    live.stream = Some("visible".into());
+    live.seq = Some(replay_count as u64 + 1);
+    out.send(live);
+    // A stalled Cloud replay must neither reach nor block another endpoint.
+    response.clear();
+    tokio::time::timeout(Duration::from_secs(5), owner.read_line(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Frame>(&response).unwrap().seq,
+        Some(replay_count as u64 + 1)
+    );
+    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(receive(&mut source).await.id, subscribe.id);
+    sink.send(Packet::Text(describe.to_json())).await.unwrap();
+    let mut next_seq = 1;
+    let mut replied = false;
+    while next_seq <= replay_count + 1 || !replied {
+        let frame = receive(&mut source).await;
+        if frame.id == describe.id {
+            assert!(
+                next_seq <= replay_count,
+                "RPC receipt waited behind the entire replay"
+            );
+            replied = true;
+        } else {
+            assert_eq!(frame.seq, Some(next_seq as u64));
+            next_seq += 1;
+        }
+    }
+    assert_eq!(slots.available_permits(), 1);
+
     for (method, params) in [
         ("session.history", json!({"session_id":"hidden"})),
         ("peer.list", json!({})),
@@ -170,13 +234,12 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     assert!(closed.is_none() || closed.unwrap().is_err());
     assert!(requests.try_recv().is_err());
 
-    let mut owner = BufReader::new(UnixStream::connect(&path).await.unwrap());
     owner
         .get_mut()
         .write_all(format!("{}\n", describe.to_json()).as_bytes())
         .await
         .unwrap();
-    let mut response = String::new();
+    response.clear();
     tokio::time::timeout(Duration::from_secs(5), owner.read_line(&mut response))
         .await
         .unwrap()
@@ -189,14 +252,11 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
 
 #[tokio::test]
 async fn exhausted_cloud_output_closes_only_its_client_without_waiting() {
-    let (sender, _receiver) = mpsc::channel(1);
     let (stop, mut stopped) = watch::channel(());
-    let output = ClientOutput {
-        sender,
-        bytes: Arc::new(tokio::sync::Semaphore::new(MAX_FRAME)),
-        stop: Some(stop),
-    };
-    output.try_send("first".into()).unwrap();
+    let (output, _receiver) = ClientOutput::channel(Some(stop));
+    for _ in 0..super::super::CLIENT_QUEUE {
+        output.try_send("first".into()).unwrap();
+    }
     assert!(
         tokio::time::timeout(
             Duration::from_millis(100),

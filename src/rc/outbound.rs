@@ -1,31 +1,8 @@
 //! Outbound queues: one for responses, one for replayable stream events.
 //!
-//! # Why three lanes
-//!
-//! Losing one of these frame kinds **does not cost what losing another costs**, and one shared
-//! queue ties them together:
-//!
-//! * An **RPC response** carries no seq, so no replay brings it back. Losing one means this
-//!   machine **has already done** the bind / send-message / mode-switch side effect while the
-//!   caller waits out its timeout and retries, doing it a second time. And "lost" is not the
-//!   only danger — **arriving late** is the same thing: a response delivered after the caller
-//!   has already timed out is no different from one that never arrived, and the side effect
-//!   repeats either way.
-//! * A **stream event** has been through the journal's ring; one `session.subscribe` from the
-//!   viewer brings it back.
-//! * A **subscribe replay** sits between the two: it must not be lost (it **is** the answer to
-//!   that subscribe, and no second path can supply it), but it must not cut in front of
-//!   responses either — one replay is at most 8192 frames, and pushed whole into the response
-//!   queue it makes the `turn.start` / interrupt / approval response behind it queue after the
-//!   entire batch; on a slow link the caller simply times out, then retries a side effect that
-//!   **already happened**.
-//!   A replay must be enqueued as **one batch**: the batch is registered synchronously before
-//!   the daemon takes live events again, and once the consumer starts a batch it stops pulling
-//!   the live lane, which keeps a live frame with a larger seq from overtaking the replay.
-//!
-//! On one shared FIFO, two thousand events backed up on a slow link push responses behind them:
-//! the response is not lost, but it queues behind those two thousand and the caller timed out
-//! long ago. Hence the split into lanes, and **responses go first** on the way out.
+//! RPC responses carry their subscription replay to the requesting endpoint. A replay
+//! never enters the live-event fanout. Its permit follows it into the client writer,
+//! so a slow reader cannot accumulate unbounded backfills or block other clients.
 //!
 //! # Why the event lane is bounded
 //!
@@ -38,7 +15,6 @@
 //! "full", and taking one out frees one slot — exact, self-healing, no hand-written state.
 
 use crate::protocol::Frame;
-use std::collections::VecDeque;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 /// How many replayable events may back up before this lane starts yielding.
@@ -47,38 +23,34 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 /// transcript: these frames are already in the journal.
 pub const EVENT_CAP: usize = 2000;
 
-struct ReplayBatch {
-    frames: VecDeque<Frame>,
-    // The slot lives with the whole batch until it has been consumed; so although the batch
-    // channel never blocks a send, memory is still hard-capped by the daemon's
-    // REPLAY_SLOTS × REPLAY_CAP.
-    _slot: OwnedSemaphorePermit,
+pub(super) struct ReplayBatch {
+    pub frames: Vec<Frame>,
+    pub slot: OwnedSemaphorePermit,
 }
 
-/// The producer side. Clone it freely — both channels are mpsc.
+struct Output {
+    frame: Frame,
+    replay: Option<ReplayBatch>,
+}
+
+impl From<Frame> for Output {
+    fn from(frame: Frame) -> Self {
+        Self {
+            frame,
+            replay: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OutboundTx {
-    /// Responses and other non-replayable frames. **Unbounded**: backpressure here is data loss.
-    replies: mpsc::UnboundedSender<Frame>,
-    /// Subscribe replays are registered as batches. The number of batches is capped by the
-    /// semaphore permit each one carries.
-    replay: mpsc::UnboundedSender<ReplayBatch>,
-    /// Replayable stream events. Bounded; dropped when full.
+    replies: mpsc::UnboundedSender<Output>,
     events: mpsc::Sender<Frame>,
 }
 
-/// The consumer side, held by the link task and reused across reconnects.
 pub struct OutboundRx {
-    /// The one frame already taken from the three lanes whose WebSocket write is not yet
-    /// confirmed.
-    ///
-    /// `Link` is rebuilt on every reconnect while the receiver is reused across them, so the
-    /// lease has to live here. On a write error or a timeout the original Frame is kept
-    /// (including the RequestId the hub minted), and the next connection resends it first.
-    pending: Option<Frame>,
-    replies: mpsc::UnboundedReceiver<Frame>,
-    replay: mpsc::UnboundedReceiver<ReplayBatch>,
-    active_replay: Option<ReplayBatch>,
+    pending: Option<Output>,
+    replies: mpsc::UnboundedReceiver<Output>,
     events: mpsc::Receiver<Frame>,
 }
 
@@ -123,22 +95,15 @@ pub async fn drain_ordered(
 
 pub fn channel() -> (OutboundTx, OutboundRx) {
     let (replies_tx, replies_rx) = mpsc::unbounded_channel();
-    // The batch channel never blocks by itself: the daemon has to be able to register a whole
-    // batch atomically before it handles live events again. The memory cap is enforced by the
-    // semaphore permit the ReplayBatch carries.
-    let (replay_tx, replay_rx) = mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAP);
     (
         OutboundTx {
             replies: replies_tx,
-            replay: replay_tx,
             events: events_tx,
         },
         OutboundRx {
             pending: None,
             replies: replies_rx,
-            replay: replay_rx,
-            active_replay: None,
             events: events_rx,
         },
     )
@@ -162,18 +127,18 @@ pub enum Sent {
 }
 
 impl OutboundTx {
-    /// Registers one subscribe replay atomically. The caller must call this before letting the
-    /// daemon main loop handle live events again; the consumer blocks the events lane until the
-    /// whole batch has drained, while still letting RPC responses cut in.
-    pub fn send_replay_batch(&self, mut frames: Vec<Frame>, slot: OwnedSemaphorePermit) -> Sent {
-        for frame in &mut frames {
-            frame.reliable = true;
-        }
+    /// Keep the response and replay atomic so live events cannot overtake the backfill.
+    pub fn send_replay_response(
+        &self,
+        frame: Frame,
+        frames: Vec<Frame>,
+        slot: OwnedSemaphorePermit,
+    ) -> Sent {
         if self
-            .replay
-            .send(ReplayBatch {
-                frames: frames.into(),
-                _slot: slot,
+            .replies
+            .send(Output {
+                frame,
+                replay: Some(ReplayBatch { frames, slot }),
             })
             .is_ok()
         {
@@ -250,18 +215,10 @@ impl OutboundTx {
             return Sent::DroppedReplayable(Box::new(f));
         }
 
-        // A single frame marked "must not be dropped" takes the response queue: it is
-        // unbounded, so a synchronous entry point can always get it in, and backpressure never
-        // evicts it.
-        //
-        // (Batched subscribe replays go through `send_replay_batch` — every batch carries a
-        // capacity permit. This is a different thing: one lone notification, such as the mark
-        // saying "the terminal broke off here". It has to be recognized as `reliable` right
-        // here — down the ordinary event path below it hits the `debug_assert` above: a debug
-        // build panics on the spot, a release build stuffs it back into the already-full queue
-        // and drops it a second time, so the mark never reaches the screen.)
+        // Reliable notices share response priority; subscription replay stays attached
+        // to its response so the endpoint can route it to exactly one client.
         if f.reliable {
-            return if self.replies.send(f).is_ok() {
+            return if self.replies.send(f.into()).is_ok() {
                 Sent::Queued
             } else {
                 Sent::Closed
@@ -273,7 +230,7 @@ impl OutboundTx {
                 Err(mpsc::error::TrySendError::Full(f)) => Sent::DroppedReplayable(Box::new(f)),
                 Err(mpsc::error::TrySendError::Closed(_)) => Sent::Closed,
             }
-        } else if self.replies.send(f).is_ok() {
+        } else if self.replies.send(f.into()).is_ok() {
             Sent::Queued
         } else {
             Sent::Closed
@@ -291,46 +248,12 @@ impl OutboundRx {
     /// events are recoverable anyway.
     pub async fn next_write(&mut self) -> Option<PendingWrite<'_>> {
         if self.pending.is_none() {
-            loop {
-                if let Some(batch) = self.active_replay.as_mut() {
-                    // A response still waits at most one replay frame; a live event has to wait
-                    // for the whole batch, or a larger seq makes the hub drop the backfill that
-                    // arrives after it as an old frame.
-                    if let Ok(reply) = self.replies.try_recv() {
-                        self.pending = Some(reply);
-                        break;
-                    }
-                    if let Some(frame) = batch.frames.pop_front() {
-                        self.pending = Some(frame);
-                        if batch.frames.is_empty() {
-                            self.active_replay = None;
-                        }
-                        break;
-                    }
-                    self.active_replay = None;
-                    continue;
-                }
-
-                let open = tokio::select! {
-                    biased;
-                    Some(frame) = self.replies.recv() => {
-                        self.pending = Some(frame);
-                        true
-                    },
-                    Some(batch) = self.replay.recv() => {
-                        self.active_replay = Some(batch);
-                        true
-                    },
-                    Some(frame) = self.events.recv() => {
-                        self.pending = Some(frame);
-                        true
-                    },
-                    else => false,
-                };
-                if !open || self.pending.is_some() {
-                    break;
-                }
-            }
+            self.pending = tokio::select! {
+                biased;
+                Some(output) = self.replies.recv() => Some(output),
+                Some(frame) = self.events.recv() => Some(frame.into()),
+                else => None,
+            };
         }
         self.pending.as_ref()?;
         Some(PendingWrite { rx: self })
@@ -350,14 +273,20 @@ pub struct PendingWrite<'a> {
 
 impl PendingWrite<'_> {
     pub fn frame(&self) -> &Frame {
-        self.rx
+        &self
+            .rx
             .pending
             .as_ref()
             .expect("PendingWrite always owns one pending frame")
+            .frame
     }
 
     pub fn to_json(&self) -> String {
         self.frame().to_json()
+    }
+
+    pub(super) fn take_replay(&mut self) -> Option<ReplayBatch> {
+        self.rx.pending.as_mut().unwrap().replay.take()
     }
 
     pub fn commit(self) {
@@ -392,12 +321,6 @@ mod tests {
         let frame = pending.frame().clone();
         pending.commit();
         frame
-    }
-
-    fn replay_slot() -> OwnedSemaphorePermit {
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1))
-            .try_acquire_owned()
-            .unwrap()
     }
 
     /// **When the queue is full, the frame that must not be dropped must not cut the line
@@ -547,88 +470,31 @@ mod tests {
         }
     }
 
-    /// One subscribe replay **must not** be droppable, and **must not** stand in front of
-    /// responses.
-    ///
-    /// It looks like a stream event (a notification with a stream), but it is the answer to that
-    /// `session.subscribe`: once lost no second path supplies it, while the `from_seq` in the
-    /// response claims the hole is already filled. The viewer sees a stretch of history that
-    /// stays missing, cut off at the same place on every retry.
     #[tokio::test]
-    async fn a_subscribe_replay_is_not_droppable_even_when_the_event_queue_is_full() {
+    async fn subscription_response_retains_its_replay_until_the_endpoint_accepts_it() {
         let (tx, mut rx) = channel();
-        for i in 0..EVENT_CAP as u64 {
-            assert_eq!(tx.send(event(i)), Sent::Queued);
-        }
-        // The queue is full, so an ordinary event yields — it can be recovered.
-        assert!(matches!(tx.send(event(9999)), Sent::DroppedReplayable(_)));
-
-        // A replay frame does not yield. Its capacity is capped by the permit the batch carries,
-        // so it never takes a slot from live events.
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = slots.clone().try_acquire_owned().unwrap();
+        tx.send_replay_response(reply("subscribe"), vec![event(101), event(102)], slot);
+        tx.send(event(103));
+        drop(rx.next_write().await.unwrap());
+        assert_eq!(slots.available_permits(), 0);
+        let mut write = rx.next_write().await.unwrap();
+        assert_eq!(write.frame().id, reply("subscribe").id);
+        let replay = write.take_replay().unwrap();
+        write.commit();
         assert_eq!(
-            tx.send_replay_batch(vec![event(1234)], replay_slot()),
-            Sent::Queued
+            replay
+                .frames
+                .iter()
+                .map(|f| f.seq.unwrap())
+                .collect::<Vec<_>>(),
+            [101, 102]
         );
-
-        // It goes out **ahead** of the backlog of two thousand events — it is the answer to a
-        // request, and the caller is waiting.
-        let first = recv_committed(&mut rx).await;
-        assert_eq!(first.seq, Some(1234));
-
-        // But **behind responses**: one replay is at most 8192 frames, and letting it cut in
-        // front of responses makes the `turn.start` / interrupt response behind it wait out the
-        // whole batch; on a slow link the caller times out and then retries a side effect that
-        // already happened.
-        assert_eq!(
-            tx.send_replay_batch(vec![event(4321)], replay_slot()),
-            Sent::Queued
-        );
-        assert_eq!(tx.send(reply("call-9")), Sent::Queued);
-        let next = recv_committed(&mut rx).await;
-        assert_eq!(
-            next.id.map(|i| i.to_string()).as_deref(),
-            Some("call-9"),
-            "a response must not queue behind a replay"
-        );
-    }
-
-    /// Once subscribe dispatch has taken its journal snapshot it registers the response and the
-    /// replay batch synchronously, and only then can the daemon main pump put a new live event
-    /// into the events lane. The consumer has to treat that batch as a barrier; with every frame
-    /// sent one by one from a freshly spawned, not-yet-polled task, seq=103 leaves first and the
-    /// hub's watermark then dedupes 101 and 102 away as old frames.
-    #[tokio::test]
-    async fn a_registered_replay_batch_is_a_barrier_in_front_of_new_live_events() {
-        let (tx, mut rx) = channel();
-        assert_eq!(tx.send(reply("subscribe-1")), Sent::Queued);
-        assert_eq!(
-            tx.send_replay_batch(vec![event(101), event(102)], replay_slot()),
-            Sent::Queued
-        );
-        assert_eq!(tx.send(event(103)), Sent::Queued);
-
-        assert_eq!(
-            recv_committed(&mut rx)
-                .await
-                .id
-                .map(|id| id.to_string())
-                .as_deref(),
-            Some("subscribe-1")
-        );
-        assert_eq!(recv_committed(&mut rx).await.seq, Some(101));
-
-        // RPC responses retain priority even in the middle of a replay batch.
-        assert_eq!(tx.send(reply("interrupt-1")), Sent::Queued);
-        assert_eq!(
-            recv_committed(&mut rx)
-                .await
-                .id
-                .map(|id| id.to_string())
-                .as_deref(),
-            Some("interrupt-1")
-        );
-        assert_eq!(recv_committed(&mut rx).await.seq, Some(102));
         assert_eq!(recv_committed(&mut rx).await.seq, Some(103));
+        assert_eq!(slots.available_permits(), 0);
+        drop(replay);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     /// A **single** notification marked "must not be dropped" — the terminal gap mark, for

@@ -748,40 +748,15 @@ impl Daemon {
             Ok(v) => Frame::response(id, v),
             Err(e) => Frame::error_response(id, e),
         };
-        // The reply goes to outbound together with the replay frames this dispatch accumulated.
-        //
-        // Neither may go through the main loop's bounded channel: its only consumer is the
-        // main loop, which is blocked inside this very dispatch, so a full channel drops
-        // the replay frames and the reply itself.
-        //
-        // Both go **straight into the outbound queue**, bypassing the main loop: on that
-        // path the main loop does exactly one thing — number the frames that carry a
-        // `stream` and journal them — and a reply has no stream while the replay frames
-        // already have their numbers.
-        //
-        // **The whole replay batch must be registered here, synchronously, before the main
-        // loop is allowed to handle the next live event.** Spawning a send task first is
-        // not enough: while it is still unpolled the main loop can push a larger seq into
-        // the events lane, the link sends the larger number first, and the hub then dedups
-        // the entire backfill as old frames. `send_replay_batch` does not wait; memory is
-        // capped by the semaphore permit that lives with the batch until it is consumed.
-        // The reply is still registered first, and the consumer side also lets later RPC
-        // replies cut into a replay.
+        // The replay belongs to this response, never to the shared event fanout.
         let deferred = std::mem::take(&mut self.deferred);
         let slot = self.deferred_slot.take();
         if let Some(outbound) = self.outbound.clone() {
-            if outbound.send(out) == crate::rc::outbound::Sent::Closed {
-                return;
-            }
-            if !deferred.is_empty() {
-                let Some(slot) = slot else {
-                    debug_assert!(
-                        false,
-                        "a deferred replay batch must retain its capacity slot"
-                    );
-                    return;
-                };
-                let _ = outbound.send_replay_batch(deferred, slot);
+            if let Some(slot) = slot {
+                let _ = outbound.send_replay_response(out, deferred, slot);
+            } else {
+                debug_assert!(deferred.is_empty());
+                let _ = outbound.send(out);
             }
             return;
         }
