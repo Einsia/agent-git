@@ -3,6 +3,8 @@
 use crate::{PeerCertificate, access::Principal};
 use serde::{Deserialize, Serialize};
 
+pub const SESSION_CONTROLLER_AUTHORITY: &str = "cloud-session-controller";
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);

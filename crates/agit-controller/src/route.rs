@@ -7,6 +7,8 @@ use std::{future::Future, pin::Pin};
 pub enum Authority {
     LocalOwner,
     CloudPrincipal,
+    #[cfg(feature = "cloud")]
+    CloudSessionController,
 }
 
 impl Authority {
@@ -14,6 +16,8 @@ impl Authority {
         match self {
             Self::LocalOwner => "local-owner",
             Self::CloudPrincipal => "cloud-principal",
+            #[cfg(feature = "cloud")]
+            Self::CloudSessionController => agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY,
         }
     }
 }

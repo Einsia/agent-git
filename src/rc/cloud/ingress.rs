@@ -391,7 +391,7 @@ impl Client {
                 && let Some(result) = frame.result.as_mut()
             {
                 result["authority"] = serde_json::json!(if self.controller.is_some() {
-                    "cloud-session-controller"
+                    agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY
                 } else {
                     "cloud-principal"
                 });

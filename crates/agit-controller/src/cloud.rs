@@ -121,7 +121,7 @@ impl Connector for SessionRoute {
     }
 
     fn authority(&self) -> Authority {
-        Authority::CloudPrincipal
+        Authority::CloudSessionController
     }
 
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
