@@ -260,8 +260,7 @@ pub struct Route {
 }
 
 impl Route {
-    pub fn new(hub: &str, target: Device) -> crate::Result<Self> {
-        let api = Client::new(hub)?;
+    pub fn new(api: Client, target: Device) -> crate::Result<Self> {
         ensure!(
             target.owner.issuer == api.origin(),
             "cloud target issuer mismatch"

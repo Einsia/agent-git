@@ -8,6 +8,30 @@ pub mod resources;
 pub mod store;
 pub use commands::{Args, run};
 
+/// Only transports are shared; callers load current credentials for every request.
+#[derive(Default)]
+pub struct Clients(
+    std::sync::Mutex<std::collections::VecDeque<(String, agit_peer::client::Client)>>,
+);
+
+impl Clients {
+    pub fn get(&self, hub: &str) -> crate::Result<agit_peer::client::Client> {
+        let mut clients = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, client)) = clients.iter().find(|(origin, _)| origin == hub) {
+            return Ok(client.clone());
+        }
+        let client = agit_peer::client::Client::new(hub)?;
+        if clients.len() >= 16 {
+            clients.pop_front();
+        }
+        clients.push_back((hub.into(), client.clone()));
+        Ok(client)
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OwnerRequest {
@@ -17,13 +41,13 @@ pub enum OwnerRequest {
     Inbound { hub: String, enabled: bool },
 }
 
-pub async fn manage(request: OwnerRequest) -> crate::Result<serde_json::Value> {
+pub async fn manage(clients: &Clients, request: OwnerRequest) -> crate::Result<serde_json::Value> {
     match request {
         OwnerRequest::Status { hub } => {
             tokio::task::spawn_blocking(move || store::status(&hub)).await?
         }
         OwnerRequest::Devices { hub, after } => {
-            let api = agit_peer::client::Client::new(&hub)?;
+            let api = clients.get(&hub)?;
             let token = account_token(api.origin(), false).await?;
             let page = match api.devices(&token, after.as_deref()).await {
                 Err(error)

@@ -328,6 +328,7 @@ async fn serve_described(
     let discovery_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
     let peer_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING * MAX_CLIENTS));
     let mut peer_states = controller.subscribe();
+    let cloud_clients = std::sync::Arc::new(super::cloud::Clients::default());
     loop {
         tokio::select! {
             Some(accepted) = async { cloud.as_mut().unwrap().incoming.recv().await }, if cloud.is_some() => {
@@ -405,11 +406,12 @@ async fn serve_described(
                                 continue;
                             };
                             let controller = controller.clone();
+                            let cloud_clients = cloud_clients.clone();
                             let output = peer.output.clone();
                             let diagnostics = diagnostics.clone();
                             tokio::spawn(async move {
                                 let _permit = (permit, global_permit);
-                                let response = super::peers::dispatch(&controller, frame).await;
+                                let response = super::peers::dispatch(&controller, &cloud_clients, frame).await;
                                 if let Some(log) = &diagnostics { log.response(client, &response); }
                                 let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
                             });

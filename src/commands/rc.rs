@@ -720,7 +720,9 @@ fn stop() -> CmdResult {
 fn list() -> CmdResult {
     crate::rc::select_local_authority();
     let runtime = tokio::runtime::Runtime::new()?;
+    let clients = crate::rc::cloud::Clients::default();
     let value = runtime.block_on(crate::rc::cloud::manage(
+        &clients,
         crate::rc::cloud::OwnerRequest::Devices {
             hub: config::hub_url(),
             after: None,

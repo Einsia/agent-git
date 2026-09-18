@@ -38,7 +38,11 @@ struct CloudConnect {
     fingerprint: Option<String>,
 }
 
-pub async fn dispatch(controller: &Controller, frame: Frame) -> Frame {
+pub async fn dispatch(
+    controller: &Controller,
+    cloud: &super::cloud::Clients,
+    frame: Frame,
+) -> Frame {
     let id = frame.id.clone().unwrap_or(RequestId::Num(0));
     let params = frame.params.clone().unwrap_or_default();
     let result: crate::Result<Frame> = async {
@@ -49,10 +53,10 @@ pub async fn dispatch(controller: &Controller, frame: Frame) -> Frame {
                 .ok_or_else(|| anyhow::anyhow!("peer_id is required"))
         };
         match frame.method() {
-            "peer.cloud" => Ok(Frame::response(id.clone(), super::cloud::manage(serde_json::from_value(params)?).await?)),
+            "peer.cloud" => Ok(Frame::response(id.clone(), super::cloud::manage(cloud, serde_json::from_value(params)?).await?)),
             "peer.connect_cloud" => {
                 let config: CloudConnect = serde_json::from_value(params)?;
-                let route = super::cloud::host::Route::new(&config.hub, config.target)?;
+                let route = super::cloud::host::Route::new(cloud.get(&config.hub)?, config.target)?;
                 controller.connect_with(config.peer_id.clone(), Arc::new(route), config.fingerprint)?;
                 let status = controller.ready(&config.peer_id, Duration::from_secs(60)).await?;
                 Ok(Frame::response(id.clone(), json!({"description":status.description,"generation":status.generation,"route_id":status.route_id})))
