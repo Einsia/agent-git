@@ -57,6 +57,18 @@ pub struct ConnectionGrant {
     pub source: Device,
     pub target: Device,
     pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_controller: Option<SessionController>,
+}
+
+/// A Hub-owned controller is confined to one canonical executor session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionController {
+    pub session_id: String,
+    pub runtime: String,
+    pub generation: u64,
+    pub access: crate::access::Access,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

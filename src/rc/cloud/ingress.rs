@@ -2,6 +2,7 @@
 
 use super::{
     access::{self, Permit},
+    delegation,
     resources::Resources,
     store,
 };
@@ -22,6 +23,7 @@ struct State {
 
 pub struct Registry {
     state: Arc<RwLock<State>>,
+    owners: Arc<delegation::Owners>,
     task: tokio::task::JoinHandle<()>,
     log: Option<crate::rc::diagnostics::Log>,
 }
@@ -80,7 +82,12 @@ impl Registry {
                 }
             }
         });
-        Self { state, task, log }
+        Self {
+            state,
+            owners: Default::default(),
+            task,
+            log,
+        }
     }
 
     #[cfg(test)]
@@ -90,6 +97,7 @@ impl Registry {
                 policy,
                 resources: Resources::default(),
             })),
+            owners: Default::default(),
             task: tokio::spawn(std::future::pending()),
             log: None,
         }
@@ -98,11 +106,42 @@ impl Registry {
     pub fn client(&self, principal: Principal, expires_at_ms: i64) -> Client {
         Client {
             principal,
+            controller: None,
             lease: Lease(Arc::new(RwLock::new(LeaseState::new(expires_at_ms)))),
             state: self.state.clone(),
             permits: Default::default(),
             live: Arc::new(RwLock::new(true)),
             log: self.log.clone(),
+        }
+    }
+
+    pub fn admitted(
+        &self,
+        grant: agit_peer::cloud::ConnectionGrant,
+    ) -> impl std::future::Future<Output = anyhow::Result<Client>> + Send + use<> {
+        let mut client = self.client(grant.caller.clone(), grant.expires_at_ms);
+        let (state, owners) = (self.state.clone(), self.owners.clone());
+        async move {
+            if let Some(scope) = &grant.session_controller {
+                let state = state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let session = state
+                    .resources
+                    .session(&scope.session_id)
+                    .context("controller session is unavailable")?;
+                anyhow::ensure!(
+                    session.runtime == scope.runtime
+                        && if session.native_id.is_empty() {
+                            session.id == scope.session_id
+                        } else {
+                            session.native_id == scope.session_id
+                        },
+                    "controller requires a canonical executor session"
+                );
+            }
+            client.controller = owners.accept(&grant).await?;
+            Ok(client)
         }
     }
 }
@@ -176,6 +215,7 @@ impl Lease {
 #[derive(Clone)]
 pub struct Client {
     pub principal: Principal,
+    controller: Option<delegation::Controller>,
     lease: Lease,
     state: Arc<RwLock<State>>,
     permits: Arc<Mutex<HashMap<RequestId, Option<Permit>>>>,
@@ -193,6 +233,7 @@ impl Drop for Client {
 }
 
 struct ExecutionAuthority {
+    controller: Option<delegation::Controller>,
     lease: Lease,
     principal: Principal,
     role: String,
@@ -213,11 +254,22 @@ impl crate::rc::authority::Authority for ExecutionAuthority {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let allowed = *live
+        let owner = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.current());
+        let policy = delegation::policy(
+            self.controller.as_ref(),
+            &state.policy,
+            &state.resources,
+            &self.principal,
+        );
+        let allowed = (self.controller.is_none() || owner.is_some())
+            && *live
             && self.lease.current()
             && self.permit.authority_matches(
                 &state.resources,
-                &state.policy,
+                &policy,
                 &self.principal,
                 &self.role,
             );
@@ -241,6 +293,10 @@ impl Client {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             && self.lease.current()
+            && self
+                .controller
+                .as_ref()
+                .is_none_or(|controller| controller.current().is_some())
     }
 
     pub(crate) fn lease(&self) -> Lease {
@@ -266,9 +322,27 @@ impl Client {
         let State { policy, resources } = &mut *state;
         let id = frame.id.clone().unwrap();
         permits.insert(id.clone(), None);
-        let (mut frame, permit) = access::authorize(frame, &self.principal, policy, resources)
+        let owner = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.current());
+        if self.controller.is_some() && owner.is_none() {
+            return Err(Rejection::Close);
+        }
+        let effective =
+            delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);
+        let (mut frame, permit) = access::authorize(frame, &self.principal, &effective, resources)
             .map_err(Rejection::Reply)?;
+        if let Some(controller) = &self.controller {
+            controller.actor(&mut frame, &self.principal).map_err(|_| {
+                Rejection::Reply(RpcError::new(
+                    crate::protocol::ErrorCode::Forbidden,
+                    "controller actor is unavailable",
+                ))
+            })?;
+        }
         frame.authority = crate::rc::authority::Guard::new(ExecutionAuthority {
+            controller: self.controller.clone(),
             principal: self.principal.clone(),
             lease: self.lease.clone(),
             role: frame.caller.as_ref().unwrap().role.clone(),
@@ -299,15 +373,28 @@ impl Client {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let State { policy, resources } = &mut *state;
+        let owner = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.current());
+        if self.controller.is_some() && owner.is_none() {
+            return Ok(None);
+        }
         if let Some(Some(permit)) = &permit {
             if let Some(result) = &frame.result {
                 permit.observe(resources, result);
             }
-            frame = permit.response(frame, resources, policy, &self.principal);
+            let effective =
+                delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);
+            frame = permit.response(frame, resources, &effective, &self.principal);
             if permit.method == "machine.describe"
                 && let Some(result) = frame.result.as_mut()
             {
-                result["authority"] = serde_json::json!("cloud-principal");
+                result["authority"] = serde_json::json!(if self.controller.is_some() {
+                    "cloud-session-controller"
+                } else {
+                    "cloud-principal"
+                });
                 result["access_ceiling"] = serde_json::json!(true);
                 if let Some(result) = result.as_object_mut() {
                     result.remove("diagnostic_log");
@@ -318,14 +405,29 @@ impl Client {
         if frame.id.is_some() {
             return Ok(matches!(permit, Some(None)).then(|| frame.to_json()));
         }
+        let effective =
+            delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);
         Ok(
-            access::event_allowed(&frame, resources, policy, &self.principal)
+            access::event_allowed(&frame, resources, &effective, &self.principal)
                 .then(|| frame.to_json()),
         )
     }
 
-    pub fn receipt_key(&self, key: String) -> String {
-        serde_json::json!([self.principal, key]).to_string()
+    pub fn receipt_key(&self, key: String, frame: &Frame) -> String {
+        if self.controller.is_some() {
+            serde_json::json!([
+                "session-controller",
+                self.principal.issuer,
+                frame
+                    .caller
+                    .as_ref()
+                    .and_then(|caller| caller.account_id.as_deref()),
+                key
+            ])
+            .to_string()
+        } else {
+            serde_json::json!([self.principal, key]).to_string()
+        }
     }
 }
 

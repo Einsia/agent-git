@@ -254,14 +254,26 @@ async fn serve_described(
     let peer_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING * MAX_CLIENTS));
     let mut peer_states = controller.subscribe();
     let cloud_clients = std::sync::Arc::new(super::cloud::Clients::default());
+    let mut cloud_admissions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             Some(accepted) = async { cloud.as_mut().unwrap().incoming.recv().await }, if cloud.is_some() => {
-                if clients.values().filter(|client| client.cloud.is_some()).count() >= MAX_CLIENTS {
+                if clients.values().filter(|client| client.cloud.is_some()).count() + cloud_admissions.len() >= MAX_CLIENTS {
                     continue;
                 }
+                let admission = cloud.as_ref().unwrap().registry.admitted(accepted.grant.clone());
+                cloud_admissions.spawn(async move { (accepted, admission.await) });
+            }
+            Some(admitted) = cloud_admissions.join_next(), if !cloud_admissions.is_empty() => {
+                let Ok((accepted, guard)) = admitted else { continue; };
+                let guard = match guard {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        if let Some(log) = &diagnostics { log.record("cloud.controller_rejected", serde_json::json!({"grant_id":accepted.grant.id,"reason":error.to_string()})); }
+                        continue;
+                    }
+                };
                 serial = serial.checked_add(1).context("client identity exhausted")?;
-                let guard = cloud.as_ref().unwrap().registry.client(accepted.grant.caller.clone(), accepted.grant.expires_at_ms);
                 if let Some(log) = &diagnostics {
                     log.record("cloud.client_attached", serde_json::json!({"client_id":serial,"grant_id":accepted.grant.id,"source_id":accepted.grant.source.id,"principal":accepted.grant.caller,"grant_expires_at_ms":accepted.grant.expires_at_ms}));
                 }
@@ -402,7 +414,7 @@ async fn serve_described(
                                 clients.remove(&client);
                                 continue;
                             }
-                            let key = message_key(&frame).map(|key| peer.cloud.as_ref().map_or_else(|| key.clone(), |guard| guard.receipt_key(key.clone())));
+                            let key = message_key(&frame).map(|key| peer.cloud.as_ref().map_or_else(|| key.clone(), |guard| guard.receipt_key(key.clone(), &frame)));
                             if let Some(key) = &key {
                                 receipts.retain(|_, entry| entry.response.is_none() || entry.created.elapsed().as_secs() < 600);
                                 if let Some(entry) = receipts.get(key) {
@@ -561,7 +573,7 @@ mod tests {
         // Queue a closed peer before the accept loop can inspect credentials.
         drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
         let (_out, outbound) = super::super::outbound::channel();
-        let (events, mut requests) = mpsc::channel(16);
+        let (events, _requests) = mpsc::channel(16);
         let server = tokio::spawn(serve_described(
             listener,
             outbound,

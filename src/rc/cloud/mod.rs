@@ -2,6 +2,7 @@
 
 pub mod access;
 mod commands;
+mod delegation;
 pub mod host;
 pub mod ingress;
 pub mod resources;

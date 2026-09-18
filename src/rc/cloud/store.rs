@@ -57,7 +57,7 @@ pub fn enrollment_lock(hub: &str) -> crate::Result<std::fs::File> {
     Ok(file)
 }
 
-fn private_lock(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn private_lock(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
         crate::infra::windows_security::open_private_control(path)
@@ -75,7 +75,10 @@ fn private_lock(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> crate::Result<Option<T>> {
+pub(super) fn read<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    limit: u64,
+) -> crate::Result<Option<T>> {
     #[cfg(unix)]
     let opened = OpenOptions::new()
         .read(true)
@@ -109,7 +112,7 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> crate::Resul
         .map_err(|_| anyhow::anyhow!("invalid private cloud state"))
 }
 
-fn write(path: &Path, value: &impl Serialize) -> crate::Result<()> {
+pub(super) fn write(path: &Path, value: &impl Serialize) -> crate::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     #[cfg(windows)]
     crate::infra::windows_security::write_private_file(path, &bytes)?;

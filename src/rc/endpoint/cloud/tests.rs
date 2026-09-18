@@ -73,6 +73,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         source: device("source", &source_identity),
         target: device("target", &target_identity),
         expires_at_ms: i64::MAX,
+        session_controller: None,
     };
     let (source, target) = tokio::io::duplex(65536);
     let (source, target) = tokio::join!(
@@ -298,6 +299,7 @@ async fn renewal_recovers_transport_failure_but_refusal_revokes_before_queued_cl
         source: device.clone(),
         target: device.clone(),
         expires_at_ms: chrono::Utc::now().timestamp_millis() + 2_000,
+        session_controller: None,
     };
     let renewed_grant = ConnectionGrant {
         expires_at_ms: grant.expires_at_ms + 2_000,

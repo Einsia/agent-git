@@ -587,8 +587,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let pid = root.path().join("duplex");
         let input = vec![b'i'; 256 * 1024];
-        let output = Deadline::new()
-            .output(child("duplex", &pid), Some(&input), 512 * 1024)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(execute_with_input(
+                child("duplex", &pid),
+                Some(&input),
+                512 * 1024,
+                Instant::now() + Duration::from_secs(30),
+            ))
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         let expected = vec![b'o'; 256 * 1024];

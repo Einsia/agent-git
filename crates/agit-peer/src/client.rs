@@ -345,6 +345,7 @@ impl Client {
         ensure!(
             grant.id == previous.id
                 && grant.caller == previous.caller
+                && grant.session_controller == previous.session_controller
                 && same_device(&grant.source, &previous.source)
                 && same_device(&grant.target, &previous.target)
                 && same_device(&grant.target, &executor.device)
@@ -362,6 +363,20 @@ impl Client {
                 && grant.source.owner.account_id == grant.caller.account_id,
             "cloud grant caller or issuer mismatch"
         );
+        if let Some(scope) = &grant.session_controller {
+            ensure!(
+                grant.caller == grant.target.owner
+                    && !scope.session_id.is_empty()
+                    && scope.session_id.len() <= 1024
+                    && !scope.session_id.chars().any(char::is_control)
+                    && !scope.runtime.is_empty()
+                    && scope.runtime.len() <= 128
+                    && !scope.runtime.chars().any(char::is_control)
+                    && scope.generation > 0
+                    && scope.access != crate::access::Access::Deny,
+                "invalid session controller delegation"
+            );
+        }
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
         ensure!(
             grant.expires_at_ms > now,
@@ -394,6 +409,7 @@ impl Client {
         let mut config = self.socket_config(device, "/api/peer/presence")?;
         if let Config::WebSocket { headers, .. } = &mut config {
             headers.push(("X-Agit-Peer-Offer".into(), "grant-v1".into()));
+            headers.push(("X-Agit-Session-Controller".into(), "session-v1".into()));
         }
         Ok(config)
     }
@@ -532,6 +548,7 @@ mod tests {
             },
             target: device,
             expires_at_ms: i64::MAX,
+            session_controller: None,
         };
         assert_eq!(
             client
@@ -541,6 +558,24 @@ mod tests {
                 .id,
             grant.id
         );
+        let serialized = serde_json::to_value(&grant).unwrap();
+        assert!(serialized.get("session_controller").is_none());
+        assert!(
+            serde_json::from_value::<ConnectionGrant>(serialized)
+                .unwrap()
+                .session_controller
+                .is_none()
+        );
+        let mut delegated = grant.clone();
+        delegated.session_controller = Some(SessionController {
+            session_id: "session".into(),
+            runtime: "codex".into(),
+            generation: 1,
+            access: crate::access::Access::Control,
+        });
+        assert!(client.validate_grant(&delegated).is_ok());
+        delegated.target.owner.account_id = "another-owner".into();
+        assert!(client.validate_grant(&delegated).is_err());
         let mut stale = grant;
         stale.target.credential_epoch += 1;
         assert!(
