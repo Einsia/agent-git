@@ -2,6 +2,8 @@
 
 mod admission;
 mod handshake;
+#[cfg(test)]
+mod session_tests;
 pub use admission::verified_transport;
 pub use handshake::join_controller;
 
@@ -277,6 +279,32 @@ impl Client {
             same_device(&dialed.connection.grant.source, source)
                 && same_endpoint(&dialed.connection.grant.target, target),
             "cloud connection identity changed; refresh device enrollment"
+        );
+        Ok(dialed)
+    }
+
+    /// Service admission derives its scope from the owner lease, never from a viewer's token.
+    pub async fn connect_session(
+        &self,
+        source: &DeviceCredential,
+        target: &Device,
+        scope: &SessionController,
+    ) -> anyhow::Result<DialedConnection> {
+        let dialed: DialedConnection = self
+            .request(
+                Method::POST,
+                "/api/peer/session-connections",
+                &source.token,
+                None,
+            )
+            .await?;
+        let grant = &dialed.connection.grant;
+        self.validate_grant(grant)?;
+        ensure!(
+            same_device(&grant.source, &source.device)
+                && same_device(&grant.target, target)
+                && grant.session_controller.as_ref() == Some(scope),
+            "cloud session controller authority changed"
         );
         Ok(dialed)
     }

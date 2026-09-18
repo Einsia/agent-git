@@ -4,7 +4,7 @@ use crate::{Authority, Connector, Opening, Worker};
 use agit_peer::{
     Identity,
     client::{Client, join_controller, verified_transport},
-    cloud::{Device, DeviceCredential, Secret},
+    cloud::{Device, DeviceCredential, DialedConnection, Secret, SessionController},
 };
 use anyhow::ensure;
 use std::{sync::Arc, time::Instant};
@@ -68,6 +68,83 @@ pub async fn dial(
     identity: &Identity,
     target: &Device,
 ) -> anyhow::Result<agit_tunnel::Connection> {
+    dial_admitted(
+        api,
+        worker,
+        source,
+        identity,
+        target,
+        api.connect(account, &source.device, target),
+    )
+    .await
+}
+
+/// A service route retains session authority independently of browser attachment lifetimes.
+pub struct SessionRoute {
+    api: Client,
+    identity: Arc<Identity>,
+    source: DeviceCredential,
+    target: Device,
+    scope: SessionController,
+    key: String,
+}
+
+impl SessionRoute {
+    pub fn new(
+        api: Client,
+        identity: Arc<Identity>,
+        source: DeviceCredential,
+        target: Device,
+        scope: SessionController,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            source.device.owner.issuer == api.origin()
+                && target.owner == source.device.owner
+                && source.device.certificate == *identity.certificate(),
+            "cloud session controller identity mismatch"
+        );
+        let key = serde_json::to_string(&(&source.device, &target, &scope))?;
+        Ok(Self {
+            api,
+            identity,
+            source,
+            target,
+            scope,
+            key,
+        })
+    }
+}
+
+impl Connector for SessionRoute {
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn authority(&self) -> Authority {
+        Authority::CloudPrincipal
+    }
+
+    fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
+        Box::pin(dial_admitted(
+            &self.api,
+            worker,
+            &self.source,
+            &self.identity,
+            &self.target,
+            self.api
+                .connect_session(&self.source, &self.target, &self.scope),
+        ))
+    }
+}
+
+async fn dial_admitted(
+    api: &Client,
+    worker: &Worker,
+    source: &DeviceCredential,
+    identity: &Identity,
+    target: &Device,
+    admission: impl std::future::Future<Output = anyhow::Result<DialedConnection>>,
+) -> anyhow::Result<agit_tunnel::Connection> {
     let config = api.data_config(source)?;
     let started = Instant::now();
     let mut phase = "admission_transport";
@@ -77,7 +154,7 @@ pub async fn dial(
         let ((dialed, admission_ms), (raw, transport_ms), reopened) = verified_transport(
             async {
                 let started = Instant::now();
-                let dialed = api.connect(account, &source.device, target).await?;
+                let dialed = admission.await?;
                 Ok((dialed, started.elapsed().as_secs_f64() * 1000.0))
             },
             || async {

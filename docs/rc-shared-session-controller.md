@@ -52,6 +52,12 @@ browser login. Revoking a member removes that attachment; revoking the device or
 delegation ends shared authority. Durable workspace destinations remain separately
 authorized even when their live session history shares an upstream reader.
 
+The controller library exposes `cloud::SessionRoute` for that service identity.
+It obtains session admission with the service credential, verifies the returned
+device, session and generation, and reuses the personal route's parallel transport
+opening and peer TLS handshake. It does not renew the owner lease, decide workspace
+membership, or carry a browser token. The hosting control plane owns those duties.
+
 Validation must include cross-account fan-out, owner replacement, retry identity,
 member revocation, a slow/disconnected browser, and external writer ownership using
 actual CLI artifacts. Existing personal-grant compatibility and session isolation
