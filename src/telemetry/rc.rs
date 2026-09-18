@@ -187,6 +187,7 @@ mod tests {
             distinct_id: "synthetic-anonymous".into(),
             generation: preferences.generation,
             destination: Destination {
+                hub: "http://127.0.0.1:9".into(),
                 url: "http://127.0.0.1:9/batch/".into(),
                 key: "synthetic".into(),
                 route: "synthetic".into(),

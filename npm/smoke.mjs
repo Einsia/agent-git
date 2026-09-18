@@ -136,7 +136,7 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
       const saved = JSON.parse(readFileSync(preferences, 'utf8'))
       check('verified install retains the browser acquisition key', saved.install_reported === true && saved.acquisition_id === acquisitionId)
       check('installer retains URL campaign context locally', saved.campaign_first?.parameters.utm_creative_format?.[0] === 'video' && saved.campaign_latest?.parameters.gclid?.[0] === 'click' && !JSON.stringify(saved).includes('private-campaign-canary'))
-      check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
+      check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('AGIT_TELEMETRY_DISABLED'), r.stderr)
       const stages = JSON.parse(readFileSync(join(home, '.agit', 'telemetry', 'queue.json'), 'utf8')).entries
         .map(entry => entry.event).filter(event => event.event === 'cli_install_stage')
       check('visible installer stages cover copy, verification, setup and completion',
@@ -145,7 +145,7 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
         new Set(stages.map(event => event.properties.attempt_id)).size === 1 &&
         stages.every(event => event.properties.acquisition_id === acquisitionId && event.properties.elapsed_ms >= 0) &&
         !JSON.stringify(stages).includes('private-campaign-canary'))
-      spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
+      writeFileSync(preferences, JSON.stringify({ preference: 'disabled', generation: saved.generation + 1 }))
       const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
       check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
     }
@@ -191,18 +191,18 @@ if (process.platform !== 'win32') {
     const dir = join(lifecycleHome, '.agit', 'telemetry')
     const prefs = join(dir, 'preferences.json')
     if (foreground) {
-      check('foreground npm discloses before enabling statistics', existsSync(prefs) && (result.stdout + result.stderr).includes('agit telemetry disable'), result.stdout + result.stderr)
+      check('foreground npm discloses before enabling statistics', existsSync(prefs) && (result.stdout + result.stderr).includes('AGIT_TELEMETRY_DISABLED'), result.stdout + result.stderr)
       check('foreground npm records a verified install without setup or registration', existsSync(prefs) && JSON.parse(readFileSync(prefs, 'utf8')).install_reported === true)
     } else {
-      check('hidden npm output cannot enable statistics or allocate an installation ID', !existsSync(prefs) && !existsSync(join(dir, 'queue.json')) && !(result.stdout + result.stderr).includes('agit telemetry disable'))
+      check('hidden npm output cannot enable statistics or allocate an installation ID', !existsSync(prefs) && !existsSync(join(dir, 'queue.json')) && !(result.stdout + result.stderr).includes('AGIT_TELEMETRY_DISABLED'))
       const pending = join(dir, 'pending-install.json')
       check('hidden npm retains the verified installation fact', existsSync(pending))
       if (existsSync(pending)) {
         const fact = JSON.parse(readFileSync(pending, 'utf8'))
-        const consent = spawnSync(bin, ['telemetry', 'enable'], { encoding: 'utf8', env: lifecycleEnv, cwd: consumer })
+        const consent = spawnSync(bin, ['setup', '--yes', '--skill', '--runtime', 'codex'], { encoding: 'utf8', env: lifecycleEnv, cwd: consumer })
         const queuePath = join(dir, 'queue.json')
         const receipt = existsSync(queuePath) && JSON.parse(readFileSync(queuePath, 'utf8')).entries.find(entry => entry.event.event === 'cli_install_succeeded')?.event
-        check('visible consent records the original installation without registration', consent.status === 0 && consent.stderr.includes('agit telemetry disable') && receipt?.timestamp === fact.verified_at, consent.stderr)
+        check('visible consent records the original installation without registration', consent.status === 0 && consent.stderr.includes('AGIT_TELEMETRY_DISABLED') && receipt?.timestamp === fact.verified_at, consent.stderr)
       }
     }
   }

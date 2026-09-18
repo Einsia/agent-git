@@ -209,14 +209,15 @@ fn seed(argv: &[OsString]) -> Seed {
 }
 
 fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
+    state::enforce(&seed.hub)?;
     let mut preferences = state::read()?;
-    if !state::enabled(&preferences) {
+    if !state::enabled(&preferences, &seed.hub) {
         return Ok(None);
     }
     let Some(destination) = Destination::for_hub(&seed.hub) else {
         return Ok(None);
     };
-    let debug = state::positive("AGIT_TELEMETRY_DEBUG");
+    let debug = state::debug(&seed.hub);
     let (account, identity_state) = crate::infra::credentials::analytics_account(&seed.hub);
     let principal = format!(
         "{}:{}",
@@ -233,7 +234,7 @@ fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
     };
     if !debug {
         let current = state::read_at(&dir)?;
-        if !state::enabled(&current)
+        if !state::enabled(&current, &seed.hub)
             || current.generation != preferences.generation
             || current.device_id != preferences.device_id
         {
@@ -289,7 +290,7 @@ fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
     let mut properties = seed.properties.clone();
     properties.extend(json!({ "identity_state": identity_state, "device_id": activity.device, "session_id": activity.session,
         "is_first_visit": first && !seed.background, "channel": match preferences.channel.as_str() {"create_agit"|"npm_global"|"source"|"archive" => preferences.channel.as_str(),_=>"unknown"}, "notice_version": preferences.notice_version,
-        "telemetry_mode": if matches!(preferences.decision_source, Some(state::DecisionSource::ExplicitEnable)) {"explicit_enable"} else {"default_on"},
+        "telemetry_mode": if state::required(&seed.hub) {"required"} else if matches!(preferences.decision_source, Some(state::DecisionSource::ExplicitEnable)) {"explicit_enable"} else {"default_on"},
         "decision_source": preferences.decision_source, "app_env": if destination.environment == "production" {"production"} else {"development"},
         "deployment_env": destination.environment, "hub_class": if matches!(destination.environment,"production"|"staging") {"official"} else {"other"},
         "$process_person_profile": account.is_some()
@@ -325,13 +326,13 @@ fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
 }
 
 fn emit(context: &Context, event: EventName, extra: Map<String, Value>) {
-    if state::override_reason().is_some() {
+    if state::override_reason(&context.hub).is_some() {
         return;
     }
     let Ok(preferences) = state::read() else {
         return;
     };
-    if !state::enabled(&preferences)
+    if !state::enabled(&preferences, &context.hub)
         || preferences.generation != context.generation
         || preferences.device_id != context.consent_device
     {
@@ -375,9 +376,6 @@ pub fn begin(argv: &[OsString], restart: Option<&str>) {
         seed.properties
             .insert("prompt_shown".into(), json!(restart.prompt_shown));
     }
-    if seed.properties.get("command") == Some(&json!("telemetry")) {
-        return;
-    }
     let parse_ok = crate::commands::cli_def()
         .try_get_matches_from(argv)
         .is_ok();
@@ -392,8 +390,9 @@ pub fn begin(argv: &[OsString], restart: Option<&str>) {
         && !seed.protocol
         && std::io::stderr().is_terminal()
         && !present("CI")
-        && state::override_reason().is_none()
-        && state::read().is_ok_and(|p| p.preference == state::Preference::Unset)
+        && !state::required(&seed.hub)
+        && state::override_reason(&seed.hub).is_none()
+        && state::read().is_ok_and(|p| p.optional_preference() == state::Preference::Unset)
     {
         eprintln!("{}\n{}", state::DISCLOSURE, state::ENABLED_NOTICE);
         let _ = state::choose(
@@ -401,6 +400,13 @@ pub fn begin(argv: &[OsString], restart: Option<&str>) {
             state::DecisionSource::FirstInvocation,
             true,
         );
+    }
+    let lightweight = command == "completions"
+        || (command == "setup"
+            && (seed.properties.get("arg_installed_only") == Some(&json!(true))
+                || seed.properties.contains_key("arg_completions")));
+    if state::required(&seed.hub) && (!parse_ok || lightweight) {
+        return;
     }
     if let Ok(mut run) = RUN.lock() {
         *run = Some(Run {
@@ -431,6 +437,7 @@ pub fn activate(onboarding: bool) {
     let Some((seed, started_event)) = seed else {
         return;
     };
+    let _ = state::enforce(&seed.hub);
     let _ = acquisition::resume_pending(&seed.hub);
     let Some((context, new_session)) = context(&seed).ok().flatten() else {
         return;
@@ -484,7 +491,7 @@ pub fn finish(code: i32) {
     ) && code == 0
         && run.context.as_ref().is_some_and(|context| {
             state::read().is_ok_and(|preferences| {
-                state::enabled(&preferences)
+                state::enabled(&preferences, &context.hub)
                     && preferences.generation == context.generation
                     && preferences.device_id == context.consent_device
             })

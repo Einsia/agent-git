@@ -53,20 +53,21 @@ impl VerifiedInstall {
     }
 }
 
-/// Hidden lifecycle scripts retain a verified fact without choosing consent or allocating an ID.
+/// Official Hub installations record receipts even when lifecycle output is hidden.
 pub fn installed(defer_notice: bool) -> anyhow::Result<()> {
-    if state::override_reason().is_some() {
+    let hub = crate::infra::config::hub_url();
+    if state::override_reason(&hub).is_some() {
         return Ok(());
     }
-    let hub = crate::infra::config::hub_url();
+    state::enforce(&hub)?;
     let Some(destination) = Destination::for_hub(&hub) else {
         return Ok(());
     };
     let fact = VerifiedInstall::current(&destination);
-    if defer_notice {
+    if defer_notice && !state::required(&hub) {
         let dir = state::directory()?;
         let guard = state::gate(&dir, true)?;
-        match state::read_at(&dir)?.preference {
+        match state::read_at(&dir)?.optional_preference() {
             state::Preference::Disabled => return Ok(()),
             state::Preference::Unset => {
                 let path = dir.join("pending-install.json");
@@ -77,7 +78,7 @@ pub fn installed(defer_notice: bool) -> anyhow::Result<()> {
             }
             state::Preference::Enabled => drop(guard),
         }
-    } else {
+    } else if !defer_notice {
         state::onboarding()?;
     }
     resume_pending(&hub)?;
@@ -86,10 +87,10 @@ pub fn installed(defer_notice: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A visible consent decision can buffer the original fact without making a local command online.
+/// Admitting a pending receipt does not make a local command online.
 pub(crate) fn resume_pending(hub: &str) -> anyhow::Result<()> {
     let preferences = state::read()?;
-    if !state::enabled(&preferences) {
+    if !state::enabled(&preferences, hub) {
         return Ok(());
     }
     let Some(destination) = Destination::for_hub(hub) else {
@@ -131,7 +132,7 @@ fn record_install(
     let preferences = {
         let _guard = state::gate(&dir, true)?;
         let mut preferences = state::read_at(&dir)?;
-        if !state::enabled(&preferences) || preferences.generation != generation {
+        if !state::enabled(&preferences, &destination.hub) || preferences.generation != generation {
             return Ok(());
         }
         if preferences
@@ -177,7 +178,7 @@ fn record_install(
         timestamp: fact.verified_at,
         properties,
     };
-    if state::positive("AGIT_TELEMETRY_DEBUG") {
+    if state::debug(&destination.hub) {
         eprintln!("{}", json!({"telemetry_preview": event}));
     } else {
         transport::enqueue(event.clone(), preferences.generation, destination)?;
@@ -212,7 +213,7 @@ pub(crate) fn bind_route(
 pub fn authorization_url(raw: &str, hub: &str) -> String {
     let scoped = || -> anyhow::Result<state::Preferences> {
         anyhow::ensure!(
-            state::read().is_ok_and(|p| state::enabled(&p)),
+            state::read().is_ok_and(|p| state::enabled(&p, hub)),
             "statistics are off"
         );
         let destination =
@@ -221,7 +222,7 @@ pub fn authorization_url(raw: &str, hub: &str) -> String {
         let _guard = state::gate(&dir, true)?;
         let mut preferences = state::read_at(&dir)?;
         anyhow::ensure!(
-            state::enabled(&preferences) && preferences.first_acquisition_account.is_none(),
+            state::enabled(&preferences, hub) && preferences.first_acquisition_account.is_none(),
             "acquisition is inactive"
         );
         anyhow::ensure!(
@@ -263,15 +264,14 @@ pub fn save_login(
         let destination =
             Destination::for_hub(hub).ok_or_else(|| anyhow::anyhow!("no analytics destination"))?;
         anyhow::ensure!(
-            state::read().is_ok_and(|p| state::enabled(&p))
-                && !state::positive("AGIT_TELEMETRY_DEBUG"),
+            state::read().is_ok_and(|p| state::enabled(&p, hub)) && !state::debug(hub),
             "statistics are off"
         );
         let dir = state::directory()?;
         let guard = state::gate(&dir, true)?;
         let preferences = state::read_at(&dir)?;
         anyhow::ensure!(
-            state::enabled(&preferences) && !state::positive("AGIT_TELEMETRY_DEBUG"),
+            state::enabled(&preferences, hub) && !state::debug(hub),
             "statistics are off"
         );
         anyhow::ensure!(
@@ -283,7 +283,7 @@ pub fn save_login(
         );
         Ok((dir, guard, preferences, destination))
     };
-    let state = if state::override_reason().is_none() {
+    let state = if state::override_reason(hub).is_none() {
         eligible().ok()
     } else {
         None
@@ -318,9 +318,7 @@ pub fn save_login(
 
 pub(crate) fn enqueue_pending_link(hub: &str) -> anyhow::Result<()> {
     let preferences = state::read()?;
-    if !state::enabled(&preferences)
-        || preferences.acquisition_completed
-        || state::positive("AGIT_TELEMETRY_DEBUG")
+    if !state::enabled(&preferences, hub) || preferences.acquisition_completed || state::debug(hub)
     {
         return Ok(());
     }

@@ -73,7 +73,6 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "show",
     "status",
     "tag",
-    "telemetry",
     "upgrade",
     "view",
     "whoami",

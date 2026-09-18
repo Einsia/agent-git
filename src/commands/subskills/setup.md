@@ -35,12 +35,12 @@ agit setup --completions zsh
 
 Run `agit doctor` after installation. Hooks may commit at Stop/turn boundaries. Full interactive setup also asks whether to push settled turns automatically; the default is off. Use `--auto-push` or `--auto-push=false` to set that user preference explicitly. Repositories without a local override inherit it.
 
-Setup first explains usage statistics and asks with a default Yes. Noninteractive
-setup and `--yes` enable statistics with a visible notice. Existing opt-outs stay
-disabled. Use `agit telemetry disable` to stop collection or `agit telemetry
-schema` to inspect the field policies. Completion generation and dependency
-postinstall defer this choice. `--yes` skips the automatic-push question without
-changing that separate preference.
+Usage statistics are required when the selected Hub is `https://agent-git.com`
+(or its `www` alias on the default HTTPS port). Setup does not ask for a telemetry
+choice on that Hub. Self-hosted Hubs keep their optional setup choice and need an
+explicit analytics destination. See `docs/telemetry.md` and
+`src/telemetry/registry.json` for the collection policy and field inventory.
+`--yes` skips the automatic-push question without changing that separate preference.
 
 Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) only when `codex features list` reports the

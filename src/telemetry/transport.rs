@@ -1,4 +1,4 @@
-//! Bounded local buffering and a consent gate shared with the detached sender.
+//! Bounded local buffering and an installation gate shared with the detached sender.
 
 use super::state;
 use anyhow::{Result, ensure};
@@ -15,6 +15,7 @@ const BATCH_SIZE: usize = 50;
 
 #[derive(Clone)]
 pub(crate) struct Destination {
+    pub hub: String,
     pub url: String,
     pub key: String,
     pub route: String,
@@ -28,7 +29,8 @@ pub(crate) fn environment(hub: &str) -> &'static str {
     let Ok(uri) = hub.parse::<http::Uri>() else {
         return "unknown";
     };
-    match (uri.scheme_str(), uri.host(), uri.port_u16()) {
+    let host = uri.host().map(str::to_ascii_lowercase);
+    match (uri.scheme_str(), host.as_deref(), uri.port_u16()) {
         (Some("https"), Some("agent-git.com" | "www.agent-git.com"), None | Some(443)) => {
             "production"
         }
@@ -43,9 +45,13 @@ impl Destination {
         let environment = environment(hub);
         let host = std::env::var("AGIT_TELEMETRY_HOST").ok();
         let key = std::env::var("AGIT_TELEMETRY_KEY").ok();
+        if let (Some(host), Some(key)) = (&host, &key)
+            && let Some(destination) = Self::checked(hub, host.clone(), key.clone(), environment)
+        {
+            return Some(destination);
+        }
         let (host, key) = match (host, key) {
-            (Some(host), Some(key)) => (host, key),
-            (None, None) if environment == "production" => (
+            _ if environment == "production" => (
                 "https://us.i.posthog.com".into(),
                 // Public ingestion token shared with the Hub frontend, never a Hub access token.
                 "phc_p24ACGfxjfJLPLeJM3T4d5BwaaecLBquGk8Fg9xpdZZ8".into(),
@@ -78,6 +84,7 @@ impl Destination {
             .storage_key();
         let route = hex::encode(Sha256::digest(format!("{authority}\0{url}\0{key}")));
         Some(Self {
+            hub: hub.into(),
             url,
             key,
             route,
@@ -166,7 +173,7 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
         ),
     )?;
     let mut preferences = state::read_at(&dir)?;
-    if !state::enabled(&preferences) || preferences.generation != generation {
+    if !state::enabled(&preferences, &destination.hub) || preferences.generation != generation {
         return Ok(());
     }
     if (event.event == EventName::InstallSucceeded && preferences.install_reported)
@@ -247,7 +254,7 @@ pub fn queue_status() -> (usize, u64) {
 }
 
 pub(crate) fn spawn_worker(hub: &str) {
-    if state::override_reason().is_some() || state::positive("AGIT_TELEMETRY_DEBUG") {
+    if state::override_reason(hub).is_some() || state::debug(hub) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -274,7 +281,7 @@ pub(crate) fn spawn_worker(hub: &str) {
     }
 }
 
-/// The gate remains held through the request, so disable can wait for the bounded request then purge.
+/// The gate keeps an admitted batch consistent with its installation generation.
 pub fn flush() -> Result<()> {
     flush_inner(None)
 }
@@ -284,10 +291,11 @@ pub(crate) fn flush_installation(attempt: uuid::Uuid) -> Result<()> {
 }
 
 fn flush_inner(installation_attempt: Option<uuid::Uuid>) -> Result<()> {
-    if state::override_reason().is_some() || state::positive("AGIT_TELEMETRY_DEBUG") {
+    let hub = crate::infra::config::hub_url();
+    if state::override_reason(&hub).is_some() || state::debug(&hub) {
         return Ok(());
     }
-    let hub = crate::infra::config::hub_url();
+    state::enforce(&hub)?;
     let _ = super::acquisition::enqueue_pending_link(&hub);
     let Some(destination) = Destination::for_hub(&hub) else {
         return Ok(());
@@ -295,7 +303,7 @@ fn flush_inner(installation_attempt: Option<uuid::Uuid>) -> Result<()> {
     let dir = state::directory()?;
     let _guard = state::gate(&dir, installation_attempt.is_some())?;
     let preferences = state::read_at(&dir)?;
-    if !state::enabled(&preferences) {
+    if !state::enabled(&preferences, &destination.hub) {
         return Ok(());
     }
     let mut queue = load(&dir)?;

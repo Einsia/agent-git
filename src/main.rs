@@ -311,7 +311,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Status(_) => Startup::Inspect,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
-        Commands::Mcp(_) | Commands::Telemetry(_) => Startup::ToolDispatcher,
+        Commands::Mcp(_) => Startup::ToolDispatcher,
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() || args.repair_permissions.is_some() => {
             Startup::ScopedDoctor
@@ -408,7 +408,6 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Logout(a) => commands::logout::run(a),
         Commands::Whoami(a) => commands::whoami::run(a, json),
         Commands::Config(a) => commands::config::run(a),
-        Commands::Telemetry(a) => commands::telemetry::run(a),
 
         Commands::Init(a) => commands::init::run(a),
         Commands::Clone(a) => commands::clone::run(a),

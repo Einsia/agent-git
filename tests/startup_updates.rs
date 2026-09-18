@@ -548,11 +548,13 @@ mod terminal {
                     PathBuf::from(env!("CARGO_BIN_EXE_agit")),
                 )
             };
-            let enabled = lab
-                .command(&["--quiet", "telemetry", "enable"], &hub.base)
-                .output()
-                .unwrap();
-            assert!(enabled.status.success(), "{enabled:?}");
+            fs::create_dir_all(lab.store.join("telemetry")).unwrap();
+            fs::write(
+                lab.store.join("telemetry/preferences.json"),
+                json!({"preference":"enabled", "generation":1, "device_id":uuid::Uuid::new_v4()})
+                    .to_string(),
+            )
+            .unwrap();
             let mut terminal = Terminal::start(
                 &lab,
                 &executable,

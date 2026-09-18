@@ -1,8 +1,8 @@
 # CLI product telemetry
 
 Status: design rationale. The implemented collection contract and operational
-limits are documented in [CLI usage statistics](telemetry.md); the executable's
-`agit telemetry schema` output is the authoritative field inventory. Deployment
+limits are documented in [CLI usage statistics](telemetry.md); the checked-in
+[`registry.json`](../src/telemetry/registry.json) is the authoritative field inventory. Deployment
 and production ingestion are separate from the local implementation.
 
 Source baseline: CLI `cf4f1abdcd401d31bd7154fed27a951980885ed4`.
@@ -14,9 +14,9 @@ not verified production ingestion.
 
 AgentGit should measure feature adoption, active accounts, command outcomes, and
 performance across the CLI, its integrations, and the Hub. Usage statistics are
-enabled by default after the onboarding notice. Interactive setup offers a choice
-with Yes selected; `npx -y create-agit` enables statistics without another question
-and prints the enabled notice. An existing disabled preference takes precedence.
+required for the official production Hub. Other Hubs retain optional setup
+preferences and need an explicit analytics destination. The Hub policy below
+applies to both ordinary commands and installer receipts.
 
 Statistics include the signed-in account ID. They are account-linked product
 analytics, not anonymous analytics. Repository contents, user-written text,
@@ -33,126 +33,26 @@ They must not be labeled explicit legal consent. Applicable notice, legal-basis,
 processor, retention, and withdrawal requirements remain separate release concerns.
 This proposal does not amend the published Privacy Policy.
 
-## Onboarding and controls
+## Hub policy and onboarding
 
-Interactive setup displays this text before creating product analytics events:
+The current behavior is specified in [CLI usage statistics](telemetry.md).
+Statistics are required for the official production HTTPS Hub (`agent-git.com`
+and `www.agent-git.com` on the default port). A valid ordinary command, integration
+or verified installer initializes this policy without an opt-in prompt. Saved
+refusals and environment opt-outs do not apply there. Hidden official npm installs
+record verified receipts without waiting for a visible terminal.
 
-```text
-Help improve AgentGit by sharing CLI usage statistics.
+The selected Hub must be passed through collection, acquisition and transport,
+including the explicit `login --hub` override. Existing enabled installation
+identities and deduplication remain stable. Migrating a disabled state starts a
+new generation so old collectors cannot append to it. The persisted decision
+source is `hosted_hub` and the event mode is `required`.
 
-Includes command and subcommand names, supported options, feature outcomes,
-performance, and basic environment information. When signed in, statistics
-are linked to your AgentGit account ID and analyzed using PostHog.
-
-Excludes repository names, paths, content, command text, and free-text arguments.
-You can turn this off at any time with `agit telemetry disable`.
-
-Enable usage statistics? [Y/n]
-```
-
-The accompanying documentation link must resolve to the shipped telemetry contract.
-The description distinguishes fixed AgentGit command names from full command text.
-If the user accepts or onboarding enables the default, print:
-
-```text
-Usage statistics are enabled and linked to your account when signed in. Run `agit telemetry disable` to turn them off.
-```
-
-On explicit rejection, print `Usage statistics are disabled.` Both answers are
-persisted. Cancellation or EOF at an interactive question does not count as Yes;
-leave telemetry unconfigured and continue or cancel setup according to its ordinary
-interaction result. An Enter key accepting the displayed default is recorded as
-`setup_default_accepted`, separately from an explicit `y` where detectable.
-
-### Preference states
-
-Persist `unset`, `enabled`, or `disabled`, with `notice_version`, `decision_source`,
-`decision_at`, and a monotonically increasing `generation`. Decision timestamps are
-metadata for this preference, not observations of repository content.
-
-| Situation | Behavior |
-| --- | --- |
-| First interactive `agit setup` | Show the disclosure and `[Y/n]`; persist the choice before capture |
-| First `npx create-agit` without automatic acceptance | Inherit its terminal and use the same Rust setup question |
-| First `npx -y create-agit` | Pass an explicit installer acceptance marker to setup, enable, and print the notice |
-| First direct `agit setup --yes` or non-interactive setup | Enable with the same notice; record `setup_yes` or `setup_noninteractive` |
-| Existing `enabled` | Keep enabled; setup can show the current setting without asking again |
-| Existing `disabled`, including reinstall or upgrade | Keep disabled even under `-y`; only an explicit telemetry enable action changes it |
-| Existing install, first ordinary foreground invocation after upgrade | Print the notice once and persist default-on before this invocation's telemetry |
-| Hidden hook, MCP, protocol child, or daemon with `unset` | Do not prompt, print notices into the protocol, or silently establish a preference; defer onboarding |
-| CI or non-TTY with a recorded enabled preference | Collect according to that preference and identify the environment; do not treat CI as a person |
-| Fresh CI invoking ordinary commands without setup | Remain unconfigured until setup or explicit enable; installations can call `agit setup --yes` |
-| `--help`, `--version`, invalid invocation, completion generation, or `telemetry status` with `unset` | Do not bootstrap tracking; retain their lightweight behavior |
-| Global force-off environment variable or administrator policy | Effective off, regardless of the saved preference or installer default |
-| Preference cannot be read or written safely | Effective off for the process; do not block the product command |
-
-Foreground is a defined execution context, not simply `isatty`: known hook/MCP/RC
-children are not foreground. A regular command running in an agent terminal can
-receive the once-only notice on stderr; machine-readable output must stay valid.
-
-### Installer ownership
-
-`npm/create-agit/bin.mjs` already copies the binary and invokes `agit setup`.
-`npm/postinstall.js` also invokes setup and can run before the create-agit wrapper.
-The Rust CLI owns preference persistence; neither JavaScript entry point implements
-its own preference database or event schema.
-
-The dependency postinstall path must pass a telemetry-defer marker: no onboarding,
-notice, ID allocation, or analytics there. The visible create-agit wrapper owns the
-installation notice and invokes setup once for telemetry. A standalone global npm
-installation with hidden lifecycle output retains a local verified fact without
-a preference, ID allocation or upload. Visible foreground consent can queue its
-original timestamp later; an existing enabled choice permits immediate reporting.
-See `docs/telemetry.md` for the scoped acquisition receipt and correlation contract.
-This avoids hidden npm lifecycle output establishing a preference before disclosure.
-
-The wrapper explicitly translates npm's supported `yes` configuration into a
-dedicated setup argument or fixed environment flag; it must not assume npm passes
-`-y` to the child application's argv. Recognize only a positive boolean value,
-honor false/unset, and verify the actual propagation with supported npm versions.
-Do not forward arbitrary npm configuration, parent argv, or environment values.
-An explicit wrapper `--yes` can provide a documented fallback for other runners.
-
-The existing `AGIT_SKIP_SETUP` behavior must remain effective and be honored by
-the visible wrapper too. Skipping setup does not silently enable analytics in npm
-postinstall. The binary's `--version` self-check creates no onboarding event.
-
-### Proposed commands
-
-```text
-agit telemetry status [--json]
-agit telemetry enable
-agit telemetry disable
-agit telemetry schema [--json]
-agit telemetry preview -- <agit command arguments>
-```
-
-`status` reports saved/effective state, override reason, identity status, destination
-class, notice version, and local queue size. It must not load tokens or contact a
-server. `schema` prints the entire allowlist and privacy transformations.
-`preview` parses the supplied command but neither executes it nor transmits an
-event; it uses synthetic identity and does not read repository content.
-
-`AGIT_TELEMETRY_DISABLED=1` forces this process and its telemetry children off.
-Support `DO_NOT_TRACK=1` as an additional documented AgentGit convention. A zero or
-false value removes that override; it does not opt a disabled installation back in.
-Invalid control values fail closed. The precedence is administrator force-off,
-environment force-off, persistent preference, then onboarding policy.
-
-`AGIT_TELEMETRY_DEBUG=1` prints the sanitized would-be envelope to stderr and never
-sends or enqueues it. Debug output must not be mixed into MCP/hook protocol output;
-use the explicit preview command for protocol troubleshooting. Force-off still wins
-over implicit debug capture; preview remains usable with synthetic identity.
-
-`disable` is local and requires neither login nor network. Persist disabled first,
-invalidate the queue generation, stop admitting new sends, and purge queued data.
-There is no final "disabled" tracking event. Cooperating daemons acknowledge the
-new generation or the transport barrier prevents another upload. A request already
-accepted by a remote server cannot be recalled; withdrawal stops future collection,
-while deletion of previously received data is a separate supported request.
-
-Preferences live at user/device scope under `AGIT_HOME`, never in a code repository
-or session branch. A repository configuration cannot turn a user-level refusal on.
+Other Hubs keep optional preferences and environment overrides, and never inherit
+the official analytics destination. Local commands buffer events without making
+network requests. Help, version, invalid commands, completion generation and
+maintenance setup remain lightweight. There is no telemetry subcommand; inspect
+the source registry for the field inventory.
 
 ## Event model and common properties
 
@@ -168,7 +68,7 @@ do not create an event name per arbitrary argument, error message, or resource.
 | `cli_onboarding_completed` | Enabled onboarding completed, with installation and decision sources |
 | `cli_session_started` | A telemetry activity session began; not an agent conversation |
 
-The installation cannot upload analytics about users who disable telemetry. Do not
+Nonproduction installations with a disabled preference do not upload analytics. Do not
 claim a complete acceptance rate from received events: the rejection denominator
 is intentionally unobserved.
 
@@ -196,7 +96,7 @@ Top-level properties shared with Hub retain their meanings where appropriate:
 | `language` | Normalized supported language code, else `unknown`; not a raw locale string |
 | `os`, `arch` | Closed enum: supported OS and CPU architecture categories |
 | `os_version_major` | Optional validated major release number; not a full OS build string |
-| `telemetry_mode` | `default_on` or `explicit_enable`; not a legal-consent claim |
+| `telemetry_mode` | `required`, `default_on` or `explicit_enable`; not a legal-consent claim |
 | `notice_version` | Fixed shipped disclosure version |
 | `sample_rate` | Included probability for sampled events; `1` for unsampled command lifecycle events |
 
@@ -383,7 +283,6 @@ The root canonical `command` remains the actual top-level command.
 | `mcp` | Server lifecycle; per-tool execution as described below; no request/response bodies |
 | `rc start`, `status`, `stop`, `list`, `revoke`, `cloud`, hidden `land`, `grant`, `ungrant`, `grants` | Detach, known runtime, ownership/actor category, lifecycle/enrollment/authorization outcomes; connection and workspace count buckets; never machine name, enrollment credentials, connection/workspace IDs, or the external command named in a grant |
 | Bare `agit`, help, version, invalid arguments | Actual TUI/help behavior; display-help/version or fixed parser error kind; only known command path components |
-| Proposed `telemetry` controls | Local control operations; status/schema/preview/disable are excluded from upload and active-user metrics |
 
 Search sort and event-kind vocabularies must come from the product parser rather
 than a second permissive parser. Free-form tool/model names are not enums simply
@@ -482,7 +381,7 @@ locally generated analytics ID without transmitting the state or URL.
 
 ### Local and offline behavior
 
-All opted-in commands can contribute sanitized local events, but local commands
+All eligible commands can contribute sanitized local events, but local commands
 must not initiate telemetry network traffic just because they ran. This preserves
 the CLI's offline and read-only request behavior, particularly `search --local`,
 status, diff, doctor, and scoped review paths.
@@ -493,7 +392,7 @@ network worker. They can therefore be represented later, when a permitted upload
 occurs. Offline-only installations may never appear in PostHog; that is a known
 coverage limit, not a reason to silently override offline behavior.
 
-Unconfigured, disabled, test, or no-destination states allocate no analytics identity,
+Nonproduction unconfigured, disabled, or no-destination states allocate no analytics identity,
 enqueue no data, and make no telemetry request. Preference inspection does not
 migrate the AgentGit store, scan Git state, launch a runtime, or acquire credentials.
 
@@ -541,7 +440,7 @@ ingress-log retention separately. Verify the actual ingest configuration.
 Self-hosted/custom Hubs must not silently report their accounts to the production
 PostHog project. Use a separately configured destination and operator policy; without
 one, effective sending is off even if the general local preference is enabled.
-`telemetry status` explains this distinction. This is a destination boundary, not
+This is a destination boundary, not
 an exception that silently re-enables a user-level refusal.
 
 ## Example event
@@ -636,7 +535,7 @@ not claims about the current PostHog project. Access to account-level drilldown 
 limited to authorized product/support staff with access auditing. It is not an
 employee surveillance or automated eligibility signal.
 
-Disabling future telemetry and requesting historical deletion are distinct controls.
+For nonproduction Hubs, disabling future telemetry and historical deletion are distinct controls.
 Account deletion must include analytics identity and related events according to
 the applicable policy. Changing the PostHog identity strategy must not leave an
 untracked anonymous alias outside the deletion scope.
@@ -651,12 +550,13 @@ The implementation is complete only when these properties have evidence:
    URLs, messages, errors, hook payloads, and MCP bodies never appears in a queue,
    event, sender log, or upload. Numeric identifiers and token-like values are
    included in adversarial cases. Privacy validation happens before persistence.
-3. Fresh setup `[Y/n]`, explicit no, cancellation, non-TTY, `--yes`, actual
+3. Official Hub mandatory setup, nonproduction `[Y/n]`, cancellation, non-TTY, `--yes`, actual
    `npx -y create-agit`, global npm postinstall, reinstall, upgrade, and prior refusal
-   obey the state table. Both npm lifecycle ordering and terminal output are checked.
-4. Disable before any use, disable with queued data, concurrent CLI processes,
+   obey the selected Hub policy. Both npm lifecycle ordering and terminal output are checked.
+4. Official Hub legacy refusals and environment overrides cannot disable capture.
+   Nonproduction refusal, queued data, concurrent CLI processes,
    running MCP/RC senders, environment overrides, corrupt config, and unwritable
-   state produce no new capture/upload after the disable boundary.
+   state respect the installation generation and nonproduction disable boundary.
 5. Account-ID capture, old credentials, token refresh, account switching, logout,
    multiple Hub authorities, self-hosting, and remote-operator attribution never
    cross principal boundaries or copy authentication tokens.
@@ -674,7 +574,7 @@ The implementation is complete only when these properties have evidence:
 Implement in focused verified commits: preference/onboarding; account-ID plumbing;
 typed schema and complete command policy; lifecycle and integration instrumentation;
 bounded transport; documentation and end-to-end verification. Update the main Skill
-and add a telemetry command reference when the commands actually exist. Deployment,
+with the current Hub policy. Deployment,
 public release, and any production policy changes are separate delivery stages.
 
 ## Source references

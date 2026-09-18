@@ -44,7 +44,8 @@ enum ErrorCategory {
 }
 
 pub fn record(raw: &str) -> anyhow::Result<()> {
-    if raw.len() > 1024 || state::override_reason().is_some() {
+    let hub = crate::infra::config::hub_url();
+    if raw.len() > 1024 || state::override_reason(&hub).is_some() {
         return Ok(());
     }
     let stage: Stage = serde_json::from_str(raw)?;
@@ -52,7 +53,7 @@ pub fn record(raw: &str) -> anyhow::Result<()> {
         stage.attempt_id.get_version_num() == 4,
         "Invalid attempt ID"
     );
-    let hub = crate::infra::config::hub_url();
+    state::enforce(&hub)?;
     let Some(destination) = Destination::for_hub(&hub) else {
         return Ok(());
     };
@@ -63,7 +64,7 @@ pub fn record(raw: &str) -> anyhow::Result<()> {
     let preferences = {
         let _guard = state::gate(&dir, true)?;
         let mut preferences = state::read_at(&dir)?;
-        if !state::enabled(&preferences)
+        if !state::enabled(&preferences, &hub)
             || !acquisition::bind_route(&mut preferences, &dir, &destination)?
         {
             return Ok(());
@@ -113,7 +114,7 @@ pub fn record(raw: &str) -> anyhow::Result<()> {
         timestamp: now,
         properties,
     };
-    if state::positive("AGIT_TELEMETRY_DEBUG") {
+    if state::debug(&hub) {
         eprintln!("{}", json!({"telemetry_preview":event}));
     } else {
         transport::enqueue(event, preferences.generation, &destination)?;

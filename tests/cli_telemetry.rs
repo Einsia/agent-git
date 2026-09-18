@@ -62,7 +62,31 @@ impl Fixture {
         self.command().args(args).output().unwrap()
     }
     fn enable(&self) {
-        assert!(self.run(&["telemetry", "enable"]).status.success());
+        self.preference(true);
+    }
+    fn disable(&self) {
+        self.preference(false);
+    }
+    fn preference(&self, enabled: bool) {
+        std::fs::create_dir_all(self.path("")).unwrap();
+        let previous: Value = std::fs::read(self.path("preferences.json"))
+            .ok()
+            .and_then(|body| serde_json::from_slice(&body).ok())
+            .unwrap_or(json!({}));
+        let preferences = json!({
+            "preference": if enabled {"enabled"} else {"disabled"},
+            "generation": previous["generation"].as_u64().unwrap_or(0) + 1,
+            "device_id": if enabled {json!(uuid::Uuid::new_v4())} else {Value::Null},
+            "decision_source": if enabled {"explicit_enable"} else {"explicit_disable"},
+            "notice_version": agit::telemetry::state::NOTICE_VERSION
+        });
+        std::fs::write(self.path("preferences.json"), preferences.to_string()).unwrap();
+        for name in ["queue.json", "activity.json", "pending-install.json"] {
+            if enabled && name == "pending-install.json" {
+                continue;
+            }
+            let _ = std::fs::remove_file(self.path(name));
+        }
     }
     fn path(&self, name: &str) -> std::path::PathBuf {
         self.home.path().join("agit/telemetry").join(name)
@@ -151,7 +175,7 @@ fn quiet_setup_discloses_the_first_choice_and_suppresses_repeated_notices() {
     let notice = String::from_utf8(first.stderr).unwrap();
     assert!(notice.contains("PostHog"));
     assert!(notice.contains("Usage statistics are enabled"));
-    assert!(notice.contains("agit telemetry disable"));
+    assert!(notice.contains("AGIT_TELEMETRY_DISABLED"));
     let preferences = std::fs::read(f.path("preferences.json")).unwrap();
     let repeated = f.run(&args);
     assert!(repeated.status.success(), "{repeated:?}");
@@ -240,7 +264,7 @@ fn disable_overrides_debug_purges_events_and_stops_a_running_protocol_parent() {
     let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
-    assert!(f.run(&["telemetry", "disable"]).status.success());
+    f.disable();
     child.stdin.take();
     assert!(child.wait().unwrap().success());
     assert!(!f.path("queue.json").exists());
@@ -287,18 +311,9 @@ fn overrides_and_self_hosted_destinations_fail_closed() {
         .unwrap();
     assert!(out.status.success());
     assert!(f.events().is_empty());
-    let preview = f.run(&[
-        "telemetry",
-        "preview",
-        "--",
-        "commit",
-        "private-repo-canary",
-        "--milestone",
-        "private-message-canary",
-    ]);
-    assert!(preview.status.success());
-    assert!(!String::from_utf8_lossy(&preview.stdout).contains("canary"));
-    assert!(f.events().is_empty());
+    let removed = f.run(&["telemetry", "status"]);
+    assert!(!removed.status.success());
+    assert!(!String::from_utf8_lossy(&f.run(&["--help"]).stdout).contains("telemetry"));
 }
 
 #[test]
@@ -480,7 +495,7 @@ fn identity_refresh_cannot_revive_a_collector_after_disable_and_enable() {
         stream.read_exact(&mut byte).unwrap();
         header.push(byte[0]);
     }
-    assert!(f.run(&["telemetry", "disable"]).status.success());
+    f.disable();
     f.enable();
     let body =
         json!({"username":"private-username-canary","account_id":"account-alice"}).to_string();
@@ -569,43 +584,6 @@ fn failed_upload_retries_preserve_uuid_timestamp_and_occurrence_identity() {
 }
 
 #[test]
-fn disable_waits_for_the_upload_gate_and_prevents_any_followup_request() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut f = Fixture::new();
-    f.sink = format!("http://{}", listener.local_addr().unwrap());
-    f.enable();
-    f.run(&["status"]);
-    let (started_tx, started_rx) = mpsc::channel();
-    let (finish_tx, finish_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut data = [0; 2048];
-        let _ = stream.read(&mut data).unwrap();
-        started_tx.send(()).unwrap();
-        finish_rx.recv_timeout(Duration::from_secs(4)).unwrap();
-        drop(stream);
-        listener.set_nonblocking(true).unwrap();
-        listener
-    });
-    let mut worker = f
-        .command()
-        .arg("--internal-telemetry-flush")
-        .spawn()
-        .unwrap();
-    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    let start = Instant::now();
-    let output = f.run(&["telemetry", "disable"]);
-    assert!(output.status.success());
-    assert!(start.elapsed() < Duration::from_secs(4));
-    assert!(worker.wait().unwrap().success());
-    assert!(!f.path("queue.json").exists());
-    finish_tx.send(()).unwrap();
-    let listener = server.join().unwrap();
-    f.run(&["--internal-telemetry-flush"]);
-    assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
-}
-
-#[test]
 fn verified_install_is_observable_without_setup_or_login_and_is_deduplicated() {
     let f = Fixture::new();
     let acquisition = uuid::Uuid::new_v4().to_string();
@@ -670,7 +648,7 @@ fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() 
         .env("AGIT_ACQUISITION_ID", uuid::Uuid::new_v4().to_string())
         .output()
         .unwrap();
-    assert!(f.run(&["telemetry", "disable"]).status.success());
+    f.disable();
     f.run(&["--internal-install-completed"]);
     assert!(f.events().is_empty());
     f.enable();
@@ -939,8 +917,8 @@ fn hidden_install_defers_ids_until_visible_consent_and_preserves_its_occurrence_
     assert!(fact.get("device_id").is_none());
     f.run(&["--version"]);
     assert!(!f.path("preferences.json").exists());
-    let enabled = f.run(&["telemetry", "enable"]);
-    assert!(String::from_utf8_lossy(&enabled.stderr).contains("agit telemetry disable"));
+    f.enable();
+    assert!(f.run(&["status", "--json"]).status.success());
     let installs: Vec<_> = f
         .events()
         .into_iter()
@@ -957,7 +935,7 @@ fn declining_statistics_purges_the_hidden_install_fact_before_reenable() {
     let f = Fixture::new();
     f.run(&["--internal-install-completed", "--defer-notice"]);
     assert!(f.path("pending-install.json").exists());
-    f.run(&["telemetry", "disable"]);
+    f.disable();
     assert!(!f.path("pending-install.json").exists());
     f.run(&["--internal-install-completed", "--defer-notice"]);
     assert!(!f.path("pending-install.json").exists());
@@ -1024,7 +1002,7 @@ fn installer_retains_first_and_latest_campaigns_locally_and_opt_out_erases_them(
     );
     assert!(!preferences.to_string().contains("private-campaign-canary"));
     assert!(!fixture.queue().to_string().contains("utm_source"));
-    assert!(fixture.run(&["telemetry", "disable"]).status.success());
+    fixture.disable();
     let preferences: Value =
         serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
     assert!(preferences["campaign_first"].is_null());
@@ -1071,7 +1049,7 @@ fn maximum_escaped_campaign_round_trips_pending_and_active_preferences() {
         preferences["campaign_latest"]["parameters"],
         pending["campaign"]["parameters"]
     );
-    assert!(fixture.run(&["telemetry", "status"]).status.success());
+    assert!(fixture.run(&["status", "--json"]).status.success());
     assert!(
         fixture
             .command()
@@ -1082,7 +1060,7 @@ fn maximum_escaped_campaign_round_trips_pending_and_active_preferences() {
             .status
             .success()
     );
-    assert!(fixture.run(&["telemetry", "status"]).status.success());
+    assert!(fixture.run(&["status", "--json"]).status.success());
 }
 
 #[test]
@@ -1151,7 +1129,7 @@ fn installer_stages_preserve_consent_and_do_not_claim_a_verified_install() {
     let invalid = stage("private-path-canary", "error");
     fixture.run(&["--internal-install-stage", &invalid]);
     assert_eq!(fixture.events().len(), events.len());
-    fixture.run(&["telemetry", "disable"]);
+    fixture.disable();
     fixture.run(&["--internal-install-stage", &stage("started", "started")]);
     assert!(fixture.events().is_empty());
 }
@@ -1304,4 +1282,154 @@ fn cancelled_installer_onboarding_stays_unset_through_receipt_and_setup() {
     assert!(!fixture.path("preferences.json").exists());
     assert!(fixture.path("pending-install.json").exists());
     assert!(fixture.events().is_empty());
+}
+
+#[test]
+fn official_hub_requires_statistics_despite_legacy_choices_and_overrides() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut f = Fixture::new();
+    f.hub = "https://agent-git.com".into();
+    f.sink = format!("http://{}", listener.local_addr().unwrap());
+    f.disable();
+    let output = f
+        .command()
+        .args(["status", "--json"])
+        .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("DO_NOT_TRACK", "1")
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .env("AGIT_TELEMETRY_DEBUG", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["ok"],
+        true
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("telemetry_preview"));
+    let events = f.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "cli_command_finished")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["properties"]["telemetry_mode"] == "required")
+    );
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(saved["preference"], "enabled");
+    assert_eq!(saved["decision_source"], "hosted_hub");
+    f.run(&["status", "--json"]);
+    let repeated: Value =
+        serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(repeated["device_id"], saved["device_id"]);
+    assert_eq!(repeated["generation"], saved["generation"]);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send(receive(listener.accept().unwrap().0)).unwrap();
+    });
+    let flushed = f
+        .command()
+        .arg("--internal-telemetry-flush")
+        .env("DO_NOT_TRACK", "1")
+        .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .env("AGIT_TELEMETRY_DEBUG", "1")
+        .output()
+        .unwrap();
+    assert!(flushed.status.success());
+    let body: Value =
+        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+    assert!(!body["batch"].as_array().unwrap().is_empty());
+    assert!(f.events().is_empty());
+}
+
+#[test]
+fn official_hidden_installs_record_receipts_and_background_protocols_initialize() {
+    let mut f = Fixture::new();
+    f.hub = "https://www.agent-git.com:443".into();
+    let output = f
+        .command()
+        .args(["--internal-install-completed", "--defer-notice"])
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        f.events()
+            .iter()
+            .any(|event| event["event"] == "cli_install_succeeded")
+    );
+    assert!(!f.path("pending-install.json").exists());
+    let mut background = Fixture::new();
+    background.hub = f.hub;
+    let output = background.run(&["mcp"]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(!background.events().is_empty());
+}
+
+#[test]
+fn login_hub_override_selects_policy_and_lightweight_commands_do_not_initialize() {
+    let mut f = Fixture::new();
+    f.hub = "https://agent-git.com".into();
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["setup", "--completions", "bash"],
+        vec!["setup", "--skill", "--installed-only", "--quiet"],
+        vec!["telemetry", "status"],
+    ] {
+        f.run(&args);
+        assert!(!f.path("preferences.json").exists(), "{args:?}");
+    }
+    f.command()
+        .args(["login", "--hub", "http://127.0.0.1:9", "--with-token"])
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap();
+    assert!(!f.path("preferences.json").exists());
+    f.hub = "http://127.0.0.1:9".into();
+    f.command()
+        .args(["login", "--hub", "https://agent-git.com", "--with-token"])
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap();
+    assert!(!f.events().is_empty());
+}
+
+#[test]
+fn required_official_policy_does_not_enable_an_optional_hub_after_switching() {
+    for disabled in [false, true] {
+        let mut f = Fixture::new();
+        if disabled {
+            f.disable();
+        }
+        f.hub = "https://agent-git.com".into();
+        assert!(f.run(&["status", "--json"]).status.success());
+        let official_events = f.events();
+        assert!(!official_events.is_empty());
+        f.hub = "http://127.0.0.1:9".into();
+        assert!(f.run(&["status", "--json"]).status.success());
+        assert_eq!(f.events(), official_events);
+        f.run(&["--internal-install-completed", "--defer-notice"]);
+        assert_eq!(f.events(), official_events);
+        assert_eq!(f.path("pending-install.json").exists(), !disabled);
+        if !disabled {
+            assert!(
+                f.run(&["setup", "--yes", "--skill", "--runtime", "codex", "--quiet"])
+                    .status
+                    .success()
+            );
+            assert!(
+                f.events()
+                    .iter()
+                    .any(|event| event["event"] == "cli_install_succeeded")
+            );
+            assert!(!f.path("pending-install.json").exists());
+        }
+    }
 }

@@ -8,9 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const NOTICE_VERSION: u32 = 1;
-pub const ENABLED_NOTICE: &str = "Usage statistics are enabled and linked to your account when signed in. Run `agit telemetry disable` to turn them off.";
-pub const DISCLOSURE: &str = "Help improve AgentGit by sharing CLI usage statistics.\n\nIncludes command and subcommand names, supported options, feature outcomes, performance, and basic environment information. When signed in, statistics are linked to your AgentGit account ID and analyzed using PostHog.\n\nExcludes repository names, paths, content, command text, and free-text arguments.\nYou can turn this off at any time with `agit telemetry disable`.\nDetails: https://github.com/Einsia/agent-git/blob/main/docs/telemetry.md\n";
+pub const NOTICE_VERSION: u32 = 2;
+pub const REQUIRED_NOTICE: &str = "Usage statistics are required when using agent-git.com and are linked to your account when signed in.";
+pub const ENABLED_NOTICE: &str =
+    "Usage statistics are enabled and linked to your account when signed in.";
+pub const DISCLOSURE: &str = "Help improve AgentGit by sharing CLI usage statistics.\n\nIncludes command and subcommand names, supported options, feature outcomes, performance, and basic environment information. When signed in, statistics are linked to your AgentGit account ID and analyzed using PostHog.\n\nExcludes repository names, paths, content, command text, and free-text arguments.\nStatistics are required for agent-git.com. Other Hubs can use AGIT_TELEMETRY_DISABLED=1 to disable statistics.\nDetails: https://github.com/Einsia/agent-git/blob/main/docs/telemetry.md\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +26,7 @@ pub enum Preference {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionSource {
+    HostedHub,
     SetupPrompt,
     SetupYes,
     SetupNoninteractive,
@@ -45,6 +48,7 @@ pub struct AcquisitionAccount {
 #[serde(default)]
 pub struct Preferences {
     pub preference: Preference,
+    pub nonproduction_preference: Option<Preference>,
     pub generation: u64,
     pub notice_version: u32,
     pub decision_source: Option<DecisionSource>,
@@ -59,6 +63,12 @@ pub struct Preferences {
     pub acquisition_completed: bool,
     pub first_acquisition_account: Option<AcquisitionAccount>,
     pub acquisition_reported: bool,
+}
+
+impl Preferences {
+    pub fn optional_preference(&self) -> Preference {
+        self.nonproduction_preference.unwrap_or(self.preference)
+    }
 }
 
 pub fn directory() -> Result<PathBuf> {
@@ -138,7 +148,18 @@ pub fn read() -> Result<Preferences> {
     read_at(&directory()?)
 }
 
-pub fn override_reason() -> Option<&'static str> {
+pub fn required(hub: &str) -> bool {
+    super::transport::environment(hub) == "production"
+}
+
+pub fn debug(hub: &str) -> bool {
+    !required(hub) && positive("AGIT_TELEMETRY_DEBUG")
+}
+
+pub fn override_reason(hub: &str) -> Option<&'static str> {
+    if required(hub) {
+        return None;
+    }
     [
         "AGIT_TELEMETRY_DISABLED",
         "DO_NOT_TRACK",
@@ -155,8 +176,13 @@ pub fn override_reason() -> Option<&'static str> {
     })
 }
 
-pub fn enabled(preferences: &Preferences) -> bool {
-    preferences.preference == Preference::Enabled && override_reason().is_none()
+pub fn enabled(preferences: &Preferences, hub: &str) -> bool {
+    let preference = if required(hub) {
+        preferences.preference
+    } else {
+        preferences.optional_preference()
+    };
+    preference == Preference::Enabled && override_reason(hub).is_none()
 }
 
 pub fn positive(name: &str) -> bool {
@@ -175,18 +201,30 @@ fn choose_at(
         Err(_) if preference == Preference::Disabled => Preferences::default(),
         Err(error) => return Err(error),
     };
-    if (only_unset && current.preference != Preference::Unset)
-        || (current.preference == preference && preference != Preference::Disabled)
+    let required = matches!(source, DecisionSource::HostedHub);
+    let previous = if required {
+        current.preference
+    } else {
+        current.optional_preference()
+    };
+    if (only_unset && previous != Preference::Unset)
+        || (previous == preference && preference != Preference::Disabled)
     {
         return Ok(current);
     }
-    let preserve_pending =
-        current.preference == Preference::Unset && preference == Preference::Enabled;
+    let preserve_pending = previous == Preference::Unset && preference == Preference::Enabled;
     // The barrier covers both persistence and queue removal, so a worker cannot admit a stale batch.
     current.generation = current
         .generation
         .checked_add(1)
         .context("telemetry generation exhausted")?;
+    if required {
+        current
+            .nonproduction_preference
+            .get_or_insert(current.preference);
+    } else {
+        current.nonproduction_preference = None;
+    }
     current.preference = preference;
     current.notice_version = NOTICE_VERSION;
     current.decision_source = Some(source);
@@ -230,13 +268,47 @@ pub fn choose(
     choose_at(&directory()?, preference, source, only_unset)
 }
 
-pub fn onboarding() -> Result<()> {
-    if override_reason().is_some() || positive("AGIT_INSTALLER_ONBOARDING_HANDLED") {
+/// Official Hub policy supersedes saved choices without rotating an active installation.
+pub fn enforce(hub: &str) -> Result<()> {
+    if !required(hub) {
         return Ok(());
     }
     let current = read()?;
-    if current.preference != Preference::Unset {
-        crate::ui::progress(if current.preference == Preference::Enabled {
+    if current.preference == Preference::Enabled
+        && current.notice_version == NOTICE_VERSION
+        && matches!(current.decision_source, Some(DecisionSource::HostedHub))
+    {
+        return Ok(());
+    }
+    let saved = choose(Preference::Enabled, DecisionSource::HostedHub, false)?;
+    if saved.notice_version != NOTICE_VERSION
+        || !matches!(saved.decision_source, Some(DecisionSource::HostedHub))
+    {
+        let dir = directory()?;
+        let _guard = gate(&dir, true)?;
+        let mut current = read_at(&dir)?;
+        current.notice_version = NOTICE_VERSION;
+        current.decision_source = Some(DecisionSource::HostedHub);
+        write_json(&dir.join("preferences.json"), &current)?;
+    }
+    Ok(())
+}
+
+pub fn onboarding() -> Result<()> {
+    let hub = crate::infra::config::hub_url();
+    if required(&hub) {
+        enforce(&hub)?;
+        if !positive("AGIT_INSTALLER_ONBOARDING_HANDLED") {
+            crate::ui::progress(REQUIRED_NOTICE);
+        }
+        return Ok(());
+    }
+    if override_reason(&hub).is_some() || positive("AGIT_INSTALLER_ONBOARDING_HANDLED") {
+        return Ok(());
+    }
+    let current = read()?;
+    if current.optional_preference() != Preference::Unset {
+        crate::ui::progress(if current.optional_preference() == Preference::Enabled {
             ENABLED_NOTICE
         } else {
             "Usage statistics are disabled."
@@ -281,6 +353,28 @@ pub fn onboarding() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn required_policy_matches_only_the_official_https_authority() {
+        for hub in [
+            "https://agent-git.com",
+            "https://www.agent-git.com:443/",
+            "https://AGENT-GIT.COM",
+        ] {
+            assert!(required(hub), "{hub}");
+        }
+        for hub in [
+            "http://agent-git.com",
+            "https://agent-git.com:8443",
+            "https://staging.agent-git.com",
+            "https://agent-git.com.example.test",
+            "https://example.test/agent-git.com",
+            "https://agent-git.com@example.test",
+            "https://agent-git.com?host=example.test",
+        ] {
+            assert!(!required(hub), "{hub}");
+        }
+    }
+
     #[test]
     fn reinstall_preserves_refusal_and_explicit_enable_rotates_identifiers() {
         let dir = tempfile::tempdir().unwrap();

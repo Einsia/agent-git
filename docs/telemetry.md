@@ -1,55 +1,41 @@
 # CLI usage statistics
 
-AgentGit can collect account-linked usage statistics to improve its CLI and Hub.
+AgentGit collects account-linked usage statistics for the official Hub to improve its CLI and Hub.
 Private and public repositories use the same field restrictions. Repository upload
 and usage statistics are separate operations: allowing one does not make repository
 contents eligible for the other.
 
-## Choosing and inspecting the setting
+## Hub policy
 
-Interactive `agit setup` displays the collection disclosure and asks
-`Enable usage statistics? [Y/n]`. Enter accepts Yes; `n` disables collection;
-cancellation leaves the setting unset. Noninteractive setup, `agit setup --yes`,
-and `npx -y create-agit` enable statistics and print the disable command. npm's
-`yes` setting is explicitly translated by create-agit; `npx create-agit --yes`
-also works. Reinstalling never reverses a recorded opt-out.
-The first disclosure remains visible under `--quiet`; subsequent setup notices
-respect quiet output.
+Usage statistics are required for `https://agent-git.com` and
+`https://www.agent-git.com`, including an explicit HTTPS port of 443. The selected
+Hub determines this policy; `agit login --hub` uses its explicit Hub for the whole
+invocation. Other hosts, staging, HTTP and nonstandard ports do not inherit it.
 
-```bash
-agit telemetry status --json
-agit telemetry disable
-agit telemetry enable
-agit telemetry schema --json
-agit telemetry preview -- search "example query" --type sessions --local
-```
+Official Hub commands initialize statistics in interactive, redirected, JSON, CI,
+hook, MCP and RC invocations. A saved disabled preference is migrated to enabled;
+an existing enabled installation keeps its identity and install deduplication.
+The prior optional preference is retained for later use of a nonproduction Hub.
+`AGIT_TELEMETRY_DISABLED`, `DO_NOT_TRACK`, `AGIT_TELEMETRY_DEFER` and
+`AGIT_TELEMETRY_DEBUG` do not disable collection or sending for the official Hub.
+Setup displays an informational notice and does not ask for a telemetry choice.
+The `agit telemetry` subcommand is removed.
 
-Telemetry commands are local and excluded from collection. Preview neither runs
-its argument nor contacts a server. Status reports the saved and effective process
-settings, destination availability, identity state, and local queue size.
+Help, version, invalid invocations, completion generation and
+`setup --skill --installed-only` remain lightweight and do not initialize statistics.
+Local commands buffer events without starting a sender. Mandatory collection does
+not make local operations require network access or make delivery guaranteed.
 
-An existing installation with an unset preference receives the disclosure and
-sets the default on its first ordinary foreground invocation with a visible
-terminal. Fresh CI, hooks, MCP parents and children, RC daemons, help, version,
-invalid invocations, and completion generation do not establish a preference.
-Verified installers establish the default-on preference with the collection notice,
-including when integration setup is skipped. A dependency installed by npm exec
-defers this to create-agit after its durable binary copy passes the self-check. Automatic Skill refresh during upgrades also defers collection in its
-hidden setup child. `setup --skill --installed-only` never establishes a telemetry
-preference, including when invoked by an older upgrader. `AGIT_SKIP_SETUP` also
-skips create-agit's setup.
-
-`AGIT_TELEMETRY_DISABLED=1` and `DO_NOT_TRACK=1` override saved preferences for a
-process and its children. `0`, `false`, and an empty value do not override; other
-values fail closed. An override never changes a saved opt-out to enabled.
-`AGIT_TELEMETRY_DEBUG=1`, with an enabled preference and configured destination,
-prints sanitized events to stderr without sending, queuing, or updating activity
-state. Protocol processes suppress debug output; use preview to inspect their
-command fields.
+Other Hubs have no implicit analytics destination. Their setup preference and
+`AGIT_TELEMETRY_DISABLED=1` / `DO_NOT_TRACK=1` overrides remain effective; a saved
+refusal is preserved. `AGIT_TELEMETRY_DEFER` continues to defer their hidden
+installer setup. With an enabled preference and an explicitly configured
+nonproduction destination, `AGIT_TELEMETRY_DEBUG=1` prints sanitized events to
+stderr instead of queuing or sending; protocol processes suppress that output.
 
 ## Collected fields
 
-The executable's `telemetry schema` output is the complete command-field policy.
+The checked-in [`registry.json`](../src/telemetry/registry.json) is the complete command-field policy.
 It covers canonical top-level commands, nested subcommands, aliases, MCP tools and
 inputs, and RC protocol methods. Tests reject unclassified additions. Aliases are
 reported under their canonical command name.
@@ -119,7 +105,7 @@ been persisted when the daemon exits may be lost.
 | `cli_onboarding_completed` | Setup established an enabled preference |
 | `cli_session_started` | Foreground telemetry activity started a new session |
 | `cli_install_stage` | Visible create-agit attempt start, durable copy, binary verification, integration setup and completion |
-| `cli_install_succeeded` | An installer copied the binary and verified it runs; once per consent generation |
+| `cli_install_succeeded` | An installer copied the binary and verified it runs; once per installation generation |
 | `cli_install_attributed` | A tagged installer associates an installation with an anonymous website acquisition |
 | `cli_acquisition_linked` | The first successful CLI login saved an authoritative account ID |
 
@@ -137,7 +123,7 @@ without a finished event can be an interrupted process or lost delivery and must
 not automatically be counted as a crash. Analytics is best effort and is not an
 audit log or a complete denominator for setup acceptance.
 
-## Buffering, sending and disabling
+## Buffering and sending
 
 Preferences and the unsent queue live under `AGIT_HOME/telemetry`, outside code and
 AgentGit repositories. Files are private to the local user. The queue is bounded
@@ -152,13 +138,8 @@ queued events. Local-only installations may never upload their queue. Failed
 telemetry never changes the product command's output or exit code. There is no
 network wait on the ordinary command's exit path.
 
-`telemetry disable` persists the refusal under the same gate used to admit uploads,
-invalidates running collectors, and removes unsent events and activity state.
-There is no final opt-out event. It can briefly wait for an already admitted
-request to finish; it cannot recall data already sent. Old collectors do not
-resume across disable/enable transitions; restart a resident integration to use
-the new setting. Removing already received data is separate from disabling future
-collection.
+Installation generations prevent stale collectors from appending events after an
+identity reset. Deleting already received data is separate from local state.
 
 ## Destinations and PostHog
 
@@ -168,7 +149,8 @@ staging and development Hubs have no implicit official analytics destination.
 Operators can explicitly set both `AGIT_TELEMETRY_HOST` and
 `AGIT_TELEMETRY_KEY` to a dedicated project. HTTPS is required except for loopback
 test receivers. Credentials, query strings and redirects in telemetry destinations
-are refused. Queues are partitioned by the selected Hub and analytics destination;
+are refused. On the official Hub, invalid or incomplete destination overrides fall
+back to the built-in destination. Queues are partitioned by the selected Hub and analytics destination;
 changing either cannot route old records into another project.
 
 The payload excludes IP addresses and requests that PostHog disable GeoIP enrichment.
@@ -191,16 +173,12 @@ as `AGIT_ACQUISITION_ID`; only random UUIDs are accepted, never command text.
 The install receipt carries `installation_id` and the optional acquisition key.
 A tagged reinstall can emit `cli_install_attributed` to associate an existing
 receipt without counting another installation. These events are independently
-sent even when setup is skipped or fails and no login ever follows, once the
-usage-statistics notice is visible and statistics are enabled. The visible
-create-agit wrapper and npm `--foreground-scripts` can do this at installation.
-Default npm lifecycle output is hidden: without an existing choice, postinstall
-keeps only a local verified fact and its original timestamp, with no new tracking
-ID, preference or upload. A visible foreground invocation, setup, or explicit
-`agit telemetry enable` can subsequently queue that receipt. Local-only commands
-do not start a sender. Pending receipts expire after a day and are deleted on
-opt-out. A hidden npm installation that never reaches visible consent remains
-unobservable in PostHog.
+sent even when setup is skipped or fails and no login ever follows. Official Hub
+installs record and queue the verified receipt even when npm lifecycle output is
+hidden; `--defer-notice` only suppresses the notice there. Other Hubs retain the
+optional preference and deferred receipt behavior: visible setup can admit a
+pending receipt with its original timestamp. Local-only commands do not start a
+sender, and pending receipts expire after a day.
 
 The first `agit login` handoff URL also carries `installation_id`. The browser
 stores it through registration, so a direct npm installation can be associated
@@ -227,7 +205,7 @@ activity or merge subsequent accounts sharing a machine.
 Untagged installs that never open browser authorization cannot be connected to an
 earlier website visit. Where the installation receipt was eligible for delivery, they still appear in
 the installation-without-observed-registration cohort. Manual archive copies, builds outside the installers, `--no-verify`, npm
-`--ignore-scripts`, opt-outs, offline delivery expiry, and older CLI releases have
+`--ignore-scripts`, nonproduction opt-outs, offline delivery expiry, and older CLI releases have
 no verified install receipt. Exclude those from claims of complete coverage. Data
 is prospective; deploying the website and releasing the CLI are both required.
 
@@ -246,17 +224,16 @@ fragments, credentials and unrelated query fields are not stored. Input is
 bounded to 8192 URL bytes, 32 keys, 8 distinct values per key and 1024 bytes
 per value; invalid or excess fields are ignored without blocking installation.
 The first context is retained across reinstalls, while the latest is updated.
-Existing consent and Hub/destination boundaries apply. Hidden npm installation
-can defer the receipt until consent; opting out deletes campaign context.
+The selected Hub policy and destination boundaries apply. Nonproduction hidden
+installations can defer the receipt until setup establishes a preference.
 
 ### Visible installer stage coverage
 
-`cli_install_stage` uses the existing telemetry preference, environment overrides,
-route binding and bounded queue. The visible installer discloses its preference
-before copying. Hidden npm lifecycle scripts retain their existing deferred
-consent behavior. A stage does not set the verified-install flag or create a
+`cli_install_stage` uses the selected Hub policy, route binding and bounded queue.
+The visible installer reports that statistics are required for the official Hub
+before copying. Other Hubs retain their optional setup preference. A stage does not set the verified-install flag or create a
 receipt. Repeated installs receive distinct random `attempt_id` values while
-retaining the consent-scoped installation identity.
+retaining the installation identity.
 
 Stages are `started`, `binary_copy`, `verification`, `setup`, and `finished`.
 Outcomes are `started`, `ok`, `error`, `skipped`, and `partial`. The error
@@ -270,5 +247,5 @@ environment-name allowlist as ordinary command telemetry.
 download time and failures before the bundled binary can run. An attempt with
 no terminal event is incomplete or unobserved, not an asserted installation
 failure. Setup failure produces a partial completion because the verified
-binary remains installed. Missing telemetry, including opt-outs and hidden
+binary remains installed. Missing telemetry, including nonproduction opt-outs and offline
 lifecycles, must never be counted as installation failure.
