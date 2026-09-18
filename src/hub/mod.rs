@@ -26,6 +26,7 @@ pub mod client;
 pub mod git;
 /// The repo-local, immutable pin of the remote identity.
 pub mod identity;
+mod json_response;
 pub(crate) mod transport;
 
 pub use client::Client;

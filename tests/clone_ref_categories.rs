@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ struct Hub {
     worker: Option<std::thread::JoinHandle<(usize, usize)>>,
     git_status: Option<u16>,
     authenticated: Arc<AtomicBool>,
+    access_requests: Arc<AtomicUsize>,
 }
 
 impl Hub {
@@ -50,6 +51,8 @@ impl Hub {
         let stopped = Arc::clone(&stop);
         let authenticated = Arc::new(AtomicBool::new(false));
         let expected_auth = Arc::clone(&authenticated);
+        let access_requests = Arc::new(AtomicUsize::new(0));
+        let observed_access = Arc::clone(&access_requests);
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut count = 0;
@@ -103,6 +106,27 @@ impl Hub {
                     if status != 0 {
                         write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
                     }
+                } else if headers.starts_with(
+                    "GET /alice/paper.git/info/refs?service=git-receive-pack HTTP/1.1\r\n",
+                ) {
+                    assert!(
+                        expected_auth.load(Ordering::Acquire),
+                        "anonymous clones cannot write"
+                    );
+                    assert!(
+                        headers
+                            .lines()
+                            .any(|line| line.eq_ignore_ascii_case(&format!(
+                                "X-AgentGit-Expected-Agent-Id: {AGENT_ID}"
+                            )))
+                    );
+                    let access_count = observed_access.fetch_add(1, Ordering::Relaxed) + 1;
+                    assert_eq!(access_count, 1, "the write-access request was replayed");
+                    write!(
+                        stream,
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
                 } else {
                     assert!(
                         headers.starts_with(
@@ -131,6 +155,7 @@ impl Hub {
             worker: Some(worker),
             git_status,
             authenticated,
+            access_requests,
         }
     }
 
@@ -574,11 +599,15 @@ fn me_alias_clones_the_logged_in_namespace_and_explicit_owners_stay_literal() {
                 let expected = if user == "alice" {
                     "agit new alice/paper -b <name>"
                 } else {
-                    "agit run alice/paper@main -b <name>"
+                    "agit branch --repo alice/paper"
                 };
                 assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
             }
             lab.hub.finish();
+            assert_eq!(
+                lab.hub.access_requests.load(Ordering::Relaxed),
+                usize::from(user != "alice")
+            );
             assert_eq!(
                 lab.git(&lab.destination(), &["rev-parse", "HEAD"]),
                 lab.head

@@ -540,7 +540,7 @@ fn valid_grant_storage_failure_is_not_misreported_as_an_invalid_command() {
                 .status
                 .success()
         );
-        let ledger = lab.home.join("rc/grants.json");
+        let ledger = lab.home.join("desktop-rc/grants.json");
         fs::create_dir(&ledger).unwrap();
         let before = lab.state();
         for (command, code, diagnostic) in [
@@ -588,7 +588,7 @@ fn grant_mutations_preserve_unusable_data_and_unrelated_authorizations() {
         let lab = Lab::new();
         let output = lab.command(mode, &["rc", "grants"]).output().unwrap();
         output_text(&output, mode, "rc", 0);
-        let ledger = lab.home.join("rc/grants.json");
+        let ledger = lab.home.join("desktop-rc/grants.json");
         for bytes in [
             b"{\"heads\":{\"existing-workspace\":[\"git\"]},".as_slice(),
             b"null".as_slice(),

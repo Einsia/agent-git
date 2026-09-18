@@ -83,6 +83,7 @@ cli = [
     "dep:owo-colors",
     "dep:dialoguer",
     "dep:ureq",
+    "dep:flate2",
     "dep:self-replace",
     "dep:sha1",
 ]

@@ -879,10 +879,11 @@ fn plan(
     let source_identity = RemoteIdentity::new(client.base(), &source.agent_id)?;
 
     if mode == Mode::ReadOnly {
-        let writable = matches!(
-            client.push_access(src_owner, src_name, &source.agent_id),
-            Ok(crate::hub::PushAccess::Writable)
-        );
+        let writable = client.has_token()
+            && matches!(
+                client.push_access(src_owner, src_name, &source.agent_id),
+                Ok(crate::hub::PushAccess::Writable)
+            );
         return Ok(Some(Plan {
             owner: source.owner,
             name: source.name,

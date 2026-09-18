@@ -207,6 +207,7 @@ impl Client {
             .is_none_or(|cred| credential_matches_hub(&base, cred));
         let cred = cred.filter(|_| credential_binding_valid);
         let cfg = ureq::Agent::config_builder()
+            .accept_encoding("identity")
             // A timeout is mandatory: hanging on an unresponsive hub buys nothing, and the
             // user reads it as agit being dead.
             .timeout_global(Some(timeout))
@@ -312,6 +313,9 @@ impl Client {
     pub(super) fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.get(self.url(path));
+            if !path.trim_start_matches('/').starts_with("api/auth/") {
+                req = req.header("Accept-Encoding", "gzip");
+            }
             if let Some(t) = t {
                 req = req.header("Authorization", &format!("Bearer {t}"));
             }
@@ -373,14 +377,13 @@ impl Client {
     /// server's wording.
     fn decode<T: serde::de::DeserializeOwned>(
         &self,
-        mut resp: ureq::http::Response<ureq::Body>,
+        resp: ureq::http::Response<ureq::Body>,
         path: &str,
     ) -> Result<T> {
         if !resp.status().is_success() {
             return Err(self.api_error(resp, path));
         }
-        resp.body_mut()
-            .read_json::<T>()
+        super::json_response::read::<T>(resp)
             .with_context(|| format!("the JSON returned by hub {path} could not be parsed"))
     }
 
@@ -392,12 +395,12 @@ impl Client {
         Err(self.api_error(resp, path))
     }
 
-    fn api_error(&self, mut resp: ureq::http::Response<ureq::Body>, path: &str) -> anyhow::Error {
+    fn api_error(&self, resp: ureq::http::Response<ureq::Body>, path: &str) -> anyhow::Error {
         let status = resp.status().as_u16();
         // Left empty when the body cannot be read (not JSON, rewritten by a proxy). Display
         // then falls back to "the hub returned HTTP <code>" — imprecise, but more honest than
         // inventing an explanation.
-        let (kind, detail, remedies) = match resp.body_mut().read_json::<ErrorBody>() {
+        let (kind, detail, remedies) = match super::json_response::read::<ErrorBody>(resp) {
             Ok(b) => {
                 let remedies = b.remedies(status);
                 (b.kind, b.error, remedies)
@@ -1178,6 +1181,16 @@ mod tests {
         n: usize,
         answer: impl Fn(&str) -> (u16, String) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        fake_hub_encoded(n, move |request| {
+            let (status, body) = answer(request);
+            (status, None, body.into_bytes())
+        })
+    }
+
+    fn fake_hub_encoded(
+        n: usize,
+        answer: impl Fn(&str) -> (u16, Option<&'static str>, Vec<u8>) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1211,17 +1224,67 @@ mod tests {
                     buf.extend_from_slice(&chunk[..k]);
                 }
                 let req = String::from_utf8_lossy(&buf).into_owned();
-                let (status, body) = answer(&req);
+                let (status, encoding, body) = answer(&req);
+                let encoding = encoding
+                    .map(|value| format!("Content-Encoding: {value}\r\n"))
+                    .unwrap_or_default();
                 let resp = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{encoding}Connection: close\r\n\r\n",
                     body.len()
                 );
                 sock.write_all(resp.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
                 seen.push(req);
             }
             seen
         });
         (base, handle)
+    }
+
+    #[test]
+    fn gzip_reads_preserve_json_errors_and_auth_negotiation() {
+        use std::io::Write;
+
+        let (base, hub) = fake_hub_encoded(4, |request| {
+            let auth = request.lines().next().unwrap().contains("/api/auth/");
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains(if auth {
+                "accept-encoding: identity\r\n"
+            } else {
+                "accept-encoding: gzip\r\n"
+            }));
+            let missing = request.starts_with("GET /api/agents/missing ");
+            let body = if missing {
+                br#"{"kind":"not_found","error":"repository unavailable"}"#.to_vec()
+            } else {
+                br#"{"name":"repository"}"#.to_vec()
+            };
+            if auth {
+                (200, None, body)
+            } else {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(&body).unwrap();
+                (
+                    if missing { 404 } else { 200 },
+                    Some("gzip"),
+                    encoder.finish().unwrap(),
+                )
+            }
+        });
+        let client = Client::for_hub(&base);
+        let value: serde_json::Value = client.get("api/agents").unwrap();
+        assert_eq!(value["name"], "repository");
+        let error = client
+            .get::<serde_json::Value>("api/agents/missing")
+            .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(error.status, 404);
+        assert_eq!(error.kind, "not_found");
+        assert_eq!(error.detail, "repository unavailable");
+        let _: serde_json::Value = client.post_public("api/auth/login", &()).unwrap();
+        let _: serde_json::Value = client.get("api/auth/me").unwrap();
+        hub.join().unwrap();
     }
 
     /// `logout --all` builds one client per hub; after a 401 the renewal must use **that hub's
