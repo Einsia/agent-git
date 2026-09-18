@@ -38,6 +38,7 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
         target: target.clone(),
         expires_at_ms: i64::MAX,
         session_controller: Some(scope.clone()),
+        project_controller: None,
     };
     let mut missing = grant.clone();
     missing.session_controller = None;

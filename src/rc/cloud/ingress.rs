@@ -122,23 +122,11 @@ impl Registry {
         let mut client = self.client(grant.caller.clone(), grant.expires_at_ms);
         let (state, owners) = (self.state.clone(), self.owners.clone());
         async move {
-            if let Some(scope) = &grant.session_controller {
+            if grant.session_controller.is_some() || grant.project_controller.is_some() {
                 let state = state
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let session = state
-                    .resources
-                    .session(&scope.session_id)
-                    .context("controller session is unavailable")?;
-                anyhow::ensure!(
-                    session.runtime == scope.runtime
-                        && if session.native_id.is_empty() {
-                            session.id == scope.session_id
-                        } else {
-                            session.native_id == scope.session_id
-                        },
-                    "controller requires a canonical executor session"
-                );
+                delegation::validate_resources(&grant, &state.resources)?;
             }
             client.controller = owners.accept(&grant).await?;
             Ok(client)
@@ -245,6 +233,12 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn project(&self) -> Option<(&str, &std::path::Path)> {
+        self.controller
+            .as_ref()
+            .and_then(|controller| controller.project())
+    }
+
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
         let live = self
             .live
@@ -337,7 +331,7 @@ impl Client {
             controller.actor(&mut frame, &self.principal).map_err(|_| {
                 Rejection::Reply(RpcError::new(
                     crate::protocol::ErrorCode::Forbidden,
-                    "controller actor is unavailable",
+                    "controller command is outside delegated authority",
                 ))
             })?;
         }
@@ -390,11 +384,11 @@ impl Client {
             if permit.method == "machine.describe"
                 && let Some(result) = frame.result.as_mut()
             {
-                result["authority"] = serde_json::json!(if self.controller.is_some() {
-                    agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY
-                } else {
-                    "cloud-principal"
-                });
+                result["authority"] = serde_json::json!(
+                    self.controller
+                        .as_ref()
+                        .map_or("cloud-principal", |controller| controller.authority())
+                );
                 result["access_ceiling"] = serde_json::json!(true);
                 if let Some(result) = result.as_object_mut() {
                     result.remove("diagnostic_log");
@@ -404,6 +398,13 @@ impl Client {
         }
         if frame.id.is_some() {
             return Ok(matches!(permit, Some(None)).then(|| frame.to_json()));
+        }
+        if self
+            .controller
+            .as_ref()
+            .is_some_and(|controller| !controller.has_session_stream())
+        {
+            return Ok(None);
         }
         let effective =
             delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);

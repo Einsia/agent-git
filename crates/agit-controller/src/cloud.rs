@@ -4,7 +4,9 @@ use crate::{Authority, Connector, Opening, Worker};
 use agit_peer::{
     Identity,
     client::{Client, join_controller, verified_transport},
-    cloud::{Device, DeviceCredential, DialedConnection, Secret, SessionController},
+    cloud::{
+        Device, DeviceCredential, DialedConnection, ProjectController, Secret, SessionController,
+    },
 };
 use anyhow::ensure;
 use std::{sync::Arc, time::Instant};
@@ -133,6 +135,64 @@ impl Connector for SessionRoute {
             &self.target,
             self.api
                 .connect_session(&self.source, &self.target, &self.scope),
+        ))
+    }
+}
+
+/// A service route retains project discovery authority independently of browser attachment lifetimes.
+pub struct ProjectRoute {
+    api: Client,
+    identity: Arc<Identity>,
+    source: DeviceCredential,
+    target: Device,
+    scope: ProjectController,
+    key: String,
+}
+
+impl ProjectRoute {
+    pub fn new(
+        api: Client,
+        identity: Arc<Identity>,
+        source: DeviceCredential,
+        target: Device,
+        scope: ProjectController,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            source.device.owner.issuer == api.origin()
+                && target.owner == source.device.owner
+                && source.device.certificate == *identity.certificate(),
+            "cloud project controller identity mismatch"
+        );
+        let key = serde_json::to_string(&(&source.device, &target, &scope))?;
+        Ok(Self {
+            api,
+            identity,
+            source,
+            target,
+            scope,
+            key,
+        })
+    }
+}
+
+impl Connector for ProjectRoute {
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn authority(&self) -> Authority {
+        Authority::CloudProjectController
+    }
+
+    fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
+        Box::pin(dial_admitted(
+            &self.api,
+            worker,
+            &self.source,
+            &self.identity,
+            &self.target,
+            self.api
+                .connect_project(&self.source, &self.target, &self.scope),
         ))
     }
 }

@@ -326,6 +326,31 @@ impl Client {
         Ok(grant)
     }
 
+    pub async fn connect_project(
+        &self,
+        source: &DeviceCredential,
+        target: &Device,
+        scope: &ProjectController,
+    ) -> anyhow::Result<DialedConnection> {
+        let dialed: DialedConnection = self
+            .request(
+                Method::POST,
+                "/api/peer/project-connections",
+                &source.token,
+                None,
+            )
+            .await?;
+        let grant = &dialed.connection.grant;
+        self.validate_grant(grant)?;
+        ensure!(
+            same_device(&grant.source, &source.device)
+                && same_device(&grant.target, target)
+                && grant.project_controller.as_ref() == Some(scope),
+            "cloud project controller authority changed"
+        );
+        Ok(dialed)
+    }
+
     /// Presence grants come from the authenticated Hub channel, before relay admission and peer TLS.
     pub async fn offered_grant(
         &self,
@@ -374,6 +399,7 @@ impl Client {
             grant.id == previous.id
                 && grant.caller == previous.caller
                 && grant.session_controller == previous.session_controller
+                && grant.project_controller == previous.project_controller
                 && same_device(&grant.source, &previous.source)
                 && same_device(&grant.target, &previous.target)
                 && same_device(&grant.target, &executor.device)
@@ -393,7 +419,8 @@ impl Client {
         );
         if let Some(scope) = &grant.session_controller {
             ensure!(
-                grant.caller == grant.target.owner
+                grant.project_controller.is_none()
+                    && grant.caller == grant.target.owner
                     && !scope.session_id.is_empty()
                     && scope.session_id.len() <= 1024
                     && !scope.session_id.chars().any(char::is_control)
@@ -403,6 +430,20 @@ impl Client {
                     && scope.generation > 0
                     && scope.access != crate::access::Access::Deny,
                 "invalid session controller delegation"
+            );
+        }
+        if let Some(scope) = &grant.project_controller {
+            ensure!(
+                grant.caller == grant.target.owner
+                    && !scope.project_id.is_empty()
+                    && scope.project_id.len() <= 1024
+                    && !scope.project_id.chars().any(char::is_control)
+                    && !scope.local_path.is_empty()
+                    && scope.local_path.len() <= 32768
+                    && !scope.local_path.chars().any(char::is_control)
+                    && scope.generation > 0
+                    && scope.access != crate::access::Access::Deny,
+                "invalid project controller delegation"
             );
         }
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
@@ -438,6 +479,7 @@ impl Client {
         if let Config::WebSocket { headers, .. } = &mut config {
             headers.push(("X-Agit-Peer-Offer".into(), "grant-v1".into()));
             headers.push(("X-Agit-Session-Controller".into(), "session-v1".into()));
+            headers.push(("X-Agit-Project-Controller".into(), "project-v1".into()));
         }
         Ok(config)
     }
@@ -577,6 +619,7 @@ mod tests {
             target: device,
             expires_at_ms: i64::MAX,
             session_controller: None,
+            project_controller: None,
         };
         assert_eq!(
             client
@@ -588,6 +631,7 @@ mod tests {
         );
         let serialized = serde_json::to_value(&grant).unwrap();
         assert!(serialized.get("session_controller").is_none());
+        assert!(serialized.get("project_controller").is_none());
         assert!(
             serde_json::from_value::<ConnectionGrant>(serialized)
                 .unwrap()
@@ -604,6 +648,16 @@ mod tests {
         assert!(client.validate_grant(&delegated).is_ok());
         delegated.target.owner.account_id = "another-owner".into();
         assert!(client.validate_grant(&delegated).is_err());
+        let mut project = grant.clone();
+        project.project_controller = Some(ProjectController {
+            project_id: "project".into(),
+            local_path: "/project".into(),
+            generation: 1,
+            access: crate::access::Access::Control,
+        });
+        assert!(client.validate_grant(&project).is_ok());
+        project.session_controller = delegated.session_controller;
+        assert!(client.validate_grant(&project).is_err());
         let mut stale = grant;
         stale.target.credential_epoch += 1;
         assert!(

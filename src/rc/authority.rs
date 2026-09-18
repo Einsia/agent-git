@@ -6,6 +6,10 @@ use std::sync::Arc;
 pub(crate) trait Authority: Send + Sync {
     /// Hold the authority's read lease while invoking the nonblocking acceptance step.
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool;
+
+    fn project(&self) -> Option<(&str, &std::path::Path)> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]
@@ -41,5 +45,20 @@ impl Guard {
                 "request authority expired before execution admission",
             ))
         }
+    }
+
+    pub fn check_project(&self, id: &str, path: &std::path::Path) -> Result<(), RpcError> {
+        if self
+            .0
+            .as_ref()
+            .and_then(|authority| authority.project())
+            .is_some_and(|(allowed_id, allowed_path)| allowed_id != id || allowed_path != path)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "project binding changed outside delegated authority",
+            ));
+        }
+        Ok(())
     }
 }

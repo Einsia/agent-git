@@ -500,6 +500,7 @@ impl Daemon {
         p: SessionStart,
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
+        authority: &crate::rc::authority::Guard,
     ) -> Result<SessionOpening, RpcError> {
         let start_id =
             negotiated_start_id(self.start_idempotency_feature(), p.start_id.as_deref())?;
@@ -513,6 +514,7 @@ impl Daemon {
                 .mirror
                 .project_path(&p.workspace_id, &p.project_id)
                 .ok_or_else(|| RpcError::new(ErrorCode::PathNotAllowed, "project is not bound"))?;
+            authority.check_project(&p.project_id, &project)?;
             let repository =
                 crate::rc::local_repository::ensure_repository(&p.project_id, &project)
                     .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
@@ -607,6 +609,8 @@ impl Daemon {
         let roots = self.mirror.roots(&p.workspace_id);
         let cwd = policy::require_within(&cwd, &roots)
             .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))?;
+        // The daemon mutex keeps the checked binding and the prepared launch path consistent.
+        authority.check_project(&p.project_id, &cwd)?;
 
         let session_id = crate::domain::meta::mint_session_id();
         // The create path is judged too — otherwise the owner-only gate is decoration: whoever

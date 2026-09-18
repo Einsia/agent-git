@@ -212,7 +212,7 @@ impl Daemon {
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
     ) -> Result<serde_json::Value, RpcError> {
-        let prepared = self.prepare_start_session(p, caller, frames)?;
+        let prepared = self.prepare_start_session(p, caller, frames, &Default::default())?;
         prepared.run_inline(self).await
     }
 

@@ -9,6 +9,8 @@ pub enum Authority {
     CloudPrincipal,
     #[cfg(feature = "cloud")]
     CloudSessionController,
+    #[cfg(feature = "cloud")]
+    CloudProjectController,
 }
 
 impl Authority {
@@ -18,6 +20,8 @@ impl Authority {
             Self::CloudPrincipal => "cloud-principal",
             #[cfg(feature = "cloud")]
             Self::CloudSessionController => agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY,
+            #[cfg(feature = "cloud")]
+            Self::CloudProjectController => agit_peer::cloud::PROJECT_CONTROLLER_AUTHORITY,
         }
     }
 }

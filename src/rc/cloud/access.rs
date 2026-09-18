@@ -252,7 +252,7 @@ pub fn authorize(
     Ok((frame, permit))
 }
 
-fn launch_key(principal: &Principal, id: &str) -> String {
+pub(super) fn launch_key(principal: &Principal, id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(
         serde_json::json!(["cloud-launch", principal, id])

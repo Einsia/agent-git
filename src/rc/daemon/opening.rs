@@ -205,7 +205,7 @@ impl Daemon {
         require_role(&caller, frame.method())?;
         let mut opening = match frame.method() {
             method::SESSION_START => {
-                self.prepare_start_session(frame.params_as()?, &caller, frames)
+                self.prepare_start_session(frame.params_as()?, &caller, frames, &frame.authority)
             }
             method::SESSION_RESUME => {
                 self.prepare_resume_session(frame.params_as()?, &caller, frames)
@@ -364,6 +364,57 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delegated_start_checks_current_binding_before_creating_repository_or_session() {
+        struct CachedAuthority(std::path::PathBuf);
+        impl crate::rc::authority::Authority for CachedAuthority {
+            fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
+                accept()
+            }
+            fn project(&self) -> Option<(&str, &std::path::Path)> {
+                Some(("project", &self.0))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old");
+        let new = directory.path().join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+        let mut daemon = daemon.lock().await;
+        daemon.opts.local_owner = true;
+        daemon
+            .settlement
+            .send_modify(|state| state.session_start_idempotency_v1 = true);
+        let bound = daemon.mirror.bind("local-owner", "project", &old).unwrap();
+        let mut request = Frame::request(
+            "session.start",
+            serde_json::json!({
+                "workspace_id":"local-owner", "project_id":"project", "runtime":"codex",
+                "start_id":uuid::Uuid::new_v4().to_string()
+            }),
+        );
+        request.caller = Some(crate::protocol::CallerClaim {
+            account_id: Some("member".into()),
+            username: None,
+            role: "operator".into(),
+            workspace_id: "local-owner".into(),
+        });
+        request.authority = crate::rc::authority::Guard::new(CachedAuthority(bound));
+        daemon.mirror.bind("local-owner", "project", &new).unwrap();
+        request.authority.check().unwrap();
+        let (frames, _) = mpsc::channel(1);
+        let error = match daemon.prepare_opening(&request, &frames) {
+            Err(error) => error,
+            Ok(_) => panic!("stale project authority admitted a launch"),
+        };
+        assert_eq!(error.code, ErrorCode::Forbidden as i32);
+        assert!(error.message.contains("project binding changed"));
+        assert!(daemon.roster.starts.is_empty());
+        assert!(daemon.opening_sessions.is_empty());
+        assert!(daemon.sessions.is_empty());
+    }
 
     async fn fixture() -> (tempfile::TempDir, Arc<Mutex<Daemon>>, PreparedSpawn) {
         let dir = tempfile::tempdir().unwrap();

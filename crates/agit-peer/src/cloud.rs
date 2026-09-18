@@ -4,6 +4,7 @@ use crate::{PeerCertificate, access::Principal};
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_CONTROLLER_AUTHORITY: &str = "cloud-session-controller";
+pub const PROJECT_CONTROLLER_AUTHORITY: &str = "cloud-project-controller";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -61,6 +62,8 @@ pub struct ConnectionGrant {
     pub expires_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_controller: Option<SessionController>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_controller: Option<ProjectController>,
 }
 
 /// A Hub-owned controller is confined to one canonical executor session.
@@ -69,6 +72,16 @@ pub struct ConnectionGrant {
 pub struct SessionController {
     pub session_id: String,
     pub runtime: String,
+    pub generation: u64,
+    pub access: crate::access::Access,
+}
+
+/// Project delegation discovers sessions and creates them without owning their event streams.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectController {
+    pub project_id: String,
+    pub local_path: String,
     pub generation: u64,
     pub access: crate::access::Access,
 }

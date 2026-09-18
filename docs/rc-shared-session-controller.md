@@ -58,6 +58,24 @@ device, session and generation, and reuses the personal route's parallel transpo
 opening and peer TLS handshake. It does not renew the owner lease, decide workspace
 membership, or carry a browser token. The hosting control plane owns those duties.
 
+Project discovery and session creation use a separate `project_controller` grant
+and `cloud::ProjectRoute`. The scope binds the executor project ID and absolute
+local path, generation and access ceiling. The executor advertises
+`X-Agit-Project-Controller: project-v1`; the Hub must check that capability before
+issuing the scope through `/api/peer/project-connections`. A grant cannot combine
+project and session scopes, and personal grants omit both optional fields.
+
+A project controller can describe its filtered catalog, list runtime models for
+the bound project and create a session with an authenticated actor. It cannot
+subscribe to session events, read session history, send existing-session commands,
+bind folders, browse files or open terminals. Existing-session operations move to
+the canonical shared session controller. Rebinding the project path invalidates
+the delegated authority. This keeps catalog discovery from creating another copy
+of each session's event stream or inheriting machine authority.
+
+The cloud lease and Web integration for project delegation remain separate work;
+executor support alone does not enable workspace collaborators in production.
+
 Validation must include cross-account fan-out, owner replacement, retry identity,
 member revocation, a slow/disconnected browser, and external writer ownership using
 actual CLI artifacts. Existing personal-grant compatibility and session isolation

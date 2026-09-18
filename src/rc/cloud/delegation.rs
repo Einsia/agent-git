@@ -1,9 +1,9 @@
-//! Session delegation narrows Hub controller authority and fences replaced owners.
+//! Delegation narrows Hub controller authority and fences replaced owners.
 
 use super::{resources::Resources, store};
 use agit_peer::{
     access::{Access, Policy, Principal, Resource, Rule},
-    cloud::{ConnectionGrant, SessionController},
+    cloud::{ConnectionGrant, ProjectController, SessionController},
 };
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
@@ -34,28 +34,89 @@ pub(super) struct Owners(Mutex<HashMap<String, Weak<Ownership>>>);
 
 #[derive(Clone)]
 pub(super) struct Controller {
-    scope: SessionController,
+    scope: Scope,
     owner: Owner,
     slot: Slot,
 }
 
+#[derive(Clone)]
+enum Scope {
+    Session(SessionController),
+    Project(ProjectController),
+}
+
+impl Scope {
+    fn from_grant(grant: &ConnectionGrant) -> anyhow::Result<Option<Self>> {
+        match (&grant.session_controller, &grant.project_controller) {
+            (Some(session), None) => Ok(Some(Self::Session(session.clone()))),
+            (None, Some(project)) => Ok(Some(Self::Project(project.clone()))),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("controller grant has conflicting resource scopes"),
+        }
+    }
+
+    fn canonical(&self, resources: &Resources) -> bool {
+        match self {
+            Self::Session(scope) => resources.session(&scope.session_id).is_some_and(|session| {
+                session.runtime == scope.runtime
+                    && if session.native_id.is_empty() {
+                        session.id == scope.session_id
+                    } else {
+                        session.native_id == scope.session_id
+                    }
+            }),
+            Self::Project(scope) => {
+                Path::new(&scope.local_path).is_absolute()
+                    && resources
+                        .projects
+                        .get(&scope.project_id)
+                        .is_some_and(|path| path == Path::new(&scope.local_path))
+            }
+        }
+    }
+}
+
+pub(super) fn validate_resources(
+    grant: &ConnectionGrant,
+    resources: &Resources,
+) -> anyhow::Result<()> {
+    ensure!(
+        Scope::from_grant(grant)?.is_none_or(|scope| scope.canonical(resources)),
+        "controller resource is unavailable or changed"
+    );
+    Ok(())
+}
+
 impl Owners {
     pub async fn accept(&self, grant: &ConnectionGrant) -> anyhow::Result<Option<Controller>> {
-        let Some(scope) = &grant.session_controller else {
+        let Some(scope) = Scope::from_grant(grant)? else {
             return Ok(None);
         };
-        let key = hex::encode(Sha256::digest(
-            serde_json::json!([
-                grant.target.owner.issuer,
-                grant.target.id,
-                grant.target.credential_epoch,
-                scope.runtime,
-                scope.session_id,
-            ])
-            .to_string(),
-        ));
+        let (coordinate, generation) = match &scope {
+            Scope::Session(scope) => (
+                serde_json::json!([
+                    grant.target.owner.issuer,
+                    grant.target.id,
+                    grant.target.credential_epoch,
+                    scope.runtime,
+                    scope.session_id,
+                ]),
+                scope.generation,
+            ),
+            Scope::Project(scope) => (
+                serde_json::json!([
+                    "project-controller",
+                    grant.target.owner.issuer,
+                    grant.target.id,
+                    grant.target.credential_epoch,
+                    scope.project_id,
+                ]),
+                scope.generation,
+            ),
+        };
+        let key = hex::encode(Sha256::digest(coordinate.to_string()));
         let owner = Owner {
-            generation: scope.generation,
+            generation,
             source: serde_json::json!([
                 grant.source.id,
                 grant.source.credential_epoch,
@@ -71,11 +132,7 @@ impl Owners {
             pending.publish(&path, &file_owner)
         })
         .await??;
-        Ok(Some(Controller {
-            scope: scope.clone(),
-            owner,
-            slot,
-        }))
+        Ok(Some(Controller { scope, owner, slot }))
     }
 
     fn slot(&self, key: &str, owner: &Owner) -> Slot {
@@ -115,7 +172,7 @@ impl Ownership {
 fn advance(current: &Owner, next: &Owner) -> anyhow::Result<()> {
     ensure!(
         next.generation > current.generation || next == current,
-        "session controller ownership changed"
+        "controller ownership changed"
     );
     Ok(())
 }
@@ -133,6 +190,13 @@ fn pin_owner(path: &Path, owner: &Owner) -> anyhow::Result<()> {
 }
 
 impl Controller {
+    pub fn project(&self) -> Option<(&str, &Path)> {
+        match &self.scope {
+            Scope::Project(scope) => Some((&scope.project_id, Path::new(&scope.local_path))),
+            Scope::Session(_) => None,
+        }
+    }
+
     pub fn current(&self) -> Option<RwLockReadGuard<'_, Owner>> {
         let current = self
             .slot
@@ -143,36 +207,68 @@ impl Controller {
     }
 
     pub fn canonical(&self, resources: &Resources) -> bool {
-        resources
-            .session(&self.scope.session_id)
-            .is_some_and(|session| {
-                session.runtime == self.scope.runtime
-                    && if session.native_id.is_empty() {
-                        session.id == self.scope.session_id
-                    } else {
-                        session.native_id == self.scope.session_id
-                    }
-            })
+        self.scope.canonical(resources)
+    }
+
+    pub fn authority(&self) -> &'static str {
+        match self.scope {
+            Scope::Session(_) => agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY,
+            Scope::Project(_) => agit_peer::cloud::PROJECT_CONTROLLER_AUTHORITY,
+        }
+    }
+
+    pub fn has_session_stream(&self) -> bool {
+        matches!(self.scope, Scope::Session(_))
     }
 
     pub fn policy(&self, base: &Policy, resources: &Resources, principal: &Principal) -> Policy {
+        if let Scope::Project(scope) = &self.scope {
+            if !self.canonical(resources) {
+                return Policy::default();
+            }
+            let access = intersect(
+                base.access(principal, None, Some(&scope.project_id)),
+                scope.access,
+            );
+            let mut rules = vec![Rule {
+                principal: principal.clone(),
+                resource: Resource::Project(scope.project_id.clone()),
+                access,
+            }];
+            for rule in base
+                .rules()
+                .iter()
+                .filter(|rule| &rule.principal == principal)
+            {
+                if let Resource::Session(id) = &rule.resource
+                    && let Some(session) = resources
+                        .session(id)
+                        .filter(|session| session.project.as_deref() == Some(&scope.project_id))
+                {
+                    rules.push(Rule {
+                        principal: principal.clone(),
+                        resource: rule.resource.clone(),
+                        access: intersect(session.access(base, principal), access),
+                    });
+                }
+            }
+            return Policy::new(base.revision(), rules).unwrap_or_default();
+        }
+        let Scope::Session(scope) = &self.scope else {
+            unreachable!()
+        };
         let Some(session) = resources
-            .session(&self.scope.session_id)
+            .session(&scope.session_id)
             .filter(|_| self.canonical(resources))
         else {
             return Policy::default();
         };
-        let access = match (session.access(base, principal), self.scope.access) {
-            (Access::Deny, _) | (_, Access::Deny) => Access::Deny,
-            (Access::Read, _) | (_, Access::Read) => Access::Read,
-            (Access::Control, _) | (_, Access::Control) => Access::Control,
-            _ => Access::Admin,
-        };
+        let access = intersect(session.access(base, principal), scope.access);
         Policy::new(
             base.revision(),
             vec![Rule {
                 principal: principal.clone(),
-                resource: Resource::Session(self.scope.session_id.clone()),
+                resource: Resource::Session(scope.session_id.clone()),
                 access,
             }],
         )
@@ -184,6 +280,18 @@ impl Controller {
         frame: &mut crate::protocol::Frame,
         principal: &Principal,
     ) -> anyhow::Result<()> {
+        ensure!(
+            self.has_session_stream()
+                || matches!(
+                    frame.method(),
+                    "machine.describe"
+                        | "workspace.list"
+                        | "session.list"
+                        | "runtime.models"
+                        | "session.start"
+                ),
+            "project controller cannot issue session or machine commands"
+        );
         let actor = frame
             .params
             .as_mut()
@@ -194,6 +302,7 @@ impl Controller {
                 matches!(
                     frame.method(),
                     "machine.describe"
+                        | "runtime.models"
                         | "workspace.list"
                         | "session.list"
                         | "session.history"
@@ -214,12 +323,27 @@ impl Controller {
                 && !actor.account_id.chars().any(char::is_control),
             "invalid controller actor"
         );
+        if frame.method() == "session.start"
+            && let Some(params) = frame.params.as_mut()
+            && let Some(id) = params["start_id"].as_str()
+        {
+            params["start_id"] = super::access::launch_key(&actor, id).into();
+        }
         frame
             .caller
             .as_mut()
             .context("controller caller is missing")?
             .account_id = Some(serde_json::json!([actor.issuer, actor.account_id]).to_string());
         Ok(())
+    }
+}
+
+fn intersect(first: Access, second: Access) -> Access {
+    match (first, second) {
+        (Access::Deny, _) | (_, Access::Deny) => Access::Deny,
+        (Access::Read, _) | (_, Access::Read) => Access::Read,
+        (Access::Control, _) | (_, Access::Control) => Access::Control,
+        _ => Access::Admin,
     }
 }
 
@@ -239,6 +363,147 @@ mod tests {
     use super::*;
     use crate::{protocol::Frame, rc::cloud::access};
     use serde_json::json;
+
+    #[test]
+    fn project_delegation_discovers_and_creates_without_controlling_session_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared");
+        let other = directory.path().join("other");
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "owner".into(),
+        };
+        let base = Policy::new(
+            1,
+            vec![
+                Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Machine,
+                    access: Access::Admin,
+                },
+                Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Session("hidden".into()),
+                    access: Access::Deny,
+                },
+            ],
+        )
+        .unwrap();
+        let mut resources = Resources::default();
+        resources.observe(
+            "workspace.list",
+            &json!({"workspaces":[{"workspace_id":"local-owner","projects":[
+                {"project_id":"shared","local_path":path}, {"project_id":"other","local_path":other}
+            ]}]}),
+        );
+        let catalog = json!({"local":[
+            {"runtime_session_id":"visible","runtime":"codex","cwd":path},
+            {"runtime_session_id":"hidden","runtime":"codex","cwd":path},
+            {"runtime_session_id":"other","runtime":"codex","cwd":other}
+        ]});
+        resources.observe("session.list", &catalog);
+        let owner = Owner {
+            generation: 1,
+            source: "controller".into(),
+        };
+        let controller = Controller {
+            scope: Scope::Project(ProjectController {
+                project_id: "shared".into(),
+                local_path: path.to_string_lossy().into(),
+                generation: 1,
+                access: Access::Control,
+            }),
+            owner: owner.clone(),
+            slot: Arc::new(Ownership {
+                current: RwLock::new(owner),
+                admission: Mutex::new(()),
+            }),
+        };
+        let policy = controller.policy(&base, &resources, &principal);
+        assert_eq!(controller.project(), Some(("shared", path.as_path())));
+        let mut filtered = catalog;
+        resources.filter("session.list", &mut filtered, &policy, &principal);
+        assert_eq!(filtered["local"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["local"][0]["runtime_session_id"], "visible");
+        let (mut create, _) = access::authorize(
+            Frame::request(
+                "session.start",
+                json!({"project_id":"shared","start_id":uuid::Uuid::new_v4().to_string(),"controller_actor":{
+                    "issuer":"https://cloud.example","account_id":"member"
+                }}),
+            ),
+            &principal,
+            &policy,
+            &mut resources,
+        )
+        .unwrap();
+        let original = create.clone();
+        controller.actor(&mut create, &principal).unwrap();
+        let mut retry = original.clone();
+        controller.actor(&mut retry, &principal).unwrap();
+        assert_eq!(
+            create.params.as_ref().unwrap()["start_id"],
+            retry.params.as_ref().unwrap()["start_id"]
+        );
+        let mut other_member = original.clone();
+        other_member.params.as_mut().unwrap()["controller_actor"]["account_id"] =
+            "other-member".into();
+        controller.actor(&mut other_member, &principal).unwrap();
+        assert_ne!(
+            create.params.as_ref().unwrap()["start_id"],
+            other_member.params.as_ref().unwrap()["start_id"]
+        );
+        let mut replacement = controller.clone();
+        replacement.owner.generation += 1;
+        let mut rejoined = original;
+        replacement.actor(&mut rejoined, &principal).unwrap();
+        assert_eq!(
+            create.params.as_ref().unwrap()["start_id"],
+            rejoined.params.as_ref().unwrap()["start_id"]
+        );
+        assert_eq!(create.caller.as_ref().unwrap().role, "operator");
+        assert_eq!(
+            create.caller.as_ref().unwrap().account_id.as_deref(),
+            Some("[\"https://cloud.example\",\"member\"]")
+        );
+        let (mut subscribe, _) = access::authorize(
+            Frame::request("session.subscribe", json!({"session_id":"visible"})),
+            &principal,
+            &policy,
+            &mut resources,
+        )
+        .unwrap();
+        assert!(controller.actor(&mut subscribe, &principal).is_err());
+        assert!(!controller.has_session_stream());
+        assert!(
+            access::authorize(
+                Frame::request("fs.readFile", json!({"path":path})),
+                &principal,
+                &policy,
+                &mut resources
+            )
+            .is_err()
+        );
+        assert!(
+            access::authorize(
+                Frame::request("session.start", json!({"project_id":"other"})),
+                &principal,
+                &policy,
+                &mut resources
+            )
+            .is_err()
+        );
+        resources.projects.insert("shared".into(), other);
+        assert!(!controller.canonical(&resources));
+        assert_eq!(
+            controller.policy(&base, &resources, &principal).access(
+                &principal,
+                None,
+                Some("shared")
+            ),
+            Access::Deny
+        );
+    }
 
     #[test]
     fn pending_admission_cannot_revive_after_its_replacement_disconnects() {
@@ -299,12 +564,12 @@ mod tests {
             source: "controller-a".into(),
         };
         let controller = Controller {
-            scope: SessionController {
+            scope: Scope::Session(SessionController {
                 session_id: "shared".into(),
                 runtime: "codex".into(),
                 generation: 1,
                 access: Access::Control,
-            },
+            }),
             owner: owner.clone(),
             slot: Arc::new(Ownership {
                 current: RwLock::new(owner),
