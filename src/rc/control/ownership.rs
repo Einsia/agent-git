@@ -20,18 +20,26 @@ struct SocketIdentity {
 
 impl SocketIdentity {
     fn read(path: &Path) -> crate::Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
+        Self::read_optional(path)?.with_context(|| format!("{} does not exist", path.display()))
+    }
+
+    fn read_optional(path: &Path) -> crate::Result<Option<Self>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         ensure!(
             metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
             "{} is not a socket owned by this user",
             path.display()
         );
-        Ok(Self {
+        Ok(Some(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             changed_secs: metadata.ctime(),
             changed_nanos: metadata.ctime_nsec(),
-        })
+        }))
     }
 }
 
@@ -116,6 +124,50 @@ impl Ownership {
         self.verify_stale(path)?;
         std::fs::remove_file(path)?;
         Ok(())
+    }
+
+    /// The operator must establish exit and exclude legacy starters: they do not hold this lock.
+    /// Connection probes only check for contradictory evidence; they cannot establish exit.
+    pub(super) fn recover_stopped(&self, path: &Path) -> crate::Result<bool> {
+        self.validate()?;
+        let paths = [path.to_owned(), path.with_extension("rpc")];
+        let identities = paths
+            .iter()
+            .map(|path| SocketIdentity::read_optional(path))
+            .collect::<crate::Result<Vec<_>>>()?;
+        for (path, identity) in paths.iter().zip(&identities) {
+            if identity.is_none() {
+                continue;
+            }
+            match super::connect_within(path, super::CONNECT_TIMEOUT) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Ok(_) => anyhow::bail!(
+                    "{} still accepts connections; stop its owner before recovery",
+                    path.display()
+                ),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot recover {}; socket state is uncertain",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
+        self.validate()?;
+        for (path, identity) in paths.iter().zip(&identities) {
+            ensure!(
+                SocketIdentity::read_optional(path)? == *identity,
+                "{} changed during recovery; preserve it and confirm all starters have exited",
+                path.display()
+            );
+        }
+        if identities[0].is_some() {
+            std::fs::remove_file(path)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Publication is diagnostic state; the lock already protects the bind/publication gap.

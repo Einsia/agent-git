@@ -76,6 +76,12 @@ enum Action {
         #[arg(long, required = true)]
         if_idle: bool,
     },
+    /// Recover Unix control socket state without starting a daemon.
+    Recover {
+        /// Confirm all daemons and starters in this local namespace have exited, including in containers.
+        #[arg(long, required = true)]
+        confirm_stopped: bool,
+    },
     #[command(hide = true)]
     AfterUpgrade {
         #[arg(long)]
@@ -121,6 +127,13 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
             if matches!(outcome, super::lifecycle::Outcome::Deferred { .. }) {
                 return Ok(crate::ExitCode::Precondition);
             }
+        }
+        Action::Recover { confirm_stopped: _ } => {
+            let removed = super::lifecycle::recover_stopped()?;
+            println!(
+                "{}",
+                serde_json::json!({"status": "recovered", "socket_removed": removed})
+            );
         }
         Action::AfterUpgrade { target } => {
             let outcome = super::lifecycle::after_upgrade(serde_json::from_str(&target)?)?;

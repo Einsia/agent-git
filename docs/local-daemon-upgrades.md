@@ -75,8 +75,25 @@ safe restart command or the attachment that requires the installed build.
 A daemon without safe restart negotiation is never stopped based on a separate
 status snapshot. The error identifies the local daemon and asks the owner to
 finish user work before explicitly stopping and starting that namespace. This
-legacy transition can require manual recovery. A local controller error does
-not imply that an SSH executor needs an upgrade.
+legacy transition can require manual recovery. On Unix, stopping a daemon that
+predates lifetime ownership can leave control sockets without an ownership record.
+Automatic startup and `restart --if-idle` preserve these sockets because they
+cannot distinguish a stopped daemon from an unresponsive legacy listener.
+
+After independently confirming that every daemon and starter using the home's
+local namespace has exited, including in containers, use the scoped command in
+the diagnostic:
+
+```sh
+AGIT_HOME=/path/to/state /path/to/agit rc local recover --confirm-stopped
+AGIT_HOME=/path/to/state /path/to/agit rc local start --detach
+```
+
+Recovery does not stop or start a daemon. It removes only the control socket and
+preserves the lifetime lock and durable state. Keep legacy starters disabled until
+replacement startup finishes. See [ownership recovery](local-daemon-ownership.md#legacy-and-incomplete-state)
+for the confirmation requirements and filesystem checks. A local controller error
+does not imply that an SSH executor needs an upgrade.
 
 Reattachment restores views and subscriptions using existing identities and
 receipts. Clients must not replay writes whose outcome is unknown. Daemon

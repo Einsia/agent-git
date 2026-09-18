@@ -459,13 +459,35 @@ fn ownership_verdict(
     })();
     match evidence {
         Ok(()) => Liveness::Stale,
-        Err(error) => Liveness::Unknown(format!(
-            "cannot establish ownership of {}: {error:#}; retry if a daemon is starting or busy. \
-             For legacy or incomplete state, stop all daemons sharing this AGIT_HOME before \
-             manually removing this socket; keep agitd.lock in place",
-            path.display()
-        )),
+        Err(error) => {
+            let recovery = if rc_dir.file_name() == Some(std::ffi::OsStr::new("desktop-rc")) {
+                rc_dir
+                    .parent()
+                    .and_then(|home| super::lifecycle::stopped_recovery_command(home).ok())
+            } else {
+                None
+            };
+            let recovery = recovery.map_or_else(
+                || "manually remove only this socket; keep agitd.lock in place".to_owned(),
+                |command| format!("run {command}, then retry startup; keep agitd.lock in place"),
+            );
+            Liveness::Unknown(format!(
+                "cannot establish ownership of {}: {error:#}; retry if a daemon is starting or busy. \
+                 For legacy or incomplete state, stop all daemons sharing this AGIT_HOME in this namespace and \
+                 independently confirm that they and all starters have exited, including in other \
+                 containers. Only then {recovery}",
+                path.display()
+            ))
+        }
     }
+}
+
+/// Explicit operator recovery is separate from automatic ownership detection.
+pub(super) fn recover_stopped() -> crate::Result<bool> {
+    let rc_dir = super::rc_dir()?;
+    let owner = Ownership::acquire(&rc_dir, true)?
+        .expect("creating an ownership lock must return a descriptor");
+    owner.recover_stopped(&socket_path_for(&rc_dir))
 }
 
 /// One probe: connect, and ask for an answer.
@@ -804,6 +826,58 @@ mod tests {
         assert!(matches!(presence_in(tmp.path()), Presence::Unclear(_)));
         assert!(listen_in(tmp.path()).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "leave unchanged");
+    }
+
+    /// Operator confirmation cannot override an observable listener or a held lifetime lock.
+    #[test]
+    fn stopped_recovery_rejects_live_listeners_and_unsafe_paths() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path();
+        let path = socket_path_for(rc);
+        let owner = Ownership::acquire(rc, true).unwrap().unwrap();
+        assert!(Ownership::acquire(rc, true).is_err());
+        let control = UnixListener::bind(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert!(
+            owner
+                .recover_stopped(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("still accepts")
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(control);
+
+        let rpc = path.with_extension("rpc");
+        let listener = UnixListener::bind(&rpc).unwrap();
+        assert!(
+            owner
+                .recover_stopped(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("still accepts")
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(listener);
+        std::fs::remove_file(&rpc).unwrap();
+
+        let unrelated = rc.join("unrelated");
+        drop(UnixListener::bind(&unrelated).unwrap());
+        let unrelated_inode = std::fs::metadata(&unrelated).unwrap().ino();
+        symlink(&unrelated, &rpc).unwrap();
+        assert!(owner.recover_stopped(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::metadata(&unrelated).unwrap().ino(),
+            unrelated_inode
+        );
+        std::fs::remove_file(&rpc).unwrap();
+        std::fs::write(&rpc, "preserve").unwrap();
+        assert!(owner.recover_stopped(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_to_string(&rpc).unwrap(), "preserve");
     }
 
     /// A released lifetime lock and its socket record establish staleness independently of PIDs.

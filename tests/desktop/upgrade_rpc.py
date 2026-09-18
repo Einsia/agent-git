@@ -99,14 +99,10 @@ def stop_if_idle(home, identity):
     return control(home, op="stop_if_idle", instance_id=identity["instance_id"], build_id=identity["build_id"])
 
 
-def has_stopped(home):
-    try:
-        control(home, op="status")
-        return False
-    except (FileNotFoundError, ConnectionRefusedError):
-        return not (home / "desktop-rc" / "agitd.pid").exists()
-    except (json.JSONDecodeError, ConnectionResetError, socket.timeout):
-        return False
+def has_stopped(binary, env):
+    result = subprocess.run([binary, "rc", "local", "status"], env=env,
+                            capture_output=True, text=True, timeout=15)
+    return result.returncode != 0 and "no local daemon is running" in result.stderr
 
 
 def run(binary):
@@ -178,7 +174,7 @@ def run(binary):
                 finally:
                     resumed.close()
                     subprocess.run([binary, "rc", "local", "stop"], env=env, capture_output=True, timeout=5)
-                    wait_for(lambda: has_stopped(home))
+                    wait_for(lambda: has_stopped(binary, env))
                 print("PASS: instance fence, live session and terminal preservation, safe idle stop, durable start replay")
             finally:
                 if client:
@@ -268,7 +264,7 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 assert not (root / "absent" / "desktop-rc" / "agitd.pid").exists()
 
                 subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
-                wait_for(lambda: has_stopped(home))
+                wait_for(lambda: has_stopped(binary, env))
                 install(old_binary, installed)
                 busy = start(str(installed), env)
                 before = busy.request("machine.describe", {})
@@ -300,7 +296,7 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 assert other.request("machine.describe", {})["instance_id"] == other_identity
 
                 subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
-                wait_for(lambda: has_stopped(home))
+                wait_for(lambda: has_stopped(binary, env))
                 install(old_binary, installed)
                 stale = start(str(installed), env)
                 stale_identity = stale.request("machine.describe", {})["instance_id"]
@@ -310,7 +306,7 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 assert "up to date" in current_result.stdout and "restarted" in current_result.stderr.lower()
                 assert control(home, op="status")["identity"]["instance_id"] != stale_identity
                 subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
-                wait_for(lambda: has_stopped(home))
+                wait_for(lambda: has_stopped(binary, env))
                 install(legacy_binary, installed)
                 legacy = start(str(installed), env)
                 legacy_identity = legacy.request("machine.describe", {})["instance_id"]
@@ -367,7 +363,7 @@ def startup_failure_check(binary, old_binary):
                 assert "agitd-*.log" in result.stderr and not result.stdout
                 daemon.wait(timeout=5)
                 assert daemon.returncode == 0
-                assert has_stopped(home)
+                assert has_stopped(binary, env)
                 assert bindings.read_bytes() == before
                 assert vault.read_text() == "invalid fixture vault\n"
                 logs = list((home / "desktop-rc").glob("agitd-*.log"))

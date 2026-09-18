@@ -411,6 +411,10 @@ mod tests {
         assert_eq!(restart["command_path"], "rc local restart");
         assert_eq!(restart["arg_if_idle"], true);
 
+        let recover = capture(&["agit", "rc", "local", "recover", "--confirm-stopped"]);
+        assert_eq!(recover["command_path"], "rc local recover");
+        assert_eq!(recover["arg_confirm_stopped"], true);
+
         let upgrade = capture(&[
             "agit",
             "rc",

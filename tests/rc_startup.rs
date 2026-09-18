@@ -53,25 +53,43 @@ impl Drop for OwnedChild {
 }
 
 #[cfg(unix)]
-#[test]
-fn legacy_socket_uncertainty_is_shared_by_startup_and_status() {
+#[tokio::test]
+async fn stopped_legacy_socket_requires_explicit_recovery_before_restart() {
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::{Duration, Instant};
 
     let directory = tempfile::tempdir().unwrap();
-    let home = directory.path();
+    let home = &directory.path().join("legacy home");
     startup_cache::seed(home);
     let rc = home.join("desktop-rc");
     std::fs::create_dir_all(&rc).unwrap();
     let socket = agit::rc::control::socket_path_for(&rc);
+    let rpc = socket.with_extension("rpc");
     drop(UnixListener::bind(&socket).unwrap());
+    drop(UnixListener::bind(&rpc).unwrap());
     let inode = std::fs::metadata(&socket).unwrap().ino();
     let pid = std::process::id().to_string();
     std::fs::write(rc.join("agitd.pid"), &pid).unwrap();
+    let project = home.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let bindings = serde_json::to_vec(&serde_json::json!({
+        "workspaces": {"local-owner": {"fixture": project}}
+    }))
+    .unwrap();
+    std::fs::write(rc.join("workspaces.json"), &bindings).unwrap();
+    let other_rc = home.join("rc");
+    std::fs::create_dir(&other_rc).unwrap();
+    let other_socket = agit::rc::control::socket_path_for(&other_rc);
+    let other_listener = UnixListener::bind(&other_socket).unwrap();
+    let other_inode = std::fs::metadata(&other_socket).unwrap().ino();
 
     for args in [
+        ["rc", "local", "start"].as_slice(),
         ["rc", "local", "start", "--detach"].as_slice(),
         ["rc", "local", "bridge", "--ensure"].as_slice(),
+        ["rc", "local", "restart", "--if-idle"].as_slice(),
         ["rc", "local", "status"].as_slice(),
         ["rc", "status"].as_slice(),
     ] {
@@ -87,10 +105,101 @@ fn legacy_socket_uncertainty_is_shared_by_startup_and_status() {
             "{diagnostic}"
         );
         assert!(!diagnostic.contains("no daemon is running"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("recover --confirm-stopped"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("AGIT_HOME="), "{diagnostic}");
         assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
         assert_eq!(std::fs::read_to_string(rc.join("agitd.pid")).unwrap(), pid);
     }
-    std::fs::remove_file(socket).unwrap();
+    let lock = rc.join("agitd.lock");
+    let lock_inode = std::fs::metadata(&lock).unwrap().ino();
+    assert!(std::fs::read(&lock).unwrap().is_empty());
+    let unconfirmed = command(home)
+        .args(["rc", "local", "recover"])
+        .output()
+        .unwrap();
+    assert!(!unconfirmed.status.success());
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+
+    let recovered = command(home)
+        .args(["rc", "local", "recover", "--confirm-stopped"])
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["status"], "recovered");
+    assert_eq!(recovered["socket_removed"], true);
+    assert!(!socket.exists());
+    assert!(rpc.exists());
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert!(std::fs::read(&lock).unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(rc.join("agitd.pid")).unwrap(), pid);
+    assert_eq!(std::fs::read(rc.join("workspaces.json")).unwrap(), bindings);
+    assert_eq!(std::fs::metadata(&other_socket).unwrap().ino(), other_inode);
+
+    let _cleanup = Stop(home);
+    let started = tokio::time::timeout(
+        Duration::from_secs(25),
+        tokio::process::Command::from(command(home))
+            .args(["rc", "local", "start", "--detach"])
+            .output(),
+    )
+    .await
+    .expect("startup after recovery must be bounded")
+    .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let mut stream = UnixStream::connect(&rpc).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace.list\",\"params\":{}}\n")
+        .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["result"]["workspaces"][0]["projects"][0]["project_id"],
+        "fixture"
+    );
+    assert_eq!(std::fs::read(rc.join("workspaces.json")).unwrap(), bindings);
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert!(!std::fs::read(&lock).unwrap().is_empty());
+    assert_eq!(std::fs::metadata(&other_socket).unwrap().ino(), other_inode);
+    let live_inode = std::fs::metadata(&socket).unwrap().ino();
+    let live_recovery = command(home)
+        .args(["rc", "local", "recover", "--confirm-stopped"])
+        .output()
+        .unwrap();
+    assert!(!live_recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&live_recovery.stderr)
+            .contains("cannot acquire daemon ownership lock")
+    );
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), live_inode);
+
+    assert!(
+        command(home)
+            .args(["rc", "local", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while agit::rc::control::presence_in(&rc) != agit::rc::control::Presence::Absent {
+        assert!(Instant::now() < deadline, "recovered daemon did not stop");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(other_listener);
+    for path in [socket, rpc, other_socket] {
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 /// Kernel ownership must recover after a crash even when the diagnostic PID names a live,

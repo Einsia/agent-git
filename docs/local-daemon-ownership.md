@@ -57,12 +57,39 @@ record or a partial record cannot be recovered automatically: an older daemon ma
 still hold a live listener. Even a nonexistent PID in the current namespace does
 not prove that such a daemon is gone.
 
-For manual recovery, first stop or otherwise establish the exit of every daemon
-and starter sharing this `AGIT_HOME`, including those in other containers. Remove
-only the control socket named in the startup diagnostic, then retry startup. Keep
-`agitd.lock` in place; startup will overwrite its record after binding. Do not kill
-the numeric PID merely because it appears in `agitd.pid`, and do not remove another
-namespace's state. If ownership cannot be established, preserve the state and
-resolve that uncertainty before removing anything.
+For manual recovery, first stop and independently establish the exit of every
+daemon and starter using the selected namespace in this `AGIT_HOME`, including
+those in other containers.
+A process supervisor waiting for its child to exit can supply that confirmation;
+a refused connection or a missing PID cannot. Keep legacy starters disabled until
+recovery and replacement startup finish, because they do not participate in the
+lifetime lock.
+
+For the local owner namespace, run the scoped command from the startup diagnostic:
+
+```sh
+AGIT_HOME=/path/to/state /path/to/agit rc local recover --confirm-stopped
+AGIT_HOME=/path/to/state /path/to/agit rc local start --detach
+```
+
+`--confirm-stopped` is the operator's assertion of those prerequisites. It
+does not infer exit from socket refusal. Recovery holds the lifecycle and lifetime
+locks, checks both control and RPC socket paths, and rejects reachable listeners,
+connection timeouts, unsafe filesystem entries, and changed socket identities.
+These checks can contradict the assertion but cannot prove a legacy daemon exited;
+in particular a full accept queue on macOS can still refuse connections.
+
+Recovery removes only the selected namespace's control socket. It returns JSON
+with `status: "recovered"` and `socket_removed`, and does not start a daemon or send
+signals. It preserves the lifetime lock inode and contents, numeric PID file,
+project bindings, credentials, and other durable state. Startup overwrites the
+ownership record after binding and replaces the residual RPC socket while holding
+ownership. `bridge --ensure` can perform that startup instead of `start --detach`.
+
+Keep `agitd.lock` in place. Do not kill the numeric PID merely because it appears
+in `agitd.pid`, and do not remove another namespace's state. If exit cannot be
+established, preserve the state and resolve that uncertainty before recovery.
+For a legacy non-local namespace, remove only the control socket named in its
+diagnostic after establishing the same prerequisites.
 
 Windows continues to use its named-pipe ownership mechanism.

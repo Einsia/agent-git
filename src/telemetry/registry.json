@@ -68,6 +68,7 @@
     "rc local after-upgrade": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "rc local bridge": {"aliases":[],"args":{"ensure":{"action":"SetTrue","policy":"boolean"},"required_features":{"action":"Append","policy":"enum","values":["peer-control-v1","history-v2","safe-restart-v1"]},"require_current_build":{"action":"SetTrue","policy":"boolean"}}},
     "rc local catalog": {"aliases":[],"args":{}},
+    "rc local recover": {"aliases":[],"args":{"confirm_stopped":{"action":"SetTrue","policy":"boolean"}}},
     "rc local restart": {"aliases":[],"args":{"if_idle":{"action":"SetTrue","policy":"boolean"}}},
     "rc local start": {"aliases":[],"args":{"detach":{"action":"SetTrue","policy":"boolean"}}},
     "rc local status": {"aliases":[],"args":{}},

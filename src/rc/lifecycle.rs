@@ -112,10 +112,14 @@ pub fn recovery_command() -> crate::Result<String> {
 
 pub fn recovery_command_for(exe: &Path) -> crate::Result<String> {
     let home = crate::infra::config::agit_home()?;
+    local_command(&home, exe, "restart --if-idle")
+}
+
+fn local_command(home: &Path, exe: &Path, action: &str) -> crate::Result<String> {
     #[cfg(unix)]
     {
         Ok(format!(
-            "AGIT_HOME={} {} rc local restart --if-idle",
+            "AGIT_HOME={} {} rc local {action}",
             shlex::try_quote(&home.to_string_lossy())?,
             shlex::try_quote(&exe.to_string_lossy())?
         ))
@@ -123,17 +127,49 @@ pub fn recovery_command_for(exe: &Path) -> crate::Result<String> {
     #[cfg(windows)]
     {
         Ok(format!(
-            "$env:AGIT_HOME = '{}'; & '{}' rc local restart --if-idle",
+            "$env:AGIT_HOME = '{}'; & '{}' rc local {action}",
             home.display().to_string().replace('\'', "''"),
             exe.display().to_string().replace('\'', "''")
         ))
     }
 }
 
+#[cfg(unix)]
+pub(super) fn stopped_recovery_command(home: &Path) -> crate::Result<String> {
+    local_command(home, &std::env::current_exe()?, "recover --confirm-stopped")
+}
+
+pub(super) fn recover_stopped() -> crate::Result<bool> {
+    #[cfg(unix)]
+    {
+        let _lock = lock()?;
+        control::recover_stopped()
+    }
+    #[cfg(windows)]
+    bail!("legacy socket recovery is only needed on Unix; Windows uses named-pipe ownership")
+}
+
 fn deferred(message: impl Into<String>) -> crate::Result<Outcome> {
     Ok(Outcome::Deferred {
         message: message.into(),
         recovery_command: recovery_command()?,
+    })
+}
+
+fn legacy_deferred(reason: &str) -> crate::Result<Outcome> {
+    let home = crate::infra::config::agit_home()?;
+    #[cfg(unix)]
+    let message = format!(
+        "{reason}; finish user work, explicitly stop this local daemon, then independently confirm \
+         all daemons and starters using this AGIT_HOME's local namespace have exited before running {} and retrying startup",
+        stopped_recovery_command(&home)?
+    );
+    #[cfg(windows)]
+    let message =
+        format!("{reason}; finish user work, then explicitly stop and start this local daemon");
+    Ok(Outcome::Deferred {
+        message,
+        recovery_command: local_command(&home, &std::env::current_exe()?, "stop")?,
     })
 }
 
@@ -174,18 +210,14 @@ fn ready(requirements: &Requirements<'_>) -> crate::Result<()> {
 
 fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Outcome> {
     let Some(identity) = &status.identity else {
-        return deferred(
-            "the running daemon predates safe restart negotiation; finish user work, then explicitly stop and start this local daemon",
-        );
+        return legacy_deferred("the running daemon predates safe restart negotiation");
     };
     if !identity
         .rpc_features
         .iter()
         .any(|feature| feature == "safe-restart-v1")
     {
-        return deferred(
-            "the running daemon does not support safe restart; finish user work before an explicit local stop and start",
-        );
+        return legacy_deferred("the running daemon does not support safe restart");
     }
     match control::ask(&Request::StopIfIdle {
         instance_id: identity.instance_id.clone(),
@@ -231,11 +263,10 @@ fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Ou
 pub fn attach(ensure_daemon: bool, extra: &[String], current_build: bool) -> crate::Result<()> {
     attach_inner(ensure_daemon, extra, current_build).with_context(|| {
         format!(
-            "local daemon attachment failed in {}; recovery: {}",
+            "local daemon attachment failed in {}",
             super::rc_dir()
                 .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            recovery_command().unwrap_or_else(|_| "agit rc local restart --if-idle".into())
+                .unwrap_or_default()
         )
     })
 }
