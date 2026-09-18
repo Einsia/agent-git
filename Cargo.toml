@@ -275,6 +275,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 agit-tunnel = { path = "crates/agit-tunnel", features = ["test-support"] }
 shlex = "2"

@@ -86,6 +86,11 @@ def run(binary):
             first_worker = peer["worker_pid"]
             remote_pid = int((executor_home / "desktop-rc" / "agitd.pid").read_text())
             assert remote_pid not in (first_worker, daemon.pid)
+            restart = subprocess.run([binary, "rc", "local", "restart", "--if-idle"], env=env,
+                                     capture_output=True, text=True, timeout=10)
+            assert restart.returncode != 0 and json.loads(restart.stdout)["status"] == "deferred"
+            assert client.request("machine.describe", {})["instance_id"] == local["instance_id"]
+            assert client.request("peer.list", {})["peers"][0]["worker_pid"] == first_worker
             # Closing the UI leaves both the tunnel and executor under daemon ownership.
             client.close()
             clients.remove(client)

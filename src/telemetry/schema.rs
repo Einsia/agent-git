@@ -385,6 +385,48 @@ mod tests {
     }
 
     #[test]
+    fn local_reconciliation_captures_flags_without_arbitrary_feature_or_target_values() {
+        let bridge = capture(&[
+            "agit",
+            "rc",
+            "local",
+            "bridge",
+            "--ensure",
+            "--require-current-build",
+            "--require-feature",
+            "peer-control-v1",
+            "--require-feature",
+            "private-canary",
+        ]);
+        assert_eq!(bridge["command_path"], "rc local bridge");
+        assert_eq!(bridge["arg_ensure"], true);
+        assert_eq!(bridge["arg_require_current_build"], true);
+        assert_eq!(
+            bridge["arg_required_features"],
+            json!(["other", "peer-control-v1"])
+        );
+        assert!(!bridge.to_string().contains("private-canary"));
+
+        let restart = capture(&["agit", "rc", "local", "restart", "--if-idle"]);
+        assert_eq!(restart["command_path"], "rc local restart");
+        assert_eq!(restart["arg_if_idle"], true);
+
+        let upgrade = capture(&[
+            "agit",
+            "rc",
+            "local",
+            "after-upgrade",
+            "--target",
+            r#"{"pid":123456789,"instance_id":"private-canary","executable":"/secret/file"}"#,
+        ]);
+        assert_eq!(upgrade["command_path"], "rc local after-upgrade");
+        assert_eq!(upgrade["arg_target"], true);
+        for value in ["private-canary", "/secret/file", "123456789"] {
+            assert!(!upgrade.to_string().contains(value), "{upgrade}");
+        }
+    }
+
+    #[test]
     fn canonical_and_nested_commands_keep_their_names() {
         assert_eq!(capture(&["agit", "run", "private"])["command"], "run");
         assert_eq!(

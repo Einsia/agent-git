@@ -2,6 +2,7 @@
 
 mod cloud;
 
+use super::admission::{Admission, Work};
 use super::local::{Listener, Stream};
 use crate::protocol::{CallerClaim, ErrorCode, Frame, RequestId, RpcError};
 use anyhow::{Context, ensure};
@@ -117,15 +118,31 @@ impl Drop for Client {
 
 #[derive(Clone)]
 struct ClientOutput {
-    sender: mpsc::Sender<(String, tokio::sync::OwnedSemaphorePermit)>,
+    sender: mpsc::Sender<(String, tokio::sync::OwnedSemaphorePermit, Option<Work>)>,
     bytes: std::sync::Arc<tokio::sync::Semaphore>,
     stop: Option<tokio::sync::watch::Sender<()>>,
 }
 impl ClientOutput {
     async fn send_timeout(&self, record: String, timeout: std::time::Duration) -> Result<(), ()> {
+        self.send_inner(record, timeout, None).await
+    }
+    async fn send_work(
+        &self,
+        record: String,
+        timeout: std::time::Duration,
+        work: Work,
+    ) -> Result<(), ()> {
+        self.send_inner(record, timeout, Some(work)).await
+    }
+    async fn send_inner(
+        &self,
+        record: String,
+        timeout: std::time::Duration,
+        work: Option<Work>,
+    ) -> Result<(), ()> {
         // A remote reader cannot stall owner RPC or the shared executor fanout.
         if self.stop.is_some() {
-            return self.try_send(record);
+            return self.try_send_inner(record, work);
         }
         tokio::time::timeout(timeout, async {
             let count = u32::try_from(record.len().max(1)).map_err(|_| ())?;
@@ -135,13 +152,23 @@ impl ClientOutput {
                 .acquire_many_owned(count)
                 .await
                 .map_err(|_| ())?;
-            self.sender.send((record, permit)).await.map_err(|_| ())
+            self.sender
+                .send((record, permit, work))
+                .await
+                .map_err(|_| ())
         })
         .await
         .map_err(|_| ())?
     }
+    #[cfg(test)]
     fn try_send(&self, record: String) -> Result<(), ()> {
-        let result = self.enqueue(record);
+        self.try_send_inner(record, None)
+    }
+    fn try_send_work(&self, record: String, work: Work) -> Result<(), ()> {
+        self.try_send_inner(record, Some(work))
+    }
+    fn try_send_inner(&self, record: String, work: Option<Work>) -> Result<(), ()> {
+        let result = self.enqueue(record, work);
         if result.is_err()
             && let Some(stop) = &self.stop
         {
@@ -150,14 +177,14 @@ impl ClientOutput {
         result
     }
 
-    fn enqueue(&self, record: String) -> Result<(), ()> {
+    fn enqueue(&self, record: String, work: Option<Work>) -> Result<(), ()> {
         let count = u32::try_from(record.len().max(1)).map_err(|_| ())?;
         let permit = self
             .bytes
             .clone()
             .try_acquire_many_owned(count)
             .map_err(|_| ())?;
-        self.sender.try_send((record, permit)).map_err(|_| ())
+        self.sender.try_send((record, permit, work)).map_err(|_| ())
     }
 }
 
@@ -169,7 +196,7 @@ fn attach(
 ) -> Client {
     let (reader, mut writer) = tokio::io::split(socket);
     let (sender, mut messages) =
-        mpsc::channel::<(String, tokio::sync::OwnedSemaphorePermit)>(CLIENT_QUEUE);
+        mpsc::channel::<(String, tokio::sync::OwnedSemaphorePermit, Option<Work>)>(CLIENT_QUEUE);
     let output = ClientOutput {
         sender,
         bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FRAME * 2)),
@@ -193,7 +220,7 @@ fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let write = async {
-            while let Some((record, _permit)) = messages.recv().await {
+            while let Some((record, _permit, _work)) = messages.recv().await {
                 writer.write_all(record.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
             }
@@ -237,9 +264,11 @@ pub async fn serve(
     outbound: super::outbound::OutboundRx,
     events: mpsc::Sender<super::link::LinkEvent>,
     controller: std::sync::Arc<agit_controller::Controller>,
+    daemon: super::build_identity::DaemonIdentity,
+    admission: Admission,
 ) -> crate::Result<()> {
     let identity = super::identity::identity()?;
-    let instance = uuid::Uuid::new_v4().to_string();
+    let instance = daemon.instance_id;
     let diagnostics = match super::diagnostics::Log::open(&instance) {
         Ok(log) => {
             log.record(
@@ -262,6 +291,8 @@ pub async fn serve(
     .await?;
     let description = serde_json::json!({"protocol_version":1,"authority":"local-owner","machine":identity,"instance_id":instance,"epoch":1,"workspace_id":WORKSPACE,"capabilities":capabilities,"max_frame_bytes":MAX_FRAME,"history":{"version":2,"runtimes":["codex","claude-code","opencode"],"snapshot":true}});
     let mut description = description;
+    description["build_id"] = serde_json::json!(daemon.build_id);
+    description["rpc_features"] = serde_json::json!(daemon.rpc_features);
     description["diagnostic_log"] = serde_json::json!(diagnostics.as_ref().map(|log| log.path()));
     let cloud = cloud::Ingress::start(diagnostics.clone())?;
     serve_described(
@@ -272,10 +303,12 @@ pub async fn serve(
         controller,
         diagnostics,
         Some(cloud),
+        admission,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_described(
     #[allow(unused_mut)] mut listener: Listener,
     mut outbound: super::outbound::OutboundRx,
@@ -284,11 +317,12 @@ async fn serve_described(
     controller: std::sync::Arc<agit_controller::Controller>,
     diagnostics: Option<super::diagnostics::Log>,
     mut cloud: Option<cloud::Ingress>,
+    admission: Admission,
 ) -> crate::Result<()> {
     let (input, mut incoming) = mpsc::channel::<Incoming>(256);
     let mut clients = HashMap::<u64, Client>::new();
     let history_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
-    let mut pending = HashMap::<RequestId, (u64, RequestId, Option<String>)>::new();
+    let mut pending = HashMap::<RequestId, (u64, RequestId, Option<String>, Work)>::new();
     let mut receipts = HashMap::<String, MessageReceipt>::new();
     let mut serial = 0_u64;
     let discovery_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
@@ -327,9 +361,7 @@ async fn serve_described(
             Some(message) = incoming.recv() => match message {
                 Incoming::Closed(client) => {
                     clients.remove(&client);
-                    // A detached sender still owns an acceptance receipt. Keep its
-                    // route until the supervisor resolves it so reconnects can replay.
-                    pending.retain(|_, (owner, _, key)| *owner != client || key.is_some());
+                    // Accepted work remains tracked until its response, even if its viewer leaves.
                 }
                 Incoming::Request(client, raw) => {
                     let Some(peer) = clients.get_mut(&client) else { continue };
@@ -342,29 +374,34 @@ async fn serve_described(
                             Err(super::cloud::ingress::Rejection::Close) => {
                                 if let Some(log) = &diagnostics { log.record("cloud.client_rejected", serde_json::json!({"client_id":client,"reason":"invalid_or_active_request_id_or_capacity"})); }
                                 clients.remove(&client);
-                                pending.retain(|_, (owner, _, key)| *owner != client || key.is_some());
                                 continue;
                             }
                         }
                     } else { authorize(*raw, client) };
+                    let Some(work) = admission.enter() else {
+                        let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy,
+                            "local daemon is restarting; nothing was accepted"));
+                        let _ = peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                        continue;
+                    };
                     match authorized {
                         Ok(frame) if frame.method().starts_with("peer.") => {
                             if matches!(frame.method(), "peer.connect" | "peer.connect_cloud")
                                 && let Some(id) = frame.params.as_ref().and_then(|p| p.get("peer_id")).and_then(serde_json::Value::as_str) {
                                     let mut peers = peer.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if peers.len() >= 64 || id.len() > 256 {
-                                        let _ = peer.output.try_send(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer subscription capacity exceeded")).to_json());
+                                        let _ = peer.output.try_send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer subscription capacity exceeded")).to_json(), work);
                                         continue;
                                     }
                                     peers.insert(id.into());
                             }
                             let Ok(permit) = peer.peer_slots.clone().try_acquire_owned() else {
                                 let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "too many peer requests"));
-                                let _ = peer.output.try_send(response.to_json());
+                                let _ = peer.output.try_send_work(response.to_json(), work);
                                 continue;
                             };
                             let Ok(global_permit) = peer_slots.clone().try_acquire_owned() else {
-                                let _ = peer.output.try_send(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer request capacity exhausted")).to_json());
+                                let _ = peer.output.try_send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer request capacity exhausted")).to_json(), work);
                                 continue;
                             };
                             let controller = controller.clone();
@@ -374,13 +411,13 @@ async fn serve_described(
                                 let _permit = (permit, global_permit);
                                 let response = super::peers::dispatch(&controller, frame).await;
                                 if let Some(log) = &diagnostics { log.response(client, &response); }
-                                let _ = output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                                let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
                             });
                         }
                         Ok(frame) if frame.method() == "machine.describe" => {
                             let response = Frame::response(original_id, description.clone());
                             if let Some(log) = &diagnostics { log.response(client, &response); }
-                            if peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                            if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                         }
                         Ok(frame) if matches!(frame.method(), "runtime.models" | "session.goal.read") => {
                             let output = peer.output.clone();
@@ -389,7 +426,7 @@ async fn serve_described(
                                 let permit = tokio::time::timeout(std::time::Duration::from_secs(30), slots.acquire_owned()).await;
                                 let response = if let Ok(Ok(_permit)) = permit {
                                     if let Err(error) = frame.authority.check() {
-                                        let _ = output.send_timeout(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2)).await;
+                                        let _ = output.send_work(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2), work).await;
                                         return;
                                     }
                                     let is_goal = frame.method() == "session.goal.read";
@@ -403,13 +440,13 @@ async fn serve_described(
                                         Err(error) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())),
                                     }
                                 } else { Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "Runtime inspection is busy; try again shortly")) };
-                                let _ = output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                                let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
                             });
                         }
                         Ok(frame) if frame.method() == "session.history" => {
                             let Ok(permit) = history_slots.clone().try_acquire_owned() else {
                                 let response = Frame::error_response(original_id, super::local_history::rpc_error(super::local_history::Failure::Busy.into()));
-                                let _ = peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                                let _ = peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
                                 continue;
                             };
                             let output = peer.output.clone();
@@ -430,13 +467,12 @@ async fn serve_described(
                                     log.response(client, &response);
                                     log.record("history.read_completed", serde_json::json!({"client_id":client,"request_id":response.id,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}));
                                 }
-                                let _ = output.send_timeout(response.to_json(),std::time::Duration::from_secs(2)).await;
+                                let _ = output.send_work(response.to_json(),std::time::Duration::from_secs(2), work).await;
                             });
                         }
                         Ok(mut frame) => {
-                            if pending.values().filter(|(owner, _, _)| *owner == client).count() >= MAX_PENDING {
+                            if pending.len() >= MAX_PENDING * MAX_CLIENTS || pending.values().filter(|(owner, _, _, _)| *owner == client).count() >= MAX_PENDING {
                                 clients.remove(&client);
-                                pending.retain(|_, (owner, _, key)| *owner != client || key.is_some());
                                 continue;
                             }
                             let key = message_key(&frame).map(|key| peer.cloud.as_ref().map_or_else(|| key.clone(), |guard| guard.receipt_key(key.clone())));
@@ -451,12 +487,12 @@ async fn serve_described(
                                         Frame::error_response(original_id.clone(), RpcError::new(ErrorCode::SessionBusy, "message acceptance is pending; retry with the same message ID"))
                                     };
                                     response.id = Some(original_id);
-                                    if peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                                    if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                                     continue;
                                 }
                                 if receipts.len() >= 4096 || key.len() > 1024 {
                                     let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "message retry capacity exceeded; nothing was sent"));
-                                    if peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                                    if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                                     continue;
                                 }
                                 receipts.insert(key.clone(), MessageReceipt { digest: message_digest(&frame), response: None, created: std::time::Instant::now() });
@@ -466,11 +502,11 @@ async fn serve_described(
                                 log.dispatch(client, &original_id, &id, frame.method());
                             }
                             frame.id = Some(id.clone());
-                            pending.insert(id, (client, original_id, key));
+                            pending.insert(id, (client, original_id, key, work));
                             events.send(super::link::LinkEvent::Frame { epoch: 1, frame: Box::new(frame) }).await?;
                         }
                         Err(error) => {
-                            if peer.output.send_timeout(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                            if peer.output.send_work(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                         }
                     }
                 }
@@ -479,7 +515,7 @@ async fn serve_described(
                 let Some(write) = write else { break };
                 let mut frame = write.frame().clone();
                 if let Some(id) = &frame.id {
-                    if let Some((client, original, key)) = pending.remove(id) {
+                    if let Some((client, original, key, work)) = pending.remove(id) {
                         if let Some(log) = &diagnostics {
                             let mut response = frame.clone();
                             response.id = Some(original.clone());
@@ -496,7 +532,7 @@ async fn serve_described(
                         }
                         frame.id = Some(original);
                         if let Some(peer) = clients.get(&client)
-                            && peer.output.send_timeout(frame.to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                            && peer.output.send_work(frame.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                     }
                 } else {
                     if frame.method() == crate::protocol::method::SESSION_STATUS
@@ -515,7 +551,6 @@ async fn serve_described(
                     }
                     for id in closed { clients.remove(&id); }
                 }
-                pending.retain(|_, (client, _, key)| clients.contains_key(client) || key.is_some());
                 write.commit();
             }
         }
@@ -527,6 +562,51 @@ async fn serve_described(
 mod tests {
     use super::*;
     use tokio::net::{UnixListener, UnixStream};
+
+    #[tokio::test]
+    async fn detached_accepted_requests_keep_the_restart_boundary_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rpc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (out, outbound) = super::super::outbound::channel();
+        let (events, mut requests) = mpsc::channel(16);
+        let admission = Admission::default();
+        let server = tokio::spawn(serve_described(
+            listener,
+            outbound,
+            events,
+            serde_json::json!({}),
+            super::super::peers::controller().unwrap(),
+            None,
+            None,
+            admission.clone(),
+        ));
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let request = Frame::request("project.bind", serde_json::json!({}));
+        client
+            .write_all(format!("{}\n", request.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let super::super::link::LinkEvent::Frame { frame, .. } = requests.recv().await.unwrap();
+        drop(client);
+        assert!(admission.freeze().is_err());
+        out.send(Frame::response(
+            frame.id.unwrap(),
+            serde_json::json!({"ok":true}),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(frozen) = admission.freeze() {
+                    drop(frozen);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
     #[tokio::test]
     async fn a_peer_closed_before_authentication_cannot_stop_other_clients() {
         let root = tempfile::tempdir().unwrap();
@@ -544,6 +624,7 @@ mod tests {
             super::super::peers::controller().unwrap(),
             None,
             None,
+            Admission::default(),
         ));
         let mut client = BufReader::new(UnixStream::connect(&path).await.unwrap());
         let request = Frame::request("machine.describe", serde_json::json!({}));
@@ -608,6 +689,7 @@ mod tests {
             super::super::peers::controller().unwrap(),
             None,
             None,
+            Admission::default(),
         ));
         let mut first = BufReader::new(UnixStream::connect(&path).await.unwrap());
         let request = Frame::request(
@@ -683,6 +765,7 @@ mod tests {
             super::super::peers::controller().unwrap(),
             None,
             None,
+            Admission::default(),
         ));
         let mut client = BufReader::new(UnixStream::connect(&path).await.unwrap());
         client

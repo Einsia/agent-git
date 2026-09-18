@@ -54,8 +54,11 @@ pub(super) fn attach(
 ) -> Client {
     let (mut sink, mut source) = accepted.connection.split();
     let mut lifetime = accepted.stopped;
-    let (sender, mut messages) =
-        mpsc::channel::<(String, tokio::sync::OwnedSemaphorePermit)>(CLIENT_QUEUE);
+    let (sender, mut messages) = mpsc::channel::<(
+        String,
+        tokio::sync::OwnedSemaphorePermit,
+        Option<super::Work>,
+    )>(CLIENT_QUEUE);
     let (stop, mut stopped) = watch::channel(());
     let output = ClientOutput {
         sender,
@@ -83,7 +86,7 @@ pub(super) fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let write = async {
-            while let Some((record, _permit)) = messages.recv().await {
+            while let Some((record, _permit, _work)) = messages.recv().await {
                 if let Some(text) = projection.project(&record)? {
                     let frame_bytes = text.len();
                     let started = std::time::Instant::now();

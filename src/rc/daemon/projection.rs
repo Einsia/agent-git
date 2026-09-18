@@ -764,6 +764,7 @@ mod bound_lineage_tests {
                     let (notes, _notes_rx) = mpsc::channel(1);
                     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
                     let mut daemon = Daemon {
+                        identity: crate::rc::build_identity::DaemonIdentity::current().unwrap(),
                         deferred: vec![],
                         deferred_slot: None,
                         replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(

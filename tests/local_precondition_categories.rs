@@ -1059,6 +1059,7 @@ fn serve_rc_status(action: &str) {
             }),
             Request::Stop => { stop = true; Reply::Stopping },
             Request::ReloadSecrets => panic!("a status fixture must not reload secrets"),
+            Request::StopIfIdle { .. } => panic!("a status fixture must not restart"),
         }).unwrap();
         if stop {
             break;

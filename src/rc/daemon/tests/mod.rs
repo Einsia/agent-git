@@ -50,6 +50,7 @@ pub(super) fn rpc_test_daemon(
     let (notes, _notes_rx) = mpsc::channel(1);
     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
     Arc::new(Mutex::new(Daemon {
+        identity: crate::rc::build_identity::DaemonIdentity::current().unwrap(),
         deferred: vec![],
         deferred_slot: None,
         replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),

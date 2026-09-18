@@ -63,7 +63,9 @@
 //! end-to-end hole-detection contract — a dropped frame at any hop is
 //! *detected*, not silently lost. Controllers reconcile replay gaps against executor history.
 
+mod admission;
 pub(crate) mod authority;
+pub mod build_identity;
 pub mod cloud;
 pub(crate) mod codex_history;
 #[cfg(unix)]
@@ -79,6 +81,7 @@ pub mod grants;
 pub mod harness;
 pub mod identity;
 pub mod journal;
+pub mod lifecycle;
 pub mod lineage;
 pub mod link;
 pub mod local;

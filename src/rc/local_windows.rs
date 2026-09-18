@@ -234,10 +234,7 @@ pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
     Ok(())
 }
 
-pub fn ensure_daemon() -> crate::Result<()> {
-    if super::super::control::running_pid().is_none() {
-        super::spawn_daemon()?;
-    }
+pub(super) fn wait_ready_sync() -> crate::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -245,10 +242,7 @@ pub fn ensure_daemon() -> crate::Result<()> {
     Ok(())
 }
 
-pub(super) fn bridge(ensure: bool) -> crate::Result<()> {
-    if ensure {
-        ensure_daemon()?;
-    }
+pub(super) fn bridge() -> crate::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

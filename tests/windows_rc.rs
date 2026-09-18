@@ -119,6 +119,7 @@ fn secret_commands_reload_live_matcher(home: &Path) {
                     stop = true;
                     Reply::Stopping
                 }
+                Request::StopIfIdle { .. } => panic!("a reload fixture must not restart"),
             })
             .unwrap();
             if stop {

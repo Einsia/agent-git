@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Status,
     Stop,
+    StopIfIdle {
+        instance_id: String,
+        build_id: String,
+    },
     ReloadSecrets,
 }
 
@@ -15,12 +19,16 @@ pub enum Request {
 pub enum Reply {
     Status(Status),
     Stopping,
+    Busy { blockers: Vec<String> },
+    InstanceChanged,
     SecretsReloaded { generation: u64, rules: usize },
     Error { message: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<super::build_identity::DaemonIdentity>,
     pub pid: u32,
     pub hub: String,
     pub online: bool,

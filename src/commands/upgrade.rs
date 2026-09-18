@@ -112,12 +112,15 @@ pub fn run(args: Args) -> CmdResult {
             return if args.check {
                 Ok(ExitCode::Ok)
             } else {
-                refresh_installed_skills(&std::env::current_exe()?)
+                let exe = std::env::current_exe()?;
+                reconcile_upgraded_daemon(&exe, crate::rc::lifecycle::upgrade_target(&exe));
+                refresh_installed_skills(&exe)
             };
         }
     }
 
     let exe = std::env::current_exe()?;
+    let daemon_target = crate::rc::lifecycle::upgrade_target(&exe);
     if let Err(e) = download_and_replace(&latest) {
         ui::error(&format!("upgrade failed: {e:#}"));
         ui::hint(
@@ -126,7 +129,41 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Network);
     }
     ui::success(&format!("upgraded to {}", latest.version));
+    reconcile_upgraded_daemon(&exe, daemon_target);
     refresh_installed_skills(&exe)
+}
+
+fn reconcile_upgraded_daemon(
+    exe: &Path,
+    target: crate::Result<Option<crate::rc::lifecycle::UpgradeTarget>>,
+) {
+    let result: crate::Result<()> = (|| {
+        let Some(target) = target? else {
+            return Ok(());
+        };
+        let output = crate::infra::background::command(exe)
+            .args(["rc", "local", "after-upgrade", "--target"])
+            .arg(serde_json::to_string(&target)?)
+            .env("AGIT_TELEMETRY_DEFER", "1")
+            .env(RESTART_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("cannot run installed CLI daemon reconciliation")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let outcome = serde_json::from_slice::<crate::rc::lifecycle::Outcome>(&output.stdout)
+            .context("installed CLI returned an invalid daemon reconciliation result")?;
+        crate::rc::lifecycle::report(&outcome)
+    })();
+    if let Err(error) = result {
+        ui::warning(&format!(
+            "CLI is installed, but local daemon reconciliation failed: {error:#}"
+        ));
+        if let Ok(command) = crate::rc::lifecycle::recovery_command_for(exe) {
+            ui::hint(&command);
+        }
+    }
 }
 
 /// Run the replacement executable so its bundled instructions match the installed CLI.

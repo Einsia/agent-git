@@ -301,6 +301,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
                 let blockers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut daemon = Daemon {
+                    identity: crate::rc::build_identity::DaemonIdentity::current().unwrap(),
                     deferred: vec![],
                     deferred_slot: None,
                     replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),

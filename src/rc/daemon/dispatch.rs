@@ -311,10 +311,9 @@ impl Daemon {
 
             method::TERMINAL_CLOSE => {
                 let p: TerminalClose = f.params_as()?;
-                // Check ownership before removing: finding out after `remove` that it was not
-                // yours leaves that terminal already gone.
+                // Keep ownership until the exit note so automatic restart cannot abandon cleanup.
                 self.terminal_owned_by(&p.terminal_id, &caller)?;
-                if let Some(t) = self.terminals.remove(&p.terminal_id) {
+                if let Some(t) = self.terminals.get(&p.terminal_id) {
                     t.term.kill();
                 }
                 Ok(serde_json::json!({}))
@@ -475,7 +474,7 @@ impl Daemon {
                 ErrorCode::UnknownMethod,
                 format!("unknown method {other}"),
             )
-            .with_hint("upgrade agit on this machine: `agit upgrade`")),
+            .with_hint("inspect this executor with `agit rc local status`; after user work finishes, use `agit rc local restart --if-idle` to load its installed CLI")),
         }
     }
 }
@@ -518,6 +517,7 @@ mod tests {
         let (notes, _notes_rx) = mpsc::channel(1);
         let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
         Daemon {
+            identity: crate::rc::build_identity::DaemonIdentity::current().unwrap(),
             deferred: vec![],
             deferred_slot: None,
             replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),

@@ -45,6 +45,10 @@ def run(binary):
                 descriptions = [read(client)["result"] for client in clients]
                 assert descriptions[0]["instance_id"] == descriptions[1]["instance_id"]
                 assert descriptions[0]["authority"] == "local-owner"
+                status = json.loads(subprocess.check_output([binary, "rc", "local", "status"], env=env))
+                assert status["identity"]["instance_id"] == descriptions[0]["instance_id"]
+                assert status["identity"]["build_id"] == descriptions[0]["build_id"]
+                assert "peer-control-v1" in descriptions[0]["rpc_features"]
                 bridge = subprocess.Popen([binary, "rc", "local", "bridge"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
                     bridge.stdin.write((json.dumps(dict(jsonrpc="2.0", id=41, method="machine.describe", params={})) + "\n").encode())

@@ -9,6 +9,9 @@ const TERMINAL_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_se
 
 impl Daemon {
     pub async fn run(opts: Options) -> crate::Result<()> {
+        let identity = crate::rc::build_identity::DaemonIdentity::current()?;
+        let admission = crate::rc::admission::Admission::default();
+        let controller = crate::rc::peers::controller()?;
         // Internal notes, session → daemon. Capacity is generous: a session sends only a few
         // over its whole life.
         let (notes_tx, mut notes_rx) = mpsc::channel::<SessionNote>(256);
@@ -30,6 +33,7 @@ impl Daemon {
         // be filtering.
         let secret_filter = crate::domain::secret_filter::MatcherHandle::load_default()?;
         let d = Arc::new(Mutex::new(Daemon {
+            identity: identity.clone(),
             deferred: vec![],
             deferred_slot: None,
             replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
@@ -64,6 +68,7 @@ impl Daemon {
         #[cfg(windows)]
         control::write_pidfile()?;
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let (safe_stop_tx, mut safe_stop_rx) = mpsc::channel::<restart::SafeStopRequest>(1);
         {
             let d = d.clone();
             let stop_tx = stop_tx.clone();
@@ -74,6 +79,8 @@ impl Daemon {
                     let d = d.clone();
                     let stop_tx = stop_tx.clone();
                     let secret_filter = secret_filter.clone();
+                    let safe_stop_tx = safe_stop_tx.clone();
+                    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
                     let _ = control::serve_one(&mut stream, move |req| match req {
                         control::Request::Status => {
                             // The control socket lives on a blocking thread on
@@ -101,6 +108,33 @@ impl Daemon {
                             let _ = stop_tx.try_send(());
                             control::Reply::Stopping
                         }
+                        control::Request::StopIfIdle {
+                            instance_id,
+                            build_id,
+                        } => {
+                            let (reply, received) = std::sync::mpsc::sync_channel(1);
+                            let budget = std::time::Duration::from_secs(2);
+                            let request = restart::SafeStopRequest {
+                                instance_id,
+                                build_id,
+                                deadline: std::time::Instant::now() + budget,
+                                reply,
+                                written: written_rx,
+                            };
+                            if safe_stop_tx.try_send(request).is_err() {
+                                control::Reply::Busy {
+                                    blockers: vec!["safe restart coordinator is busy".into()],
+                                }
+                            } else {
+                                received.recv_timeout(budget).unwrap_or_else(|_| {
+                                    control::Reply::Busy {
+                                        blockers: vec![
+                                            "daemon did not reach a safe restart boundary".into(),
+                                        ],
+                                    }
+                                })
+                            }
+                        }
                         control::Request::ReloadSecrets => match secret_filter.reload_default() {
                             Ok(status) => control::Reply::SecretsReloaded {
                                 generation: status.generation,
@@ -111,6 +145,7 @@ impl Daemon {
                             },
                         },
                     });
+                    let _ = written_tx.send(());
                 }
             });
         }
@@ -184,10 +219,18 @@ impl Daemon {
             let listener = crate::rc::local::listen()?;
             d.lock().await.online = true;
             let local_events = _link_ev_tx.clone();
-            let controller = crate::rc::peers::controller()?;
+            let controller = controller.clone();
+            let admission = admission.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    crate::rc::endpoint::serve(listener, _out_rx, local_events, controller).await
+                if let Err(error) = crate::rc::endpoint::serve(
+                    listener,
+                    _out_rx,
+                    local_events,
+                    controller,
+                    identity,
+                    admission,
+                )
+                .await
                 {
                     eprintln!("agitd: local transport stopped: {error:#}");
                 }
@@ -579,6 +622,22 @@ impl Daemon {
                     // moment the daemon started, and typing the command does nothing.
                     g.reload_grants();
                 }
+                Some(request) = safe_stop_rx.recv(), if !stopping => {
+                    let prepared = {
+                        let state = d.lock().await;
+                        state.prepare_safe_stop(&request, &admission, !session_rpc_tasks.is_empty(), || !controller.list().is_empty())
+                    };
+                    match prepared {
+                        Err(reply) => { let _ = request.reply.send(reply.into()); }
+                        Ok(frozen) => {
+                            if request.reply.send(control::Reply::Stopping).is_ok() {
+                                frozen.commit();
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), request.written).await;
+                                begin_daemon_stop(&mut stopping, &link_stopping, &session_rpc_stop_tx, shutdown_deadline.as_mut());
+                            }
+                        }
+                    }
+                }
                 _ = stop_rx.recv(), if !stopping => {
                     begin_daemon_stop(
                         &mut stopping,
@@ -639,6 +698,7 @@ impl Daemon {
 
     fn status(&self) -> control::Status {
         control::Status {
+            identity: Some(self.identity.clone()),
             pid: std::process::id(),
             hub: self.opts.hub.clone(),
             online: self.online,

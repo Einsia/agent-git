@@ -19,7 +19,9 @@ mod windows;
 #[cfg(windows)]
 use windows::bridge;
 #[cfg(windows)]
-pub use windows::ensure_daemon;
+pub(super) fn wait_ready() -> crate::Result<()> {
+    windows::wait_ready_sync()
+}
 #[cfg(windows)]
 pub(super) use windows::{Listener, Stream, authenticate_client, listen};
 #[cfg(unix)]
@@ -58,11 +60,27 @@ enum Action {
     Bridge {
         #[arg(long)]
         ensure: bool,
+        /// Require an additional RPC feature before forwarding any client bytes.
+        #[arg(long = "require-feature")]
+        required_features: Vec<String>,
+        /// Require this bridge's exact build, including same-version replacements.
+        #[arg(long)]
+        require_current_build: bool,
     },
     /// Inspect the local daemon.
     Status,
     /// Stop the local daemon and its supervised sessions.
     Stop,
+    /// Replace the running local daemon only when no user work would be interrupted.
+    Restart {
+        #[arg(long, required = true)]
+        if_idle: bool,
+    },
+    #[command(hide = true)]
+    AfterUpgrade {
+        #[arg(long)]
+        target: String,
+    },
 }
 
 pub fn run(args: Args) -> crate::commands::CmdResult {
@@ -88,7 +106,26 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
                 start_foreground()?;
             }
         }
-        Action::Bridge { ensure } => bridge(ensure)?,
+        Action::Bridge {
+            ensure,
+            required_features,
+            require_current_build,
+        } => {
+            super::lifecycle::attach(ensure, &required_features, require_current_build)?;
+            bridge()?;
+        }
+        Action::Restart { if_idle: _ } => {
+            let outcome = super::lifecycle::restart_if_idle()?;
+            super::lifecycle::report(&outcome)?;
+            println!("{}", serde_json::to_string(&outcome)?);
+            if matches!(outcome, super::lifecycle::Outcome::Deferred { .. }) {
+                return Ok(crate::ExitCode::Precondition);
+            }
+        }
+        Action::AfterUpgrade { target } => {
+            let outcome = super::lifecycle::after_upgrade(serde_json::from_str(&target)?)?;
+            println!("{}", serde_json::to_string(&outcome)?);
+        }
         Action::Status => {
             use super::control::{self, Presence};
             let reply = control::ask(&control::Request::Status).map_err(|error| {
@@ -126,12 +163,17 @@ pub fn start_foreground() -> crate::Result<()> {
     }))
 }
 
-#[cfg(unix)]
 pub fn ensure_daemon() -> crate::Result<()> {
-    spawn_if_absent()?;
+    super::lifecycle::attach(true, &[], false)
+}
+
+#[cfg(unix)]
+pub(super) fn wait_ready() -> crate::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if let Ok(socket) = std::os::unix::net::UnixStream::connect(rpc_path()?) {
+        if let Ok(socket) =
+            super::control::connect_within(&rpc_path()?, std::time::Duration::from_secs(1))
+        {
             authenticate_server(socket, unsafe { libc::geteuid() })?;
             return Ok(());
         }
@@ -144,18 +186,7 @@ pub fn ensure_daemon() -> crate::Result<()> {
     }
 }
 
-#[cfg(unix)]
-fn spawn_if_absent() -> crate::Result<()> {
-    match super::control::presence() {
-        super::control::Presence::Running(_) => Ok(()),
-        super::control::Presence::Absent => spawn_daemon(),
-        super::control::Presence::Unclear(why) => {
-            anyhow::bail!("cannot establish local daemon state: {why}")
-        }
-    }
-}
-
-fn spawn_daemon() -> crate::Result<()> {
+pub(super) fn spawn_daemon() -> crate::Result<()> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let log = tempfile::Builder::new()
@@ -195,31 +226,9 @@ fn spawn_daemon() -> crate::Result<()> {
 }
 
 #[cfg(unix)]
-fn bridge(ensure_daemon: bool) -> crate::Result<()> {
-    use std::os::unix::net::UnixStream as StdStream;
-    let path = rpc_path()?;
-    let socket = match StdStream::connect(&path) {
-        Ok(socket) => socket,
-        Err(first) if ensure_daemon => {
-            spawn_if_absent()?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                match StdStream::connect(&path) {
-                    Ok(socket) => break socket,
-                    Err(_) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(50))
-                    }
-                    Err(_) => {
-                        return Err(first).context(format!(
-                            "local daemon did not become ready; inspect agitd-*.log in {}",
-                            super::rc_dir()?.display()
-                        ));
-                    }
-                }
-            }
-        }
-        Err(error) => return Err(error).context("start the local daemon or pass --ensure"),
-    };
+fn bridge() -> crate::Result<()> {
+    let socket = super::control::connect_within(&rpc_path()?, std::time::Duration::from_secs(5))
+        .context("local daemon disappeared before bridge attachment; retry the connection")?;
     let mut socket = authenticate_server(socket, unsafe { libc::geteuid() })?;
     let mut input = socket.try_clone()?;
     // The output owner exits on socket closure even while stdin has no data.

@@ -67,6 +67,7 @@ mod opening;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 mod projection;
 mod pump;
+mod restart;
 mod session_metadata;
 mod session_rpc;
 mod sessions;
@@ -1033,6 +1034,7 @@ const FAIL_CLOSED_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::
 const FAIL_CLOSED_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Daemon {
+    identity: crate::rc::build_identity::DaemonIdentity,
     /// Replay frames this dispatch accumulated, to be sent **outside the mutex**. See
     /// [`Daemon::on_frame`].
     deferred: Vec<Frame>,

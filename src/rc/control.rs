@@ -223,7 +223,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// the leak keeps accumulating. So this opens the fd itself: `O_NONBLOCK` + `connect` + `poll` for
 /// writability + `getsockopt(SO_ERROR)` for the result, and on timeout the fd is closed, leaving
 /// nothing behind.
-fn connect_within(
+pub(super) fn connect_within(
     path: &std::path::Path,
     budget: std::time::Duration,
 ) -> std::io::Result<UnixStream> {

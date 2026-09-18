@@ -1,4 +1,4 @@
-#![cfg(all(feature = "cli", unix))]
+#![cfg(feature = "cli")]
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,6 +13,11 @@ fn command(home: &Path) -> Command {
         .env("AGIT_HOME", home)
         .env("AGIT_HUB_URL", "http://127.0.0.1:9")
         .env("AGIT_TELEMETRY", "off")
+        .env("CI", "1")
+        .env(
+            "AGIT_SECRETS_KEYSTORE",
+            if cfg!(windows) { "os" } else { "file" },
+        )
         .env_remove("AGIT_SESSION")
         .env_remove("AGIT_RC")
         .stdin(Stdio::null());
@@ -23,11 +28,23 @@ struct Stop<'a>(&'a Path);
 impl Drop for Stop<'_> {
     fn drop(&mut self) {
         let _ = command(self.0).args(["rc", "stop"]).output();
+        #[cfg(windows)]
+        {
+            use agit::domain::secret_filter::KeyStore;
+            if let Ok(bytes) = std::fs::read(self.0.join("secret-filter/vault.json"))
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(id) = value["vault_id"].as_str()
+            {
+                let _ = agit::domain::secret_filter::OsKeyStore.delete(id);
+            }
+        }
     }
 }
 
+#[cfg(unix)]
 struct OwnedChild(std::process::Child);
 
+#[cfg(unix)]
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -35,6 +52,7 @@ impl Drop for OwnedChild {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn legacy_socket_uncertainty_is_shared_by_startup_and_status() {
     use std::os::unix::fs::MetadataExt;
@@ -53,6 +71,7 @@ fn legacy_socket_uncertainty_is_shared_by_startup_and_status() {
 
     for args in [
         ["rc", "local", "start", "--detach"].as_slice(),
+        ["rc", "local", "bridge", "--ensure"].as_slice(),
         ["rc", "local", "status"].as_slice(),
         ["rc", "status"].as_slice(),
     ] {
@@ -76,6 +95,7 @@ fn legacy_socket_uncertainty_is_shared_by_startup_and_status() {
 
 /// Kernel ownership must recover after a crash even when the diagnostic PID names a live,
 /// unrelated process. Synthesizing that reuse avoids depending on the host PID allocator.
+#[cfg(unix)]
 #[tokio::test]
 async fn crashed_owner_recovers_with_a_reused_live_pid() {
     use agit::rc::control::{Presence, presence_in, socket_path_for};
@@ -161,6 +181,7 @@ async fn crashed_owner_recovers_with_a_reused_live_pid() {
     std::fs::remove_file(socket).unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_daemon() {
     let directory = tempfile::tempdir().unwrap();
@@ -231,4 +252,79 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
             .status
             .success()
     );
+}
+
+#[tokio::test]
+async fn bridge_waits_for_another_process_to_release_the_lifecycle_lock() {
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::time::timeout;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    startup_cache::seed(&home);
+    let _cleanup = Stop(&home);
+    let started = command(&home)
+        .args(["rc", "local", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let status = command(&home)
+        .args(["rc", "local", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let before: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("desktop-rc/lifecycle.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let mut bridge = tokio::process::Command::from(command(&home))
+        .args(["rc", "local", "bridge", "--ensure"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    bridge
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"machine.describe\",\"params\":{}}\n",
+        )
+        .await
+        .unwrap();
+    let mut replies = BufReader::new(bridge.stdout.take().unwrap()).lines();
+    assert!(
+        timeout(Duration::from_secs(1), replies.next_line())
+            .await
+            .is_err(),
+        "a contended bridge must wait without replying or closing stdout"
+    );
+    assert!(
+        bridge.try_wait().unwrap().is_none(),
+        "lock contention must not terminate the bridge"
+    );
+
+    fs2::FileExt::unlock(&lock).unwrap();
+    let reply = timeout(Duration::from_secs(20), replies.next_line())
+        .await
+        .expect("bridge must attach after the lifecycle lock is released")
+        .unwrap()
+        .expect("bridge must deliver the pending RPC reply");
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["id"], 1);
+    assert!(reply["result"]["instance_id"].is_string(), "{reply}");
+    assert_eq!(
+        reply["result"]["instance_id"], before["identity"]["instance_id"],
+        "the waiting bridge must reuse the compatible daemon"
+    );
+    bridge.kill().await.unwrap();
 }

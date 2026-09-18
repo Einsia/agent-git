@@ -117,10 +117,11 @@ pub async fn dispatch(controller: &Controller, frame: Frame) -> Frame {
                     }
                 }
             }
-            _ => Ok(Frame::error_response(
-                id.clone(),
-                RpcError::new(ErrorCode::UnknownMethod, "unknown peer method"),
-            )),
+            _ => {
+                let mut error = RpcError::new(ErrorCode::UnknownMethod, "local controller does not support this peer method");
+                error.data = Some(json!({"origin":"local_controller", "hint":"inspect `agit rc local status` and use `agit rc local restart --if-idle` after user work finishes"}));
+                Ok(Frame::error_response(id.clone(), error))
+            },
         }
     }
     .await;
