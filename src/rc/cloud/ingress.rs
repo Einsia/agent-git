@@ -210,10 +210,15 @@ pub struct Client {
     controller: Option<delegation::Controller>,
     lease: Lease,
     state: Arc<RwLock<State>>,
-    permits: Arc<Mutex<HashMap<RequestId, Option<Permit>>>>,
+    permits: Arc<Mutex<HashMap<RequestId, Option<PendingPermit>>>>,
     live: Arc<RwLock<bool>>,
     session_events: Arc<AtomicBool>,
     log: Option<crate::rc::diagnostics::Log>,
+}
+
+struct PendingPermit {
+    permit: Permit,
+    observed: bool,
 }
 
 impl Drop for Client {
@@ -389,8 +394,42 @@ impl Client {
             request: id.clone(),
             log: self.log.clone(),
         });
-        permits.insert(id, Some(permit));
+        permits.insert(
+            id,
+            Some(PendingPermit {
+                permit,
+                observed: false,
+            }),
+        );
         Ok(frame)
+    }
+
+    pub(crate) fn observe_response(&self, frame: &Frame) {
+        let (Some(id), Some(result)) = (&frame.id, &frame.result) else {
+            return;
+        };
+        if !self.current() {
+            return;
+        }
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(Some(pending)) = permits.get_mut(id) else {
+            return;
+        };
+        if !pending.observed {
+            // Trusted response identities precede notification admission, independent of writer scheduling.
+            pending.permit.observe(
+                &mut self
+                    .state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .resources,
+                result,
+            );
+            pending.observed = true;
+        }
     }
 
     pub fn project(&self, record: &str) -> crate::Result<Option<String>> {
@@ -403,6 +442,7 @@ impl Client {
         if !self.current() {
             return Ok(None);
         }
+        self.observe_response(&frame);
         let permit = frame.id.as_ref().and_then(|id| {
             self.permits
                 .lock()
@@ -421,10 +461,8 @@ impl Client {
         if self.controller.is_some() && owner.is_none() {
             return Ok(None);
         }
-        if let Some(Some(permit)) = &permit {
-            if let Some(result) = &frame.result {
-                permit.observe(resources, result);
-            }
+        if let Some(Some(pending)) = &permit {
+            let permit = &pending.permit;
             let effective =
                 delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);
             frame = permit.response(frame, resources, &effective, &self.principal);
@@ -799,6 +837,61 @@ mod tests {
                 .is_err()
         );
         assert!(!utility.session_events.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn new_session_events_are_admitted_before_the_creation_receipt_is_written() {
+        let registry = Registry::fixed(
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal(),
+                    resource: Resource::Project("project".into()),
+                    access: Access::Control,
+                }],
+            )
+            .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        registry.state.write().unwrap().resources.observe(
+            "project.bind",
+            &json!({
+                "project_id":"project", "local_path":root.path(),
+            }),
+        );
+        let client = registry.client(principal(), i64::MAX);
+        let request = client
+            .authorize(Frame::request(
+                "session.start",
+                json!({"project_id":"project"}),
+            ))
+            .unwrap();
+        let response = Frame::response(
+            request.id.clone().unwrap(),
+            json!({"session":{
+                "session_id":"new", "runtime_session_id":"native", "runtime":"codex",
+                "workspace_id":crate::rc::endpoint::WORKSPACE, "project_id":"project",
+            }}),
+        );
+        let mut event = Frame::notification("item.completed", json!({}));
+        event.stream = Some("new".into());
+        assert!(!client.accepts_notification(&event));
+        let mut unrelated = response.clone();
+        unrelated.id = Some(RequestId::Str("unrelated".into()));
+        client.observe_response(&unrelated);
+        assert!(!client.accepts_notification(&event));
+        client.observe_response(&response);
+        assert!(client.accepts_notification(&event));
+        assert!(matches!(client.authorize(request), Err(Rejection::Close)));
+        registry.state.write().unwrap().policy = Policy::default();
+        assert!(client.project(&event.to_json()).unwrap().is_none());
+        let written = client.project(&response.to_json()).unwrap().unwrap();
+        assert!(
+            serde_json::from_str::<Frame>(&written)
+                .unwrap()
+                .error
+                .is_some()
+        );
     }
 
     #[tokio::test]

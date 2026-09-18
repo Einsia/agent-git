@@ -484,6 +484,9 @@ async fn serve_described(
                         }
                         frame.id = Some(original);
                         if let Some(peer) = clients.get(&client) {
+                            if let Some(cloud) = &peer.cloud {
+                                cloud.observe_response(&frame);
+                            }
                             let result = if let Some(replay) = replay {
                                 let frames = replay.frames.len();
                                 let result = peer.output.send_replay(frame.to_json(), replay, work);
