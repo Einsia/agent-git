@@ -41,6 +41,8 @@ fn engine() -> (tempfile::TempDir, OpenCodeEngine) {
         }),
         seen_approvals: super::super::BoundedTurnIds::default(),
         exited: false,
+        config_options: vec![],
+        pending_config: None,
     };
     (root, engine)
 }
@@ -62,6 +64,60 @@ async fn output(engine: &mut OpenCodeEngine) -> Value {
         Line::Json(value) => value,
         other => panic!("expected JSON, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn model_settings_follow_acp_choices_and_keep_prompt_delivery_available() {
+    let (_root, mut engine) = engine();
+    engine.proc.shutdown().await.unwrap();
+    let options = json!([
+        {"id":"model","type":"select","currentValue":"provider/first","options":[
+            {"group":"Provider","options":[{"value":"provider/first","name":"First"},{"value":"provider/second","name":"Second"}]}]},
+        {"id":"effort","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"careful","name":"Careful"}]}
+    ]);
+    engine.capture_config(&json!({"configOptions":options}));
+    let script = r#"import sys,json
+options=json.loads(sys.argv[1])
+for line in sys.stdin:
+    v=json.loads(line)
+    if v['method']=='session/prompt':
+        print(json.dumps(v),flush=True)
+        continue
+    assert v['method']=='session/set_config_option'
+    assert v['params']['sessionId']=='ses_owned'
+    for option in options:
+        if option['id']==v['params']['configId']: option['currentValue']=v['params']['value']
+    print(json.dumps({'jsonrpc':'2.0','id':v['id'],'result':{'configOptions':options}}),flush=True)
+"#;
+    engine.proc = Proc::spawn(
+        "python3",
+        &["-u".into(), "-c".into(), script.into(), options.to_string()],
+        &engine.spec.cwd,
+        &[],
+    )
+    .unwrap();
+    let patch =
+        super::super::models::ModelPatch::parse(&json!({"model":"provider/second"})).unwrap();
+    let state = engine.model_control(Some(&patch)).await.unwrap();
+    assert_eq!(state["model"], "provider/second");
+    assert_eq!(state["models"][1]["id"], "provider/second");
+    let patch = super::super::models::ModelPatch::parse(&json!({"effort":"careful"})).unwrap();
+    assert_eq!(
+        engine.model_control(Some(&patch)).await.unwrap()["effort"],
+        "careful"
+    );
+    let reset = super::super::models::ModelPatch::parse(&json!({"effort":null})).unwrap();
+    assert_eq!(
+        engine.model_control(Some(&reset)).await.unwrap()["effort"],
+        "default"
+    );
+    assert_eq!(
+        engine.start_turn("Keep this conversation going").await,
+        TurnStartDispatch::Awaiting
+    );
+    assert_eq!(output(&mut engine).await["method"], "session/prompt");
+    assert!(engine.model_control(Some(&patch)).await.is_err());
+    engine.proc.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -315,6 +315,10 @@ pub struct CodexDriver {
     cwd: PathBuf,
     resume_from: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    pending_model: Option<(String, Option<String>)>,
+    model_catalog: Vec<Value>,
+    default_model: Option<String>,
     turn_options: serde_json::Map<String, Value>,
     started: bool,
     command_requests: std::collections::HashSet<i64>,
@@ -396,6 +400,10 @@ impl CodexDriver {
             cwd: spec.cwd.clone(),
             resume_from: spec.resume_from.clone(),
             model: spec.model.clone(),
+            effort: None,
+            pending_model: None,
+            model_catalog: vec![],
+            default_model: None,
             turn_options: Default::default(),
             started: false,
             handshake_request: None,
@@ -578,8 +586,21 @@ impl CodexDriver {
             "threadId": tid,
             "input": [{"type":"text","text": message, "text_elements": []}]
         });
-        if let Some(model) = &self.model {
+        let model = self
+            .pending_model
+            .as_ref()
+            .map(|p| &p.0)
+            .or(self.model.as_ref());
+        let effort = self
+            .pending_model
+            .as_ref()
+            .map(|p| p.1.as_ref())
+            .unwrap_or(self.effort.as_ref());
+        if let Some(model) = model {
             params["model"] = json!(model);
+        }
+        if let Some(effort) = effort {
+            params["effort"] = json!(effort);
         }
         if let Some(prompt_id) = prompt_id {
             params["clientUserMessageId"] = json!(prompt_id);
@@ -590,9 +611,9 @@ impl CodexDriver {
             .extend(self.turn_options.clone());
         let effective_mode = staged_mode.unwrap_or(self.mode);
         if (effective_mode == PermissionMode::Plan || self.mode == PermissionMode::Plan)
-            && let Some(model) = &self.model
+            && let Some(model) = model
         {
-            params["collaborationMode"] = json!({"mode":if effective_mode == PermissionMode::Plan {"plan"} else {"default"},"settings":{"model":model,"reasoning_effort":null,"developer_instructions":null}});
+            params["collaborationMode"] = json!({"mode":if effective_mode == PermissionMode::Plan {"plan"} else {"default"},"settings":{"model":model,"reasoning_effort":effort,"developer_instructions":null}});
         }
         // A queued mode change lands here, because this is the only place codex
         // lets it land. The override is sticky ("this turn and subsequent
@@ -718,11 +739,115 @@ impl CodexDriver {
         Ok(PermissionApply::NextTurn)
     }
 
-    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
-        if let Some(model) = model {
-            self.model = Some(model.to_string());
+    pub async fn model_control(
+        &mut self,
+        patch: Option<&super::models::ModelPatch>,
+    ) -> crate::Result<Value> {
+        anyhow::ensure!(
+            self.thread_id.is_some() && self.handshake_request.is_none(),
+            "The Codex thread is still opening"
+        );
+        if self.model_catalog.is_empty() {
+            let mut cursor = Value::Null;
+            let mut seen = std::collections::HashSet::new();
+            let mut catalog = vec![];
+            loop {
+                let native = self
+                    .command_request("model/list", json!({"limit":100,"cursor":cursor}))
+                    .await?;
+                catalog.extend(super::models::normalize("codex", &native)?);
+                cursor = native.get("nextCursor").cloned().unwrap_or(Value::Null);
+                if cursor.is_null() {
+                    break;
+                }
+                anyhow::ensure!(
+                    catalog.len() <= 2048 && seen.insert(cursor.to_string()),
+                    "Runtime model pagination did not converge"
+                );
+            }
+            self.default_model = match self
+                .command_request("config/read", json!({"cwd":self.cwd,"includeLayers":false}))
+                .await
+            {
+                Ok(config) => config["config"]["model"]
+                    .as_str()
+                    .map(String::from)
+                    .or_else(|| {
+                        super::models::selected(&catalog, None)
+                            .and_then(|v| v["id"].as_str())
+                            .map(String::from)
+                    }),
+                Err(_) => None,
+            };
+            self.model_catalog = catalog;
         }
-        Ok(json!({"model": self.model, "applied": "next_turn"}))
+        if let Some(patch) = patch {
+            anyhow::ensure!(
+                self.current_turn.is_none() && self.pending_turn_start.is_none(),
+                "Wait for the current turn before changing model settings"
+            );
+            let current = self
+                .pending_model
+                .as_ref()
+                .map(|p| p.0.as_str())
+                .or(self.model.as_deref());
+            let selected = match &patch.model {
+                Some(Some(model)) => super::models::selected(&self.model_catalog, Some(model)),
+                Some(None) => self
+                    .default_model
+                    .as_deref()
+                    .and_then(|id| super::models::selected(&self.model_catalog, Some(id))),
+                None => super::models::selected(&self.model_catalog, current),
+            }
+            .ok_or_else(|| anyhow::anyhow!("This model is absent from the native catalog"))?;
+            let model = selected["id"]
+                .as_str()
+                .expect("normalized model")
+                .to_string();
+            let default = selected["default_effort"].as_str().map(String::from);
+            let effort = match &patch.effort {
+                Some(Some(value)) => {
+                    super::models::check_effort(Some(selected), value)?;
+                    Some(value.clone())
+                }
+                Some(None) => {
+                    anyhow::ensure!(
+                        default.is_some(),
+                        "This model does not advertise a default effort"
+                    );
+                    default
+                }
+                None if patch.model.is_some() => default,
+                None => self
+                    .pending_model
+                    .as_ref()
+                    .map(|p| p.1.clone())
+                    .unwrap_or_else(|| self.effort.clone()),
+            };
+            self.pending_model = Some((model, effort));
+        }
+        let desired = self
+            .pending_model
+            .as_ref()
+            .map(|p| p.0.as_str())
+            .or(self.model.as_deref());
+        let selected = super::models::selected(&self.model_catalog, desired);
+        let efforts = super::models::efforts(selected);
+        Ok(
+            json!({"model":self.model,"effort":self.effort,"effort_known":self.effort.is_some(),
+            "pending":self.pending_model.as_ref().map(|p| json!({"model":p.0,"effort":p.1})),
+            "models":self.model_catalog,"efforts":efforts,"applied":if self.pending_model.is_some() {"next_turn"} else {"immediate"},
+            "capabilities":{"model":true,"effort":efforts.as_array().is_some_and(|v| !v.is_empty()),
+                "reset_model":self.default_model.as_deref().is_some_and(|id| super::models::selected(&self.model_catalog, Some(id)).is_some()),
+                "reset_effort":selected.is_some_and(|v| v["default_effort"].is_string())}}),
+        )
+    }
+
+    fn confirm_model_settings(&mut self) {
+        if let Some((model, effort)) = self.pending_model.take() {
+            self.model = Some(model);
+            self.effort = effort;
+        }
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -758,6 +883,7 @@ impl CodexDriver {
             if let Some(mode) = pending.staged_mode {
                 self.mode = mode;
             }
+            self.confirm_model_settings();
             self.current_turn = (!pending.completed).then(|| turn_id.clone());
             Ok(TurnStartOutcome::Accepted {
                 turn_id,
@@ -1116,6 +1242,7 @@ impl CodexDriver {
                     consumed_mode,
                     ..
                 } => {
+                    self.confirm_model_settings();
                     *still_running = !pending.completed;
                     self.current_turn = (*still_running).then(|| turn_id.clone());
                     if let Some(mode) = consumed_mode {
@@ -1229,6 +1356,7 @@ impl CodexDriver {
                     .and_then(|t| t.get("id"))
                     .and_then(|x| x.as_str())
                 {
+                    self.effort = res["reasoningEffort"].as_str().map(String::from);
                     self.model = res["model"]
                         .as_str()
                         .map(String::from)
@@ -1650,6 +1778,10 @@ impl CodexDriver {
             cwd,
             resume_from: None,
             model: None,
+            effort: None,
+            pending_model: None,
+            model_catalog: vec![],
+            default_model: None,
             turn_options: Default::default(),
             started: thread_id.is_some(),
             handshake_request: None,
@@ -1768,6 +1900,10 @@ mod tests {
             cwd,
             resume_from: None,
             model: None,
+            effort: None,
+            pending_model: None,
+            model_catalog: vec![],
+            default_model: None,
             turn_options: Default::default(),
             started: false,
             handshake_request: None,
@@ -1811,8 +1947,16 @@ mod tests {
     async fn selected_options_and_plan_mode_are_sent_on_the_next_native_turn() {
         let mut driver = probe();
         driver.thread_id = Some("thread".into());
+        driver.model_catalog = vec![
+            json!({"id":"selected-native-model","efforts":[{"id":"high"}],"default_effort":"high"}),
+        ];
         let result = driver
-            .model_control(Some("selected-native-model"))
+            .model_control(Some(
+                &super::super::models::ModelPatch::parse(
+                    &json!({"model":"selected-native-model","effort":"high"}),
+                )
+                .unwrap(),
+            ))
             .await
             .unwrap();
         assert_eq!(result["applied"], "next_turn");
@@ -1833,12 +1977,36 @@ mod tests {
         };
         assert_eq!(request["method"], "turn/start");
         assert_eq!(request["params"]["model"], "selected-native-model");
+        assert_eq!(request["params"]["effort"], "high");
         assert_eq!(request["params"]["personality"], "friendly");
         assert_eq!(request["params"]["serviceTier"], "fast");
         assert_eq!(request["params"]["collaborationMode"]["mode"], "plan");
         assert_eq!(
             request["params"]["collaborationMode"]["settings"]["model"],
             "selected-native-model"
+        );
+        assert_eq!(
+            request["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+        let request_id = request["id"].clone();
+        assert!(driver.model_control(None).await.unwrap()["pending"].is_object());
+        driver
+            .classify(
+                json!({"id":request_id,"result":{"turn":{"id":"confirmed","status":"inProgress"}}}),
+            )
+            .await;
+        let state = driver.model_control(None).await.unwrap();
+        assert_eq!(state["model"], "selected-native-model");
+        assert_eq!(state["effort"], "high");
+        assert!(state["pending"].is_null());
+        assert!(
+            driver
+                .model_control(Some(
+                    &super::super::models::ModelPatch::parse(&json!({"effort":"high"})).unwrap()
+                ))
+                .await
+                .is_err()
         );
         driver.shutdown().await.unwrap();
     }

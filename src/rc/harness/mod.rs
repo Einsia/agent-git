@@ -647,11 +647,14 @@ impl AnyDriver {
         }
     }
 
-    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
+    pub async fn model_control(
+        &mut self,
+        model: Option<&models::ModelPatch>,
+    ) -> crate::Result<Value> {
         match self {
             Self::Codex(d) => d.model_control(model).await,
             Self::ClaudeCode(d) => d.model_control(model).await,
-            _ => anyhow::bail!("this runtime does not support model control"),
+            Self::OpenCode(d) => d.model_control(model).await,
         }
     }
 

@@ -4,6 +4,66 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+/// Omission preserves a setting; JSON null (or a legacy empty string) restores its default.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPatch {
+    pub model: Option<Option<String>>,
+    pub effort: Option<Option<String>>,
+}
+
+impl ModelPatch {
+    pub fn parse(params: &Value) -> crate::Result<Self> {
+        fn field(params: &Value, name: &str) -> crate::Result<Option<Option<String>>> {
+            let Some(value) = params.get(name) else {
+                return Ok(None);
+            };
+            if value.is_null() || value == "" {
+                return Ok(Some(None));
+            }
+            let value = value
+                .as_str()
+                .filter(|s| {
+                    !s.trim().is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
+                })
+                .with_context(|| format!("{name} must be an identifier or null"))?;
+            Ok(Some(Some(value.into())))
+        }
+        let patch = Self {
+            model: field(params, "model")?,
+            effort: field(params, "effort")?,
+        };
+        ensure!(
+            patch.model.is_some() || patch.effort.is_some(),
+            "Choose a model or effort to change"
+        );
+        Ok(patch)
+    }
+}
+
+pub(super) fn selected<'a>(catalog: &'a [Value], model: Option<&str>) -> Option<&'a Value> {
+    catalog.iter().find(|entry| match model {
+        Some(id) => entry["id"] == id || entry["native"]["resolvedModel"] == id,
+        None => entry["is_default"] == true || entry["id"] == "default",
+    })
+}
+
+pub(super) fn efforts(model: Option<&Value>) -> Value {
+    model
+        .and_then(|m| m.get("efforts"))
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
+pub(super) fn check_effort(model: Option<&Value>, effort: &str) -> crate::Result<()> {
+    ensure!(
+        efforts(model)
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["id"] == effort)),
+        "This model does not advertise the requested effort"
+    );
+    Ok(())
+}
+
 async fn response(proc: &mut Proc, id: Value, claude: bool) -> crate::Result<Value> {
     while let Some(line) = proc.next().await {
         if let Line::Json(value) = line.line() {
@@ -102,14 +162,25 @@ pub async fn discover(runtime: &str, cwd: PathBuf) -> crate::Result<Value> {
     value
 }
 
-fn normalize(runtime: &str, native: &Value) -> crate::Result<Vec<Value>> {
+pub(super) fn normalize(runtime: &str, native: &Value) -> crate::Result<Vec<Value>> {
     let list = native
         .get(if runtime == "codex" { "data" } else { "models" })
         .and_then(Value::as_array)
         .context("Runtime did not advertise a model list")?;
     Ok(list.iter().filter(|entry| entry.get("hidden") != Some(&json!(true))).filter_map(|entry| {
         let id = entry.get(if runtime == "codex" { "model" } else { "value" })?.as_str()?;
-        Some(json!({"id":id, "name":entry.get("displayName").and_then(Value::as_str).unwrap_or(id), "description":entry.get("description").and_then(Value::as_str).unwrap_or(""), "native":entry}))
+        let efforts = if runtime == "codex" {
+            entry["supportedReasoningEfforts"].as_array().into_iter().flatten().filter_map(|v| {
+                let id = v["reasoningEffort"].as_str()?;
+                Some(json!({"id":id,"name":id,"description":v["description"]}))
+            }).collect::<Vec<_>>()
+        } else {
+            entry["supportedEffortLevels"].as_array().into_iter().flatten().filter_map(|v| {
+                let id = v.as_str()?;
+                Some(json!({"id":id,"name":id}))
+            }).collect()
+        };
+        Some(json!({"id":id, "name":entry.get("displayName").and_then(Value::as_str).unwrap_or(id), "description":entry.get("description").and_then(Value::as_str).unwrap_or(""), "efforts":efforts,"default_effort":entry["defaultReasoningEffort"],"is_default":entry["isDefault"], "native":entry}))
     }).collect())
 }
 
@@ -117,11 +188,28 @@ fn normalize(runtime: &str, native: &Value) -> crate::Result<Vec<Value>> {
 mod tests {
     use super::*;
     #[test]
+    fn settings_patches_distinguish_omission_reset_and_native_identifiers() {
+        let patch = ModelPatch::parse(&json!({"model":"provider/model", "effort":null})).unwrap();
+        assert_eq!(patch.model, Some(Some("provider/model".into())));
+        assert_eq!(patch.effort, Some(None));
+        let patch = ModelPatch::parse(&json!({"model":""})).unwrap();
+        assert_eq!(patch.model, Some(None));
+        assert_eq!(patch.effort, None);
+        for params in [
+            json!({}),
+            json!({"effort":false}),
+            json!({"model":"bad\nmodel"}),
+        ] {
+            assert!(ModelPatch::parse(&params).is_err());
+        }
+    }
+    #[test]
     fn catalogs_preserve_native_ids_and_metadata() {
         let c = normalize("codex", &json!({"data":[{"id":"ui-id","model":"wire-model","displayName":"Model","supportedReasoningEfforts":[{"reasoningEffort":"high"}]},{"model":"hidden","hidden":true}]})).unwrap();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0]["id"], "wire-model");
         assert!(c[0]["native"]["supportedReasoningEfforts"].is_array());
+        assert_eq!(c[0]["efforts"][0]["id"], "high");
         let c = normalize("claude-code", &json!({"models":[{"value":"custom-alias","resolvedModel":"provider-id","displayName":"Custom"}]})).unwrap();
         assert_eq!(c[0]["id"], "custom-alias");
         assert_eq!(c[0]["native"]["resolvedModel"], "provider-id");

@@ -110,6 +110,10 @@ impl CodexDriver {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or(self.model.take());
+            self.effort = result
+                .get("reasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             self.handshake_request = None;
             self.opening_ready = Some(HarnessEvent::Ready {
                 runtime_thread_id: native.to_owned(),
@@ -141,11 +145,12 @@ mod tests {
         let mut driver = driver(Some("native"), &[
             json!({"id":1,"result":{}}),
             json!({"method":"thread/started","params":{"threadId":"native"}}),
-            json!({"id":2,"result":{"thread":{"id":"native"},"model":"fixture"}}),
+            json!({"id":2,"result":{"thread":{"id":"native"},"model":"fixture","reasoningEffort":"high"}}),
             json!({"method":"thread/goal/updated","params":{"threadId":"native","goal":{"text":"fixture goal"}}}),
         ]).await;
         driver.confirm_opening().await.unwrap();
         assert_eq!(driver.runtime_thread_id(), Some("native"));
+        assert_eq!(driver.effort.as_deref(), Some("high"));
         assert!(
             matches!(driver.next_event().await, Some(HarnessEvent::Ready { runtime_thread_id, .. }) if runtime_thread_id == "native")
         );

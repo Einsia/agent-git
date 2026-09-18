@@ -38,6 +38,10 @@ enum Command {
     Start(String, oneshot::Sender<TurnStartDispatch>),
     Interrupt(oneshot::Sender<crate::Result<()>>),
     Approve(ApprovalResponse, oneshot::Sender<ApprovalOutcome>),
+    Model(
+        Option<super::models::ModelPatch>,
+        oneshot::Sender<crate::Result<Value>>,
+    ),
     Shutdown,
 }
 
@@ -152,6 +156,27 @@ impl OpenCodeDriver {
         )
     }
 
+    pub async fn model_control(
+        &mut self,
+        patch: Option<&super::models::ModelPatch>,
+    ) -> crate::Result<Value> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.runtime_thread_id().is_none() && !self.commands.is_closed() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("OpenCode is still opening its settings"))?;
+        let (send, receive) = oneshot::channel();
+        self.commands
+            .send(Command::Model(patch.cloned(), send))
+            .await
+            .map_err(|_| anyhow::anyhow!("OpenCode control plane has ended"))?;
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("OpenCode model settings outcome is unknown"))?
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         PermissionMode::Default
     }
@@ -260,6 +285,12 @@ async fn run_engine(
                     let _ = reply.send(result);
                 }
             }
+            Input::Command(Some(Command::Model(patch, reply))) => {
+                if !reply.is_closed() {
+                    let result = engine.model_control(patch.as_ref()).await;
+                    let _ = reply.send(result);
+                }
+            }
             Input::Command(Some(Command::Shutdown) | None) => break,
             Input::Timeout => {
                 let event = engine.fatal("OpenCode ACP response timed out");
@@ -356,6 +387,8 @@ struct OpenCodeEngine {
     source: Option<crate::adapter::native_snapshot::Source>,
     seen_approvals: super::BoundedTurnIds,
     exited: bool,
+    config_options: Vec<Value>,
+    pending_config: Option<u64>,
 }
 
 fn launch_env(spec: &LaunchSpec, agent: &str) -> crate::Result<Vec<(String, String)>> {
@@ -423,6 +456,8 @@ impl OpenCodeEngine {
             source: None,
             seen_approvals: super::BoundedTurnIds::default(),
             exited: false,
+            config_options: vec![],
+            pending_config: None,
         };
         if driver
             .request(
@@ -458,6 +493,136 @@ impl OpenCodeEngine {
         (self.phase == Phase::Ready)
             .then_some(self.session.as_deref())
             .flatten()
+    }
+
+    fn config(&self, id: &str) -> Option<&Value> {
+        self.config_options
+            .iter()
+            .find(|option| option["id"] == id && option["type"] == "select")
+    }
+
+    fn capture_config(&mut self, value: &Value) {
+        if let Some(options) = value["configOptions"].as_array() {
+            self.config_options = options.clone();
+        }
+    }
+
+    fn model_state(&self) -> Value {
+        fn options(config: Option<&Value>) -> Vec<Value> {
+            fn append(rows: &[Value], output: &mut Vec<Value>) {
+                for row in rows {
+                    if let Some(group) = row["options"].as_array() {
+                        append(group, output);
+                    } else if let Some(id) = row["value"].as_str() {
+                        output.push(json!({"id":id,"name":row["name"].as_str().unwrap_or(id),"description":row["description"]}));
+                    }
+                }
+            }
+            let mut output = vec![];
+            if let Some(rows) = config.and_then(|v| v["options"].as_array()) {
+                append(rows, &mut output);
+            }
+            output
+        }
+        let model = self.config("model");
+        let effort = self.config("effort");
+        let efforts = options(effort);
+        let ready = self.pending_config.is_none();
+        json!({"model":model.map(|v| &v["currentValue"]),"effort":effort.map(|v| &v["currentValue"]),
+            "effort_known":effort.is_some() && ready,"models":options(model),"efforts":efforts,"pending":null,"settings_unknown":!ready,"applied":"immediate",
+            "capabilities":{"model":model.is_some() && ready,"effort":effort.is_some() && ready,
+                "reset_model":false,"reset_effort":efforts.iter().any(|v| v["id"] == "default")}})
+    }
+
+    async fn config_request(&mut self, id: &str, value: &str) -> crate::Result<()> {
+        self.pending_config = Some(self.next_id);
+        let request = self
+            .request(
+                "session/set_config_option",
+                json!({"sessionId":self.session,"configId":id,"value":value}),
+            )
+            .await?;
+        self.pending_config = Some(request);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(line) = self.proc.next().await {
+                match line.into_line() {
+                    Line::Json(frame)
+                        if frame["id"].as_u64() == Some(request)
+                            && frame.get("method").is_none() =>
+                    {
+                        self.pending_config = None;
+                        anyhow::ensure!(
+                            frame.get("error").is_none(),
+                            "OpenCode refused model settings: {}",
+                            frame["error"]
+                        );
+                        anyhow::ensure!(
+                            frame["result"]["configOptions"].is_array(),
+                            "OpenCode returned no model settings"
+                        );
+                        self.capture_config(&frame["result"]);
+                        return Ok(());
+                    }
+                    Line::Json(frame) => self.frame(frame).await?,
+                    Line::Notice(_) => {}
+                    _ => anyhow::bail!("OpenCode ended before confirming model settings"),
+                }
+            }
+            anyhow::bail!("OpenCode ended before confirming model settings")
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Model settings outcome is unknown; waiting for OpenCode confirmation")
+        })?
+    }
+
+    async fn model_control(
+        &mut self,
+        patch: Option<&super::models::ModelPatch>,
+    ) -> crate::Result<Value> {
+        anyhow::ensure!(self.phase == Phase::Ready, "OpenCode is still opening");
+        if let Some(patch) = patch {
+            anyhow::ensure!(
+                self.turn.is_none(),
+                "Wait for the current turn before changing model settings"
+            );
+            anyhow::ensure!(
+                self.pending_config.is_none(),
+                "A native settings change is still awaiting confirmation"
+            );
+            // ACP returns the new effort choices after a model change, so each change is acknowledged separately.
+            anyhow::ensure!(
+                patch.model.is_none() || patch.effort.is_none(),
+                "Change the model before choosing its effort"
+            );
+            let (id, value) = if let Some(model) = &patch.model {
+                (
+                    "model",
+                    model.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("OpenCode does not advertise a default model reset")
+                    })?,
+                )
+            } else {
+                (
+                    "effort",
+                    patch
+                        .effort
+                        .as_ref()
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("default"),
+                )
+            };
+            let state = self.model_state();
+            let options = &state[if id == "model" { "models" } else { "efforts" }];
+            anyhow::ensure!(
+                options
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().any(|v| v["id"] == value)),
+                "OpenCode does not advertise this setting"
+            );
+            self.config_request(id, value).await?;
+        }
+        Ok(self.model_state())
     }
 
     async fn read_snapshot(&mut self) -> crate::Result<()> {
@@ -637,6 +802,9 @@ impl OpenCodeEngine {
                 anyhow::bail!("OpenCode update belongs to another session");
             }
             let update = &params["update"];
+            if update["sessionUpdate"] == "config_option_update" {
+                self.capture_config(update);
+            }
             if matches!(
                 update["sessionUpdate"].as_str(),
                 Some(
@@ -666,6 +834,13 @@ impl OpenCodeEngine {
         let id = frame["id"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("OpenCode response id is invalid"))?;
+        if self.pending_config == Some(id) {
+            self.pending_config = None;
+            if frame.get("error").is_none() {
+                self.capture_config(&frame["result"]);
+            }
+            return Ok(());
+        }
         if self.phase != Phase::Ready {
             if id != self.phase_request {
                 anyhow::bail!("OpenCode handshake response does not match its request");
@@ -673,6 +848,7 @@ impl OpenCodeEngine {
             if frame.get("error").is_some() || !frame["result"].is_object() {
                 anyhow::bail!("OpenCode ACP handshake was rejected");
             }
+            self.capture_config(&frame["result"]);
             match self.phase {
                 Phase::Initialize => {
                     if frame["result"]["protocolVersion"] != 1 {

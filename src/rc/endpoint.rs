@@ -254,9 +254,9 @@ pub async fn serve(
         }
     };
     let capabilities = tokio::task::spawn_blocking(|| {
-        ["codex", "claude-code"]
+        super::harness::drivable()
             .into_iter()
-            .map(|runtime| (runtime, super::harness::capability_of(runtime)))
+            .map(|capability| (capability.runtime.clone(), capability))
             .collect::<std::collections::BTreeMap<_, _>>()
     })
     .await?;

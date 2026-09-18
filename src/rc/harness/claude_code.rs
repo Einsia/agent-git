@@ -302,6 +302,11 @@ pub struct ClaudeCodeDriver {
     /// control without asking the harness.
     mode: PermissionMode,
     model: Option<String>,
+    effort: Option<String>,
+    effort_known: bool,
+    model_choice: Option<String>,
+    model_catalog: Vec<Value>,
+    pending_model_request: Option<(String, Value)>,
     /// Set once the first `system/init` arrives.
     ready_sent: bool,
     /// Slash commands the CLI advertised in its handshake. Surfaced to viewers
@@ -404,6 +409,10 @@ impl ClaudeCodeDriver {
         .await
         .map_err(LaunchError::spawned)?;
 
+        let model_choice = spec
+            .model
+            .clone()
+            .or_else(|| spec.resume_from.is_none().then(|| "default".into()));
         Ok(ClaudeCodeDriver {
             proc,
             session_id,
@@ -414,6 +423,11 @@ impl ClaudeCodeDriver {
             pending_approvals: Default::default(),
             mode,
             model: spec.model,
+            effort: None,
+            effort_known: false,
+            model_choice,
+            model_catalog: vec![],
+            pending_model_request: None,
             ready_sent: false,
             commands: vec![],
             pushback: Default::default(),
@@ -695,42 +709,147 @@ impl ClaudeCodeDriver {
         }
     }
 
-    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
-        if let Some(model) = model {
-            let id = uuid::Uuid::new_v4().to_string();
-            self.proc
-                .write_line(&json!({"type":"control_request", "request_id":id,
-                "request":{"subtype":"set_model", "model":model}}))
-                .await?;
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while let Some(line) = self.proc.next().await {
-                    if let Line::Json(v) = line.line()
-                        && v.pointer("/response/request_id").and_then(Value::as_str)
-                            == Some(id.as_str())
-                    {
-                        anyhow::ensure!(
-                            v.pointer("/response/subtype").and_then(Value::as_str)
-                                == Some("success"),
-                            "Claude refused model change: {}",
-                            v["response"]
-                        );
-                        return Ok(());
-                    }
-                    self.pushback.push(line);
+    async fn model_request(&mut self, request: Value) -> crate::Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.pending_model_request = Some((id.clone(), request.clone()));
+        self.proc
+            .write_line(&json!({"type":"control_request","request_id":id,"request":request}))
+            .await?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(line) = self.proc.next().await {
+                if let Line::Json(v) = line.line()
+                    && v.pointer("/response/request_id").and_then(Value::as_str)
+                        == Some(id.as_str())
+                {
+                    self.capture_model_response(v);
+                    anyhow::ensure!(
+                        v.pointer("/response/subtype").and_then(Value::as_str) == Some("success"),
+                        "Claude refused model settings: {}",
+                        v["response"]
+                    );
+                    return Ok(());
                 }
-                anyhow::bail!("Claude exited before confirming the model change")
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => self.model = Some(model.to_string()),
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    self.model = None;
-                    anyhow::bail!("Model change outcome is unknown; reconnect before retrying");
-                }
+                self.pushback.push(line);
+            }
+            anyhow::bail!("Claude exited before confirming model settings")
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                anyhow::bail!("Model settings outcome is unknown; waiting for Claude confirmation")
             }
         }
-        Ok(json!({"model":self.model, "applied":"immediate"}))
+    }
+
+    fn capture_model_response(&mut self, response: &Value) {
+        let Some((id, _)) = &self.pending_model_request else {
+            return;
+        };
+        if response
+            .pointer("/response/request_id")
+            .and_then(Value::as_str)
+            != Some(id.as_str())
+        {
+            return;
+        }
+        let (_, request) = self
+            .pending_model_request
+            .take()
+            .expect("matched settings request");
+        if response
+            .pointer("/response/subtype")
+            .and_then(Value::as_str)
+            != Some("success")
+        {
+            return;
+        }
+        if request["subtype"] == "set_model" {
+            self.model = request["model"].as_str().map(String::from);
+            self.model_choice = Some(self.model.clone().unwrap_or_else(|| "default".into()));
+        } else if request["subtype"] == "apply_flag_settings" {
+            self.effort = request["settings"]["effortLevel"]
+                .as_str()
+                .map(String::from);
+            self.effort_known = true;
+        }
+    }
+
+    pub async fn model_control(
+        &mut self,
+        patch: Option<&super::models::ModelPatch>,
+    ) -> crate::Result<Value> {
+        if self.model_catalog.is_empty() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(line) = self.proc.next().await {
+                    let found = if let Line::Json(value) = line.line() {
+                        let native = &value["response"]["response"];
+                        if let Ok(models) = super::models::normalize("claude-code", native) {
+                            self.model_catalog = models;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    self.pushback.push(line);
+                    if found {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Claude is still opening its model catalog"))?;
+        }
+        if let Some(patch) = patch {
+            anyhow::ensure!(
+                self.pending_model_request.is_none(),
+                "A native settings change is still awaiting confirmation"
+            );
+            anyhow::ensure!(
+                self.current_turn.is_none() && !self.interrupt_draining,
+                "Wait for the current turn before changing model settings"
+            );
+            let desired = patch
+                .model
+                .as_ref()
+                .map(|m| m.as_deref())
+                .unwrap_or(self.model_choice.as_deref().or(self.model.as_deref()));
+            let selected = super::models::selected(&self.model_catalog, desired);
+            let supports_effort = super::models::efforts(selected)
+                .as_array()
+                .is_some_and(|values| !values.is_empty());
+            if let Some(Some(effort)) = &patch.effort {
+                super::models::check_effort(selected, effort)?;
+            }
+            if let Some(model) = &patch.model {
+                self.model_request(json!({"subtype":"set_model","model":model}))
+                    .await?;
+            }
+            // A model switch clears the override so an old model's effort cannot leak into a new one.
+            let effort = patch.effort.as_ref().cloned().or_else(|| {
+                patch
+                    .model
+                    .as_ref()
+                    .and_then(|_| (supports_effort || self.effort_known).then_some(None))
+            });
+            if let Some(effort) = effort {
+                self.model_request(
+                    json!({"subtype":"apply_flag_settings","settings":{"effortLevel":effort}}),
+                )
+                .await?;
+            }
+        }
+        let efforts = super::models::efforts(super::models::selected(
+            &self.model_catalog,
+            self.model_choice.as_deref().or(self.model.as_deref()),
+        ));
+        Ok(
+            json!({"model":self.model,"selected_model":self.model_choice,"effort":self.effort,"effort_known":self.effort_known && self.pending_model_request.is_none(),"pending":null,"settings_unknown":self.pending_model_request.is_some(),
+            "models":self.model_catalog,"efforts":efforts,"applied":"immediate",
+            "capabilities":{"model":self.pending_model_request.is_none(),"effort":self.pending_model_request.is_none() && efforts.as_array().is_some_and(|v| !v.is_empty()),"reset_model":true,"reset_effort":true}}),
+        )
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -829,7 +948,11 @@ impl ClaudeCodeDriver {
 
             // The handshake reply carries the slash-command catalogue.
             "control_response" => {
+                self.capture_model_response(&v);
                 let r = v.get("response")?.get("response")?;
+                if let Ok(models) = super::models::normalize("claude-code", r) {
+                    self.model_catalog = models;
+                }
                 let arr = r.get("commands")?.as_array()?;
                 let mut harvested: Vec<crate::protocol::SlashCommand> = arr
                     .iter()
@@ -1160,6 +1283,11 @@ impl ClaudeCodeDriver {
             stream_items: Default::default(),
             pending_approvals: Default::default(),
             model: None,
+            effort: None,
+            effort_known: false,
+            model_choice: None,
+            model_catalog: vec![],
+            pending_model_request: None,
             mode: PermissionMode::Default,
             ready_sent: true,
             commands: vec![],
@@ -1399,6 +1527,11 @@ mod tests {
             stream_items: Default::default(),
             pending_approvals: Default::default(),
             model: None,
+            effort: None,
+            effort_known: false,
+            model_choice: None,
+            model_catalog: vec![],
+            pending_model_request: None,
             mode: PermissionMode::Default,
             ready_sent: true,
             commands: vec![],
@@ -1432,9 +1565,10 @@ mod tests {
         let script = r#"import sys,json
 for line in sys.stdin:
     v=json.loads(line)
-    assert v['request']['subtype']=='set_model'
+    assert v['request']['subtype'] in ['set_model', 'apply_flag_settings']
+    if v['request']['subtype']=='apply_flag_settings': assert v['request']['settings']['effortLevel'] in ['high',None]
     print(json.dumps({'type':'system','subtype':'status','status':'compacting'}),flush=True)
-    print(json.dumps({'type':'control_response','response':{'request_id':v['request_id'],'subtype':'error' if v['request']['model']=='refuse' else 'success','response':{}}}),flush=True)
+    print(json.dumps({'type':'control_response','response':{'request_id':v['request_id'],'subtype':'error' if v['request'].get('model')=='refuse' else 'success','response':{}}}),flush=True)
 "#;
         driver.proc = Proc::spawn(
             "python3",
@@ -1443,17 +1577,65 @@ for line in sys.stdin:
             &[],
         )
         .unwrap();
-        let response = driver.model_control(Some("native-alias")).await.unwrap();
+        driver.model_catalog = vec![json!({"id":"native-alias","efforts":[{"id":"high"}]})];
+        let response = driver
+            .model_control(Some(
+                &super::super::models::ModelPatch::parse(&json!({"model":"native-alias"})).unwrap(),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response["model"], "native-alias");
         assert_eq!(response["applied"], "immediate");
+        assert_eq!(response["effort_known"], true);
+        assert!(response["effort"].is_null());
         assert!(
             matches!(driver.pushback.pop_front(), Some(Line::Json(value)) if value["status"] == "compacting")
         );
-        assert!(driver.model_control(Some("refuse")).await.is_err());
+        assert!(
+            driver
+                .model_control(Some(
+                    &super::super::models::ModelPatch::parse(&json!({"model":"refuse"})).unwrap()
+                ))
+                .await
+                .is_err()
+        );
         assert_eq!(
             driver.model_control(None).await.unwrap()["model"],
             "native-alias"
         );
+        let patch = super::super::models::ModelPatch::parse(&json!({"effort":"high"})).unwrap();
+        assert_eq!(
+            driver.model_control(Some(&patch)).await.unwrap()["effort"],
+            "high"
+        );
+        let patch = super::super::models::ModelPatch::parse(&json!({"effort":null})).unwrap();
+        let state = driver.model_control(Some(&patch)).await.unwrap();
+        assert!(state["effort"].is_null());
+        assert_eq!(state["effort_known"], true);
+        driver.current_turn = Some("active".into());
+        assert!(driver.model_control(Some(&patch)).await.is_err());
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_model_ack_resolves_unknown_state_without_starting_a_turn() {
+        let mut driver = probe();
+        driver.model_catalog = vec![json!({"id":"native","efforts":[{"id":"high"}]})];
+        driver.model = Some("native".into());
+        driver.pending_model_request = Some((
+            "pending".into(),
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}}),
+        ));
+        let state = driver.model_control(None).await.unwrap();
+        assert_eq!(state["settings_unknown"], true);
+        assert_eq!(state["capabilities"]["model"], false);
+        assert!(driver.classify(json!({"type":"control_response","response":{"request_id":"another","subtype":"success"}})).is_none());
+        assert!(driver.pending_model_request.is_some());
+        assert!(driver.classify(json!({"type":"control_response","response":{"request_id":"pending","subtype":"success"}})).is_none());
+        let state = driver.model_control(None).await.unwrap();
+        assert_eq!(state["effort"], "high");
+        assert_eq!(state["settings_unknown"], false);
+        assert!(driver.current_turn.is_none());
         driver.shutdown().await.unwrap();
     }
 

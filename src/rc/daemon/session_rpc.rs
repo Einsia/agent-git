@@ -123,25 +123,12 @@ impl Daemon {
             method::SESSION_SET_MODEL => {
                 let p: crate::protocol::SessionSubscribe = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                let model = {
-                    let value = f
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("model"))
-                        .and_then(|m| m.as_str())
-                        .filter(|m| {
-                            !m.trim().is_empty()
-                                && m.len() <= 256
-                                && !m.chars().any(char::is_control)
-                        })
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                ErrorCode::MalformedFrame,
-                                "model must be a nonempty model identifier",
-                            )
-                        })?;
-                    Some(value.to_string())
-                };
+                let model = Some(
+                    crate::rc::harness::models::ModelPatch::parse(
+                        f.params.as_ref().unwrap_or(&serde_json::Value::Null),
+                    )
+                    .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?,
+                );
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Value {

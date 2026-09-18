@@ -920,7 +920,7 @@ pub enum Command {
         reply: Ticket<serde_json::Value>,
     },
     Model {
-        model: Option<String>,
+        model: Option<crate::rc::harness::models::ModelPatch>,
         reply: Ticket<serde_json::Value>,
     },
     /// Internal startup barrier for a resumed Claude generation whose launch
@@ -2260,7 +2260,13 @@ impl Session {
                             reply.finish(result);
                         }
                         Some(Command::Model { model, reply }) => {
-                            reply.finish(self.driver.model_control(model.as_deref()).await);
+                            let result = self.driver.model_control(model.as_ref()).await;
+                            if model.is_some() {
+                                self.emit(method::SESSION_MODEL, serde_json::json!({
+                                    "session_id": self.info.session_id,
+                                })).await;
+                            }
+                            reply.finish(result);
                         }
                         Some(Command::SetPermissionMode {
                             mode,

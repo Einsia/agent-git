@@ -283,7 +283,11 @@ impl CodexDriver {
         self.command_request(method, params).await
     }
 
-    async fn command_request(&mut self, method: &str, params: Value) -> crate::Result<Value> {
+    pub(super) async fn command_request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> crate::Result<Value> {
         ensure!(
             self.command_requests.len() < 128,
             "Too many Codex commands are awaiting responses"
