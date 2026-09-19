@@ -453,6 +453,7 @@ impl CodexDriver {
                     method,
                     "skills/list"
                         | "model/list"
+                        | "config/read"
                         | "account/rateLimits/read"
                         | "thread/read"
                         | "thread/goal/get"

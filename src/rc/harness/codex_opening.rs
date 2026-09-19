@@ -171,11 +171,14 @@ mod tests {
                     json!({"id":1,"result":{}}),
                     json!({"id":2,"result":{"thread":{"id":native,"turns":[],"path":root.path().join("absent.jsonl")}}}),
                     json!({"id":3,"result":{"data":[]}}),
+                    json!({"id":4,"result":{"data":[]}}),
+                    json!({"id":5,"result":{"config":{"model":"fixture"}}}),
                 ],
             ).await;
             driver.cwd = root.path().to_owned();
             driver.confirm_opening().await.unwrap();
             driver.runtime_command("commands", json!({})).await.unwrap();
+            driver.model_control(None).await.unwrap();
             let params = json!({"session_id":native,"runtime":"codex","cwd":root.path()});
             let read = crate::rc::local_history::read(params.clone());
             if resume {

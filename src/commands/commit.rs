@@ -2363,14 +2363,14 @@ fn settle_bytes(
     observations.runtime_instances.push(lk.session_id.clone());
     observations.cwd_is_agent_repository = crate::domain::repo::Repo::open(Path::new(&cwd))
         .and_then(|code| {
-            code.common_dir_with_policy(crate::domain::repo::ReadPolicy::LocalOnly)
-                .ok()
+            let code = code
+                .common_dir_with_policy(crate::domain::repo::ReadPolicy::LocalOnly)
+                .ok()?;
+            let agent = repo
+                .common_dir_with_policy(crate::domain::repo::ReadPolicy::LocalOnly)
+                .ok()?;
+            code.canonicalize().ok().zip(agent.canonicalize().ok())
         })
-        .zip(
-            repo.common_dir_with_policy(crate::domain::repo::ReadPolicy::LocalOnly)
-                .ok(),
-        )
-        .and_then(|(code, agent)| code.canonicalize().ok().zip(agent.canonicalize().ok()))
         .is_some_and(|(code, agent)| code == agent);
     observations.code = observed_code.clone();
     observations.cwd_state = cwd_state.clone();
