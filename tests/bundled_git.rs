@@ -2,7 +2,35 @@
 
 use agit::domain::{meta, repo::Repo};
 use std::fs;
+use std::io::Write;
 use std::process::Command;
+
+#[test]
+fn tunnel_worker_does_not_initialize_git() {
+    let lab = tempfile::tempdir().unwrap();
+    let unavailable_home = lab.path().join("not-a-directory");
+    fs::write(&unavailable_home, b"unavailable store").unwrap();
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_agit"))
+        .args(["rc", "tunnel"])
+        .env("AGIT_HOME", &unavailable_home)
+        .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("PATH", lab.path().join("no-system-executables"))
+        .env_remove("AGIT_USE_SYSTEM_GIT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    worker.stdin.take().unwrap().write_all(
+        b"{\"op\":\"open\",\"version\":0,\"config\":{\"provider\":\"web_socket\",\"url\":\"ws://127.0.0.1:9\",\"headers\":[]}}\n",
+    ).unwrap();
+    let output = worker.wait_with_output().unwrap();
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["event"], "failed");
+    assert_eq!(event["message"], "unsupported tunnel worker protocol");
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&unavailable_home).unwrap(), b"unavailable store");
+}
 
 #[test]
 fn copied_cli_records_and_restores_lfs_without_system_git_or_profile_changes() {

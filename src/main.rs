@@ -31,7 +31,9 @@ fn main() {
     }
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Err(error) = agit::infra::git_runtime::initialize() {
+    // The private transport worker forwards packets without local Git or store state.
+    let transport_worker = raw_args.len() == 3 && raw_args[1] == "rc" && raw_args[2] == "tunnel";
+    if !transport_worker && let Err(error) = agit::infra::git_runtime::initialize() {
         let code = agit::ExitCode::Precondition.as_i32();
         if raw_args.iter().any(|arg| arg == "--json") {
             exit(commands::json::emit_rejection_version(
