@@ -325,12 +325,17 @@ impl Redactor {
         self.scrub_native_batch(&[(value, pointers)]).remove(0)
     }
 
-    /// One page uses one dictionary transaction; identity masks remain occurrence-scoped.
+    /// Healthy pages share a dictionary transaction; identity masks remain occurrence-scoped.
     #[cfg(feature = "rc")]
     pub(crate) fn scrub_native_batch(
         &self,
         records: &[(&serde_json::Value, &[&str])],
     ) -> Vec<NativeJson> {
+        let withheld = || NativeJson {
+            value: serde_json::json!({"protection_error":"content withheld: repository secret protection failed"}),
+            secret_projection: true,
+            registered_ids: Vec::new(),
+        };
         if records.is_empty() {
             return Vec::new();
         }
@@ -358,61 +363,74 @@ impl Redactor {
                 native.evidence.seed_native(&runtime, &session)?;
                 native.seeded = true;
             }
-            let mut input = String::new();
-            for (value, _) in records {
-                input.push_str(&serde_json::to_string(value)?);
-                input.push('\n');
-            }
-            let mut index = 0;
-            let protected =
-                dictionary.protect_with_masks(&input, &self.registered.snapshot(), |value| {
+            let masks: Vec<_> = records
+                .iter()
+                .map(|(value, pointers)| {
                     let mut mask = native.evidence.record(&runtime, &session, value);
-                    for pointer in records[index].1 {
+                    for pointer in *pointers {
                         if let Some(text) =
                             value.pointer(pointer).and_then(serde_json::Value::as_str)
                         {
                             mask.0.push(((*pointer).into(), 0..text.len()));
                         }
                     }
-                    index += 1;
                     mask.0
                         .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.start.cmp(&b.1.start)));
                     mask.0.dedup();
                     mask
-                })?;
-            anyhow::ensure!(
-                protected.intact == 0,
-                "native page exceeds its reversible protection limit"
-            );
-            let values: Vec<serde_json::Value> = protected
-                .text
-                .lines()
-                .map(serde_json::from_str)
-                .collect::<Result<_, _>>()?;
-            anyhow::ensure!(
-                index == records.len() && values.len() == records.len(),
-                "native protection changed record boundaries"
-            );
-            values
-                .into_iter()
-                .zip(records)
-                .map(|(mut value, (original, _))| {
-                    // Persona changes preserve source hashes; secret projection cannot expose them.
-                    let secret_projection = value != **original;
-                    self.scrub_persona_json(&mut value, &mut JsonTotals::default())?;
-                    Ok(NativeJson {
-                        value,
-                        secret_projection,
-                        registered_ids: Vec::new(),
-                    })
                 })
-                .collect()
+                .collect();
+            let registered = self.registered.snapshot();
+            let protect = |range: std::ops::Range<usize>| -> crate::Result<Vec<NativeJson>> {
+                let mut input = String::new();
+                for (value, _) in &records[range.clone()] {
+                    input.push_str(&serde_json::to_string(value)?);
+                    input.push('\n');
+                }
+                let mut index = range.start;
+                let protected = dictionary.protect_with_masks(&input, &registered, |_| {
+                    let mask = masks[index].clone();
+                    index += 1;
+                    mask
+                })?;
+                anyhow::ensure!(
+                    protected.intact == 0,
+                    "native page exceeds its reversible protection limit"
+                );
+                let values: Vec<serde_json::Value> = protected
+                    .text
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<Result<_, _>>()?;
+                anyhow::ensure!(
+                    index == range.end && values.len() == range.len(),
+                    "native protection changed record boundaries"
+                );
+                values
+                    .into_iter()
+                    .zip(&records[range])
+                    .map(|(mut value, (original, _))| {
+                        // Persona changes preserve source hashes; secret projection cannot expose them.
+                        let secret_projection = value != **original;
+                        self.scrub_persona_json(&mut value, &mut JsonTotals::default())?;
+                        Ok(NativeJson {
+                            value,
+                            secret_projection,
+                            registered_ids: Vec::new(),
+                        })
+                    })
+                    .collect()
+            };
+            // Failure isolation reuses each occurrence's mask; later evidence cannot bless an earlier record.
+            Ok(protect(0..records.len()).unwrap_or_else(|_| {
+                (0..records.len())
+                    .flat_map(|index| {
+                        protect(index..index + 1).unwrap_or_else(|_| vec![withheld()])
+                    })
+                    .collect()
+            }))
         })();
-        result.unwrap_or_else(|_| records.iter().map(|_| NativeJson {
-            value: serde_json::json!({"protection_error":"content withheld: repository secret protection failed"}),
-            secret_projection: true,
-            registered_ids: Vec::new(),
-        }).collect())
+        result.unwrap_or_else(|_| records.iter().map(|_| withheld()).collect())
     }
 
     #[cfg(feature = "rc")]
@@ -956,6 +974,39 @@ mod tests {
         assert!(updated[0].secret_projection);
         assert!(!updated[0].value.to_string().contains(secret));
         assert_eq!(updated[2].value, clean);
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn native_batch_isolates_unprotectable_records_without_exposing_neighbors() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let redactor = Redactor::new(Persona::default())
+            .with_repository(repo.root())
+            .unwrap()
+            .with_native_context("codex", "", repo.root(), repo.root());
+        let clean = serde_json::json!({"text":"The first reply stays readable."});
+        let oversized = serde_json::json!({"text":format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+            "A".repeat(65537)
+        )});
+        let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let adjacent = serde_json::json!({"text":"The last reply stays readable.","token":secret});
+        let projected =
+            redactor.scrub_native_batch(&[(&clean, &[]), (&oversized, &[]), (&adjacent, &[])]);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].value, clean);
+        assert!(projected[1].value.get("protection_error").is_some());
+        assert!(projected[1].secret_projection);
+        assert!(
+            !projected[1]
+                .value
+                .to_string()
+                .contains("BEGIN RSA PRIVATE KEY")
+        );
+        assert_eq!(projected[2].value["text"], adjacent["text"]);
+        assert!(!projected[2].value.to_string().contains(secret));
+        assert!(projected[2].secret_projection);
     }
 
     fn persona() -> Persona {

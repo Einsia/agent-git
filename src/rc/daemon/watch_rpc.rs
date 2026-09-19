@@ -486,26 +486,10 @@ impl Daemon {
                             // A read-only follow has no session identity, and
                             // `secret.detected` is a session-level alert: this only
                             // guarantees the content is redacted.
-                            for line in &lines {
-                                if let Some(mut frame) = watch_turn_event(&rt, &line.text) {
-                                    frame.stream = Some(stream.clone());
-                                    if frames.send(frame).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                let (items, _) = crate::rc::supervisor::items_from_lines_with_mode(
-                                    &rt,
-                                    &redactor,
-                                    std::slice::from_ref(line),
-                                    mode,
-                                );
-                                for item in items {
-                                    let mut frame =
-                                        Frame::notification(method::ITEM_COMPLETED, item);
-                                    frame.stream = Some(stream.clone());
-                                    if frames.send(frame).await.is_err() {
-                                        return;
-                                    }
+                            for mut frame in watch_frames(&rt, &redactor, &lines, mode) {
+                                frame.stream = Some(stream.clone());
+                                if frames.send(frame).await.is_err() {
+                                    return;
                                 }
                             }
                         }
@@ -748,6 +732,31 @@ impl WatchRpcTicket {
 #[path = "tests/watch_rpc.rs"]
 mod tests;
 
+/// Lifecycle markers stay interleaved with their protected source records.
+fn watch_frames(
+    runtime: &str,
+    redactor: &crate::domain::redact::Redactor,
+    lines: &[crate::rc::tail::TailedLine],
+    mode: crate::rc::codex_history::HistoryMode,
+) -> Vec<Frame> {
+    let (items, _) =
+        crate::rc::supervisor::items_from_lines_with_mode(runtime, redactor, lines, mode);
+    let mut items = items.into_iter().peekable();
+    let mut frames = Vec::new();
+    for line in lines {
+        if let Some(frame) = watch_turn_event(runtime, &line.text) {
+            frames.push(frame);
+        }
+        while items.peek().is_some_and(|item| item.line == line.lineno) {
+            frames.push(Frame::notification(
+                method::ITEM_COMPLETED,
+                items.next().unwrap(),
+            ));
+        }
+    }
+    frames
+}
+
 /// Transcript lifecycle markers describe external turns without claiming their control channel.
 fn watch_turn_event(runtime: &str, line: &str) -> Option<Frame> {
     let raw: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -775,6 +784,84 @@ fn watch_turn_event(runtime: &str, line: &str) -> Option<Frame> {
 #[cfg(test)]
 mod watch_activity_tests {
     use super::*;
+
+    #[test]
+    fn batched_watch_keeps_content_inside_its_turn() {
+        let records = [
+            (
+                3,
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a"}}),
+            ),
+            (7, serde_json::json!({"type":"session_meta","payload":{}})),
+            (
+                11,
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}}),
+            ),
+            (
+                19,
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-a"}}),
+            ),
+            (
+                23,
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-b"}}),
+            ),
+            (
+                29,
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}}),
+            ),
+            (
+                31,
+                serde_json::json!({"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-b"}}),
+            ),
+        ];
+        let lines: Vec<_> = records
+            .into_iter()
+            .map(|(lineno, record)| crate::rc::tail::TailedLine {
+                source: None,
+                lineno,
+                text: record.to_string(),
+            })
+            .collect();
+        let redactor = crate::domain::redact::Redactor::new(Default::default());
+        let frames = watch_frames(
+            "codex",
+            &redactor,
+            &lines,
+            crate::rc::codex_history::HistoryMode::Model,
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.method.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "turn.started",
+                "item.completed",
+                "turn.completed",
+                "item.completed",
+                "turn.started",
+                "item.completed",
+                "turn.completed"
+            ]
+        );
+        assert_eq!(
+            frames[1].params.as_ref().unwrap()["event"]["text"],
+            "First answer"
+        );
+        assert_eq!(frames[1].params.as_ref().unwrap()["line"], 11);
+        assert_eq!(frames[3].params.as_ref().unwrap()["line"], 19);
+        assert_eq!(
+            frames[3].params.as_ref().unwrap()["event"]["kind"],
+            "turn_end"
+        );
+        assert_eq!(
+            frames[5].params.as_ref().unwrap()["event"]["text"],
+            "Second answer"
+        );
+        assert_eq!(frames[5].params.as_ref().unwrap()["line"], 29);
+        assert_eq!(frames[6].params.as_ref().unwrap()["outcome"], "interrupted");
+    }
+
     #[test]
     fn native_turn_markers_do_not_treat_content_or_quiet_as_completion() {
         for (kind, method) in [
