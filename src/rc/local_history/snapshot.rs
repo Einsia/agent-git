@@ -102,7 +102,13 @@ impl Cache {
 
 static SNAPSHOTS: OnceLock<Cache> = OnceLock::new();
 
-pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> crate::Result<Value> {
+pub(super) fn read(
+    runtime: &str,
+    native: &str,
+    cwd: &str,
+    params: &Value,
+    timings: &mut Timings,
+) -> crate::Result<Value> {
     ensure!(
         params.get("before").is_none() || params.get("snapshot").is_some(),
         Failure::InvalidCursor
@@ -113,23 +119,27 @@ pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> cr
         .transpose()?;
     let scope = json!([runtime, native, cwd]).to_string();
     let cache = SNAPSHOTS.get_or_init(Default::default);
-    let (token, snapshot) =
-        cache.snapshot(scope, token, || capture(runtime, native, cwd, cache))?;
+    let (token, snapshot) = timings.measure("snapshot_ms", || {
+        cache.snapshot(scope, token, || capture(runtime, native, cwd, cache))
+    })?;
     // Only readers of the same immutable snapshot share file cursor positions.
-    let mut entry = snapshot.lock().map_err(|_| Failure::Busy)?;
+    let mut entry = timings
+        .measure("snapshot_lock_ms", || snapshot.lock())
+        .map_err(|_| Failure::Busy)?;
     let before = params
         .get("before")
         .map(|value| value.as_u64().context(Failure::InvalidCursor))
         .transpose()?;
-    let (items, next) =
-        if let Some(items) = &entry.native_items {
-            let end = before.unwrap_or(items.len() as u64);
-            ensure!(end <= items.len() as u64, Failure::InvalidCursor);
-            let start = end.saturating_sub(64);
-            {
-                let redactor =
-                    crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
-                let page: Vec<Value> = items[start as usize..end as usize]
+    let (items, next) = if let Some(items) = &entry.native_items {
+        let end = before.unwrap_or(items.len() as u64);
+        ensure!(end <= items.len() as u64, Failure::InvalidCursor);
+        let start = end.saturating_sub(64);
+        {
+            let redactor = timings.measure("protection_context_ms", || {
+                crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))
+            })?;
+            let page: Vec<Value> = timings.measure("projection_ms", || {
+                items[start as usize..end as usize]
                     .iter()
                     .map(|item| -> crate::Result<Value> {
                         let mut item = item.clone();
@@ -142,31 +152,49 @@ pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> cr
                         }
                         Ok(item)
                     })
-                    .collect::<crate::Result<_>>()?;
-                (page, start)
-            }
-        } else {
+                    .collect::<crate::Result<_>>()
+            })?;
+            (page, start)
+        }
+    } else {
+        let (lines, next, mode, context) = timings.measure("page_ms", || -> crate::Result<_> {
             let (mut lines, next, mode) = page_segments(&mut entry.parts, before)?;
             validate_records(runtime, &lines)?;
             let context = select_view(&mut lines, runtime, params);
-            let redactor =
-                crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
+            Ok((lines, next, mode, context))
+        })?;
+        let redactor = timings.measure("protection_context_ms", || {
+            crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))
+        })?;
+        let items: Vec<Value> = timings.measure("projection_ms", || {
             let (items, _) = super::super::supervisor::items_from_lines_with_mode(
                 runtime, &redactor, &lines, mode,
             );
-            (items.into_iter().map(|mut item| {
-            if runtime == "codex" && params["view"] == "conversation" {
-                project_context(&mut item, &context);
-            }
-            item.event.line = None;
-            json!({"item_id":format!("history:{}",item.item_id),"source_id":item.source_id,
-                "event":item.event,"raw":item.raw})
-        }).collect(), next)
-        };
+            items
+                .into_iter()
+                .map(|mut item| {
+                    if runtime == "codex" && params["view"] == "conversation" {
+                        project_context(&mut item, &context);
+                    }
+                    item.event.line = None;
+                    json!({
+                        "item_id": format!("history:{}", item.item_id),
+                        "source_id": item.source_id,
+                        "event": item.event,
+                        "raw": item.raw,
+                    })
+                })
+                .collect()
+        });
+        (items, next)
+    };
     let result =
         json!({"items":items,"before":next,"has_more":next>0,"snapshot":token,"status":"complete"});
     ensure!(
-        serde_json::to_vec(&result)?.len() < super::super::local::MAX_FRAME - 1024,
+        timings
+            .measure("size_check_ms", || serde_json::to_vec(&result))?
+            .len()
+            < super::super::local::MAX_FRAME - 1024,
         Failure::Limit
     );
     Ok(result)

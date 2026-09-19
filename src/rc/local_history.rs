@@ -6,11 +6,33 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
-pub fn read(params: Value) -> crate::Result<Value> {
-    read_with_roster(params, &super::roster::Roster::try_load()?)
+#[derive(Default, serde::Serialize)]
+pub(crate) struct Timings(std::collections::BTreeMap<&'static str, f64>);
+
+impl Timings {
+    fn measure<T>(&mut self, phase: &'static str, operation: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let result = operation();
+        self.0
+            .insert(phase, started.elapsed().as_secs_f64() * 1000.0);
+        result
+    }
 }
 
-fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Result<Value> {
+pub fn read(params: Value) -> crate::Result<Value> {
+    read_timed(params, &mut Timings::default())
+}
+
+pub(crate) fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> {
+    let roster = timings.measure("roster_ms", super::roster::Roster::try_load)?;
+    read_with_roster(params, &roster, timings)
+}
+
+fn read_with_roster(
+    params: Value,
+    roster: &super::roster::Roster,
+    timings: &mut Timings,
+) -> crate::Result<Value> {
     let session = params["session_id"]
         .as_str()
         .context("Session id is required")?;
@@ -35,7 +57,7 @@ fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Res
         .map(|e| e.cwd.as_str())
         .or_else(|| params["cwd"].as_str())
         .context("Working directory is required")?;
-    snapshot::read(runtime, native, cwd, &params)
+    snapshot::read(runtime, native, cwd, &params, timings)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -497,7 +519,8 @@ mod tests {
             assert!(
                 read_with_roster(
                     json!({"session_id":"logical","runtime":"claude-code","cwd":"/fixture"}),
-                    &roster
+                    &roster,
+                    &mut Timings::default(),
                 )
                 .is_err()
             );
@@ -505,8 +528,12 @@ mod tests {
                 roster.sessions.insert("logical".into(), serde_json::from_value(json!({"runtime":"claude-code","thread_id":native,"cwd":"/fixture","workspace_id":"local-owner"})).unwrap());
                 for before in [Value::Null, json!(100)] {
                     assert!(
-                        read_with_roster(json!({"session_id":"logical","before":before}), &roster)
-                            .is_err()
+                        read_with_roster(
+                            json!({"session_id":"logical","before":before}),
+                            &roster,
+                            &mut Timings::default(),
+                        )
+                        .is_err()
                     );
                 }
             }
@@ -549,7 +576,7 @@ mod tests {
         })).unwrap();
         let params = json!({"session_id":"logical"});
         assert!(
-            !read_with_roster(params.clone(), &roster).unwrap()["items"]
+            !read_with_roster(params.clone(), &roster, &mut Timings::default()).unwrap()["items"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -559,7 +586,7 @@ mod tests {
         let restarted = super::super::roster::Roster::try_load().unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(
-            read_with_roster(params, &restarted)
+            read_with_roster(params, &restarted, &mut Timings::default())
                 .unwrap_err()
                 .to_string(),
             "Native transcript is unavailable"

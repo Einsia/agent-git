@@ -394,12 +394,18 @@ async fn serve_described(
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     let _permit = permit;
-                                    frame.authority.check().map_err(|error| anyhow::anyhow!(error.message))?;
-                                    super::local_history::read(frame.params.unwrap_or_default())
+                                    let queue_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                    let mut timings = super::local_history::Timings::default();
+                                    let result = frame.authority.check().map_err(|error| anyhow::anyhow!(error.message))
+                                        .and_then(|()| super::local_history::read_timed(frame.params.unwrap_or_default(), &mut timings));
+                                    (result, queue_ms, timings)
                                 }).await;
+                                if let (Some(log), Ok((_, queue_ms, phases))) = (&diagnostics, &result) {
+                                    log.record("history.read_phases", serde_json::json!({"client_id":client,"request_id":original_id,"queue_ms":queue_ms,"phases":phases}));
+                                }
                                 let response = match result {
-                                    Ok(Ok(value)) => Frame::response(original_id,value),
-                                    Ok(Err(error)) => Frame::error_response(original_id,super::local_history::rpc_error(error)),
+                                    Ok((Ok(value), _, _)) => Frame::response(original_id,value),
+                                    Ok((Err(error), _, _)) => Frame::error_response(original_id,super::local_history::rpc_error(error)),
                                     Err(_) => Frame::error_response(original_id,RpcError::new(ErrorCode::RuntimeUnavailable,"History reader stopped unexpectedly")),
                                 };
                                 if let Some(log) = &diagnostics {
