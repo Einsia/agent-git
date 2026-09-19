@@ -2287,9 +2287,7 @@ fn settle_bytes(
         });
     let source = runtime.as_str();
 
-    repo.git(&["config", "user.name", owner])?;
     let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
-    repo.git(&["config", "user.email", &email])?;
 
     let cwd = lk.cwd.clone().unwrap_or_else(|| ".".into());
     let total = new_chunks.len();
@@ -2453,7 +2451,13 @@ fn settle_bytes(
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        last_sha = super::plumbing::commit_tree(repo, &tree, &parents, &protected_message.text)?;
+        last_sha = super::plumbing::commit_tree_as(
+            repo,
+            &tree,
+            &parents,
+            &protected_message.text,
+            (owner, &email),
+        )?;
         pending_parent = Some(last_sha.clone());
         let protected_subject = protected_message
             .text

@@ -78,10 +78,20 @@ pub fn regular_blob_text_at(repo: &Repo, treeish: &str, path: &str) -> Result<Op
 
 /// A git call with optional stdin.
 pub fn raw_git(repo: &Repo, args: &[&str], stdin: Option<&str>) -> Result<String> {
+    raw_git_with_env(repo, args, stdin, &[])
+}
+
+fn raw_git_with_env(
+    repo: &Repo,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+) -> Result<String> {
     let mut child = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .args(args)
         .current_dir(repo.root())
+        .envs(env.iter().copied())
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -3486,6 +3496,39 @@ pub fn commit_tree(repo: &Repo, tree: &str, parents: &[&str], message: &str) -> 
     // identity itself: a freshly cloned repository that has never committed (no
     // user.name/email) otherwise fails to record a fork commit here.
     repo.ensure_committer()?;
+    commit_tree_with_env(repo, tree, parents, message, &[])
+}
+
+/// Authenticated writers keep their identity on the command; repository configuration is shared
+/// across worktrees and cannot carry the identity of concurrent settlements.
+pub(super) fn commit_tree_as(
+    repo: &Repo,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    author: (&str, &str),
+) -> Result<String> {
+    commit_tree_with_env(
+        repo,
+        tree,
+        parents,
+        message,
+        &[
+            ("GIT_AUTHOR_NAME", author.0),
+            ("GIT_AUTHOR_EMAIL", author.1),
+            ("GIT_COMMITTER_NAME", author.0),
+            ("GIT_COMMITTER_EMAIL", author.1),
+        ],
+    )
+}
+
+fn commit_tree_with_env(
+    repo: &Repo,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    env: &[(&str, &str)],
+) -> Result<String> {
     let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
     for p in parents {
         args.push("-p".into());
@@ -3494,7 +3537,9 @@ pub fn commit_tree(repo: &Repo, tree: &str, parents: &[&str], message: &str) -> 
     args.push("-m".into());
     args.push(message.into());
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    Ok(raw_git(repo, &arg_refs, None)?.trim().to_string())
+    Ok(raw_git_with_env(repo, &arg_refs, None, env)?
+        .trim()
+        .to_string())
 }
 
 /// Create the one mechanical storage-migration commit shared by every runtime.
@@ -3943,6 +3988,22 @@ mod tests {
         // CAS: a branch of that name already exists, so creating it must fail.
         let c2 = commit_tree(&repo, &t, &[&head], "again").unwrap();
         assert!(update_ref_cas(&repo, "refs/heads/other", &c2, None).is_err());
+
+        let config_path = repo.root().join(".git/config");
+        let config = std::fs::read(&config_path).unwrap();
+        for author in [
+            ("Session owner", "owner@example.invalid"),
+            ("Collaborator", "collaborator@example.invalid"),
+        ] {
+            let commit = commit_tree_as(&repo, &t, &[&head], "authored", author).unwrap();
+            assert_eq!(
+                repo.git(&["show", "-s", "--format=%an%n%ae%n%cn%n%ce", &commit])
+                    .unwrap()
+                    .trim_end(),
+                format!("{}\n{}\n{}\n{}", author.0, author.1, author.0, author.1)
+            );
+            assert_eq!(std::fs::read(&config_path).unwrap(), config);
+        }
     }
 
     #[test]
