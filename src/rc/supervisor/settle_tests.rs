@@ -1405,6 +1405,17 @@ async fn incoming_control_preserves_an_owned_git_reference_transaction() {
     )
     .unwrap();
     let (mut session, mut out, _notes, _lease_tx, _) = fixture.session();
+    session.driver.shutdown().await.unwrap();
+    session.driver = AnyDriver::Codex(Box::new(
+        crate::rc::harness::codex::CodexDriver::test_responder(
+            Some("test-session"),
+            &[
+                serde_json::json!({"id":1,"result":{"data":[{"model":"native-model"}]}}),
+                serde_json::json!({"id":2,"result":{"config":{"model":"native-model"}}}),
+            ],
+        ),
+    ));
+    session.info.runtime = "codex".into();
     session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
     let (commands, mut receiver) = mpsc::channel(4);
     let (ticket, receipt) = crate::rc::ticket::ticket();
@@ -1422,6 +1433,27 @@ async fn incoming_control_preserves_an_owned_git_reference_transaction() {
         assert!(
             lock.exists(),
             "the real Git transaction holds its reference lock"
+        );
+        let (model_ticket, mut model_receipt) = crate::rc::ticket::ticket();
+        commands
+            .send(Command::Model {
+                model: None,
+                reply: model_ticket,
+            })
+            .await
+            .unwrap();
+        let state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut settle => panic!("the local transaction must remain held"),
+                result = model_receipt.wait_until_closed() => result.unwrap().unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state["models"][0]["id"], "native-model");
+        assert!(
+            lock.exists(),
+            "a model read must not release the Git writer"
         );
         commands
             .send(Command::Steer {

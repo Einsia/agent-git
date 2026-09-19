@@ -39,6 +39,7 @@
 
 mod landing;
 pub(crate) mod native_records;
+mod settlement_io;
 
 use crate::domain::{redact, transcript};
 use crate::protocol::{
@@ -2781,19 +2782,9 @@ impl Session {
             return None;
         }
         self.settlement_due = false;
-        let session_id = self.info.session_id.clone();
         let boundary = self.completed_boundary.clone();
-        let mut settle =
-            std::pin::pin!(self.settle_and_push_inner(SettlementBoundary::Turn, boundary));
-        tokio::select! {
-            () = &mut settle => None,
-            command = commands.recv() => {
-                let started = std::time::Instant::now();
-                settle.await;
-                trace_phase(&session_id, "settlement.command_wait", started);
-                Some(command)
-            }
-        }
+        self.settle_and_push_inner(SettlementBoundary::Turn, boundary, Some(commands))
+            .await
     }
 
     async fn finish_publication(&mut self, wait: bool) {
@@ -2867,16 +2858,18 @@ impl Session {
     /// interrupting a session that is doing work because a push failed.
     async fn settle_and_push(&mut self, boundary: SettlementBoundary) {
         self.finish_publication(true).await;
-        self.settle_and_push_inner(boundary, None).await;
+        let _ = self.settle_and_push_inner(boundary, None, None).await;
     }
 
     async fn settle_and_push_inner(
         &mut self,
         boundary: SettlementBoundary,
         journal_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
-    ) {
+        commands: Option<&mut mpsc::Receiver<Command>>,
+    ) -> Option<Option<Command>> {
+        let mut deferred_command = None;
         let Some(lease) = settlement_lease(&self.settlement) else {
-            return;
+            return deferred_command;
         };
         if let Some(delivery) = self
             .pending_settlement
@@ -2917,7 +2910,7 @@ impl Session {
                 crate::protocol::DeliveryStatus::Pending => {
                     if boundary == SettlementBoundary::Turn {
                         self.settlement_due = journal_boundary.is_some();
-                        return;
+                        return deferred_command;
                     }
                 }
             }
@@ -2933,7 +2926,7 @@ impl Session {
         // needs one most: the store link still points at the transcript nobody appends to, and
         // every later turn settles nothing.
         let Some(thread_id) = self.driver.runtime_thread_id() else {
-            return;
+            return deferred_command;
         };
         if self.landed_thread.as_deref() != Some(thread_id.as_str()) {
             self.announce_binding().await;
@@ -2948,10 +2941,10 @@ impl Session {
         if self.landed_thread.as_deref() != Some(thread_id.as_str())
             || !settlement_lease_is_current(&self.settlement, lease)
         {
-            return;
+            return deferred_command;
         }
         let Some(agit_session) = self.agit_session.clone() else {
-            return; // this session is unmanaged (no project bound), so there is nowhere to push
+            return deferred_command; // this session is unmanaged (no project bound), so there is nowhere to push
         };
         let slug = agit_session.slug();
         let branch = agit_session.branch().to_string();
@@ -2960,14 +2953,14 @@ impl Session {
         // `repo_dir` is the vine that climbs out of the repo root with `../..`, three files away
         // from the point that validates it.
         let Some(repo_dir) = self.settlement_repo_dir(&agit_session) else {
-            return;
+            return deferred_command;
         };
         // The durable watermark on the notification side. See [`unacked_settlement_path`]: it
         // asks something **different** from git reachability.
         let receipt_path = unacked_settlement_path(&repo_dir, &branch);
 
         let Some(exe) = self.settlement_exe() else {
-            return;
+            return deferred_command;
         };
         let cwd = self.cwd.clone();
         let agit_session_env = agit_session.to_string();
@@ -3017,31 +3010,16 @@ impl Session {
         };
 
         let repo_dir_s = repo_dir.to_string_lossy().into_owned();
-        let started = std::time::Instant::now();
-        let before = guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await;
-        trace_phase(&self.info.session_id, "settlement.read_before", started);
-        let Some(before) = before else {
-            return;
-        };
-        // Before the branch is born (ahead of the first settlement) there is no prior
-        // watermark; the empty string is equal to no commit.
-        let before = if before.status.success() {
-            String::from_utf8_lossy(&before.stdout).trim().to_string()
-        } else {
-            String::new()
-        };
-
         // RC Stop hooks deliberately no-op; this cancellable path is the only
         // settlement writer. Losing the negotiated feature kills this process
         // (and its git process group) instead of letting a static child env keep
         // committing after authorization disappeared.
         let Ok(result_file) = tempfile::NamedTempFile::new_in(repo_dir.join(".git")) else {
-            return;
+            return deferred_command;
         };
-        let result_path = result_file.path().to_path_buf();
         let mut strict_commit = command(&["commit", "--from-supervisor"]);
         strict_commit
-            .env(crate::commands::commit::SUPERVISOR_RESULT_ENV, &result_path)
+            .env(crate::commands::commit::SUPERVISOR_RESULT_ENV, result_file.path())
             .env(
                 crate::commands::commit::archive::NATIVE_ENV,
                 serde_json::json!({
@@ -3053,31 +3031,30 @@ impl Session {
         strict_commit.env_remove(crate::commands::commit::archive::ROLE_ENV);
         if let Some(handoff) = &self.archive_handoff {
             let Ok(role) = serde_json::to_string(&handoff.role) else {
-                return;
+                return deferred_command;
             };
             strict_commit.env(crate::commands::commit::archive::ROLE_ENV, role);
         }
-        let started = std::time::Instant::now();
-        let commit = guarded_output(&mut self.settlement, lease, strict_commit).await;
-        trace_phase(&self.info.session_id, "settlement.commit", started);
-        let Some(commit) = commit else {
-            return;
+        let request = settlement_io::LocalCommitRequest {
+            session_id: self.info.session_id.clone(),
+            settlement: self.settlement.clone(),
+            lease,
+            read_before: read_head(&repo_dir_s),
+            commit: strict_commit,
+            read_after: read_head(&repo_dir_s),
+            result_file,
         };
-        let started = std::time::Instant::now();
-        let after = guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await;
-        trace_phase(&self.info.session_id, "settlement.read_after", started);
-        let Some(after) = after else {
-            return;
+        let Some(settlement_io::LocalCommit {
+            before,
+            output: commit,
+            after,
+            reported,
+        }) = self
+            .local_commit_with_reads(request, commands, &mut deferred_command)
+            .await
+        else {
+            return deferred_command;
         };
-        if !after.status.success() {
-            return;
-        }
-        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
-        let Ok(report) = std::fs::read_to_string(&result_path) else {
-            tracing_note("strict settlement result could not be read");
-            return;
-        };
-        let reported = Some(report.trim().to_string()).filter(|report| !report.is_empty());
         let pending = match self
             .pending_settlement
             .as_ref()
@@ -3126,11 +3103,11 @@ impl Session {
                     "strict RC settlement stopped ({reason}): {}",
                     String::from_utf8_lossy(&commit.stderr).trim()
                 ));
-                return;
+                return deferred_command;
             }
         };
         let Some(sha) = candidate else {
-            return; // strict commit succeeded but produced no new turn
+            return deferred_command; // strict commit succeeded but produced no new turn
         };
         // The receipt is written **before the push**: a crash after a successful push but
         // before the notification arrives is this hole's most common shape (the daemon's
@@ -3166,7 +3143,7 @@ impl Session {
             self.pending_settlement = None;
             // Local Git is authoritative; a disconnected viewer can rediscover HEAD.
             let _ = self.out.send(notification).await;
-            return;
+            return deferred_command;
         }
         let publish = publish_settlement(
             self.settlement.clone(),
@@ -3181,6 +3158,7 @@ impl Session {
         } else if let Some(delivery) = publish.await {
             self.apply_publication_delivery(delivery);
         }
+        deferred_command
     }
 
     /// Wait for the transcript file to go quiet.
