@@ -14,8 +14,23 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Upgrades can replace the executable while its parent is still running.
+    // Only a parent that opts in receives extended connection diagnostics.
+    let report_timing = std::env::var("AGIT_TUNNEL_CONNECT_TIMING").as_deref() == Ok("1");
+    run_with_timing(input, &mut output, report_timing).await
+}
+
+pub(crate) async fn run_with_timing<R, W>(
+    input: R,
+    mut output: W,
+    report_timing: bool,
+) -> crate::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut input = Reader::new(input, MAX_RECORD);
-    let result = run_inner(&mut input, &mut output).await;
+    let result = run_inner(&mut input, &mut output, report_timing).await;
     if let Err(error) = &result {
         let message: String = error.to_string().chars().take(512).collect();
         let _ =
@@ -24,7 +39,11 @@ where
     result
 }
 
-async fn run_inner<R, W>(input: &mut Reader<R>, output: &mut W) -> crate::Result<()>
+async fn run_inner<R, W>(
+    input: &mut Reader<R>,
+    output: &mut W,
+    report_timing: bool,
+) -> crate::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -36,7 +55,8 @@ where
     };
     ensure!(version == VERSION, "unsupported tunnel worker protocol");
     config.validate()?;
-    let (mut sink, mut source) = tokio::time::timeout(IO_TIMEOUT, connect(config)).await??;
+    let (mut sink, mut source, timing) =
+        tokio::time::timeout(IO_TIMEOUT, connect(config)).await??;
     tokio::time::timeout(
         IO_TIMEOUT,
         write(
@@ -44,6 +64,7 @@ where
             &Event::Connected {
                 version: VERSION,
                 worker_pid: std::process::id(),
+                timing: timing.filter(|_| report_timing),
             },
         ),
     )
@@ -82,7 +103,9 @@ where
     tokio::select! { result = sending => result, result = receiving => result, result = writing => result }
 }
 
-async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
+async fn connect(
+    config: Config,
+) -> crate::Result<(PacketSink, PacketSource, Option<ConnectTiming>)> {
     match config {
         Config::WebSocket {
             url,
@@ -99,7 +122,7 @@ async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
                     http::HeaderValue::from_str(&value).context("invalid tunnel header value")?,
                 );
             }
-            let socket = super::websocket::connect(request, direct).await?;
+            let (socket, timing) = super::websocket::connect(request, direct).await?;
             let (sink, source) = socket.split();
             let sink = sink
                 .with(|packet| async move { Ok::<_, anyhow::Error>(to_websocket(packet)) })
@@ -110,7 +133,7 @@ async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
                     Err(error) => Some(Err(error.into())),
                 }
             });
-            Ok((Box::pin(sink), Box::pin(source)))
+            Ok((Box::pin(sink), Box::pin(source), Some(timing)))
         }
         Config::Ssh {
             host,
@@ -183,7 +206,7 @@ async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
                     }
                 },
             );
-            Ok((Box::pin(sink), Box::pin(source)))
+            Ok((Box::pin(sink), Box::pin(source), None))
         }
     }
 }

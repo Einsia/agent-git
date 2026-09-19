@@ -1,9 +1,10 @@
 //! Proxy-aware TCP establishment followed by the hub's TLS and WebSocket handshake.
 
+use super::protocol::ConnectTiming;
 use anyhow::{Context, bail};
 use http::Uri;
 use hyper_util::client::proxy::matcher::Matcher;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
@@ -13,7 +14,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECT_HEADERS: usize = 8192;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-pub(super) async fn connect(request: Request, direct: bool) -> crate::Result<Socket> {
+pub(super) async fn connect(
+    request: Request,
+    direct: bool,
+) -> crate::Result<(Socket, ConnectTiming)> {
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
         .unwrap_or_default();
@@ -86,7 +90,8 @@ async fn connect_with(
     request: Request,
     proxies: &Matcher,
     timeout: Duration,
-) -> crate::Result<Socket> {
+) -> crate::Result<(Socket, ConnectTiming)> {
+    let started = Instant::now();
     let destination = proxy_destination(request.uri())?;
     let proxy = proxies.intercept(&destination);
     let route = match &proxy {
@@ -103,22 +108,33 @@ async fn connect_with(
 
     // One deadline covers DNS, TCP, CONNECT, TLS and WebSocket negotiation.
     tokio::time::timeout(timeout, async {
-        let stream = match proxy {
+        let (stream, dns_ms, tcp_ms, proxy_connect_ms) = match proxy {
             Some(proxy) => {
                 // Only proxy credentials belong on CONNECT. For WSS, the RC
                 // bearer token stays inside the hub's TLS tunnel.
-                let mut stream = super::tcp::connect(proxy.uri())
+                let (mut stream, dns_ms, tcp_ms) = super::tcp::connect(proxy.uri())
                     .await
                     .context("proxy TCP connection failed")?;
+                let proxy_started = Instant::now();
                 establish_tunnel(&mut stream, &destination, proxy.basic_auth())
                     .await
                     .context("proxy CONNECT failed")?;
-                stream
+                (
+                    stream,
+                    dns_ms,
+                    tcp_ms,
+                    Some(proxy_started.elapsed().as_secs_f64() * 1000.0),
+                )
             }
-            None => super::tcp::connect(&destination)
-                .await
-                .context("TCP connection failed")?,
+            None => {
+                let (stream, dns_ms, tcp_ms) = super::tcp::connect(&destination)
+                    .await
+                    .context("TCP connection failed")?;
+                (stream, dns_ms, tcp_ms, None)
+            }
         };
+        let ipv6 = stream.peer_addr().is_ok_and(|address| address.is_ipv6());
+        let handshake_started = Instant::now();
         // Keep the original hub URI for SNI, certificate validation and Host.
         let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
             request,
@@ -132,7 +148,17 @@ async fn connect_with(
         )
         .await
         .context("hub TLS/WebSocket handshake failed")?;
-        Ok::<_, anyhow::Error>(socket)
+        Ok::<_, anyhow::Error>((
+            socket,
+            ConnectTiming {
+                dns_ms,
+                tcp_ms,
+                proxy_connect_ms,
+                tls_websocket_ms: handshake_started.elapsed().as_secs_f64() * 1000.0,
+                total_ms: started.elapsed().as_secs_f64() * 1000.0,
+                ipv6,
+            },
+        ))
     })
     .await
     .with_context(|| format!("RC connection timed out via {route}"))?
@@ -331,13 +357,15 @@ mod tests {
         let matcher = Matcher::builder()
             .http(format!("http://proxy-user:proxy-password@{address}"))
             .build();
-        let mut socket = connect_with(
+        let (mut socket, timing) = connect_with(
             request("ws://unresolvable.invalid:8765/rc/ws"),
             &matcher,
             TEST_TIMEOUT,
         )
         .await
         .unwrap();
+        assert!(timing.proxy_connect_ms.is_some());
+        assert!(!timing.ipv6);
         socket
             .send(Message::Text("rc payload".into()))
             .await

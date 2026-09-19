@@ -162,8 +162,9 @@ async fn run_executor(
             ensure!(enrollment.inbound_enabled, "inbound cloud connections are disabled");
             let api = Client::new(&hub)?;
             let raw = worker.open(api.presence_config(&enrollment.credential)?).await?;
+            let transport_timing = raw.connect_timing;
             let mut presence = Presence::open(raw).await?;
-            record(&log, "cloud.presence_connected", serde_json::json!({"hub":hub,"device_id":enrollment.credential.device.id,"epoch":presence.epoch,"worker_pid":presence.worker_pid}));
+            record(&log, "cloud.presence_connected", serde_json::json!({"hub":hub,"device_id":enrollment.credential.device.id,"epoch":presence.epoch,"worker_pid":presence.worker_pid,"transport_timing":transport_timing}));
             backoff = Duration::from_millis(250);
             loop {
                 tokio::select! {
@@ -207,6 +208,7 @@ async fn run_executor(
                                 };
                                 // Raw transport carries no executor authority before grant validation and endpoint TLS.
                                 let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = verified_transport(verification, transport).await?;
+                                let transport_timing = raw.connect_timing;
                                 phase = "relay_pair";
                                 let paired = Instant::now();
                                 let raw = join_data(raw, &link_id, ticket).await?;
@@ -214,7 +216,7 @@ async fn run_executor(
                                 phase = "endpoint_tls";
                                 let authenticated = Instant::now();
                                 let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
-                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
+                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_timing":transport_timing,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
                                 let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
                                 phase = "ingress";
                                 incoming.try_send(Authenticated { connection, grant, stopped, renewal })

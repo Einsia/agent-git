@@ -67,6 +67,9 @@ async fn websocket_worker_preserves_messages_and_write_receipts() {
     })
     .await
     .unwrap();
+    let timing = connection.connect_timing.unwrap();
+    assert!(timing.proxy_connect_ms.is_none());
+    assert!(timing.total_ms >= timing.dns_ms + timing.tcp_ms + timing.tls_websocket_ms);
     let (mut sink, mut source) = connection.split();
     sink.send(Packet::Text("request".into())).await.unwrap();
     assert_eq!(
@@ -94,6 +97,7 @@ async fn congested_receiver_cannot_turn_a_missing_write_ack_into_success() {
             &Event::Connected {
                 version: VERSION,
                 worker_pid: 1,
+                timing: None,
             },
         )
         .await

@@ -119,10 +119,32 @@ pub enum Command {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
-    Connected { version: u32, worker_pid: u32 },
-    Received { packet: Packet },
-    Written { serial: u64 },
-    Failed { message: String },
+    Connected {
+        version: u32,
+        worker_pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timing: Option<ConnectTiming>,
+    },
+    Received {
+        packet: Packet,
+    },
+    Written {
+        serial: u64,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// Transport durations contain no addresses, credentials or application data.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ConnectTiming {
+    pub dns_ms: f64,
+    pub tcp_ms: f64,
+    pub proxy_connect_ms: Option<f64>,
+    pub tls_websocket_ms: f64,
+    pub total_ms: f64,
+    pub ipv6: bool,
 }
 
 /// Partial records stay in the reader when another select branch wins.

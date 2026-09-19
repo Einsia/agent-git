@@ -47,6 +47,8 @@ async fn killing_one_worker_preserves_another_connection_and_reaps_both() {
     let executable = Path::new(env!("CARGO_BIN_EXE_agit-tunnel"));
     let first = Connection::open(first, executable, &[]).await.unwrap();
     let second = Connection::open(second, executable, &[]).await.unwrap();
+    assert!(first.connect_timing.is_some());
+    assert!(second.connect_timing.is_some());
     let first_pid = first.worker_pid;
     let second_pid = second.worker_pid;
     assert_ne!(first_pid, std::process::id());

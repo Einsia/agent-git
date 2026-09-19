@@ -197,6 +197,26 @@ their descriptions do not advertise delegated session services or event selectio
 
 ## Operational diagnostics
 
+`cloud.presence_connected` and `cloud.endpoint_authenticated` include optional
+`transport_timing` for the actual WebSocket worker connection. Its durations are
+`dns_ms`, `tcp_ms`, `proxy_connect_ms`, `tls_websocket_ms`, and `total_ms`.
+`proxy_connect_ms` is null for direct connections. `ipv6` describes the connected
+TCP socket, including the proxy socket when a proxy is used. TLS and WebSocket
+negotiation remain one combined measurement.
+
+These worker durations exclude process startup and parent IPC. Compare their
+`total_ms` with the endpoint's existing `transport_ms` to measure the remainder;
+do not attribute that remainder exclusively to process startup. Correlate the
+endpoint event with controller logs by `link_id`, since device wall clocks can
+differ. No additional network requests are made to obtain these measurements.
+The values stay in local diagnostics and contain no remote addresses, headers,
+credentials, or conversation content.
+
+The parent opts its child into the extended worker reply using
+`AGIT_TUNNEL_CONNECT_TIMING=1`. Without that opt-in the reply retains its original
+shape; a parent also accepts replies with no timings. This keeps worker startup
+compatible when an executable is replaced while an older daemon remains alive.
+
 Cloud `session.list` accepts an optional `resolve_session` logical or native ID.
 Its `resolved_session` field contains executor-owned session, native, runtime,
 workspace and project coordinates, or null when no readable native mapping is

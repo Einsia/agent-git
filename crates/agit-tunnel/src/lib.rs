@@ -15,7 +15,7 @@ pub type Result<T> = anyhow::Result<T>;
 use anyhow::{Context, ensure};
 use futures_util::{Sink, Stream};
 use protocol::{Command, Event, MAX_RECORD, QUEUE_BYTES, QUEUE_CAP, Reader, VERSION, write};
-pub use protocol::{Config, Packet};
+pub use protocol::{Config, ConnectTiming, Packet};
 use std::{
     path::Path,
     pin::Pin,
@@ -54,6 +54,7 @@ impl Drop for Owner {
 
 pub struct Connection {
     pub worker_pid: u32,
+    pub connect_timing: Option<ConnectTiming>,
     sink: PacketSink,
     source: PacketSource,
 }
@@ -63,6 +64,7 @@ impl Connection {
     pub fn from_parts(worker_pid: u32, sink: PacketSink, source: PacketSource) -> Self {
         Self {
             worker_pid,
+            connect_timing: None,
             sink,
             source,
         }
@@ -72,7 +74,7 @@ impl Connection {
     pub async fn open(config: Config, executable: &Path, args: &[&str]) -> Result<Self> {
         config.validate()?;
         let mut command = tokio::process::Command::new(executable);
-        command.args(args);
+        command.args(args).env("AGIT_TUNNEL_CONNECT_TIMING", "1");
         let mut process = process::Process::spawn(&mut command)?;
         let output = process
             .child
@@ -129,13 +131,14 @@ impl Connection {
         )
         .await?;
         let mut input = Reader::new(input, MAX_RECORD);
-        let worker_pid = match input.read::<Event>().await? {
+        let (worker_pid, connect_timing) = match input.read::<Event>().await? {
             Some(Event::Connected {
                 version,
                 worker_pid,
+                timing,
             }) => {
                 ensure!(version == VERSION, "unsupported tunnel worker version");
-                worker_pid
+                (worker_pid, timing)
             }
             Some(Event::Failed { message }) => anyhow::bail!("tunnel connection failed: {message}"),
             _ => anyhow::bail!("tunnel worker closed before connecting"),
@@ -218,6 +221,7 @@ impl Connection {
             });
         Ok(Self {
             worker_pid,
+            connect_timing,
             sink: Box::pin(sink),
             source: Box::pin(source),
         })
@@ -228,7 +232,11 @@ impl Connection {
         let (client, server) = tokio::io::duplex(65536);
         let (input, output) = tokio::io::split(client);
         let (worker_input, worker_output) = tokio::io::split(server);
-        let task = tokio::spawn(worker::run(BufReader::new(worker_input), worker_output));
+        let task = tokio::spawn(worker::run_with_timing(
+            BufReader::new(worker_input),
+            worker_output,
+            true,
+        ));
         let owner = Arc::new(Owner {
             stop: None,
             tasks: Mutex::new(vec![task.abort_handle()]),

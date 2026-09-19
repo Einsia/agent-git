@@ -8,7 +8,7 @@ use tokio::{net::TcpStream, time::Instant};
 
 const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
-pub(super) async fn connect(uri: &Uri) -> crate::Result<TcpStream> {
+pub(super) async fn connect(uri: &Uri) -> crate::Result<(TcpStream, f64, f64)> {
     let host = uri.host().context("TCP destination is missing a host")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port = uri
@@ -18,10 +18,14 @@ pub(super) async fn connect(uri: &Uri) -> crate::Result<TcpStream> {
         } else {
             80
         });
+    let started = Instant::now();
     let addresses = tokio::net::lookup_host((host, port)).await?;
+    let dns_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = Instant::now();
     let stream = race(interleave(addresses), TcpStream::connect).await?;
+    let tcp_ms = started.elapsed().as_secs_f64() * 1000.0;
     stream.set_nodelay(true)?;
-    Ok(stream)
+    Ok((stream, dns_ms, tcp_ms))
 }
 
 fn interleave(addresses: impl Iterator<Item = SocketAddr>) -> impl Iterator<Item = SocketAddr> {

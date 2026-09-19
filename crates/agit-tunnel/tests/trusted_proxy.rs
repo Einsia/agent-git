@@ -50,6 +50,7 @@ async fn explicit_direct_transport_bypasses_worker_environment_proxy() {
             let mut child = command
                 .env("NO_PROXY", "")
                 .env("no_proxy", "")
+                .env_remove("AGIT_TUNNEL_CONNECT_TIMING")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -79,9 +80,17 @@ async fn explicit_direct_transport_bypasses_worker_environment_proxy() {
             )
             .await
             .unwrap();
-            let event = output.read::<Event>().await.unwrap().unwrap();
+            let wire = output.read::<serde_json::Value>().await.unwrap().unwrap();
+            assert!(
+                wire.get("timing").is_none(),
+                "diagnostics require parent opt-in"
+            );
+            let event: Event = serde_json::from_value(wire).unwrap();
             if direct {
-                assert!(matches!(event, Event::Connected { .. }), "{event:?}");
+                assert!(
+                    matches!(event, Event::Connected { timing: None, .. }),
+                    "{event:?}"
+                );
                 let packet = Packet::Text("direct relay".into());
                 write(
                     &mut input,
