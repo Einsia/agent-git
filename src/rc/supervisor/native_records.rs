@@ -118,8 +118,11 @@ impl NativeRecords {
                 continue;
             }
             let scrubbed = redactor.scrub_json(raw);
-            let hash =
-                projected_object_hash(raw, &scrubbed.value, !scrubbed.registered_ids.is_empty());
+            let hash = projected_object_hash(
+                raw,
+                &scrubbed.value,
+                scrubbed.secrets > 0 || scrubbed.value.get("protection_error").is_some(),
+            );
             registered.extend(scrubbed.registered_ids);
             let (raw, raw_truncated) = cap_raw(scrubbed.value);
             if let Some(text) = event.text.take() {

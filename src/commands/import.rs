@@ -50,6 +50,7 @@ use crate::infra::config;
 #[cfg(windows)]
 use crate::ui::quote_powershell_argument as powershell_selection_arg;
 use crate::{ExitCode, adapter, ui};
+use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use std::path::{Path, PathBuf};
 
@@ -407,9 +408,14 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         target.verify()?;
     }
 
-    // ── --privacy: swap in a redacted copy; no byte of the original enters history ──
+    if args.privacy && args.link_only {
+        anyhow::bail!(
+            "--privacy requires a destination Agent repository for reversible protection"
+        );
+    }
+    // The local copy is protected after its destination exists, before opening a Git version.
     let found = if args.privacy {
-        match scrub_copy(&found)? {
+        match privacy_copy(&found)? {
             Some(f) => f,
             None => return Ok(ExitCode::Usage),
         }
@@ -465,8 +471,12 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     println!();
     // Settlement that did not succeed = this import did not happen: put the ref that was created
     // and the checkout that was switched back the way they were.
-    let outcome =
-        super::commit::record_at(&store, lk, &agent, &namespace, &owner, landing.repo_dir());
+    let outcome = (|| {
+        if args.privacy {
+            protect_privacy_copy(&found, landing.repo_dir())?;
+        }
+        super::commit::record_at(&store, lk, &agent, &namespace, &owner, landing.repo_dir())
+    })();
     if !matches!(outcome, Ok(ExitCode::Ok)) {
         landing.rollback();
     }
@@ -1442,8 +1452,8 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
     }
 }
 
-/// What `--privacy` does: read the original → redact → write a byte copy under a **new session
-/// identity**, so the rest of the import flow runs it through as an ordinary session.
+/// Create an independent native session; the import flow projects it with the selected repository
+/// dictionary before settlement. The original remains the runtime's local source.
 ///
 /// # Why only claude-code
 ///
@@ -1457,7 +1467,7 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
 /// The original session keeps growing; the copy stops at the moment of redaction — following the
 /// original would turn the privacy gate into a one-time action, and secrets appended later would
 /// slip into an already published lineage. Run `import --privacy` again to update it.
-fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
+fn privacy_copy(found: &Found) -> crate::Result<Option<Found>> {
     if found.runtime != "claude-code" {
         ui::error(&format!(
             "--privacy currently supports claude-code sessions (this one is {}).",
@@ -1477,12 +1487,19 @@ fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
 
-    let rep = crate::domain::redact::Redactor::try_this_machine()?.scrub(&raw);
-
     // A new identity. The old id inside the copy is replaced along with it — a copy that claims
     // to be another session fools both resume and dedupe.
     let new_id = uuid::Uuid::new_v4().to_string();
-    let text = rep.text.replace(&found.session_id, &new_id);
+    let mut text = String::new();
+    for line in raw.split_inclusive('\n') {
+        let mut value: serde_json::Value = serde_json::from_str(line)
+            .context("privacy import requires complete native JSON records")?;
+        if value["sessionId"] == found.session_id {
+            value["sessionId"] = new_id.clone().into();
+        }
+        text.push_str(&serde_json::to_string(&value)?);
+        text.push('\n');
+    }
 
     let cwd = found
         .cwd
@@ -1503,29 +1520,40 @@ fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
     let out = dir.join(format!("{new_id}.jsonl"));
     std::fs::write(&out, &text)?;
 
-    ui::success(&format!(
-        "scrubbed copy: {} ({} secrets, {} path/host hits, {} public IPs)",
-        link::short(&new_id),
-        rep.secrets,
-        rep.paths,
-        rep.ips
-    ));
-    // `ui::dim` only colors and **returns**; it does not print (unlike `ui::success` /
-    // `ui::hint`, which do). A bare call here means this hint never reaches any `agit import`
-    // output.
-    println!(
-        "{}",
-        ui::dim(
-            "  the copy is frozen at this moment; the original session keeps growing without it"
-        )
-    );
-    println!();
-
     Ok(Some(Found {
         runtime: "claude-code",
         session_id: new_id,
         cwd: Some(cwd.to_string_lossy().into_owned()),
     }))
+}
+
+fn protect_privacy_copy(found: &Found, root: &Path) -> crate::Result<()> {
+    let path = adapter::get(found.runtime)?
+        .resolve(&found.session_id, None)
+        .context("the local privacy copy is unavailable")?;
+    let raw = std::fs::read_to_string(&path)?;
+    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(root)?;
+    let protected = dictionary.protect_session_jsonl(
+        &raw,
+        &global,
+        found.runtime,
+        &found.session_id,
+        Path::new(found.cwd.as_deref().unwrap_or(".")),
+    )?;
+    anyhow::ensure!(
+        protected.intact == 0,
+        "privacy copy exceeds the reversible protection limit"
+    );
+    let redactor =
+        crate::domain::redact::Redactor::new(crate::domain::redact::Persona::this_machine());
+    let report = redactor.scrub_persona(&protected.text);
+    std::fs::write(&path, report.text)?;
+    ui::success(&format!(
+        "protected local copy: {}",
+        link::short(&found.session_id)
+    ));
+    Ok(())
 }
 
 /// With no session argument: pick one of the sessions that ran in this repo and are not adopted

@@ -263,7 +263,7 @@ impl Rule {
         {
             return false;
         }
-        !global_allow().iter().any(|a| a.allows(secret, whole, line))
+        !preset_allows(secret)
     }
 
     /// Which span of a match is "the actual secret".
@@ -392,6 +392,13 @@ static SET: LazyLock<RuleSet> = LazyLock::new(|| {
 });
 
 static GLOBAL_ALLOW: OnceLock<Vec<Allow>> = OnceLock::new();
+
+/// Global preset allowances apply to candidate values regardless of how they were discovered.
+pub(crate) fn preset_allows(secret: &str) -> bool {
+    global_allow()
+        .iter()
+        .any(|allow| allow.allows(secret, secret, secret))
+}
 
 fn global_allow() -> &'static [Allow] {
     GLOBAL_ALLOW.get_or_init(|| SET.global.iter().map(Allow::compile).collect())

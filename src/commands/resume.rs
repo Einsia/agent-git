@@ -1865,15 +1865,6 @@ fn materialize_and_resume(
     }
     let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
         .hydrate_envelopes(&saved)?;
-    if hydrated.unresolved > 0 {
-        ui::warning(&format!(
-            "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",
-            hydrated.unresolved
-        ));
-        ui::hint(
-            "repository secret dictionaries are device-local and are never fetched from the hub",
-        );
-    }
     let saved = hydrated.text;
 
     let mut locked_supersede = Vec::with_capacity(supersede.len());

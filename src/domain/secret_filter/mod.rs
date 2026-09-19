@@ -1028,10 +1028,13 @@ pub struct Matcher {
     inner: Arc<MatcherInner>,
 }
 
+#[derive(Clone)]
 struct MatcherInner {
     generation: u64,
+    allowlist: Vec<Zeroizing<String>>,
     ac: Option<AhoCorasick>,
     ids: Vec<String>,
+    explicit: Vec<bool>,
     // Aho-Corasick owns an opaque copy of every pattern. Keeping an explicitly
     // zeroizing copy does not widen the runtime trust boundary (the automaton is
     // already recoverable), and lets the repository dictionary build one
@@ -1055,15 +1058,18 @@ impl Matcher {
         Self {
             inner: Arc::new(MatcherInner {
                 generation: 0,
+                allowlist: vec![],
                 ac: None,
                 ids: vec![],
+                explicit: vec![],
                 patterns: vec![],
                 max_pattern_len: 0,
             }),
         }
     }
 
-    fn build(generation: u64, records: Vec<DecryptedRecord>) -> crate::Result<Self> {
+    fn build(generation: u64, mut records: Vec<DecryptedRecord>) -> crate::Result<Self> {
+        records.retain(|record| !crate::domain::secrets::rules::preset_allows(&record.secret));
         if records.is_empty() {
             let mut empty = Self::empty();
             Arc::get_mut(&mut empty.inner)
@@ -1084,12 +1090,24 @@ impl Matcher {
             .match_kind(MatchKind::LeftmostLongest)
             .build(patterns.iter().map(|p| p.as_bytes()))
             .context("cannot build the registered-secret matcher")?;
+        let explicit = records
+            .iter()
+            .map(|record| {
+                record.origins.is_empty()
+                    || record.explicit_block
+                    || record.origins.iter().any(|origin| {
+                        matches!(origin, RecordOrigin::Global | RecordOrigin::Explicit)
+                    })
+            })
+            .collect();
         let ids = records.into_iter().map(|r| r.id).collect();
         Ok(Self {
             inner: Arc::new(MatcherInner {
                 generation,
+                allowlist: vec![],
                 ac: Some(ac),
                 ids,
+                explicit,
                 patterns,
                 max_pattern_len,
             }),
@@ -1134,31 +1152,121 @@ impl Matcher {
             .zip(self.inner.patterns.iter().map(|p| p.as_str()))
     }
 
+    pub(crate) fn allowed_values(&self) -> impl Iterator<Item = &str> {
+        self.inner.allowlist.iter().map(|value| value.as_str())
+    }
+
+    pub(crate) fn with_allowlist(mut self, values: impl IntoIterator<Item = String>) -> Self {
+        Arc::make_mut(&mut self.inner).allowlist = values.into_iter().map(Zeroizing::new).collect();
+        self
+    }
+
     pub(crate) fn merged(&self, other: &Self) -> crate::Result<Self> {
         let mut records = Vec::with_capacity(self.rules() + other.rules());
-        for (id, secret) in self.patterns().chain(other.patterns()) {
-            if records
-                .iter()
-                .any(|record: &DecryptedRecord| record.secret.as_str() == secret)
+        for ((id, secret), explicit) in self
+            .patterns()
+            .zip(&self.inner.explicit)
+            .chain(other.patterns().zip(&other.inner.explicit))
+        {
+            if let Some(record) = records
+                .iter_mut()
+                .find(|record: &&mut DecryptedRecord| record.secret.as_str() == secret)
             {
+                record.explicit_block |= explicit;
                 continue;
             }
             records.push(DecryptedRecord {
                 id: id.to_string(),
                 name: id.to_string(),
                 secret: Zeroizing::new(secret.to_string()),
-                origins: vec![],
+                origins: vec![RecordOrigin::Heuristic],
                 heuristic_disposition: HeuristicDisposition::Protect,
-                explicit_block: false,
+                explicit_block: *explicit,
                 created_at: "runtime".to_string(),
                 updated_at: "runtime".to_string(),
             });
         }
-        Self::build(self.generation().max(other.generation()), records)
+        let allowlist: HashSet<String> = self
+            .allowed_values()
+            .chain(other.allowed_values())
+            .map(str::to_owned)
+            .collect();
+        records.retain(|record| !allowlist.contains(record.secret.as_str()));
+        Ok(
+            Self::build(self.generation().max(other.generation()), records)?
+                .with_allowlist(allowlist),
+        )
+    }
+
+    /// Exclude values before overlap selection so an allowed outer match cannot hide another rule.
+    pub(crate) fn excluding(&self, allowlist: &HashSet<String>) -> crate::Result<Self> {
+        if !self.patterns().any(|(_, value)| allowlist.contains(value)) {
+            return Ok(self.clone());
+        }
+        let records = self
+            .patterns()
+            .zip(&self.inner.explicit)
+            .filter(|((_, value), _)| !allowlist.contains(*value))
+            .map(|((id, secret), explicit)| DecryptedRecord {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                secret: Zeroizing::new(secret.to_owned()),
+                origins: vec![if *explicit {
+                    RecordOrigin::Explicit
+                } else {
+                    RecordOrigin::Heuristic
+                }],
+                heuristic_disposition: HeuristicDisposition::Protect,
+                explicit_block: *explicit,
+                created_at: "runtime".into(),
+                updated_at: "runtime".into(),
+            })
+            .collect();
+        Ok(Self::build(self.generation(), records)?
+            .with_allowlist(self.allowed_values().map(str::to_owned)))
+    }
+
+    /// Proven identity occurrences may bypass learned suspicion, never an explicit registration.
+    pub(crate) fn explicit_only(&self) -> crate::Result<Self> {
+        let records = self
+            .patterns()
+            .zip(&self.inner.explicit)
+            .filter(|(_, explicit)| **explicit)
+            .map(|((id, secret), _)| DecryptedRecord {
+                id: id.into(),
+                name: id.into(),
+                secret: Zeroizing::new(secret.into()),
+                origins: vec![RecordOrigin::Explicit],
+                heuristic_disposition: HeuristicDisposition::Protect,
+                explicit_block: true,
+                created_at: "runtime".into(),
+                updated_at: "runtime".into(),
+            })
+            .collect();
+        Ok(Self::build(self.generation(), records)?
+            .with_allowlist(self.allowed_values().map(str::to_owned)))
     }
 
     pub fn find(&self, text: &str) -> Vec<RegisteredMatch> {
         self.find_capped(text, usize::MAX).0
+    }
+
+    /// Visit original spans without allocating a record-id copy for each occurrence.
+    pub(crate) fn visit_matches(&self, text: &str, mut visit: impl FnMut(usize, usize, &str)) {
+        let Some(ac) = &self.inner.ac else { return };
+        let mut cursor = 0;
+        for (start, end, _) in
+            repository::token_segments(text).chain(std::iter::once((text.len(), text.len(), "")))
+        {
+            for found in ac.find_iter(&text.as_bytes()[cursor..start]) {
+                visit(
+                    cursor + found.start(),
+                    cursor + found.end(),
+                    &self.inner.ids[found.pattern().as_usize()],
+                );
+            }
+            cursor = end;
+        }
     }
 
     /// Return the earliest registered match or opaque repository token that
@@ -1896,9 +2004,9 @@ mod tests {
             handle,
         );
         let mut stream = redactor.stream();
-        let first = stream.push("before correct horse ");
-        let second = stream.push("battery after");
-        let last = stream.flush();
+        let first = stream.push("before correct horse ").unwrap();
+        let second = stream.push("battery after").unwrap();
+        let last = stream.flush().unwrap();
         let text = format!("{}{}{}", first.text, second.text, last.text);
         assert_eq!(text, format!("before {PLACEHOLDER} after"));
         let ids = [first, second, last]

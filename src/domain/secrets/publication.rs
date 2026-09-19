@@ -92,7 +92,7 @@ impl<'a> Inspector<'a> {
             policy,
             limits,
             remaining: limits.budget_bytes,
-            trusted: HashMap::new(),
+            trusted: TrustedEnvelopeIdentities::new(),
             out: HitCollector::new(),
             unscanned: Unscanned::default(),
             binary_git: 0,
@@ -199,8 +199,15 @@ impl<'a> Inspector<'a> {
                         }
                     };
                     // Raw headers and bodies remain covered even when they contain non-text bytes.
-                    let report = scan_text_capped_registered(
-                        &String::from_utf8_lossy(bytes),
+                    let original = String::from_utf8_lossy(bytes);
+                    let text = crate::domain::secrets::mask_verified_git_headers(
+                        repo,
+                        &original,
+                        received_kind,
+                    );
+                    let report = super::scan_text_capped_registered_views(
+                        &original,
+                        &text,
                         &self.policy.allowlist,
                         Policy::CLIENT,
                         self.out.remaining(),
@@ -387,14 +394,25 @@ pub(super) fn scan_blob_payload(
         &mut reserved,
     )? {
         inspection::Payload::Text(text) => {
-            let report = scan_repository_payload_capped(
-                &text,
-                context.allowlist,
-                context.trusted_identities,
-                Policy::CLIENT,
-                out.remaining(),
-                context.registered,
-            );
+            let report = if let Some(view) = protocol_blob_view(context, oid, &text, labels) {
+                scan_text_capped_registered_views(
+                    &text,
+                    &view,
+                    context.allowlist,
+                    Policy::CLIENT,
+                    out.remaining(),
+                    context.registered,
+                )
+            } else {
+                scan_repository_payload_capped(
+                    &text,
+                    context.allowlist,
+                    context.trusted_identities,
+                    Policy::CLIENT,
+                    out.remaining(),
+                    context.registered,
+                )
+            };
             if report.truncated {
                 out.mark_truncated();
             }
@@ -438,6 +456,37 @@ mod tests {
     }
 
     #[test]
+    fn lfs_identity_mask_is_scoped_to_the_validated_pointer_field() {
+        let value = pointer(b"published content");
+        let text = format!(
+            "version {}\noid sha256:{}\nsize {}\n",
+            crate::domain::lfs::VERSION,
+            value.oid,
+            value.size
+        );
+        let policy = policy();
+        let masked = pointer_scan_view(&text, &policy.registered).unwrap();
+        assert!(!masked.contains(&value.oid));
+        let adjacent = format!("{text}token {}\n", value.oid);
+        assert!(
+            pointer_scan_view(&adjacent, &policy.registered)
+                .unwrap()
+                .contains(&value.oid)
+        );
+        assert!(
+            pointer_scan_view(&format!("oid sha256:{}\n", value.oid), &policy.registered).is_none()
+        );
+        #[cfg(feature = "secret-vault")]
+        assert!(
+            pointer_scan_view(
+                &text,
+                &RegisteredMatcher::for_test(&[("explicit", &value.oid)])
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn staged_readers_share_the_remaining_byte_budget() {
         let policy = policy();
         let bytes = b"plain content";
@@ -460,10 +509,10 @@ mod tests {
 
     #[cfg(feature = "secret-vault")]
     #[test]
-    fn staged_registered_json_values_ignore_local_waivers() {
+    fn staged_registered_json_values_honor_allowlists_but_ignore_inline_waivers() {
         let secret = "blue \"horse\" battery";
-        let policy = CapturedPolicy {
-            allowlist: HashSet::from([secret.into()]),
+        let mut policy = CapturedPolicy {
+            allowlist: HashSet::new(),
             registered: RegisteredMatcher::for_test(&[("sec_owned", secret)]),
         };
         let text =
@@ -477,6 +526,13 @@ mod tests {
         assert_eq!(report.hits.len(), 1);
         assert_eq!(report.hits[0].rule, "registered-secret");
         assert_eq!(report.hits[0].redacted, "[redacted:registered-secret]");
+
+        policy.allowlist.insert(secret.into());
+        let mut inspector = Inspector::new(&policy, ScanLimits::DEFAULT);
+        assert!(!inspector.lfs(text.as_bytes(), &pointer).unwrap());
+        let (report, _) = inspector.finish();
+        assert!(!report.truncated);
+        assert!(report.hits.is_empty());
     }
 
     #[test]

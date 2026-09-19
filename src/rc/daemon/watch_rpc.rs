@@ -24,6 +24,7 @@ pub(super) struct PreparedWatch {
     roots: policy::CanonicalRoots,
     runtime: String,
     cwd: PathBuf,
+    protection_repo: Option<PathBuf>,
     source: WatchSource,
     seed: Option<Frame>,
     from_line: u64,
@@ -71,6 +72,15 @@ impl WatchScan {
         let runtime = local.runtime;
         let cwd = policy::require_within(Path::new(&local.cwd), &roots)
             .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
+        let protection_repo =
+            crate::rc::protection::native_repository(&runtime, &request.session_id, &cwd).map_err(
+                |_| {
+                    RpcError::new(
+                        ErrorCode::RuntimeUnavailable,
+                        "session protection context is unavailable",
+                    )
+                },
+            )?;
         let (source, from_line, total_lines, absolute_lines) = if runtime == "opencode" {
             use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
             let source = OpenCode
@@ -133,6 +143,7 @@ impl WatchScan {
             roots,
             runtime,
             cwd,
+            protection_repo,
             source,
             seed,
             from_line,
@@ -189,6 +200,7 @@ impl Daemon {
             roots,
             runtime,
             cwd,
+            protection_repo,
             source,
             seed,
             from_line,
@@ -320,11 +332,22 @@ impl Daemon {
                 // freezes a snapshot on this stream, which keeps allowing by the old
                 // rules after `agit rc secrets reload`.
                 let secret_filter = self.secret_filter.clone();
+                let mut redactor = crate::domain::redact::Redactor::with_registered(
+                    crate::domain::redact::Persona::this_machine(),
+                    secret_filter,
+                )
+                .require_repository();
+                if let Some(root) = &protection_repo {
+                    redactor = redactor.with_repository(root).map_err(|_| {
+                        RpcError::new(
+                            ErrorCode::RuntimeUnavailable,
+                            "session protection context is unavailable",
+                        )
+                    })?;
+                    redactor =
+                        redactor.with_native_context(&runtime, &request.session_id, &cwd, root);
+                }
                 let handle = tokio::spawn(async move {
-                    let redactor = crate::domain::redact::Redactor::with_registered(
-                        crate::domain::redact::Persona::this_machine(),
-                        secret_filter,
-                    );
                     // Read from the start of the window instead of reading from the
                     // beginning and discarding — the latter costs memory the size of
                     // the whole transcript.

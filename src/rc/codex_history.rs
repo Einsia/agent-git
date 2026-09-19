@@ -184,5 +184,17 @@ pub(crate) fn prompt_identity(record: &serde_json::Value, mode: HistoryMode) -> 
     (parsed.to_string() == id).then(|| id.to_owned())
 }
 
+pub(crate) fn prompt_identity_pointer(
+    record: &serde_json::Value,
+    mode: HistoryMode,
+) -> Option<&'static str> {
+    prompt_identity(record, mode)?;
+    match mode {
+        HistoryMode::Legacy => Some("/payload/client_id"),
+        HistoryMode::Paginated => Some("/payload/item/client_id"),
+        HistoryMode::Model => None,
+    }
+}
+
 #[cfg(test)]
 mod tests;

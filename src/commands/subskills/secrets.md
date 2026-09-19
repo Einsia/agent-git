@@ -26,7 +26,7 @@ agit secrets <subcommand>
 | `remove <id-or-name>` | Delete one record irreversibly | `--yes` skips the prompt |
 | `status` | Authenticate the vault and every encrypted record | `--json` |
 | `review` | Review this repository's candidate policy | `--repo <path>`, `--json` |
-| `allow <record-id>` | Stop projecting a heuristic candidate from now on | `--repo <path>` |
+| `allow <record-id>` | Allow an exact repository value in local projection and scans | `--repo <path>` |
 | `unallow <record-id>` | Restore default protection for an allowed candidate | `--repo <path>` |
 | `block add <name>` | Add an exact repository-local block rule | `--stdin`, `--allow-short`, `--repo <path>` |
 | `block remove <record-id>` | Clear the explicit block bit | `--repo <path>` |
@@ -48,7 +48,7 @@ agit secrets remove ci-token --yes
 
 `--allow-short` accepts a 4–7 byte rule. A short rule matches everywhere and materially raises both false positives and enumeration risk; prefer a longer literal when one exists.
 
-`allow` only changes *future* projection. The reverse mapping is retained so placeholders already written into history keep hydrating on this device. An explicit `block` always wins over a heuristic `allow`, and neither registered rules nor block rules honour the store's `.agit-allow-secrets` allowlist or inline pragmas — a repository's contents cannot switch off a policy you set on your own device.
+`allow` exempts the exact value from future local projection and client scans, even when a global registration or repository `block` also matches. The device's `$AGIT_HOME/.agit-allow-secrets` file has the same precedence. Preset allowances apply to all candidate sources, including entropy and registered literals. Reverse mappings remain available so old placeholders keep hydrating. Strict server scans do not inherit local allowances, and inline pragmas do not override registered rules.
 
 `remove` is irreversible: placeholders written under that record can no longer be hydrated anywhere. Unregister a value only when it is no longer a secret.
 

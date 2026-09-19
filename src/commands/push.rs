@@ -1536,14 +1536,10 @@ fn finish_secret_scan(
             "{} suspected secrets found — publish blocked.",
             hits.len()
         ));
-        // A registered secret deliberately does not accept the allowlist; this way out is
-        // offered only when a built-in heuristic actually hit.
-        if hits.iter().any(|h| h.rule != "registered-secret") {
-            ui::hint(&format!(
-                "· false positive? add the string to {}",
-                ui::tilde(&config::agit_home()?.join(secrets::ALLOWLIST_FILE))
-            ));
-        }
+        ui::hint(&format!(
+            "· false positive? add the string to {}",
+            ui::tilde(&config::agit_home()?.join(secrets::ALLOWLIST_FILE))
+        ));
     }
     if unscanned.is_empty() {
         ui::hint("to accept these findings explicitly, repeat the push with --allow-secrets");

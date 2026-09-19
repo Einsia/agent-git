@@ -257,15 +257,7 @@ pub fn run(args: Args) -> CmdResult {
                 "· this report is incomplete: it shows {shown} findings and stops there, more remain — handle these, then run `agit scan` again to see the rest"
             ));
         }
-        // An explicitly registered secret deliberately does not accept an allowlist, so this
-        // way out is offered only when a built-in heuristic actually hit.
-        if found
-            .hits
-            .iter()
-            .any(|(_, h)| h.rule != "registered-secret")
-        {
-            ui::hint("· allowlist (local): write to $AGIT_HOME/.agit-allow-secrets");
-        }
+        ui::hint("· allowlist (local): write to $AGIT_HOME/.agit-allow-secrets");
         ui::hint(
             "· blanket bypass (think twice before it enters history): AGIT_ALLOW_SECRETS=1 agit push — the server may still refuse it, and it will block going public later",
         );

@@ -108,70 +108,7 @@ pub fn run(mut args: Args) -> CmdResult {
         )],
     );
 
-    let raw = source.raw;
-
-    // ── Scan before sharing ──
-    //
-    // This is less reversible than push: once a link has been visited, the content may already be
-    // cached or indexed.
-    // The allowlist has to really be loaded. The hint below tells the reader to add a false
-    // positive to `.agit-allow-secrets`, and passing an empty set would leave that way out
-    // closed — together with `AGIT_ALLOW_SECRETS` being deliberately off here, one false
-    // positive could block sharing permanently with no way around it.
-    let hits = secrets::scan_text(&raw, &secrets::load_allowlist(&config::agit_home()?));
-    let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let (registered_hits, registered_truncated) =
-        secrets::registered_hits_semantic_capped(&raw, 5, &registered);
-    if !hits.is_empty() || !registered_hits.is_empty() {
-        let reported = hits.len() + registered_hits.len();
-        let qualifier = if registered_truncated {
-            "at least "
-        } else {
-            ""
-        };
-        ui::error(&format!(
-            "this session has {qualifier}{reported} suspected secrets — refusing to share."
-        ));
-        for h in hits.iter().take(5) {
-            println!("  {} line {}  {}", h.rule, h.line, ui::dim(&h.redacted));
-        }
-        if !registered_hits.is_empty() {
-            // Registered rules show only the kind and the line; they print no name/id and
-            // never the matched text.
-            for found in &registered_hits {
-                println!(
-                    "  registered-secret line {}  {}",
-                    found.line,
-                    ui::dim("[redacted:registered-secret]")
-                );
-            }
-        }
-        // There is deliberately **no** AGIT_ALLOW_SECRETS escape hatch here: what push sends
-        // still lands in an agent that has an owner and can be made private, while a sharing
-        // link is readable by anyone.
-        if !hits.is_empty() {
-            ui::hint(
-                "if they’re false positives, add them to the store’s .agit-allow-secrets allowlist",
-            );
-        }
-        if !registered_hits.is_empty() {
-            ui::hint(
-                "registered-secret rules ignore allowlists; inspect labels with `agit secrets list` and unregister one only if the value is no longer secret",
-            );
-        }
-        return Ok(ExitCode::Policy);
-    }
-
-    // Render a readable transcript before sharing — a share exists to be read by people, not
-    // parsed by machines.
-    let parsed = match source.envelope.as_deref() {
-        Some(envelope) => transcript::display::parse(envelope)?,
-        None => {
-            let rt = adapter::infer_runtime(&raw).unwrap_or(source.runtime.as_str());
-            adapter::get(rt)?.parse(&raw)?
-        }
-    };
-    let readable = ui::transcript::render_transcript(&parsed, 20000);
+    let readable = protected_readable(&source)?;
 
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
@@ -321,6 +258,56 @@ struct ShareSource {
     runtime: String,
     label: String,
     selection_source: super::echo::Source,
+    protection_repo: Option<std::path::PathBuf>,
+    native_context: Option<(String, std::path::PathBuf)>,
+}
+
+/// Project native content before rendering so truncation cannot hide discovery context.
+fn protected_readable(source: &ShareSource) -> crate::Result<String> {
+    let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    if let Some(root) = &source.protection_repo {
+        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(root)?;
+        let protected = match source.envelope.as_deref() {
+            Some(envelope) => dictionary.protect_envelopes(envelope, &registered)?,
+            None => match &source.native_context {
+                Some((native, cwd)) => dictionary.protect_session_jsonl(
+                    &source.raw,
+                    &registered,
+                    &source.runtime,
+                    native,
+                    cwd,
+                )?,
+                None => dictionary.protect_jsonl(&source.raw, &registered)?,
+            },
+        };
+        anyhow::ensure!(
+            protected.intact == 0,
+            "share exceeds the reversible protection limit; no content was sent"
+        );
+        let parsed = if source.envelope.is_some() {
+            transcript::display::parse(&protected.text)?
+        } else {
+            adapter::get(&source.runtime)?.parse(&protected.text)?
+        };
+        return Ok(ui::transcript::render_transcript(&parsed, 20000));
+    }
+    let parsed = match source.envelope.as_deref() {
+        Some(envelope) => transcript::display::parse(envelope)?,
+        None => {
+            let runtime = adapter::infer_runtime(&source.raw).unwrap_or(source.runtime.as_str());
+            adapter::get(runtime)?.parse(&source.raw)?
+        }
+    };
+    let hits = secrets::scan_text_registered_with(
+        &serde_json::to_string(&parsed)?,
+        &std::collections::HashSet::new(),
+        &registered,
+    );
+    anyhow::ensure!(
+        hits.is_empty(),
+        "this unclaimed native session needs an Agent repository for reversible protection; no content was sent"
+    );
+    Ok(ui::transcript::render_transcript(&parsed, 20000))
 }
 
 struct SharePoint {
@@ -403,6 +390,13 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
             "--full-log needs an AgentGit ref such as owner/repo@branch; native session IDs select the live transcript"
         );
     }
+    let protection_repo = match (&native.owner, &native.agent) {
+        (Some(owner), Some(agent)) => {
+            let (owner, agent) = super::parse_slug(&format!("{owner}/{agent}"))?;
+            Some(config::repo_dir(&owner, &agent)?)
+        }
+        _ => None,
+    };
     Ok(ShareSource {
         raw: native.read()?,
         envelope: None,
@@ -413,6 +407,11 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
             link::short(&native.session_id)
         ),
         selection_source: super::echo::Source::Explicit,
+        protection_repo,
+        native_context: native
+            .cwd
+            .as_ref()
+            .map(|cwd| (native.session_id.clone(), std::path::PathBuf::from(cwd))),
     })
 }
 
@@ -535,6 +534,8 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
             &point.sha[..12.min(point.sha.len())]
         ),
         selection_source: point.selection_source,
+        protection_repo: Some(point.repo.root().to_path_buf()),
+        native_context: None,
     })
 }
 
@@ -723,6 +724,45 @@ mod tests {
         let w = W::parse_from(["x"]);
         assert!(!w.a.public, "the default must be encrypted");
         assert_eq!(w.a.expire, "7d", "the default must have an expiry");
+    }
+
+    #[test]
+    fn sharing_legacy_plaintext_projects_before_rendering_and_keeps_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let raw = serde_json::json!({"type":"user","sessionId":"s1",
+            "message":{"role":"user","content": format!("token: {secret}")}})
+        .to_string()
+            + "\n";
+        let source = ShareSource {
+            envelope: Some(transcript::wrap_lines(&raw, "claude-code", &claim())),
+            raw: raw.clone(),
+            runtime: "claude-code".into(),
+            label: "fixture".into(),
+            selection_source: super::super::echo::Source::Explicit,
+            protection_repo: Some(repo.root().to_path_buf()),
+            native_context: None,
+        };
+        let sent = protected_readable(&source).unwrap();
+        assert!(!sent.contains(secret));
+        assert!(sent.contains("{{AGIT_SECRET_V1:"));
+        let dictionary =
+            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
+        assert!(
+            dictionary
+                .hydrate_text(&sent)
+                .unwrap()
+                .text
+                .contains(secret)
+        );
+        assert_eq!(source.raw, raw);
+        assert!(
+            transcript::unwrap_strict(source.envelope.as_ref().unwrap())
+                .unwrap()
+                .contains(secret)
+        );
+        assert_eq!(protected_readable(&source).unwrap(), sent);
     }
 
     #[test]

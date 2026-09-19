@@ -59,13 +59,13 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Allow a heuristic candidate in future projections (old keys still hydrate)
+    /// Allow a repository value in local protection and scans (old keys still hydrate)
     Allow {
         record_id: String,
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Restore default protection for an allowed heuristic candidate
+    /// Restore default protection for an allowed repository value
     Unallow {
         record_id: String,
         #[arg(long)]
@@ -199,7 +199,7 @@ pub fn run(args: Args) -> CmdResult {
         Action::Allow { record_id, repo } => {
             let changed = repository_dictionary(repo)?.allow(&record_id)?;
             ui::success(&format!(
-                "allowed heuristic record {} (old placeholders remain hydratable)",
+                "allowed repository record {} (old placeholders remain hydratable)",
                 changed.id
             ));
             Ok(ExitCode::Ok)

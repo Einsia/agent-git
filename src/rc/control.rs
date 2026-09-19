@@ -642,6 +642,26 @@ pub fn serve_one(
 mod tests {
     use super::*;
 
+    /// A separate process prevents unrelated test forks from retaining listener and lock descriptors.
+    fn in_isolated_process(case: &str) -> bool {
+        const CHILD_CASE: &str = "AGIT_TEST_CONTROL_CASE";
+        let name = format!("rc::control::tests::{case}");
+        if std::env::var(CHILD_CASE).as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_CASE, &name)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "{name}: {output:?}"
+        );
+        true
+    }
+
     /// Start a fake daemon that **really answers**: it serves `n` times, then exits and takes the
     /// listener with it.
     ///
@@ -698,6 +718,9 @@ mod tests {
 
     #[test]
     fn concurrent_starters_serialize_stale_cleanup_and_publication() {
+        if in_isolated_process("concurrent_starters_serialize_stale_cleanup_and_publication") {
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
         use std::sync::Barrier;
 
@@ -733,6 +756,9 @@ mod tests {
 
     #[test]
     fn ownership_is_rooted_in_each_namespace_with_short_socket_fallback() {
+        if in_isolated_process("ownership_is_rooted_in_each_namespace_with_short_socket_fallback") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("deep-home-".repeat(15));
         let rc = home.join("rc");
@@ -759,6 +785,9 @@ mod tests {
 
     #[test]
     fn stale_evidence_cannot_remove_a_replacement_socket() {
+        if in_isolated_process("stale_evidence_cannot_remove_a_replacement_socket") {
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -831,6 +860,9 @@ mod tests {
     /// Operator confirmation cannot override an observable listener or a held lifetime lock.
     #[test]
     fn stopped_recovery_rejects_live_listeners_and_unsafe_paths() {
+        if in_isolated_process("stopped_recovery_rejects_live_listeners_and_unsafe_paths") {
+            return;
+        }
         use std::os::unix::fs::{MetadataExt, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -883,6 +915,9 @@ mod tests {
     /// A released lifetime lock and its socket record establish staleness independently of PIDs.
     #[test]
     fn a_socket_file_with_nobody_listening_is_stale() {
+        if in_isolated_process("a_socket_file_with_nobody_listening_is_stale") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let rc = tmp.path();
         let p = rc.join("dead.sock");

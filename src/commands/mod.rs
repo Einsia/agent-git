@@ -353,7 +353,7 @@ pub fn hint_secret_remedies(sources: impl IntoIterator<Item = secrets::Source>) 
 }
 
 /// The rule that matched takes part in the remedy too: an explicitly registered rule accepts
-/// neither an allowlist nor an inline annotation.
+/// no inline annotation; local allowlists still apply.
 ///
 /// The object-rewrite remedies hold for both kinds of rule; only a built-in heuristic hit in the
 /// working tree can be allowed through with `agit:allow-secret`. Keeping that decision in one
@@ -373,7 +373,7 @@ pub fn hint_secret_hit_remedies<'a>(hits: impl IntoIterator<Item = &'a secrets::
     }
     if registered {
         crate::ui::hint(
-            "· registered-secret rules are explicit and ignore allowlists: remove the value from the content, or review local rule labels with `agit secrets list` and unregister one only if it is no longer a secret",
+            "· registered-secret rules ignore inline annotations: remove the value, allow the exact value locally, or review local rule labels with `agit secrets list`",
         );
     }
     hint_secret_remedies(sources);
@@ -430,6 +430,14 @@ fn remedy_hint(r: SecretRemedy) -> String {
 /// nothing about it. So this prints both the reason and the next step the user can actually take;
 /// the verdict is the caller's, by the same rule (stop, unless `AGIT_ALLOW_SECRETS`).
 pub fn report_unscanned(u: &secrets::Unscanned) {
+    if !u.unsupported.is_empty() {
+        crate::ui::error(
+            "Some carriers were unreadable or outside UTF-8 inspection; absence of findings does not establish that their content is safe.",
+        );
+        for label in u.unsupported.iter().take(5) {
+            crate::ui::hint(label);
+        }
+    }
     if let Some((bytes, budget)) = u.over_budget {
         // All three words are deliberate.
         //

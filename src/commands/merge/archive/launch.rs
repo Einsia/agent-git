@@ -88,11 +88,6 @@ pub(in crate::commands::merge) fn start(
         &mut command,
         || Ok(()),
     )?;
-    if let Some(unresolved) = prepared.unresolved_placeholders.filter(|count| *count > 0) {
-        crate::ui::warning(&format!(
-            "archive VIEW retains {unresolved} unresolved secret placeholders"
-        ));
-    }
     Ok(Launched {
         child,
         binding: prepared.binding,

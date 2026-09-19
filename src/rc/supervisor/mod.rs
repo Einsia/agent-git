@@ -1160,6 +1160,23 @@ impl Session {
     ) -> Result<Session, crate::rc::harness::proc::LaunchError> {
         let agit_session = spec.agit_session.clone();
         let cwd = spec.cwd.clone();
+        let mut redactor =
+            redact::Redactor::with_registered(redact::Persona::this_machine(), secret_filter)
+                .require_repository();
+        if let Some(session) = &agit_session {
+            let repo = session
+                .repo_dir()
+                .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
+            redactor = redactor
+                .with_repository(&repo)
+                .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
+            redactor = redactor.with_native_context(
+                &info.runtime,
+                spec.resume_from.as_deref().unwrap_or(""),
+                &cwd,
+                &repo,
+            );
+        }
         // **Whether this is a new run or a continuation is known at this moment.**
         //
         // The two sites below cannot ask "does the transcript file exist right now": that
@@ -1187,10 +1204,7 @@ impl Session {
             driver,
             tailer: None,
             native_records: native_records::NativeRecords::default(),
-            redactor: redact::Redactor::with_registered(
-                redact::Persona::this_machine(),
-                secret_filter,
-            ),
+            redactor,
             out,
             pending: Default::default(),
             consumed_bytes: 0,
@@ -1710,7 +1724,21 @@ impl Session {
         let Some(mut stream) = self.delta_streams.remove(item_id) else {
             return;
         };
-        let report = stream.flush();
+        let report = match stream.flush() {
+            Ok(report) => report,
+            Err(error) => {
+                tracing_note(&format!("Stream protection failed: {error}"));
+                self.emit(
+                    method::ITEM_DELTA,
+                    ItemDelta {
+                        item_id: item_id.to_string(),
+                        text: "[output withheld: stream protection exceeded its buffer limit; the local transcript is retained]".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
         if report.text.is_empty() {
             return;
         }
@@ -2453,6 +2481,7 @@ impl Session {
                 runtime_thread_id,
                 transcript_path,
             } => {
+                self.redactor.bind_native_session(&runtime_thread_id);
                 // The native id stays here. Viewers address the session by its
                 // logical agit id, which is what makes "continue on another
                 // machine" and "continue in another harness" invisible to them.
@@ -2537,25 +2566,17 @@ impl Session {
                 .await;
             }
             HarnessEvent::Delta { item_id, text } => {
-                // **One delta is not a whole string.** The harness can cut a registered secret
-                // between two chunks; redacted chunk by chunk neither half matches, and the
-                // complete value leaves the machine across two frames. So every item has its
-                // own streaming redactor, holding back a tail that could still grow into a rule
-                // match; `flush_delta` releases what is held when the item ends.
+                // Item completion is the inspection boundary. An overflow poisons
+                // the buffer and is reported by `flush_delta`; no suffix is released.
                 if !self.delta_streams.contains_key(&item_id) {
                     let stream = self.redactor.stream();
                     self.delta_streams.insert(item_id.clone(), stream);
                 }
-                let report = self
+                let _ = self
                     .delta_streams
                     .get_mut(&item_id)
                     .expect("delta stream was inserted above")
                     .push(&text);
-                if !report.text.is_empty() {
-                    let text = self.finish_scrub(report, "item_delta").await;
-                    self.emit(method::ITEM_DELTA, ItemDelta { item_id, text })
-                        .await;
-                }
             }
             HarnessEvent::ItemCompleted { item_id } => {
                 self.flush_delta(&item_id).await;
@@ -3349,49 +3370,41 @@ pub(crate) fn items_from_lines_with_mode(
         // registered literal containing `"`, `\` or a newline; rewriting in place also removes
         // the "scrubbed but no longer parseable" branch — the structure was never touched, so
         // there is no shape to fall back from.
-        let scrubbed = redactor.scrub_json(&raw);
-        let registered_projection = !scrubbed.registered_ids.is_empty();
+        let verified = (runtime == "codex")
+            .then(|| super::codex_history::prompt_identity_pointer(&raw, mode))
+            .flatten();
+        let scrubbed = redactor.scrub_native_json(&raw, &verified.into_iter().collect::<Vec<_>>());
+        let secret_projection =
+            scrubbed.secrets > 0 || scrubbed.value.get("protection_error").is_some();
         registered.extend(scrubbed.registered_ids);
         let scrubbed_raw = scrubbed.value;
         let native_prompt_id = (runtime == "codex")
             .then(|| super::codex_history::prompt_identity(&scrubbed_raw, mode))
             .flatten();
-        // Once a registered low-entropy value was removed, sending the hash of
-        // the original JSON would give the hub an offline dictionary oracle.
-        // Only that case switches identity: ordinary path/persona redaction must
+        // Once a secret value is removed, sending the hash of the original JSON
+        // can give the hub an offline dictionary oracle. Path/persona redaction must
         // retain the committed envelope's original hash so live reconciliation
         // still works.
-        let object_hash = projected_object_hash(&raw, &scrubbed_raw, registered_projection);
+        let object_hash = projected_object_hash(&raw, &scrubbed_raw, secret_projection);
+        let events = if scrubbed_raw.get("protection_error").is_some() {
+            vec![crate::adapter::Event::text(
+                crate::adapter::EventKind::AssistantReply,
+                "[content withheld: repository secret protection failed]",
+                None,
+            )]
+        } else if runtime == "codex" {
+            super::codex_history::events(&scrubbed_raw, mode)
+        } else {
+            serde_json::to_string(&scrubbed_raw)
+                .ok()
+                .and_then(|text| adapter.parse(&text).ok())
+                .map(|session| session.events)
+                .unwrap_or_default()
+        };
         let (raw_out, truncated) = cap_raw(scrubbed_raw);
 
+        // IR text and paths are derived from the protected native bytes before display truncation.
         for (i, mut event) in events.into_iter().enumerate() {
-            if let Some(t) = event.text.take() {
-                let r = redactor.scrub(&t);
-                registered.extend(r.registered_ids);
-                event.text = Some(r.text);
-            }
-            // **`paths`, like `text`, is raw material, not metadata.**
-            //
-            // What the adapter puts here is the **absolute** `file_path` —
-            // `/Users/alice/secret/src/main.rs`. With `text` scrubbed it still lies unchanged
-            // in the same event, leaves the machine with `item.completed` and lands in the
-            // hub's database: everyone in the workspace who sees this transcript gets the
-            // machine owner's username and home directory. Scrubbing the line's `raw` does not
-            // help — `raw` hangs off the first event of the line only, and consumers read
-            // `paths` out of the IR.
-            //
-            // The approval card carries the same trap; see the comment on `req.paths` in
-            // `Session::on_harness_event`: **every** string field in a struct gets scrubbed,
-            // and `paths` is not an exception.
-            event.paths = event
-                .paths
-                .iter()
-                .map(|p| {
-                    let r = redactor.scrub(p);
-                    registered.extend(r.registered_ids);
-                    r.text
-                })
-                .collect();
             event.line = Some(line.lineno as usize);
             out.push(ItemCompleted {
                 source_id: line

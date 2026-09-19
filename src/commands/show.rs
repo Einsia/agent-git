@@ -35,7 +35,7 @@ pub struct Args {
     #[arg(long)]
     pub log_only: bool,
 
-    /// Emit native JSONL from the selected evidence without headers or truncation.
+    /// Keep canonical placeholders; emit native JSONL or the selected file without display formatting.
     #[arg(long, conflicts_with = "max_chars")]
     pub raw: bool,
 
@@ -666,7 +666,13 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
             if args.raw {
                 return Some(print_native(&events.concat()));
             }
-            let text = events.concat();
+            let text = match local_display_envelopes(&repo, &events.concat()) {
+                Ok(text) => text,
+                Err(error) => {
+                    ui::error(&format!("cannot restore local display: {error:#}"));
+                    return Some(ExitCode::Precondition);
+                }
+            };
             if use_tui {
                 return Some(browse_ref_text(t, text, "turn LOG"));
             }
@@ -699,7 +705,18 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
                 ui::error(&format!("turn {turn} has no event #{index}."));
                 return Some(ExitCode::Ref);
             };
-            let Ok(env) = serde_json::from_str::<transcript::Envelope>(l) else {
+            let local = if args.raw {
+                l.clone()
+            } else {
+                match local_display_envelopes(&repo, l) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        ui::error(&format!("cannot restore local display: {error:#}"));
+                        return Some(ExitCode::Precondition);
+                    }
+                }
+            };
+            let Ok(env) = serde_json::from_str::<transcript::Envelope>(&local) else {
                 ui::error("that line is not a valid envelope.");
                 return Some(ExitCode::Precondition);
             };
@@ -717,7 +734,7 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
         }
     };
 
-    // `:path`: the file in the tree **verbatim**, exactly the semantics of `git show <sha>:<path>`.
+    // `:path` selects the literal tree path; local display may hydrate its text.
     //
     // This takes the raw reader rather than [`Repo::show_result`]: that one resolves the names
     // `LOG` / `VIEW` into this line's logical event sequence (v0 lands in `session/log.jsonl`),
@@ -727,6 +744,19 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     if let Some(p) = &resolved.path {
         match repo.show_raw_result(&resolved.sha, p) {
             Ok(Some(text)) => {
+                let text = if args.raw {
+                    text
+                } else {
+                    match crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+                        .and_then(|dictionary| dictionary.hydrate_pair_readonly(&text, ""))
+                    {
+                        Ok((report, _)) => report.text,
+                        Err(error) => {
+                            ui::error(&format!("cannot restore local display: {error:#}"));
+                            return Some(ExitCode::Precondition);
+                        }
+                    }
+                };
                 print!("{text}");
                 return Some(ExitCode::Ok);
             }
@@ -779,6 +809,13 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     if args.raw {
         return Some(print_native(&env));
     }
+    let env = match local_display_envelopes(&repo, &env) {
+        Ok(text) => text,
+        Err(error) => {
+            ui::error(&format!("cannot restore local display: {error:#}"));
+            return Some(ExitCode::Precondition);
+        }
+    };
     if use_tui {
         return Some(browse_ref_text(t, env, repository_source(args.log_only)));
     }
@@ -803,10 +840,20 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     })
 }
 
+fn local_display_envelopes(repo: &Repo, envelopes: &str) -> crate::Result<String> {
+    Ok(
+        crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+            .hydrate_envelopes_readonly(envelopes)?
+            .text,
+    )
+}
+
 fn render_saved_point(repo: &Repo, sha: &str, envelopes: &str, args: &Args) -> crate::Result<()> {
     let parsed = transcript::display::parse(envelopes)?;
-    let snapshot = meta::read_at_ref_result(repo, sha)?
+    let mut snapshot = meta::read_at_ref_result(repo, sha)?
         .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
+    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        .hydrate_metadata_readonly(&mut snapshot)?;
     let (status, seconds, _) = repo.git_status_local(&[
         "show",
         "--no-patch",
@@ -985,6 +1032,50 @@ fn render_envelopes(envelopes: &str, max_chars: usize) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_display_restores_known_values_and_keeps_foreign_tokens_without_writing_git() {
+        use crate::domain::{
+            repo::Repo,
+            secret_filter::{Matcher, RepositoryDictionary},
+            transcript,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("owner")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
+        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let raw = serde_json::json!({"message":{"content":secret}}).to_string();
+        let protected = dictionary.protect_jsonl(&raw, &Matcher::empty()).unwrap();
+        let saved = transcript::wrap_lines(
+            &protected.text,
+            "claude-code",
+            &format!("agit-{}", "a".repeat(40)),
+        );
+        std::fs::write(repo.root().join("saved.jsonl"), &saved).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Store protected fixture").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let vault = repo.root().join(".git/agit/secret-dictionary/vault.json");
+        let vault_before = std::fs::read(&vault).unwrap();
+        let shown = super::local_display_envelopes(&repo, &saved).unwrap();
+        assert!(shown.contains(secret));
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("saved.jsonl")).unwrap(),
+            saved
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(std::fs::read(&vault).unwrap(), vault_before);
+        let foreign = Repo::init(&dir.path().join("foreign")).unwrap();
+        assert_eq!(
+            super::local_display_envelopes(&foreign, &saved).unwrap(),
+            saved
+        );
+        assert!(!foreign.root().join(".git/agit/secret-dictionary").exists());
+        std::fs::write(vault, "broken dictionary").unwrap();
+        assert!(super::local_display_envelopes(&repo, &saved).is_err());
+    }
+
     #[test]
     fn unreadable_snapshot_refuses_before_entering_the_terminal() {
         assert_eq!(

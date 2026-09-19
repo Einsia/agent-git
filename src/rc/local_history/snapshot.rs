@@ -127,26 +127,30 @@ pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> cr
             ensure!(end <= items.len() as u64, Failure::InvalidCursor);
             let start = end.saturating_sub(64);
             {
-                let redactor = crate::domain::redact::Redactor::try_this_machine()?;
+                let redactor =
+                    crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
                 let page: Vec<Value> = items[start as usize..end as usize]
                     .iter()
-                    .map(|item| {
-                        let scrubbed = redactor.scrub_json(item);
-                        let mut item = scrubbed.value;
-                        if !scrubbed.registered_ids.is_empty() {
+                    .map(|item| -> crate::Result<Value> {
+                        let mut item = item.clone();
+                        let scrubbed = redactor.try_scrub_json(&item["raw"])?;
+                        item["raw"] = scrubbed.value;
+                        item["event"] = redactor.try_scrub_json(&item["event"])?.value;
+                        if scrubbed.secrets > 0 {
                             item["object_hash"] =
                                 crate::domain::transcript::object_hash(&item["raw"]).into();
                         }
-                        item
+                        Ok(item)
                     })
-                    .collect();
+                    .collect::<crate::Result<_>>()?;
                 (page, start)
             }
         } else {
             let (mut lines, next, mode) = page_segments(&mut entry.parts, before)?;
             validate_records(runtime, &lines)?;
             let context = select_view(&mut lines, runtime, params);
-            let redactor = crate::domain::redact::Redactor::try_this_machine()?;
+            let redactor =
+                crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
             let (items, _) = super::super::supervisor::items_from_lines_with_mode(
                 runtime, &redactor, &lines, mode,
             );
@@ -190,7 +194,8 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
             std::path::Path::new(cwd),
         )?;
         snapshot.bytes = bytes.len() as u64;
-        let redactor = crate::domain::redact::Redactor::try_this_machine()?;
+        let redactor =
+            crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
         let (items, _) = super::super::supervisor::native_records::NativeRecords::default()
             .project(&bytes, false, &redactor)?;
         let items = items

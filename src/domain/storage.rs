@@ -724,6 +724,51 @@ pub fn materialize_at(repo_root: &Path, git_ref: &str, seq_file: &str) -> Result
     }
 }
 
+/// Identity evidence reads immutable local objects with a bound on both source and expanded bytes.
+pub(crate) fn identity_log_at(
+    repo_root: &Path,
+    commit: &str,
+    layout: LayoutVersion,
+    maximum: usize,
+) -> Result<String> {
+    anyhow::ensure!(
+        meta::is_event_id(commit),
+        "identity evidence requires an immutable commit"
+    );
+    let policy = ReadPolicy::LocalOnly;
+    let bytes = git_blob_with_policy(
+        repo_root,
+        commit,
+        SequenceKind::Log.path(layout),
+        maximum,
+        policy,
+    )?;
+    let text = String::from_utf8(bytes).context("identity evidence LOG is not UTF-8")?;
+    if layout == LayoutVersion::V0 {
+        let canonical = canonical_v0(&text)?;
+        anyhow::ensure!(
+            canonical.len() <= maximum,
+            "identity evidence exceeds its expansion limit"
+        );
+        return Ok(canonical);
+    }
+    let ids = parse_sequence(&text)?;
+    materialize_pair_ids_with_limits(
+        &ids,
+        &[],
+        maximum.min(MAX_EVENT_BYTES),
+        maximum,
+        maximum,
+        |unique| inspect_git_event_sizes_with_policy(repo_root, commit, unique, policy),
+        |unique, sizes, offsets, output| {
+            read_git_events_into_output_with_policy(
+                repo_root, commit, unique, sizes, offsets, output, policy,
+            )
+        },
+    )
+    .map(|(log, _)| log)
+}
+
 /// Read saved history from a validated immutable snapshot without consulting VIEW or fetching.
 /// The limit covers both unique object bytes and the expanded LOG, including repeated events.
 #[cfg(feature = "cli")]

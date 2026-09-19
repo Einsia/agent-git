@@ -59,12 +59,11 @@
 use super::CmdResult;
 use crate::domain::meta::{self, Kind};
 use crate::domain::repo::Repo;
-use crate::domain::secrets;
 use crate::{ExitCode, ui};
 use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use sha2::Digest as _;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The memory directory in the branch tree.
@@ -458,23 +457,32 @@ fn upsert_index(existing: &str, scope: &str, lines: &[String]) -> String {
     out
 }
 
-/// A suspected secret: the built-in rules plus the allowlist, plus the literals registered with
-/// `agit secrets` (they can be low-entropy enough to hit no heuristic rule). A failed scan counts
-/// as "there are hits" — better to collect one file less.
-fn suspected_secret(bytes: &[u8], allowlist: &HashSet<String>) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    match secrets::scan_text_registered(&text, allowlist) {
-        Ok(hits) if hits.is_empty() => None,
-        Ok(hits) => Some(
-            hits.iter()
-                .map(|h| h.rule.as_str())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        Err(error) => Some(format!("scan failed: {error:#}")),
+/// Protect one memory file before it enters a Git tree. Text gets repository-local placeholders;
+/// Non-text memory stays in its native source because this boundary cannot reversibly inspect it.
+fn protect_memory_bytes(
+    dictionary: &crate::domain::secret_filter::RepositoryDictionary,
+    bytes: &[u8],
+    global: &crate::domain::secret_filter::Matcher,
+) -> crate::Result<Result<Vec<u8>, String>> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(Err(
+            "memory is outside the supported UTF-8 protection boundary; native content is retained"
+                .into(),
+        ));
+    };
+    if text.contains('\0') {
+        return Ok(Err(
+            "memory contains binary data; native content is retained".into(),
+        ));
     }
+    let protected = dictionary.protect_jsonl(text, global)?;
+    if protected.intact > 0 {
+        return Ok(Err(format!(
+            "{} finding(s) exceeded the reversible record limit",
+            protected.intact
+        )));
+    }
+    Ok(Ok(protected.text.into_bytes()))
 }
 
 // ────────────────────── Collection plan ─────────────────────
@@ -591,7 +599,17 @@ pub fn materialize_with(
         report.refused.extend(collected.refused);
     }
     let baseline = read_baseline(&checkout, mem_dir)?.unwrap_or_default();
-    let files = branch_files(&checkout, &tree_ref(branch))?;
+    let mut files = branch_files(&checkout, &tree_ref(branch))?;
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
+    for bytes in files.values_mut() {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            *bytes = dictionary
+                .hydrate_pair_readonly(text, "")?
+                .0
+                .text
+                .into_bytes();
+        }
+    }
     let top = md_files(mem_dir)?;
     let mirrored = md_files(&mirror)?;
     let mut index: Vec<String> = Vec::new();
@@ -733,7 +751,8 @@ pub fn collect_with(
     let mirror = md_files(&mirror_dir(mem_dir, slug, branch))?;
     let baseline = read_baseline(&checkout, mem_dir)?;
     let plan = plan_collect(baseline.as_ref(), &top, &mirror, &in_branch, policy.scope);
-    let allowlist = secrets::load_allowlist(&crate::infra::config::agit_home()?);
+    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
 
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     // Refused file names are tracked separately (the display string carries the rule name and is
@@ -741,13 +760,13 @@ pub fn collect_with(
     // collection and the next materialization both see them again.
     let mut refused_names: BTreeSet<String> = BTreeSet::new();
     for (name, bytes) in plan.top_changed.iter().chain(plan.mirror_changed.iter()) {
-        match suspected_secret(bytes, &allowlist) {
-            Some(rule) => {
+        match protect_memory_bytes(&dictionary, bytes, &global)? {
+            Ok(protected) => {
+                edits.insert(name.clone(), Some(protected));
+            }
+            Err(rule) => {
                 report.refused.push(format!("{name} ({rule})"));
                 refused_names.insert(name.clone());
-            }
-            None => {
-                edits.insert(name.clone(), Some(bytes.clone()));
             }
         }
     }
@@ -921,6 +940,8 @@ pub fn distill(
         );
     }
     let ours = branch_files(primary, &plan.branch_tip)?;
+    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     for item in chosen {
         match item {
@@ -928,7 +949,9 @@ pub fn distill(
                 let bytes = ours
                     .get(name)
                     .ok_or_else(|| anyhow::anyhow!("the plan has no memory/{name}"))?;
-                edits.insert(name.clone(), Some(bytes.clone()));
+                let bytes = protect_memory_bytes(&dictionary, bytes, &global)?
+                    .map_err(|reason| anyhow::anyhow!("cannot protect memory/{name}: {reason}"))?;
+                edits.insert(name.clone(), Some(bytes));
             }
             Pending::Remove(name) => {
                 edits.insert(name.clone(), None);
@@ -1294,20 +1317,10 @@ fn distill_cmd(
 
     // Every file to carry passes the secret scan first: main gets pushed and inherited by
     // others. The scan reads the bytes at the tip in the plan, and the landing carries those.
-    let ours = branch_files(primary, &plan.branch_tip)?;
-    let allowlist = secrets::load_allowlist(&crate::infra::config::agit_home()?);
     let mut chosen = Vec::new();
     for item in &wanted {
         let question = match item {
-            Pending::Carry(name) => {
-                if let Some(rule) = suspected_secret(&ours[name], &allowlist) {
-                    ui::warning(&format!(
-                        "memory/{name} skipped — suspected secret ({rule}); clean it up first"
-                    ));
-                    continue;
-                }
-                format!("carry memory/{name} into main?")
-            }
+            Pending::Carry(name) => format!("carry memory/{name} into main?"),
             Pending::Remove(name) => format!("delete memory/{name} from main?"),
             Pending::Conflict(name) => {
                 ui::warning(&format!(
@@ -1792,7 +1805,10 @@ mod tests {
     fn a_refused_mirror_edit_is_kept_and_reported_as_a_conflict() {
         let (_d, repo, mem) = fixture();
         materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        let leak = format!("token: agit_at_{}\n", "0123456789abcdef".repeat(4));
+        let leak = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}",
+            "unrecoverable-region\n".repeat(4096)
+        );
         std::fs::write(mirror(&mem).join("team.md"), &leak).unwrap();
 
         let r = materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
@@ -1948,21 +1964,38 @@ mod tests {
         assert!(file(&repo, "refs/heads/s1", "mine.md").is_none());
     }
 
-    /// A file with a suspected secret does not enter the branch and is named in the report.
+    /// Memory stores reversible tokens while the runtime keeps its local bytes across syncs.
     #[test]
-    fn a_file_with_a_secret_is_refused() {
+    fn a_file_with_a_secret_is_protected_and_materialized_locally() {
         let (_d, repo, mem) = fixture();
         materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        std::fs::write(
-            mem.join("leak.md"),
-            format!("token: agit_at_{}\n", "0123456789abcdef".repeat(4)),
-        )
-        .unwrap();
+        let plaintext = format!("token: agit_at_{}\n", "0123456789abcdef".repeat(4));
+        std::fs::write(mem.join("leak.md"), &plaintext).unwrap();
         let r = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(r.collected, 0);
-        assert!(r.commit.is_none());
-        assert_eq!(r.refused.len(), 1, "{:?}", r.refused);
-        assert!(r.refused[0].starts_with("leak.md"));
+        assert_eq!(r.collected, 1);
+        assert!(r.commit.is_some());
+        assert!(r.refused.is_empty());
+        let stored = file(&repo, "refs/heads/s1", "leak.md").unwrap();
+        assert!(stored.contains("{{AGIT_SECRET_V1:"));
+        assert!(!stored.contains("agit_at_"));
+        let dictionary =
+            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
+        assert_eq!(dictionary.hydrate_text(&stored).unwrap().text, plaintext);
+        assert_eq!(
+            collect_with(&repo, "s1", SLUG, &mem, ON).unwrap().collected,
+            0
+        );
+        std::fs::remove_file(mem.join("leak.md")).unwrap();
+        let off = Policy {
+            track: false,
+            scope: Scope::SinceBaseline,
+        };
+        materialize_with(&repo, "s1", SLUG, &mem, off).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror(&mem).join("leak.md")).unwrap(),
+            plaintext
+        );
+        assert_eq!(file(&repo, "refs/heads/s1", "leak.md").unwrap(), stored);
     }
 
     /// Distill: what is new on the branch is carried into main; what was inherited from main,
@@ -2090,7 +2123,10 @@ mod tests {
         )
         .unwrap();
         materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        let leak = format!("token: agit_at_{}\n", "0123456789abcdef".repeat(4));
+        let leak = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}",
+            "unrecoverable-region\n".repeat(4096)
+        );
         std::fs::write(mirror(&mem).join("team note.md"), &leak).unwrap();
         let r = materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
         assert_eq!(r.conflicts, vec!["team note.md".to_string()]);

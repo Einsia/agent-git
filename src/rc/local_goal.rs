@@ -77,8 +77,8 @@ pub async fn read(params: Value) -> crate::Result<Value> {
     };
     let roots = super::mirror::Mirror::load().roots(super::local::WORKSPACE);
     super::policy::require_within(&cwd, &roots)?;
-    let redactor = crate::domain::redact::Redactor::try_this_machine()?;
-    Ok(redactor.scrub_json(&result).value)
+    let redactor = super::protection::for_native("codex", &native, &cwd)?;
+    Ok(redactor.try_scrub_json(&result)?.value)
 }
 
 #[cfg(test)]

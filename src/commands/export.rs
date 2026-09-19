@@ -125,6 +125,14 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         env_text
     };
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+    let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    let selected = dictionary.protect_envelopes(&selected, &registered)?;
+    anyhow::ensure!(
+        selected.intact == 0,
+        "export exceeds the reversible protection limit; no output was written"
+    );
+    let selected = selected.text;
     let result = match args.format.as_str() {
         "jsonl" => Ok(transcript::unwrap_lossy(&selected).0),
         "ir" => to_ir(&selected),
@@ -148,11 +156,8 @@ pub fn run(args: Args) -> CmdResult {
     };
 
     if args.redact {
-        // Redaction is `domain::redact`: per-hit placeholder substitution (secrets) plus
-        // persona / path / IP masking. `secrets::redact` is not it — that computes one key mask
-        // over the **entire export** (keep the first four and the last two characters, star the
-        // rest), and the whole content is written off on the spot.
-        let rep = crate::domain::redact::Redactor::try_this_machine()?.scrub(&out);
+        // Secret projection precedes rendering; this optional pass anonymizes the local persona.
+        let rep = crate::domain::redact::Redactor::try_this_machine()?.scrub_persona(&out);
         out = rep.text;
         // The counts answer "is this export safe", so they must be visible whether the output
         // goes to -o or to stdout.
@@ -315,6 +320,41 @@ fn to_markdown(envelopes: &str) -> crate::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protection_precedes_export_rendering_and_preserves_source_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let dictionary =
+            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
+        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let raw = serde_json::json!({"type":"assistant", "message": {
+            "role":"assistant", "content":[{"type":"text", "text":secret}]
+        }})
+        .to_string();
+        let saved = crate::domain::transcript::wrap_lines(
+            &raw,
+            "claude-code",
+            &format!("agit-{}", "a".repeat(40)),
+        );
+        let projected = dictionary
+            .protect_envelopes(&saved, &crate::domain::secret_filter::Matcher::empty())
+            .unwrap();
+        assert!(saved.contains(secret));
+        assert!(!projected.text.contains(secret));
+        for output in [
+            super::to_markdown(&projected.text).unwrap(),
+            super::to_ir(&projected.text).unwrap(),
+            super::to_native(&projected.text, "codex").unwrap(),
+        ] {
+            assert!(!output.contains(secret));
+            assert!(output.contains("{{AGIT_SECRET_V1:"));
+        }
+        assert_eq!(
+            dictionary.hydrate_envelopes(&projected.text).unwrap().text,
+            saved
+        );
+    }
+
     fn render_native(raw: &str, from: &str, target: &str) -> crate::Result<String> {
         let saved =
             crate::domain::transcript::wrap_lines(raw, from, &format!("agit-{}", "a".repeat(40)));

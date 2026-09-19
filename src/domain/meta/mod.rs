@@ -411,6 +411,10 @@ pub struct Meta {
     /// these entries cannot prove liveness or authorize a writer on another machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_instances: Vec<String>,
+    /// The native cwd shares this Agent repository's object database. This is read-only identity
+    /// provenance, not permission to route a runtime or write to a repository after relocation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cwd_is_agent_repository: bool,
 }
 
 impl Meta {
@@ -430,6 +434,7 @@ impl Meta {
             milestone: None,
             baseline_bytes: None,
             runtime_instances: Vec::new(),
+            cwd_is_agent_repository: false,
         }
     }
 

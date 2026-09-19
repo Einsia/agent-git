@@ -20,10 +20,10 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 const DICTIONARY_RELATIVE_PATH: &str = "agit/secret-dictionary/vault.json";
-const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V1:";
-const TOKEN_SUFFIX: &str = "}}";
-const CANONICAL_TOKEN_LEN: usize = TOKEN_PREFIX.len() + 36 + 1 + 4 + 32 + TOKEN_SUFFIX.len();
+use crate::domain::secrets::placeholder::{CANONICAL_TOKEN_LEN, TOKEN_PREFIX, TOKEN_SUFFIX};
 const MAX_NEW_HEURISTIC_RECORDS: usize = 1_024;
+const MAX_OVERLAPPING_MATCHES: usize = 64 * 1024;
+const OVERLAPPING_MATCH_BATCH: usize = 4 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) struct ReadonlyDictionaryLimits {
     pub vault_bytes: usize,
@@ -101,6 +101,7 @@ pub struct RepositoryRecordSummary {
 /// normal add/push/export path can accidentally publish it.
 pub struct RepositoryDictionary<K: KeyStore = RepositoryKeyStore> {
     store: VaultStore<K>,
+    repo_root: Option<PathBuf>,
 }
 
 impl RepositoryDictionary<RepositoryKeyStore> {
@@ -117,10 +118,12 @@ impl RepositoryDictionary<RepositoryKeyStore> {
     pub fn open(repo_root: &Path) -> crate::Result<Self> {
         // One dictionary per repository: session-branch worktrees and the main checkout share it.
         let git_dir = crate::domain::repo::common_git_dir(repo_root);
-        Ok(Self::new(
+        let mut dictionary = Self::new(
             git_dir.join(Path::new(DICTIONARY_RELATIVE_PATH)),
             RepositoryKeyStore::new(git_dir.join("agit/secret-dictionary/keys")),
-        ))
+        );
+        dictionary.repo_root = Some(repo_root.to_owned());
+        Ok(dictionary)
     }
 }
 
@@ -128,6 +131,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     pub fn new(path: PathBuf, keys: K) -> Self {
         Self {
             store: VaultStore::new(path, keys),
+            repo_root: None,
         }
     }
 
@@ -141,6 +145,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     pub fn protect_jsonl(&self, text: &str, global: &Matcher) -> crate::Result<ProtectionReport> {
         self.store.with_lock(|| {
             let (unlocked, records) = ProtectionState::read_records(&self.store)?;
+            let allowlist = local_allowlist(&records, global)?;
             // A finding larger than a reversible record cannot become a
             // placeholder, but that is a fact about *that* finding — it says
             // nothing about the registered secret three lines above it. Only
@@ -166,6 +171,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                     |candidate| {
                         candidate.len() <= MAX_REPOSITORY_SECRET_BYTES
                             && !existing.contains(candidate)
+                            && !allowlist.contains(candidate)
                     },
                 )
             };
@@ -181,6 +187,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 ExistingRecordScope::All,
                 unlocked,
                 records,
+                allowlist,
             )?;
             state.oversized_threshold = Some(MAX_REPOSITORY_SECRET_BYTES);
             let (text, replacements) = transform_jsonl(text, |s| state.protect_string(s))?;
@@ -196,6 +203,123 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 intact,
             })
         })
+    }
+
+    /// The caller binds the native source to its validated session claim before using this boundary.
+    /// A schema-owned session field is retained only when it equals that claim; credentials elsewhere
+    /// keep their protection semantics even when they contain the same bytes.
+    pub fn protect_native_jsonl(
+        &self,
+        text: &str,
+        global: &Matcher,
+        runtime: &str,
+        native: &str,
+    ) -> crate::Result<ProtectionReport> {
+        self.protect_session_jsonl(
+            text,
+            global,
+            runtime,
+            native,
+            self.repo_root.as_deref().unwrap_or(Path::new(".")),
+        )
+    }
+
+    pub(crate) fn protect_session_jsonl(
+        &self,
+        text: &str,
+        global: &Matcher,
+        runtime: &str,
+        native: &str,
+        cwd: &Path,
+    ) -> crate::Result<ProtectionReport> {
+        use crate::domain::secrets::identity::{Evidence, RecordMask, native_session_pointers};
+        let repo = self.repo_root.as_ref().map(crate::domain::repo::Repo::at);
+        let mut evidence = repo.as_ref().map(|repo| Evidence::new(repo, cwd));
+        if let Some(evidence) = &mut evidence {
+            evidence.seed_native(runtime, native)?;
+        }
+        self.protect_with_masks(text, global, |value| {
+            if let Some(evidence) = &mut evidence {
+                evidence.record(runtime, native, value)
+            } else {
+                RecordMask(
+                    native_session_pointers(runtime, native, value)
+                        .into_iter()
+                        .filter_map(|pointer| {
+                            Some((
+                                pointer.to_owned(),
+                                0..value.pointer(pointer)?.as_str()?.len(),
+                            ))
+                        })
+                        .collect(),
+                )
+            }
+        })
+    }
+
+    pub(crate) fn protect_with_masks(
+        &self,
+        text: &str,
+        global: &Matcher,
+        mut mask_for: impl FnMut(&Value) -> crate::domain::secrets::identity::RecordMask,
+    ) -> crate::Result<ProtectionReport> {
+        let registered = global.merged(&self.registered_matcher()?)?;
+        let mut hidden = std::collections::HashMap::<String, String>::new();
+        let mut aliases = std::collections::HashMap::<String, String>::new();
+        let mut input = String::new();
+        for (chunk, value) in crate::domain::secrets::jsonl_chunks(text) {
+            if let Some(mut value) = value {
+                let mut mask = mask_for(&value);
+                mask.0.retain(|(pointer, span)| {
+                    value
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            !registered
+                                .find(text)
+                                .iter()
+                                .any(|hit| hit.start < span.end && span.start < hit.end)
+                        })
+                });
+                mask.apply(&mut value, |identity| {
+                    if let Some(token) = aliases.get(identity) {
+                        return token.clone();
+                    }
+                    let token = format!(
+                        "{{{{AGIT_SECRET_V1:{}:sec_{}}}}}",
+                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    hidden.insert(token.clone(), identity.to_owned());
+                    aliases.insert(identity.to_owned(), token.clone());
+                    token
+                });
+                input.push_str(&serde_json::to_string(&value)?);
+                if chunk.ends_with('\n') {
+                    input.push('\n');
+                }
+            } else {
+                input.push_str(chunk);
+            }
+        }
+        let mut report = self.protect_jsonl(&input, global)?;
+        if !hidden.is_empty() {
+            report.text = transform_jsonl(&report.text, |text| {
+                let mut restored = String::with_capacity(text.len());
+                let mut cursor = 0;
+                for (start, end, token) in token_segments(text) {
+                    if let Some(identity) = hidden.get(token) {
+                        restored.push_str(&text[cursor..start]);
+                        restored.push_str(identity);
+                        cursor = end;
+                    }
+                }
+                restored.push_str(&text[cursor..]);
+                Ok((restored, 0))
+            })?
+            .0;
+        }
+        Ok(report)
     }
 
     /// Protect user-controlled observations without rewriting metadata schema or identity fields.
@@ -232,10 +356,40 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         Ok(report.unresolved)
     }
 
-    /// Protect arbitrary text (currently used for the generated commit subject).
+    /// Protect a text carrier without interpreting its contents as a JSON record.
     pub fn protect_text(&self, text: &str, global: &Matcher) -> crate::Result<ProtectionReport> {
         self.store.with_lock(|| {
-            let mut state = ProtectionState::load(&self.store, global, &[])?;
+            let (unlocked, records) = ProtectionState::read_records(&self.store)?;
+            let allowlist = local_allowlist(&records, global)?;
+            let existing: HashSet<&str> = records
+                .iter()
+                .map(|record| record.secret.as_str())
+                .collect();
+            let literal = serde_json::to_string(text)?;
+            let candidates = crate::domain::secrets::secret_candidates_jsonl(
+                &literal,
+                MAX_NEW_HEURISTIC_RECORDS,
+                |candidate| {
+                    candidate.len() <= MAX_REPOSITORY_SECRET_BYTES
+                        && !existing.contains(candidate)
+                        && !allowlist.contains(candidate)
+                },
+            );
+            if candidates.truncated {
+                bail!(
+                    "more than {MAX_NEW_HEURISTIC_RECORDS} new heuristic secrets were found in one text carrier; no repository dictionary update was written"
+                );
+            }
+            let mut state = ProtectionState::from_records(
+                &self.store,
+                global,
+                &candidates.values,
+                ExistingRecordScope::All,
+                unlocked,
+                records,
+                allowlist,
+            )?;
+            state.oversized_threshold = Some(MAX_REPOSITORY_SECRET_BYTES);
             let (text, replacements) = state.protect_string(text)?;
             let new_records = state.new_records;
             let new_heuristic_records = state.new_heuristic_records;
@@ -249,6 +403,14 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 intact,
             })
         })
+    }
+
+    /// Expand only repository tokens in literal text. JSON escapes inside the carrier stay data.
+    pub fn hydrate_text(&self, text: &str) -> crate::Result<HydrationReport> {
+        let encoded = serde_json::to_string(text)?;
+        let (mut hydrated, _) = self.hydrate_pair_readonly(&encoded, "")?;
+        hydrated.text = serde_json::from_str(&hydrated.text)?;
+        Ok(hydrated)
     }
 
     /// For continuity checks after a secret was already assigned a repository
@@ -477,9 +639,10 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 return Ok(vec![]);
             }
             let unlocked = self.store.unlock_existing()?;
+            let allowlist = local_allowlist(&[], &Matcher::empty())?;
             let mut out: Vec<_> = super::decrypt_records(&unlocked.file, &unlocked.dek)?
                 .iter()
-                .map(record_summary)
+                .map(|record| record_summary(record, &allowlist))
                 .collect();
             out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
             Ok(out)
@@ -487,25 +650,45 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     }
 
     pub(crate) fn active_matcher(&self) -> crate::Result<Matcher> {
+        self.matcher_for(false)
+    }
+
+    pub(crate) fn registered_matcher(&self) -> crate::Result<Matcher> {
+        self.matcher_for(true)
+    }
+
+    fn matcher_for(&self, registered_only: bool) -> crate::Result<Matcher> {
         self.store.with_lock(|| {
             if !self.store.path.exists() {
-                return Ok(Matcher::empty());
+                return Ok(
+                    Matcher::empty().with_allowlist(local_allowlist(&[], &Matcher::empty())?)
+                );
             }
             let unlocked = self.store.unlock_existing()?;
             let generation = unlocked.file.generation;
-            let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?
+            let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
+            let allowlist = local_allowlist(&records, &Matcher::empty())?;
+            let records = records
                 .into_iter()
-                .filter(effective_protect)
+                .filter(|record| {
+                    if allowlist.contains(record.secret.as_str())
+                        || crate::domain::secrets::rules::preset_allows(&record.secret)
+                    {
+                        return false;
+                    }
+                    if registered_only {
+                        registered_protect(record)
+                    } else {
+                        effective_protect(record)
+                    }
+                })
                 .collect();
-            Matcher::build(generation, records)
+            Ok(Matcher::build(generation, records)?.with_allowlist(allowlist))
         })
     }
 
     pub fn allow(&self, record_id: &str) -> crate::Result<RepositoryRecordSummary> {
         self.update_record(record_id, |record| {
-            if !record.origins.contains(&RecordOrigin::Heuristic) {
-                bail!("repository secret `{record_id}` was not discovered heuristically and cannot be allowlisted");
-            }
             record.heuristic_disposition = super::HeuristicDisposition::Allow;
             Ok(())
         })
@@ -513,9 +696,6 @@ impl<K: KeyStore> RepositoryDictionary<K> {
 
     pub fn unallow(&self, record_id: &str) -> crate::Result<RepositoryRecordSummary> {
         self.update_record(record_id, |record| {
-            if !record.origins.contains(&RecordOrigin::Heuristic) {
-                bail!("repository secret `{record_id}` was not discovered heuristically");
-            }
             record.heuristic_disposition = super::HeuristicDisposition::Protect;
             Ok(())
         })
@@ -529,6 +709,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     ) -> crate::Result<RepositoryRecordSummary> {
         super::validate_registration(name, &secret, allow_short)?;
         self.store.with_lock(|| {
+            let allowlist = local_allowlist(&[], &Matcher::empty())?;
             let created = !self.store.path.exists();
             let mut unlocked = if created {
                 self.store.create_unlocked()?
@@ -548,7 +729,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 record.updated_at = chrono::Utc::now().to_rfc3339();
                 reseal_record(&mut unlocked, record)?;
                 bump_and_write(&self.store, &mut unlocked, created)?;
-                return Ok(record_summary(record));
+                return Ok(record_summary(record, &allowlist));
             }
 
             let id = format!("sec_{}", uuid::Uuid::now_v7().simple());
@@ -564,7 +745,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 updated_at: now,
             };
             append_record(&mut unlocked, &record)?;
-            let summary = record_summary(&record);
+            let summary = record_summary(&record, &allowlist);
             bump_and_write(&self.store, &mut unlocked, created)?;
             Ok(summary)
         })
@@ -589,6 +770,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         update: impl FnOnce(&mut DecryptedRecord) -> crate::Result<()>,
     ) -> crate::Result<RepositoryRecordSummary> {
         self.store.with_lock(|| {
+            let allowlist = local_allowlist(&[], &Matcher::empty())?;
             if !self.store.path.exists() {
                 bail!("the repository secret dictionary has not been initialized");
             }
@@ -601,19 +783,79 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             record.updated_at = chrono::Utc::now().to_rfc3339();
             reseal_record(&mut unlocked, record)?;
             bump_and_write(&self.store, &mut unlocked, false)?;
-            Ok(record_summary(record))
+            Ok(record_summary(record, &allowlist))
         })
+    }
+
+    /// Validate envelopes before projecting native content; projected hashes describe the emitted bytes.
+    pub fn protect_envelopes(
+        &self,
+        saved: &str,
+        global: &Matcher,
+    ) -> crate::Result<ProtectionReport> {
+        use crate::domain::{storage, transcript};
+        let envelopes = saved
+            .split_inclusive('\n')
+            .map(storage::parse_envelope_line)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let masks = if let Some(root) = &self.repo_root {
+            crate::domain::secrets::saved_content_masks(
+                &crate::domain::repo::Repo::at(root),
+                saved,
+            )?
+        } else {
+            Vec::new()
+        };
+        let mut masks = masks.into_iter();
+        let mut report =
+            self.protect_with_masks(&transcript::unwrap_strict(saved)?, global, |_| {
+                masks.next().unwrap_or_default()
+            })?;
+        let contents = report
+            .text
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            contents.len() == envelopes.len(),
+            "protection changed the native record count"
+        );
+        let mut text = String::new();
+        for (mut envelope, content) in envelopes.into_iter().zip(contents) {
+            envelope.content = content;
+            envelope.object_hash = transcript::object_hash(&envelope.content);
+            text.push_str(&storage::envelope_line(&envelope));
+        }
+        report.text = text;
+        Ok(report)
     }
 
     /// Hydration changes only native content; provenance stays intact and hashes describe the new content.
     pub fn hydrate_envelopes(&self, saved: &str) -> crate::Result<HydrationReport> {
+        self.hydrate_envelopes_with(saved, false)
+    }
+
+    /// Local presentation validates stored identities before restoring content without changing the vault.
+    pub fn hydrate_envelopes_readonly(&self, saved: &str) -> crate::Result<HydrationReport> {
+        self.hydrate_envelopes_with(saved, true)
+    }
+
+    fn hydrate_envelopes_with(
+        &self,
+        saved: &str,
+        readonly: bool,
+    ) -> crate::Result<HydrationReport> {
         use crate::domain::{storage, transcript};
         let envelopes = saved
             .split_inclusive('\n')
             .map(storage::parse_envelope_line)
             .collect::<crate::Result<Vec<_>>>()?;
         let raw = transcript::unwrap_strict(saved)?;
-        let mut report = self.hydrate_jsonl(&raw)?;
+        let mut report = if readonly {
+            self.hydrate_pair_readonly(&raw, "")?.0
+        } else {
+            self.hydrate_jsonl(&raw)?
+        };
         let contents = report
             .text
             .lines()
@@ -685,6 +927,29 @@ struct PatternSource {
     from_heuristic: bool,
 }
 
+#[derive(Default)]
+struct MergedSources {
+    explicit_block: bool,
+    heuristic: bool,
+    global: bool,
+    explicit: bool,
+}
+
+impl MergedSources {
+    fn add(&mut self, record: &DecryptedRecord) {
+        self.explicit_block |= record.explicit_block || legacy_record(record);
+        self.heuristic |= record.origins.contains(&RecordOrigin::Heuristic);
+        self.global |= record.origins.contains(&RecordOrigin::Global);
+        self.explicit |= record.origins.contains(&RecordOrigin::Explicit);
+    }
+}
+
+struct ProjectionBuffer {
+    out: String,
+    cursor: usize,
+    replacements: usize,
+}
+
 struct PatternSpec {
     secret: Zeroizing<String>,
     record_id: Option<String>,
@@ -705,6 +970,7 @@ struct ProtectionState<'a, K: KeyStore> {
     records: Vec<DecryptedRecord>,
     ac: Option<Arc<AhoCorasick>>,
     sources: Vec<PatternSource>,
+    allowlist: HashSet<String>,
     dirty: bool,
     created: bool,
     new_records: usize,
@@ -731,7 +997,10 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         scope: ExistingRecordScope,
     ) -> crate::Result<Self> {
         let (unlocked, records) = Self::read_records(store)?;
-        Self::from_records(store, global, candidates, scope, unlocked, records)
+        let allowlist = local_allowlist(&records, global)?;
+        Self::from_records(
+            store, global, candidates, scope, unlocked, records, allowlist,
+        )
     }
 
     fn read_records(
@@ -754,6 +1023,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         scope: ExistingRecordScope,
         unlocked: Option<Unlocked>,
         records: Vec<DecryptedRecord>,
+        allowlist: HashSet<String>,
     ) -> crate::Result<Self> {
         let mut specs: Vec<PatternSpec> =
             Vec::with_capacity(records.len() + global.rules() + candidates.len());
@@ -791,18 +1061,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
                 .find(|spec| spec.secret.as_str() == candidate.as_str())
             {
                 spec.from_heuristic = true;
-                let allowed = spec.record_id.as_ref().is_some_and(|id| {
-                    records.iter().any(|record| {
-                        &record.id == id
-                            && record.origins.contains(&RecordOrigin::Heuristic)
-                            && record.heuristic_disposition == super::HeuristicDisposition::Allow
-                            && !record.explicit_block
-                            && !legacy_record(record)
-                    })
-                });
-                if !allowed || spec.from_global {
-                    spec.active = true;
-                }
+                spec.active = true;
             } else {
                 specs.push(PatternSpec {
                     secret: Zeroizing::new(candidate.to_string()),
@@ -816,7 +1075,11 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
 
         let mut patterns = Vec::new();
         let mut sources = Vec::new();
-        for spec in specs.into_iter().filter(|spec| spec.active) {
+        for spec in specs.into_iter().filter(|spec| {
+            spec.active
+                && !allowlist.contains(spec.secret.as_str())
+                && !crate::domain::secrets::rules::preset_allows(&spec.secret)
+        }) {
             patterns.push(spec.secret);
             sources.push(PatternSource {
                 record_id: spec.record_id,
@@ -830,7 +1093,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         } else {
             Some(Arc::new(
                 AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
+                    .match_kind(MatchKind::Standard)
                     .build(patterns.iter().map(|p| p.as_bytes()))
                     .context("cannot build the repository secret protector")?,
             ))
@@ -842,6 +1105,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             records,
             ac,
             sources,
+            allowlist,
             dirty: false,
             created: false,
             new_records: 0,
@@ -934,35 +1198,259 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     fn oversized_spans(&self, text: &str) -> Vec<(usize, usize)> {
         match self.oversized_threshold {
             Some(threshold) if text.len() > threshold => {
-                crate::domain::secrets::oversized_finding_spans(text, threshold)
+                crate::domain::secrets::oversized_finding_spans(text, threshold, |value| {
+                    !self.allowlist.contains(value)
+                })
             }
             _ => vec![],
         }
     }
 
     fn protect_segment(&mut self, text: &str, ac: &AhoCorasick) -> crate::Result<(String, usize)> {
-        let mut out = String::with_capacity(text.len());
-        let mut cursor = 0usize;
-        let mut replacements = 0usize;
-        for found in ac.find_iter(text.as_bytes()) {
-            let pattern = found.pattern().as_usize();
-            out.push_str(&text[cursor..found.start()]);
-            let id = self.ensure_record(pattern, &text[found.start()..found.end()])?;
+        let mut projection = ProjectionBuffer {
+            out: String::with_capacity(text.len()),
+            cursor: 0,
+            replacements: 0,
+        };
+        let mut pending = Vec::with_capacity(OVERLAPPING_MATCH_BATCH);
+        let mut max_end = 0usize;
+        let mut pending_ordered = true;
+        let mut blocked_until = 0usize;
+        // The overlapping iterator advances by match end. Keep the suffix that can still be
+        // reached by a pattern; a connected component is projected only after that suffix closes.
+        for found in ac.find_overlapping_iter(text.as_bytes()) {
+            let current = (found.start(), found.end(), found.pattern().as_usize());
+            max_end = max_end.max(current.1);
+            if current.0 < blocked_until {
+                blocked_until = blocked_until.max(current.1);
+            }
+            if pending
+                .last()
+                .is_some_and(|last: &(usize, usize, usize)| current.0 < last.0)
+            {
+                pending_ordered = false;
+            }
+            pending.push(current);
+            if pending.len() > MAX_OVERLAPPING_MATCHES {
+                bail!(
+                    "overlapping secret matches exceed the bounded protection limit; no dictionary update was written"
+                );
+            }
+            let safe_end = max_end.saturating_sub(ac.max_pattern_len());
+            if pending.len() >= OVERLAPPING_MATCH_BATCH && safe_end >= blocked_until {
+                self.flush_components(
+                    text,
+                    &mut pending,
+                    safe_end,
+                    &mut pending_ordered,
+                    &mut blocked_until,
+                    &mut projection,
+                )?;
+            }
+        }
+        self.flush_components(
+            text,
+            &mut pending,
+            usize::MAX,
+            &mut pending_ordered,
+            &mut blocked_until,
+            &mut projection,
+        )?;
+        if projection.replacements == 0 {
+            return Ok((text.to_string(), 0));
+        }
+        projection.out.push_str(&text[projection.cursor..]);
+        Ok((projection.out, projection.replacements))
+    }
+
+    fn flush_components(
+        &mut self,
+        text: &str,
+        pending: &mut Vec<(usize, usize, usize)>,
+        safe_end: usize,
+        ordered: &mut bool,
+        blocked_until: &mut usize,
+        projection: &mut ProjectionBuffer,
+    ) -> crate::Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if safe_end < *blocked_until {
+            return Ok(());
+        }
+        if !*ordered {
+            pending.sort_unstable_by_key(|(start, end, _)| (*start, *end));
+            *ordered = true;
+        }
+        let mut ready = 0usize;
+        let mut index = 0usize;
+        while index < pending.len() {
+            let (_, mut region_end, _) = pending[index];
+            let component_start = index;
+            index += 1;
+            while index < pending.len() && pending[index].0 < region_end {
+                region_end = region_end.max(pending[index].1);
+                index += 1;
+            }
+            if region_end > safe_end {
+                *blocked_until = region_end;
+                break;
+            }
+            self.protect_component(text, &pending[component_start..index], projection)?;
+            ready = index;
+        }
+        if ready > 0 {
+            pending.drain(..ready);
+            if pending.is_empty() {
+                *ordered = true;
+                *blocked_until = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn protect_component(
+        &mut self,
+        text: &str,
+        matches: &[(usize, usize, usize)],
+        projection: &mut ProjectionBuffer,
+    ) -> crate::Result<()> {
+        let (region_start, mut region_end, first_pattern) = matches[0];
+        let mut exact = Some(first_pattern);
+        for &(start, end, pattern) in &matches[1..] {
+            let extended = end > region_end;
+            region_end = region_end.max(end);
+            if extended {
+                exact = (start == region_start).then_some(pattern);
+            }
+        }
+        let mut sources = MergedSources::default();
+        let mut seen_patterns = HashSet::new();
+        let mut exact_id = None;
+        for &(start, end, pattern) in matches {
+            if !seen_patterns.insert(pattern) {
+                continue;
+            }
+            let id = self.ensure_record(pattern, &text[start..end])?;
+            if exact == Some(pattern) {
+                exact_id = Some(id.clone());
+            }
+            if let Some(record) = self.records.iter().find(|record| record.id == id) {
+                sources.add(record);
+            }
+        }
+        let id =
+            if region_end - region_start > MAX_REPOSITORY_SECRET_BYTES {
+                self.intact_hits = self.intact_hits.saturating_add(1);
+                None
+            } else {
+                Some(exact_id.unwrap_or(
+                    self.ensure_region_record(&text[region_start..region_end], &sources)?,
+                ))
+            };
+        projection
+            .out
+            .push_str(&text[projection.cursor..region_start]);
+        let replaced = id.is_some();
+        if let Some(id) = id {
             let vault_id = &self
                 .unlocked
                 .as_ref()
                 .expect("a matched pattern always initializes the dictionary")
                 .file
                 .vault_id;
-            out.push_str(&token(vault_id, &id));
-            cursor = found.end();
-            replacements = replacements.saturating_add(1);
+            projection.out.push_str(&token(vault_id, &id));
+        } else {
+            projection.out.push_str(&text[region_start..region_end]);
         }
-        if replacements == 0 {
-            return Ok((text.to_string(), 0));
+        projection.cursor = region_end;
+        if replaced {
+            projection.replacements = projection.replacements.saturating_add(1);
         }
-        out.push_str(&text[cursor..]);
-        Ok((out, replacements))
+        Ok(())
+    }
+
+    fn ensure_region_record(
+        &mut self,
+        secret: &str,
+        sources: &MergedSources,
+    ) -> crate::Result<String> {
+        if let Some(record) = self
+            .records
+            .iter()
+            .find(|record| record.secret.as_str() == secret)
+        {
+            let id = record.id.clone();
+            let index = self
+                .records
+                .iter()
+                .position(|record| record.id == id)
+                .expect("record was found above");
+            let mut changed = false;
+            {
+                let record = &mut self.records[index];
+                if sources.explicit_block && !record.explicit_block {
+                    record.explicit_block = true;
+                    changed = true;
+                }
+                for origin in [
+                    sources.heuristic.then_some(RecordOrigin::Heuristic),
+                    sources.global.then_some(RecordOrigin::Global),
+                    sources.explicit.then_some(RecordOrigin::Explicit),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !record.origins.contains(&origin) {
+                        record.origins.push(origin);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    record.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
+            if changed {
+                let record = &self.records[index];
+                reseal_record(
+                    self.unlocked
+                        .as_mut()
+                        .expect("an existing record has an unlocked dictionary"),
+                    record,
+                )?;
+                self.dirty = true;
+            }
+            return Ok(id);
+        }
+        if self.unlocked.is_none() {
+            self.unlocked = Some(self.store.create_unlocked()?);
+            self.created = true;
+        }
+        let id = format!("sec_{}", uuid::Uuid::now_v7().simple());
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = DecryptedRecord {
+            id: id.clone(),
+            name: format!("repository-{id}"),
+            secret: Zeroizing::new(secret.to_owned()),
+            origins: [
+                sources.heuristic.then_some(RecordOrigin::Heuristic),
+                sources.global.then_some(RecordOrigin::Global),
+                sources.explicit.then_some(RecordOrigin::Explicit),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            heuristic_disposition: super::HeuristicDisposition::Protect,
+            explicit_block: sources.explicit_block,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        append_record(self.unlocked.as_mut().expect("initialized above"), &record)?;
+        self.records.push(record);
+        self.dirty = true;
+        self.new_records += 1;
+        self.new_heuristic_records += 1;
+        Ok(id)
     }
 
     fn ensure_record(&mut self, pattern: usize, secret: &str) -> crate::Result<String> {
@@ -1083,10 +1571,27 @@ fn legacy_record(record: &DecryptedRecord) -> bool {
 }
 
 fn effective_protect(record: &DecryptedRecord) -> bool {
-    legacy_record(record)
-        || record.explicit_block
-        || (record.origins.contains(&RecordOrigin::Heuristic)
-            && record.heuristic_disposition == super::HeuristicDisposition::Protect)
+    record.heuristic_disposition != super::HeuristicDisposition::Allow
+        && !crate::domain::secrets::rules::preset_allows(&record.secret)
+        && (legacy_record(record)
+            || record.explicit_block
+            || record.origins.contains(&RecordOrigin::Heuristic))
+}
+
+fn local_allowlist(
+    records: &[DecryptedRecord],
+    global: &Matcher,
+) -> crate::Result<HashSet<String>> {
+    let home = crate::infra::config::agit_home()?;
+    let mut allowed = crate::domain::secrets::load_allowlist(&home);
+    allowed.extend(global.allowed_values().map(str::to_owned));
+    allowed.extend(
+        records
+            .iter()
+            .filter(|record| record.heuristic_disposition == super::HeuristicDisposition::Allow)
+            .map(|record| record.secret.to_string()),
+    );
+    Ok(allowed)
 }
 
 fn registered_protect(record: &DecryptedRecord) -> bool {
@@ -1097,7 +1602,10 @@ fn registered_protect(record: &DecryptedRecord) -> bool {
             || record.origins.contains(&RecordOrigin::Explicit))
 }
 
-fn record_summary(record: &DecryptedRecord) -> RepositoryRecordSummary {
+fn record_summary(
+    record: &DecryptedRecord,
+    allowlist: &HashSet<String>,
+) -> RepositoryRecordSummary {
     let origins = if legacy_record(record) {
         vec!["legacy".to_string()]
     } else {
@@ -1118,7 +1626,7 @@ fn record_summary(record: &DecryptedRecord) -> RepositoryRecordSummary {
         origins,
         heuristic_disposition: record.heuristic_disposition,
         explicit_block: record.explicit_block || legacy_record(record),
-        effective_protect: effective_protect(record),
+        effective_protect: effective_protect(record) && !allowlist.contains(record.secret.as_str()),
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
     }
@@ -1189,6 +1697,9 @@ fn observation_fields(metadata: &mut crate::domain::meta::Meta) -> Vec<&mut Stri
     fields.extend(metadata.code.iter_mut());
     fields.extend(metadata.milestone.iter_mut());
     if let Some(state) = metadata.cwd_state.as_mut() {
+        if !crate::domain::secrets::identity::empty_status_digest(state) {
+            fields.extend(state.status_digest.iter_mut());
+        }
         fields.extend(state.origin.iter_mut());
         fields.extend(state.branch.iter_mut());
     }
@@ -1201,25 +1712,24 @@ fn transform_jsonl(
 ) -> crate::Result<(String, usize)> {
     let mut out = String::with_capacity(text.len());
     let mut replacements = 0usize;
-    for inclusive in text.split_inclusive('\n') {
-        let (body, newline) = inclusive
-            .strip_suffix('\n')
-            .map(|s| (s.strip_suffix('\r').unwrap_or(s), true))
-            .unwrap_or((inclusive, false));
-        match serde_json::from_str::<Value>(body) {
-            Ok(mut value) => {
+    for (chunk, value) in crate::domain::secrets::jsonl_chunks(text) {
+        match value {
+            Some(mut value) => {
                 replacements =
                     replacements.saturating_add(transform_value(&mut value, &mut transform)?);
                 out.push_str(&serde_json::to_string(&value)?);
+                if chunk.ends_with('\n') {
+                    out.push('\n');
+                }
             }
-            Err(_) => {
-                let (protected, count) = transform(body)?;
+            None => {
+                let (protected, count) = transform(chunk.strip_suffix('\n').unwrap_or(chunk))?;
                 out.push_str(&protected);
+                if chunk.ends_with('\n') {
+                    out.push('\n');
+                }
                 replacements = replacements.saturating_add(count);
             }
-        }
-        if newline {
-            out.push('\n');
         }
     }
     Ok((out, replacements))
@@ -1263,106 +1773,7 @@ fn token(vault_id: &str, record_id: &str) -> String {
     format!("{TOKEN_PREFIX}{vault_id}:{record_id}{TOKEN_SUFFIX}")
 }
 
-pub(super) fn token_segments(text: &str) -> TokenSegments<'_> {
-    TokenSegments { text, cursor: 0 }
-}
-
-/// Return the start of an opaque repository token that is complete and crosses
-/// `cut`, or that is still a structurally valid prefix at the end of the
-/// current stream buffer. The latter case is what keeps a chunk boundary from
-/// exposing the token body to the registered-literal matcher.
-pub(super) fn streaming_token_start(text: &str, cut: usize) -> Option<usize> {
-    let mut earliest = token_segments(text)
-        .take_while(|(start, _, _)| *start < cut)
-        .find_map(|(start, end, _)| (end > cut).then_some(start));
-
-    // Generated tokens have a fixed, bounded shape. Inspect only possible
-    // starts close enough to the buffer end to remain an incomplete token, so
-    // malformed input cannot make the stream buffer grow without bound.
-    for (start, _) in text.rmatch_indices('{') {
-        if text.len().saturating_sub(start) >= CANONICAL_TOKEN_LEN {
-            break;
-        }
-        if start < cut && canonical_token_prefix(&text[start..]) {
-            earliest = Some(earliest.map_or(start, |current| current.min(start)));
-        }
-    }
-    earliest
-}
-
-fn canonical_token_prefix(fragment: &str) -> bool {
-    if fragment.is_empty() || fragment.len() >= CANONICAL_TOKEN_LEN {
-        return false;
-    }
-    fragment
-        .bytes()
-        .enumerate()
-        .all(|(index, byte)| canonical_token_byte(index, byte))
-}
-
-fn canonical_token_byte(index: usize, byte: u8) -> bool {
-    if index < TOKEN_PREFIX.len() {
-        return TOKEN_PREFIX.as_bytes()[index] == byte;
-    }
-
-    let uuid_index = index - TOKEN_PREFIX.len();
-    if uuid_index < 36 {
-        return if matches!(uuid_index, 8 | 13 | 18 | 23) {
-            byte == b'-'
-        } else {
-            byte.is_ascii_hexdigit()
-        };
-    }
-
-    let after_uuid = uuid_index - 36;
-    if after_uuid == 0 {
-        return byte == b':';
-    }
-    if (1..5).contains(&after_uuid) {
-        return b"sec_"[after_uuid - 1] == byte;
-    }
-    if (5..37).contains(&after_uuid) {
-        return byte.is_ascii_hexdigit();
-    }
-    TOKEN_SUFFIX.as_bytes()[after_uuid - 37] == byte
-}
-
-pub(super) struct TokenSegments<'a> {
-    text: &'a str,
-    cursor: usize,
-}
-
-impl<'a> Iterator for TokenSegments<'a> {
-    type Item = (usize, usize, &'a str);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(relative) = self.text[self.cursor..].find(TOKEN_PREFIX) {
-            let start = self.cursor + relative;
-            let content_start = start + TOKEN_PREFIX.len();
-            let Some(close) = self.text[content_start..].find(TOKEN_SUFFIX) else {
-                self.cursor = self.text.len();
-                return None;
-            };
-            let end = content_start + close + TOKEN_SUFFIX.len();
-            let body = &self.text[content_start..content_start + close];
-            self.cursor = end;
-            if valid_token_body(body) {
-                return Some((start, end, &self.text[start..end]));
-            }
-        }
-        None
-    }
-}
-
-fn valid_token_body(body: &str) -> bool {
-    let Some((vault, record)) = body.split_once(':') else {
-        return false;
-    };
-    uuid::Uuid::parse_str(vault).is_ok()
-        && record
-            .strip_prefix("sec_")
-            .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-}
+pub(super) use crate::domain::secrets::placeholder::{streaming_token_start, token_segments};
 
 fn replace_known_tokens(text: &str, ac: &AhoCorasick, secrets: &[&str]) -> (String, usize) {
     let mut out = String::with_capacity(text.len());
@@ -2029,6 +2440,216 @@ mod tests {
     }
 
     #[test]
+    fn preset_allowances_filter_entropy_and_registered_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let sample = "abcdefghijklmnopqrstuvwxyz";
+        let global = Matcher::for_test(&[("sec_sample", sample)]);
+        let input = serde_json::json!({"token": sample, "text": sample}).to_string();
+        assert!(
+            crate::domain::secrets::scan_text_registered_with(&input, &HashSet::new(), &global)
+                .is_empty()
+        );
+        let protected = dictionary.protect_jsonl(&input, &global).unwrap();
+        assert_eq!(protected.replacements, 0);
+        assert_eq!(protected.new_records, 0);
+        assert!(dictionary.review().unwrap().is_empty());
+        let blocked = dictionary
+            .block_add("sample", Zeroizing::new(sample.into()), false)
+            .unwrap();
+        assert!(!blocked.effective_protect);
+        assert!(!dictionary.review().unwrap()[0].effective_protect);
+        assert_eq!(
+            dictionary
+                .protect_jsonl(&input, &global)
+                .unwrap()
+                .replacements,
+            0
+        );
+    }
+
+    #[test]
+    fn boolean_substrings_do_not_waive_public_scan_or_reversible_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let random = "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let mut vendor = format!("ghp_{random}");
+        vendor.replace_range(16..21, "false");
+        let cases = [
+            vendor,
+            format!("true{random}"),
+            format!("{random}false"),
+            format!("{random}null"),
+        ];
+        for secret in cases {
+            let input = serde_json::to_string(&serde_json::json!({
+                "text": format!("https://reader:{secret}@example.test")
+            }))
+            .unwrap();
+            assert!(!crate::domain::secrets::scan_text(&input, &HashSet::new()).is_empty());
+            let protected = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+            assert!(!protected.text.contains(&secret));
+            assert!(protected.text.contains(TOKEN_PREFIX));
+            assert_eq!(
+                dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn complete_and_truncated_pem_regions_roundtrip_without_exposing_body_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let body = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr\nprivate body material";
+        for footer in [
+            "",
+            "\n-----END RSA PRIVATE KEY-----",
+            "\n-----END PUBLIC KEY-----",
+        ] {
+            let pem = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}{footer}");
+            let input = serde_json::to_string(&serde_json::json!({"text": pem})).unwrap();
+            let protected = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+            assert_eq!(protected.intact, 0);
+            assert!(!protected.text.contains("private body material"));
+            assert!(!protected.text.contains("ghp_"));
+            assert!(crate::domain::secrets::scan_text(&protected.text, &HashSet::new()).is_empty());
+            assert_eq!(
+                dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+                input
+            );
+            let repeated = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+            assert_eq!(repeated.new_records, 0);
+            assert_eq!(repeated.text, protected.text);
+            let (scrubbed, _) = crate::domain::secrets::scrub(&pem);
+            assert!(!scrubbed.contains("private body material"));
+            assert!(!scrubbed.contains("BEGIN"));
+            let (scrubbed_json, _) = crate::domain::secrets::scrub(&input);
+            assert!(serde_json::from_str::<Value>(&scrubbed_json).is_ok());
+            assert!(!scrubbed_json.contains("private body material"));
+
+            let plain = dictionary.protect_jsonl(&pem, &Matcher::empty()).unwrap();
+            assert!(!plain.text.contains("private body material"));
+            assert_eq!(dictionary.hydrate_jsonl(&plain.text).unwrap().text, pem);
+            let mixed = format!("{pem}\n{{\"text\":\"ordinary prose\"}}\n");
+            let protected = dictionary.protect_jsonl(&mixed, &Matcher::empty()).unwrap();
+            assert!(
+                protected
+                    .text
+                    .ends_with("\n{\"text\":\"ordinary prose\"}\n")
+            );
+            assert_eq!(
+                dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+                mixed
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_registered_prefix_projects_the_complete_pem_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let pem = "prefix\n-----BEGIN RSA PRIVATE KEY-----\nprivate body material\n-----END RSA PRIVATE KEY-----";
+        let global = Matcher::for_test(&[(
+            "registered-prefix",
+            "prefix\n-----BEGIN RSA PRIVATE KEY-----",
+        )]);
+        let text = dictionary.protect_text(pem, &global).unwrap();
+        assert!(!text.text.contains("private body material"));
+        assert!(crate::domain::secrets::scan_text(&text.text, &HashSet::new()).is_empty());
+        assert_eq!(dictionary.hydrate_text(&text.text).unwrap().text, pem);
+
+        let json = serde_json::to_string(&serde_json::json!({"text": pem})).unwrap();
+        let protected = dictionary.protect_jsonl(&json, &global).unwrap();
+        assert!(!protected.text.contains("private body material"));
+        assert!(crate::domain::secrets::scan_text(&protected.text, &HashSet::new()).is_empty());
+        assert_eq!(
+            dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+            json
+        );
+    }
+
+    #[test]
+    fn an_oversized_merged_region_stays_intact_without_an_oversized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let input = "ab".repeat(MAX_REPOSITORY_SECRET_BYTES / 2 + 1);
+        let global = Matcher::for_test(&[("short", "abab")]);
+
+        let protected = dictionary.protect_text(&input, &global).unwrap();
+
+        assert_eq!(protected.text, input);
+        assert_eq!(protected.replacements, 0);
+        assert_eq!(protected.intact, 1);
+        let records = dictionary.review().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(dictionary.hydrate_text(&input).is_ok());
+    }
+
+    #[test]
+    fn overlapping_global_records_keep_explicit_protection_after_the_rules_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let global = Matcher::for_test(&[("left", "abcdefgh"), ("right", "efghijkl")]);
+
+        let protected = dictionary.protect_text("abcdefghijkl", &global).unwrap();
+
+        assert_eq!(protected.replacements, 1);
+        assert_eq!(dictionary.review().unwrap().len(), 3);
+        let after_rules_change = dictionary
+            .protect_text("abcdefgh", &Matcher::empty())
+            .unwrap();
+        assert_eq!(after_rules_change.replacements, 1);
+        assert!(!after_rules_change.text.contains("abcdefgh"));
+    }
+
+    #[test]
+    fn overlapping_match_collection_has_a_bounded_resource_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let patterns: Vec<String> = (1..=125).map(|length| "ab".repeat(length)).collect();
+        let ids: Vec<String> = (0..patterns.len()).map(|index| index.to_string()).collect();
+        let pattern_refs: Vec<(&str, &str)> = patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| (ids[index].as_str(), pattern.as_str()))
+            .collect();
+        let global = Matcher::for_test(&pattern_refs);
+
+        let error = dictionary
+            .protect_text(&"ab".repeat(MAX_REPOSITORY_SECRET_BYTES / 2), &global)
+            .expect_err("the overlap budget must reject a dense match set");
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping secret matches exceed the bounded protection limit")
+        );
+        assert!(dictionary.review().unwrap().is_empty());
+    }
+
+    #[test]
     fn heuristic_forward_projection_is_retry_safe_and_content_classified() {
         let dir = tempfile::tempdir().unwrap();
         let dictionary = RepositoryDictionary::new(
@@ -2491,15 +3112,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_block_wins_over_an_allow_decision() {
+    fn allow_wins_over_global_and_explicit_blocks_and_unallow_restores_them() {
         let dir = tempfile::tempdir().unwrap();
         let dictionary = RepositoryDictionary::new(
             dir.path().join("dictionary/vault.json"),
             MemoryKeys::default(),
         );
-        let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let secret = "blue horse battery";
+        let global = Matcher::for_test(&[("sec_global", secret)]);
         let input = format!(r#"{{"message":"{secret}"}}"#) + "\n";
-        let _ = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+        let protected = dictionary.protect_jsonl(&input, &global).unwrap();
+        assert_eq!(dictionary.review().unwrap()[0].origins, vec!["global"]);
         let id = dictionary.review().unwrap()[0].id.clone();
         dictionary.allow(&id).unwrap();
 
@@ -2508,8 +3131,34 @@ mod tests {
             .unwrap();
         assert_eq!(blocked.id, id);
         assert!(blocked.explicit_block);
-        assert!(blocked.effective_protect);
-        assert!(dictionary.active_matcher().unwrap().find(secret).len() == 1);
+        assert!(!blocked.effective_protect);
+        assert!(dictionary.active_matcher().unwrap().find(secret).is_empty());
+        assert_eq!(
+            dictionary.protect_jsonl(&input, &global).unwrap().text,
+            input
+        );
+        let scan = global
+            .merged(&dictionary.active_matcher().unwrap())
+            .unwrap();
+        assert!(
+            crate::domain::secrets::scan_text_registered_with(&input, &HashSet::new(), &scan)
+                .is_empty()
+        );
+
+        assert_eq!(
+            dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+            input
+        );
+        dictionary.unallow(&id).unwrap();
+        assert_eq!(dictionary.active_matcher().unwrap().find(secret).len(), 1);
+        assert_eq!(
+            dictionary
+                .protect_jsonl(&input, &global)
+                .unwrap()
+                .replacements,
+            1
+        );
+        dictionary.allow(&id).unwrap();
 
         let unblocked = dictionary.block_remove(&id).unwrap();
         assert!(!unblocked.explicit_block);
@@ -2518,7 +3167,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_identity_fields_do_not_create_heuristic_records() {
+    fn unverified_identity_field_names_do_not_waive_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let dictionary = RepositoryDictionary::new(
             dir.path().join("dictionary/vault.json"),
@@ -2526,8 +3175,108 @@ mod tests {
         );
         let input = r#"{"session_id":"ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"}"#;
         let protected = dictionary.protect_jsonl(input, &Matcher::empty()).unwrap();
-        assert_eq!(protected.replacements, 0);
-        assert_eq!(protected.new_records, 0);
-        assert!(dictionary.review().unwrap().is_empty());
+        assert_eq!(protected.replacements, 1);
+        assert_eq!(protected.new_records, 1);
+        assert!(!dictionary.review().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bare_values_and_user_controlled_keys_are_reversible_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("dictionary/vault.json"),
+            MemoryKeys::default(),
+        );
+        let alpha = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let hex = "4f2a9c1e7b3d8056af12cd34ef56ab78901234cd";
+        let key = "Kx7mQv2Lp9Nc8Wj3Fh6sVd1aGe5uRz4tYp8";
+        let contextual = "aB3dE6gH9jK2mN5p";
+        let input = serde_json::to_string(&serde_json::json!({
+            "signature": {"credential": alpha},
+            "token": hex,
+            "password": contextual,
+            key: "ordinary value"
+        }))
+        .unwrap();
+        let protected = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+        assert!(protected.new_heuristic_records >= 4);
+        assert!(!protected.text.contains(alpha));
+        assert!(!protected.text.contains(hex));
+        assert!(!protected.text.contains(key));
+        assert!(!protected.text.contains(contextual));
+        assert_eq!(
+            dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+            input
+        );
+    }
+
+    #[test]
+    fn native_identity_evidence_does_not_waive_equal_credential_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let native = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
+        let input = serde_json::json!({"type":"assistant", "sessionId":native,
+            "message":{"role":"assistant", "content":"public"}, "token":native})
+        .to_string();
+        let report = dictionary
+            .protect_native_jsonl(&input, &Matcher::empty(), "claude-code", native)
+            .unwrap();
+        let protected: Value = serde_json::from_str(&report.text).unwrap();
+        assert_eq!(protected["sessionId"], native);
+        assert_ne!(protected["token"], native);
+        assert_eq!(
+            serde_json::from_str::<Value>(&dictionary.hydrate_jsonl(&report.text).unwrap().text)
+                .unwrap(),
+            serde_json::from_str::<Value>(&input).unwrap()
+        );
+        assert_eq!(
+            dictionary
+                .protect_native_jsonl(&input, &Matcher::empty(), "claude-code", native)
+                .unwrap()
+                .text,
+            report.text
+        );
+        let explicit = Matcher::for_test(&[("explicit", native)]);
+        assert!(
+            !dictionary
+                .protect_native_jsonl(&input, &explicit, "claude-code", native)
+                .unwrap()
+                .text
+                .contains(native)
+        );
+        let untrusted = serde_json::json!({"sessionId":native, "signature":native}).to_string();
+        assert!(
+            !dictionary
+                .protect_native_jsonl(&untrusted, &Matcher::empty(), "claude-code", native)
+                .unwrap()
+                .text
+                .contains(native)
+        );
+    }
+
+    #[test]
+    fn independent_entropy_alphabets_roundtrip_as_literal_carriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        for value in [
+            "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF",
+            "qLmRtNxPzSwTyVaXbUdZeFhJkCgHoIpQsMrNvLtPwZxY",
+            "4f2a9c1e7b3d8056af12cd34ef56ab78901234cd",
+            "Qz7mXv9L+pZ4tNc8/WjF3bHy6sVd1aGe5uKr2dF==",
+            "Qz7mXv9L-pZ4tNc8_WjF3bHy6sVd1aGe5uKr2dF",
+            "qL!2rM@5tN#8xP$3zR%6wS^9yT&4uV*7aX",
+        ] {
+            let first = dictionary.protect_text(value, &Matcher::empty()).unwrap();
+            assert!(
+                !first.text.contains(value),
+                "a supported alphabet must be protected"
+            );
+            assert_eq!(dictionary.hydrate_text(&first.text).unwrap().text, value);
+            let retry = dictionary.protect_text(value, &Matcher::empty()).unwrap();
+            assert_eq!(retry.new_records, 0);
+            assert_eq!(retry.text, first.text);
+        }
     }
 }

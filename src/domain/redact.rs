@@ -47,6 +47,10 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// What one redaction pass produced.
 #[derive(Debug, Clone)]
@@ -114,7 +118,22 @@ impl Persona {
 pub struct Redactor {
     persona: Persona,
     #[cfg(feature = "secret-vault")]
+    require_repository: bool,
+    buffered_stream_bytes: Arc<AtomicUsize>,
+    #[cfg(feature = "secret-vault")]
     registered: crate::domain::secret_filter::MatcherHandle,
+    #[cfg(feature = "secret-vault")]
+    dictionary: Option<Arc<crate::domain::secret_filter::RepositoryDictionary>>,
+    #[cfg(feature = "rc")]
+    native: Option<Arc<std::sync::Mutex<NativeProtection>>>,
+}
+
+#[cfg(feature = "rc")]
+struct NativeProtection {
+    runtime: String,
+    session: String,
+    evidence: crate::domain::secrets::identity::Evidence,
+    seeded: bool,
 }
 
 /// The name appearing in `/home/<name>` / `/Users/<name>`. The reserved macOS shared
@@ -214,7 +233,14 @@ impl Redactor {
         Redactor {
             persona,
             #[cfg(feature = "secret-vault")]
+            require_repository: false,
+            buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "secret-vault")]
             registered: Default::default(),
+            #[cfg(feature = "secret-vault")]
+            dictionary: None,
+            #[cfg(feature = "rc")]
+            native: None,
         }
     }
 
@@ -225,8 +251,149 @@ impl Redactor {
     ) -> Self {
         Redactor {
             persona,
+            require_repository: false,
+            buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
             registered,
+            dictionary: None,
+            #[cfg(feature = "rc")]
+            native: None,
         }
+    }
+
+    /// The caller supplies the selected Agent repository; a source-code working directory does
+    /// not select the repository that owns this session's reversible mappings.
+    #[cfg(feature = "secret-vault")]
+    pub fn with_repository(mut self, repo_root: &std::path::Path) -> crate::Result<Self> {
+        self.dictionary = Some(Arc::new(
+            crate::domain::secret_filter::RepositoryDictionary::open(repo_root)?,
+        ));
+        Ok(self)
+    }
+
+    /// Remote adapters without a selected Agent repository withhold suspicious content.
+    #[cfg(feature = "rc")]
+    pub(crate) fn require_repository(mut self) -> Self {
+        self.require_repository = true;
+        self
+    }
+
+    #[cfg(feature = "rc")]
+    pub(crate) fn with_native_context(
+        mut self,
+        runtime: &str,
+        session: &str,
+        cwd: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Self {
+        self.native = Some(Arc::new(std::sync::Mutex::new(NativeProtection {
+            runtime: runtime.into(),
+            session: session.into(),
+            evidence: crate::domain::secrets::identity::Evidence::new(
+                &crate::domain::repo::Repo::at(root),
+                cwd,
+            ),
+            seeded: false,
+        })));
+        self
+    }
+
+    #[cfg(feature = "rc")]
+    pub(crate) fn bind_native_session(&self, session: &str) {
+        if let Some(native) = &self.native
+            && let Ok(mut native) = native.lock()
+            && native.session != session
+        {
+            native.evidence.reset();
+            native.seeded = false;
+            native.session = session.to_owned();
+        }
+    }
+
+    #[cfg(feature = "rc")]
+    pub(crate) fn scrub_native_json(
+        &self,
+        value: &serde_json::Value,
+        pointers: &[&str],
+    ) -> JsonReport {
+        let result = (|| -> crate::Result<JsonReport> {
+            let (Some(native), Some(dictionary)) = (&self.native, &self.dictionary) else {
+                return Ok(self.scrub_json_with_verified_fields(value, pointers));
+            };
+            let mut native = native
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native protection context is unavailable"))?;
+            let runtime = native.runtime.clone();
+            let session = native.session.clone();
+            if !native.seeded && !session.is_empty() {
+                native.evidence.seed_native(&runtime, &session)?;
+                native.seeded = true;
+            }
+            let mut mask = native.evidence.record(&runtime, &session, value);
+            for pointer in pointers {
+                if let Some(text) = value.pointer(pointer).and_then(serde_json::Value::as_str) {
+                    mask.0.push(((*pointer).into(), 0..text.len()));
+                }
+            }
+            mask.0
+                .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.start.cmp(&b.1.start)));
+            mask.0.dedup();
+            let protected = dictionary.protect_with_masks(
+                &serde_json::to_string(value)?,
+                &self.registered.snapshot(),
+                |_| mask.clone(),
+            )?;
+            anyhow::ensure!(
+                protected.intact == 0,
+                "native record exceeds its reversible protection limit"
+            );
+            let mut value = serde_json::from_str(&protected.text)?;
+            let mut totals = JsonTotals::default();
+            self.scrub_persona_json(&mut value, &mut totals)?;
+            Ok(JsonReport {
+                value,
+                secrets: protected.replacements,
+                paths: totals.paths,
+                ips: totals.ips,
+                registered_ids: Vec::new(),
+            })
+        })();
+        result.unwrap_or_else(|_| JsonReport {
+            value: serde_json::json!({"protection_error":"content withheld: repository secret protection failed"}),
+            secrets: 0, paths: 0, ips: 0, registered_ids: Vec::new(),
+        })
+    }
+
+    #[cfg(feature = "rc")]
+    fn scrub_persona_json(
+        &self,
+        value: &mut serde_json::Value,
+        totals: &mut JsonTotals,
+    ) -> crate::Result<()> {
+        match value {
+            serde_json::Value::String(text) => {
+                let report = self.scrub_persona(text);
+                totals.add(&report);
+                *text = report.text;
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.scrub_persona_json(value, totals)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, mut value) in std::mem::take(map) {
+                    let report = self.scrub_persona(&key);
+                    totals.add(&report);
+                    self.scrub_persona_json(&mut value, totals)?;
+                    anyhow::ensure!(
+                        map.insert(report.text, value).is_none(),
+                        "privacy projection produced duplicate JSON keys"
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The infallible form: panicking on a vault failure is safer than silently publishing
@@ -257,28 +424,56 @@ impl Redactor {
         StreamRedactor {
             redactor: self.clone(),
             pending: String::new(),
+            failed: false,
         }
     }
 
     /// Redact one text. Deterministic: same input, same persona ⇒ same output.
     pub fn scrub(&self, text: &str) -> Report {
-        let mut paths = 0usize;
+        self.try_scrub(text).unwrap_or_else(|_| Report {
+            text: "[content withheld: repository secret protection failed]".into(),
+            ..empty_report()
+        })
+    }
 
+    /// Mapping persistence must succeed before any protected bytes leave this call.
+    pub fn try_scrub(&self, text: &str) -> crate::Result<Report> {
         // ── 1. Secrets first: later rewrites must not change rule hits, or the reverse ──
-        // Registered literals go first: even when a complete registered value contains a
-        // substring gitleaks recognizes, the whole span is replaced once — rewriting the middle
-        // first turns the literal into a miss.
+        // Inspect both policies on original bytes. Rewriting either first can
+        // destroy the evidence needed to recognize an overlapping sensitive region.
         #[cfg(feature = "secret-vault")]
-        let registered = self.registered.snapshot().scrub(text);
-        #[cfg(feature = "secret-vault")]
-        let (mut out, built_in_secrets) = crate::domain::secrets::scrub(&registered.text);
-        #[cfg(feature = "secret-vault")]
-        let (secrets, registered_ids) = (built_in_secrets + registered.matches, registered.ids);
+        let (out, secrets, registered_ids) = if let Some(dictionary) = &self.dictionary {
+            let report = dictionary.protect_text(text, &self.registered.snapshot())?;
+            anyhow::ensure!(
+                report.intact == 0,
+                "text exceeds the reversible protection limit"
+            );
+            (report.text, report.replacements, Vec::new())
+        } else {
+            let scrubbed =
+                crate::domain::secrets::scrub_registered(text, &self.registered.snapshot());
+            anyhow::ensure!(
+                !self.require_repository || scrubbed.1 == 0,
+                "content withheld: reversible protection requires the session's Agent repository"
+            );
+            scrubbed
+        };
 
         #[cfg(not(feature = "secret-vault"))]
-        let (mut out, secrets) = crate::domain::secrets::scrub(text);
+        let (out, secrets) = crate::domain::secrets::scrub(text);
         #[cfg(not(feature = "secret-vault"))]
         let registered_ids = Vec::new();
+
+        let mut report = self.scrub_persona(&out);
+        report.secrets = secrets;
+        report.registered_ids = registered_ids;
+        Ok(report)
+    }
+
+    /// Call only after secret projection: environment substitutions are intentionally irreversible.
+    pub(crate) fn scrub_persona(&self, protected: &str) -> Report {
+        let mut out = protected.to_owned();
+        let mut paths = 0;
 
         // ── 2. The full home prefix ──
         if let Some(home) = &self.persona.home
@@ -374,10 +569,10 @@ impl Redactor {
 
         Report {
             text: out,
-            secrets,
+            secrets: 0,
             paths,
             ips,
-            registered_ids,
+            registered_ids: Vec::new(),
         }
     }
 
@@ -385,14 +580,70 @@ impl Redactor {
     /// only safe boundary for serialized runtime events: matching the wire text
     /// would miss `\"`, `\\` and `\n` inside a registered literal.
     pub fn scrub_json(&self, value: &serde_json::Value) -> JsonReport {
+        self.try_scrub_json(value).unwrap_or_else(|_| JsonReport {
+            value: serde_json::json!({"protection_error": "content withheld: repository secret protection failed"}),
+            secrets: 0, paths: 0, ips: 0, registered_ids: vec![],
+        })
+    }
+
+    /// Pointers are supplied only after the caller validates schema-owned identities.
+    /// Explicit registrations still override identity evidence at those exact occurrences.
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn scrub_json_with_verified_fields(
+        &self,
+        value: &serde_json::Value,
+        pointers: &[&str],
+    ) -> JsonReport {
+        let registered = match &self.dictionary {
+            Some(dictionary) => match dictionary
+                .registered_matcher()
+                .and_then(|local| self.registered.snapshot().merged(&local))
+            {
+                Ok(matcher) => matcher,
+                Err(_) => return self.scrub_json(value),
+            },
+            None => self.registered.snapshot(),
+        };
+        let mut input = value.clone();
+        let mut retained = Vec::new();
+        for pointer in pointers {
+            if let Some(field) = input.pointer_mut(pointer)
+                && let Some(identity) = field.as_str()
+                && registered.find(identity).is_empty()
+            {
+                retained.push((*pointer, field.take()));
+            }
+        }
+        let mut report = self.scrub_json(&input);
+        for (pointer, identity) in retained {
+            if let Some(field) = report.value.pointer_mut(pointer) {
+                *field = identity;
+            }
+        }
+        report
+    }
+
+    pub fn try_scrub_json(&self, value: &serde_json::Value) -> crate::Result<JsonReport> {
         let mut value = value.clone();
         let mut totals = JsonTotals::default();
-        self.scrub_json_inner(&mut value, &mut totals);
+        self.scrub_json_inner(&mut value, &mut totals)?;
         // Some built-in gitleaks rules need assignment context spanning a JSON
         // key and value. Preserve the previous whole-wire pass after semantic
         // registered matching; otherwise `{"token":"..."}` could regress
         // even though quoted/newline registered values are now handled safely.
-        let wire = serde_json::to_string(&value).unwrap_or_default();
+        let wire = serde_json::to_string(&value)?;
+        #[cfg(feature = "secret-vault")]
+        let (wire, built_in) = if let Some(dictionary) = &self.dictionary {
+            let report = dictionary.protect_jsonl(&wire, &self.registered.snapshot())?;
+            anyhow::ensure!(
+                report.intact == 0,
+                "JSON exceeds the reversible protection limit"
+            );
+            (report.text, report.replacements)
+        } else {
+            crate::domain::secrets::scrub(&wire)
+        };
+        #[cfg(not(feature = "secret-vault"))]
         let (wire, built_in) = crate::domain::secrets::scrub(&wire);
         if built_in > 0
             && let Ok(scrubbed) = serde_json::from_str(&wire)
@@ -400,33 +651,37 @@ impl Redactor {
             value = scrubbed;
             totals.secrets = totals.secrets.saturating_add(built_in);
         }
-        JsonReport {
+        Ok(JsonReport {
             value,
             secrets: totals.secrets,
             paths: totals.paths,
             ips: totals.ips,
             registered_ids: totals.registered_ids.into_iter().collect(),
-        }
+        })
     }
 
-    fn scrub_json_inner(&self, value: &mut serde_json::Value, totals: &mut JsonTotals) {
+    fn scrub_json_inner(
+        &self,
+        value: &mut serde_json::Value,
+        totals: &mut JsonTotals,
+    ) -> crate::Result<()> {
         match value {
             serde_json::Value::String(text) => {
-                let report = self.scrub(text);
+                let report = self.try_scrub(text)?;
                 totals.add(&report);
                 *text = report.text;
             }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    self.scrub_json_inner(value, totals);
+                    self.scrub_json_inner(value, totals)?;
                 }
             }
             serde_json::Value::Object(map) => {
                 let old = std::mem::take(map);
                 for (key, mut value) in old {
-                    let key_report = self.scrub(&key);
+                    let key_report = self.try_scrub(&key)?;
                     totals.add(&key_report);
-                    self.scrub_json_inner(&mut value, totals);
+                    self.scrub_json_inner(&mut value, totals)?;
                     // Redaction can theoretically collapse two keys. Keep the
                     // first instead of losing the whole object or restoring a
                     // secret-bearing key on the outbound path.
@@ -436,6 +691,7 @@ impl Redactor {
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
             }
         }
+        Ok(())
     }
 }
 
@@ -457,51 +713,90 @@ impl JsonTotals {
     }
 }
 
-/// The safe tail of a delta stream. A prefix reaches [`Redactor`] only once no future byte can
-/// extend it into a registered secret, so a value spanning two chunks never sends its first half
-/// over the network.
+/// Buffer an item until finalization: contextual and multiline findings may
+/// depend on bytes beyond any fixed tail. Capacity failure poisons the item so
+/// neither later chunks nor finalization can release an unchecked suffix.
 pub struct StreamRedactor {
     redactor: Redactor,
     pending: String,
+    failed: bool,
 }
 
-impl StreamRedactor {
-    pub fn push(&mut self, chunk: &str) -> Report {
-        self.pending.push_str(chunk);
-        #[cfg(feature = "secret-vault")]
-        let matcher = self.redactor.registered.snapshot();
-        #[cfg(feature = "secret-vault")]
-        let hold = matcher.max_pattern_len().saturating_sub(1);
-        #[cfg(not(feature = "secret-vault"))]
-        let hold = 0;
-        if self.pending.len() <= hold {
-            return empty_report();
-        }
+pub(crate) const MAX_STREAM_ITEM_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_BUFFER_BYTES: usize = 8 * MAX_STREAM_ITEM_BYTES;
 
-        let mut cut = self.pending.len() - hold;
-        while cut > 0 && !self.pending.is_char_boundary(cut) {
-            cut -= 1;
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("stream protection failed or exceeded its limit; no item bytes were emitted")]
+pub struct StreamProtectionError;
+
+impl StreamRedactor {
+    pub fn push(&mut self, chunk: &str) -> Result<Report, StreamProtectionError> {
+        if self.failed || chunk.len() > MAX_STREAM_ITEM_BYTES.saturating_sub(self.pending.len()) {
+            self.fail();
+            return Err(StreamProtectionError);
         }
-        // Never cut through the middle of a span that already matches in full; the whole span
-        // waits for the next chunk and is replaced there in one piece.
-        #[cfg(feature = "secret-vault")]
-        if let Some(start) = matcher.crossing_start(&self.pending, cut) {
-            cut = start;
+        if self
+            .redactor
+            .buffered_stream_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(chunk.len())
+                    .filter(|total| *total <= MAX_STREAM_BUFFER_BYTES)
+            })
+            .is_err()
+        {
+            self.fail();
+            return Err(StreamProtectionError);
         }
-        if cut == 0 {
-            return empty_report();
+        if self.pending.try_reserve_exact(chunk.len()).is_err() {
+            self.redactor
+                .buffered_stream_bytes
+                .fetch_sub(chunk.len(), Ordering::Relaxed);
+            self.fail();
+            return Err(StreamProtectionError);
         }
-        let tail = self.pending.split_off(cut);
-        let ready = std::mem::replace(&mut self.pending, tail);
-        self.redactor.scrub(&ready)
+        self.pending.push_str(chunk);
+        Ok(empty_report())
     }
 
-    pub fn flush(&mut self) -> Report {
+    pub fn flush(&mut self) -> Result<Report, StreamProtectionError> {
+        if self.failed {
+            return Err(StreamProtectionError);
+        }
         if self.pending.is_empty() {
-            return empty_report();
+            return Ok(empty_report());
         }
         let ready = std::mem::take(&mut self.pending);
-        self.redactor.scrub(&ready)
+        self.redactor
+            .buffered_stream_bytes
+            .fetch_sub(ready.len(), Ordering::Relaxed);
+        #[cfg(feature = "rc")]
+        if let Some(native) = &self.redactor.native {
+            let mut native = native.lock().map_err(|_| StreamProtectionError)?;
+            if native.evidence.contains_object_identity(&ready) {
+                // The authoritative completed record carries the operation/result relationship.
+                return Ok(empty_report());
+            }
+        }
+        self.redactor.try_scrub(&ready).map_err(|_| {
+            self.failed = true;
+            StreamProtectionError
+        })
+    }
+
+    fn fail(&mut self) {
+        self.failed = true;
+        self.redactor
+            .buffered_stream_bytes
+            .fetch_sub(self.pending.len(), Ordering::Relaxed);
+        #[cfg(feature = "secret-vault")]
+        zeroize::Zeroize::zeroize(&mut self.pending);
+        self.pending.clear();
+    }
+}
+
+impl Drop for StreamRedactor {
+    fn drop(&mut self) {
+        self.fail();
     }
 }
 
@@ -518,6 +813,49 @@ fn empty_report() -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "secret-vault")]
+    #[test]
+    fn repository_streams_persist_reversible_values_and_reuse_local_blocks() {
+        use crate::domain::secret_filter::{MatcherHandle, RepositoryDictionary};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
+        dictionary
+            .block_add("local", "blue horse battery".to_string().into(), false)
+            .unwrap();
+        let value = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let redactor = Redactor::with_registered(Persona::default(), MatcherHandle::default())
+            .with_repository(repo.root())
+            .unwrap();
+        let input = format!("blue horse battery {value}");
+        let mut stream = redactor.stream();
+        assert!(stream.push(&input[..27]).unwrap().text.is_empty());
+        assert!(stream.push(&input[27..]).unwrap().text.is_empty());
+        let protected = stream.flush().unwrap();
+        assert!(!protected.text.contains(value));
+        assert!(!protected.text.contains("blue horse battery"));
+        assert_eq!(
+            dictionary.hydrate_text(&protected.text).unwrap().text,
+            input
+        );
+        let reopened = Redactor::with_registered(Persona::default(), MatcherHandle::default())
+            .with_repository(repo.root())
+            .unwrap();
+        assert_eq!(reopened.try_scrub(&input).unwrap().text, protected.text);
+        let json = serde_json::json!({"result": value});
+        let protected_json = reopened.try_scrub_json(&json).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &dictionary
+                    .hydrate_jsonl(&protected_json.value.to_string())
+                    .unwrap()
+                    .text
+            )
+            .unwrap(),
+            json
+        );
+    }
 
     fn persona() -> Persona {
         Persona {
@@ -659,13 +997,78 @@ mod tests {
 
         for split in 1..token.len() {
             let mut stream = redactor.stream();
-            let mut output = stream.push(&token[..split]).text;
-            output.push_str(&stream.push(&token[split..]).text);
-            output.push_str(&stream.flush().text);
+            let mut output = stream.push(&token[..split]).unwrap().text;
+            output.push_str(&stream.push(&token[split..]).unwrap().text);
+            output.push_str(&stream.flush().unwrap().text);
             assert_eq!(
                 output, token,
                 "placeholder was changed at byte boundary {split}"
             );
         }
+    }
+
+    #[test]
+    fn vendor_and_pem_fragments_are_not_released_before_finalization() {
+        let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{token}\nprivate body");
+        for text in [token, pem.as_str()] {
+            for split in 1..text.len() {
+                let mut stream = Redactor::new(Persona::default()).stream();
+                let first = stream.push(&text[..split]).unwrap();
+                let second = stream.push(&text[split..]).unwrap();
+                assert!(first.text.is_empty() && second.text.is_empty());
+                let output = stream.flush().unwrap().text;
+                assert!(output.starts_with("[redacted:"));
+                assert!(!output.contains(token));
+                assert!(!output.contains("private body"));
+            }
+        }
+    }
+
+    #[cfg(feature = "secret-vault")]
+    #[test]
+    fn a_registered_header_cannot_erase_evidence_for_the_private_key_body() {
+        let header = "-----BEGIN PRIVATE KEY-----";
+        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_header", header)]);
+        let redactor = Redactor::with_registered(
+            Persona::default(),
+            crate::domain::secret_filter::MatcherHandle::new(matcher),
+        );
+        let report = redactor.scrub(&format!("{header}\nprivate body material"));
+        assert_eq!(report.text, "[redacted:registered-secret]");
+        assert_eq!(report.registered_ids, ["sec_header"]);
+    }
+
+    #[test]
+    fn exceeding_stream_capacity_cannot_release_a_suffix_on_retry_or_flush() {
+        let mut stream = Redactor::new(Persona::default()).stream();
+        assert!(
+            stream
+                .push(&"a".repeat(MAX_STREAM_ITEM_BYTES))
+                .unwrap()
+                .text
+                .is_empty()
+        );
+        assert!(stream.push("b").is_err());
+        assert!(stream.pending.is_empty());
+        assert!(stream.push("suffix").is_err());
+        assert!(stream.flush().is_err());
+    }
+
+    #[test]
+    fn concurrent_items_share_a_reclaimable_buffer_budget() {
+        let redactor = Redactor::new(Persona::default());
+        let mut streams: Vec<_> = (0..MAX_STREAM_BUFFER_BYTES / MAX_STREAM_ITEM_BYTES)
+            .map(|_| redactor.stream())
+            .collect();
+        let chunk = "a".repeat(MAX_STREAM_ITEM_BYTES);
+        for stream in &mut streams {
+            assert!(stream.push(&chunk).is_ok());
+        }
+        assert!(redactor.clone().stream().push("overflow").is_err());
+        streams.pop();
+        assert!(redactor.stream().push(&chunk).is_ok());
+        drop(streams);
+        assert_eq!(redactor.buffered_stream_bytes.load(Ordering::Relaxed), 0);
     }
 }

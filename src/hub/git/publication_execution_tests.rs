@@ -493,6 +493,7 @@ fn native_publication_empty_and_remote_present_inventory_need_no_local_payload()
             complete.report().remote_present().len(),
             usize::from(with_pointer)
         );
+        assert!(!complete.has_findings(), "{:?}", complete.report().scan().hits);
         let report = complete.publish(SecretFindingsAcceptance::Reject);
         assert!(report.ok(), "empty native phase: {report:?}");
         let lfs = report.lfs.unwrap();

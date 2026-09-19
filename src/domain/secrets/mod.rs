@@ -14,16 +14,14 @@
 //! `AGIT_ALLOW_SECRETS` affects local checking only. The push command's `--allow-secrets` option
 //! also communicates explicit acceptance to a supporting server for that operation.
 //!
-//! Not at `agit commit`: a commit is a purely local action, a secret staying on this machine is
-//! not a leak, and a commit that refuses to record a version because of a secret only teaches
-//! people to stop recording versions. Same division of labour as git — commit freely, stop it at
-//! push.
+//! Settlement projects discovered values through the local repository dictionary before
+//! forming canonical objects. Publication independently inspects retained history and direct
+//! Git writes; protecting a new snapshot cannot remove secrets in its ancestors.
 //!
 //! # Err toward the false positive
 //!
-//! A miss costs a leaked, irreversible secret; a false positive costs one allowlist entry. So the
-//! rule set is the aggressive gitleaks set of 222 rules (see [`rules`]), with two levels of
-//! allowlist to absorb the false positives.
+//! Uncertain token-like values become reversible repository placeholders. Independent entropy
+//! discovery and provider rules share the same inspection surface; neither is exhaustive.
 //!
 //! # Same source on both sides, different authority
 //!
@@ -40,6 +38,8 @@
 //! at the top of the file and update the version, then run `cargo test --lib domain::secrets` —
 //! `every_rule_compiles` tells you whether there is a new rule Rust's `regex` cannot compile.
 
+pub(crate) mod identity;
+pub(crate) mod placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
 pub mod rules;
@@ -417,12 +417,23 @@ pub struct Unscanned {
     /// **Working-tree files** over the line that were not read: `(path relative to the repo,
     /// byte count)`.
     pub oversized_files: Vec<(String, u64)>,
+    /// Bounded samples of carriers outside UTF-8 inspection, or whose bytes could not be read.
+    pub unsupported: Vec<String>,
 }
 
 impl Unscanned {
+    fn record_unsupported(&mut self, label: String) {
+        if self.unsupported.len() < MAX_REPORTED_HITS {
+            self.unsupported.push(label);
+        }
+    }
+
     /// Nothing went unread.
     pub fn is_empty(&self) -> bool {
-        self.over_budget.is_none() && self.oversized.is_empty() && self.oversized_files.is_empty()
+        self.over_budget.is_none()
+            && self.oversized.is_empty()
+            && self.oversized_files.is_empty()
+            && self.unsupported.is_empty()
     }
 }
 
@@ -698,12 +709,21 @@ pub fn load_allowlist(dir: &Path) -> HashSet<String> {
 /// byte-for-byte the same result as replacing them in turn.
 pub fn view_of(s: &str) -> String {
     let b = s.as_bytes();
-    if !b.contains(&b'\\') {
+    if !b.contains(&b'\\') && !s.contains(placeholder::TOKEN_PREFIX) {
         return s.to_string();
     }
     let mut out = Vec::with_capacity(b.len());
+    let mut opaque = placeholder::token_segments(s).peekable();
     let mut i = 0;
     while i < b.len() {
+        if let Some(&(start, end, _)) = opaque.peek()
+            && i == start
+        {
+            out.resize(end, b' ');
+            i = end;
+            opaque.next();
+            continue;
+        }
         if b[i] == b'\\' && matches!(b.get(i + 1), Some(b'n' | b'r' | b't' | b'"')) {
             out.extend_from_slice(b"  ");
             i += 2;
@@ -890,6 +910,7 @@ fn raw_hits_capped(
     let mut budget = SpanBudget::new(cap);
     // The line text is only needed to decide `regexTarget = "line"`, so it is built on demand.
     let mut lines: Option<Lines> = None;
+    let json_regions = std::cell::OnceCell::new();
     'rules: for rule in rules::candidates(view) {
         let Some(re) = rule.regex() else { continue };
         if rule.has_groups() {
@@ -921,26 +942,154 @@ fn raw_hits_capped(
                 let line = lines
                     .get_or_insert_with(|| Lines::new(view))
                     .text_at(m.start());
-                if !rule.accepts(m.as_str(), m.as_str(), line) {
+                let end = if rule.id == "agit-private-key-header" {
+                    let strings = json_regions.get_or_init(|| json_string_regions(view));
+                    let carrier_end = strings
+                        .iter()
+                        .find(|(start, end)| *start <= m.start() && m.end() <= *end)
+                        .map_or(view.len(), |(_, end)| *end);
+                    private_key_region_end(&view[..carrier_end], m.start(), m.end())
+                } else {
+                    m.end()
+                };
+                let secret = &view[m.start()..end];
+                if !rule.accepts(secret, secret, line) {
                     continue;
                 }
-                if !keep(m.as_str(), m.start()) {
+                if !keep(secret, m.start()) {
                     continue;
                 }
-                if !budget.charge(m.start(), m.end()) {
+                if !budget.charge(m.start(), end) {
                     break 'rules;
                 }
                 out.push(Raw {
                     rule: rule.id.as_str(),
                     start: m.start(),
-                    end: m.end(),
+                    end,
                 });
             }
         }
     }
+    for (start, end) in bare_candidate_spans(view) {
+        let secret = &view[start..end];
+        if rules::preset_allows(secret) || !keep(secret, start) {
+            continue;
+        }
+        if !budget.charge(start, end) {
+            break;
+        }
+        out.push(Raw {
+            rule: "high-entropy-value",
+            start,
+            end,
+        });
+    }
     out.sort_by_key(|h| (h.start, h.end));
     dedupe_same_span(&mut out);
     (out, budget.exhausted)
+}
+
+/// Discover token-like values independently of provider rules or field names.
+fn bare_candidate_spans(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    entropy_candidate_spans(text, false)
+}
+
+fn entropy_candidate_spans(
+    text: &str,
+    credential_field: bool,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        while start < bytes.len() {
+            if !is_token_byte(bytes[start]) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < bytes.len() && is_token_byte(bytes[end]) {
+                end += 1;
+            }
+            let candidate = &text[start..end];
+            let hex_candidate = ["agit-", "sha1-", "sha256-"]
+                .iter()
+                .find_map(|prefix| candidate.strip_prefix(prefix))
+                .unwrap_or(candidate);
+            let is_hex = hex_candidate.bytes().any(|byte| byte.is_ascii_hexdigit())
+                && hex_candidate
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
+            let is_alpha = candidate.bytes().all(|byte| byte.is_ascii_alphabetic());
+            let has_separator = candidate.bytes().any(|byte| !byte.is_ascii_alphanumeric());
+            let min_len = if credential_field {
+                10
+            } else if is_hex {
+                32
+            } else if is_alpha {
+                24
+            } else {
+                20
+            };
+            let floor = if credential_field {
+                3.5
+            } else if is_hex {
+                3.2
+            } else if is_alpha {
+                3.8
+            } else if has_separator {
+                4.2
+            } else {
+                4.0
+            };
+            let mixed_alpha = candidate.bytes().any(|byte| byte.is_ascii_uppercase())
+                && candidate.bytes().any(|byte| byte.is_ascii_lowercase());
+            let has_digit = candidate.bytes().any(|byte| byte.is_ascii_digit());
+            if candidate.len() >= min_len
+                && rules::shannon(candidate) >= floor
+                && (mixed_alpha || has_digit || is_hex)
+            {
+                let span = (start, end);
+                start = end;
+                return Some(span);
+            }
+            start = end;
+        }
+        None
+    })
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"_-+/=.!@#$%^&*?~".contains(&byte)
+}
+
+/// A private-key header opens a sensitive region until its matching footer or
+/// the end of the carrier. Incomplete captures retain the body as part of the
+/// finding, so replacing a header cannot erase the only evidence of sensitivity.
+fn private_key_region_end(text: &str, start: usize, header_end: usize) -> usize {
+    let header = &text[start..header_end];
+    let footer = header.replacen("-----BEGIN", "-----END", 1);
+    text[header_end..]
+        .find(&footer)
+        .map_or(text.len(), |offset| header_end + offset + footer.len())
+}
+
+/// Valid JSON delimiters belong to the carrier, outside its sensitive strings.
+/// Invalid input receives no structural exemption and remains ordinary text.
+fn json_string_regions(text: &str) -> Vec<(usize, usize)> {
+    if serde_json::from_str::<serde_json::Value>(text).is_err() {
+        return Vec::new();
+    }
+    let mut strings = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find('"') {
+        let start = cursor + relative;
+        let Some(end) = json_string_end(text.as_bytes(), start) else {
+            return Vec::new();
+        };
+        strings.push((start + 1, end - 1));
+        cursor = end;
+    }
+    strings
 }
 
 /// When two rules recognize the same characters, keep one.
@@ -1007,33 +1156,7 @@ pub fn scan_text_registered_with(
 
 /// The explicit-policy version of [`scan_text`]. The server passes [`Policy::STRICT`].
 pub fn scan_text_with(text: &str, allowlist: &HashSet<String>, policy: Policy) -> Vec<Hit> {
-    let view = view_of(text);
-    let raw = raw_hits(&view);
-    if raw.is_empty() {
-        return vec![];
-    }
-    let lines = Lines::new(&view);
-    // With no line carrying the annotation, not even one contains call is needed.
-    let any_pragma = policy.inline_pragma && view.contains(INLINE_PRAGMA);
-    raw.into_iter()
-        .filter_map(|h| {
-            let found = &view[h.start..h.end];
-            if policy.allowlist && is_allowlisted(found, allowlist) {
-                return None;
-            }
-            if any_pragma && lines.text_at(h.start).contains(INLINE_PRAGMA) {
-                return None;
-            }
-            Some(Hit {
-                rule: h.rule.to_string(),
-                file: None,
-                source: Source::File,
-                line: lines.number_at(h.start),
-                redacted: redact(found),
-                fingerprint: fingerprint(found),
-            })
-        })
-        .collect()
+    scan_text_capped(text, allowlist, policy, usize::MAX).hits
 }
 
 /// The **bounded** version of [`scan_text_with`]: stop once `cap` reportable hits are found.
@@ -1106,15 +1229,8 @@ pub fn scan_text_capped(
             None => true,
         }
     });
-    if raw.is_empty() {
-        return ScanReport {
-            hits: vec![],
-            truncated,
-            unscanned: Unscanned::default(),
-        };
-    }
     let lines = pragma_lines.unwrap_or_else(|| Lines::new(&view));
-    ScanReport {
+    let mut report = ScanReport {
         hits: raw
             .into_iter()
             .map(|h| Hit {
@@ -1128,16 +1244,111 @@ pub fn scan_text_capped(
             .collect(),
         truncated,
         unscanned: Unscanned::default(),
+    };
+    if !report.truncated {
+        scan_semantic_strings(text, allowlist, policy, cap, &mut report);
+    }
+    report
+}
+
+/// Decode only valid JSON carriers. Reports use the source string's line and the semantic value's fingerprint.
+fn scan_semantic_strings(
+    text: &str,
+    allowlist: &HashSet<String>,
+    policy: Policy,
+    cap: usize,
+    report: &mut ScanReport,
+) {
+    let mut seen: HashSet<_> = report
+        .hits
+        .iter()
+        .map(|hit| (hit.line, hit.fingerprint))
+        .collect();
+    let lines = Lines::new(text);
+    let mut offset = 0;
+    for (chunk, value) in jsonl_chunks(text) {
+        if report.truncated {
+            break;
+        }
+        if value.is_some() {
+            let mut previous: Option<(usize, String)> = None;
+            for (start, end) in json_string_regions(chunk) {
+                let Ok(decoded) = serde_json::from_str::<String>(&chunk[start - 1..end + 1]) else {
+                    continue;
+                };
+                let field = previous.as_ref().and_then(|(previous_end, key)| {
+                    (chunk[*previous_end..start - 1].trim() == ":").then_some(key.as_str())
+                });
+                let line = lines.number_at(offset + start);
+                if !(policy.inline_pragma && lines.text_at(offset + start).contains(INLINE_PRAGMA))
+                {
+                    let view = view_of(&decoded);
+                    let remaining = cap.saturating_sub(report.hits.len());
+                    let mut record = |found: &str, _start: usize| {
+                        !(policy.allowlist && is_allowlisted(found, allowlist))
+                            && seen.insert((line, fingerprint(found)))
+                    };
+                    let (mut raw, mut truncated) =
+                        raw_hits_capped(&view, remaining.saturating_add(1), &mut record);
+                    if !truncated && field.is_some_and(is_credential_field) {
+                        for (start, end) in entropy_candidate_spans(&view, true) {
+                            if !rules::preset_allows(&view[start..end])
+                                && record(&view[start..end], start)
+                            {
+                                raw.push(Raw {
+                                    rule: "high-entropy-value",
+                                    start,
+                                    end,
+                                });
+                                if raw.len() > remaining {
+                                    truncated = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    report.truncated |= truncated || raw.len() > remaining;
+                    report
+                        .hits
+                        .extend(raw.into_iter().take(remaining).map(|hit| {
+                            let found = &view[hit.start..hit.end];
+                            Hit {
+                                rule: hit.rule.into(),
+                                file: None,
+                                source: Source::File,
+                                line,
+                                redacted: redact(found),
+                                fingerprint: fingerprint(found),
+                            }
+                        }));
+                }
+                previous = Some((end + 1, decoded));
+                if report.truncated {
+                    break;
+                }
+            }
+        }
+        offset += chunk.len();
     }
 }
 
 /// Fold the literals the user registered explicitly into the client scan.
 ///
-/// The registered rules run first and honour neither the gitleaks allowlist nor the inline
-/// pragma: the user has already said "this value is a secret", and project content must not
-/// switch that local policy off on the user's behalf. The built-in rules keep the [`Policy`] they
-/// were given, and the two share one `cap`, so the memory ceiling for dense input is unchanged.
+/// All candidate sources honor preset allowances and the caller's local allowlist policy before
+/// consuming the shared hit budget. Inline content annotations do not override registered rules.
 fn scan_text_capped_registered(
+    text: &str,
+    allowlist: &HashSet<String>,
+    policy: Policy,
+    cap: usize,
+    registered: &RegisteredMatcher,
+) -> ScanReport {
+    scan_text_capped_registered_views(text, text, allowlist, policy, cap, registered)
+}
+
+/// Identity evidence narrows heuristic inspection only; explicit secret matches still read the source.
+fn scan_text_capped_registered_views(
+    original: &str,
     text: &str,
     allowlist: &HashSet<String>,
     policy: Policy,
@@ -1146,7 +1357,7 @@ fn scan_text_capped_registered(
 ) -> ScanReport {
     #[cfg(not(feature = "secret-vault"))]
     {
-        let _ = registered;
+        let _ = (original, registered);
         scan_text_capped(text, allowlist, policy, cap)
     }
 
@@ -1160,8 +1371,42 @@ fn scan_text_capped_registered(
             };
         }
 
-        let (mut hits, registered_truncated) =
-            registered_hits_semantic_capped(text, cap, registered);
+        let mut combined;
+        let allowlist = if policy.allowlist && registered.allowed_values().next().is_some() {
+            combined = allowlist.clone();
+            combined.extend(registered.allowed_values().map(str::to_owned));
+            &combined
+        } else {
+            allowlist
+        };
+        let no_local_allowances = HashSet::new();
+        let registered_allowlist = if policy.allowlist {
+            allowlist
+        } else {
+            &no_local_allowances
+        };
+        let (mut hits, registered_truncated) = if original == text {
+            registered_hits_semantic_capped(text, cap, registered, registered_allowlist)
+        } else {
+            let explicit = registered
+                .explicit_only()
+                .unwrap_or_else(|_| registered.clone());
+            let (mut hits, mut truncated) =
+                registered_hits_semantic_capped(original, cap, &explicit, registered_allowlist);
+            let (learned, more) =
+                registered_hits_semantic_capped(text, cap, registered, registered_allowlist);
+            let mut seen: HashSet<_> = hits.iter().map(|hit| (hit.line, hit.fingerprint)).collect();
+            for hit in learned {
+                if seen.insert((hit.line, hit.fingerprint)) {
+                    if hits.len() == cap {
+                        truncated = true;
+                        break;
+                    }
+                    hits.push(hit);
+                }
+            }
+            (hits, truncated || more)
+        };
 
         if registered_truncated {
             return ScanReport {
@@ -1198,7 +1443,11 @@ pub(crate) fn registered_hits_semantic_capped(
     text: &str,
     cap: usize,
     registered: &crate::domain::secret_filter::Matcher,
+    allowlist: &HashSet<String>,
 ) -> (Vec<Hit>, bool) {
+    let registered = registered
+        .excluding(allowlist)
+        .unwrap_or_else(|_| registered.clone());
     // Both representations are scanned, and the results are merged.
     //
     // Neither one alone is a gate. The wire bytes miss `"`, `\` and `\n` inside
@@ -1240,36 +1489,35 @@ pub(crate) fn registered_hits_semantic_capped(
         }
     }
 
-    // ── 2. the decoded value of every line that is JSON ──
-    for (index, line) in text.lines().enumerate() {
+    // Semantic strings retain their source coordinates even in a multiline document.
+    let source_lines = Lines::new(text);
+    let mut offset = 0;
+    for (chunk, value) in jsonl_chunks(text) {
         if truncated {
             break;
         }
-        // A line that does not parse was already scanned literally above; a
-        // parse failure is not permission to stop scanning the rest.
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        if value.is_none() {
+            offset += chunk.len();
             continue;
-        };
-        visit_json_strings(&value, &mut |string| {
+        }
+        for (start, end) in json_string_regions(chunk) {
             if truncated {
-                return;
+                break;
             }
+            let Ok(string) = serde_json::from_str::<String>(&chunk[start - 1..end + 1]) else {
+                continue;
+            };
+            let line = source_lines.number_at(offset + start);
             let remaining = cap.saturating_sub(hits.len());
-            if remaining == 0 {
-                // Full. Probe for one more match so the report can still say
-                // whether it is complete; a match already recorded by the pass
-                // above only over-reports truncation, which is the safe way to
-                // be wrong here.
-                let (probe, more) = registered.find_capped(string, 1);
-                truncated |= more || !probe.is_empty();
-                return;
-            }
-            let (matches, more) = registered.find_capped(string, remaining);
+            let (matches, more) = registered.find_capped(&string, remaining.saturating_add(1));
             truncated |= more;
             for found in matches {
-                let line = index + 1;
                 let fingerprint = fingerprint(&string[found.start..found.end]);
                 if seen.insert((line, fingerprint)) {
+                    if hits.len() == cap {
+                        truncated = true;
+                        break;
+                    }
                     hits.push(Hit {
                         rule: "registered-secret".to_string(),
                         file: None,
@@ -1280,28 +1528,10 @@ pub(crate) fn registered_hits_semantic_capped(
                     });
                 }
             }
-        });
+        }
+        offset += chunk.len();
     }
     (hits, truncated)
-}
-
-#[cfg(feature = "secret-vault")]
-fn visit_json_strings(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
-    match value {
-        serde_json::Value::String(text) => visit(text),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                visit_json_strings(value, visit);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                visit(key);
-                visit_json_strings(value, visit);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
 }
 
 /// Byte ranges of heuristic findings too long to become a reversible record.
@@ -1321,18 +1551,23 @@ fn visit_json_strings(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
 /// Ranges are in `text` coordinates. `view_of` preserves length, so they line
 /// up with the same string as it is seen by [`secret_candidates_jsonl`].
 #[cfg(feature = "secret-vault")]
-pub(crate) fn oversized_finding_spans(text: &str, threshold: usize) -> Vec<(usize, usize)> {
+pub(crate) fn oversized_finding_spans(
+    text: &str,
+    threshold: usize,
+    include: impl Fn(&str) -> bool,
+) -> Vec<(usize, usize)> {
     let view = view_of(text);
     let mut spans: Vec<(usize, usize)> = vec![];
     // `keep` always refuses, so no `Raw` is materialized and no span budget is
     // charged: this pass exists only to observe where the long findings are.
     let (_, _) = raw_hits_capped(&view, usize::MAX, |found, start| {
-        if found.len() > threshold {
+        if found.len() > threshold && include(&text[start..start + found.len()]) {
             spans.push((start, start + found.len()));
         }
         false
     });
     spans.sort_unstable();
+    spans.dedup();
     spans
 }
 
@@ -1352,27 +1587,140 @@ pub(crate) fn secret_candidates_jsonl(
     let mut values: Vec<Zeroizing<String>> = Vec::with_capacity(cap.min(16));
     let mut truncated = false;
 
-    for line in text.lines() {
-        if truncated || line.trim().is_empty() {
+    for (chunk, value) in jsonl_chunks(text) {
+        if truncated || chunk.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => visit_candidate_values(&value, None, &mut |candidate| {
-                collect_candidate(candidate, cap, &mut values, &mut truncated, &mut include)
+        match value {
+            Some(value) => visit_candidate_values(&value, None, &mut |candidate, field| {
+                collect_candidate(
+                    candidate,
+                    field,
+                    cap,
+                    &mut values,
+                    &mut truncated,
+                    &mut include,
+                )
             }),
-            // A half-written or legacy plaintext line is still publishable
-            // content. Scan it literally instead of treating parse failure as
-            // permission to bypass automatic protection.
-            Err(_) => collect_candidate(line, cap, &mut values, &mut truncated, &mut include),
+            None => collect_candidate(
+                chunk.strip_suffix('\n').unwrap_or(chunk),
+                None,
+                cap,
+                &mut values,
+                &mut truncated,
+                &mut include,
+            ),
         }
     }
 
     SecretCandidateBatch { values, truncated }
 }
 
+/// Consecutive plaintext lines share a carrier so multiline sensitive regions
+/// are discovered and projected with identical boundaries.
+pub(crate) fn jsonl_chunks(
+    mut text: &str,
+) -> impl Iterator<Item = (&str, Option<serde_json::Value>)> {
+    let mut document = text
+        .contains('\n')
+        .then(|| serde_json::from_str(text).ok())
+        .flatten();
+    std::iter::from_fn(move || {
+        if let Some(value) = document.take() {
+            let chunk = text;
+            text = "";
+            return Some((chunk, Some(value)));
+        }
+        let mut lines = text.split_inclusive('\n');
+        let first = lines.next()?;
+        if let Ok(value) = serde_json::from_str(first) {
+            text = &text[first.len()..];
+            return Some((first, Some(value)));
+        }
+        let mut end = first.len();
+        for line in lines {
+            if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+                break;
+            }
+            end += line.len();
+        }
+        let (chunk, remaining) = text.split_at(end);
+        text = remaining;
+        Some((chunk, None))
+    })
+}
+
+/// Mask hashes in typed Git object headers only after resolving each reference
+/// in the repository. Arbitrary hash-shaped text stays part of the scan.
+pub(crate) fn mask_verified_git_headers(
+    repo: &crate::domain::repo::Repo,
+    text: &str,
+    kind: &str,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut headers = true;
+    let width = match repo.git(&["rev-parse", "--show-object-format"]).as_deref() {
+        Ok("sha1") => 40,
+        Ok("sha256") => 64,
+        _ => return text.to_owned(),
+    };
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.is_empty() {
+            headers = false;
+        }
+        if !headers {
+            out.push_str(line);
+            continue;
+        }
+        let Some((field, value)) = body.split_once(' ') else {
+            out.push_str(line);
+            continue;
+        };
+        let typed = matches!(
+            (kind, field),
+            ("commit", "tree") | ("commit", "parent") | ("tag", "object")
+        );
+        let valid_shape = value.len() == width
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        let resolved_type = if typed && valid_shape {
+            repo.git(&["cat-file", "-t", value])
+                .ok()
+                .map(|output| output.trim().to_owned())
+        } else {
+            None
+        };
+        let version_tag = kind == "tag"
+            && field == "tag"
+            && identity::resolve_identity(repo, &format!("refs/tags/{value}"), true)
+                .is_some_and(|oid| text.lines().next() == Some(format!("object {oid}").as_str()));
+        let type_matches = matches!(
+            (kind, field, resolved_type.as_deref()),
+            ("commit", "tree", Some("tree"))
+                | ("commit", "parent", Some("commit"))
+                | ("tag", "object", Some(_))
+        );
+
+        if type_matches || version_tag {
+            out.push_str(field);
+            out.push(' ');
+            out.push_str(&"0".repeat(value.len()));
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 #[cfg(feature = "secret-vault")]
 fn collect_candidate(
     text: &str,
+    field: Option<&str>,
     cap: usize,
     values: &mut Vec<Zeroizing<String>>,
     truncated: &mut bool,
@@ -1387,7 +1735,7 @@ fn collect_candidate(
     // Filter duplicate literal values inside the producer. Its budget then
     // counts distinct dictionary records rather than repeated occurrences of
     // the same token in a large transcript.
-    let (_, more) = raw_hits_capped(&view, remaining.saturating_add(1), |found, start| {
+    let mut record = |found: &str, start: usize| {
         let literal = &text[start..start + found.len()];
         if values.iter().any(|known| known.as_str() == literal)
             || newly_seen.iter().any(|known| known.as_str() == literal)
@@ -1397,7 +1745,26 @@ fn collect_candidate(
         }
         newly_seen.push(Zeroizing::new(literal.to_string()));
         true
-    });
+    };
+    let (_, mut more) = raw_hits_capped(&view, remaining.saturating_add(1), &mut record);
+    let credential_field = field.is_some_and(is_credential_field);
+    if !more && credential_field {
+        for (start, end) in entropy_candidate_spans(&view, true) {
+            let literal = &text[start..end];
+            if values.iter().any(|known| known.as_str() == literal)
+                || newly_seen.iter().any(|known| known.as_str() == literal)
+                || rules::preset_allows(literal)
+                || !include(literal)
+            {
+                continue;
+            }
+            newly_seen.push(Zeroizing::new(literal.to_owned()));
+            if newly_seen.len() > remaining {
+                more = true;
+                break;
+            }
+        }
+    }
     for literal in newly_seen {
         if values.len() == cap {
             *truncated = true;
@@ -1408,26 +1775,45 @@ fn collect_candidate(
     *truncated |= more;
 }
 
+fn is_credential_field(field: &str) -> bool {
+    field
+        .to_ascii_lowercase()
+        .split(['_', '-', '.'])
+        .any(|part| {
+            matches!(
+                part,
+                "token"
+                    | "password"
+                    | "passwd"
+                    | "secret"
+                    | "credential"
+                    | "credentials"
+                    | "authorization"
+                    | "key"
+            )
+        })
+}
+
 #[cfg(feature = "secret-vault")]
 fn visit_candidate_values(
     value: &serde_json::Value,
     field: Option<&str>,
-    visit: &mut impl FnMut(&str),
+    visit: &mut impl FnMut(&str, Option<&str>),
 ) {
-    if field.is_some_and(is_protocol_identity_field) {
-        return;
-    }
+    let verified_envelope = field.is_none() && is_verified_envelope(value);
     match value {
-        serde_json::Value::String(text) => visit(text),
+        serde_json::Value::String(text) => visit(text, field),
         serde_json::Value::Array(values) => {
             for value in values {
                 visit_candidate_values(value, field, visit);
             }
         }
         serde_json::Value::Object(map) => {
-            // Keys are protocol structure, not session content. Only values
-            // are eligible for heuristic insertion.
             for (key, value) in map {
+                if verified_envelope && key == "_object_hash" {
+                    continue;
+                }
+                visit(key, None);
                 visit_candidate_values(value, Some(key), visit);
             }
         }
@@ -1436,30 +1822,12 @@ fn visit_candidate_values(
 }
 
 #[cfg(feature = "secret-vault")]
-fn is_protocol_identity_field(field: &str) -> bool {
-    matches!(
-        field.to_ascii_lowercase().as_str(),
-        "_session_id"
-            | "session_id"
-            | "_object_hash"
-            | "object_hash"
-            | "event_id"
-            | "commit_id"
-            | "tree_id"
-            | "blob_id"
-            | "oid"
-            | "sha"
-            | "ref"
-            | "ref_name"
-            | "schema_version"
-            | "layout_version"
-            | "projection_version"
-            | "signature"
-            | "created_at"
-            | "updated_at"
-            | "timestamp"
-            | "provenance"
-    )
+fn is_verified_envelope(value: &serde_json::Value) -> bool {
+    let Ok(mut line) = serde_json::to_string(value) else {
+        return false;
+    };
+    line.push('\n');
+    crate::domain::storage::parse_legacy_envelope_line(&line).is_ok()
 }
 
 /// Scan a repository file or blob while moving the envelope identity fields AgentGit generates
@@ -1494,15 +1862,166 @@ fn scan_repository_payload_capped(
     cap: usize,
     registered: &RegisteredMatcher,
 ) -> ScanReport {
-    // The mask replaces only the value spans of the two identity fields with quoted sentinels,
-    // so every line stays valid JSON and the registered rules keep matching semantic strings on
-    // the masked view. The two masked fields are identities AgentGit generated itself, and the
-    // repository dictionary excludes them from its candidates in `is_protocol_identity_field` —
-    // both sites keep one boundary for "which fields are not session content".
-    let Some(view) = mask_valid_envelope_stream(text, trusted_identities) else {
+    let Some(view) = mask_valid_envelope_stream(text, trusted_identities)
+        .or_else(|| pointer_scan_view(text, registered))
+    else {
         return scan_text_capped_registered(text, allowlist, policy, cap, registered);
     };
-    scan_text_capped_registered(&view, allowlist, policy, cap, registered)
+    scan_text_capped_registered_views(text, &view, allowlist, policy, cap, registered)
+}
+
+/// Payload availability and integrity are checked separately by the LFS publication owner.
+/// Only the parsed pointer's oid field is structural; extension values remain ordinary content.
+fn pointer_scan_view(text: &str, registered: &RegisteredMatcher) -> Option<String> {
+    let pointer = crate::domain::lfs::Pointer::parse(text.as_bytes()).ok()??;
+    #[cfg(feature = "secret-vault")]
+    if !registered.find(&pointer.oid).is_empty() {
+        return None;
+    }
+    #[cfg(not(feature = "secret-vault"))]
+    let _ = registered;
+    let start = text.find("\noid sha256:")? + "\noid sha256:".len();
+    let end = start + pointer.oid.len();
+    let mut view = text.to_owned();
+    view.replace_range(start..end, &"0".repeat(pointer.oid.len()));
+    Some(view)
+}
+
+fn protocol_payload_view(
+    repo: &crate::domain::repo::Repo,
+    text: &str,
+    path: &str,
+    trusted: &TrustedEnvelopeIdentities,
+) -> Option<String> {
+    use crate::domain::{meta, storage};
+    if matches!(path, meta::LOG_FILE | meta::VIEW_FILE) {
+        let ids = storage::parse_sequence(text).ok()?;
+        if ids.is_empty() || !ids.iter().all(|id| trusted.events.contains(id)) {
+            return None;
+        }
+        return Some(
+            text.chars()
+                .map(|c| if c == '\n' { c } else { '0' })
+                .collect(),
+        );
+    }
+    if path != meta::FILE {
+        return None;
+    }
+    let metadata: meta::Meta = serde_json::from_str(text).ok()?;
+    meta::validate(&metadata).ok()?;
+    if !trusted
+        .get(&metadata.session)
+        .is_some_and(|runtimes| runtimes.contains(&metadata.runtime))
+    {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    // Observations, including cwd, origin, branch and milestone, retain their inspection surface.
+    let source = if metadata.cwd_is_agent_repository {
+        Some(crate::domain::repo::Repo::at(repo.root()).local_objects_only())
+    } else {
+        let cwd = &metadata.cwd;
+        #[cfg(feature = "secret-vault")]
+        let cwd = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+            .and_then(|dictionary| dictionary.hydrate_text(cwd))
+            .ok()?
+            .text;
+        // Restored paths locate identity evidence; the inspection surface keeps its stored bytes.
+        crate::domain::repo::Repo::open(Path::new(&cwd)).map(|repo| repo.local_objects_only())
+    };
+    let mut pointers = vec!["/session"];
+    if let Some(state) = &metadata.cwd_state {
+        if state.head.as_deref().is_some_and(|head| {
+            source
+                .as_ref()
+                .is_some_and(|source| identity::resolve_identity(source, head, true).is_some())
+        }) {
+            pointers.push("/cwd_state/head");
+        }
+        if identity::empty_status_digest(state) {
+            pointers.push("/cwd_state/status_digest");
+        }
+    }
+    for pointer in pointers {
+        if let Some(serde_json::Value::String(field)) = value.pointer_mut(pointer) {
+            *field = "0".repeat(field.len());
+        }
+    }
+    if let Some(instances) = value
+        .get_mut("runtime_instances")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for instance in instances {
+            if let Some(text) = instance.as_str()
+                && uuid::Uuid::parse_str(text)
+                    .is_ok_and(|uuid| uuid.hyphenated().to_string() == text)
+                && trusted.native_instances.contains(&(
+                    metadata.session.clone(),
+                    metadata.runtime.clone(),
+                    text.to_owned(),
+                ))
+            {
+                *instance = serde_json::Value::String("native-session-identity".into());
+            }
+        }
+    }
+    serde_json::to_string_pretty(&value).ok()
+}
+
+/// A rev-list label alone cannot waive a blob also used as ordinary shared content.
+fn protocol_blob_view(
+    context: &BlobScanContext<'_>,
+    oid: &str,
+    text: &str,
+    labels: &HashMap<String, String>,
+) -> Option<String> {
+    let path = labels.get(oid)?;
+    let view = protocol_payload_view(context.repo, text, path, context.trusted_identities)?;
+    let finder = format!("--find-object={oid}");
+    let args = vec![
+        "log",
+        "--all",
+        "--root",
+        "-m",
+        "--no-renames",
+        "--name-only",
+        "--format=",
+        &finder,
+    ];
+    let mut seen = false;
+    let mut bytes = 0usize;
+    let read = HistorySelection::Frozen(&context.trusted_identities.roots).stream(
+        context.repo,
+        &args,
+        |line| {
+            bytes = bytes.saturating_add(line.len());
+            anyhow::ensure!(
+                bytes <= 1024 * 1024,
+                "protocol occurrence verification exceeds its budget"
+            );
+            if !line.is_empty() {
+                seen = true;
+                let location = std::str::from_utf8(line)?;
+                anyhow::ensure!(
+                    location == path
+                        || matches!(
+                            (path.as_str(), location),
+                            (
+                                crate::domain::meta::LOG_FILE,
+                                crate::domain::meta::VIEW_FILE
+                            ) | (
+                                crate::domain::meta::VIEW_FILE,
+                                crate::domain::meta::LOG_FILE
+                            )
+                        ),
+                    "protocol blob also occurs outside its typed storage location"
+                );
+            }
+            Ok(())
+        },
+    );
+    (read.is_ok() && seen).then_some(view)
 }
 
 /// The `(session id, runtime)` pairs the repository metadata has declared.
@@ -1513,7 +2032,33 @@ fn scan_repository_payload_capped(
 /// AgentGit merge whose LOG delta is a complete, verifiable AgentGit merge block can authorize
 /// masking `_session_id`. The runtime is bound along with it, so borrowing a session id alone
 /// cannot impersonate a different producer.
-type TrustedEnvelopeIdentities = HashMap<String, HashSet<String>>;
+#[derive(Clone, Default)]
+struct TrustedEnvelopeIdentities {
+    sessions: HashMap<String, HashSet<String>>,
+    content: HashMap<(String, String, String), identity::RecordMask>,
+    events: HashSet<String>,
+    native_instances: HashSet<(String, String, String)>,
+    roots: Vec<String>,
+}
+
+impl TrustedEnvelopeIdentities {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for TrustedEnvelopeIdentities {
+    type Target = HashMap<String, HashSet<String>>;
+    fn deref(&self) -> &Self::Target {
+        &self.sessions
+    }
+}
+
+impl std::ops::DerefMut for TrustedEnvelopeIdentities {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sessions
+    }
+}
 
 fn trust_meta_identity(trusted: &mut TrustedEnvelopeIdentities, meta: &crate::domain::meta::Meta) {
     if !meta.is_session_line()
@@ -1553,6 +2098,100 @@ fn branch_trusted_envelope_identities(
     trusted_envelope_identities_at(repo, &tips, HistorySelection::Revisions(&["--branches"]))
 }
 
+#[cfg(feature = "secret-vault")]
+pub(crate) fn saved_content_masks(
+    repo: &crate::domain::repo::Repo,
+    saved: &str,
+) -> crate::Result<Vec<identity::RecordMask>> {
+    let branches = tag_scan_branches(repo)?;
+    let trusted = branch_trusted_envelope_identities(repo, &branches);
+    saved
+        .split_inclusive('\n')
+        .map(|line| {
+            let envelope = crate::domain::storage::parse_envelope_line(line)?;
+            Ok(trusted
+                .content
+                .get(&(envelope.session_id, envelope.source, envelope.object_hash))
+                .cloned()
+                .unwrap_or_default())
+        })
+        .collect()
+}
+
+#[cfg(feature = "secret-vault")]
+pub(crate) fn seed_native_evidence(
+    repo: &crate::domain::repo::Repo,
+    cwd: &Path,
+    runtime: &str,
+    native: &str,
+    evidence: &mut identity::Evidence,
+) -> crate::Result<()> {
+    if native.is_empty() {
+        return Ok(());
+    }
+    let mut roots = Vec::new();
+    repo.git_stream_split(
+        &["for-each-ref", "--format=%(objectname)", "refs/heads"],
+        b'\n',
+        |line| {
+            anyhow::ensure!(
+                roots.len() < 1024,
+                "native identity history exceeds its reference budget"
+            );
+            roots.push(std::str::from_utf8(line)?.to_owned());
+            Ok(())
+        },
+    )?;
+    let specs: Vec<_> = roots
+        .iter()
+        .map(|root| format!("{root}:{}", crate::domain::meta::FILE))
+        .collect();
+    let mut budget = ProvenanceReadBudget::new();
+    let mut matching: Vec<_> = roots
+        .into_iter()
+        .zip(read_trusted_meta_batch(repo, &specs, &mut budget))
+        .filter_map(|(root, meta)| {
+            meta.filter(|meta| {
+                meta.runtime == runtime && meta.runtime_instances.iter().any(|id| id == native)
+            })
+            .map(|meta| (root, meta))
+        })
+        .collect();
+    matching.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.turn));
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+    let mut sessions = HashSet::new();
+    let mut remaining = 8 * 1024 * 1024;
+    for (root, mut meta) in matching {
+        if !sessions.insert(meta.session.clone()) {
+            continue;
+        }
+        let alias = meta.cwd.clone();
+        dictionary.hydrate_metadata_readonly(&mut meta)?;
+        if meta.cwd_is_agent_repository
+            || Path::new(&meta.cwd)
+                .canonicalize()
+                .ok()
+                .zip(cwd.canonicalize().ok())
+                .is_some_and(|(saved, live)| saved == live)
+        {
+            evidence.add_cwd_alias(&alias);
+        }
+        let Ok(saved) =
+            crate::domain::storage::identity_log_at(repo.root(), &root, meta.layout, remaining)
+        else {
+            continue;
+        };
+        remaining = remaining.saturating_sub(saved.len());
+        for line in saved.split_inclusive('\n') {
+            let envelope = crate::domain::storage::parse_envelope_line(line)?;
+            if envelope.session_id == meta.session && envelope.source == runtime {
+                evidence.record(runtime, native, &envelope.content);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn trusted_envelope_identities_at(
     repo: &crate::domain::repo::Repo,
     tips: &[String],
@@ -1569,23 +2208,118 @@ fn trusted_envelope_identities_with_budget(
     budget: &mut ProvenanceReadBudget,
 ) -> TrustedEnvelopeIdentities {
     let mut trusted = TrustedEnvelopeIdentities::new();
+    trusted.roots = tips
+        .iter()
+        .filter_map(|tip| {
+            if crate::domain::meta::is_event_id(tip) {
+                Some(tip.clone())
+            } else {
+                repo.git(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
+                    .ok()
+            }
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let tip_specs: Vec<String> = tips
         .iter()
         .map(|tip| format!("{tip}:{}", crate::domain::meta::FILE))
         .collect();
-    for meta in read_trusted_meta_batch(repo, &tip_specs, budget)
-        .into_iter()
-        .flatten()
+    let mut evidence_budget = 8 * 1024 * 1024;
+    let mut evidence_tips = HashSet::new();
+    for (tip, meta) in tips
+        .iter()
+        .zip(read_trusted_meta_batch(repo, &tip_specs, budget))
+        .filter_map(|(tip, meta)| meta.map(|meta| (tip, meta)))
     {
         // Missing, corrupt, oversized, or a failed git read all mean only "this identity cannot
         // be proven to be AgentGit's": no exemption for `_session_id`, and the blob scan behind
         // it still reaches its verdict on the raw text.
         if meta.is_session_line() {
             trust_meta_identity(&mut trusted, &meta);
+            if evidence_tips.insert(tip) {
+                trust_native_content(repo, tip, &meta, &mut trusted, &mut evidence_budget, budget);
+            }
         }
     }
     trust_merge_source_identities(repo, &mut trusted, budget, history);
     trusted
+}
+
+fn trust_native_content(
+    repo: &crate::domain::repo::Repo,
+    tip: &str,
+    meta: &crate::domain::meta::Meta,
+    trusted: &mut TrustedEnvelopeIdentities,
+    remaining: &mut usize,
+    budget: &mut ProvenanceReadBudget,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    let Ok(commit) = repo.git(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")]) else {
+        return;
+    };
+    let maximum = (*remaining).min(budget.remaining as usize);
+    let Ok(saved) =
+        crate::domain::storage::identity_log_at(repo.root(), &commit, meta.layout, maximum)
+    else {
+        return;
+    };
+    *remaining = remaining.saturating_sub(saved.len());
+    if !budget.reserve(saved.len() as u64) {
+        return;
+    }
+    let observed = meta.clone();
+    #[cfg(feature = "secret-vault")]
+    let observed = {
+        let mut observed = observed;
+        if let Ok(dictionary) =
+            crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+        {
+            let _ = dictionary.hydrate_metadata_readonly(&mut observed);
+        }
+        observed
+    };
+    let mut evidence = identity::Evidence::new(repo, Path::new(&observed.cwd))
+        .with_agent_cwd(meta.cwd_is_agent_repository);
+    if observed.cwd != meta.cwd {
+        evidence.add_cwd_alias(&meta.cwd);
+    }
+    for line in saved.split_inclusive('\n') {
+        let Ok(envelope) = crate::domain::storage::parse_envelope_line(line) else {
+            return;
+        };
+        if envelope.session_id != meta.session || envelope.source != meta.runtime {
+            continue;
+        }
+        if let Ok(id) = crate::domain::storage::event_id(line) {
+            trusted.events.insert(id);
+        }
+        let native = meta
+            .runtime_instances
+            .iter()
+            .find(|native| {
+                !identity::native_session_pointers(&meta.runtime, native, &envelope.content)
+                    .is_empty()
+            })
+            .map(String::as_str)
+            .unwrap_or("");
+        if !native.is_empty() {
+            trusted.native_instances.insert((
+                meta.session.clone(),
+                meta.runtime.clone(),
+                native.into(),
+            ));
+        }
+        let mask = evidence.record(&meta.runtime, native, &envelope.content);
+        if !mask.0.is_empty() {
+            trusted.content.insert(
+                (envelope.session_id, envelope.source, envelope.object_hash),
+                mask,
+            );
+        }
+    }
 }
 
 /// Recover source identities from AgentGit merges still reachable from a local branch.
@@ -1777,6 +2511,15 @@ fn trust_merge_source_batch(
     let validated = validate_merge_source_events_batch(repo, validated, budget);
     for merge in validate_merge_markers_batch(repo, validated, budget) {
         trust_meta_identity(trusted, &merge.source_meta);
+        let mut remaining = 8 * 1024 * 1024;
+        trust_native_content(
+            repo,
+            &merge.source_parent,
+            &merge.source_meta,
+            trusted,
+            &mut remaining,
+            budget,
+        );
     }
 }
 
@@ -2457,7 +3200,23 @@ fn mask_valid_envelope_stream(
         let session_is_trusted = trusted_identities
             .get(&envelope.session_id)
             .is_some_and(|runtimes| runtimes.contains(&envelope.source));
-        append_masked_envelope_identity_fields(&mut view, line, &envelope, session_is_trusted)?;
+        let mut masked = String::new();
+        append_masked_envelope_identity_fields(&mut masked, line, &envelope, session_is_trusted)?;
+        if session_is_trusted
+            && let Some(mask) = trusted_identities.content.get(&(
+                envelope.session_id,
+                envelope.source,
+                envelope.object_hash,
+            ))
+        {
+            let mut value: serde_json::Value = serde_json::from_str(&masked).ok()?;
+            mask.apply(value.get_mut("content")?, |identity| {
+                "0".repeat(identity.len())
+            });
+            masked = serde_json::to_string(&value).ok()?;
+            masked.push('\n');
+        }
+        view.push_str(&masked);
     }
     Some(view)
 }
@@ -2631,9 +3390,9 @@ fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
-/// Allowed on an exact match, or when an allowlist entry is wrapped inside the longer match.
+/// A local allowance names the complete candidate, never a provider prefix or substring.
 fn is_allowlisted(found: &str, allowlist: &HashSet<String>) -> bool {
-    allowlist.contains(found) || allowlist.iter().any(|a| found.contains(a.as_str()))
+    allowlist.contains(found)
 }
 
 /// The outbound scan surface: whether the content at this path **in the working tree** leaves
@@ -2876,6 +3635,7 @@ fn scan_agent_repo_selected_inner(
         // Metadata that cannot be obtained counts as "cannot be read", the same as the read
         // failure below.
         let Ok(size) = entry.metadata().map(|m| m.len()) else {
+            unscanned.record_unsupported(format!("unreadable working-tree file {rel}"));
             continue;
         };
         if size > plan.limits.max_object_bytes && is_lfs_worktree_file(repo, &rel)? {
@@ -2889,6 +3649,7 @@ fn scan_agent_repo_selected_inner(
             )?;
             spent = plan.limits.budget_bytes - remaining;
             if inspected == crate::domain::lfs::inspection::Payload::Binary {
+                unscanned.record_unsupported(format!("binary LFS working-tree file {rel}"));
                 continue;
             }
         }
@@ -2924,8 +3685,12 @@ fn scan_agent_repo_selected_inner(
         // it failed (the whole file went through memory), and booking it after this `continue`
         // would let arbitrarily many bytes that are not valid UTF-8 through the budget for free
         // — and binary files are the easiest thing in a working tree to pile up.
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
+        let text = match std::fs::read_to_string(entry.path()) {
+            Ok(text) => text,
+            Err(_) => {
+                unscanned.record_unsupported(format!("working-tree file {rel}"));
+                continue;
+            }
         };
         let mut remaining = plan.limits.budget_bytes.saturating_sub(spent);
         let payload = inspect_lfs_text(
@@ -2935,6 +3700,12 @@ fn scan_agent_repo_selected_inner(
             &mut remaining,
         )?;
         spent = plan.limits.budget_bytes - remaining;
+        if matches!(
+            payload,
+            Some(crate::domain::lfs::inspection::Payload::Binary)
+        ) {
+            unscanned.record_unsupported(format!("LFS payload for {rel}"));
+        }
         if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = payload {
             let pointer = crate::domain::lfs::Pointer::parse(text.as_bytes())?.unwrap();
             unscanned.oversized_files.push((rel, pointer.size));
@@ -2949,14 +3720,26 @@ fn scan_agent_repo_selected_inner(
             // line materializes `Hit`s on the order of its line count before `extend` takes over, and
             // capping the final list does not stop that stretch. See [`scan_text_capped`].
             let cap = out.remaining();
-            let scanned = scan_repository_payload_capped(
-                text,
-                &allowlist,
-                &worktree_identities,
-                Policy::CLIENT,
-                cap,
-                &registered,
-            );
+            let scanned =
+                if let Some(view) = protocol_payload_view(repo, text, &rel, &worktree_identities) {
+                    scan_text_capped_registered_views(
+                        text,
+                        &view,
+                        &allowlist,
+                        Policy::CLIENT,
+                        cap,
+                        &registered,
+                    )
+                } else {
+                    scan_repository_payload_capped(
+                        text,
+                        &allowlist,
+                        &worktree_identities,
+                        Policy::CLIENT,
+                        cap,
+                        &registered,
+                    )
+                };
             // This file's own budget ran out: it holds hits that were never scanned. Completeness is
             // stated by the side that knows.
             if scanned.truncated {
@@ -3565,6 +4348,12 @@ fn scan_blob_batch(
                 &mut remaining,
             )?;
             context.lfs_remaining.set(remaining);
+            if matches!(
+                inspected,
+                Some(crate::domain::lfs::inspection::Payload::Binary)
+            ) {
+                unscanned.record_unsupported(format!("LFS payload for blob {oid}"));
+            }
             if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = inspected {
                 let pointer = crate::domain::lfs::Pointer::parse(payload)?.unwrap();
                 unscanned
@@ -3579,20 +4368,32 @@ fn scan_blob_batch(
             // Non-UTF-8 (binary) is skipped, the same test as `read_to_string` on the
             // working-tree path.
             let Ok(text) = std::str::from_utf8(payload) else {
+                unscanned.record_unsupported(format!("blob {oid}"));
                 return Ok(());
             };
             for text in std::iter::once(text).chain(decoded) {
                 // The bound is **how much the collector can still take**, for the same reason as the
                 // working-tree path.
                 let cap = out.remaining();
-                let scanned = scan_repository_payload_capped(
-                    text,
-                    context.allowlist,
-                    context.trusted_identities,
-                    Policy::CLIENT,
-                    cap,
-                    context.registered,
-                );
+                let scanned = if let Some(view) = protocol_blob_view(context, oid, text, label) {
+                    scan_text_capped_registered_views(
+                        text,
+                        &view,
+                        context.allowlist,
+                        Policy::CLIENT,
+                        cap,
+                        context.registered,
+                    )
+                } else {
+                    scan_repository_payload_capped(
+                        text,
+                        context.allowlist,
+                        context.trusted_identities,
+                        Policy::CLIENT,
+                        cap,
+                        context.registered,
+                    )
+                };
                 // This blob's own budget ran out: it holds hits that were never scanned.
                 if scanned.truncated {
                     out.mark_truncated();
@@ -3800,12 +4601,19 @@ fn scan_tag_batch(
         // rather than skipping non-UTF-8 the way the blob path does: the first lines of a tag
         // body (tagger, tag name) are always text, and a message holding binary must not remove
         // the whole tag from the scan surface.
-        let text = String::from_utf8_lossy(payload);
+        let original = String::from_utf8_lossy(payload);
+        let text = mask_verified_git_headers(repo, &original, "tag");
         // The bound is **how much the collector can still take**, for the same reason as the
         // working-tree path: a single dense carrier's peak has to be bounded too.
         let cap = out.remaining();
-        let scanned =
-            scan_text_capped_registered(&text, allowlist, Policy::CLIENT, cap, registered);
+        let scanned = scan_text_capped_registered_views(
+            &original,
+            &text,
+            allowlist,
+            Policy::CLIENT,
+            cap,
+            registered,
+        );
         // This tag body's own budget ran out: it holds hits that were never scanned.
         if scanned.truncated {
             out.mark_truncated();
@@ -4154,13 +4962,14 @@ fn scan_messages(
         // The conversion applies to this one body — the scanning engine wants a `&str`, and the
         // rule set is insensitive to U+FFFD (it appears in no credential shape). The framing was
         // already done on bytes.
-        let text = String::from_utf8_lossy(payload);
+        let original = String::from_utf8_lossy(payload);
+        let text = mask_verified_git_headers(repo, &original, "commit");
         // The bound is **how much the collector can still take**: materializing every hit of a
         // whole body before handing it over means the allocation over the line already happened
         // before the collector took over. See [`scan_text_capped`].
         let cap = out.remaining();
         let scanned =
-            scan_text_capped_registered(&text, allowlist, Policy::CLIENT, cap, registered);
+            scan_text_capped_registered_views(&original, &text, allowlist, Policy::CLIENT, cap, registered);
         // This commit body's own budget ran out: it holds hits that were never scanned.
         if scanned.truncated {
             out.mark_truncated();
@@ -4197,25 +5006,94 @@ fn scan_messages(
 /// inline waiver** — those two are "do not stop me locally" switches, not "carry the secret into
 /// the published copy" switches.
 ///
-/// One view, one match pass, replacements in reverse: of overlapping hits (the same characters
-/// recognized by two rules) only the first is kept, so no placeholder ever gets masked a second
-/// time.
+/// Overlapping findings cover their union. Selecting only an inner finding
+/// would leave the outer sensitive region partly exposed.
 pub fn scrub(text: &str) -> (String, usize) {
     let view = view_of(text);
-    let raw = raw_hits(&view);
-    let mut out = text.to_string();
-    let mut applied = 0usize;
-    let mut last_start = usize::MAX;
-    // Replace in reverse: change the later spans first so the earlier offsets stay valid.
-    for h in raw.iter().rev() {
-        if h.end > last_start {
-            continue; // Overlaps a span that was already replaced.
-        }
-        out.replace_range(h.start..h.end, &format!("[redacted:{}]", h.rule));
-        last_start = h.start;
-        applied += 1;
+    let mut writer = RedactionWriter::new(text);
+    for hit in raw_hits(&view) {
+        writer.add(hit);
     }
-    (out, applied)
+    writer.finish()
+}
+
+#[cfg(feature = "secret-vault")]
+pub(crate) fn scrub_registered(
+    text: &str,
+    registered: &RegisteredMatcher,
+) -> (String, usize, Vec<String>) {
+    let view = view_of(text);
+    let mut raw = raw_hits(&view).into_iter().peekable();
+    let mut writer = RedactionWriter::new(text);
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    registered.visit_matches(text, |start, end, id| {
+        while raw.peek().is_some_and(|hit| hit.start <= start) {
+            writer.add(raw.next().unwrap());
+        }
+        writer.add(Raw {
+            rule: "registered-secret",
+            start,
+            end,
+        });
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    });
+    for hit in raw {
+        writer.add(hit);
+    }
+    let (text, count) = writer.finish();
+    (text, count, ids)
+}
+
+struct RedactionWriter<'a> {
+    text: &'a str,
+    out: String,
+    region: Option<Raw>,
+    cursor: usize,
+    count: usize,
+}
+
+impl<'a> RedactionWriter<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            out: String::with_capacity(text.len()),
+            region: None,
+            cursor: 0,
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, hit: Raw) {
+        if let Some(region) = self.region.as_mut()
+            && hit.start < region.end
+        {
+            region.end = region.end.max(hit.end);
+            if hit.rule == "registered-secret" {
+                region.rule = hit.rule;
+            }
+        } else {
+            self.emit_region();
+            self.region = Some(hit);
+        }
+    }
+
+    fn emit_region(&mut self) {
+        if let Some(region) = self.region.take() {
+            self.out.push_str(&self.text[self.cursor..region.start]);
+            self.out.push_str(&format!("[redacted:{}]", region.rule));
+            self.cursor = region.end;
+            self.count += 1;
+        }
+    }
+
+    fn finish(mut self) -> (String, usize) {
+        self.emit_region();
+        self.out.push_str(&self.text[self.cursor..]);
+        (self.out, self.count)
+    }
 }
 
 /// Redaction: keep the first four and the last two characters. Enough of the ends for the user to
@@ -4240,24 +5118,43 @@ mod tests {
 
     #[cfg(feature = "secret-vault")]
     #[test]
-    fn registered_low_entropy_literal_is_not_suppressed_by_allowlist() {
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[(
-            "sec_memorable",
-            "blue horse battery",
-        )]);
-        let allowlist = HashSet::from(["blue horse battery".to_string()]);
-        let report = scan_text_capped_registered(
-            "prefix blue horse battery suffix",
-            &allowlist,
-            Policy::CLIENT,
-            10,
-            &matcher,
-        );
+    fn local_allowances_filter_registered_and_heuristic_hits_before_the_cap() {
+        let allowed = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let escaped = "quote\" slash\\ and\nnewline";
+        let matcher = crate::domain::secret_filter::Matcher::for_test(&[
+            ("sec_allowed", allowed),
+            ("sec_escaped", escaped),
+            ("sec_remaining", "blue horse battery"),
+            ("sec_outer", "blue horse battery suffix"),
+        ])
+        .with_allowlist([allowed.to_owned()]);
+        let allowlist = HashSet::from([escaped.to_owned(), "blue horse battery suffix".to_owned()]);
+        let text = serde_json::to_string(&serde_json::json!({
+            "message": format!("{allowed} {allowed} {escaped} blue horse battery suffix")
+        }))
+        .unwrap();
+        let report = scan_text_capped_registered(&text, &allowlist, Policy::CLIENT, 1, &matcher);
         assert!(!report.truncated);
         assert_eq!(report.hits.len(), 1);
+        assert_eq!(
+            report.hits[0].fingerprint,
+            fingerprint("blue horse battery")
+        );
         assert_eq!(report.hits[0].rule, "registered-secret");
-        assert_eq!(report.hits[0].line, 1);
-        assert_eq!(report.hits[0].redacted, "[redacted:registered-secret]");
+
+        let strict = scan_text_capped_registered(&text, &allowlist, Policy::STRICT, 20, &matcher);
+        assert!(
+            strict
+                .hits
+                .iter()
+                .any(|hit| hit.fingerprint == fingerprint(allowed))
+        );
+        assert!(
+            strict
+                .hits
+                .iter()
+                .any(|hit| hit.fingerprint == fingerprint(escaped))
+        );
     }
 
     #[cfg(feature = "secret-vault")]
@@ -4274,7 +5171,8 @@ mod tests {
             "the regression requires a wire representation different from the semantic value"
         );
 
-        let (hits, truncated) = registered_hits_semantic_capped(&line, 10, &matcher);
+        let (hits, truncated) =
+            registered_hits_semantic_capped(&line, 10, &matcher, &HashSet::new());
         assert!(!truncated);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 1);
@@ -4304,7 +5202,8 @@ mod tests {
         );
         let text = format!("{good}\n{{\"message\":\"truncated mid-w");
 
-        let (hits, truncated) = registered_hits_semantic_capped(&text, 10, &matcher);
+        let (hits, truncated) =
+            registered_hits_semantic_capped(&text, 10, &matcher, &HashSet::new());
         assert!(!truncated);
         assert_eq!(
             hits.len(),
@@ -4327,7 +5226,8 @@ mod tests {
             "a value with no escapes is identical in both representations"
         );
 
-        let (hits, truncated) = registered_hits_semantic_capped(&text, 10, &matcher);
+        let (hits, truncated) =
+            registered_hits_semantic_capped(&text, 10, &matcher, &HashSet::new());
         assert!(!truncated);
         assert_eq!(hits.len(), 1, "{hits:?}");
     }
@@ -4337,7 +5237,8 @@ mod tests {
     fn registered_scanner_ignores_repository_placeholder_internals() {
         let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_short", "AGIT")]);
         let text = r#"{"value":"{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}"}"#;
-        let (hits, truncated) = registered_hits_semantic_capped(text, 10, &matcher);
+        let (hits, truncated) =
+            registered_hits_semantic_capped(text, 10, &matcher, &HashSet::new());
         assert!(!truncated);
         assert!(hits.is_empty());
     }
@@ -4556,7 +5457,9 @@ mod tests {
             let report = scan_agent_repo(&repo, &plan).unwrap();
             if name == "video.bin" {
                 assert!(
-                    report.unscanned.is_empty(),
+                    !report.unscanned.unsupported.is_empty()
+                        && report.unscanned.oversized.is_empty()
+                        && report.unscanned.oversized_files.is_empty(),
                     "hits: {:?}, unread: {:?}",
                     report.hits,
                     report.unscanned
@@ -4636,14 +5539,7 @@ mod tests {
         assert!(!scanned.truncated);
     }
 
-    /// Masking identities must not mask the registered rules along with them.
-    ///
-    /// The masked view is the only input this path hands to the rules. As soon as it falls back
-    /// to [`scan_text_capped`], a low-entropy literal the user registered explicitly is only
-    /// stopped inside an **invalid** envelope — while a valid envelope is exactly what every
-    /// ordinary settlement goes through. The two tests above use an empty matcher, so swapping
-    /// that back in turns nothing red; this one pins separately that the registered rules still
-    /// run on the masked view.
+    /// Verified identities cannot override an explicit secret registration, even at the identity field.
     #[cfg(feature = "secret-vault")]
     #[test]
     fn masking_internal_identities_still_runs_registered_rules() {
@@ -4655,15 +5551,14 @@ mod tests {
             mask_valid_envelope_stream(&line, &trust(&envelope)).is_some(),
             "precondition: this line has to take the masking path, or the fallback branch is what is under test"
         );
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[(
-            "sec_memorable",
-            "blue horse battery",
-        )]);
+        let matcher = crate::domain::secret_filter::Matcher::for_test(&[
+            ("sec_memorable", "blue horse battery"),
+            ("sec_identity", &envelope.object_hash),
+        ]);
 
         let scanned = scan_repository_payload_capped(
             &line,
-            // The registered rules do not honour the allowlist: repo content must not switch a
-            // local policy off.
+            // Strict publication does not inherit local allow decisions.
             &HashSet::from(["blue horse battery".to_string()]),
             &trust(&envelope),
             Policy::STRICT,
@@ -4675,6 +5570,13 @@ mod tests {
             scanned.hits.iter().any(|h| h.rule == "registered-secret"),
             "masking replaces only AgentGit's own two identity fields; the registered rules must still see content: {:?}",
             scanned.hits
+        );
+        assert!(
+            scanned
+                .hits
+                .iter()
+                .any(|hit| hit.rule == "registered-secret"
+                    && hit.fingerprint == fingerprint(&envelope.object_hash))
         );
     }
 
@@ -7750,9 +8652,7 @@ mod tests {
         }
     }
 
-    /// gitleaks' `private-key` only recognizes a complete PEM, while the most common shape in a
-    /// transcript is the truncated one, so a rule of ours recognizes the header alone. Losing it
-    /// loses detection for a whole class of private key.
+    /// An incomplete private-key capture is sensitive even without a footer.
     #[test]
     fn a_truncated_private_key_header_still_trips_the_gate() {
         let hits = scan_text(
@@ -7862,26 +8762,57 @@ mod tests {
             "password: ${DB_PASSWORD}\n",
             "auth_token = \"{{ vault.secret }}\"\n",
             "AWS_SECRET_ACCESS_KEY=<your-secret-here>\n",
-            // Ordinary git and package-manager output: plenty of high-entropy hex with no
-            // credential meaning.
-            "commit 4f2a9c1e7b3d8056af12cd34ef56ab78901234cd\n",
-            "  tree e91b0c2d4a6f8135792bcde04613f8a5c7d92e0b\n",
             "added 214 packages in 3s / audited 1204 packages\n",
-            "sha256-9f8e7d6c5b4a3021ffeeddccbbaa99887766554433221100aabbccddeeff0011\n",
             // Prose and commands that really occur in a session.
             "user: help me see why the auth middleware 401s, the token should come from the header\n",
             "assistant: your credentials go through the keychain, no plaintext password belongs in the code\n",
             "$ curl -H \"Authorization: Bearer $TOKEN\" https://api.example.com/v1/me\n",
             "$ git remote add origin git@github.com:acme/widget.git\n",
-            // Paths, UUIDs, timestamps.
+            // Paths and timestamps.
             "/Users/nana/Library/Application Support/agit/credentials.json\n",
-            "session 3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731 at 2026-08-16T09:12:44Z\n",
         );
         let hits = scan_text(corpus, &none());
         assert!(
             hits.is_empty(),
             "a flood of false positives gets the gate switched off entirely: {hits:?}"
         );
+    }
+
+    #[test]
+    fn semantic_json_escapes_and_exact_allowances_share_the_public_gate() {
+        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let escaped: String = secret
+            .chars()
+            .map(|ch| format!("\\u{:04x}", ch as u32))
+            .collect();
+        let text =
+            format!("{{\n  \"signature\": \"{escaped}\",\n  \"{escaped}\": \"public\"\n}}\n");
+        let hits = scan_text_with(&text, &none(), Policy::STRICT);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.line == 2 && hit.fingerprint == fingerprint(secret))
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.line == 3 && hit.fingerprint == fingerprint(secret))
+        );
+        let capped = scan_text_capped(&text, &none(), Policy::STRICT, 1);
+        assert_eq!(capped.hits.len(), 1);
+        assert!(capped.truncated);
+        assert!(!scan_text(GHP, &HashSet::from(["ghp_".into()])).is_empty());
+        assert!(scan_text(GHP, &HashSet::from([GHP.into()])).is_empty());
+        assert!(!scan_text_with(GHP, &HashSet::from([GHP.into()]), Policy::STRICT).is_empty());
+    }
+
+    #[test]
+    fn unverified_identity_like_values_are_candidates() {
+        let text = concat!(
+            "commit 4f2a9c1e7b3d8056af12cd34ef56ab78901234cd\n",
+            "tree e91b0c2d4a6f8135792bcde04613f8a5c7d92e0b\n",
+            "sha256-9f8e7d6c5b4a3021ffeeddccbbaa99887766554433221100aabbccddeeff0011\n",
+            "session 3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731\n",
+        );
+        assert_eq!(scan_text(text, &none()).len(), 4);
     }
 
     #[test]

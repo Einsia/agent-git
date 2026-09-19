@@ -94,6 +94,7 @@ pub(crate) mod navigation;
 pub mod outbound;
 pub mod peers;
 pub mod policy;
+pub(crate) mod protection;
 pub mod roster;
 pub mod supervisor;
 pub mod tail;

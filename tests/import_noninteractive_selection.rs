@@ -1394,6 +1394,98 @@ fn legacy_import_onto_accepts_qualified_session_and_historic_commit_targets() {
     }
 }
 
+/// Device allowances govern both automatic protection and scans of the resulting history.
+#[test]
+fn device_allowlist_wins_over_entropy_and_registered_rules_during_import() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let lab = Lab::new(1);
+    let entropy = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+    let provider = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let registered = "blue horse battery";
+    let preset = "abcdefghijklmnopqrstuvwxyz";
+    let protected = "AKIA4X7QZ2M5RT6VW3JH";
+    let source = &lab.sources[0].1;
+    // The import summary must not truncate an allowed value into a different candidate.
+    let content = fs::read_to_string(source).unwrap().replace(
+        "SYNTHETIC-CANDIDATE-0",
+        &format!("This fixture checks device allowances across imported content and saved history: {entropy} {provider} {registered} {preset} {protected}"),
+    );
+    fs::write(source, &content).unwrap();
+    fs::write(
+        lab.store.join(".agit-allow-secrets"),
+        format!("{entropy}\n{provider}\n{registered}\n"),
+    )
+    .unwrap();
+    let mut child = lab
+        .command()
+        .args(["secrets", "add", "fixture", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(registered.as_bytes())
+        .unwrap();
+    let added = child.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+
+    let imported = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@allowed",
+            "--independent",
+        ])
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    assert_eq!(fs::read_to_string(source).unwrap(), content);
+    let repo = lab.store.join("repos/me/qa");
+    let ids = target_git(&lab, &repo, &["show", "allowed:LOG"]);
+    let log: String = ids
+        .lines()
+        .map(|id| {
+            let path = agit::domain::meta::event_path(id).unwrap();
+            target_git(&lab, &repo, &["show", &format!("allowed:{path}")])
+        })
+        .collect();
+    for value in [entropy, provider, registered, preset] {
+        assert!(
+            log.contains(value),
+            "allowed candidate {value} remains literal"
+        );
+    }
+    assert!(!log.contains(protected));
+    assert!(log.contains("AGIT_SECRET_V1"));
+    let scan = lab
+        .command()
+        .args(["scan", "--secrets", "me/qa@allowed", "--json"])
+        .output()
+        .unwrap();
+    assert!(scan.status.success(), "{scan:?}");
+
+    fs::write(lab.store.join(".agit-allow-secrets"), "").unwrap();
+    let scan = lab
+        .command()
+        .args(["scan", "--secrets", "me/qa@allowed", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(scan.status.code(), Some(7), "{scan:?}");
+    let report = String::from_utf8(scan.stdout).unwrap();
+    assert!(report.contains("registered-secret"));
+    assert!(report.contains("high-entropy-value"));
+}
+
 /// Generated observations must use the same secret projection as the imported transcript.
 #[test]
 fn imported_and_live_metadata_remain_publishable() {
@@ -1421,7 +1513,10 @@ fn imported_and_live_metadata_remain_publishable() {
         assert!(output.status.success(), "{output:?}");
     };
     add_rule("origin", secret);
-    add_rule("workspace", lab.work.to_str().unwrap());
+    // A relative fragment remains outside preset absolute-path allowances.
+    let workspace_fragment = PathBuf::from(lab.work.parent().unwrap().file_name().unwrap())
+        .join(lab.work.file_name().unwrap());
+    add_rule("workspace", workspace_fragment.to_str().unwrap());
     target_git(&lab, &lab.work, &["init", "-q", "--initial-branch=main"]);
     target_git(
         &lab,
@@ -1476,6 +1571,7 @@ fn imported_and_live_metadata_remain_publishable() {
     assert!(!snapshot.cwd.contains(lab.work.to_str().unwrap()));
     assert_eq!(snapshot.runtime, "claude-code");
     assert_eq!(snapshot.turn, Some(1));
+    let source_head = target_git(&lab, &lab.work, &["rev-parse", "HEAD"]);
 
     let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
     for value in [
@@ -1504,6 +1600,10 @@ fn imported_and_live_metadata_remain_publishable() {
     assert!(!metadata.contains(milestone_secret));
     assert_eq!(snapshot.turn, Some(2));
     assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V1"));
+    assert_eq!(
+        snapshot.cwd_state.as_ref().unwrap().head.as_deref(),
+        Some(source_head.trim())
+    );
     assert!(
         snapshot
             .cwd_state
@@ -1512,12 +1612,19 @@ fn imported_and_live_metadata_remain_publishable() {
             .unwrap()
             .contains("AGIT_SECRET_V1")
     );
+    let vault = repo.join(".git/agit/secret-dictionary/vault.json");
+    let vault_before = fs::read(&vault).unwrap();
     let scan = lab
         .command()
         .args(["scan", "--secrets", "me/qa@metadata", "--json"])
         .output()
         .unwrap();
     assert!(scan.status.success(), "{scan:?}");
+    assert_eq!(fs::read(&vault).unwrap(), vault_before);
+    assert_eq!(
+        target_git(&lab, &repo, &["show", "metadata:session/meta.json"]),
+        metadata
+    );
     let resumed = lab
         .command()
         .args(["resume", "me/qa@metadata", "--no-launch", "--json"])

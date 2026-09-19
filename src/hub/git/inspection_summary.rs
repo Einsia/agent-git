@@ -57,6 +57,7 @@ pub struct UnscannedSummary<'a> {
     pub over_budget: Option<BudgetExceeded>,
     pub oversized_objects: &'a [(String, u64)],
     pub oversized_files: &'a [(String, u64)],
+    pub unsupported: &'a [String],
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +138,7 @@ impl<'a> InspectionSummary<'a> {
                     }),
                 oversized_objects: &scan.unscanned.oversized,
                 oversized_files: &scan.unscanned.oversized_files,
+                unsupported: &scan.unscanned.unsupported,
             },
             binary_git_objects: report.binary_git_objects(),
             lfs: prepared
@@ -224,6 +226,12 @@ impl<'a> InspectionSummary<'a> {
                 ));
             }
         }
+        for label in self.unscanned.unsupported {
+            lines.push(format!(
+                "Unsupported or unreadable text carrier: {}",
+                quoted(label)
+            ));
+        }
         lines.push(format!(
             "Binary Git objects observed: {} (not scanned as text)",
             self.binary_git_objects,
@@ -284,6 +292,7 @@ mod tests {
                 over_budget: None,
                 oversized_objects: &[],
                 oversized_files: &[],
+                unsupported: &[],
             },
             binary_git_objects: 0,
             lfs: Vec::new(),

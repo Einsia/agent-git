@@ -1319,15 +1319,6 @@ pub fn view_text_for_install(repo_root: &Path) -> crate::Result<String> {
     }
     let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo_root)?
         .hydrate_jsonl(&text)?;
-    if hydrated.unresolved > 0 {
-        ui::warning(&format!(
-            "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",
-            hydrated.unresolved
-        ));
-        ui::hint(
-            "repository secret dictionaries are device-local and are never fetched from the hub",
-        );
-    }
     Ok(hydrated.text)
 }
 
