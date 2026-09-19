@@ -448,13 +448,19 @@ fn land_local(args: LandArgs) -> CmdResult {
         link.merge_archive.is_none(),
         "local landing cannot replace an Archive role"
     );
-    if repo.commit_count() == 0 {
-        super::import::create_main_file_line(&repo, lineage.owner(), &link)?;
-    }
-    let created = materialize_branch(&repo, &args.branch)?;
-    super::migration::finish_external_history_update(&repo, history_update)?;
-    if created {
-        super::import::declare_session_line(&repo, &args.branch, &link)?;
+    // Existing local branches change only their native link. Without a ref update there is
+    // no new external history to migrate; unrelated session branches remain untouched.
+    if !repo.has_ref(&format!("refs/heads/{}", args.branch)) {
+        if repo.commit_count() == 0 {
+            super::import::create_main_file_line(&repo, lineage.owner(), &link)?;
+        }
+        let created = materialize_branch(&repo, &args.branch)?;
+        super::migration::finish_external_history_update(&repo, history_update)?;
+        if created {
+            super::import::declare_session_line(&repo, &args.branch, &link)?;
+        }
+    } else if let Some(recovery) = history_update {
+        recovery.clear()?;
     }
     crate::domain::link::write(&store, &link)?;
     Ok(ExitCode::Ok)
