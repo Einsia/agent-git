@@ -2488,7 +2488,7 @@ fn tree_file(repo: &Repo, commit: &str, path: &str) -> Result<Option<TreeFile>> 
     }))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TreeEntry {
     mode: String,
     oid: String,
@@ -2506,6 +2506,9 @@ fn checkout_tree_entries(
     wanted: &std::collections::BTreeSet<&str>,
     scope: CheckoutScope,
 ) -> Result<std::collections::BTreeMap<String, TreeEntry>> {
+    if let Some(entries) = native_checkout_tree_entries(repo, commit, wanted, scope) {
+        return Ok(entries);
+    }
     let wanted_bytes: std::collections::BTreeMap<&[u8], &str> =
         wanted.iter().map(|path| (path.as_bytes(), *path)).collect();
     let mut args = vec![
@@ -2567,6 +2570,76 @@ fn checkout_tree_entries(
         );
     }
     Ok(entries)
+}
+
+/// Immutable checkout endpoints only need the paths participating in the transaction.
+/// Unavailable objects and unsupported modes retain Git's strict read path.
+fn native_checkout_tree_entries(
+    repo: &Repo,
+    commit: &str,
+    wanted: &std::collections::BTreeSet<&str>,
+    scope: CheckoutScope,
+) -> Option<std::collections::BTreeMap<String, TreeEntry>> {
+    let id = gix::ObjectId::from_hex(commit.as_bytes()).ok()?;
+    let native = repo.native_commit_repository()?;
+    let object = native.find_object(id).ok()?;
+    let tree = match object.kind {
+        gix::objs::Kind::Commit => object.try_into_commit().ok()?.tree().ok()?,
+        gix::objs::Kind::Tree => object.try_into_tree().ok()?,
+        _ => return None,
+    };
+    let wanted: std::collections::BTreeSet<_> = wanted
+        .iter()
+        .copied()
+        .filter(|path| {
+            scope != CheckoutScope::Storage
+                || *path == meta::ATTRS_FILE
+                || storage_roots().iter().any(|root| {
+                    *path == *root
+                        || path
+                            .strip_prefix(*root)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+        })
+        .collect();
+    let mut pending = vec![(tree.id, String::new())];
+    let mut entries = std::collections::BTreeMap::new();
+    while let Some((id, prefix)) = pending.pop() {
+        let tree = native.find_object(id).ok()?.try_into_tree().ok()?;
+        // Decode the entire containing tree before treating a requested path as absent.
+        for entry in tree.decode().ok()?.entries {
+            let Ok(name) = std::str::from_utf8(entry.filename) else {
+                continue;
+            };
+            let path = format!("{prefix}{name}");
+            if entry.mode.is_tree() {
+                let prefix = format!("{path}/");
+                if wanted.iter().any(|path| path.starts_with(&prefix)) {
+                    pending.push((entry.oid.to_owned(), prefix));
+                }
+            } else if wanted.contains(path.as_str()) {
+                let mode = match entry.mode.value() {
+                    0o100644 => "100644",
+                    0o100755 => "100755",
+                    0o120000 => "120000",
+                    _ => return None,
+                };
+                if entries
+                    .insert(
+                        path,
+                        TreeEntry {
+                            mode: mode.into(),
+                            oid: entry.oid.to_string(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(entries)
 }
 
 #[derive(Clone, Copy)]
@@ -4136,7 +4209,10 @@ mod tests {
         let tree = tree_apply_owned(
             &repo,
             base.trim(),
-            vec![("notes".into(), Some(b"new".to_vec()))],
+            vec![
+                ("notes".into(), Some(b"new".to_vec())),
+                ("events/a b/reply".into(), Some(b"event".to_vec())),
+            ],
         )
         .unwrap();
         for path in ["executable", "link", "module"] {
@@ -4145,6 +4221,34 @@ mod tests {
                 repo.git(&["ls-tree", &tree, "--", path]).unwrap()
             );
         }
+        let wanted = ["executable", "link", "notes", "events/a b/reply", "absent"]
+            .into_iter()
+            .collect();
+        let selected = native_checkout_tree_entries(&repo, &tree, &wanted, CheckoutScope::Full)
+            .expect("immutable tree entries are read without a Git child");
+        // HEAD exercises Git's revision path, independently of the native object-ID read.
+        let commit = raw_git(&repo, &["commit-tree", &tree, "-m", "snapshot"], None).unwrap();
+        repo.git(&["update-ref", "HEAD", commit.trim()]).unwrap();
+        assert_eq!(
+            selected,
+            checkout_tree_entries(&repo, "HEAD", &wanted, CheckoutScope::Full).unwrap()
+        );
+        assert_eq!(selected["executable"].mode, "100755");
+        assert_eq!(selected["link"].mode, "120000");
+        assert!(!selected.contains_key("absent"));
+        let stored =
+            native_checkout_tree_entries(&repo, &tree, &wanted, CheckoutScope::Storage).unwrap();
+        assert_eq!(
+            stored,
+            checkout_tree_entries(&repo, "HEAD", &wanted, CheckoutScope::Storage).unwrap()
+        );
+        assert_eq!(
+            stored.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["events/a b/reply"]
+        );
+        let module = ["module"].into_iter().collect();
+        assert!(native_checkout_tree_entries(&repo, &tree, &module, CheckoutScope::Full).is_none());
+        assert!(checkout_tree_entries(&repo, &tree, &module, CheckoutScope::Full).is_err());
     }
 
     #[test]
