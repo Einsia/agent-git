@@ -2781,13 +2781,16 @@ impl Session {
             return None;
         }
         self.settlement_due = false;
+        let session_id = self.info.session_id.clone();
         let boundary = self.completed_boundary.clone();
         let mut settle =
             std::pin::pin!(self.settle_and_push_inner(SettlementBoundary::Turn, boundary));
         tokio::select! {
             () = &mut settle => None,
             command = commands.recv() => {
+                let started = std::time::Instant::now();
                 settle.await;
+                trace_phase(&session_id, "settlement.command_wait", started);
                 Some(command)
             }
         }
@@ -3014,9 +3017,10 @@ impl Session {
         };
 
         let repo_dir_s = repo_dir.to_string_lossy().into_owned();
-        let Some(before) =
-            guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await
-        else {
+        let started = std::time::Instant::now();
+        let before = guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await;
+        trace_phase(&self.info.session_id, "settlement.read_before", started);
+        let Some(before) = before else {
             return;
         };
         // Before the branch is born (ahead of the first settlement) there is no prior
@@ -3053,11 +3057,16 @@ impl Session {
             };
             strict_commit.env(crate::commands::commit::archive::ROLE_ENV, role);
         }
-        let Some(commit) = guarded_output(&mut self.settlement, lease, strict_commit).await else {
+        let started = std::time::Instant::now();
+        let commit = guarded_output(&mut self.settlement, lease, strict_commit).await;
+        trace_phase(&self.info.session_id, "settlement.commit", started);
+        let Some(commit) = commit else {
             return;
         };
-        let Some(after) = guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await
-        else {
+        let started = std::time::Instant::now();
+        let after = guarded_output(&mut self.settlement, lease, read_head(&repo_dir_s)).await;
+        trace_phase(&self.info.session_id, "settlement.read_after", started);
+        let Some(after) = after else {
             return;
         };
         if !after.status.success() {
