@@ -80,6 +80,13 @@ pub struct JsonReport {
     pub registered_ids: Vec<String>,
 }
 
+#[cfg(feature = "rc")]
+pub(crate) struct NativeJson {
+    pub value: serde_json::Value,
+    pub secret_projection: bool,
+    pub registered_ids: Vec<String>,
+}
+
 /// The device-local persona: "who this machine is", read out of the environment.
 #[derive(Debug, Clone, Default)]
 pub struct Persona {
@@ -309,15 +316,38 @@ impl Redactor {
         }
     }
 
-    #[cfg(feature = "rc")]
+    #[cfg(all(feature = "rc", test))]
     pub(crate) fn scrub_native_json(
         &self,
         value: &serde_json::Value,
         pointers: &[&str],
-    ) -> JsonReport {
-        let result = (|| -> crate::Result<JsonReport> {
+    ) -> NativeJson {
+        self.scrub_native_batch(&[(value, pointers)]).remove(0)
+    }
+
+    /// One page uses one dictionary transaction; identity masks remain occurrence-scoped.
+    #[cfg(feature = "rc")]
+    pub(crate) fn scrub_native_batch(
+        &self,
+        records: &[(&serde_json::Value, &[&str])],
+    ) -> Vec<NativeJson> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+        let result = (|| -> crate::Result<Vec<NativeJson>> {
             let (Some(native), Some(dictionary)) = (&self.native, &self.dictionary) else {
-                return Ok(self.scrub_json_with_verified_fields(value, pointers));
+                return Ok(records
+                    .iter()
+                    .map(|(value, pointers)| {
+                        let report = self.scrub_json_with_verified_fields(value, pointers);
+                        NativeJson {
+                            secret_projection: report.secrets > 0
+                                || report.value.get("protection_error").is_some(),
+                            value: report.value,
+                            registered_ids: report.registered_ids,
+                        }
+                    })
+                    .collect());
             };
             let mut native = native
                 .lock()
@@ -328,39 +358,61 @@ impl Redactor {
                 native.evidence.seed_native(&runtime, &session)?;
                 native.seeded = true;
             }
-            let mut mask = native.evidence.record(&runtime, &session, value);
-            for pointer in pointers {
-                if let Some(text) = value.pointer(pointer).and_then(serde_json::Value::as_str) {
-                    mask.0.push(((*pointer).into(), 0..text.len()));
-                }
+            let mut input = String::new();
+            for (value, _) in records {
+                input.push_str(&serde_json::to_string(value)?);
+                input.push('\n');
             }
-            mask.0
-                .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.start.cmp(&b.1.start)));
-            mask.0.dedup();
-            let protected = dictionary.protect_with_masks(
-                &serde_json::to_string(value)?,
-                &self.registered.snapshot(),
-                |_| mask.clone(),
-            )?;
+            let mut index = 0;
+            let protected =
+                dictionary.protect_with_masks(&input, &self.registered.snapshot(), |value| {
+                    let mut mask = native.evidence.record(&runtime, &session, value);
+                    for pointer in records[index].1 {
+                        if let Some(text) =
+                            value.pointer(pointer).and_then(serde_json::Value::as_str)
+                        {
+                            mask.0.push(((*pointer).into(), 0..text.len()));
+                        }
+                    }
+                    index += 1;
+                    mask.0
+                        .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.start.cmp(&b.1.start)));
+                    mask.0.dedup();
+                    mask
+                })?;
             anyhow::ensure!(
                 protected.intact == 0,
-                "native record exceeds its reversible protection limit"
+                "native page exceeds its reversible protection limit"
             );
-            let mut value = serde_json::from_str(&protected.text)?;
-            let mut totals = JsonTotals::default();
-            self.scrub_persona_json(&mut value, &mut totals)?;
-            Ok(JsonReport {
-                value,
-                secrets: protected.replacements,
-                paths: totals.paths,
-                ips: totals.ips,
-                registered_ids: Vec::new(),
-            })
+            let values: Vec<serde_json::Value> = protected
+                .text
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+            anyhow::ensure!(
+                index == records.len() && values.len() == records.len(),
+                "native protection changed record boundaries"
+            );
+            values
+                .into_iter()
+                .zip(records)
+                .map(|(mut value, (original, _))| {
+                    // Persona changes preserve source hashes; secret projection cannot expose them.
+                    let secret_projection = value != **original;
+                    self.scrub_persona_json(&mut value, &mut JsonTotals::default())?;
+                    Ok(NativeJson {
+                        value,
+                        secret_projection,
+                        registered_ids: Vec::new(),
+                    })
+                })
+                .collect()
         })();
-        result.unwrap_or_else(|_| JsonReport {
+        result.unwrap_or_else(|_| records.iter().map(|_| NativeJson {
             value: serde_json::json!({"protection_error":"content withheld: repository secret protection failed"}),
-            secrets: 0, paths: 0, ips: 0, registered_ids: Vec::new(),
-        })
+            secret_projection: true,
+            registered_ids: Vec::new(),
+        }).collect())
     }
 
     #[cfg(feature = "rc")]
@@ -855,6 +907,55 @@ mod tests {
             .unwrap(),
             json
         );
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn native_batch_keeps_identity_masks_local_and_reloads_explicit_policy() {
+        use crate::domain::secret_filter::RepositoryDictionary;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
+        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+        let identity = serde_json::json!({"identity":secret,"path":"/home/operator/work"});
+        let credential = serde_json::json!({"token":secret,"text":"A quoted \"value\" and a newline\nremain readable."});
+        let clean = serde_json::json!({"text":"No credentials here."});
+        let redactor = Redactor::new(Persona {
+            home: Some("/home/operator".into()),
+            ..Default::default()
+        })
+        .with_repository(repo.root())
+        .unwrap()
+        .with_native_context("codex", "", repo.root(), repo.root());
+        let records: &[(&serde_json::Value, &[&str])] = &[
+            (&identity, &["/identity"]),
+            (&credential, &[]),
+            (&clean, &[]),
+        ];
+        let projected = redactor.scrub_native_batch(records);
+        assert_eq!(projected.len(), records.len());
+        assert_eq!(projected[0].value["identity"], secret);
+        assert_eq!(projected[0].value["path"], "~/work");
+        assert!(!projected[0].secret_projection);
+        assert!(projected[1].secret_projection);
+        assert!(!projected[1].value.to_string().contains(secret));
+        let hydrated: serde_json::Value = serde_json::from_str(
+            &dictionary
+                .hydrate_jsonl(&projected[1].value.to_string())
+                .unwrap()
+                .text,
+        )
+        .unwrap();
+        assert_eq!(hydrated, credential);
+        assert_eq!(projected[2].value, clean);
+        assert!(!projected[2].secret_projection);
+        dictionary
+            .block_add("explicit", secret.to_string().into(), false)
+            .unwrap();
+        let updated = redactor.scrub_native_batch(records);
+        assert!(updated[0].secret_projection);
+        assert!(!updated[0].value.to_string().contains(secret));
+        assert_eq!(updated[2].value, clean);
     }
 
     fn persona() -> Persona {

@@ -3325,8 +3325,7 @@ pub(crate) fn items_from_lines_with_mode(
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return (vec![], vec![]);
     };
-    let mut out = vec![];
-    let mut registered = std::collections::HashSet::new();
+    let mut records = vec![];
     for line in lines {
         if line.text.trim().is_empty() {
             continue;
@@ -3353,16 +3352,20 @@ pub(crate) fn items_from_lines_with_mode(
             continue;
         }
 
-        // Scrub the **decoded strings**, not the wire bytes. Matching bytes misses every
-        // registered literal containing `"`, `\` or a newline; rewriting in place also removes
-        // the "scrubbed but no longer parseable" branch — the structure was never touched, so
-        // there is no shape to fall back from.
         let verified = (runtime == "codex")
             .then(|| super::codex_history::prompt_identity_pointer(&raw, mode))
             .flatten();
-        let scrubbed = redactor.scrub_native_json(&raw, &verified.into_iter().collect::<Vec<_>>());
-        let secret_projection =
-            scrubbed.secrets > 0 || scrubbed.value.get("protection_error").is_some();
+        records.push((line, raw, verified.into_iter().collect::<Vec<_>>()));
+    }
+    let inputs: Vec<_> = records
+        .iter()
+        .map(|(_, raw, pointers)| (raw, pointers.as_slice()))
+        .collect();
+    let protected = redactor.scrub_native_batch(&inputs);
+    let mut out = vec![];
+    let mut registered = std::collections::HashSet::new();
+    for ((line, raw, _), scrubbed) in records.into_iter().zip(protected) {
+        let secret_projection = scrubbed.secret_projection;
         registered.extend(scrubbed.registered_ids);
         let scrubbed_raw = scrubbed.value;
         let native_prompt_id = (runtime == "codex")
