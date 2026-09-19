@@ -2231,6 +2231,33 @@ impl Repo {
         Some(commit.id.to_string())
     }
 
+    /// Read ordinary attributes at an immutable tree or commit without inspecting the checkout.
+    /// Unsupported modes and unavailable objects leave Git's validation and transport intact.
+    #[cfg(feature = "cli")]
+    pub(crate) fn native_regular_attributes(&self, object_id: &str) -> Option<Option<Vec<u8>>> {
+        let id = gix::ObjectId::from_hex(object_id.as_bytes()).ok()?;
+        let native = self.native_commit_repository()?;
+        let object = native.find_object(id).ok()?;
+        let tree = match object.kind {
+            gix::objs::Kind::Commit => object.try_into_commit().ok()?.tree().ok()?,
+            gix::objs::Kind::Tree => object.try_into_tree().ok()?,
+            _ => return None,
+        };
+        let decoded = tree.decode().ok()?;
+        let mut entries = decoded
+            .entries
+            .iter()
+            .filter(|entry| entry.filename == crate::domain::meta::ATTRS_FILE.as_bytes());
+        let Some(entry) = entries.next() else {
+            return Some(None);
+        };
+        if entries.next().is_some() || entry.mode.value() != 0o100644 {
+            return None;
+        }
+        let blob = native.find_object(entry.oid).ok()?.try_into_blob().ok()?;
+        Some(Some(blob.data.clone()))
+    }
+
     #[cfg(feature = "cli")]
     fn native_commit_repository(&self) -> Option<gix::Repository> {
         if self.local_objects_only
@@ -3392,6 +3419,13 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         assert!(repo.native_branch_commit("refs/heads/session").is_none());
         assert!(!repo.has_ref("refs/heads/session"));
 
+        let attributes = b"*.bin binary\n";
+        std::fs::write(
+            linked.root().join(crate::domain::meta::ATTRS_FILE),
+            attributes,
+        )
+        .unwrap();
+        linked.add_all().unwrap();
         linked
             .git(&["commit", "--allow-empty", "-m", "advance"])
             .unwrap();
@@ -3404,6 +3438,27 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         let current = repo.git(&["rev-parse", branch]).unwrap();
         repo.git(&["replace", &before, &current]).unwrap();
         assert_eq!(linked.native_commit_object(&before), Some(before.clone()));
+        assert_eq!(linked.native_regular_attributes(&before), Some(None));
+        assert_eq!(
+            repo.native_regular_attributes(&current),
+            Some(Some(attributes.to_vec()))
+        );
+        let current_tree = linked.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        assert_eq!(
+            linked.native_regular_attributes(&current_tree),
+            Some(Some(attributes.to_vec()))
+        );
+        linked
+            .git(&[
+                "update-index",
+                "--chmod=+x",
+                crate::domain::meta::ATTRS_FILE,
+            ])
+            .unwrap();
+        let executable_tree = linked.git(&["write-tree"]).unwrap();
+        assert!(linked.native_regular_attributes(&executable_tree).is_none());
+        assert!(linked.native_regular_attributes(branch).is_none());
+        assert!(linked.native_regular_attributes(&current[..8]).is_none());
         let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
         assert!(repo.native_commit_object(&tree).is_none());
         assert!(repo.native_commit_object(&before[..8]).is_none());

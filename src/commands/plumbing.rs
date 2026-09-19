@@ -35,6 +35,14 @@ const MAX_CHECKOUT_ATTRIBUTES_SIDECAR_BYTES: u64 = (MAX_CHECKOUT_ATTRIBUTES_LAYE
 /// the bytes happened to be valid UTF-8. Callers use this boundary before generating the managed
 /// attributes blocks.
 pub fn regular_blob_text_at(repo: &Repo, treeish: &str, path: &str) -> Result<Option<String>> {
+    if path == meta::ATTRS_FILE
+        && let Some(attributes) = repo.native_regular_attributes(treeish)
+    {
+        return attributes
+            .map(String::from_utf8)
+            .transpose()
+            .with_context(|| format!("{treeish}:{path} is not UTF-8"));
+    }
     let entry = repo.git_bytes_result(&["ls-tree", "-z", "--full-name", treeish, "--", path])?;
     if entry.is_empty() {
         return Ok(None);
