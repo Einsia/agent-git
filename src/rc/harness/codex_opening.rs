@@ -95,16 +95,24 @@ impl CodexDriver {
                     "Codex opened a session that cannot accept direct input"
                 )));
             }
-            self.thread_id = Some(native.to_owned());
-            if method == "thread/start"
-                && result
-                    .pointer("/thread/turns")
-                    .and_then(Value::as_array)
-                    .is_some_and(Vec::is_empty)
-                && let Some(path) = result.pointer("/thread/path").and_then(Value::as_str)
-            {
-                self.fresh_history = fresh::FreshCodex::new(native, &self.cwd, PathBuf::from(path));
+            if method == "thread/start" {
+                // RC publishes a durable session before its first input. A native metadata
+                // write materializes lazy history; replaying its Git SHA preserves both
+                // the conversation and its title without synthesizing transcript records.
+                let persisted = self
+                    .command_request(
+                        "thread/metadata/update",
+                        json!({"threadId":native,"gitInfo":{"sha":result.pointer("/thread/gitInfo/sha")}}),
+                    )
+                    .await
+                    .map_err(LaunchError::spawned)?;
+                if persisted.pointer("/thread/id").and_then(Value::as_str) != Some(native) {
+                    return Err(LaunchError::spawned(anyhow::anyhow!(
+                        "Codex did not confirm persistence of the new session"
+                    )));
+                }
             }
+            self.thread_id = Some(native.to_owned());
             self.model = result
                 .get("model")
                 .and_then(Value::as_str)
@@ -161,63 +169,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_history_is_empty_only_until_native_input_or_creator_exit() {
-        let root = tempfile::tempdir().unwrap();
-        for resume in [false, true] {
-            let native = uuid::Uuid::new_v4().to_string();
-            let mut driver = driver(
-                resume.then_some(native.as_str()),
+    async fn new_opening_requires_native_persistence_before_publication() {
+        for reply in [
+            json!({"id":3,"result":{"thread":{"id":"native"}}}),
+            json!({"id":3,"error":{"code":-32603,"message":"storage unavailable"}}),
+            json!({"id":3,"result":{"thread":{"id":"other"}}}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let capture = root.path().join("opening.jsonl");
+            let mut driver = CodexDriver::test_responder(None, &[]);
+            driver.shutdown().await.unwrap();
+            driver.proc = Proc::spawn(
+                "sh",
                 &[
-                    json!({"id":1,"result":{}}),
-                    json!({"id":2,"result":{"thread":{"id":native,"turns":[],"path":root.path().join("absent.jsonl")}}}),
-                    json!({"id":3,"result":{"data":[]}}),
-                    json!({"id":4,"result":{"data":[]}}),
-                    json!({"id":5,"result":{"config":{"model":"fixture"}}}),
+                    "-c".into(),
+                    concat!(
+                        "IFS= read -r request\n",
+                        "printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
+                        "IFS= read -r request\n",
+                        "printf '%s\\n' \"$request\" > \"$AGIT_OPENING_CAPTURE\"\n",
+                        "printf '%s\\n' \"$AGIT_OPENING_RESULT\"\n",
+                        "IFS= read -r request\n",
+                        "printf '%s\\n' \"$request\" >> \"$AGIT_OPENING_CAPTURE\"\n",
+                        "printf '%s\\n' \"$AGIT_PERSIST_RESULT\"\n",
+                        "while IFS= read -r request; do :; done\n"
+                    )
+                    .into(),
                 ],
-            ).await;
-            driver.cwd = root.path().to_owned();
-            driver.confirm_opening().await.unwrap();
-            driver.runtime_command("commands", json!({})).await.unwrap();
-            driver.model_control(None).await.unwrap();
-            let params = json!({"session_id":native,"runtime":"codex","cwd":root.path()});
-            let read = crate::rc::local_history::read(params.clone());
-            if resume {
-                assert!(
-                    read.is_err(),
-                    "Resume cannot prove missing history is empty"
-                );
-            } else {
-                let page = read.unwrap();
-                assert_eq!(page["items"], json!([]));
-                assert_eq!(page["status"], "complete");
-                let mut invalid = params.clone();
-                invalid["snapshot"] = json!("expired");
-                assert!(crate::rc::local_history::read(invalid).is_err());
+                &root.path().to_path_buf(),
+                &[
+                    ("AGIT_OPENING_CAPTURE".into(), capture.to_string_lossy().into()),
+                    ("AGIT_OPENING_RESULT".into(), json!({"id":2,"result":{"thread":{"id":"native","gitInfo":{"sha":"existing-sha"}},"model":"fixture"}}).to_string()),
+                    ("AGIT_PERSIST_RESULT".into(), reply.to_string()),
+                ],
+            )
+            .unwrap();
+            driver.handshake_request = Some((1, "initialize"));
+            driver.next_id = Some(2);
+            driver
+                .send(&json!({"id":1,"method":"initialize"}))
+                .await
+                .unwrap();
+            let result = driver.confirm_opening().await;
+            let requests: Vec<Value> = std::fs::read_to_string(capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(requests[0]["params"]["historyMode"], "legacy");
+            assert_eq!(requests[0]["params"]["ephemeral"], false);
+            assert_eq!(
+                requests[1],
+                json!({"id":3,"method":"thread/metadata/update","params":{"threadId":"native","gitInfo":{"sha":"existing-sha"}}})
+            );
+            if reply.pointer("/result/thread/id").and_then(Value::as_str) == Some("native") {
+                result.unwrap();
+                assert_eq!(driver.runtime_thread_id(), Some("native"));
                 assert!(matches!(
-                    driver.start_turn("hello", false, None).await,
-                    TurnStartDispatch::Awaiting
+                    driver.opening_ready,
+                    Some(HarnessEvent::Ready { .. })
                 ));
-                assert!(crate::rc::local_history::read(params.clone()).is_err());
-                let mut retained = params.clone();
-                retained["snapshot"] = page["snapshot"].clone();
-                assert_eq!(
-                    crate::rc::local_history::read(retained).unwrap()["items"],
-                    json!([])
-                );
+            } else {
+                assert!(result.unwrap_err().reached_spawn());
+                assert_eq!(driver.runtime_thread_id(), None);
+                assert!(driver.opening_ready.is_none());
             }
             driver.shutdown().await.unwrap();
         }
-        let native = uuid::Uuid::new_v4().to_string();
-        let mut driver = driver(None, &[
-            json!({"id":1,"result":{}}),
-            json!({"id":2,"result":{"thread":{"id":native,"turns":[],"path":root.path().join("absent.jsonl")}}}),
-        ]).await;
-        driver.cwd = root.path().to_owned();
-        driver.confirm_opening().await.unwrap();
-        let params = json!({"session_id":native,"runtime":"codex","cwd":root.path()});
-        assert!(crate::rc::local_history::read(params.clone()).is_ok());
-        driver.shutdown().await.unwrap();
-        assert!(crate::rc::local_history::read(params).is_err());
     }
 
     #[tokio::test]

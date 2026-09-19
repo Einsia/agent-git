@@ -26,7 +26,7 @@ fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn target(params: Value) -> crate::Result<(String, PathBuf, bool)> {
+fn target(params: Value) -> crate::Result<(String, PathBuf)> {
     let session = params["session_id"]
         .as_str()
         .context("Session id is required")?;
@@ -53,28 +53,20 @@ fn target(params: Value) -> crate::Result<(String, PathBuf, bool)> {
         .context("Working directory is required")?;
     let roots = super::mirror::Mirror::load().roots(super::local::WORKSPACE);
     let cwd = super::policy::require_within(Path::new(cwd), &roots)?;
-    let empty = source_is_empty(native, &cwd)?;
-    Ok((native.to_string(), cwd, empty))
+    validate_source(native, &cwd)?;
+    Ok((native.to_string(), cwd))
 }
 
-fn source_is_empty(native: &str, cwd: &Path) -> crate::Result<bool> {
-    if super::harness::codex::fresh::is_empty(native, cwd) {
-        return Ok(true);
-    }
+fn validate_source(native: &str, cwd: &Path) -> crate::Result<()> {
     let path = crate::adapter::get("codex")?
         .resolve(native, Some(cwd))
         .context("Native transcript is unavailable")?;
-    validate_header(&path, native, cwd)?;
-    Ok(false)
+    validate_header(&path, native, cwd)
 }
 
 pub async fn read(params: Value) -> crate::Result<Value> {
-    let (native, cwd, empty) = tokio::task::spawn_blocking(move || target(params)).await??;
-    let result = if empty {
-        serde_json::json!({"goal": null})
-    } else {
-        super::harness::models::codex_goal(cwd.clone(), &native).await?
-    };
+    let (native, cwd) = tokio::task::spawn_blocking(move || target(params)).await??;
+    let result = super::harness::models::codex_goal(cwd.clone(), &native).await?;
     let roots = super::mirror::Mirror::load().roots(super::local::WORKSPACE);
     super::policy::require_within(&cwd, &roots)?;
     let redactor = super::protection::for_native("codex", &native, &cwd)?;
@@ -85,23 +77,6 @@ pub async fn read(params: Value) -> crate::Result<Value> {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn empty_goal_requires_a_live_creator_for_the_same_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
-        let native = uuid::Uuid::new_v4().to_string();
-        let creator = super::super::harness::codex::fresh::FreshCodex::new(
-            &native,
-            root.path(),
-            root.path().join("absent.jsonl"),
-        )
-        .unwrap();
-        assert!(source_is_empty(&native, root.path()).unwrap());
-        assert!(source_is_empty(&native, other.path()).is_err());
-        drop(creator);
-        assert!(source_is_empty(&native, root.path()).is_err());
-    }
 
     #[test]
     fn transcript_identity_and_directory_must_both_match() {

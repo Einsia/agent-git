@@ -23,7 +23,6 @@
 //! installed binary (codex-cli 0.147.0), not from documentation.
 
 mod commands;
-pub(crate) mod fresh;
 mod guardian;
 mod prompts;
 
@@ -337,7 +336,6 @@ pub struct CodexDriver {
     /// recognize its error and treat it as fatal.
     handshake_request: Option<(i64, &'static str)>,
     opening_ready: Option<HarnessEvent>,
-    fresh_history: Option<fresh::FreshCodex>,
     /// Current permission mode, and the one to apply at the next `turn/start`.
     ///
     /// Two fields because codex's switch is not live: a viewer can ask for
@@ -408,7 +406,6 @@ impl CodexDriver {
             started: false,
             handshake_request: None,
             opening_ready: None,
-            fresh_history: None,
             command_requests: Default::default(),
             token_usage: None,
             guardian_denials: Default::default(),
@@ -446,24 +443,6 @@ impl CodexDriver {
     }
 
     async fn send(&mut self, v: &Value) -> crate::Result<()> {
-        if v.get("method")
-            .and_then(Value::as_str)
-            .is_some_and(|method| {
-                !matches!(
-                    method,
-                    "skills/list"
-                        | "model/list"
-                        | "config/read"
-                        | "account/rateLimits/read"
-                        | "thread/read"
-                        | "thread/goal/get"
-                        | "mcpServerStatus/list"
-                        | "app/list"
-                )
-            })
-        {
-            self.fresh_history = None;
-        }
         self.proc.write_line(v).await
     }
 
@@ -479,6 +458,7 @@ impl CodexDriver {
         // `config.toml` says — so "take this conversation over from the web"
         // could come back with a different guard than it had, in either
         // direction, and nothing on screen would say so.
+        // Native transcript projection consumes JSONL rollouts rather than paginated storage.
         let (method, mut params) = match &self.resume_from {
             Some(tid) => (
                 "thread/resume",
@@ -494,7 +474,9 @@ impl CodexDriver {
                 json!({
                     "cwd": self.cwd.to_string_lossy(),
                     "approvalPolicy": policy,
-                    "sandbox": sandbox
+                    "sandbox": sandbox,
+                    "ephemeral": false,
+                    "historyMode": "legacy"
                 }),
             ),
         };
@@ -517,9 +499,6 @@ impl CodexDriver {
     /// sqlite index (0.4 ms) once the thread id is known.
     pub fn transcript_path(&self) -> Option<PathBuf> {
         let tid = self.thread_id.as_ref()?;
-        if fresh::is_empty(tid, &self.cwd) {
-            return None;
-        }
         crate::adapter::get("codex")
             .ok()?
             .resolve(tid, Some(&self.cwd))
@@ -1186,12 +1165,6 @@ impl CodexDriver {
     }
 
     async fn classify(&mut self, v: Value) -> Option<HarnessEvent> {
-        if v.get("method")
-            .and_then(Value::as_str)
-            .is_some_and(|method| method.starts_with("turn/") || method.starts_with("item/"))
-        {
-            self.fresh_history = None;
-        }
         if let Some(pending) = self.pending_turn_start.as_ref()
             && v.get("method").is_none()
             && v.get("id").and_then(Value::as_i64) == Some(pending.request_id)
@@ -1746,7 +1719,6 @@ impl CodexDriver {
     }
 
     pub async fn shutdown(&mut self) -> crate::Result<()> {
-        self.fresh_history = None;
         self.proc.shutdown().await
     }
 
@@ -1787,7 +1759,6 @@ impl CodexDriver {
             started: thread_id.is_some(),
             handshake_request: None,
             opening_ready: None,
-            fresh_history: None,
             command_requests: Default::default(),
             token_usage: None,
             guardian_denials: Default::default(),
@@ -1909,7 +1880,6 @@ mod tests {
             started: false,
             handshake_request: None,
             opening_ready: None,
-            fresh_history: None,
             command_requests: Default::default(),
             token_usage: None,
             guardian_denials: Default::default(),

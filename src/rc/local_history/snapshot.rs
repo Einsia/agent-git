@@ -179,12 +179,6 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
         native_items: None,
         bytes: 0,
     };
-    if runtime == "codex"
-        && crate::rc::harness::codex::fresh::is_empty(native, std::path::Path::new(cwd))
-    {
-        snapshot.native_items = Some(vec![]);
-        return Ok(snapshot);
-    }
     if runtime == "opencode" {
         snapshot._budget.merge(cache.reserve(MAX_BYTES as u32)?);
         use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
