@@ -2210,9 +2210,31 @@ impl Repo {
     /// Absence, symbolic refs, overrides and unreadable objects require the caller's Git path.
     #[cfg(feature = "cli")]
     pub(crate) fn native_branch_commit(&self, branch_ref: &str) -> Option<String> {
+        if !branch_ref.starts_with("refs/heads/") {
+            return None;
+        }
+        let native = self.native_commit_repository()?;
+        let reference = native.find_reference(branch_ref).ok()?;
+        if reference.name().as_bstr() != branch_ref.as_bytes() {
+            return None;
+        }
+        let commit = reference.try_id()?.object().ok()?.try_into_commit().ok()?;
+        Some(commit.id.to_string())
+    }
+
+    /// Only complete object IDs naming commits bypass Git's revision and tag resolution.
+    #[cfg(feature = "cli")]
+    pub(crate) fn native_commit_object(&self, object_id: &str) -> Option<String> {
+        let id = gix::ObjectId::from_hex(object_id.as_bytes()).ok()?;
+        let native = self.native_commit_repository()?;
+        let commit = native.find_object(id).ok()?.try_into_commit().ok()?;
+        Some(commit.id.to_string())
+    }
+
+    #[cfg(feature = "cli")]
+    fn native_commit_repository(&self) -> Option<gix::Repository> {
         if self.local_objects_only
             || !self.root().is_absolute()
-            || !branch_ref.starts_with("refs/heads/")
             || [
                 "GIT_DIR",
                 "GIT_WORK_TREE",
@@ -2234,12 +2256,7 @@ impl Repo {
         )
         .ok()?;
         native.objects.ignore_replacements = true;
-        let reference = native.find_reference(branch_ref).ok()?;
-        if reference.name().as_bstr() != branch_ref.as_bytes() {
-            return None;
-        }
-        let commit = reference.try_id()?.object().ok()?.try_into_commit().ok()?;
-        Some(commit.id.to_string())
+        Some(native)
     }
 
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -3383,6 +3400,20 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         assert_eq!(repo.native_branch_commit(branch), Some(after.clone()));
         assert_eq!(linked.native_branch_commit(branch), Some(after));
         assert!(repo.has_ref(branch));
+        assert_eq!(repo.native_commit_object(&before), Some(before.clone()));
+        let current = repo.git(&["rev-parse", branch]).unwrap();
+        repo.git(&["replace", &before, &current]).unwrap();
+        assert_eq!(linked.native_commit_object(&before), Some(before.clone()));
+        let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        assert!(repo.native_commit_object(&tree).is_none());
+        assert!(repo.native_commit_object(&before[..8]).is_none());
+        assert!(repo.native_commit_object(branch).is_none());
+        assert!(
+            repo.clone()
+                .local_objects_only()
+                .native_commit_object(&before)
+                .is_none()
+        );
         assert!(
             repo.local_objects_only()
                 .native_branch_commit(branch)

@@ -776,7 +776,10 @@ fn prepare_scoped_checkout_transaction(
     let old = canonical_commit(repo, old)?;
     let new = canonical_commit(repo, new)?;
     let refname = format!("refs/heads/{branch}");
-    let current = repo.git(&["rev-parse", "--verify", &format!("{refname}^{{commit}}")])?;
+    let current = match repo.native_branch_commit(&refname) {
+        Some(commit) => commit,
+        None => repo.git(&["rev-parse", "--verify", &format!("{refname}^{{commit}}")])?,
+    };
     anyhow::ensure!(
         current == old,
         "refusing checkout transaction for {refname}: expected {old}, found {current}"
@@ -1189,10 +1192,16 @@ fn canonical_commit(repo: &Repo, commit: &str) -> Result<String> {
             && !commit.contains(['\n', '\r']),
         "invalid checkout transaction commit id"
     );
+    if let Some(commit) = repo.native_commit_object(commit) {
+        return Ok(commit);
+    }
     repo.git(&["rev-parse", "--verify", &format!("{commit}^{{commit}}")])
 }
 
 fn optional_ref_commit(repo: &Repo, refname: &str) -> Result<Option<String>> {
+    if let Some(commit) = repo.native_branch_commit(refname) {
+        return Ok(Some(commit));
+    }
     let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
