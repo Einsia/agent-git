@@ -16,6 +16,7 @@
     "domain::repo::tests::inspection_",
     "domain::repo::tests::legacy_inspection_",
     "adapter::cursor::tests::windows_cwd_",
+    "adapter::codex_ownership::tests::observation_distinguishes_live_released_and_unknown_native_ownership",
     "infra::local_git::tests",
     "infra::windows_security::tests",
     "domain::secret_filter::repository::tests::bounded_",

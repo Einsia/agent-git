@@ -574,18 +574,9 @@ pub struct LocalSession {
     /// The agent it is managed by (`owner/name`), if it was ever adopted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    /// The transcript file was still growing a moment ago — **this session is
-    /// probably open in someone else's terminal**.
-    ///
-    /// Taking over a live session is not "continuing it", it is **opening a
-    /// second writer on the same transcript file**: the original process keeps
-    /// appending, the process started by `--resume` appends too, and once the
-    /// two streams of writes interleave both histories are destroyed. So this
-    /// is not a hint, it is a stop line — the UI must block, or at least send
-    /// the user to that terminal to exit first.
-    ///
-    /// The test is only mtime, so it is **conservative**: "live" may mean it
-    /// only just ended, while "not live" holds. Better one block too many.
+    /// Native writer ownership, or transcript recency when ownership is unavailable.
+    /// A live external writer keeps this session read-only. Discovery is advisory;
+    /// native resume must still arbitrate competing writers before accepting input.
     #[serde(default)]
     pub likely_active: bool,
 }

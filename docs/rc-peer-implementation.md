@@ -171,12 +171,28 @@ succeeded and a competing native app-server was refused by Codex's writer lock.
 The SSH shim in this fixture is process coverage, not a real network test.
 
 These results establish the tested Codex opening behavior, not a universal
-native ownership contract. Transcript-recency admission checks and unsupported
-runtime ownership remain open. In an isolated Claude Code 2.1.222 probe using
+native ownership contract. In an isolated Claude Code 2.1.222 probe using
 only local synthetic model responses, competing processes resumed the same
 native session and both continued accepting input. Agit-only reservations do
 not establish exclusion against such external applications. Further ownership
 work remains separate from controller/tunnel architecture acceptance.
+
+Codex discovery and resume admission inspect its existing native writer lock
+under a nonblocking shared coordination lock. An occupied writer remains
+read-only even when its transcript is old. A released writer becomes resumable
+immediately even when its transcript is fresh. Observation neither creates nor
+removes native lock files. If native coordination is absent or cannot be read,
+the existing transcript-recency estimate remains in effect; other runtimes keep
+their own admission behavior. The observation does not reserve a session:
+executor launch reservations and Codex's atomic `thread/resume` writer lock
+still arbitrate competing launches before input is accepted. Native runtimes
+that do not participate in Codex's writer-lock contract are not covered by it.
+
+The native writer fixture refreshes the transcript timestamp after its external
+owner exits and checks both the local catalog and immediate peer resume. It also
+checks rejection while the external writer is live and reverse native exclusion.
+This fixture requires an installed Codex and remains a targeted acceptance check,
+not an additional required CI job.
 
 ## Utility connection event selection
 

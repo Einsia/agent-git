@@ -2098,7 +2098,26 @@ fn resume_lineage(
     }
 }
 
-/// Whether this session's transcript is still growing (= likely open in another terminal).
+/// Native writer ownership takes precedence over transcript age when it is observable.
+fn native_session_likely_active(
+    runtime: &str,
+    thread_id: &str,
+    recent: impl FnOnce() -> bool,
+) -> bool {
+    if runtime == "codex"
+        && let Some(active) = crate::adapter::codex_ownership::writer_active(thread_id)
+    {
+        return active;
+    }
+    recent()
+}
+
+fn transcript_likely_active(runtime: &str, thread_id: &str, cwd: &std::path::Path) -> bool {
+    native_session_likely_active(runtime, thread_id, || {
+        transcript_recently_written(runtime, thread_id, cwd)
+    })
+}
+
 fn transcript_recently_written(runtime: &str, thread_id: &str, cwd: &std::path::Path) -> bool {
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return false;

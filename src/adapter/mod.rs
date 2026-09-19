@@ -28,6 +28,8 @@ pub mod claude_code;
 pub mod claude_desktop;
 pub mod codex;
 pub mod codex_index;
+#[cfg(feature = "rc")]
+pub(crate) mod codex_ownership;
 #[cfg(feature = "cli")]
 pub(crate) mod codex_provider;
 mod codex_titles;

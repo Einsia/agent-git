@@ -210,7 +210,7 @@ impl Daemon {
                         "that session's working directory is outside this workspace's bound folders",
                     )
                 })?;
-            if transcript_recently_written(&entry.runtime, &entry.thread_id, &cwd) {
+            if transcript_likely_active(&entry.runtime, &entry.thread_id, &cwd) {
                 return Err(busy_error());
             }
             // The cell in the roster may hold legacy lineage that does not pass today's test.
@@ -1062,7 +1062,9 @@ impl LocalSessionSnapshot {
                         gist: r.gist,
                         adopted: link.is_some(),
                         agent: link.and_then(|l| l.agent),
-                        likely_active: recently_written(r.mtime),
+                        likely_active: native_session_likely_active(r.runtime, &r.id, || {
+                            recently_written(r.mtime)
+                        }),
                     });
                 }
             }

@@ -135,7 +135,7 @@ async def run(binary):
                 before = transcript.read_bytes()
                 for call in (direct.rpc, peer, direct.rpc):
                     response = await call("session.resume", session_id=logical_id, prompt="Must not reach native input.")
-                    assert "active writer" in response["error"]["message"], response
+                    assert response["error"]["code"] == 303, response
                     response = await call("session.enqueue", session_id=native_id,
                                           client_msg_id=str(uuid.uuid4()), message="Must not enter native inbox.")
                     assert "read-only" in response["error"]["message"], response
@@ -145,7 +145,10 @@ async def run(binary):
                 assert (await direct.rpc("machine.describe"))["result"]["instance_id"] == identity
 
                 await owner.close()
-                os.utime(transcript, (1, 1))
+                os.utime(transcript, None)
+                listed = await direct.rpc("session.list", include_local=True)
+                local = next(row for row in listed["result"]["local"] if row["runtime_session_id"] == native_id)
+                assert not local["likely_active"], "released native writer must not remain read-only"
                 resumed = await peer("session.resume", session_id=logical_id)
                 assert "result" in resumed, resumed
                 logical = resumed["result"]["session"]["session_id"]
