@@ -93,11 +93,14 @@ pub fn dir_for(primary: &Repo, branch: &str) -> crate::Result<PathBuf> {
 
 /// The checkout that holds this branch (the main checkout or a linked worktree); never a new one.
 ///
-/// Once the main checkout has been moved (`repo rename`, `clone --mine` promoting in place), a
-/// linked worktree's `.git` file still points at the old address, so git repairs it first; a
-/// worktree still sitting in the old home moves to its canonical place in the new one — it is a
-/// cache, and moving it loses nothing.
+/// Healthy canonical registrations are reused directly. If the main checkout moves, a linked
+/// worktree's `.git` file can point at the old address, so Git repairs it before discovery. A
+/// worktree in the old home moves to its canonical place when that destination is available.
 pub fn existing(primary: &Repo, branch: &str) -> crate::Result<Option<Repo>> {
+    let wanted = dir_for(primary, branch)?;
+    if let Some(checkout) = primary.native_registered_worktree(&wanted, branch) {
+        return Ok(Some(checkout));
+    }
     primary.repair_worktrees();
     primary.prune_worktrees()?;
     let Some(holder) = primary
@@ -109,7 +112,6 @@ pub fn existing(primary: &Repo, branch: &str) -> crate::Result<Option<Repo>> {
     if holder.primary {
         return Ok(Some(Repo::at(holder.path)));
     }
-    let wanted = dir_for(primary, branch)?;
     if holder.path != wanted
         && !wanted.exists()
         && primary.move_worktree(&holder.path, &wanted).is_ok()
@@ -298,7 +300,7 @@ mod tests {
     fn fixture(on: &str) -> (tempfile::TempDir, Repo) {
         let d = tempfile::tempdir().unwrap();
         // Canonical path: worktree directories compare byte-for-byte with the paths git reports.
-        let repo = Repo::init(&d.path().canonicalize().unwrap().join("repo")).unwrap();
+        let repo = Repo::init(&canonical(d.path()).join("repo")).unwrap();
         repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
         meta::write(repo.root(), &Meta::new_file_line()).unwrap();
         std::fs::write(repo.root().join("AGENTS.md"), "# team\n").unwrap();
@@ -320,10 +322,7 @@ mod tests {
     fn a_session_branch_gets_its_own_worktree_and_the_primary_stays_on_main() {
         let (d, repo) = fixture("main");
         let wt = checkout(&repo, "s1").unwrap();
-        assert_eq!(
-            wt.root(),
-            d.path().canonicalize().unwrap().join("repo.worktrees/s1")
-        );
+        assert_eq!(wt.root(), canonical(d.path()).join("repo.worktrees/s1"));
         assert!(wt.is_linked_worktree());
         assert_eq!(wt.current_branch().as_deref(), Some("s1"));
         assert_eq!(repo.current_branch().as_deref(), Some("main"));
@@ -331,6 +330,32 @@ mod tests {
 
         let again = checkout(&repo, "s1").unwrap();
         assert_eq!(again.root(), wt.root());
+        assert!(repo.native_registered_worktree(wt.root(), "s1").is_some());
+
+        wt.switch("s2").unwrap();
+        assert!(repo.native_registered_worktree(wt.root(), "s1").is_none());
+        wt.switch("s1").unwrap();
+
+        let registration = gix::open(wt.root()).unwrap().git_dir().join("gitdir");
+        let backpointer = std::fs::read(&registration).unwrap();
+        std::fs::write(
+            &registration,
+            d.path()
+                .join("unregistered/.git")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(repo.native_registered_worktree(wt.root(), "s1").is_none());
+        std::fs::write(&registration, backpointer).unwrap();
+
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/s1"])
+            .unwrap();
+        assert!(repo.native_registered_worktree(wt.root(), "s1").is_none());
+        assert_eq!(existing(&repo, "s1").unwrap().unwrap().root(), repo.root());
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .unwrap();
+        assert_eq!(checkout(&repo, "s1").unwrap().root(), wt.root());
         assert!(
             existing(&repo, "s2").unwrap().is_none(),
             "no worktree until asked"

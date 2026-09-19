@@ -1,5 +1,6 @@
 {
   "unit": [
+    "commands::worktree::tests::a_session_branch_gets_its_own_worktree_and_the_primary_stays_on_main",
     "domain::repo::tests::native_branch_tip_observes_packed_refs_and_linked_worktree_updates",
     "commands::plumbing::tests::checkout_metadata_paths_remain_private_to_each_worktree",
     "commands::plumbing::tests::owned_tree_apply_persists_from_a_long_linked_worktree",

@@ -1161,6 +1161,45 @@ impl Repo {
             .find(|w| w.branch.as_deref() == Some(branch)))
     }
 
+    /// Reuse a linked checkout only when its registration and checkout point to each other.
+    /// Missing or moved metadata leaves repair and discovery to Git.
+    #[cfg(feature = "cli")]
+    pub(crate) fn native_registered_worktree(&self, path: &Path, branch: &str) -> Option<Repo> {
+        let primary = self.native_commit_repository()?;
+        let common = primary.common_dir().canonicalize().ok()?;
+        let branch_ref = format!("refs/heads/{branch}");
+        if primary.git_dir().canonicalize().ok()? != common
+            || primary.workdir()?.canonicalize().ok()? != self.root().canonicalize().ok()?
+            || primary
+                .head_name()
+                .ok()?
+                .is_some_and(|name| name.as_bstr() == branch_ref.as_bytes())
+            || !path.join(".git").is_file()
+        {
+            return None;
+        }
+
+        let checkout = Repo::at(path);
+        let linked = checkout.native_commit_repository()?;
+        let root = path.canonicalize().ok()?;
+        let git_dir = linked.git_dir().canonicalize().ok()?;
+        if linked.common_dir().canonicalize().ok()? != common
+            || linked.workdir()?.canonicalize().ok()? != root
+            || linked.head_name().ok()??.as_bstr() != branch_ref.as_bytes()
+        {
+            return None;
+        }
+
+        for registration in primary.worktrees().ok()? {
+            if registration.git_dir().canonicalize().ok().as_ref() == Some(&git_dir)
+                && registration.base().ok()?.canonicalize().ok()? == root
+            {
+                return Some(checkout);
+            }
+        }
+        None
+    }
+
     /// Create a linked worktree for a branch that already exists.
     pub fn add_worktree(&self, path: &Path, branch: &str) -> Result<Repo> {
         if let Some(parent) = path.parent() {
