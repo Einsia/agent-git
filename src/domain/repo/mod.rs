@@ -2261,6 +2261,28 @@ impl Repo {
         Some(commit.id.to_string())
     }
 
+    /// Inspect the current checkout without caching HEAD across publication boundaries.
+    /// Symbolic chains and nonlocal namespaces retain Git's reference resolution.
+    #[cfg(feature = "cli")]
+    pub(crate) fn native_checked_out_branch(&self) -> Option<Option<String>> {
+        let native = self.native_commit_repository()?;
+        let head = native.head().ok()?;
+        let name = match head.kind {
+            gix::head::Kind::Detached { .. } => return Some(None),
+            gix::head::Kind::Unborn(name) => name,
+            gix::head::Kind::Symbolic(reference) => {
+                if matches!(reference.target, gix::refs::Target::Symbolic(_)) {
+                    return None;
+                }
+                reference.name
+            }
+        };
+        let branch = std::str::from_utf8(name.as_bstr())
+            .ok()?
+            .strip_prefix("refs/heads/")?;
+        Some(Some(branch.to_owned()))
+    }
+
     /// Only complete object IDs naming commits bypass Git's revision and tag resolution.
     #[cfg(feature = "cli")]
     pub(crate) fn native_commit_object(&self, object_id: &str) -> Option<String> {
@@ -3444,6 +3466,7 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
     fn native_branch_tip_observes_packed_refs_and_linked_worktree_updates() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repo::init(&directory.path().join("main checkout")).unwrap();
+        assert_eq!(repo.native_checked_out_branch(), Some(Some("main".into())));
         repo.git(&["commit", "--allow-empty", "-m", "base"])
             .unwrap();
         repo.git(&["branch", "session/child"]).unwrap();
@@ -3451,6 +3474,10 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
             .add_worktree(&directory.path().join("linked checkout"), "session/child")
             .unwrap();
         let branch = "refs/heads/session/child";
+        assert_eq!(
+            linked.native_checked_out_branch(),
+            Some(Some("session/child".into()))
+        );
         let before = repo.git(&["rev-parse", branch]).unwrap();
         repo.git(&["pack-refs", "--all", "--prune"]).unwrap();
         assert_eq!(repo.native_branch_commit(branch), Some(before.clone()));
@@ -3502,6 +3529,26 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         assert!(repo.native_commit_object(&tree).is_none());
         assert!(repo.native_commit_object(&before[..8]).is_none());
         assert!(repo.native_commit_object(branch).is_none());
+        linked.git(&["checkout", "--detach", &current]).unwrap();
+        assert_eq!(linked.native_checked_out_branch(), Some(None));
+        linked.git(&["symbolic-ref", "HEAD", branch]).unwrap();
+        assert_eq!(
+            linked.native_checked_out_branch(),
+            Some(Some("session/child".into()))
+        );
+        repo.git(&["symbolic-ref", "refs/heads/alias", branch])
+            .unwrap();
+        linked
+            .git(&["symbolic-ref", "HEAD", "refs/heads/alias"])
+            .unwrap();
+        assert!(linked.native_checked_out_branch().is_none());
+        assert_eq!(repo.native_checked_out_branch(), Some(Some("main".into())));
+        assert!(
+            linked
+                .local_objects_only()
+                .native_checked_out_branch()
+                .is_none()
+        );
         assert!(
             repo.clone()
                 .local_objects_only()

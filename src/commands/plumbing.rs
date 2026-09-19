@@ -3865,6 +3865,9 @@ fn update_branch_cas_with_scope(
 }
 
 fn checked_out_branch(repo: &Repo) -> Result<Option<String>> {
+    if let Some(branch) = repo.native_checked_out_branch() {
+        return Ok(branch);
+    }
     let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
