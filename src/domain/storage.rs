@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "cli")]
 mod local_read;
 #[cfg(feature = "cli")]
+mod native;
+#[cfg(feature = "cli")]
 pub(crate) use local_read::LocalReadBudget;
 
 #[derive(Debug, thiserror::Error)]
@@ -1340,6 +1342,12 @@ fn resolve_commit_with_policy(
     git_ref: &str,
     policy: ReadPolicy,
 ) -> Result<String> {
+    #[cfg(feature = "cli")]
+    if matches!(policy, ReadPolicy::AllowTransport)
+        && let Some(commit) = crate::domain::repo::Repo::at(repo_root).native_commit_object(git_ref)
+    {
+        return Ok(commit);
+    }
     let expression = format!("{git_ref}^{{commit}}");
     let output = read_output(
         repo_root,
@@ -2069,6 +2077,13 @@ fn git_blob_with_policy(
     limit: usize,
     policy: ReadPolicy,
 ) -> Result<Vec<u8>> {
+    #[cfg(feature = "cli")]
+    if matches!(policy, ReadPolicy::AllowTransport)
+        && let Some(snapshot) = native::Snapshot::open(repo_root, git_ref)
+        && let Ok(bytes) = snapshot.blob(path, limit)
+    {
+        return Ok(bytes);
+    }
     let spec = format!("{git_ref}:{path}");
     let size = read_output(repo_root, policy, &["cat-file", "-s", &spec], 64)
         .with_context(|| format!("cannot inspect {spec}"))?;
@@ -2108,6 +2123,12 @@ fn git_blob_with_policy(
 }
 
 fn materialize_ids_at(repo_root: &Path, git_ref: &str, ids: &[String]) -> Result<String> {
+    #[cfg(feature = "cli")]
+    if let Some(snapshot) = native::Snapshot::open(repo_root, git_ref)
+        && let Ok(text) = snapshot.materialize(ids)
+    {
+        return Ok(text);
+    }
     materialize_ids_with_limits(
         ids,
         MAX_EVENT_BYTES,
@@ -3362,7 +3383,8 @@ mod tests {
         );
 
         let new_line = line(SID_A, 1);
-        write_snapshot(dir.path(), &new_line, &new_line).unwrap();
+        let log = format!("{old_line}{new_line}{old_line}");
+        write_snapshot(dir.path(), &log, &new_line).unwrap();
         let new_meta = meta::Meta::new(SID_A.into(), "codex".into(), "/r".into());
         meta::write(dir.path(), &new_meta).unwrap();
         repo.add_all().unwrap();
@@ -3370,8 +3392,59 @@ mod tests {
 
         assert_eq!(
             materialize_at(dir.path(), "HEAD", meta::LOG_FILE).unwrap(),
+            log
+        );
+        assert_eq!(
+            materialize_at(dir.path(), "HEAD", meta::VIEW_FILE).unwrap(),
             new_line
         );
+
+        #[cfg(feature = "cli")]
+        {
+            let commit = repo.git(&["rev-parse", "HEAD"]).unwrap();
+            repo.git(&["repack", "-ad"]).unwrap();
+            let linked_root = tempfile::tempdir().unwrap();
+            let linked = linked_root.path().join("checkout");
+            repo.git(&[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                &commit,
+            ])
+            .unwrap();
+            let snapshot = native::Snapshot::open(&linked, &commit).unwrap();
+            let sequence = snapshot
+                .blob(meta::LOG_FILE, MAX_MATERIALIZED_BYTES)
+                .unwrap();
+            let ids = parse_sequence(std::str::from_utf8(&sequence).unwrap()).unwrap();
+            assert_eq!(snapshot.materialize(&ids).unwrap(), log);
+            assert_eq!(
+                materialize_at(&linked, &commit, meta::LOG_FILE).unwrap(),
+                log
+            );
+            let error = snapshot
+                .blob(meta::LOG_FILE, sequence.len() - 1)
+                .unwrap_err();
+            assert!(error.downcast_ref::<ReadLimitExceeded>().is_some());
+            assert!(snapshot.blob("missing", MAX_EVENT_BYTES).is_err());
+            drop(snapshot);
+            repo.git(&["worktree", "remove", linked.to_str().unwrap()])
+                .unwrap();
+
+            let event = meta::event_path(&event_id(&new_line).unwrap()).unwrap();
+            std::fs::write(dir.path().join(event), &old_line).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("corrupt event").unwrap();
+            let corrupt = repo.git(&["rev-parse", "HEAD"]).unwrap();
+            assert!(
+                native::Snapshot::open(dir.path(), &corrupt)
+                    .unwrap()
+                    .materialize(&ids)
+                    .is_err()
+            );
+            assert!(materialize_at(dir.path(), &corrupt, meta::LOG_FILE).is_err());
+        }
     }
 
     #[cfg(feature = "cli")]

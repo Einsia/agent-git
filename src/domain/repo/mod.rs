@@ -2298,7 +2298,7 @@ impl Repo {
     }
 
     #[cfg(feature = "cli")]
-    fn native_commit_repository(&self) -> Option<gix::Repository> {
+    pub(crate) fn native_commit_repository(&self) -> Option<gix::Repository> {
         if self.local_objects_only
             || !self.root().is_absolute()
             || [
