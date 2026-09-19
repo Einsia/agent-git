@@ -2312,6 +2312,15 @@ impl Repo {
 
     /// Strict raw blob read with a real `None` only when the exact path is absent.
     pub fn show_raw_result(&self, git_ref: &str, path: &str) -> Result<Option<String>> {
+        #[cfg(feature = "cli")]
+        if !self.local_objects_only
+            && path == crate::domain::meta::FILE
+            && matches!(git_ref.len(), 40 | 64)
+            && git_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && let Ok(text) = self.pinned_metadata(git_ref)
+        {
+            return Ok(text);
+        }
         let commit = self
             .git(&["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")])?
             .trim()
@@ -2324,6 +2333,40 @@ impl Repo {
         let bytes = self.git_bytes_result(&["cat-file", "blob", &format!("{commit}:{path}")])?;
         String::from_utf8(bytes)
             .with_context(|| format!("{git_ref}:{path} is not UTF-8"))
+            .map(Some)
+    }
+
+    #[cfg(feature = "cli")]
+    fn pinned_metadata(&self, commit: &str) -> Result<Option<String>> {
+        // Immutable metadata comes from the object database, never the checkout or replace refs.
+        // Unavailable local objects still use Git's transport-aware read path.
+        let mut objects = gix::open_opts(
+            self.root(),
+            gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
+        )?;
+        objects.objects.ignore_replacements = true;
+        let id = gix::ObjectId::from_hex(commit.as_bytes())?;
+        let mut object = objects
+            .find_object(id)?
+            .try_into_commit()?
+            .tree_id()?
+            .object()?;
+        for component in crate::domain::meta::FILE.split('/') {
+            let tree = object.try_into_tree()?;
+            // Absence is meaningful only after every entry in the containing tree decodes.
+            let decoded = tree.decode()?;
+            let Some(entry) = decoded
+                .entries
+                .iter()
+                .find(|entry| entry.filename == component.as_bytes())
+            else {
+                return Ok(None);
+            };
+            object = objects.find_object(entry.oid)?;
+        }
+        let blob = object.try_into_blob()?;
+        String::from_utf8(blob.data.clone())
+            .with_context(|| format!("{commit}:{} is not UTF-8", crate::domain::meta::FILE))
             .map(Some)
     }
 

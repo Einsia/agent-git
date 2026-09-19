@@ -1721,12 +1721,15 @@ mod tests {
         repo.add_all().unwrap();
         repo.commit("no meta").unwrap();
         assert!(read_at_ref_result(&repo, "HEAD").unwrap().is_none());
+        let absent = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        assert!(read_at_ref_result(&repo, absent.trim()).unwrap().is_none());
 
         ensure_session_dir(d.path()).unwrap();
         std::fs::write(path_in(d.path()), "{not-json\n").unwrap();
         repo.add_all().unwrap();
         repo.commit("bad json").unwrap();
-        let json_error = read_at_ref_result(&repo, "HEAD").unwrap_err();
+        let malformed = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let json_error = read_at_ref_result(&repo, malformed.trim()).unwrap_err();
         assert!(json_error.to_string().contains("JSON"), "{json_error:#}");
 
         std::fs::write(
@@ -1736,7 +1739,8 @@ mod tests {
         .unwrap();
         repo.add_all().unwrap();
         repo.commit("bad invariant").unwrap();
-        let validation_error = read_at_ref_result(&repo, "HEAD").unwrap_err();
+        let invalid = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let validation_error = read_at_ref_result(&repo, invalid.trim()).unwrap_err();
         assert!(
             validation_error.to_string().contains("metadata"),
             "{validation_error:#}"
@@ -1746,6 +1750,63 @@ mod tests {
             worktree_error.to_string().contains("metadata"),
             "{worktree_error:#}"
         );
+        write(d.path(), &Meta::new_file_line()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("valid metadata").unwrap();
+        let valid = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        repo.git(&["replace", absent.trim(), valid.trim()]).unwrap();
+        assert!(read_at_ref_result(&repo, absent.trim()).unwrap().is_none());
+        let linked_root = d.path().join("linked");
+        repo.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked_root.to_str().unwrap(),
+            valid.trim(),
+        ])
+        .unwrap();
+        let linked = crate::domain::repo::Repo::at(linked_root);
+        assert!(
+            read_at_ref_result(&linked, valid.trim())
+                .unwrap()
+                .unwrap()
+                .is_file_line()
+        );
+
+        let object_file = d.path().join("tree-object");
+        std::fs::write(&object_file, b"100644 truncated\0").unwrap();
+        let corrupt_tree = repo
+            .git(&[
+                "hash-object",
+                "--literally",
+                "-t",
+                "tree",
+                "-w",
+                object_file.to_str().unwrap(),
+            ])
+            .unwrap();
+        let mut root = b"40000 session\0".to_vec();
+        let corrupt_id = corrupt_tree.trim();
+        for index in (0..corrupt_id.len()).step_by(2) {
+            root.push(u8::from_str_radix(&corrupt_id[index..index + 2], 16).unwrap());
+        }
+        std::fs::write(&object_file, root).unwrap();
+        let corrupt_subtree = repo
+            .git(&[
+                "hash-object",
+                "-t",
+                "tree",
+                "-w",
+                object_file.to_str().unwrap(),
+            ])
+            .unwrap();
+        for tree in [&corrupt_tree, &corrupt_subtree] {
+            let commit = repo
+                .git(&["commit-tree", tree.trim(), "-m", "corrupt tree"])
+                .unwrap();
+            let error = read_at_ref_result(&repo, commit.trim()).unwrap_err();
+            assert!(error.to_string().contains("tree"), "{error:#}");
+        }
     }
 
     #[cfg(unix)]

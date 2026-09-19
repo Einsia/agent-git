@@ -6,6 +6,7 @@
     "commands::json::windows::tests",
     "domain::link::tests::archive_transition_replaces_inherited_public_reads_with_private_acl",
     "native_snapshot",
+    "domain::meta::tests::strict_ref_read_distinguishes_missing_json_and_validation_errors",
     "domain::repo::tests::local_",
     "domain::repo::tests::inspection_",
     "domain::repo::tests::legacy_inspection_",
