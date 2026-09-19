@@ -1470,7 +1470,7 @@ async fn incoming_control_preserves_an_owned_git_reference_transaction() {
             "a queued control must not kill the local Git writer"
         );
         assert!(lock.exists());
-        std::fs::write(release, "go").unwrap();
+        std::fs::write(&release, "go").unwrap();
         let command = tokio::time::timeout(std::time::Duration::from_secs(5), settle)
             .await
             .unwrap()
@@ -1495,6 +1495,81 @@ async fn incoming_control_preserves_an_owned_git_reference_transaction() {
         only_settled_frame(settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await);
     assert_ne!(before, settled.commit_sha);
     assert_eq!(fixture.tracking(), settled.commit_sha);
+    assert!(!fixture.receipt().exists());
+    std::fs::remove_file(&held).unwrap();
+    std::fs::remove_file(&release).unwrap();
+    let script = std::fs::read_to_string(&fixture.exe).unwrap();
+    std::fs::write(
+        &fixture.exe,
+        script.replace(
+            "commit)\n",
+            "commit)\nprintf 'prepared\\n' > \"$AGIT_RC_SUPERVISOR_PREPARED\"\n",
+        ),
+    )
+    .unwrap();
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(41)));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.settle_until_command(&mut receiver)
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(session.local_settlement.is_some());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !held.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        fixture
+            .repo
+            .join(".git/refs/heads/s/settlement.lock")
+            .exists()
+    );
+    assert!(
+        session.publication.is_none(),
+        "readiness does not authorize publication"
+    );
+    let (next_ticket, next_receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Steer {
+            message: "prepared input".into(),
+            attribution: MessageAttribution::default(),
+            reply: next_ticket,
+        })
+        .await
+        .unwrap();
+    let next = receiver.recv().await.unwrap();
+    assert!(
+        accept(&next),
+        "the command pump can own input after preparation"
+    );
+    drop(next);
+    drop(next_receipt);
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(59)));
+    assert!(session.settle_until_command(&mut receiver).await.is_none());
+    assert!(session.settlement_due);
+    std::fs::write(&release, "go").unwrap();
+    session.finish_local_settlement(true).await;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frame
+            .settlement_boundary
+            .as_ref()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::Acquire),
+        41
+    );
+    frame.connection_delivery.unwrap().mark_delivered();
+    session.finish_publication(true).await;
     assert!(!fixture.receipt().exists());
     session.driver.shutdown().await.unwrap();
 }

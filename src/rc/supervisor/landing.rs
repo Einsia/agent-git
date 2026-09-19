@@ -161,7 +161,7 @@ impl Session {
     /// worker so Git and Hub latency cannot hold the harness command loop.
     pub(super) async fn bind_if_known(&mut self) {
         self.announce_binding().await;
-        if self.publication.is_some() || self.landing.is_some() {
+        if self.publication.is_some() || self.local_settlement.is_some() || self.landing.is_some() {
             return;
         }
         let Some(thread_id) = self.driver.runtime_thread_id() else {

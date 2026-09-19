@@ -64,6 +64,7 @@ pub(super) fn harness_test_session_with_channels(
         settlement,
         pending_settlement: None,
         publication: None,
+        local_settlement: None,
         settlement_due: false,
         completed_boundary: None,
         settlement_child: None,

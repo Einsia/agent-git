@@ -60,12 +60,17 @@ use std::path::Path;
 /// its branch ref; a zero exit without this result is therefore a true no-op.
 pub(crate) const SUPERVISOR_RESULT_ENV: &str = "AGIT_RC_SUPERVISOR_COMMIT_RESULT";
 
+/// A private readiness marker; it proves frozen input, never successful publication.
+pub(crate) const SUPERVISOR_PREPARED_ENV: &str = "AGIT_RC_SUPERVISOR_PREPARED";
+
 #[cfg(test)]
 type SettlementInterleaveHook = Box<dyn FnOnce(&Repo, &str)>;
 
 #[cfg(test)]
 thread_local! {
     static SETTLEMENT_INTERLEAVE_HOOK: std::cell::RefCell<Option<SettlementInterleaveHook>> =
+        std::cell::RefCell::new(None);
+    static SETTLEMENT_PREPARED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static SETTLEMENT_PUBLICATION_HOOK: std::cell::RefCell<Option<SettlementInterleaveHook>> =
         std::cell::RefCell::new(None);
@@ -1631,6 +1636,17 @@ fn advance_materialized_tip(repo: &Repo, link: &mut Link, candidate: &str) -> cr
     Ok(true)
 }
 
+fn record_supervisor_prepared() -> crate::Result<()> {
+    if let Some(path) = std::env::var_os(SUPERVISOR_PREPARED_ENV) {
+        std::fs::write(path, b"prepared\n")?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = SETTLEMENT_PREPARED_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    Ok(())
+}
+
 fn record_supervisor_result(commit_sha: &str) -> crate::Result<()> {
     let Some(path) = std::env::var_os(SUPERVISOR_RESULT_ENV) else {
         return Ok(());
@@ -2356,6 +2372,9 @@ fn settle_bytes(
     } else {
         None
     };
+    // Native bytes, redaction and code observations must be immutable before another turn
+    // can run. Memory collection is a separate file commit and cannot advance this boundary.
+    record_supervisor_prepared()?;
     for (i, c) in new_chunks.iter().enumerate() {
         let turn_no = head_turn_base + 1 + i as u32;
         let absolute_end = region_start + c.end_byte;
@@ -4438,6 +4457,26 @@ mod tests {
             codex_user("add one more test"),
             codex_asst("test added")
         );
+        let code_head = run_code_git(code.path(), &["rev-parse", "HEAD"]);
+        let changed_code = code.path().to_owned();
+        SETTLEMENT_PREPARED_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(changed_code.join("next-turn.txt"), "next turn").unwrap();
+                run_code_git(
+                    &changed_code,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@x",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "next turn",
+                    ],
+                );
+            }));
+        });
         let exit = settle_bytes(
             &s,
             &repo,
@@ -4457,7 +4496,7 @@ mod tests {
         assert!(last.code.is_some());
         assert_eq!(last.completeness, Some(Completeness::Exact));
         let state = last.cwd_state.as_ref().expect("cwd state is captured");
-        let code_head = run_code_git(code.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(code_head, run_code_git(code.path(), &["rev-parse", "HEAD"]));
         assert_eq!(
             state.origin.as_deref(),
             Some("https://example.invalid/code.git")
