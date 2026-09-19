@@ -753,6 +753,12 @@ pub(crate) fn identity_log_at(
         return Ok(canonical);
     }
     let ids = parse_sequence(&text)?;
+    #[cfg(feature = "cli")]
+    if let Some(snapshot) = native::Snapshot::open(repo_root, commit)
+        && let Ok(text) = snapshot.materialize_bounded(&ids, maximum)
+    {
+        return Ok(text);
+    }
     materialize_pair_ids_with_limits(
         &ids,
         &[],
@@ -2123,7 +2129,7 @@ fn git_blob_with_policy(
     policy: ReadPolicy,
 ) -> Result<Vec<u8>> {
     #[cfg(feature = "cli")]
-    if matches!(policy, ReadPolicy::AllowTransport)
+    if matches!(policy, ReadPolicy::AllowTransport | ReadPolicy::LocalOnly)
         && let Some(snapshot) = native::Snapshot::open(repo_root, git_ref)
         && let Ok(bytes) = snapshot.blob(path, limit)
     {
@@ -3464,6 +3470,19 @@ mod tests {
                 .unwrap();
             let ids = parse_sequence(std::str::from_utf8(&sequence).unwrap()).unwrap();
             assert_eq!(snapshot.materialize(&ids).unwrap(), log);
+            assert_eq!(snapshot.materialize_bounded(&ids, log.len()).unwrap(), log);
+            assert!(
+                snapshot
+                    .materialize_bounded(&ids, log.len() - 1)
+                    .unwrap_err()
+                    .downcast_ref::<ReadLimitExceeded>()
+                    .is_some()
+            );
+            assert_eq!(
+                identity_log_at(&linked, &commit, LayoutVersion::V1, log.len()).unwrap(),
+                log
+            );
+            assert!(identity_log_at(&linked, &commit, LayoutVersion::V1, log.len() - 1).is_err());
             assert_eq!(
                 materialize_at(&linked, &commit, meta::LOG_FILE).unwrap(),
                 log
@@ -3489,6 +3508,7 @@ mod tests {
                     .is_err()
             );
             assert!(materialize_at(dir.path(), &corrupt, meta::LOG_FILE).is_err());
+            assert!(identity_log_at(dir.path(), &corrupt, LayoutVersion::V1, log.len()).is_err());
         }
     }
 

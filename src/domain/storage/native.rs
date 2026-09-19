@@ -50,11 +50,15 @@ impl Snapshot {
     }
 
     pub(super) fn materialize(&self, ids: &[String]) -> Result<String> {
+        self.materialize_bounded(ids, MAX_MATERIALIZED_BYTES)
+    }
+
+    pub(super) fn materialize_bounded(&self, ids: &[String], maximum: usize) -> Result<String> {
         let objects = RefCell::new(Vec::new());
         materialize_ids_with_limits(
             ids,
-            MAX_EVENT_BYTES,
-            MAX_MATERIALIZED_BYTES,
+            MAX_EVENT_BYTES.min(maximum),
+            maximum,
             |unique| {
                 let mut sizes = Vec::with_capacity(unique.len());
                 let mut objects = objects.borrow_mut();
