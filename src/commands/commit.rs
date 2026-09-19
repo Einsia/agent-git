@@ -1650,6 +1650,9 @@ fn record_supervisor_result(commit_sha: &str) -> crate::Result<()> {
 /// warnings for broken refs); filtering its result ourselves also avoids confusing `main` with
 /// `main/child`. Once found, the object must still peel to a commit.
 fn optional_branch_commit(repo: &Repo, branch_ref: &str) -> crate::Result<Option<String>> {
+    if let Some(commit) = repo.native_branch_commit(branch_ref) {
+        return Ok(Some(commit));
+    }
     let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")

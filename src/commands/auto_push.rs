@@ -6,8 +6,12 @@ use std::path::Path;
 use std::process::Stdio;
 
 pub(super) fn branch_tip(directory: &Path, branch: &str) -> Option<String> {
-    Repo::open(directory)?
-        .git(&["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+    let repo = Repo::open(directory)?;
+    let branch_ref = format!("refs/heads/{branch}");
+    if let Some(commit) = repo.native_branch_commit(&branch_ref) {
+        return Some(commit);
+    }
+    repo.git(&["rev-parse", "--verify", &branch_ref])
         .ok()
         .map(|value| value.trim().to_owned())
 }

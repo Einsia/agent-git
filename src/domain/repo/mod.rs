@@ -2197,9 +2197,49 @@ impl Repo {
     }
 
     pub fn has_ref(&self, r: &str) -> bool {
+        #[cfg(feature = "cli")]
+        if self.native_branch_commit(r).is_some() {
+            return true;
+        }
         self.git_opt(&["rev-parse", "--verify", "--quiet", r])
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
+    }
+
+    /// Read a present local branch tip without retaining mutable reference state.
+    /// Absence, symbolic refs, overrides and unreadable objects require the caller's Git path.
+    #[cfg(feature = "cli")]
+    pub(crate) fn native_branch_commit(&self, branch_ref: &str) -> Option<String> {
+        if self.local_objects_only
+            || !self.root().is_absolute()
+            || !branch_ref.starts_with("refs/heads/")
+            || [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_NAMESPACE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return None;
+        }
+        let mut native = gix::open_opts(
+            self.root(),
+            gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
+        )
+        .ok()?;
+        native.objects.ignore_replacements = true;
+        let reference = native.find_reference(branch_ref).ok()?;
+        if reference.name().as_bstr() != branch_ref.as_bytes() {
+            return None;
+        }
+        let commit = reference.try_id()?.object().ok()?.try_into_commit().ok()?;
+        Some(commit.id.to_string())
     }
 
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -3314,6 +3354,40 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         // lexically.
         assert_eq!(v[0].0, "agit-aaa222");
         assert_eq!(v[1].0, "agit-zzz111");
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn native_branch_tip_observes_packed_refs_and_linked_worktree_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("main checkout")).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        repo.git(&["branch", "session/child"]).unwrap();
+        let linked = repo
+            .add_worktree(&directory.path().join("linked checkout"), "session/child")
+            .unwrap();
+        let branch = "refs/heads/session/child";
+        let before = repo.git(&["rev-parse", branch]).unwrap();
+        repo.git(&["pack-refs", "--all", "--prune"]).unwrap();
+        assert_eq!(repo.native_branch_commit(branch), Some(before.clone()));
+        assert_eq!(linked.native_branch_commit(branch), Some(before.clone()));
+        assert!(repo.native_branch_commit("refs/heads/session").is_none());
+        assert!(!repo.has_ref("refs/heads/session"));
+
+        linked
+            .git(&["commit", "--allow-empty", "-m", "advance"])
+            .unwrap();
+        let after = repo.git(&["rev-parse", branch]).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(repo.native_branch_commit(branch), Some(after.clone()));
+        assert_eq!(linked.native_branch_commit(branch), Some(after));
+        assert!(repo.has_ref(branch));
+        assert!(
+            repo.local_objects_only()
+                .native_branch_commit(branch)
+                .is_none()
+        );
     }
 
     #[test]
