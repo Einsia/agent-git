@@ -70,17 +70,10 @@ fn strict_settlement_requires_a_new_commit_and_a_confirmed_push() {
     assert!(strict_settlement_candidate("new", &failed, "new", withheld, None).is_err());
 }
 
-/// Guards against "the predicate is right and the inputs are the test's own invention": the
-/// test above feeds only hand-written "old"/"new". Here the **guarded subprocess** really runs
-/// `git rev-parse HEAD` and hands its stdout to the predicate unchanged — without
-/// `Stdio::piped()` in `guarded_output`, tokio lets the child inherit stdio, `Output.stdout` is
-/// forever the empty string while the status is success, so every settlement is judged
-/// "strict commit left an unreadable HEAD" and not one `commit.settled` goes out, while the
-/// unit tests that feed hand-written input alone stay **all green**. Delete the piped lines
-/// from `guarded_output` and this goes red at once.
+/// Settlement reads fresh session-branch tips and discards reads after authority ends.
 #[cfg(unix)]
 #[tokio::test]
-async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() {
+async fn settlement_watermarks_follow_the_session_branch_and_lease() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().to_str().unwrap().to_string();
     let git = |args: &[&str]| {
@@ -102,17 +95,12 @@ async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() 
             .env("HOME", &repo);
         command
     };
-    // The same command and the same guarded channel as `read_head` in `settle_and_push`.
-    let read_head = || {
-        let mut head = tokio::process::Command::new("git");
-        head.args(crate::domain::meta::GIT_SAFE)
-            .args(["-C", &repo, "rev-parse", "HEAD"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0");
-        head
+    let watermark = super::settlement_io::BranchWatermark {
+        repository: dir.path().to_path_buf(),
+        reference: settlement_watermark_ref("session"),
     };
 
-    let (_tx, mut rx) = tokio::sync::watch::channel(SettlementState {
+    let (lease_tx, mut rx) = tokio::sync::watch::channel(SettlementState {
         local_owner: false,
         epoch: 1,
         agent_identity_v1: true,
@@ -120,7 +108,7 @@ async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() 
     });
     let lease = *rx.borrow_and_update();
 
-    let init = guarded_output(&mut rx, lease, git(&["init", "-q"]))
+    let init = guarded_output(&mut rx, lease, git(&["init", "-q", "-b", "main"]))
         .await
         .expect("lease is current");
     assert!(
@@ -141,16 +129,19 @@ async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() 
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let before = guarded_output(&mut rx, lease, read_head())
+    let branch = guarded_output(&mut rx, lease, git(&["checkout", "-q", "-b", "session"]))
         .await
-        .expect("lease is current");
-    assert!(before.status.success());
-    let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
-    assert_eq!(
-        before.len(),
-        40,
-        "the guarded child's stdout must carry the real HEAD, got `{before}`"
+        .unwrap();
+    assert!(branch.status.success());
+    assert!(
+        guarded_output(&mut rx, lease, git(&["pack-refs", "--all"]))
+            .await
+            .unwrap()
+            .status
+            .success()
     );
+    let before = watermark.read(&mut rx, lease).await.unwrap().unwrap();
+    assert_eq!(before.len(), 40);
 
     // Stands in for the step where `agit commit --from-supervisor` produces a new commit.
     let commit = guarded_output(
@@ -160,18 +151,21 @@ async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() 
     )
     .await
     .expect("lease is current");
-    let after = guarded_output(&mut rx, lease, read_head())
-        .await
-        .expect("lease is current");
-    assert!(after.status.success());
-    let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
-    assert_eq!(after.len(), 40, "the settlement HEAD read back empty");
+    let after = watermark.read(&mut rx, lease).await.unwrap().unwrap();
+    assert_eq!(after.len(), 40, "the settlement branch read back empty");
     assert_ne!(before, after, "the guarded commit did not move HEAD");
 
     let candidate = strict_settlement_candidate(&before, &commit, &after, Some(&after), None)
         .expect("real subprocess outputs must satisfy the settlement predicate")
         .expect("a really-new HEAD is the settlement candidate");
     assert_eq!(candidate, after);
+    let checkout = guarded_output(&mut rx, lease, git(&["checkout", "-q", "main"]))
+        .await
+        .unwrap();
+    assert!(checkout.status.success());
+    assert_eq!(watermark.read(&mut rx, lease).await.unwrap(), Some(after));
+    lease_tx.send_modify(|state| state.epoch += 1);
+    assert!(watermark.read(&mut rx, lease).await.is_none());
 }
 
 /// Regression (no settlement at session end): when `Command::Shutdown` / driver EOF / `Exited`

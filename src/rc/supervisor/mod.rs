@@ -3021,21 +3021,6 @@ impl Session {
         // settlement lands in the branch's own worktree while the main checkout stays on main,
         // so HEAD is identical before and after while the branch has moved on.
         let watermark_ref = settlement_watermark_ref(&branch);
-        let read_head = |repo_dir: &str| {
-            let mut head = crate::infra::git_runtime::async_command();
-            head.args(crate::domain::meta::GIT_SAFE)
-                .args([
-                    "-C",
-                    repo_dir,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &watermark_ref,
-                ])
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_TERMINAL_PROMPT", "0");
-            head
-        };
 
         let repo_dir_s = repo_dir.to_string_lossy().into_owned();
         // RC Stop hooks deliberately no-op; this cancellable path is the only
@@ -3071,9 +3056,11 @@ impl Session {
             session_id: self.info.session_id.clone(),
             settlement: self.settlement.clone(),
             lease,
-            read_before: read_head(&repo_dir_s),
+            watermark: settlement_io::BranchWatermark {
+                repository: repo_dir.clone(),
+                reference: watermark_ref,
+            },
             commit: strict_commit,
-            read_after: read_head(&repo_dir_s),
             result_file,
             prepared_file,
         };
