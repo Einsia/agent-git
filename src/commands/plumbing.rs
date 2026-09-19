@@ -1783,6 +1783,11 @@ fn checkout_git_path_with_policy(
     if matches!(policy, crate::domain::repo::ReadPolicy::LocalOnly) {
         return repo.git_path_local(name);
     }
+    if matches!(policy, crate::domain::repo::ReadPolicy::AllowTransport)
+        && let Some(path) = native_checkout_metadata_path(repo, name)
+    {
+        return Ok(path);
+    }
     let value = repo.git_with_policy(&["rev-parse", "--git-path", name], policy)?;
     anyhow::ensure!(!value.is_empty(), "git returned an empty path for {name}");
     let path = std::path::PathBuf::from(value);
@@ -1791,6 +1796,30 @@ fn checkout_git_path_with_policy(
     } else {
         repo.root().join(path)
     })
+}
+
+fn native_checkout_metadata_path(repo: &Repo, name: &str) -> Option<std::path::PathBuf> {
+    // Checkout recovery metadata belongs to the private git directory, not the shared object
+    // store. Other Git paths can be redirected by configuration or environment variables.
+    if !matches!(
+        name,
+        CHECKOUT_LOCK_NAME | CHECKOUT_JOURNAL_NAME | CHECKOUT_ATTRIBUTES_SIDECAR_NAME
+    ) || !repo.root().is_absolute()
+        || [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return None;
+    }
+    // Resolve afresh so moving or repairing a worktree cannot leave a cached carrier behind.
+    let native = gix::open(repo.root()).ok()?;
+    Some(native.git_dir().join(name))
 }
 
 fn read_checkout_journal(path: &std::path::Path) -> Result<Option<CheckoutJournal>> {
@@ -3943,6 +3972,37 @@ mod tests {
         assert_eq!(cat_blob(&repo, &tree, "events/00004e1f"), b"event 19999\n");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
         assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkout_metadata_paths_remain_private_to_each_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("main checkout")).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        repo.git(&["branch", "session"]).unwrap();
+        let linked = repo
+            .add_worktree(&directory.path().join("linked checkout"), "session")
+            .unwrap();
+        for name in [
+            CHECKOUT_LOCK_NAME,
+            CHECKOUT_JOURNAL_NAME,
+            CHECKOUT_ATTRIBUTES_SIDECAR_NAME,
+        ] {
+            let primary_path = native_checkout_metadata_path(&repo, name).unwrap();
+            let linked_path = native_checkout_metadata_path(&linked, name).unwrap();
+            std::fs::write(&primary_path, b"primary").unwrap();
+            std::fs::write(&linked_path, b"linked").unwrap();
+            assert_eq!(
+                std::fs::read(repo.git_path(name).unwrap()).unwrap(),
+                b"primary"
+            );
+            assert_eq!(
+                std::fs::read(linked.git_path(name).unwrap()).unwrap(),
+                b"linked"
+            );
+        }
+        assert!(native_checkout_metadata_path(&linked, "index").is_none());
     }
 
     #[cfg(windows)]

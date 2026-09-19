@@ -1,5 +1,6 @@
 {
   "unit": [
+    "commands::plumbing::tests::checkout_metadata_paths_remain_private_to_each_worktree",
     "commands::plumbing::tests::owned_tree_apply_persists_from_a_long_linked_worktree",
     "commands::show::tests::unreadable_snapshot_refuses_before_entering_the_terminal",
     "commands::export::tests::output_flush_failure_is_not_a_successful_delivery",
