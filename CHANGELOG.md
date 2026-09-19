@@ -6,6 +6,42 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.2] - 2026-09-19
+
+### Added
+
+- **Shared workspace controllers.** Accept project- and session-scoped authority
+  from the Hub controller, so collaborators can operate a shared session without
+  separate device grants. This requires a Hub with shared controller support;
+  personal peer/Cloud connections retain their existing protocol.
+- Expose native model and reasoning-effort controls through peer remote control.
+- Protect detected secrets automatically with reversible, repository-local
+  placeholders before saving or publishing session content.
+
+### Changed
+
+- Keep native controls responsive while prepared settlement completes, reuse
+  healthy session worktrees and Hub connections, and replace repeated Git child
+  processes with bounded local object reads.
+- Start tunnel transport independently of repository storage and overlap Cloud
+  admission and peer setup to reduce connection overhead.
+- Official Hub usage requires usage statistics; installation attempts and stages
+  are included in the documented collection policy. Other Hubs retain their
+  opt-out controls. See [usage statistics](docs/telemetry.md).
+
+### Fixed
+
+- Keep shared native subscriptions attached to controller authority, isolate each
+  viewer's replay, and suppress duplicate events on Cloud utility routes.
+- Preserve early session events, uncertain command receipt identities, native
+  titles, and saved session identities outside the active catalog.
+- Correct Windows path component handling and directory navigation.
+- Distinguish stale daemon records from reused process IDs, recover stopped
+  daemons after upgrades, and enforce private state permissions under permissive
+  umasks.
+- Preserve fresh native history during model reads and settlement without
+  blocking read-only controls on repository metadata work.
+
 ## [0.2.1] - 2026-09-17
 
 ### Added

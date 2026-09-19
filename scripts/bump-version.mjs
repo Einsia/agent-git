@@ -114,8 +114,7 @@ if (check.status !== 0) process.exit(check.status ?? 1)
 console.log(`
 version ${version} prepared (the CHANGELOG.md section for it is the Release body). Next:
   Commit and review the changed files, then merge after CI passes.
-  Wait for GitHub main synchronization and verify the mirrored files.
-  From the verified Einsia/agent-git GitHub mirror checkout:
-    git tag agit-v${version}
-    git push git@github.com:Einsia/agent-git.git refs/tags/agit-v${version}
+  Wait for the GitLab main pipeline's builds and mirror:github job.
+  Run that pipeline's manual release:github-tag job to publish agit-v${version}.
+  Do not push tags directly to GitHub; CI uses the verified mirror commit.
   release.yml builds the binaries; on success "npm publish" publishes the npm family.`)

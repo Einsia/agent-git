@@ -163,16 +163,15 @@ The section becomes the GitHub Release body (`scripts/release-notes.mjs` extract
 `release.yml`, with repository-relative links pinned to the release tag) and ships inside
 the `@einsia/agent-git` package.
 
-After the source release commit passes CI and is synchronized to GitHub `main`,
-verify the mirrored files and create the tag in that GitHub checkout. The mirror
-rewrites commit IDs, so the source repository's SHA is not the release SHA.
-Pushing the tag to GitHub runs the whole chain — binaries first, npm right after:
+After the source release commit passes CI, merge it into GitLab `main`. Wait for
+that pipeline's development builds and `mirror:github`, then run its manual
+`release:github-tag` job. CI verifies the recorded source-to-mirror mapping and
+creates `agit-v<version>` on the public mirror commit. Release tags are immutable;
+a stale pipeline cannot publish after either `main` moves.
 
-```sh
-# Run from the verified Einsia/agent-git GitHub mirror checkout.
-git tag agit-v0.1.0
-git push git@github.com:Einsia/agent-git.git refs/tags/agit-v0.1.0
-```
+The mirror rewrites commit IDs, so the source SHA is not the release SHA. Do not
+push release tags directly to GitHub. The CI-created tag starts the GitHub Release
+workflow, which builds the binaries and then triggers npm publication.
 
 Distribution to users runs through the npm registry: each target ships as a
 platform sub-package (`@einsia/agent-git-linux-x64` and friends, gated by
