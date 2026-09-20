@@ -1040,13 +1040,12 @@ fn resume_branch_for(
     {
         // Native reuse requires both saved VIEW equality and a native LOG prefix. History
         // overlays cannot authorize replaying evidence excluded from the current snapshot.
-        if let Ok(live) = lk.read() {
-            let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-                .protect_existing_jsonl(&live)?;
-            if matches!(
-                transcript::continuity(&committed_log, &projected.text),
-                transcript::Continuity::Append | transcript::Continuity::Noop
-            ) && let Some(cmd) = native_resume_cmd(
+        if let Ok(live) = lk.read()
+            && matches!(
+                native_claim_activity(repo, &committed_log, &live)?,
+                ClaimActivity::Untouched | ClaimActivity::Appended
+            )
+            && let Some(cmd) = native_resume_cmd(
                 from,
                 &lk.session_id,
                 &cwd,
@@ -1054,20 +1053,20 @@ fn resume_branch_for(
                 branch,
                 prompt,
                 system_prompt.as_deref(),
-            ) {
-                report_environment_notice(from, system_prompt.as_deref());
-                materialize_memory(repo, branch, slug, from, &cwd);
-                println!(
-                    "{}",
-                    ui::dim(&format!(
-                        "  reusing the local native session (zero-copy): {slug} @ {branch}"
-                    ))
-                );
-                return Ok(Some(Resumed {
-                    cmd: Some(cmd),
-                    lossy: false,
-                }));
-            }
+            )
+        {
+            report_environment_notice(from, system_prompt.as_deref());
+            materialize_memory(repo, branch, slug, from, &cwd);
+            println!(
+                "{}",
+                ui::dim(&format!(
+                    "  reusing the local native session (zero-copy): {slug} @ {branch}"
+                ))
+            );
+            return Ok(Some(Resumed {
+                cmd: Some(cmd),
+                lossy: false,
+            }));
         }
     }
 
@@ -1552,7 +1551,7 @@ pub(crate) fn require_merge_claim_with_bytes(
             link::MaterializationActivity::Unverifiable => ClaimActivity::Unverifiable,
         }
     } else {
-        native_merge_claim_activity(repo, committed, text)?
+        native_claim_activity(repo, committed, text)?
     };
     if activity == ClaimActivity::Untouched {
         return Ok(());
@@ -1578,11 +1577,15 @@ pub(crate) fn require_merge_claim_with_bytes(
     )
 }
 
-fn native_merge_claim_activity(
-    repo: &Repo,
-    committed: &str,
-    live: &str,
-) -> crate::Result<ClaimActivity> {
+/// Classify a native transcript against the committed LOG by hydrated content.
+///
+/// The committed side is expanded back to plaintext and compared with the live transcript as
+/// the runtime wrote it. Re-projecting the live text with the current dictionary is not a valid
+/// comparison: a record registered after settlement whose value occurs inside the settled
+/// prefix changes the projection of that prefix, so an untouched transcript reads as rewritten
+/// and the branch becomes unresumable. A token the dictionary cannot resolve leaves the
+/// comparison unverifiable, which fails closed.
+fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Result<ClaimActivity> {
     if transcript::continuity(committed, live) == transcript::Continuity::Noop {
         return Ok(ClaimActivity::Untouched);
     }
@@ -1602,9 +1605,8 @@ fn native_merge_claim_activity(
 
 /// Classify whether replacing one active branch claim can lose runtime content.
 ///
-/// Materialized instances carry their own byte baseline. Native instances are compared against
-/// the committed LOG after applying the repository's existing secret projection, the same
-/// comparison used by the zero-copy path.
+/// Materialized instances carry their own byte baseline. Native instances use the hydrated
+/// content comparison shared with the zero-copy path, merge, doctor and diff.
 fn claim_activity(repo: &Repo, committed_log: &str, link: &Link) -> crate::Result<ClaimActivity> {
     if link.baseline_bytes.is_some() {
         return Ok(match link::materialization_activity(link) {
@@ -1617,15 +1619,7 @@ fn claim_activity(repo: &Repo, committed_log: &str, link: &Link) -> crate::Resul
     let Ok(live) = link.read() else {
         return Ok(ClaimActivity::Unverifiable);
     };
-    let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .protect_existing_jsonl(&live)?;
-    Ok(
-        match transcript::continuity(committed_log, &projected.text) {
-            transcript::Continuity::Noop => ClaimActivity::Untouched,
-            transcript::Continuity::Append => ClaimActivity::Appended,
-            transcript::Continuity::Diverged => ClaimActivity::Rewritten,
-        },
-    )
+    native_claim_activity(repo, committed_log, &live)
 }
 
 fn report_multiple_active(slug: &str, branch: &str, links: &[Link]) {

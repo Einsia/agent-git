@@ -305,6 +305,9 @@ hard to guess" is not a replay defense.
   deterministically;
 - many repeated hits do not first build an unbounded match `Vec`;
 - settling again after a commit still passes continuity;
+- resume, merge, doctor and diff judge a native transcript against hydrated committed content:
+  a record registered after settlement whose value sits inside the settled prefix leaves an
+  untouched transcript resumable instead of reporting a rewrite;
 - resume hydrates when the dictionary is present, and keeps the token quietly when it
   is not;
 - a missing keystore entry and an authentication failure on any record both fail closed;
