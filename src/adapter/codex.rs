@@ -600,6 +600,17 @@ impl Adapter for Codex {
             .collect())
     }
 
+    fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
+        match record["type"].as_str() {
+            Some("event_msg") => matches!(
+                record["payload"]["type"].as_str(),
+                Some("thread_settings_applied" | "token_count")
+            ),
+            Some("token_usage_record") => true,
+            _ => false,
+        }
+    }
+
     /// Reverse lookup: the index database first (0.40 ms), then a glob by id (39 ms).
     ///
     /// `cwd` is useless here — Codex splits directories by date and the path carries no project
@@ -2694,5 +2705,32 @@ mod tests {
         // End to end: it changes neither the turn count nor that turn's hash.
         let chain = crate::domain::turn::chain_of(&s);
         assert_eq!(chain.len(), 1, "a marker does not form a turn of its own");
+    }
+}
+
+#[cfg(test)]
+mod bookkeeping_tests {
+    use super::*;
+
+    /// Settings and usage records are bookkeeping; anything carrying or framing a turn is not,
+    /// and neither is a record of unknown shape.
+    #[test]
+    fn only_settings_and_usage_records_are_bookkeeping() {
+        let codex = Codex;
+        for record in [
+            serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}}),
+            serde_json::json!({"type":"token_usage_record","payload":{}}),
+        ] {
+            assert!(codex.is_runtime_bookkeeping(&record), "{record}");
+        }
+        for record in [
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hi"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user"}}),
+            serde_json::json!({"unsettled":true}),
+        ] {
+            assert!(!codex.is_runtime_bookkeeping(&record), "{record}");
+        }
     }
 }

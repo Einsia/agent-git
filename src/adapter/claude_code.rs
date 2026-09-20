@@ -153,6 +153,13 @@ impl Adapter for ClaudeCode {
             .collect())
     }
 
+    fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
+        matches!(
+            record["type"].as_str(),
+            Some("file-history-snapshot" | "custom-title" | "summary")
+        )
+    }
+
     /// Reverse lookup: with a cwd, go straight there (0.14 ms); without one, or on a miss, glob
     /// one level (2.2 ms).
     ///

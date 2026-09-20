@@ -632,6 +632,14 @@ pub trait Adapter {
     /// in — Codex splits directories by date and the path carries no project information.
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>>;
 
+    /// Whether one native record carries no conversation: applied settings, titles, usage
+    /// counters and similar entries the runtime writes on its own. Settlement leaves such records
+    /// after the last turn, and a runtime switch may leave them behind. A record the adapter
+    /// does not recognize is not bookkeeping.
+    fn is_runtime_bookkeeping(&self, _record: &serde_json::Value) -> bool {
+        false
+    }
+
     /// Human-facing choices omit runtime bookkeeping when its native provenance is known.
     /// Explicit discovery remains available for inspecting and importing those records.
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {

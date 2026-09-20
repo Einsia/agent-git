@@ -1082,6 +1082,15 @@ fn resume_branch_for(
         let existing = &active[0];
         match claim_activity(repo, &committed_log, existing)? {
             ClaimActivity::Untouched => active,
+            ClaimActivity::Appended if tail_is_bookkeeping(&committed_log, existing)? => {
+                println!(
+                    "{}",
+                    ui::dim(
+                        "  the runtime wrote no new turn since the last settlement; its bookkeeping tail stays with it"
+                    )
+                );
+                active
+            }
             ClaimActivity::Appended => {
                 ui::error(&format!(
                     "{slug}@{branch} already has unsettled content in {} {}.",
@@ -1477,6 +1486,56 @@ enum ClaimActivity {
     Appended,
     Rewritten,
     Unverifiable,
+}
+
+/// Whether what a claim holds beyond its settled prefix is runtime bookkeeping only.
+///
+/// A runtime keeps writing after the last turn is settled: applied thread settings, token
+/// counts and similar records that carry no prompt, reply or tool activity. Materializing the
+/// branch elsewhere loses nothing of them, whereas refusing on them alone leaves a fully
+/// settled branch unresumable under another runtime until the runtime writes a turn that can
+/// be settled. Every record of the tail must be one its adapter recognizes as bookkeeping: a
+/// conversational record, an unknown shape or a partial line is unsettled work and keeps the
+/// refusal. An unreadable transcript is not bookkeeping.
+fn tail_is_bookkeeping(committed_log: &str, link: &Link) -> crate::Result<bool> {
+    let Ok(live) = link.read() else {
+        return Ok(false);
+    };
+    let tail = match link.baseline_bytes {
+        Some(baseline) => usize::try_from(baseline)
+            .ok()
+            .and_then(|offset| live.get(offset..)),
+        None => Some(unsettled_native_tail(committed_log, &live)),
+    };
+    let Some(tail) = tail else {
+        return Ok(false);
+    };
+    let adapter = adapter::get(&link.source)?;
+    Ok(tail
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| adapter.is_runtime_bookkeeping(&record))
+        }))
+}
+
+/// The live text past the committed envelopes, counted with the same parseable-line ruler as
+/// the continuity check: an unparseable partial line at the end belongs to the tail.
+fn unsettled_native_tail<'a>(committed_log: &str, live: &'a str) -> &'a str {
+    let settled = transcript::envelope_hashes(committed_log).len();
+    let mut seen = 0;
+    let mut offset = 0;
+    for line in live.split_inclusive('\n') {
+        if seen == settled {
+            break;
+        }
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            seen += 1;
+        }
+        offset += line.len();
+    }
+    &live[offset..]
 }
 
 /// Merge replaces local writers only after their complete evidence is represented in history.
@@ -1912,7 +1971,10 @@ fn materialize_and_resume(
     lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&materialized)));
     for (_, current) in &locked_supersede {
         if !args.force {
-            let activity = claim_activity(repo, committed_log, current)?;
+            let mut activity = claim_activity(repo, committed_log, current)?;
+            if activity == ClaimActivity::Appended && tail_is_bookkeeping(committed_log, current)? {
+                activity = ClaimActivity::Untouched;
+            }
             if activity != ClaimActivity::Untouched {
                 ui::warning(&format!(
                     "the prepared {} session {} was left unclaimed; `agit status --check-missing` can find it",
