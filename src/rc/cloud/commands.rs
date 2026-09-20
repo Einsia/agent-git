@@ -14,13 +14,6 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Register this daemon namespace and allow inbound cloud connections.
-    Enroll {
-        #[arg(long)]
-        hub: String,
-        #[arg(long)]
-        name: Option<String>,
-    },
     /// Discover devices this cloud account may connect to.
     Devices {
         #[arg(long)]
@@ -82,7 +75,6 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
         .build()?;
     let value = runtime.block_on(async move {
         match args.action {
-            Action::Enroll { hub, name } => enroll(&hub, name).await,
             Action::Devices { hub, after } => {
                 let api = Client::new(&hub)?;
                 let token = super::account_token(api.origin(), false).await?;

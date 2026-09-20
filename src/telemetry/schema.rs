@@ -448,7 +448,6 @@ mod tests {
     #[test]
     fn cloud_telemetry_keeps_permission_enums_without_endpoint_or_resource_values() {
         for args in [
-            vec!["enroll", "--name", "private-canary"],
             vec!["devices", "--after", "private-canary"],
             vec!["status"],
             vec![

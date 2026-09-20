@@ -30,8 +30,8 @@ not enable inbound Cloud access. `agit rc cloud inbound --hub <origin> --enabled
 disables inbound access independently of outgoing control.
 
 Advanced device management: `agit rc list`, `agit rc revoke <device-id>`, and `agit rc cloud
-status --hub <origin>`. `cloud enroll` is an explicit registration tool; ordinary startup
-performs registration automatically. SSH uses `agit rc local bridge --ensure`.
+status --hub <origin>`. Registration is performed by `agit rc start`; there is no separate
+enrollment command. SSH uses `agit rc local bridge --ensure`.
 
 The peer executor supports native Windows, Linux and macOS. Windows uses a current-user local
 named pipe for owner RPC; Unix systems use a current-user local socket. Cloud peers use the

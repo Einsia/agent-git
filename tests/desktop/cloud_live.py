@@ -91,10 +91,7 @@ async def run(args, login):
         await remote(args, {}, "test", "!", "-e", remote_root + "/agit/desktop-rc/control.rpc")
         await remote(args, target_env, args.remote_binary, "login", "--hub", args.hub, "--with-token", input=token.encode())
         target_login = True
-        enrolled = json.loads(await remote(args, target_env, args.remote_binary, "rc", "cloud", "enroll", "--hub", args.hub, "--name", "Cloud acceptance executor"))
-        target_device = enrolled["device"]
-        devices.append(target_device["id"])
-        await remote(args, target_env, args.remote_binary, "rc", "local", "start", "--detach")
+        await remote(args, target_env, args.remote_binary, "rc", "start", "--detach")
         remote_started = True
         async def target_ready():
             try:
@@ -110,12 +107,16 @@ async def run(args, login):
             return (root / "agit/desktop-rc/control.rpc").exists()
         await eventually(source_ready, "local controller did not become ready")
         controller = await Client().connect(args.binary, environment, journal)
-        source = await controller.rpc("peer.cloud", operation="enroll", hub=args.hub, name="Cloud acceptance controller")
-        devices.append(source["device"]["id"])
+        target_device = None
         async def online():
+            nonlocal target_device
             page = await controller.rpc("peer.cloud", operation="devices", hub=args.hub)
-            return any(row["device"]["id"] == target_device["id"] and row["online"] for row in page["devices"])
+            if not page["devices"]:
+                return False
+            target_device = page["devices"][0]["device"]
+            return page["devices"][0]["online"]
         await eventually(online, "remote outbound presence did not reach dev", timeout=60)
+        assert target_device is not None
         config = dict(peer_id="target", hub=args.hub, target=target_device)
         connected = await controller.rpc("peer.connect_cloud", **config)
         assert connected["description"]["instance_id"] == target["instance_id"]

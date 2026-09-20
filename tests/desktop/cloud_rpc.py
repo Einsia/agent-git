@@ -1,7 +1,7 @@
 """Exercise the backend relay with real daemons, OS workers, and a fixture harness.
 
 The backend's opt-in cloud_peer_process_chain test supplies a disposable account
-token through stdin. Normal login and enrollment commands own credential files.
+    token through stdin. Normal login and peer startup own credential files.
 """
 import asyncio
 import json
@@ -154,7 +154,11 @@ async def run(binary, hub, account, token):
             await command(binary, env, "login", "--hub", hub, "--with-token", input=token.encode())
             log = (root / (name + ".log")).open("w")
             logs.append(log)
-            daemon = await asyncio.create_subprocess_exec(binary, "rc", "local", "start", env=env, stdout=log, stderr=log)
+            # Keep both test daemons in the process tree so cleanup can terminate them.
+            # The executor's foreground start still exercises the same automatic peer registration
+            # as `rc start --detach` without relying on a detached child that the fixture cannot own.
+            start_action = ("start",) if name == "executor" else ("local", "start")
+            daemon = await asyncio.create_subprocess_exec(binary, "rc", *start_action, env=env, stdout=log, stderr=log)
             daemons.append(daemon)
             async def ready():
                 assert daemon.returncode is None, "isolated daemon exited"
@@ -164,8 +168,6 @@ async def run(binary, hub, account, token):
             logs.append(journal)
             client = await Client().connect(binary, env, journal)
             clients.append(client)
-            if name == "executor":
-                await client.rpc("peer.cloud", operation="enroll", hub=hub, name=name)
         controller, executor = clients
         local = await controller.rpc("machine.describe")
         target = await executor.rpc("machine.describe")
@@ -235,7 +237,7 @@ async def run(binary, hub, account, token):
         catalog = await controller.peer("session.list", include_local=False)
         assert not any(row["session_id"] == session for row in catalog["sessions"])
         assert (await executor.rpc("machine.describe"))["instance_id"] == target["instance_id"]
-        print("PASS: enrollment, outbound presence, encrypted relay, distinct daemon and worker processes", flush=True)
+        print("PASS: peer startup, outbound presence, encrypted relay, distinct daemon and worker processes", flush=True)
         print("PASS: native launch, turn receipt, events, history, worker recovery, session replay and executor denial", flush=True)
     finally:
         for client in clients:

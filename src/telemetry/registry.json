@@ -59,7 +59,6 @@
     "rc": {"aliases":[],"args":{}},
     "rc cloud": {"aliases":[],"args":{}},
     "rc cloud devices": {"aliases":[],"args":{"after":{"action":"Set","policy":"presence"},"hub":{"action":"Set","policy":"presence"}}},
-    "rc cloud enroll": {"aliases":[],"args":{"hub":{"action":"Set","policy":"presence"},"name":{"action":"Set","policy":"presence"}}},
     "rc cloud inbound": {"aliases":[],"args":{"hub":{"action":"Set","policy":"presence"},"enabled":{"action":"Set","policy":"enum","values":["true","false"]}}},
     "rc cloud grant": {"aliases":[],"args":{"access":{"action":"Set","policy":"enum","values":["deny","read","control","admin"]},"account":{"action":"Set","policy":"presence"},"hub":{"action":"Set","policy":"presence"},"resource":{"action":"Set","policy":"presence"}}},
     "rc cloud policy": {"aliases":[],"args":{}},

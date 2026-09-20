@@ -38,7 +38,6 @@ impl Clients {
 pub enum OwnerRequest {
     Status { hub: String },
     Devices { hub: String, after: Option<String> },
-    Enroll { hub: String, name: Option<String> },
     Inbound { hub: String, enabled: bool },
 }
 
@@ -63,7 +62,6 @@ pub async fn manage(clients: &Clients, request: OwnerRequest) -> crate::Result<s
             };
             Ok(serde_json::to_value(page)?)
         }
-        OwnerRequest::Enroll { hub, name } => commands::enroll(&hub, name).await,
         OwnerRequest::Inbound { hub, enabled } => commands::inbound(&hub, enabled).await,
     }
 }
