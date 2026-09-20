@@ -41,6 +41,8 @@ struct Candidate {
     here: bool,
     ambiguous: bool,
     gist: Option<String>,
+    /// The runtime's own name for the session, when its index records one.
+    title: Option<String>,
     last_active: SystemTime,
     live: bool,
 }
@@ -56,9 +58,10 @@ impl Candidate {
 
     fn haystack(&self, preview: Option<&selector::Preview>) -> String {
         format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             self.runtime,
             self.session_id,
+            self.title.as_deref().unwrap_or_default(),
             preview
                 .and_then(|preview| preview.gist.as_deref())
                 .or(self.gist.as_deref())
@@ -68,6 +71,14 @@ impl Candidate {
                 .or_else(|| preview.and_then(|preview| preview.cwd.as_deref()))
                 .unwrap_or_default()
         )
+    }
+
+    /// A pasted Codex deep link selects exactly that thread; any other query is free text.
+    fn matches(&self, filter: &Filter, preview: Option<&selector::Preview>) -> bool {
+        match crate::adapter::codex::thread_link_id(filter.query()) {
+            Some(id) => self.runtime == "codex" && self.session_id == id,
+            None => filter.matches(&self.haystack(preview)),
+        }
     }
 }
 
@@ -242,6 +253,7 @@ fn candidates_from_rows(
                 cwd: session.cwd,
                 ambiguous,
                 gist: session.gist,
+                title: session.title,
                 last_active: session.mtime,
                 live: sessions::is_live(session.mtime, now),
             }
@@ -404,7 +416,7 @@ fn run_loop(
             .filter(|candidate| {
                 let cached = previews.get(&candidate.key());
                 scope.includes(&candidate.runtime, candidate.here)
-                    && session_filter.matches(&candidate.haystack(cached))
+                    && candidate.matches(&session_filter, cached)
             })
             .collect();
         let repo_view: Vec<&repos::Row> = repos
@@ -921,20 +933,28 @@ fn row_lines(
 ) -> Vec<Line<'static>> {
     let width = area.width.saturating_sub(4) as usize;
     let live = if candidate.live { " · active" } else { "" };
+    let identity = format!(
+        "{}  {}",
+        candidate.runtime,
+        link::short(&candidate.session_id)
+    );
+    // A native name leads the row; runtime and id then sit next to the project so the
+    // identity `agit import` needs stays on screen.
+    let (lead, detail) = match &candidate.title {
+        Some(title) => (title.clone(), format!("{identity} · ")),
+        None => (identity, String::new()),
+    };
     let mut lines = vec![widgets::clamp_line(
         Line::from(format!(
-            "{}  {}  {}{}",
-            candidate.runtime,
-            link::short(&candidate.session_id),
-            crate::ui::ago(candidate.last_active),
-            live
+            "{lead}  {}{live}",
+            crate::ui::ago(candidate.last_active)
         )),
         width,
     )];
     lines.push(widgets::clamp_line(
         Line::from(Span::styled(
             format!(
-                "  {}",
+                "  {detail}{}",
                 selector::project_label(
                     candidate
                         .cwd
@@ -949,6 +969,7 @@ fn row_lines(
     if let Some(preview) = preview
         .and_then(|preview| preview.gist.as_deref())
         .or(candidate.gist.as_deref())
+        .filter(|gist| candidate.title.as_deref() != Some(*gist))
     {
         lines.push(widgets::clamp_line(
             Line::from(Span::styled(format!("  {preview}"), theme::muted())),
@@ -1002,6 +1023,9 @@ fn detail_text(
         }
     ));
     out.push_str(&format!("runtime    {}\n", candidate.runtime));
+    if let Some(title) = &candidate.title {
+        out.push_str(&format!("name       {title}\n"));
+    }
     out.push_str(&format!(
         "project    {}\n",
         selector::project_label(
@@ -1061,6 +1085,7 @@ mod tests {
             ambiguous: false,
             session_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
             gist: Some("fix the retry path".into()),
+            title: None,
             last_active: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
             live,
         }
@@ -1383,5 +1408,73 @@ mod tests {
             Focus::Sessions
         );
         assert_eq!(previous_stage(Focus::Sessions), Focus::Repos);
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn candidate(id: &str, title: Option<&str>) -> Candidate {
+        Candidate {
+            runtime: "codex".into(),
+            path: "/missing".into(),
+            cwd: Some("/work".into()),
+            here: true,
+            ambiguous: false,
+            session_id: id.into(),
+            gist: Some("fix the retry path".into()),
+            title: title.map(str::to_owned),
+            last_active: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            live: false,
+        }
+    }
+
+    /// A named candidate leads with its name and keeps runtime and id on the detail line; an
+    /// unnamed one keeps the identity-first row unchanged.
+    #[test]
+    fn a_named_candidate_leads_with_its_name_and_keeps_its_identity() {
+        let area = Rect::new(0, 0, 80, 12);
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let named: Vec<String> = row_lines(&candidate(id, Some("CLI release")), None, area)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(named[0].contains("CLI release"), "{named:?}");
+        assert!(!named[0].contains("aaaaaaaa"), "{named:?}");
+        assert!(named[1].contains("codex  aaaaaaaa-000"), "{named:?}");
+        let anonymous: Vec<String> = row_lines(&candidate(id, None), None, area)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            anonymous[0].contains("codex  aaaaaaaa-000"),
+            "{anonymous:?}"
+        );
+        assert!(!anonymous[1].contains("aaaaaaaa"), "{anonymous:?}");
+    }
+
+    /// A pasted Codex deep link selects exactly its thread, while free text keeps matching the
+    /// name, id, prompt and project.
+    #[test]
+    fn a_pasted_thread_link_selects_exactly_that_thread() {
+        let wanted = "aaaaaaaa-0000-4000-8000-000000000001";
+        let other = "aaaaaaaa-0000-4000-8000-000000000002";
+        let mut filter = Filter::default();
+        filter.open();
+        for ch in format!("codex://threads/{wanted}").chars() {
+            filter.push(ch);
+        }
+        assert!(candidate(wanted, Some("CLI release")).matches(&filter, None));
+        assert!(!candidate(other, Some("CLI release")).matches(&filter, None));
+
+        let mut by_name = Filter::default();
+        by_name.open();
+        for ch in "cli rel".chars() {
+            by_name.push(ch);
+        }
+        assert!(candidate(other, Some("CLI release")).matches(&by_name, None));
+        assert!(!candidate(other, None).matches(&by_name, None));
     }
 }

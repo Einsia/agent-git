@@ -436,6 +436,43 @@ pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
 ///
 /// mtime comes from the database's `updated_at_ms` rather than a stat of the file — sorting must
 /// not stat tens of thousands of files (that is exactly the cost this path removes).
+/// Human-facing rows: internal runtimes are dropped and every row carries its native name.
+///
+/// The name Codex shows in its own session list outranks a legacy index rename, which outranks
+/// the generated title; the newest store a user can edit is the one they expect to see back.
+fn named_choices(threads: Vec<super::codex_index::Thread>) -> Vec<SessionRef> {
+    let names: std::collections::HashMap<String, String> = threads
+        .iter()
+        .filter_map(|thread| Some((thread.id.clone(), thread.name.clone()?)))
+        .collect();
+    let mut sessions: Vec<_> = threads
+        .into_iter()
+        .filter(is_user_thread)
+        .map(thread_to_ref)
+        .collect();
+    if let Ok(home) = codex_home() {
+        super::codex_titles::apply_names(&home.join("session_index.jsonl"), &mut sessions);
+    }
+    for session in &mut sessions {
+        if let Some(name) = names.get(&session.id) {
+            session.title = Some(name.clone());
+        }
+    }
+    sessions
+}
+
+/// The thread id inside a Codex deep link (`codex://threads/<id>`), as pasted from the app.
+#[cfg(feature = "cli")]
+pub(crate) fn thread_link_id(reference: &str) -> Option<&str> {
+    let rest = reference.trim().strip_prefix("codex://threads/")?;
+    let id = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!id.is_empty()).then_some(id)
+}
+
 fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
     let mtime = t
         .updated_at_ms
@@ -443,7 +480,7 @@ fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
         .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     SessionRef {
-        title: t.title,
+        title: t.name.or(t.title),
         id: t.id,
         path: t.rollout_path,
         runtime: "codex",
@@ -583,19 +620,21 @@ impl Adapter for Codex {
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         let want = repo.to_string_lossy();
         if let Some(threads) = super::codex_index::session_choices_for_cwd(&want) {
-            let mut sessions: Vec<_> = threads
-                .into_iter()
-                .filter(is_user_thread)
-                .map(thread_to_ref)
-                .collect();
-            if let Ok(home) = codex_home() {
-                super::codex_titles::apply_names(&home.join("session_index.jsonl"), &mut sessions);
-            }
-            return Ok(sessions);
+            return Ok(named_choices(threads));
         }
         Ok(scan_all_sessions(true)?
             .into_iter()
             .filter(|session| session.cwd.as_deref() == Some(want.as_ref()))
+            .filter(|session| !super::session_visibility::internal_codex_file(&session.path))
+            .collect())
+    }
+
+    fn all_session_choices(&self) -> Result<Vec<SessionRef>> {
+        if let Some(threads) = super::codex_index::all_threads() {
+            return Ok(named_choices(threads));
+        }
+        Ok(scan_all_sessions(true)?
+            .into_iter()
             .filter(|session| !super::session_visibility::internal_codex_file(&session.path))
             .collect())
     }
@@ -606,7 +645,9 @@ impl Adapter for Codex {
                 record["payload"]["type"].as_str(),
                 Some("thread_settings_applied" | "token_count")
             ),
-            Some("token_usage_record") => true,
+            // A turn's context and the world state are written around turns and carry no
+            // prompt, reply or tool activity of their own.
+            Some("token_usage_record" | "turn_context" | "world_state") => true,
             _ => false,
         }
     }
@@ -2721,6 +2762,8 @@ mod bookkeeping_tests {
             serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}}),
             serde_json::json!({"type":"token_usage_record","payload":{}}),
+            serde_json::json!({"type":"turn_context","payload":{"cwd":"/w","model":"m"}}),
+            serde_json::json!({"type":"world_state","payload":{}}),
         ] {
             assert!(codex.is_runtime_bookkeeping(&record), "{record}");
         }

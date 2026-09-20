@@ -91,6 +91,8 @@ pub struct Row {
     pub here: bool,
     /// An indexed opening prompt or an advisory prompt from a bounded opening window.
     pub gist: Option<String>,
+    /// The runtime's own name for the session, when its index records one.
+    pub title: Option<String>,
     pub last_active: SystemTime,
     /// The transcript is still growing — a second writer must not take it over.
     pub live: bool,
@@ -106,6 +108,7 @@ impl Row {
             &self.runtime,
             self.cwd.as_deref().unwrap_or_default(),
             self.gist.as_deref().unwrap_or_default(),
+            self.title.as_deref().unwrap_or_default(),
         ]
         .join(" ")
     }
@@ -119,6 +122,7 @@ pub struct Seen {
     pub runtime: String,
     pub mtime: SystemTime,
     pub gist: Option<String>,
+    pub title: Option<String>,
     /// When unadopted: whether this session is worth asking the user to name
     /// ([`worth_naming`]'s verdict).
     pub worth_naming: bool,
@@ -132,6 +136,7 @@ impl Seen {
             runtime: sr.runtime.to_string(),
             mtime: sr.mtime,
             gist: sr.gist.clone(),
+            title: sr.title.clone(),
             worth_naming,
         }
     }
@@ -230,6 +235,7 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
             runtime: l.source.clone(),
             session_id: Some(l.session_id.clone()),
             gist: s.and_then(|s| s.gist.clone()),
+            title: s.and_then(|s| s.title.clone()),
             // With no index entry (the transcript was deleted or moved), the link's own time
             // keeps the row off the bottom.
             last_active: s.map(|s| s.mtime).unwrap_or(a.touched),
@@ -284,6 +290,7 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
             runtime: s.runtime.clone(),
             session_id: Some(s.id.clone()),
             gist: s.gist.clone(),
+            title: s.title.clone(),
             last_active: s.mtime,
             live: is_live(s.mtime, now),
         });
@@ -312,6 +319,7 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
             cwd: sr.cwd.clone(),
             here: true,
             gist: None,
+            title: None,
             last_active: sr.last_active,
             // With no session for it on this machine there is no transcript to collide with;
             // with one, the same window applies, and an unreadable time always counts as live —
@@ -447,7 +455,9 @@ fn gather(cwd: &Path, now: SystemTime, all_projects: bool) -> Input {
 /// Gather runtime-index rows and apply the naming probe budget on one recency axis.
 ///
 /// Every TUI that offers unmanaged sessions uses this path so opening a screen cannot multiply
-/// transcript reads by the number of candidates in the directory.
+/// transcript reads by the number of candidates in the directory. Rows come from the runtimes'
+/// human-facing choice lists: approval and subagent threads never compete for a name, and each
+/// row carries the name its runtime already shows for it.
 pub(super) fn probe_sessions_for_scope(
     cwd: &Path,
     links: &[&Link],
@@ -458,7 +468,7 @@ pub(super) fn probe_sessions_for_scope(
         let Ok(ad) = crate::adapter::get(rt) else {
             continue;
         };
-        let here = ad.sessions_for(cwd).unwrap_or_default();
+        let here = ad.session_choices_for(cwd).unwrap_or_default();
         let mut known: std::collections::HashSet<_> = here
             .iter()
             .map(|row| (row.id.clone(), row.path.clone()))
@@ -466,7 +476,7 @@ pub(super) fn probe_sessions_for_scope(
         refs.extend(here);
         if all_projects {
             refs.extend(
-                ad.all_sessions()
+                ad.all_session_choices()
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|row| known.insert((row.id.clone(), row.path.clone()))),
@@ -1030,10 +1040,12 @@ fn row_line(r: &Row, width: usize) -> Line<'static> {
     let (badge_color, name) = match r.badge {
         Badge::Unnamed => (
             theme::WARN,
-            r.session_id
-                .as_deref()
-                .map(crate::domain::link::short)
-                .unwrap_or_default(),
+            r.title.clone().unwrap_or_else(|| {
+                r.session_id
+                    .as_deref()
+                    .map(crate::domain::link::short)
+                    .unwrap_or_default()
+            }),
         ),
         _ => (
             theme::MUTED,
@@ -1062,11 +1074,18 @@ fn row_line(r: &Row, width: usize) -> Line<'static> {
 }
 
 fn project_line(row: &Row, width: usize) -> Line<'static> {
+    // A name on the first line displaces the id, which must stay visible for `agit import`.
+    let identity = match (&row.title, &row.session_id) {
+        (Some(_), Some(id)) if row.badge == Badge::Unnamed => {
+            format!("{} {}", row.runtime, crate::domain::link::short(id))
+        }
+        _ => row.runtime.clone(),
+    };
     widgets::clamp_line(
         Line::from(Span::styled(
             format!(
                 "  {} · {} · {}",
-                row.runtime,
+                identity,
                 super::selector::project_label(row.cwd.as_deref()),
                 crate::ui::truncate(row.gist.as_deref().unwrap_or("preview unavailable"), 60)
             ),
@@ -1093,6 +1112,9 @@ fn detail_text(r: Option<&Row>, notice: Option<&str>) -> String {
     }
     if !r.runtime.is_empty() {
         out.push_str(&format!("runtime  {}\n", r.runtime));
+    }
+    if let Some(title) = &r.title {
+        out.push_str(&format!("name     {title}\n"));
     }
     if let Some(id) = &r.session_id {
         out.push_str(&format!("session  {}\n", crate::domain::link::short(id)));
@@ -1127,6 +1149,7 @@ mod tests {
             runtime: "claude-code".into(),
             mtime: t(at),
             gist: None,
+            title: None,
             worth_naming: true,
         }
     }
@@ -1954,5 +1977,57 @@ mod tests {
                 assert!(text.contains("/work"), "{text}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn seen(title: Option<&str>) -> Seen {
+        Seen {
+            cwd: Some("/w".into()),
+            id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            runtime: "codex".into(),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            gist: Some("opening prompt".into()),
+            title: title.map(str::to_owned),
+            worth_naming: true,
+        }
+    }
+
+    /// A native name leads the unnamed row while the id moves to the detail line: a row the
+    /// user recognizes must still show the identity `agit import` needs.
+    #[test]
+    fn an_unnamed_row_leads_with_its_native_name_and_keeps_its_id() {
+        let named = assemble(
+            &Input {
+                cwd: "/w".into(),
+                seen: vec![seen(Some("CLI release"))],
+                ..Default::default()
+            },
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+        );
+        assert_eq!(named[0].title.as_deref(), Some("CLI release"));
+        let lead = row_line(&named[0], 80).to_string();
+        assert!(lead.contains("CLI release"), "{lead}");
+        assert!(!lead.contains("aaaaaaaa"), "{lead}");
+        let detail = project_line(&named[0], 80).to_string();
+        assert!(detail.contains("codex aaaaaaaa-000"), "{detail}");
+        assert!(named[0].haystack().contains("CLI release"));
+
+        let anonymous = assemble(
+            &Input {
+                cwd: "/w".into(),
+                seen: vec![seen(None)],
+                ..Default::default()
+            },
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+        );
+        let lead = row_line(&anonymous[0], 80).to_string();
+        assert!(lead.contains("aaaaaaaa-000"), "{lead}");
+        let detail = project_line(&anonymous[0], 80).to_string();
+        assert!(!detail.contains("aaaaaaaa"), "{detail}");
     }
 }

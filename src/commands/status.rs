@@ -516,7 +516,8 @@ fn uncaptured(links: &[link::Link], complete: bool) -> Discovery {
         let Ok(ad) = crate::adapter::get(rt) else {
             continue;
         };
-        let sessions = match ad.sessions_for(&repo) {
+        // Unadopted sessions are offered for naming; runtime bookkeeping is not.
+        let sessions = match ad.session_choices_for(&repo) {
             Ok(sessions) => sessions,
             Err(error) => {
                 out.errors.push(IndexError {

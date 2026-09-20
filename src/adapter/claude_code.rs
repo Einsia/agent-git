@@ -32,6 +32,16 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
+/// Nested subagents are outside collect_dir; legacy agent files can be siblings.
+fn is_user_session(session: &SessionRef) -> bool {
+    !session.id.starts_with("agent-")
+        && !super::session_visibility::has_internal_metadata(&session.path, |record| {
+            record
+                .get("isSidechain")
+                .and_then(serde_json::Value::as_bool)
+        })
+}
+
 pub(crate) fn projects_dir() -> Result<PathBuf> {
     projects_dir_from(
         std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
@@ -141,15 +151,15 @@ impl Adapter for ClaudeCode {
         Ok(self
             .sessions_for(repo)?
             .into_iter()
-            .filter(|session| {
-                // Nested subagents are outside collect_dir; legacy agent files can be siblings.
-                !session.id.starts_with("agent-")
-                    && !super::session_visibility::has_internal_metadata(&session.path, |record| {
-                        record
-                            .get("isSidechain")
-                            .and_then(serde_json::Value::as_bool)
-                    })
-            })
+            .filter(is_user_session)
+            .collect())
+    }
+
+    fn all_session_choices(&self) -> Result<Vec<SessionRef>> {
+        Ok(self
+            .all_sessions()?
+            .into_iter()
+            .filter(is_user_session)
             .collect())
     }
 

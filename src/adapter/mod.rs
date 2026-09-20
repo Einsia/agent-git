@@ -692,6 +692,12 @@ pub trait Adapter {
     /// For `doctor` to check for missed captures. More expensive than `sessions_for`.
     fn all_sessions(&self) -> Result<Vec<SessionRef>>;
 
+    /// Human-facing choices across every project: [`Self::all_sessions`] minus the runtime
+    /// bookkeeping [`Self::session_choices_for`] omits.
+    fn all_session_choices(&self) -> Result<Vec<SessionRef>> {
+        self.all_sessions()
+    }
+
     fn parse(&self, text: &str) -> Result<Session>;
 
     /// Parse from a **path**.

@@ -455,16 +455,23 @@ fn row_lines(row: &sessions::Row, area: Rect) -> Vec<Line<'static>> {
         .map(crate::domain::link::short)
         .unwrap_or_default();
     let active = crate::ui::ago(row.last_active);
-    let identity = format!("{}  {id}", row.runtime);
-    let identity =
-        widgets::truncate_cols(&identity, width.saturating_sub(widgets::cols(&active) + 2));
+    // A native name leads; the runtime and id then move next to the project so the row a
+    // user recognizes is also the one `agit import <id>` names.
+    let (lead, detail) = match &row.title {
+        Some(title) => (title.clone(), format!("{}  {id} · ", row.runtime)),
+        None => (format!("{}  {id}", row.runtime), String::new()),
+    };
+    let lead = widgets::truncate_cols(&lead, width.saturating_sub(widgets::cols(&active) + 2));
     let mut lines = vec![widgets::clamp_line(
-        Line::from(format!("{identity}  {active}")),
+        Line::from(format!("{lead}  {active}")),
         width,
     )];
     lines.push(widgets::clamp_line(
         Line::from(Span::styled(
-            format!("  {}", super::selector::project_label(row.cwd.as_deref())),
+            format!(
+                "  {detail}{}",
+                super::selector::project_label(row.cwd.as_deref())
+            ),
             theme::muted(),
         )),
         width,
@@ -497,6 +504,9 @@ fn detail_text(
         out.push_str("\n\n");
     }
     out.push_str(&format!("runtime  {}\n", row.runtime));
+    if let Some(title) = &row.title {
+        out.push_str(&format!("name     {title}\n"));
+    }
     out.push_str(&format!(
         "project  {}\n",
         super::selector::project_label(row.cwd.as_deref())
@@ -549,6 +559,7 @@ mod tests {
             runtime: runtime.into(),
             session_id: Some(id.into()),
             gist: Some("fix the retry path".into()),
+            title: None,
             last_active: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
             live,
         }
@@ -623,6 +634,7 @@ mod tests {
                 cwd: Some("/work".into()),
                 mtime: SystemTime::UNIX_EPOCH,
                 gist: None,
+                title: None,
                 worth_naming,
             })
             .collect(),

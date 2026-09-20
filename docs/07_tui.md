@@ -335,8 +335,15 @@ session stage; the user may still retreat to inspect it. With none, the repo
 stage states that versioned adoption requires `agit init` and leaves
 `link-only` available.
 
-Each session row shows runtime, short id, opening prompt and relative last
-activity, and the rows are ordered newest first. "Last activity" is the runtime
+Each session row leads with the name the runtime itself shows for the session
+when its index records one (Codex thread names), otherwise with runtime and
+short id; the project directory, the opening prompt and relative last activity
+follow, and the rows are ordered newest first. The id stays on the row either
+way, because it is what `agit import <id>` names. Runtime bookkeeping such as
+Codex approval and subagent threads or Claude Code sidechains is not offered;
+an explicit id still imports it. A Codex deep link (`codex://threads/<id>`)
+pasted into the filter selects exactly that thread, and `agit import` accepts
+the same link in place of the id. "Last activity" is the runtime
 index's update time when it provides one, otherwise the transcript's modified
 time; it is not a separately recorded "last resumed" event. The `●` live marker
 uses the same timestamp and conservative live window. A session that still

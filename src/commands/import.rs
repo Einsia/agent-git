@@ -1396,8 +1396,19 @@ pub(super) fn declare_session_line(
     Ok(Some(commit))
 }
 
-/// Find a session by id or prefix. **Does not open the transcript file.**
+/// Find a session by id, prefix or Codex deep link. **Does not open the transcript file.**
 fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
+    let (selector, from) = match crate::adapter::codex::thread_link_id(selector) {
+        Some(id) => {
+            if from.is_some_and(|runtime| adapter::normalize(runtime).ok() != Some("codex")) {
+                ui::error("a codex://threads/ link names a Codex thread; `--from` disagrees.");
+                ui::hint("drop `--from`, or pass the bare session id with the runtime you mean");
+                return Ok(Pick::Explained(ExitCode::Usage));
+            }
+            (id, Some("codex"))
+        }
+        None => (selector, from),
+    };
     let runtimes: Vec<&'static str> = match from {
         Some(r) => vec![crate::input_argument(adapter::normalize(r))?],
         None => adapter::RUNTIMES.to_vec(),
@@ -1560,7 +1571,8 @@ fn protect_privacy_copy(found: &Found, root: &Path) -> crate::Result<()> {
 /// yet.
 ///
 /// Candidates come from the runtime index (Codex queries the `threads` table, Claude Code reads
-/// the directory), with **no transcript opened**.
+/// the directory), with **no transcript opened**. Only human-facing choices are offered: an
+/// approval or subagent thread is still importable by its explicit id.
 fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
     pick_here_with_preview(store, args, true)
 }
@@ -1592,9 +1604,9 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
             continue;
         }
         let Ok(ad) = adapter::get(rt) else { continue };
-        for sr in ad.sessions_for(&repo).unwrap_or_default() {
+        for sr in ad.session_choices_for(&repo).unwrap_or_default() {
             if !known.contains(&(ad.id(), sr.id.as_str())) {
-                cands.push((ad.id(), sr.path, sr.id, sr.gist, sr.mtime));
+                cands.push((ad.id(), sr.path, sr.id, sr.gist, sr.mtime, sr.title));
             }
         }
     }
@@ -1626,7 +1638,7 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
                 && std::env::var_os("CI").is_none()));
     let labels: Vec<String> = cands
         .iter()
-        .map(|(rt, p, id, indexed_gist, _)| {
+        .map(|(rt, p, id, indexed_gist, _, title)| {
             let gist = indexed_gist
                 .clone()
                 .or_else(|| {
@@ -1642,7 +1654,10 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
             } else {
                 id.clone()
             };
-            format!("{rt:12} {identity}  \"{gist}\"")
+            match title {
+                Some(title) => format!("{rt:12} {identity}  {title}  \"{gist}\""),
+                None => format!("{rt:12} {identity}  \"{gist}\""),
+            }
         })
         .collect();
 
@@ -1659,7 +1674,7 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
 
     match ui::prompt::select("which session to adopt?", &refs)? {
         Some(i) => {
-            let (rt, _, id, _, _) = &cands[i];
+            let (rt, _, id, _, _, _) = &cands[i];
             Ok(Pick::One(Found {
                 runtime: rt,
                 session_id: id.clone(),

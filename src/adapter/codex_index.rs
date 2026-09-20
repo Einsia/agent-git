@@ -11,7 +11,7 @@
 //! ```text
 //! threads: 18779 rows
 //!   id, rollout_path, cwd, git_origin_url, git_branch, git_sha,
-//!   first_user_message, preview, title, tokens_used, archived,
+//!   first_user_message, preview, title, name, tokens_used, archived,
 //!   created_at/updated_at(_ms), source, model, thread_source, history_mode
 //! ```
 //!
@@ -52,6 +52,9 @@ pub struct Thread {
     pub updated_at_ms: Option<i64>,
     /// A bounded native title; missing or blank metadata is absent.
     pub title: Option<String>,
+    /// The bounded thread name Codex shows in its own session list; absent when the index has
+    /// no such column or the value is blank.
+    pub name: Option<String>,
 }
 
 /// Find the newest state database.
@@ -117,20 +120,30 @@ fn select(con: &Connection) -> String {
     } else {
         "NULL"
     };
-    let title = if con.prepare("SELECT title FROM threads LIMIT 0").is_ok() {
+    let title = bounded_text_column(con, "title");
+    let name = bounded_text_column(con, "name");
+    format!(
+        "SELECT id, rollout_path, cwd, \
+         CASE WHEN typeof(first_user_message) = 'text' THEN substr(first_user_message, 1, {}) END, thread_source, \
+         updated_at_ms, {source}, {title}, {name} FROM threads",
+        GIST_SOURCE_CHARS + 1
+    )
+}
+
+/// A text column older indexes can lack, clipped in SQL so a long value never crosses the
+/// process boundary in full.
+fn bounded_text_column(con: &Connection, column: &str) -> String {
+    if con
+        .prepare(&format!("SELECT {column} FROM threads LIMIT 0"))
+        .is_ok()
+    {
         format!(
-            "CASE WHEN typeof(title) = 'text' THEN substr(title, 1, {}) END",
+            "CASE WHEN typeof({column}) = 'text' THEN substr({column}, 1, {}) END",
             GIST_SOURCE_CHARS + 1
         )
     } else {
         "NULL".into()
-    };
-    format!(
-        "SELECT id, rollout_path, cwd, \
-         CASE WHEN typeof(first_user_message) = 'text' THEN substr(first_user_message, 1, {}) END, thread_source, \
-         updated_at_ms, {source}, {title} FROM threads",
-        GIST_SOURCE_CHARS + 1
-    )
+    }
 }
 
 fn opening_preview(text: String) -> String {
@@ -156,6 +169,10 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
             .get::<_, String>(7)
             .ok()
             .and_then(|title| super::codex_titles::preview(&title)),
+        name: r
+            .get::<_, String>(8)
+            .ok()
+            .and_then(|name| super::codex_titles::preview(&name)),
     })
 }
 
@@ -505,6 +522,51 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(stored, title);
+        }
+    }
+
+    #[test]
+    fn names_are_optional_bounded_text_independent_of_titles() {
+        let (_directory, path) = fixture();
+        assert!(
+            q_cwd(&path, "/repo/one")
+                .iter()
+                .all(|row| row.name.is_none())
+        );
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch(
+            "ALTER TABLE threads ADD COLUMN name; ALTER TABLE threads ADD COLUMN title;",
+        )
+        .unwrap();
+        con.execute(
+            "UPDATE threads SET name = 'Retry path', title = 'fix rotation' WHERE id = 'id-a'",
+            [],
+        )
+        .unwrap();
+        let listed = q_cwd(&path, "/repo/one");
+        assert_eq!(listed[0].name.as_deref(), Some("Retry path"));
+        assert_eq!(listed[0].title.as_deref(), Some("fix rotation"));
+        assert!(listed[1].name.is_none());
+        let long = format!("{}TAIL", "n".repeat(GIST_SOURCE_CHARS * 2));
+        for name in [
+            rusqlite::types::Value::Text(long.clone()),
+            rusqlite::types::Value::Text("  \n  ".into()),
+            rusqlite::types::Value::Blob(b"not text".to_vec()),
+        ] {
+            con.execute("UPDATE threads SET name = ?1 WHERE id = 'id-a'", [&name])
+                .unwrap();
+            let listed = q_cwd(&path, "/repo/one");
+            assert_eq!(listed[0].title.as_deref(), Some("fix rotation"));
+            if name == rusqlite::types::Value::Text(long.clone()) {
+                let shown = listed[0].name.as_ref().unwrap();
+                assert_eq!(
+                    shown.chars().count(),
+                    super::super::preview::SESSION_PREVIEW_CHARS + 1
+                );
+                assert!(shown.ends_with('…'));
+            } else {
+                assert!(listed[0].name.is_none());
+            }
         }
     }
 
