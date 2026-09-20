@@ -303,13 +303,13 @@ in the local diagnostic file. No active user daemon was restarted.
 
 This validates the current controller/tunnel/SSH architecture stage. Cloud RC
 deployment and comprehensive external-writer arbitration remain later work;
-the existing Hub implementation is retained compatibility code. Native Windows
-execution and a second full CLI workspace run are not claimed here.
+the retired Hub registration adapter is not part of the peer startup or workspace path.
+Native Windows execution and a second full CLI workspace run are not claimed here.
 
 ## Cloud peer ingress implementation
 
-`agit rc cloud enroll --hub <origin>` persists a private endpoint identity and
-device credential in the local daemon namespace. The enrolling account receives
+`agit rc start --detach` persists a private endpoint identity and device credential
+in the local daemon namespace. The signed-in account receives
 an explicit machine-admin policy only when no machine rule already exists.
 `devices`, `status`, `policy`, and `grant` inspect or update enrollment and
 executor resource access. SSH continues to use host-owner authority.
@@ -402,7 +402,7 @@ The full [RFC](rfc-rc-daemon-peer-transports.md) remains open. In particular:
 - Add durable controller recovery/operation receipts where mutations must be
   replayable across controller restarts, and delegated peer authorization.
 - Host the standalone controller for future cloud Web RC. Existing Hub
-  registration and replay remain a compatibility protocol adapter.
+  registration and replay use the peer session protocol; the retired paired adapter is removed.
 - Verify mutual control with active harnesses and the complete acceptance suite
   over every supported platform/provider. Windows process-tree behavior needs
   its Windows CI environment.
@@ -420,7 +420,6 @@ TLS. The relay still rechecks live authority before `DataReady`, and the executo
 still applies its resource policy to every admitted operation.
 
 The offer's optional `grant` field is sent only to an executor that requests it.
-Linux 0.2.0 presence messages retain their existing shape. A new executor can use
-the existing peer verification endpoint when a Hub does not attach a grant; this
-is peer protocol negotiation and does not restore paired RC. Diagnostics record
-`verification_source` as `presence` or `http` for actual rollout verification.
+The 0.2.1 peer handshake is required. A relay may attach a grant on the presence channel,
+or the executor may verify the grant through the peer endpoint; both are peer protocol paths.
+Diagnostics record `verification_source` as `presence` or `http` for rollout verification.

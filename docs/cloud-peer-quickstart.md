@@ -1,8 +1,9 @@
 # Connect an executor through a cloud relay
 
-The cloud service must provide the peer relay API. This implementation targets a
-single combined dev backend; it does not enable relay routing in staging or
-across backend replicas. Desktop and the executor need compatible CLI builds.
+The cloud service must provide the peer relay API. Every backend region must either
+own the relay or forward peer traffic to the configured relay owner; a router replica
+must not keep a private in-memory relay. Desktop and the executor need compatible CLI
+builds.
 
 Cloud adapters with a narrower role than the signed-in account can send
 `access_ceiling` in executor RPC parameters: `read`, `control`, or `admin`.
@@ -15,19 +16,19 @@ access. Omitting it preserves the account's executor policy. This lets a Web
 workspace operator stay an operator even if the account also administers the
 machine and another controller changes the session's dangerous mode.
 
-On the execution machine, sign in, enroll its daemon identity, and start the
-owner daemon:
+On the execution machine, sign in and start the owner daemon. Startup performs peer
+registration and enables the owner's Cloud inbound path; no separate enrollment command
+is required:
 
 ```sh
 agit login --hub https://dev.agent-git.com
-agit rc cloud enroll --hub https://dev.agent-git.com --name "My executor"
-agit rc local start --detach
+agit rc start --detach
 ```
 
 The executor opens outbound presence and data connections. It needs no public RC
 listener or inbound SSH route for cloud sessions. Its existing local owner
 endpoint and session registry remain authoritative. Use the same `AGIT_HOME` for
-enrollment, daemon startup, and policy commands if choosing an isolated namespace.
+daemon and policy commands if choosing an isolated namespace.
 
 On the Desktop machine, sign in to the same cloud with `agit login --hub ...`.
 In Desktop, add a cloud machine, enter the cloud origin, enable cloud connections
@@ -35,7 +36,7 @@ for the local controller, and select the online executor. Desktop connects
 through its local controller and the relay. Private keys and account/device
 credentials stay in the daemon namespace; Desktop stores public device identity.
 
-Enrollment explicitly grants the enrolling owner machine Admin access unless a
+Peer registration grants the signed-in owner machine Admin access unless a
 machine rule already exists. Cloud connection permission and executor resource
 permission are independent: admission alone does not expose another account's
 sessions. The executor owner manages its local resource policy:

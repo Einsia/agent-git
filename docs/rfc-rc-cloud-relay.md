@@ -71,7 +71,8 @@ Neither waits for network I/O while holding the executor's session coordinator.
 ## Enrollment and outbound connection establishment
 
 Endpoint names below are proposed contracts. Existing `/rc/ws` and
-`/ws/workspaces/{id}` remain legacy protocol endpoints during migration.
+`/ws/workspaces/{id}` are retired and are not valid peer endpoints. Workspace control uses the
+authenticated peer session RPC over the Cloud relay.
 
 1. Install the ordinary CLI on the target and enable its daemon as a user
    service. Device registration generates a private device key locally and
@@ -454,8 +455,8 @@ buildable controller, device enrollment/discovery, cloud rendezvous, and mutuall
 authenticated cloud peer ingress into the existing executor. Desktop supports
 local, SSH, and cloud routes; its cloud operations originate in its local
 controller. The cloud relay forwards encrypted peer records and never dispatches
-session methods. Legacy Hub registration, request routing, and projection remain
-compatibility paths; they do not define this architecture.
+session methods. Hub registration, request routing, and projection are retired and do not
+define or backstop this architecture.
 
 The process integration fixture covers an actual HTTP/WebSocket backend, daemon
 pair, OS tunnel workers, native Desktop IPC, and a synthetic harness subprocess.
@@ -484,10 +485,9 @@ Deliver small changes on the existing RFC/implementation review line:
 4. Controller-only cloud host with backend authentication, scoped subscriptions,
    durable origin recovery, and projection adapters. Move Web control to it using
    the same relay and remote executor; verify shared-session behavior with Desktop.
-5. Publish and verify Windows/Linux peer startup artifacts before retiring the paired
-   CLI, Hub, and Web paths. Keep Linux 0.2.0 peer/Cloud communication supported; its
-   old default startup requires an upgrade. Workspaces without a peer device display
-   No device. Never fall back to paired execution or resubmit historical pending work.
+5. Publish and verify Windows/Linux peer startup artifacts before enabling the current peer path
+   in every environment. Older CLI builds must upgrade; there is no paired fallback. Workspaces
+   without a peer device display No device and never resubmit historical pending work.
 
 Cloud changes use the companion backend and deployment MRs; Desktop changes use
 the companion Desktop MR. Deploy the backend with the relay disabled before

@@ -40,7 +40,7 @@ forwards opaque endpoint traffic. SSH authenticates through the machine's SSH se
 Cloud registration retries in the background without holding local daemon startup or session
 execution. A ready local RPC endpoint does not imply Cloud presence is online. Use
 `agit rc status`, `agit rc cloud status --hub <origin>`, and the private daemon logs to
-inspect the local process and enrollment, then verify Online in the Cloud device list.
+inspect the local process and peer registration, then verify Online in the Cloud device list.
 
 The device's owner can create a workspace without another enrollment command. Other accounts
 need explicit device admission and executor permissions. Reconnect preserves the existing
@@ -48,8 +48,8 @@ peer identity; it does not consume another device slot. Revocation removes remot
 
 Desktop's `agit rc local start --detach` starts outgoing control independently of inbound
 access. `agit rc cloud inbound --hub <origin> --enabled false` disables incoming Cloud control.
-The standard peer startup works on native Windows, Linux, and macOS. Linux 0.2.0's existing
-peer enrollment remains supported; its default paired startup requires upgrading.
+The standard peer startup works on native Windows, Linux, and macOS. The peer startup path is
+the only supported remote-control path; older CLI builds must be upgraded before connecting.
 
 ## 3. Binding a project = creating a private repo
 
@@ -223,6 +223,6 @@ current one.
 |---|---|---|
 | `path must be shorter than SUN_LEN` | `$AGIT_HOME` is too deep; a unix socket path caps at 108 bytes | it already falls back to `$XDG_RUNTIME_DIR`; if that still fails, move `AGIT_HOME` somewhere shallower |
 | `rc start` says it is already running, but `rc status` says it is not | a stale socket file / pidfile | the test is **whether the socket connects**; inspect the private daemon log and use `agit rc stop` before restarting |
-| the page says the machine is offline, but local RPC is ready | Cloud enrollment or presence has not completed | check the selected Hub, device enrollment, and timestamped Cloud logs |
+| the page says the machine is offline, but local RPC is ready | Cloud registration or presence has not completed | check the selected Hub, peer registration, and timestamped Cloud logs |
 | taking over a session is refused with still open in a terminal | that session is open right now, and taking it over destroys both histories | quit in that terminal, then take over |
 | binding a folder is refused | the path does not exist, or it is a system root | use a real project directory |
