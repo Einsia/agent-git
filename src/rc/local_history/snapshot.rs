@@ -3,7 +3,10 @@ use super::*;
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,8 +30,50 @@ struct CachedSnapshot {
     touched: Instant,
 }
 
+struct CaptureState {
+    finished: bool,
+    result: Option<(String, Arc<Mutex<Snapshot>>)>,
+}
+
+struct InFlightCapture {
+    state: Mutex<CaptureState>,
+    ready: Condvar,
+    waiters: AtomicUsize,
+}
+
+impl InFlightCapture {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CaptureState {
+                finished: false,
+                result: None,
+            }),
+            ready: Condvar::new(),
+            waiters: AtomicUsize::new(0),
+        }
+    }
+
+    fn wait(&self) -> crate::Result<Option<(String, Arc<Mutex<Snapshot>>)>> {
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock().map_err(|_| Failure::Busy)?;
+        while !state.finished {
+            state = self.ready.wait(state).map_err(|_| Failure::Busy)?;
+        }
+        Ok(state.result.clone())
+    }
+
+    fn finish(&self, result: Option<(String, Arc<Mutex<Snapshot>>)>) -> crate::Result<()> {
+        let mut state = self.state.lock().map_err(|_| Failure::Busy)?;
+        state.finished = true;
+        state.result = result;
+        self.ready.notify_all();
+        Ok(())
+    }
+}
+
 struct Cache {
     entries: Mutex<HashMap<String, CachedSnapshot>>,
+    inflight: Mutex<HashMap<String, Arc<InFlightCapture>>>,
     bytes: Arc<Semaphore>,
 }
 
@@ -36,6 +81,7 @@ impl Default for Cache {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             bytes: Arc::new(Semaphore::new(MAX_TOTAL_BYTES as usize)),
         }
     }
@@ -48,18 +94,65 @@ impl Cache {
         token: Option<&str>,
         capture: impl FnOnce() -> crate::Result<Snapshot>,
     ) -> crate::Result<(String, Arc<Mutex<Snapshot>>)> {
-        let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
-        entries.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
         if let Some(token) = token {
+            let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
+            entries.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
             let entry = entries.get_mut(token).context(Failure::Expired)?;
             ensure!(entry.scope == scope, Failure::Expired);
             entry.touched = Instant::now();
             return Ok((token.into(), entry.snapshot.clone()));
         }
-        drop(entries);
-        let snapshot = Arc::new(Mutex::new(capture()?));
+
+        let mut capture = Some(capture);
+        loop {
+            let (flight, owner) = {
+                let mut inflight = self.inflight.lock().map_err(|_| Failure::Busy)?;
+                if let Some(flight) = inflight.get(&scope) {
+                    (flight.clone(), false)
+                } else {
+                    let flight = Arc::new(InFlightCapture::new());
+                    inflight.insert(scope.clone(), flight.clone());
+                    (flight, true)
+                }
+            };
+
+            if !owner {
+                if let Some(result) = flight.wait()? {
+                    return Ok(result);
+                }
+                // The original capture failed. Re-enter as the next owner so a
+                // transient native writer race can be retried by a waiter.
+                continue;
+            }
+
+            let result = (capture
+                .take()
+                .expect("a single-flight capture has one owner"))()
+            .and_then(|snapshot| self.store(scope.clone(), snapshot));
+            match result {
+                Ok(result) => {
+                    flight.finish(Some(result.clone()))?;
+                    self.remove_inflight(&scope, &flight)?;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    flight.finish(None)?;
+                    self.remove_inflight(&scope, &flight)?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn store(
+        &self,
+        scope: String,
+        snapshot: Snapshot,
+    ) -> crate::Result<(String, Arc<Mutex<Snapshot>>)> {
+        let snapshot = Arc::new(Mutex::new(snapshot));
         let token = uuid::Uuid::new_v4().to_string();
         let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
+        entries.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
         while entries.len() >= MAX_SNAPSHOTS {
             let oldest = entries
                 .iter()
@@ -77,6 +170,17 @@ impl Cache {
             },
         );
         Ok((token, snapshot))
+    }
+
+    fn remove_inflight(&self, scope: &str, flight: &Arc<InFlightCapture>) -> crate::Result<()> {
+        let mut inflight = self.inflight.lock().map_err(|_| Failure::Busy)?;
+        if inflight
+            .get(scope)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            inflight.remove(scope);
+        }
+        Ok(())
     }
 
     fn reserve(&self, bytes: u32) -> crate::Result<OwnedSemaphorePermit> {
@@ -290,6 +394,11 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn captures_and_readers_do_not_lock_unrelated_history_or_release_live_bytes() {
@@ -338,5 +447,69 @@ mod tests {
         assert!(cache.reserve(1).is_err());
         drop(full);
         assert!(cache.reserve(1).is_ok());
+    }
+
+    #[test]
+    fn concurrent_requests_for_one_scope_share_capture() {
+        let cache = Arc::new(Cache::default());
+        let captures = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let leader_cache = cache.clone();
+        let leader_captures = captures.clone();
+        let leader = thread::spawn(move || {
+            leader_cache.snapshot("scope".into(), None, || {
+                leader_captures.fetch_add(1, Ordering::Relaxed);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Snapshot {
+                    parts: vec![],
+                    native_items: None,
+                    bytes: 1,
+                    _budget: leader_cache.reserve(1)?,
+                })
+            })
+        });
+        started_rx.recv().unwrap();
+
+        let (follower_entered_tx, follower_entered_rx) = mpsc::channel();
+        let follower_cache = cache.clone();
+        let follower_captures = captures.clone();
+        let follower = thread::spawn(move || {
+            follower_entered_tx.send(()).unwrap();
+            follower_cache.snapshot("scope".into(), None, || {
+                follower_captures.fetch_add(1, Ordering::Relaxed);
+                Ok(Snapshot {
+                    parts: vec![],
+                    native_items: None,
+                    bytes: 1,
+                    _budget: follower_cache.reserve(1)?,
+                })
+            })
+        });
+        follower_entered_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let flight = cache
+                .inflight
+                .lock()
+                .unwrap()
+                .get("scope")
+                .cloned()
+                .unwrap();
+            if flight.waiters.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "follower did not join capture");
+            thread::yield_now();
+        }
+
+        release_tx.send(()).unwrap();
+        let (leader_token, leader_snapshot) = leader.join().unwrap().unwrap();
+        let (follower_token, follower_snapshot) = follower.join().unwrap().unwrap();
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        assert_eq!(leader_token, follower_token);
+        assert!(Arc::ptr_eq(&leader_snapshot, &follower_snapshot));
     }
 }
