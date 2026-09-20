@@ -2278,7 +2278,7 @@ pub(crate) fn seed_native_evidence(
     matching.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.turn));
     let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
     let mut sessions = HashSet::new();
-    let mut remaining = 8 * 1024 * 1024;
+    let mut remaining = TRUSTED_EVIDENCE_MAX_BYTES;
     for (root, mut meta) in matching {
         if !sessions.insert(meta.session.clone()) {
             continue;
@@ -2294,12 +2294,16 @@ pub(crate) fn seed_native_evidence(
         {
             evidence.add_cwd_alias(&alias);
         }
+        let maximum = remaining.min(budget.remaining as usize);
         let Ok(saved) =
-            crate::domain::storage::identity_log_at(repo.root(), &root, meta.layout, remaining)
+            crate::domain::storage::identity_log_at(repo.root(), &root, meta.layout, maximum)
         else {
             continue;
         };
         remaining = remaining.saturating_sub(saved.len());
+        if !budget.reserve(saved.len() as u64) {
+            break;
+        }
         for line in saved.split_inclusive('\n') {
             let envelope = crate::domain::storage::parse_envelope_line(line)?;
             if envelope.session_id == meta.session && envelope.source == runtime {
@@ -2325,6 +2329,17 @@ fn trusted_envelope_identities_with_budget(
     history: HistorySelection<'_>,
     budget: &mut ProvenanceReadBudget,
 ) -> TrustedEnvelopeIdentities {
+    trusted_envelope_identities_with_limits(repo, tips, history, budget, TRUSTED_EVIDENCE_MAX_BYTES)
+}
+
+/// `evidence` bounds the expanded LOG bytes one tip may contribute; a tip past it stays untrusted.
+fn trusted_envelope_identities_with_limits(
+    repo: &crate::domain::repo::Repo,
+    tips: &[String],
+    history: HistorySelection<'_>,
+    budget: &mut ProvenanceReadBudget,
+    evidence: usize,
+) -> TrustedEnvelopeIdentities {
     let mut trusted = TrustedEnvelopeIdentities::new();
     trusted.roots = tips
         .iter()
@@ -2343,7 +2358,7 @@ fn trusted_envelope_identities_with_budget(
         .iter()
         .map(|tip| format!("{tip}:{}", crate::domain::meta::FILE))
         .collect();
-    let mut evidence_budget = 8 * 1024 * 1024;
+    let mut evidence_budget = evidence;
     let mut evidence_tips = HashSet::new();
     for (tip, meta) in tips
         .iter()
@@ -2517,6 +2532,12 @@ const TRUSTED_META_MAX_BYTES: u64 = 1024 * 1024;
 /// bytes are still scanned normally, so the failure direction remains safe.
 const TRUSTED_PROVENANCE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const TRUSTED_PROVENANCE_OBJECT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Expanded identity evidence one tip may contribute to trusting native event ids. A session's
+/// saved LOG expands to its whole transcript, so a bound below a real session's size leaves every
+/// id of that tip untrusted and its LOG scanned as raw text, where each content address reads as
+/// a high-entropy finding. It is the per-object peak the scanner already accepts; the provenance
+/// read budget still caps the total across tips, and a tip past the peak stays untrusted.
+const TRUSTED_EVIDENCE_MAX_BYTES: usize = TRUSTED_PROVENANCE_OBJECT_MAX_BYTES as usize;
 
 struct ProvenanceReadBudget {
     remaining: u64,
@@ -2629,7 +2650,7 @@ fn trust_merge_source_batch(
     let validated = validate_merge_source_events_batch(repo, validated, budget);
     for merge in validate_merge_markers_batch(repo, validated, budget) {
         trust_meta_identity(trusted, &merge.source_meta);
-        let mut remaining = 8 * 1024 * 1024;
+        let mut remaining = TRUSTED_EVIDENCE_MAX_BYTES;
         trust_native_content(
             repo,
             &merge.source_parent,
@@ -9902,6 +9923,87 @@ mod tests {
              budget, or one `continue` lets any number of bytes through for free: {:?}",
             edge.unscanned
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_bound_tests {
+    use super::*;
+
+    /// A tip whose expanded LOG fits the evidence bound contributes its event ids; one past the
+    /// bound contributes nothing and its LOG is left to the raw scan. An implementation that
+    /// read a truncated prefix would trust part of an unverified tip.
+    #[test]
+    fn identity_evidence_past_the_per_tip_bound_stays_untrusted() {
+        let d = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(d.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["branch", "-M", "main"]);
+        let meta = crate::domain::meta::Meta::new(
+            "agit-0123456789abcdef0123456789abcdef01234567".into(),
+            "codex".into(),
+            "/work".into(),
+        );
+        let envelope = crate::domain::transcript::Envelope {
+            source: meta.runtime.clone(),
+            session_id: meta.session.clone(),
+            content: serde_json::json!({"message": "one settled turn"}),
+            object_hash: String::new(),
+        };
+        let envelope = crate::domain::transcript::Envelope {
+            object_hash: crate::domain::transcript::object_hash(&envelope.content),
+            ..envelope
+        };
+        let line = crate::domain::storage::envelope_line(&envelope);
+        crate::domain::meta::write(d.path(), &meta).unwrap();
+        for (rel, bytes) in crate::domain::storage::snapshot_files(&line, &line).unwrap() {
+            let path = d.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "turn"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let repo = crate::domain::repo::Repo::open(d.path()).unwrap();
+        let tips = vec![head];
+        let id = crate::domain::storage::event_id(&line).unwrap();
+
+        let mut budget = ProvenanceReadBudget::new();
+        let trusted = trusted_envelope_identities_with_limits(
+            &repo,
+            &tips,
+            HistorySelection::Frozen(&tips),
+            &mut budget,
+            line.len(),
+        );
+        assert!(trusted.events.contains(&id));
+
+        let mut budget = ProvenanceReadBudget::new();
+        let untrusted = trusted_envelope_identities_with_limits(
+            &repo,
+            &tips,
+            HistorySelection::Frozen(&tips),
+            &mut budget,
+            line.len() - 1,
+        );
+        assert!(untrusted.events.is_empty());
     }
 }
 
