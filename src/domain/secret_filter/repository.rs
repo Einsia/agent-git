@@ -21,7 +21,6 @@ use zeroize::Zeroizing;
 
 const DICTIONARY_RELATIVE_PATH: &str = "agit/secret-dictionary/vault.json";
 use crate::domain::secrets::placeholder::{CANONICAL_TOKEN_LEN, TOKEN_PREFIX, TOKEN_SUFFIX};
-const MAX_NEW_HEURISTIC_RECORDS: usize = 1_024;
 const MAX_OVERLAPPING_MATCHES: usize = 64 * 1024;
 const OVERLAPPING_MATCH_BATCH: usize = 4 * 1024;
 #[derive(Clone, Copy)]
@@ -155,29 +154,23 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             // Git object in the clear.
             //
             // Where those spans are is recomputed per string during protection,
-            // from a bounded length test. Collecting the literals here instead
-            // would have no budget to bound it: the candidate collector charges
-            // its 1,024-record budget only for values it accepts, so refusing
-            // the over-capacity ones excludes them from the very limit that
-            // would have capped them.
+            // from a bounded length test, so the candidate list never has to
+            // carry the over-capacity literals.
             let candidates = {
                 let existing: HashSet<&str> = records
                     .iter()
                     .map(|record| record.secret.as_str())
                     .collect();
-                crate::domain::secrets::secret_candidates_jsonl(
-                    text,
-                    MAX_NEW_HEURISTIC_RECORDS,
-                    |candidate| {
-                        candidate.len() <= MAX_REPOSITORY_SECRET_BYTES
-                            && !existing.contains(candidate)
-                            && !allowlist.contains(candidate)
-                    },
-                )
+                crate::domain::secrets::secret_candidates_jsonl(text, |candidate| {
+                    candidate.len() <= MAX_REPOSITORY_SECRET_BYTES
+                        && !existing.contains(candidate)
+                        && !allowlist.contains(candidate)
+                })
             };
-            if candidates.truncated {
+            if candidates.over_capacity {
                 bail!(
-                    "more than {MAX_NEW_HEURISTIC_RECORDS} new heuristic secrets were found in one settlement; no repository dictionary update was written"
+                    "more than {} MiB of new heuristic secret values were found in one settlement; no repository dictionary update was written",
+                    crate::domain::secrets::MAX_NEW_CANDIDATE_BYTES / (1024 * 1024)
                 );
             }
             let mut state = ProtectionState::from_records(
@@ -366,18 +359,16 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 .map(|record| record.secret.as_str())
                 .collect();
             let literal = serde_json::to_string(text)?;
-            let candidates = crate::domain::secrets::secret_candidates_jsonl(
-                &literal,
-                MAX_NEW_HEURISTIC_RECORDS,
-                |candidate| {
+            let candidates =
+                crate::domain::secrets::secret_candidates_jsonl(&literal, |candidate| {
                     candidate.len() <= MAX_REPOSITORY_SECRET_BYTES
                         && !existing.contains(candidate)
                         && !allowlist.contains(candidate)
-                },
-            );
-            if candidates.truncated {
+                });
+            if candidates.over_capacity {
                 bail!(
-                    "more than {MAX_NEW_HEURISTIC_RECORDS} new heuristic secrets were found in one text carrier; no repository dictionary update was written"
+                    "more than {} MiB of new heuristic secret values were found in one text carrier; no repository dictionary update was written",
+                    crate::domain::secrets::MAX_NEW_CANDIDATE_BYTES / (1024 * 1024)
                 );
             }
             let mut state = ProtectionState::from_records(
@@ -2851,23 +2842,27 @@ mod tests {
         );
     }
 
+    /// A settlement is never refused for the number of new heuristic values it carries: a long
+    /// unsettled session full of identifiers must still settle in one pass, and a later pass
+    /// registers only what the dictionary does not hold yet. An implementation that batches
+    /// candidates against a fixed budget would refuse the first call or double-count the second.
     #[test]
-    fn heuristic_cap_counts_only_candidates_not_already_in_the_dictionary() {
+    fn heuristic_records_are_unbounded_per_settlement_and_counted_once() {
         let dir = tempfile::tempdir().unwrap();
         let dictionary = RepositoryDictionary::new(
             dir.path().join("dictionary/vault.json"),
             MemoryKeys::default(),
         );
-        let tokens: Vec<_> = (0..=MAX_NEW_HEURISTIC_RECORDS)
+        let batch = 1_500;
+        let tokens: Vec<_> = (0..=batch)
             .map(|index| format!("ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6s{index:010X}"))
             .collect();
-        let first = serde_json::to_string(&serde_json::json!({
-            "tokens": &tokens[..MAX_NEW_HEURISTIC_RECORDS]
-        }))
-        .unwrap()
+        let first = serde_json::to_string(&serde_json::json!({ "tokens": &tokens[..batch] }))
+            .unwrap()
             + "\n";
         let first = dictionary.protect_jsonl(&first, &Matcher::empty()).unwrap();
-        assert_eq!(first.new_heuristic_records, MAX_NEW_HEURISTIC_RECORDS);
+        assert_eq!(first.new_heuristic_records, batch);
+        assert_eq!(first.replacements, batch);
 
         let cumulative =
             serde_json::to_string(&serde_json::json!({ "tokens": tokens })).unwrap() + "\n";
@@ -2875,10 +2870,7 @@ mod tests {
             .protect_jsonl(&cumulative, &Matcher::empty())
             .unwrap();
         assert_eq!(next.new_heuristic_records, 1);
-        assert_eq!(
-            dictionary.review().unwrap().len(),
-            MAX_NEW_HEURISTIC_RECORDS + 1
-        );
+        assert_eq!(dictionary.review().unwrap().len(), batch + 1);
     }
 
     #[test]

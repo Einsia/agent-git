@@ -53,11 +53,13 @@ projection and client findings without deleting the reverse mapping, so old plac
 hydrate. A property named `sha`, `signature`,
 `session_id` or `provenance` does not exempt its value or subtree. Verified envelope identities,
 typed Git headers resolved in the selected repository, and canonical existing secret tokens
-have scoped exemptions; adjacent content is inspected normally. One settlement adds at most 1024 distinct
-candidates; a candidate already present in this repository's dictionary (an allowed one
-included) does not spend that budget again, so a long append-only session is never blocked
-forever at its 1025th historical candidate. Going over the limit on additions fails before any
-Git object is written.
+have scoped exemptions; adjacent content is inspected normally. A settlement registers every
+distinct new candidate it carries, however many: a long unsettled session full of identifiers
+settles in one pass instead of being refused for its count. A candidate already present in this
+repository's dictionary (an allowed one included) is not registered again. What bounds a
+settlement is bytes: the distinct new values it registers may total 64 MiB, and past that it
+refuses before any dictionary update is written. Per value, an oversized finding stays in the
+clear and visible to the push scanner rather than becoming an irreversible record.
 
 The independent tokenizer accepts ASCII letters, digits and `_-+/=.!@#$%^&*?~`.
 It measures Shannon entropy in bits per character with these minimum length / entropy pairs:
@@ -290,7 +292,11 @@ hard to guess" is not a replay defense.
   still recovers on a retry after the dictionary has persisted;
 - a single heuristic hit over the repository record capacity: local settlement refuses before
   publishing a version; the native source remains intact, and a PEM header is never replaced
-  on its own in a way that conceals the remaining sensitive block;
+  on its own in a way that conceals the remaining sensitive block. The payload of a base64
+  data URL whose bytes open with a media or archive file header (an inline screenshot, a PDF,
+  a gzip or zip body) is neither a candidate nor such a hit, so a pasted image never blocks
+  settlement; the same bytes outside that carrier, or a token that merely starts like a file
+  header, are still reported;
 - old history still holds plaintext: the push gate keeps refusing, and commits/tags are never
   rewritten in the background;
 - another device holds only the placeholder: it preserves unresolved tokens quietly and
@@ -314,8 +320,9 @@ hard to guess" is not a replay defense.
 - push still refuses a secret in old history or outside the protection surface;
 - a retry after the heuristic dictionary has persisted still allows forward projection, while
   an explicit/global rule hitting an old prefix is still refused;
-- appending the 1025th candidate after 1024 existing ones still enters the dictionary, a
-  common long PEM is reversible, and an over-capacity PEM stays visible to the push scanner;
+- a settlement carrying more new candidates than any fixed batch size still enters the
+  dictionary in one pass, a common long PEM is reversible, and an over-capacity PEM stays
+  visible to the push scanner;
 - a registered hit during live RC sends no unredacted plaintext hash.
 
 

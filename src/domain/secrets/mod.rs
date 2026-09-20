@@ -160,7 +160,91 @@ pub struct Hit {
 #[cfg(feature = "secret-vault")]
 pub(crate) struct SecretCandidateBatch {
     pub(crate) values: Vec<Zeroizing<String>>,
-    pub(crate) truncated: bool,
+    /// The distinct new values exceed [`MAX_NEW_CANDIDATE_BYTES`]; `values` holds what fit.
+    pub(crate) over_capacity: bool,
+}
+
+/// Distinct new heuristic values one settlement may register, in bytes. The batch is held in
+/// memory, becomes one Aho-Corasick automaton and is sealed into the dictionary, so its size is
+/// what bounds a settlement, not how many values there are; a session of ordinary length stays
+/// far inside it, and one past it refuses before any dictionary update is written.
+#[cfg(feature = "secret-vault")]
+pub(crate) const MAX_NEW_CANDIDATE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Media types a data URL may declare, each with the file header its decoded payload must open
+/// with: JPEG, PNG, GIF, WebP (a RIFF container), PDF, gzip and zip.
+const MEDIA_HEADERS: [(&str, &[u8]); 9] = [
+    ("image/jpeg", &[0xFF, 0xD8, 0xFF]),
+    ("image/jpg", &[0xFF, 0xD8, 0xFF]),
+    (
+        "image/png",
+        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+    ),
+    ("image/gif", b"GIF8"),
+    ("image/webp", b"RIFF"),
+    ("application/pdf", b"%PDF-"),
+    ("application/gzip", &[0x1F, 0x8B, 0x08]),
+    ("application/x-gzip", &[0x1F, 0x8B, 0x08]),
+    ("application/zip", &[b'P', b'K', 0x03, 0x04]),
+];
+
+/// Whether the token at `start` is the payload of a `data:<media type>;base64,` URL whose
+/// decoded bytes open with the file header that media type requires. A pasted screenshot
+/// arrives that way, as one token of hundreds of kilobytes, and is data rather than a
+/// credential. Carrier, declared type and decoded header must all agree: text that merely ends
+/// in `;base64,`, a data URL declaring another type, or a token that only starts like a header
+/// remain candidates.
+fn base64_media_payload(text: &str, start: usize) -> bool {
+    let before = &text[..start];
+    let Some(carrier) = before
+        .rfind("data:")
+        .map(|at| &before[at + "data:".len()..])
+    else {
+        return false;
+    };
+    let Some(parameters) = carrier.strip_suffix(";base64,") else {
+        return false;
+    };
+    if parameters
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b'<' | b'>'))
+    {
+        return false;
+    }
+    let media_type = parameters.split(';').next().unwrap_or_default();
+    let Some((_, header)) = MEDIA_HEADERS
+        .iter()
+        .find(|(declared, _)| declared.eq_ignore_ascii_case(media_type))
+    else {
+        return false;
+    };
+    let mut sextets = [0u8; 16];
+    let mut count = 0;
+    for byte in text[start..].bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => break,
+        };
+        sextets[count] = value;
+        count += 1;
+        if count == sextets.len() {
+            break;
+        }
+    }
+    if count < sextets.len() {
+        return false;
+    }
+    let mut decoded = [0u8; 12];
+    for (group, chunk) in sextets.chunks(4).enumerate() {
+        decoded[group * 3] = (chunk[0] << 2) | (chunk[1] >> 4);
+        decoded[group * 3 + 1] = (chunk[1] << 4) | (chunk[2] >> 2);
+        decoded[group * 3 + 2] = (chunk[2] << 6) | chunk[3];
+    }
+    decoded.starts_with(header)
 }
 
 /// An irreversible fingerprint of a matched span.
@@ -1047,6 +1131,7 @@ fn entropy_candidate_spans(
             if candidate.len() >= min_len
                 && rules::shannon(candidate) >= floor
                 && (mixed_alpha || has_digit || is_hex)
+                && !base64_media_payload(text, start)
             {
                 let span = (start, end);
                 start = end;
@@ -1581,39 +1666,65 @@ pub(crate) fn oversized_finding_spans(
 #[cfg(feature = "secret-vault")]
 pub(crate) fn secret_candidates_jsonl(
     text: &str,
-    cap: usize,
+    include: impl FnMut(&str) -> bool,
+) -> SecretCandidateBatch {
+    secret_candidates_jsonl_bounded(text, MAX_NEW_CANDIDATE_BYTES, include)
+}
+
+#[cfg(feature = "secret-vault")]
+pub(crate) fn secret_candidates_jsonl_bounded(
+    text: &str,
+    max_bytes: usize,
     mut include: impl FnMut(&str) -> bool,
 ) -> SecretCandidateBatch {
-    let mut values: Vec<Zeroizing<String>> = Vec::with_capacity(cap.min(16));
-    let mut truncated = false;
+    let mut batch = CandidateBatch {
+        values: Vec::new(),
+        bytes: 0,
+        max_bytes,
+        over_capacity: false,
+    };
 
     for (chunk, value) in jsonl_chunks(text) {
-        if truncated || chunk.trim().is_empty() {
+        if batch.over_capacity || chunk.trim().is_empty() {
             continue;
         }
         match value {
             Some(value) => visit_candidate_values(&value, None, &mut |candidate, field| {
-                collect_candidate(
-                    candidate,
-                    field,
-                    cap,
-                    &mut values,
-                    &mut truncated,
-                    &mut include,
-                )
+                collect_candidate(candidate, field, &mut batch, &mut include)
             }),
             None => collect_candidate(
                 chunk.strip_suffix('\n').unwrap_or(chunk),
                 None,
-                cap,
-                &mut values,
-                &mut truncated,
+                &mut batch,
                 &mut include,
             ),
         }
     }
 
-    SecretCandidateBatch { values, truncated }
+    SecretCandidateBatch {
+        values: batch.values,
+        over_capacity: batch.over_capacity,
+    }
+}
+
+#[cfg(feature = "secret-vault")]
+struct CandidateBatch {
+    values: Vec<Zeroizing<String>>,
+    bytes: usize,
+    max_bytes: usize,
+    over_capacity: bool,
+}
+
+#[cfg(feature = "secret-vault")]
+impl CandidateBatch {
+    fn push(&mut self, literal: Zeroizing<String>) {
+        if self.over_capacity || self.bytes + literal.len() > self.max_bytes {
+            self.over_capacity = true;
+            return;
+        }
+        self.bytes += literal.len();
+        self.values.push(literal);
+    }
 }
 
 /// Consecutive plaintext lines share a carrier so multiline sensitive regions
@@ -1721,35 +1832,45 @@ pub(crate) fn mask_verified_git_headers(
 fn collect_candidate(
     text: &str,
     field: Option<&str>,
-    cap: usize,
-    values: &mut Vec<Zeroizing<String>>,
-    truncated: &mut bool,
+    batch: &mut CandidateBatch,
     include: &mut impl FnMut(&str) -> bool,
 ) {
-    if *truncated || text.is_empty() {
+    if text.is_empty() || batch.over_capacity {
         return;
     }
+    let values = &batch.values;
     let view = view_of(text);
-    let remaining = cap.saturating_sub(values.len());
-    let mut newly_seen: Vec<Zeroizing<String>> = Vec::with_capacity(remaining.min(16));
-    // Filter duplicate literal values inside the producer. Its budget then
-    // counts distinct dictionary records rather than repeated occurrences of
-    // the same token in a large transcript.
+    // The temporary collection shares the batch's byte bound: a single carrier
+    // larger than the bound is refused without first copying its values.
+    let mut room = batch.max_bytes - batch.bytes;
+    let mut over_capacity = false;
+    let mut newly_seen: Vec<Zeroizing<String>> = Vec::new();
+    // Filter duplicate literal values inside the producer, so the batch holds
+    // distinct dictionary records rather than repeated occurrences of the same
+    // token in a large transcript.
     let mut record = |found: &str, start: usize| {
         let literal = &text[start..start + found.len()];
-        if values.iter().any(|known| known.as_str() == literal)
+        if over_capacity
+            || values.iter().any(|known| known.as_str() == literal)
             || newly_seen.iter().any(|known| known.as_str() == literal)
             || !include(literal)
         {
             return false;
         }
+        if literal.len() > room {
+            over_capacity = true;
+            return false;
+        }
+        room -= literal.len();
         newly_seen.push(Zeroizing::new(literal.to_string()));
         true
     };
-    let (_, mut more) = raw_hits_capped(&view, remaining.saturating_add(1), &mut record);
-    let credential_field = field.is_some_and(is_credential_field);
-    if !more && credential_field {
+    let (_, _) = raw_hits_capped(&view, usize::MAX, &mut record);
+    if field.is_some_and(is_credential_field) {
         for (start, end) in entropy_candidate_spans(&view, true) {
+            if over_capacity {
+                break;
+            }
             let literal = &text[start..end];
             if values.iter().any(|known| known.as_str() == literal)
                 || newly_seen.iter().any(|known| known.as_str() == literal)
@@ -1758,21 +1879,18 @@ fn collect_candidate(
             {
                 continue;
             }
-            newly_seen.push(Zeroizing::new(literal.to_owned()));
-            if newly_seen.len() > remaining {
-                more = true;
+            if literal.len() > room {
+                over_capacity = true;
                 break;
             }
+            room -= literal.len();
+            newly_seen.push(Zeroizing::new(literal.to_owned()));
         }
     }
     for literal in newly_seen {
-        if values.len() == cap {
-            *truncated = true;
-            break;
-        }
-        values.push(literal);
+        batch.push(literal);
     }
-    *truncated |= more;
+    batch.over_capacity |= over_capacity;
 }
 
 fn is_credential_field(field: &str) -> bool {
@@ -9784,5 +9902,122 @@ mod tests {
              budget, or one `continue` lets any number of bytes through for free: {:?}",
             edge.unscanned
         );
+    }
+}
+
+#[cfg(all(test, feature = "secret-vault"))]
+mod media_payload_tests {
+    use super::*;
+
+    fn payload(prefix: &str, bytes: usize) -> String {
+        let body: String = (0..bytes)
+            .map(|i| {
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                    [(i * 7 + i / 3) % 64] as char
+            })
+            .collect();
+        format!("{prefix}{body}")
+    }
+
+    fn line(image_url: &str) -> String {
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "content": [{"type": "input_image", "image_url": image_url}]}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    /// An inline image is neither a dictionary candidate nor an oversized finding only when it
+    /// is the payload of a `data:` URL whose declared media type matches the decoded file
+    /// header. The same bytes outside that carrier, behind text that merely ends in
+    /// `;base64,`, behind a data URL declaring another type, or a token that only starts like a
+    /// header, are all still reported.
+    #[test]
+    fn base64_media_payloads_are_exempt_only_inside_a_matching_data_url() {
+        let threshold = 64 * 1024;
+        for (media_type, prefix) in [
+            ("image/jpeg", "/9j/4AAQSkZJRg"),
+            ("image/png", "iVBORw0KGgoAAAANSUhEUg"),
+            ("image/gif", "R0lGODlhAQABAIAAAP"),
+            ("image/webp", "UklGRiQAAABXRUJQVlA4"),
+            ("application/pdf", "JVBERi0xLjcKJeLjz9MK"),
+            ("application/gzip", "H4sIAAAAAAAAA"),
+            ("application/zip", "UEsDBBQAAAAIAA"),
+        ] {
+            let body = payload(prefix, threshold + 512);
+            let carried = line(&format!("data:{media_type};base64,{body}"));
+            assert!(
+                secret_candidates_jsonl(&carried, |_| true)
+                    .values
+                    .is_empty(),
+                "{prefix}"
+            );
+            assert!(
+                oversized_finding_spans(&carried, threshold, |_| true).is_empty(),
+                "{prefix}"
+            );
+            assert!(scan_text(&carried, &HashSet::new()).is_empty(), "{prefix}");
+
+            for forged in [
+                body.clone(),
+                format!("foo;bar;base64,{body}"),
+                format!("data:text/plain;base64,{body}"),
+                format!(
+                    "data:{media_type};base64,{}",
+                    payload("QUJDREVGR0hJSktMTU5PUFFS", threshold + 512)
+                ),
+            ] {
+                let forged = line(&forged);
+                assert_eq!(
+                    oversized_finding_spans(&forged, threshold, |_| true).len(),
+                    1,
+                    "{prefix}"
+                );
+                assert_eq!(
+                    secret_candidates_jsonl(&forged, |_| true).values.len(),
+                    1,
+                    "{prefix}"
+                );
+            }
+        }
+        let header_like_token = line(&payload("H4sI", 40));
+        assert!(!scan_text(&header_like_token, &HashSet::new()).is_empty());
+        assert_eq!(
+            secret_candidates_jsonl(&header_like_token, |_| true)
+                .values
+                .len(),
+            1
+        );
+        let mismatched = line(&format!(
+            "data:image/jpeg;base64,{}",
+            payload("iVBORw0KGgoAAAANSUhEUg", 300)
+        ));
+        assert!(!scan_text(&mismatched, &HashSet::new()).is_empty());
+    }
+
+    /// The batch a settlement registers is bounded by bytes, not by count: values that fit are
+    /// kept in order, the first value past the bound flags the batch, and nothing after it is
+    /// collected. An implementation that kept counting would grow without bound.
+    #[test]
+    fn candidate_batches_are_bounded_by_bytes() {
+        let tokens: Vec<String> = (0..6)
+            .map(|i| payload("R7kQ2mXv9LpZ4tNc8W", 20 + i))
+            .collect();
+        let text = serde_json::json!({"tokens": tokens}).to_string() + "\n";
+        let full = secret_candidates_jsonl(&text, |_| true);
+        assert_eq!(full.values.len(), 6);
+        assert!(!full.over_capacity);
+        let bound = tokens[0].len() + tokens[1].len();
+        let bounded = secret_candidates_jsonl_bounded(&text, bound, |_| true);
+        assert!(bounded.over_capacity);
+        assert_eq!(bounded.values.len(), 2);
+        assert!(bounded.values.iter().map(|v| v.len()).sum::<usize>() <= bound);
+        // One carrier holding every value is bounded the same way: the values past the bound
+        // are never copied out of it.
+        let one_carrier = serde_json::json!({"blob": tokens.join(" ")}).to_string() + "\n";
+        let bounded = secret_candidates_jsonl_bounded(&one_carrier, bound, |_| true);
+        assert!(bounded.over_capacity);
+        assert!(bounded.values.iter().map(|v| v.len()).sum::<usize>() <= bound);
     }
 }
