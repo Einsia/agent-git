@@ -346,8 +346,6 @@ impl Daemon {
                 self.resume_session(p, &caller, frames).await
             }
 
-            method::SESSION_ENQUEUE => self.reject_native_inbox(f),
-
             method::SESSION_WATCH => {
                 let prepared = self.prepare_watch_scan(f)?.run()?;
                 self.finish_watch_scan(f, prepared, frames)
@@ -539,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn native_inbox_cannot_bypass_external_read_only_policy() {
+    fn native_inbox_is_operator_scoped_and_stays_session_bound() {
         let mut daemon = watching_daemon();
         let mut frame = Frame::request(
             method::SESSION_ENQUEUE,
@@ -555,31 +553,21 @@ mod tests {
             workspace_id: "ws-a".into(),
         });
         assert_eq!(
-            daemon.reject_native_inbox(&frame).err().unwrap().code,
+            daemon
+                .prepare_native_inbox(&frame, None)
+                .err()
+                .unwrap()
+                .code,
             ErrorCode::Forbidden as i32
         );
         frame.caller.as_mut().unwrap().role = "operator".into();
-        assert!(
-            !danger::judge(
-                &daemon.roster,
-                "codex",
-                frame.params.as_ref().unwrap()["session_id"]
-                    .as_str()
-                    .unwrap(),
-                "ws-a",
-                "/unregistered-native-session",
-            )
-            .ever_dangerous()
-        );
-        assert_eq!(
-            daemon.reject_native_inbox(&frame).err().unwrap().code,
-            ErrorCode::Forbidden as i32,
-            "an unregistered native process may have full access outside the daemon's ledger"
-        );
-        frame.caller.as_mut().unwrap().role = "owner".into();
         frame.caller.as_mut().unwrap().workspace_id = "ws-b".into();
         assert_eq!(
-            daemon.reject_native_inbox(&frame).err().unwrap().code,
+            daemon
+                .prepare_native_inbox(&frame, None)
+                .err()
+                .unwrap()
+                .code,
             ErrorCode::WorkspaceNotFound as i32
         );
         frame.caller.as_mut().unwrap().workspace_id = "ws-a".into();
@@ -589,8 +577,13 @@ mod tests {
             .bind("ws-a", "project", project.path())
             .unwrap();
         assert_eq!(
-            daemon.reject_native_inbox(&frame).err().unwrap().code,
-            ErrorCode::SessionBusy as i32
+            daemon
+                .prepare_native_inbox(&frame, None)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::SessionNotFound as i32,
+            "operator queue access still requires an exact local native session"
         );
     }
 

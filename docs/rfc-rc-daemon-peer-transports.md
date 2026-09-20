@@ -97,18 +97,25 @@ ownership. Local clients, peer controllers, and the legacy Hub path must pass th
 same mutation gate. A tunnel connection, machine-owner login, or writable UI does
 not constitute possession of a native session's control channel.
 
-An externally controlled session is read-only through every Agit entry point.
+An externally controlled session retains read access through every Agit entry point.
 Reading history, observing status, and subscribing to events remain available.
 Starting or steering a turn, interrupting it, deciding an approval, changing the
-model or permission mode, enqueueing input, running a mutating runtime command,
+model or permission mode, running a mutating runtime command,
 and resuming a second writer must fail before changing the native session.
 
 Ownership has three distinct states: held by this executor, held externally, and
-unknown. External and unknown ownership both deny mutations. Transcript activity
+unknown. External and unknown ownership both deny writer-dependent mutations.
+An independently verified native inbox is a narrow exception: authorized operators
+may queue text for the exact native session without acquiring its writer. Queue
+acceptance confirms persisted delivery, not execution or live control. Receipts
+remain scoped to caller, workspace and native identity across reconnects, and the
+existing dangerous-session restriction still applies. No controller or tunnel may
+emulate this capability with another resume or direct transcript writes.
+Transcript activity
 is useful for display but silence, elapsed time, a disconnected UI, and a missing
 PID file are not proof that another program released control. A handoff requires
 positive release/acquisition evidence from the runtime or a cooperating exclusive
-writer protocol. A runtime that cannot provide that evidence remains read-only
+writer protocol. A runtime that cannot provide that evidence denies writer-dependent control
 for external sessions; the controller must not implement an automatic takeover.
 
 The write permit identifies the native runtime/session and its current generation,
@@ -569,7 +576,7 @@ The RFC does not authorize auto-merging dependencies or deploying either service
   Inspecting the cloud entry dependency graph finds no executor, native adapter,
   transcript, Git workspace, or settlement dependency. Starting that service
   performs no local harness discovery or executor storage initialization.
-- [ ] Externally owned and unknown-ownership sessions remain read-only through
+- [ ] Externally owned and unknown-ownership sessions deny writer-dependent control through
   both local and remote entry points, including after a long idle period.
 - [ ] Competing resume attempts cannot create two native writers. Losing the
   write permit invalidates queued controls and stale approval responses.

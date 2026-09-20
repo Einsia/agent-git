@@ -1558,8 +1558,10 @@ fn min_role(method_name: &str) -> Role {
         | method::SESSION_SET_MODEL
         | method::SESSION_SET_PERMISSION_MODE
         | method::FS_READ_FILE => Role::Operator,
-        // Native processes keep permission state outside the daemon's supervision.
-        method::SESSION_ENQUEUE => Role::Owner,
+        // Codex's native queue is an independently authorized persisted inbox. It does not
+        // acquire the writer lock or start a turn, so an operator may enqueue text while the
+        // original process remains the sole transcript writer.
+        method::SESSION_ENQUEUE => Role::Operator,
         // **Acting on the machine itself**: list the home directory (unrelated to any
         // workspace), add a directory to the allowlist, open a real shell.
         method::FS_READ_DIRECTORY

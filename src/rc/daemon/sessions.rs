@@ -1,5 +1,6 @@
 use super::*;
 use std::io::Read;
+use std::path::Path;
 
 impl Daemon {
     /// Local sessions on this machine that can be taken over.
@@ -477,24 +478,86 @@ impl Daemon {
         })
     }
 
-    pub(super) fn reject_native_inbox(&self, frame: &Frame) -> Result<serde_json::Value, RpcError> {
+    pub(super) fn prepare_native_inbox(
+        &self,
+        frame: &Frame,
+        local: Option<LocalSession>,
+    ) -> Result<crate::rc::native_inbox::Prepared, RpcError> {
         let caller = caller_scope(frame)?;
         require_role(&caller, method::SESSION_ENQUEUE)?;
         let request: crate::rc::native_inbox::Request = frame.params_as()?;
         request
             .validate()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
-        if !self.mirror.has_workspace(&request.workspace_id) {
+        let local = local
+            .filter(|local| local.runtime_session_id == request.session_id)
+            .ok_or_else(|| {
+                RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
+            })?;
+        if local.runtime != "codex" {
             return Err(RpcError::new(
-                ErrorCode::WorkspaceNotFound,
-                "workspace is not bound on this machine",
+                ErrorCode::RuntimeUnavailable,
+                "this runtime does not offer a native inbox",
             ));
         }
-        Err(RpcError::new(
-            ErrorCode::SessionBusy,
-            "native inbox delivery is unavailable: external and unknown sessions are read-only",
+        let cwd = policy::require_within(
+            Path::new(&local.cwd),
+            &self.mirror.roots(&request.workspace_id),
         )
-        .with_hint("use the controlling application, or acquire the session through a supported native handoff"))
+        .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
+        let _ = danger::authorize(
+            &self.roster,
+            &caller,
+            "codex",
+            &request.session_id,
+            &request.workspace_id,
+            &cwd.to_string_lossy(),
+        )?;
+        let transcript = {
+            use crate::adapter::Adapter;
+            crate::adapter::codex::Codex
+                .resolve(&request.session_id, Some(&cwd))
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::SessionNotFound,
+                        "cannot locate this Codex transcript",
+                    )
+                })?
+        };
+        let codex = crate::adapter::which("codex")
+            .and_then(|path| path.canonicalize().ok())
+            .ok_or_else(|| {
+                RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
+            })?;
+        let receipts = crate::rc::rc_dir()
+            .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
+            .join("native-inbox");
+        Ok(crate::rc::native_inbox::Prepared {
+            request,
+            transcript,
+            cwd,
+            codex,
+            receipts,
+            hub: self.opts.hub.clone(),
+            account: caller
+                .account_id
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    if value.starts_with("local:") && caller.is_owner() {
+                        "local-owner".to_owned()
+                    } else {
+                        value.clone()
+                    }
+                })
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::Unauthenticated,
+                        "native messages require an authenticated account",
+                    )
+                })?,
+            username: caller.username.filter(|value| !value.is_empty()),
+        })
     }
 
     pub(super) fn prepare_start_session(

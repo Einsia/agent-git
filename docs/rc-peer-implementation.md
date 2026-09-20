@@ -59,13 +59,15 @@ real-harness acceptance below. The separate Web controller host remains future w
   automatically. The executor's existing start and message receipts remain the
   authority for deduplicating accepted operations.
 
-External watch replies do not advertise native inbox delivery. The legacy
-`session.enqueue` method checks caller scope and role, then refuses input instead
-of launching `codex queue`. Direct owner RPC, peer forwarding, and the inherited
-Hub path share this refusal. Sending input to the application's own inbox still
-changes its session and therefore cannot bypass the external read-only policy.
-This closes that input path; it does not establish exclusive native ownership
-for other session operations.
+Codex watches advertise `native_inbox: "codex_queue"` only after a bounded,
+nonmutating probe confirms that the installed CLI supports queue submission.
+`session.enqueue` independently authorizes an operator against the workspace,
+exact native UUID and existing dangerous-session policy. It uses Codex's native
+queue without acquiring the writer or resuming another process. Durable receipts
+bind the account, workspace, session and client message ID to its payload across
+reconnects. A queued receipt confirms storage, not execution; ambiguous delivery
+remains unknown and must not be replayed with a new ID. Live steer, interrupt,
+approval, model and permission controls still require the original control path.
 
 ## Executor launch lifecycle
 
@@ -394,7 +396,7 @@ conversation evidence; daemon diagnostic logs contain metadata only.
 The full [RFC](rfc-rc-daemon-peer-transports.md) remains open. In particular:
 
 - Replace transcript-recency takeover heuristics with executor-owned exclusive
-  native session control. External or unknown ownership must be read-only
+  native session control. External or unknown ownership must deny writer-dependent mutations
   through every entry point. Current read-only watch behavior and per-session
   RPC gates do not establish that stronger guarantee.
 - Move the remaining synchronous start/resume discovery, repository preparation,

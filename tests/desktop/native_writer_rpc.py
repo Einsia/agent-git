@@ -136,9 +136,6 @@ async def run(binary):
                 for call in (direct.rpc, peer, direct.rpc):
                     response = await call("session.resume", session_id=logical_id, prompt="Must not reach native input.")
                     assert response["error"]["code"] == 303, response
-                    response = await call("session.enqueue", session_id=native_id,
-                                          client_msg_id=str(uuid.uuid4()), message="Must not enter native inbox.")
-                    assert "read-only" in response["error"]["message"], response
                     assert (await direct.rpc("session.list", include_local=False))["result"]["sessions"] == []
                 assert transcript.read_bytes() == before, "rejected control changed the external transcript"
                 assert owner.process.returncode is None, "Agit stopped the external owner"
@@ -158,7 +155,7 @@ async def run(binary):
                 denied = await contender.rpc("thread/resume", params)
                 assert "active writer" in denied["error"]["message"], denied
                 assert (await direct.rpc("machine.describe"))["result"]["instance_id"] == identity
-                print("PASS: direct/peer refusal, repeatable busy result, no inbox writes, release then resume, reverse native exclusion")
+                print("PASS: direct/peer refusal, repeatable busy result, release then resume, reverse native exclusion")
                 print("Native version:", owner.version)
             except Exception:
                 log.flush()

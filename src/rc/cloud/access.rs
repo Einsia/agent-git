@@ -181,6 +181,7 @@ pub fn authorize(
         | "session.commands"
         | "session.model"
         | "session.resume"
+        | "session.enqueue"
         | "turn.start"
         | "turn.steer"
         | "turn.interrupt"
@@ -362,6 +363,39 @@ mod tests {
         );
         let revoked = permit.response(response, &resources, &Policy::default(), &principal);
         assert!(revoked.result.unwrap()["resolved_session"].is_null());
+    }
+
+    #[test]
+    fn native_inbox_requires_control_of_the_exact_session() {
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "operator".into(),
+        };
+        let mut resources = Resources::default();
+        resources.observe(
+            "session.list",
+            &json!({"local":[{
+                "runtime_session_id":"native", "runtime":"codex", "cwd":"/trusted"
+            }]}),
+        );
+        for (access, allowed) in [(Access::Read, false), (Access::Control, true)] {
+            let policy = Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Session("native".into()),
+                    access,
+                }],
+            )
+            .unwrap();
+            let request = Frame::request("session.enqueue", json!({"session_id":"native"}));
+            assert_eq!(
+                authorize(request, &principal, &policy, &mut resources).is_ok(),
+                allowed
+            );
+            let other = Frame::request("session.enqueue", json!({"session_id":"another"}));
+            assert!(authorize(other, &principal, &policy, &mut resources).is_err());
+        }
     }
 
     #[test]

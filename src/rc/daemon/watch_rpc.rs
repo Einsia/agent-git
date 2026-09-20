@@ -32,6 +32,7 @@ pub(super) struct PreparedWatch {
     absolute_lines: bool,
     before_cursor: u64,
     history_error: Option<String>,
+    native_inbox: Option<String>,
 }
 
 enum WatchSource {
@@ -151,6 +152,7 @@ impl WatchScan {
             absolute_lines,
             before_cursor,
             history_error,
+            native_inbox: None,
         })
     }
 }
@@ -208,6 +210,7 @@ impl Daemon {
             absolute_lines,
             before_cursor,
             history_error,
+            native_inbox,
         } = prepared;
         if request != p {
             return Err(RpcError::new(
@@ -547,7 +550,7 @@ impl Daemon {
             total_lines,
             absolute_lines,
             read_only: true,
-            native_inbox: None,
+            native_inbox,
         })
         .unwrap())
     }
@@ -708,6 +711,14 @@ impl WatchRpcTicket {
                         "session history preparation worker failed")).and_then(|result| result),
                     _ = stopping(&mut stop) => return,
                 };
+                let mut scanned = scanned;
+                if let Ok(prepared) = &mut scanned
+                    && prepared.runtime == "codex"
+                    && let Some(codex) = crate::adapter::which("codex")
+                    && crate::rc::native_inbox::queue_available(codex).await
+                {
+                    prepared.native_inbox = Some("codex_queue".into());
+                }
                 let mut state = daemon.lock().await;
                 if *stop.borrow() || !connection_epoch_is_current(&state.settlement, epoch) {
                     return;

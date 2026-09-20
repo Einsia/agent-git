@@ -521,6 +521,50 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
+                            if frame.method() == method::SESSION_ENQUEUE =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(
+                                    ErrorCode::SessionBusy, "native inbox is busy; retry this client message id")));
+                                continue;
+                            }
+                            let snapshot = {
+                                let state = d.lock().await;
+                                state.prepare_session_list(&frame)
+                            };
+                            match snapshot {
+                                Ok(snapshot) => {
+                                    let out = out_tx.clone();
+                                    let daemon = d.clone();
+                                    session_rpc_tasks.spawn(async move {
+                                        let result = async {
+                                            let request: crate::rc::native_inbox::Request = frame.params_as()?;
+                                            request.validate().map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+                                            let local = tokio::task::spawn_blocking(move || snapshot.scan(LocalSessionScan::Locate)
+                                                .into_iter().find(|local| local.runtime_session_id == request.session_id))
+                                                .await.map_err(|_| RpcError::new(ErrorCode::Internal, "native inbox discovery failed"))?;
+                                            let prepared = {
+                                                let state = daemon.lock().await;
+                                                if !connection_epoch_is_current(&state.settlement, epoch) {
+                                                    return Err(RpcError::new(ErrorCode::SessionBusy, "connection changed before native delivery"));
+                                                }
+                                                state.prepare_native_inbox(&frame, local)?
+                                            };
+                                            prepared.deliver().await.map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))
+                                        }.await;
+                                        let response = match result {
+                                            Ok(value) => Frame::response(id, value),
+                                            Err(error) => Frame::error_response(id, error),
+                                        };
+                                        let _ = out.send(response);
+                                    });
+                                }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if is_queued_session_rpc(frame.method()) =>
                         {
                             // Queueing a command and waiting for its receipt can

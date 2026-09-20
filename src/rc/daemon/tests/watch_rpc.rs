@@ -56,6 +56,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         absolute_lines: true,
         before_cursor: 0,
         history_error: None,
+        native_inbox: None,
     }
 }
 

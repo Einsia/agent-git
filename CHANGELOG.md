@@ -6,6 +6,33 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.3] - 2026-09-20
+
+### Added
+
+- **Send to externally owned Codex conversations.** Authorized operators can
+  enqueue text through the installed Codex CLI while its original process keeps
+  the writer lock. Capability discovery is nonmutating, and durable receipts
+  prevent duplicate submission after reconnect. Queue acceptance does not mean
+  execution; Codex controls consumption. Live controls still require ownership.
+- Include Cloud connection diagnostics and executor history phase timings to
+  help locate connection and history-loading delays.
+
+### Changed
+
+- Batch native history protection and watch projection, and coalesce concurrent
+  history captures while retaining session identity and turn order.
+- Remove the standalone `rc cloud enroll` command. `agit login` followed by
+  `agit rc start --detach` performs registration automatically.
+
+### Fixed
+
+- Resume Codex sessions promptly after the native writer releases ownership.
+- Preserve empty Codex sessions before publishing them to a workspace.
+- Keep unadopted native previews available with secret protection.
+- Compare hydrated native content when resolving resume identity, and ignore
+  bookkeeping after a settled turn when checking for unsettled work.
+
 ## [0.2.2] - 2026-09-19
 
 ### Added
