@@ -134,10 +134,6 @@ fn verify_transcript(path: &Path, session: &str) -> crate::Result<()> {
 
 impl Prepared {
     pub async fn deliver(self) -> crate::Result<Value> {
-        ensure!(
-            queue_available(self.codex.clone()).await,
-            "Codex native queue is unavailable"
-        );
         self.request.validate()?;
         verify_transcript(&self.transcript, &self.request.session_id)?;
         std::fs::create_dir_all(&self.receipts)?;
@@ -168,6 +164,26 @@ impl Prepared {
         let key = hex::encode(Sha256::digest(scope));
         let path = self.receipts.join(format!("{key}.json"));
         let digest = hex::encode(Sha256::digest(self.request.message.as_bytes()));
+        // A durable receipt is authoritative for retries. Return it before probing the native
+        // executable, because the original submission may have succeeded while its response was
+        // lost and the executable can be temporarily unavailable during recovery.
+        if std::fs::symlink_metadata(&path).is_ok() {
+            let mut bytes = Vec::new();
+            open_regular(&path)?.take(4096).read_to_end(&mut bytes)?;
+            let receipt: Receipt = serde_json::from_slice(&bytes)?;
+            ensure!(
+                receipt.digest == digest,
+                "client message id already belongs to different content"
+            );
+            return Ok(json!({
+                "client_msg_id": self.request.client_msg_id,
+                "status": receipt.status
+            }));
+        }
+        ensure!(
+            queue_available(self.codex.clone()).await,
+            "Codex native queue is unavailable"
+        );
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -314,6 +330,7 @@ mod tests {
         let first = std::fs::read(root.path().join("native-calls")).unwrap();
         assert!(String::from_utf8_lossy(&first).contains(&session));
         assert!(String::from_utf8_lossy(&first).contains("@collaborator"));
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o000)).unwrap();
         prepared(root.path(), &session, &id)
             .deliver()
             .await
@@ -322,6 +339,7 @@ mod tests {
             std::fs::read(root.path().join("native-calls")).unwrap(),
             first
         );
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut changed = prepared(root.path(), &session, &id);
         changed.request.message.push('!');
         assert!(changed.deliver().await.is_err());
