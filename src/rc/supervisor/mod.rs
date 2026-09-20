@@ -3364,6 +3364,7 @@ pub(crate) fn items_from_lines_with_mode(
     let protected = redactor.scrub_native_batch(&inputs);
     let mut out = vec![];
     let mut registered = std::collections::HashSet::new();
+    let mut protection_error_emitted = false;
     for ((line, raw, _), scrubbed) in records.into_iter().zip(protected) {
         let secret_projection = scrubbed.secret_projection;
         registered.extend(scrubbed.registered_ids);
@@ -3377,9 +3378,13 @@ pub(crate) fn items_from_lines_with_mode(
         // still works.
         let object_hash = projected_object_hash(&raw, &scrubbed_raw, secret_projection);
         let events = if scrubbed_raw.get("protection_error").is_some() {
+            if protection_error_emitted {
+                continue;
+            }
+            protection_error_emitted = true;
             vec![crate::adapter::Event::text(
                 crate::adapter::EventKind::AssistantReply,
-                "[content withheld: repository secret protection failed]",
+                redact::PROTECTION_ERROR_TEXT,
                 None,
             )]
         } else if runtime == "codex" {
@@ -3391,7 +3396,13 @@ pub(crate) fn items_from_lines_with_mode(
                 .map(|session| session.events)
                 .unwrap_or_default()
         };
-        let (raw_out, truncated) = cap_raw(scrubbed_raw);
+        let (raw_out, truncated) = if scrubbed_raw.get("protection_error").is_some() {
+            // The internal failure marker is a control-plane detail; never put it in the
+            // transcript payload that viewers can inspect.
+            (serde_json::Value::Null, false)
+        } else {
+            cap_raw(scrubbed_raw)
+        };
 
         // IR text and paths are derived from the protected native bytes before display truncation.
         for (i, mut event) in events.into_iter().enumerate() {

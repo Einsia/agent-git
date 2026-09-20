@@ -87,6 +87,11 @@ pub(crate) struct NativeJson {
     pub registered_ids: Vec<String>,
 }
 
+/// User-facing text for a native record that could not pass the local privacy boundary.
+/// Internal protection errors belong in the daemon log and must not be sent to viewers.
+pub(crate) const PROTECTION_ERROR_TEXT: &str =
+    "[content unavailable: local privacy protection could not complete]";
+
 /// The device-local persona: "who this machine is", read out of the environment.
 #[derive(Debug, Clone, Default)]
 pub struct Persona {
@@ -332,7 +337,7 @@ impl Redactor {
         records: &[(&serde_json::Value, &[&str])],
     ) -> Vec<NativeJson> {
         let withheld = || NativeJson {
-            value: serde_json::json!({"protection_error":"content withheld: repository secret protection failed"}),
+            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
             secret_projection: true,
             registered_ids: Vec::new(),
         };
@@ -421,16 +426,42 @@ impl Redactor {
                     })
                     .collect()
             };
-            // Failure isolation reuses each occurrence's mask; later evidence cannot bless an earlier record.
-            Ok(protect(0..records.len()).unwrap_or_else(|_| {
-                (0..records.len())
-                    .flat_map(|index| {
-                        protect(index..index + 1).unwrap_or_else(|_| vec![withheld()])
-                    })
-                    .collect()
-            }))
+            // A single oversized or malformed record must not hide healthy neighbors. Retry
+            // each record with its original mask, while keeping every failed record fail-closed.
+            match protect(0..records.len()) {
+                Ok(values) => Ok(values),
+                Err(batch_error) => {
+                    let mut values = Vec::with_capacity(records.len());
+                    let mut first_failure = None;
+                    for index in 0..records.len() {
+                        match protect(index..index + 1) {
+                            Ok(mut item) => values.append(&mut item),
+                            Err(error) => {
+                                first_failure.get_or_insert(error);
+                                values.push(withheld());
+                            }
+                        }
+                    }
+                    if let Some(error) = first_failure {
+                        eprintln!(
+                            "agitd: native secret projection batch failed; retried {} records: {batch_error:#}",
+                            records.len()
+                        );
+                        eprintln!(
+                            "agitd: native secret projection withheld one or more records: {error:#}"
+                        );
+                    }
+                    Ok(values)
+                }
+            }
         })();
-        result.unwrap_or_else(|_| records.iter().map(|_| withheld()).collect())
+        result.unwrap_or_else(|error| {
+            eprintln!(
+                "agitd: native secret projection withheld {} records: {error:#}",
+                records.len()
+            );
+            records.iter().map(|_| withheld()).collect()
+        })
     }
 
     #[cfg(feature = "rc")]
@@ -501,7 +532,7 @@ impl Redactor {
     /// Redact one text. Deterministic: same input, same persona ⇒ same output.
     pub fn scrub(&self, text: &str) -> Report {
         self.try_scrub(text).unwrap_or_else(|_| Report {
-            text: "[content withheld: repository secret protection failed]".into(),
+            text: PROTECTION_ERROR_TEXT.into(),
             ..empty_report()
         })
     }
@@ -651,8 +682,11 @@ impl Redactor {
     /// would miss `\"`, `\\` and `\n` inside a registered literal.
     pub fn scrub_json(&self, value: &serde_json::Value) -> JsonReport {
         self.try_scrub_json(value).unwrap_or_else(|_| JsonReport {
-            value: serde_json::json!({"protection_error": "content withheld: repository secret protection failed"}),
-            secrets: 0, paths: 0, ips: 0, registered_ids: vec![],
+            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
+            secrets: 0,
+            paths: 0,
+            ips: 0,
+            registered_ids: vec![],
         })
     }
 

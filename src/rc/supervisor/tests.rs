@@ -2002,6 +2002,51 @@ fn oversized_raw_lines_are_replaced_not_streamed() {
     assert_eq!(out, small);
 }
 
+#[cfg(feature = "secret-vault")]
+#[test]
+fn native_history_coalesces_repeated_protection_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+    let vault = repo.root().join(".git/agit/secret-dictionary/vault.json");
+    std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let redactor = crate::domain::redact::Redactor::with_registered(
+        crate::domain::redact::Persona::default(),
+        crate::domain::secret_filter::MatcherHandle::default(),
+    )
+    .with_repository(repo.root())
+    .unwrap()
+    .with_native_context("codex", "", repo.root(), repo.root());
+    let lines: Vec<_> = ["first", "second"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| crate::rc::tail::TailedLine {
+            source: None,
+            lineno: index as u64,
+            text: serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}]
+                }
+            })
+            .to_string(),
+        })
+        .collect();
+    let (items, _) = items_from_lines("codex", &redactor, &lines);
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].event.text.as_deref(),
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
+    );
+    assert!(
+        !serde_json::to_string(&items)
+            .unwrap()
+            .contains("protection_error")
+    );
+}
+
 /// A transcript line is redacted on its **decoded strings**, so the JSON shape has no room to be
 /// disturbed.
 ///

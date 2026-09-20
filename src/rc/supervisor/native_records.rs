@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) struct NativeRecords {
     initialized: bool,
     fingerprints: HashMap<String, String>,
+    protection_failures: HashSet<String>,
 }
 
 impl NativeRecords {
@@ -76,6 +77,7 @@ impl NativeRecords {
         let mut indices = HashMap::<usize, usize>::new();
         let mut items = Vec::new();
         let mut registered = HashSet::new();
+        let mut protection_error_emitted = false;
         for mut event in parsed.events {
             let Some(line) = event.line else {
                 continue;
@@ -112,20 +114,39 @@ impl NativeRecords {
             content.line = None;
             let fingerprint =
                 crate::domain::transcript::object_hash(&serde_json::json!([raw, content]));
-            let unchanged = self.fingerprints.get(&item_id) == Some(&fingerprint);
+            let unchanged = self.fingerprints.get(&item_id) == Some(&fingerprint)
+                && !self.protection_failures.contains(&item_id);
             current.insert(item_id.clone(), fingerprint);
             if unchanged || (!self.initialized && resuming) || (line as u64) < from_line {
                 continue;
             }
             let scrubbed = redactor.scrub_json(raw);
+            let protection_error = scrubbed.value.get("protection_error").is_some();
+            if protection_error {
+                self.protection_failures.insert(item_id.clone());
+                if protection_error_emitted {
+                    continue;
+                }
+                protection_error_emitted = true;
+            } else {
+                self.protection_failures.remove(&item_id);
+            }
             let hash = projected_object_hash(
                 raw,
                 &scrubbed.value,
-                scrubbed.secrets > 0 || scrubbed.value.get("protection_error").is_some(),
+                scrubbed.secrets > 0 || protection_error,
             );
             registered.extend(scrubbed.registered_ids);
-            let (raw, raw_truncated) = cap_raw(scrubbed.value);
-            if let Some(text) = event.text.take() {
+            let (raw, raw_truncated) = if protection_error {
+                // The internal failure marker is a control-plane detail; never put it in the
+                // transcript payload that viewers can inspect.
+                (Value::Null, false)
+            } else {
+                cap_raw(scrubbed.value)
+            };
+            if protection_error {
+                event.text = Some(crate::domain::redact::PROTECTION_ERROR_TEXT.into());
+            } else if let Some(text) = event.text.take() {
                 let scrubbed = redactor.scrub(&text);
                 registered.extend(scrubbed.registered_ids);
                 event.text = Some(scrubbed.text);
@@ -153,6 +174,8 @@ impl NativeRecords {
         }
         self.initialized = true;
         self.fingerprints = current;
+        self.protection_failures
+            .retain(|item_id| self.fingerprints.contains_key(item_id));
         Ok((items, registered.into_iter().collect()))
     }
 }
