@@ -561,11 +561,12 @@ mod tests {
             .join(crate::adapter::claude_code::slug_for(&root));
         std::fs::create_dir_all(&project).unwrap();
         let path = project.join(format!("{native}.jsonl"));
+        let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         std::fs::write(
             &path,
             format!(
                 "{}\n",
-                json!({"type":"user","message":{"role":"user","content":"Existing native history"}})
+                json!({"type":"user","message":{"role":"user","content":format!("Existing native history {credential}")}})
             ),
         )
         .unwrap();
@@ -575,12 +576,14 @@ mod tests {
             "starts":{"launch":{"spec":{"workspace_id":"local-owner","project_id":"project","runtime":"claude-code","cwd":root,"permission_mode":"default"},"state":{"state":"completed","result":{"session":session}}}}
         })).unwrap();
         let params = json!({"session_id":"logical"});
-        assert!(
-            !read_with_roster(params.clone(), &roster, &mut Timings::default()).unwrap()["items"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        let history = read_with_roster(params.clone(), &roster, &mut Timings::default()).unwrap();
+        assert!(history["items"].as_array().unwrap().iter().any(|item| {
+            item["event"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Existing native history "))
+        }));
+        assert!(!history.to_string().contains(credential));
+        assert!(!history.to_string().contains("protection_error"));
         roster.save().unwrap();
         drop(roster);
         let restarted = super::super::roster::Roster::try_load().unwrap();

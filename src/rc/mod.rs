@@ -339,6 +339,26 @@ impl Drop for TestAgitHomeGuard {
     }
 }
 
+/// Isolating descriptor-sensitive fixtures prevents other tests' forks from retaining their files.
+#[cfg(all(test, unix))]
+pub(crate) fn in_isolated_test(name: &str) -> bool {
+    const CHILD_CASE: &str = "AGIT_TEST_ISOLATED_RC_CASE";
+    if std::env::var(CHILD_CASE).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env(CHILD_CASE, name)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{name}: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "{name}: {output:?}"
+    );
+    true
+}
+
 /// Run a piece of test code synchronously with `home` as the home directory.
 ///
 /// The override is visible only to the current thread, so cargo's other tests never touch this

@@ -335,8 +335,7 @@ impl Daemon {
                 let mut redactor = crate::domain::redact::Redactor::with_registered(
                     crate::domain::redact::Persona::this_machine(),
                     secret_filter,
-                )
-                .require_repository();
+                );
                 if let Some(root) = &protection_repo {
                     redactor = redactor.with_repository(root).map_err(|_| {
                         RpcError::new(

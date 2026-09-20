@@ -642,24 +642,8 @@ pub fn serve_one(
 mod tests {
     use super::*;
 
-    /// A separate process prevents unrelated test forks from retaining listener and lock descriptors.
     fn in_isolated_process(case: &str) -> bool {
-        const CHILD_CASE: &str = "AGIT_TEST_CONTROL_CASE";
-        let name = format!("rc::control::tests::{case}");
-        if std::env::var(CHILD_CASE).as_deref() == Ok(name.as_str()) {
-            return false;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
-            .env(CHILD_CASE, &name)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{name}: {output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-            "{name}: {output:?}"
-        );
-        true
+        crate::rc::in_isolated_test(&format!("rc::control::tests::{case}"))
     }
 
     /// Start a fake daemon that **really answers**: it serves `n` times, then exits and takes the
@@ -811,6 +795,11 @@ mod tests {
 
     #[test]
     fn legacy_and_incomplete_records_fail_closed_without_rewriting_pidfiles() {
+        if in_isolated_process(
+            "legacy_and_incomplete_records_fail_closed_without_rewriting_pidfiles",
+        ) {
+            return;
+        }
         let cases = [
             (Some("1"), None),
             (None, Some("")),
@@ -834,7 +823,8 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("stop all daemons sharing this AGIT_HOME")
+                    .contains("stop all daemons sharing this AGIT_HOME"),
+                "{error}"
             );
             assert!(path.exists());
             assert_eq!(

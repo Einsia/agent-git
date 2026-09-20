@@ -67,6 +67,59 @@ async fn response(rx: &mut crate::rc::outbound::OutboundRx) -> Frame {
 }
 
 #[tokio::test]
+async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let daemon = fixture(&cwd).await;
+    let registered = "private preview sentinel";
+    let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    std::fs::write(
+        cwd.join("history.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":format!("Preview answer {registered} {credential}")}]
+            }})
+        ),
+    )
+    .unwrap();
+    let (frames, mut received) = mpsc::channel(8);
+    {
+        let mut state = daemon.lock().await;
+        state.secret_filter = crate::domain::secret_filter::MatcherHandle::new(
+            crate::domain::secret_filter::Matcher::for_test(&[("preview", registered)]),
+        );
+        let request = request(method::SESSION_WATCH, "ws", "native");
+        let scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd);
+        state.finish_watch_scan(&request, scan, &frames).unwrap();
+    }
+    let item = ready(async {
+        loop {
+            let frame = received.recv().await.unwrap();
+            if frame.method() == method::ITEM_COMPLETED {
+                break serde_json::to_value(frame).unwrap();
+            }
+        }
+    })
+    .await;
+    assert!(
+        item["params"]["event"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Preview answer "))
+    );
+    let wire = item.to_string();
+    assert!(!wire.contains(registered) && !wire.contains(credential));
+    assert!(!wire.contains("protection_error"));
+    daemon
+        .lock()
+        .await
+        .dispatch(&request(method::SESSION_UNWATCH, "ws", "native"), &frames)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_intermediate_request_keeps_stream_order_and_admission() {
     let mut queue = WatchRpcQueue::default();
     let frame = request(method::SESSION_WATCH, "ws", "native");

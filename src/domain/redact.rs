@@ -277,7 +277,7 @@ impl Redactor {
         Ok(self)
     }
 
-    /// Remote adapters without a selected Agent repository withhold suspicious content.
+    /// Supervised sessions need a selected Agent repository to publish reversible mappings.
     #[cfg(feature = "rc")]
     pub(crate) fn require_repository(mut self) -> Self {
         self.require_repository = true;

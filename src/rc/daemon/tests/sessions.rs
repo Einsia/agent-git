@@ -910,6 +910,11 @@ fn a_prewrite_failure_before_launch_releases_the_start_reservation() {
 #[cfg(unix)]
 #[test]
 fn a_missing_harness_binary_releases_the_start_reservation_for_a_retry() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::a_missing_harness_binary_releases_the_start_reservation_for_a_retry",
+    ) {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
 
     let home = tempfile::tempdir().unwrap();
@@ -1206,6 +1211,11 @@ fn revoked_authority_before_native_launch_releases_the_unexecuted_reservation() 
 #[cfg(unix)]
 #[test]
 fn a_launch_that_crossed_os_spawn_keeps_the_start_pending_for_inspection() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::a_launch_that_crossed_os_spawn_keeps_the_start_pending_for_inspection",
+    ) {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
 
     let home = tempfile::tempdir().unwrap();
