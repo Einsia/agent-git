@@ -1,6 +1,6 @@
 {
   "name": "@einsia/agent-git-darwin-arm64",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Prebuilt agit CLI binary (darwin arm64) — platform package for @einsia/agent-git.",
   "license": "MIT",
   "os": [

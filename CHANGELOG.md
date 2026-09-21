@@ -6,6 +6,20 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.4] - 2026-09-21
+
+### Fixed
+
+- Return an existing native Codex inbox receipt before probing the executable,
+  so reconnect retries remain observable when Codex is temporarily unavailable.
+  Retries with the same message ID do not enqueue another message.
+- Coalesce repeated native history protection failures and keep internal error
+  details in daemon logs instead of repeating them in conversation history.
+- Preserve native conversation titles in session pickers and omit runtime
+  bookkeeping from message previews and counts.
+- Settle multiple newly detected heuristic secrets in one pass, and bound identity
+  evidence to the provenance budget when scanning large inputs.
+
 ## [0.2.3] - 2026-09-20
 
 ### Added
