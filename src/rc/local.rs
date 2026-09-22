@@ -156,7 +156,7 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
         }
         Action::Stop => println!(
             "{}",
-            serde_json::to_string(&super::control::ask(&super::control::Request::Stop)?)?
+            serde_json::to_string(&super::lifecycle::stop_and_wait()?)?
         ),
     }
     Ok(crate::ExitCode::Ok)

@@ -271,6 +271,25 @@ pub fn attach(ensure_daemon: bool, extra: &[String], current_build: bool) -> cra
     })
 }
 
+pub fn stop_and_wait() -> crate::Result<Reply> {
+    let _lock = lock()?;
+    let reply = control::ask(&Request::Stop)?;
+    ensure!(
+        matches!(reply, Reply::Stopping),
+        "daemon refused stop: {reply:?}"
+    );
+    // Stop acknowledges admission; attachment must wait for lifetime ownership to be released.
+    let deadline = Instant::now() + WAIT;
+    while control::presence() != Presence::Absent {
+        ensure!(
+            Instant::now() < deadline,
+            "daemon accepted stop but has not exited; no replacement was started"
+        );
+        std::thread::sleep(POLL);
+    }
+    Ok(reply)
+}
+
 fn attach_inner(ensure_daemon: bool, extra: &[String], current_build: bool) -> crate::Result<()> {
     let requirements = Requirements {
         extra,

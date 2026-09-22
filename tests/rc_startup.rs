@@ -353,6 +353,20 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
     );
     let stopped = command(home).args(["rc", "stop"]).output().unwrap();
     assert!(stopped.status.success());
+    assert_eq!(
+        agit::rc::control::presence_in(&home.join("desktop-rc")),
+        agit::rc::control::Presence::Absent,
+        "a completed stop must release the daemon's lifetime ownership"
+    );
+    let restarted = command(home)
+        .args(["rc", "local", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(restarted.status.success(), "{restarted:?}");
+    assert_ne!(
+        before["identity"]["instance_id"],
+        status()["identity"]["instance_id"]
+    );
     assert!(
         !command(home)
             .args(["rc", "pair"])

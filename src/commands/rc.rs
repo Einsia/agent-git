@@ -701,7 +701,7 @@ fn stop_verdict(p: control::Presence) -> (String, String, ExitCode) {
 
 fn stop() -> CmdResult {
     crate::rc::select_local_authority();
-    match control::ask(&control::Request::Stop) {
+    match crate::rc::lifecycle::stop_and_wait() {
         Ok(_) => {
             println!("  {} stopped", ui::ok("✓"));
             Ok(ExitCode::Ok)
