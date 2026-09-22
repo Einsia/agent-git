@@ -245,20 +245,33 @@ impl Controller {
                 base.access(principal, None, Some(&scope.project_id)),
                 scope.access,
             );
-            let mut rules = vec![Rule {
-                principal: principal.clone(),
-                resource: Resource::Project(scope.project_id.clone()),
-                access,
-            }];
+            // Equivalent directory bindings share discovery; execution retains the granted ID.
+            let aliases: std::collections::HashSet<_> = resources
+                .projects
+                .iter()
+                .filter(|(_, path)| path.as_path() == Path::new(&scope.local_path))
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let mut rules: Vec<_> = aliases
+                .iter()
+                .map(|id| Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Project((*id).into()),
+                    access: intersect(base.access(principal, None, Some(id)), access),
+                })
+                .collect();
             for rule in base
                 .rules()
                 .iter()
                 .filter(|rule| &rule.principal == principal)
             {
                 if let Resource::Session(id) = &rule.resource
-                    && let Some(session) = resources
-                        .session(id)
-                        .filter(|session| session.project.as_deref() == Some(&scope.project_id))
+                    && let Some(session) = resources.session(id).filter(|session| {
+                        session
+                            .project
+                            .as_deref()
+                            .is_some_and(|id| aliases.contains(id))
+                    })
                 {
                     rules.push(Rule {
                         principal: principal.clone(),
@@ -410,7 +423,7 @@ mod tests {
         resources.observe(
             "workspace.list",
             &json!({"workspaces":[{"workspace_id":"local-owner","projects":[
-                {"project_id":"shared","local_path":path}, {"project_id":"other","local_path":other}
+                {"project_id":"alias","local_path":path}, {"project_id":"other","local_path":other}
             ]}]}),
         );
         let catalog = json!({"local":[
@@ -419,6 +432,10 @@ mod tests {
             {"runtime_session_id":"other","runtime":"codex","cwd":other}
         ]});
         resources.observe("session.list", &catalog);
+        resources.observe(
+            "project.bind",
+            &json!({"project_id":"shared","local_path":path}),
+        );
         let owner = Owner {
             generation: 1,
             source: "controller".into(),
