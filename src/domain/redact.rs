@@ -129,6 +129,8 @@ impl Persona {
 #[derive(Clone)]
 pub struct Redactor {
     persona: Persona,
+    username_pattern: Option<Regex>,
+    hostname_pattern: Option<Regex>,
     #[cfg(feature = "secret-vault")]
     require_repository: bool,
     buffered_stream_bytes: Arc<AtomicUsize>,
@@ -210,11 +212,7 @@ fn apply_spans(out: &mut String, spans: &[(usize, usize, String)], count: &mut u
 
 /// Replacement wrapped in word boundaries (the regex crate has no lookaround, so the boundary is
 /// "capture what precedes + check what follows by hand").
-fn replace_token(text: &str, token: &str, with: &str, count: &mut usize) -> String {
-    // Boundary character set: path separators, dots and colons all count as "outside", so
-    // /etc/<user>, <user>@host and <user>:<group> all match while <user>name and my<user> do
-    // not.
-    let re = Regex::new(&format!(r"(^|[^A-Za-z0-9._-]){}", regex::escape(token))).unwrap();
+fn replace_token(text: &str, token: &str, re: &Regex, with: &str, count: &mut usize) -> String {
     let view = crate::domain::secrets::view_of(text);
     let mut spans: Vec<(usize, usize, String)> = vec![];
     let mut pos = 0;
@@ -240,9 +238,18 @@ fn replace_token(text: &str, token: &str, with: &str, count: &mut usize) -> Stri
     out
 }
 
+fn token_pattern(token: Option<&str>) -> Option<Regex> {
+    // Dots, underscores, hyphens, and ASCII alphanumerics keep a token inside a longer name.
+    token
+        .filter(|token| token.len() >= 3)
+        .map(|token| Regex::new(&format!(r"(^|[^A-Za-z0-9._-]){}", regex::escape(token))).unwrap())
+}
+
 impl Redactor {
     pub fn new(persona: Persona) -> Self {
         Redactor {
+            username_pattern: token_pattern(persona.username.as_deref()),
+            hostname_pattern: token_pattern(persona.hostname.as_deref()),
             persona,
             #[cfg(feature = "secret-vault")]
             require_repository: false,
@@ -262,13 +269,8 @@ impl Redactor {
         registered: crate::domain::secret_filter::MatcherHandle,
     ) -> Self {
         Redactor {
-            persona,
-            require_repository: false,
-            buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
             registered,
-            dictionary: None,
-            #[cfg(feature = "rc")]
-            native: None,
+            ..Self::new(persona)
         }
     }
 
@@ -634,15 +636,11 @@ impl Redactor {
         }
 
         // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
-        if let Some(user) = persona_user
-            && user.len() >= 3
-        {
-            out = replace_token(&out, user, "user", &mut paths);
+        if let (Some(user), Some(pattern)) = (persona_user, &self.username_pattern) {
+            out = replace_token(&out, user, pattern, "user", &mut paths);
         }
-        if let Some(host) = &self.persona.hostname
-            && host.len() >= 3
-        {
-            out = replace_token(&out, host, "host", &mut paths);
+        if let (Some(host), Some(pattern)) = (&self.persona.hostname, &self.hostname_pattern) {
+            out = replace_token(&out, host, pattern, "host", &mut paths);
         }
 
         // ── 5. Public IPs ──

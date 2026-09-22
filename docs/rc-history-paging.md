@@ -2,8 +2,8 @@
 
 The executor advertises `machine.describe.history` with `version: 2`,
 `snapshot: true`, and the supported runtime names. Callers must negotiate this
-capability before requesting consistent history. Paired Hub connections retain
-bounded watch history; the Cloud executor endpoint provides pagination.
+capability before requesting consistent history. The peer/Cloud executor endpoint
+provides pagination.
 
 `session.history` accepts `session_id`, and authorized native lookups also supply
 `runtime` and `cwd`. The initial request omits `before` and `snapshot`. Its response
@@ -64,3 +64,39 @@ python3 tests/desktop/history_rpc.py target/debug/agit --serve /tmp/history-fixt
 The backend repository documents the collector and component commands in
 `docs/web-history-checkpoints.md`. Stop the fixture process after those checks;
 its temporary sources and daemon are owned by the test process.
+
+## Projection measurement (2026-09-23)
+
+A release-profile offline reader on einsia-h1 isolates history processing from
+the Cloud route. In the baseline at `20d7aaf8`, persona projection recompiles the
+username and hostname regexes for every JSON key and string. Compiling them once
+per `Redactor`'s fixed persona removes that repeated work. Identity evidence and secret
+policy still run on every read; protected pages and authorization are not cached.
+
+| Saved fixture | Warm read before | Warm read after | Projected items |
+| --- | --- | --- | --- |
+| Staging collaboration | 254–264 ms | 55–65 ms | 28 |
+| Production collaboration | 343–347 ms | 123–129 ms | 30 |
+
+Each range covers three warm reads after an initial read, using the same build
+profile and toolchain. Item digests and byte lengths agree across baseline,
+candidate, and an independent read through the published 0.2.4 daemon. Existing
+redaction tests also pass, including explicit-policy reload and failure isolation.
+These bounded local measurements do not establish end-to-end Cloud latency or
+fleet percentiles. Remaining work includes cold initialization, native evidence
+loading, session creation, and the separately tracked browser reset.
+
+The same candidate also passes a staging Cloud trial on chiikawa: two accounts
+open four connections and perform twelve simultaneous reads of an existing tool
+conversation. All return identical items without reconnecting. Warm requests take
+1,196–1,206 ms, compared with 1,616–1,627 ms in a passing published-0.2.4 trial;
+first-page requests take 1,916–1,923 ms and 2,077–2,086 ms, respectively. The
+executor performs one upstream projection per concurrent batch. This still exceeds
+the latency target and compares different builds, so the isolated same-toolchain
+measurement above is the evidence for the specific code change.
+
+An earlier official-package trial fails before reading history: the executor
+logs completion of `machine.describe`, but the backend's shared-session handshake
+times out and reconnects. The later official-package trial passes. The failed
+trial and correlated AWS logs remain part of the evidence; this optimization does
+not establish the cause or repair of that intermittent handshake failure.
