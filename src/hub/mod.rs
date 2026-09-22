@@ -253,6 +253,25 @@ pub struct ShareResponse {
     pub expires_at: Option<String>,
 }
 
+/// One repository invitation link as the hub describes it. The token is never part of it.
+#[derive(Debug, Deserialize)]
+pub struct RepositoryInvitation {
+    pub id: String,
+    pub role: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// A freshly minted invitation. The hub stores only the token's digest, so this answer is the
+/// only place the token ever appears; losing it means minting another link.
+#[derive(Debug, Deserialize)]
+pub struct CreatedInvitation {
+    pub invitation: RepositoryInvitation,
+    pub token: String,
+}
+
 /// One session hit. The fields correspond to `SessionHit` in the hub's `search/scan.rs`.
 ///
 /// **One row per session**, not one per event: the same word can occur dozens of times inside one

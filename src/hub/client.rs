@@ -818,6 +818,23 @@ impl Client {
         )
     }
 
+    /// Mint an invitation link (owners only; anyone else gets the same 404 as a missing repo).
+    pub fn create_invitation(
+        &self,
+        owner: &str,
+        name: &str,
+        role: &str,
+        expected_agent_id: &str,
+    ) -> Result<super::CreatedInvitation> {
+        self.post(
+            &format!("api/agents/{owner}/{name}/invitations"),
+            &serde_json::json!({
+                "role": role,
+                "expected_agent_id": expected_agent_id,
+            }),
+        )
+    }
+
     /// Translate a **transport-layer** error into something useful to the user.
     ///
     /// Only unreachable, timed out and TLS problems are left — status codes go through
@@ -2109,6 +2126,41 @@ mod tests {
         assert_eq!(body["name"], "photo-copy");
         assert_eq!(body["expected_source_agent_id"], id);
         assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+
+    /// Minting an invitation posts exactly the role and the pinned identity to the repository's
+    /// invitation collection. A body that dropped `expected_agent_id` is refused by the hub, and
+    /// one that carried extra fields (a branch, a session) would put the landing page on the
+    /// server when it lives only in the link fragment.
+    #[test]
+    fn an_invitation_posts_only_the_role_and_the_pinned_identity() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let token = "ab".repeat(32);
+        let reply = serde_json::json!({
+            "invitation": {"id": "inv-1", "role": "read", "created_by": "alice", "created_at": "2026-09-23T00:00:00Z"},
+            "token": token,
+        })
+        .to_string();
+        let (base, hub) = fake_hub(1, move |_| (200, reply.clone()));
+        let created = client(&base)
+            .create_invitation("alice", "notes", "read", id)
+            .unwrap();
+        assert_eq!(created.token, token);
+        assert_eq!(created.invitation.id, "inv-1");
+        assert_eq!(created.invitation.role, "read");
+
+        let seen = hub.join().unwrap();
+        let request = &seen[0];
+        assert!(
+            request.starts_with("POST /api/agents/alice/notes/invitations HTTP/1.1\r\n"),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"role": "read", "expected_agent_id": id})
+        );
     }
 
     #[test]

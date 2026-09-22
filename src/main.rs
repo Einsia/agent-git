@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! Auth        login · logout · whoami · config
-//! Repos       init · clone · run · repo (create/list/info/visibility/collab/rename/delete/path)
+//! Repos       init · clone · run · repo (create/list/info/visibility/collab/invite/rename/delete/path)
 //! Adoption    import · status · switch · branch
 //! Recording   commit · tag
 //! Inspection  log · show · diff · view

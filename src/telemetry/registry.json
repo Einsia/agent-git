@@ -90,6 +90,7 @@
     "repo create": {"aliases":[],"args":{"name":{"action":"Set","policy":"presence"},"private":{"action":"SetTrue","policy":"boolean"}}},
     "repo delete": {"aliases":[],"args":{"local":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "repo info": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"}}},
+    "repo invite": {"aliases":[],"args":{"branch":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"},"role":{"action":"Set","policy":"enum","values":["owner","read","write"]}}},
     "repo list": {"aliases":[],"args":{"remote":{"action":"SetTrue","policy":"boolean"}}},
     "repo path": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"}}},
     "repo rename": {"aliases":[],"args":{"new_name":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},

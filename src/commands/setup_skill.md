@@ -122,6 +122,7 @@ session and records its claim; it is not a read-only preview.
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
 | Publish local history | `agit push <owner/repo>@<branch>` | Scans secrets, then publishes existing refs |
+| Invite someone to a repo or a pushed session | `agit repo invite <owner/repo>[@<branch>]` | Prints a non-expiring invite link (owners only; default role `read`); `@<branch>` lands the invitee on that session |
 
 ## Deliver files at completed milestones
 
@@ -200,7 +201,7 @@ agit push <owner/repo> -b main                         # publish the file line
 |---|---|
 | `init` | Create a local Agent repo, its `main` line, and shared-file scaffold |
 | `clone` | Fetch an existing Agent repo; read-only by default, `--mine` makes a copy in your namespace |
-| `repo` | Manage repo create/list/info/visibility/collaborators/rename/delete/path |
+| `repo` | Manage repo create/list/info/visibility/collaborators/invite links/rename/delete/path |
 | `new` | Create an empty session branch in a selected repo |
 | `run` | Open a branch or saved point, continuing a writable head or forking |
 | `resume` | Strictly continue an existing writable session branch |

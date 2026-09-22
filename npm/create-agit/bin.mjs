@@ -139,8 +139,7 @@ function main() {
   say('')
   say('Next:')
   say('  agit login        # sign in to the hub')
-  say('  agit import <session-id> -n <name> -b <branch>   # sessions live on their own line')
-  say('  agit push         # publish')
+  say('  then ask your agent to follow https://agent-git.com/docs/quickstart/')
   say('')
   dim('docs: https://agent-git.com/docs')
 }

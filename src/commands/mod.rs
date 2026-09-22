@@ -1298,7 +1298,7 @@ pub enum Commands {
     /// Open a saved source: continue a writable session or fork a new one when needed
     #[command(name = "run")]
     Run(run::Args),
-    /// Repo administration: create/list/info/visibility/collab/rename/delete/path
+    /// Repo administration: create/list/info/visibility/collab/invite/rename/delete/path
     Repo(repo::Args),
 
     // ── Adoption and status ─────────────────────────────────────────

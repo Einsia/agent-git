@@ -443,11 +443,11 @@ fn read_session(
     })
 }
 
-/// A web link follows the repository's pinned Hub and a locally known published point.
-fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
-    if !meta::is_bare_id(session_id) {
-        return None;
-    }
+/// The `(hub, owner, name)` a checkout publishes to, only when its origin sits on the pinned Hub.
+///
+/// Remote-tracking refs describe whatever origin points at; if origin names another Hub or a
+/// malformed path, a session read from them belongs to a page this pin cannot vouch for.
+pub(super) fn pinned_origin(repo: &Repo) -> Option<(String, String, String)> {
     let identity = crate::hub::identity::read(repo).ok()??;
     crate::infra::hub_authority::HubAuthority::parse(&identity.hub).ok()?;
     let remote = repo.remote_url()?;
@@ -460,6 +460,15 @@ fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
     if remote != expected && remote != format!("{expected}.git") {
         return None;
     }
+    Some((identity.hub, owner, name))
+}
+
+/// A web link follows the repository's pinned Hub and a locally known published point.
+fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
+    if !meta::is_bare_id(session_id) {
+        return None;
+    }
+    let (hub, owner, name) = pinned_origin(repo)?;
     let (status, published, _) = repo
         .git_status_local(&[
             "for-each-ref",
@@ -472,10 +481,7 @@ fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
     if status != Some(0) || published.is_empty() {
         return None;
     }
-    Some(format!(
-        "{}/@{owner}/{name}/s/{session_id}?ref={sha}",
-        identity.hub
-    ))
+    Some(format!("{hub}/@{owner}/{name}/s/{session_id}?ref={sha}"))
 }
 
 fn append_saved_metadata(

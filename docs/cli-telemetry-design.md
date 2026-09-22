@@ -248,6 +248,7 @@ The root canonical `command` remains the actual top-level command.
 | `repo info`, `repo path` | Explicit/context target source; found/unavailable result |
 | `repo visibility` | Validated requested visibility, changed/unchanged/refused |
 | `repo collab add`, `rm`, `list` | Validated read/write role for add; list count bucket; never collaborator identity |
+| `repo invite` | Validated read/write/owner role, target and `-b` presence; never the repository, branch name, token, or link |
 | `repo rename`, `delete` | Rename/delete action, local/remote deletion, outcome; names excluded |
 | `import` | Runtime, link-only/privacy/propose-lineage/independent, supplied target/base flags; linked/adopted/already-adopted/refused; lineage mode and imported-turn count bucket |
 | `status` | Check-missing, limit/offset buckets; adoption/pagination count buckets from existing results |

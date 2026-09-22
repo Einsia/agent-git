@@ -836,7 +836,7 @@ agit branch --repo alice/payments
 | Goal                   | Command                                                   |
 | ---------------------- | --------------------------------------------------------- |
 | Sign in / identity     | `login` `logout` `whoami` `config`                        |
-| Create / fetch repos   | `init` `clone` `repo` (create/list/info/visibility/collab/rename/delete/path) |
+| Create / fetch repos   | `init` `clone` `repo` (create/list/info/visibility/collab/invite/rename/delete/path) |
 | Adopt / status         | `import` `status` `switch` `branch` (rename/rm/seal)      |
 | Record                 | `commit` `tag` `memory` (status/diff/distill/sync) `distill` |
 | Inspect                | `log` `show` `diff` `view`                                |

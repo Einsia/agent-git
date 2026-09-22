@@ -6,6 +6,24 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [Unreleased]
+
+### Added
+
+- **Invite links from the CLI.** `agit repo invite <owner/repo>` prints a link
+  that adds whoever opens it as a collaborator (`--role read|write|owner`,
+  default `read`). `agit repo invite <owner/repo>@<branch>` (or `-b <branch>`)
+  also lands the invitee on that branch's session page after they accept. Only repository
+  owners can create links; they do not expire and can be revoked in the
+  repository's settings (Invite by link). A session link requires the session
+  to be pushed already. `--json` reports the link, role, repository,
+  invitation ID and, for a session, its page URL.
+
+### Fixed
+
+- The `npx create-agit` installer's closing hint no longer suggests an
+  outdated `agit import` invocation; it points to the quickstart instead.
+
 ## [0.2.4] - 2026-09-21
 
 ### Fixed

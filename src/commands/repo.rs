@@ -5,6 +5,7 @@
 //! visibility and deleting both require typing the full name to confirm.
 
 use super::CmdResult;
+use crate::domain::meta;
 use crate::domain::repo::Repo;
 use crate::hub::Client;
 use crate::{ExitCode, ui};
@@ -38,6 +39,22 @@ pub enum Cmd {
         #[command(subcommand)]
         action: CollabAction,
     },
+    /// Print an invite link (owners only); `@branch` lands the invitee on that session.
+    ///
+    /// Whoever opens the link and signs in joins the repository with the chosen role. The link
+    /// does not expire and can be used more than once; revoke it in the repository's settings
+    /// (Invite by link). With `@branch` or `-b`, the branch's session must already be pushed.
+    Invite {
+        /// `owner/repo`, `owner/repo@branch` for that session, or `@` for AGIT_SESSION's session.
+        #[arg(value_name = "owner/repo[@branch]")]
+        repo: String,
+        /// Land the invitee on this branch's session; the same as writing `owner/repo@branch`.
+        #[arg(short = 'b', long, value_name = "branch")]
+        branch: Option<String>,
+        /// The role an accepted invitation grants.
+        #[arg(long, value_enum, value_name = "role", default_value_t = InviteRole::Read)]
+        role: InviteRole,
+    },
     /// Rename.
     Rename { repo: String, new_name: String },
     /// Delete. Deletes the remote by default (full name required); --local removes only the local copy.
@@ -48,6 +65,35 @@ pub enum Cmd {
     },
     /// Print the local directory: the main checkout, or `<owner/repo>@<branch>` for that session’s worktree.
     Path { repo: Option<String> },
+}
+
+/// The role an invitation link grants; the hub accepts exactly these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InviteRole {
+    /// Clone and pull.
+    Read,
+    /// Clone, pull and push.
+    Write,
+    /// Full control, including settings and invite links.
+    Owner,
+}
+
+impl InviteRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Owner => "owner",
+        }
+    }
+
+    fn grants(self) -> &'static str {
+        match self {
+            Self::Read => "clone and pull",
+            Self::Write => "clone, pull and push",
+            Self::Owner => "full control, including settings and invite links",
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -74,6 +120,7 @@ pub fn run(args: Args) -> CmdResult {
         Cmd::Info { repo } => info(resolve_or_ctx(repo.as_deref())),
         Cmd::Visibility { repo, visibility } => set_visibility(&repo, &visibility),
         Cmd::Collab { action } => collab(action),
+        Cmd::Invite { repo, branch, role } => invite(&repo, branch.as_deref(), role),
         Cmd::Rename { repo, new_name } => rename(&repo, &new_name),
         Cmd::Delete { repo, local } => delete(&repo, local),
         Cmd::Path { repo } => path(resolve_or_ctx(repo.as_deref())),
@@ -593,6 +640,360 @@ fn collab(action: CollabAction) -> CmdResult {
     }
 }
 
+/// What an invite names: a repository, or one of its session branches as the landing page.
+#[derive(Debug, PartialEq, Eq)]
+struct InviteTarget {
+    owner: String,
+    name: String,
+    branch: Option<String>,
+}
+
+/// `owner/repo` or `owner/repo@branch`. A bare `@` is AGIT_SESSION's and is expanded by the
+/// caller; an empty branch is refused rather than read as the repository, because the two print
+/// links to different pages.
+fn parse_invite_target(raw: &str) -> crate::Result<InviteTarget> {
+    let raw = raw.trim();
+    let (slug, branch) = match raw.split_once('@') {
+        Some((_, "")) => anyhow::bail!(
+            "`{raw}` names no branch after `@`; drop the `@` to invite to the whole repository"
+        ),
+        Some((slug, branch)) => (slug, Some(branch.to_owned())),
+        None => (raw, None),
+    };
+    let (owner, name) = super::parse_slug(slug)?;
+    super::canonical_owner(&owner)?;
+    Ok(InviteTarget {
+        owner,
+        name,
+        branch,
+    })
+}
+
+/// JavaScript's `encodeURIComponent`. The web app reads `next` back with `URLSearchParams`, and a
+/// link for the same session must be byte-identical whichever side builds it; RFC 3986's
+/// unreserved set would also escape `!*'()`.
+fn encode_uri_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The session page as a path on the hub: the value an invite link carries in `next`.
+fn session_path(owner: &str, name: &str, session_id: &str, branch: &str) -> String {
+    format!(
+        "/@{owner}/{name}/s/{}?ref={}",
+        encode_uri_component(session_id),
+        encode_uri_component(branch)
+    )
+}
+
+/// The token and the landing path ride in the fragment, which browsers never send to the server.
+/// The creator's account rides in the query as `share=true&sharer=<account>`, the attribution the
+/// hub counts share clicks and share-driven signups by; it names no secret.
+fn invite_link(hub: &str, token: &str, next: Option<&str>, sharer: Option<&str>) -> String {
+    let mut link = format!("{}/invite", hub.trim_end_matches('/'));
+    if let Some(sharer) = sharer {
+        link.push_str("?share=true&sharer=");
+        link.push_str(&encode_uri_component(sharer));
+    }
+    link.push_str("#token=");
+    link.push_str(token);
+    if let Some(next) = next {
+        link.push_str("&next=");
+        link.push_str(&encode_uri_component(next));
+    }
+    link
+}
+
+/// The web app refuses any other shape, so a link built from it could never be accepted.
+fn is_invitation_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Why a branch cannot be the landing page of an invite link.
+#[derive(Debug, PartialEq, Eq)]
+enum Unlinkable {
+    BadName,
+    /// Neither a local branch nor a remote-tracking one.
+    Missing,
+    /// A local branch this checkout has never seen on the hub.
+    Unpublished,
+    /// The file line carries no session.
+    FileLine,
+    /// The published head has not settled a turn, so the hub has no session page yet.
+    Unsettled,
+}
+
+/// The session id the hub serves for `branch`, read at the head this checkout last exchanged
+/// with origin.
+///
+/// The local head may be ahead of it; that is harmless because a branch's session identity is
+/// claimed by its first turn and never changes. What must not happen is naming a session from a
+/// local-only head: the hub has no page for it, and the invitee lands on a 404.
+fn published_session(repo: &Repo, branch: &str) -> crate::Result<Result<String, Unlinkable>> {
+    let (status, _, _) =
+        repo.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
+    if status != Some(0) {
+        return Ok(Err(Unlinkable::BadName));
+    }
+    let Some(head) = repo.git_opt(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/remotes/origin/{branch}^{{commit}}"),
+    ]) else {
+        return Ok(Err(if repo.has_ref(&format!("refs/heads/{branch}")) {
+            Unlinkable::Unpublished
+        } else {
+            Unlinkable::Missing
+        }));
+    };
+    let Some(snapshot) = meta::read_at_ref_result(repo, head.trim())? else {
+        return Ok(Err(Unlinkable::Unsettled));
+    };
+    if snapshot.is_file_line() {
+        return Ok(Err(Unlinkable::FileLine));
+    }
+    if !meta::is_bare_id(&snapshot.session) {
+        return Ok(Err(Unlinkable::Unsettled));
+    }
+    Ok(Ok(snapshot.session))
+}
+
+/// Resolve the landing session before anything is minted: a link, once printed, cannot be
+/// retargeted, and a refused lookup must not leave an unused invitation behind.
+fn landing_session(
+    owner: &str,
+    name: &str,
+    branch: &str,
+    hub: &str,
+) -> crate::Result<Result<String, ExitCode>> {
+    let slug = format!("{owner}/{name}");
+    let dir = crate::infra::config::repo_dir(owner, name)?;
+    let repo = Repo::open(&dir).ok_or_else(|| anyhow::anyhow!("{slug} has no local checkout"))?;
+    if super::show::pinned_origin(&repo)
+        != Some((hub.to_owned(), owner.to_owned(), name.to_owned()))
+    {
+        ui::error(&format!(
+            "the origin of {} is not {hub}/{slug}, so its branches cannot name a session there",
+            ui::tilde(&dir)
+        ));
+        ui::hint(&format!(
+            "invite to the repository with `agit repo invite {slug}`, or re-clone it with `agit clone {slug}`"
+        ));
+        return Ok(Err(ExitCode::Precondition));
+    }
+    let refusal = match published_session(&repo, branch)? {
+        Ok(session) => return Ok(Ok(session)),
+        Err(refusal) => refusal,
+    };
+    Ok(Err(match refusal {
+        Unlinkable::BadName => {
+            ui::error(&format!("`{branch}` is not a valid branch name."));
+            ExitCode::Usage
+        }
+        Unlinkable::Missing => {
+            ui::error(&format!("{slug} has no branch `{branch}`."));
+            ui::hint(&format!("`agit branch --repo {slug}` lists its branches"));
+            ExitCode::Ref
+        }
+        Unlinkable::Unpublished => {
+            ui::error(&format!(
+                "{slug}@{branch} is not on the hub as far as this checkout knows, so there is no session page to land on."
+            ));
+            ui::hint(&format!(
+                "publish it with `agit push {slug}@{branch}` (or `agit fetch {slug}` if it was pushed from elsewhere), then retry"
+            ));
+            ExitCode::Precondition
+        }
+        Unlinkable::FileLine => {
+            ui::error(&format!(
+                "`{branch}` is the file line of {slug}; it carries no session."
+            ));
+            ui::hint(&format!(
+                "invite to the repository instead: `agit repo invite {slug}`"
+            ));
+            ExitCode::Precondition
+        }
+        Unlinkable::Unsettled => {
+            ui::error(&format!(
+                "the published head of {slug}@{branch} has no settled session yet."
+            ));
+            ui::hint(&format!(
+                "settle and publish a turn first: `agit commit {slug}@{branch}`, then `agit push {slug}@{branch}`"
+            ));
+            ExitCode::Precondition
+        }
+    }))
+}
+
+/// An invite link is a governance write like adding a collaborator: it is fenced by the local
+/// pin, never by a live lookup of the name.
+fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
+    let raw = match (branch, raw.trim().contains('@')) {
+        (Some(_), true) => {
+            ui::error(&format!(
+                "`{}` already names a branch; give it either after `@` or with -b, not both",
+                raw.trim()
+            ));
+            return Ok(ExitCode::Usage);
+        }
+        (Some(branch), false) => format!("{}@{branch}", raw.trim()),
+        (None, _) => raw.to_owned(),
+    };
+    let raw = raw.as_str();
+    let target = if raw.trim() == "@" {
+        match super::context::at_context() {
+            Ok(context) => parse_invite_target(&format!("{}@{}", context.repo, context.branch)),
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Ref);
+            }
+        }
+    } else {
+        parse_invite_target(raw)
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
+            return Ok(ExitCode::Usage);
+        }
+    };
+    let (owner, name) = (target.owner.as_str(), target.name.as_str());
+    let slug = format!("{owner}/{name}");
+    let client = super::require_login()?;
+    let identity = match mutation_identity(&client, owner, name) {
+        Ok(identity) => identity,
+        Err(e) => {
+            ui::error(&format!("{e:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+    };
+    let hub = identity.hub.as_str();
+    let session = match target.branch.as_deref() {
+        None => None,
+        Some(branch) => match landing_session(owner, name, branch, hub)? {
+            Ok(session) => Some((branch, session)),
+            Err(code) => return Ok(code),
+        },
+    };
+    let settings = format!("{hub}/@{slug}/settings");
+
+    let created = match client.create_invitation(owner, name, role.as_str(), &identity.agent_id) {
+        Ok(created) => created,
+        Err(error) => {
+            super::fix::register_terminal_api_error(&error);
+            match error
+                .downcast_ref::<crate::hub::client::ApiError>()
+                .map(|api| api.status)
+            {
+                Some(404) => {
+                    ui::error(&format!(
+                        "only repository owners can create invite links: {slug} does not exist on {hub}, or you are not one of its owners."
+                    ));
+                    ui::hint(
+                        "ask an owner to run `agit repo invite`, or check the signed-in account with `agit whoami`",
+                    );
+                }
+                Some(400) => {
+                    ui::error(&format!("{error:#}"));
+                    ui::hint(&format!(
+                        "existing invite links are listed and revocable in {settings} (Invite by link)"
+                    ));
+                }
+                Some(409) => {
+                    ui::error(&format!("{error:#}"));
+                    ui::hint(
+                        "the repository changed while the link was being created; run the same command again",
+                    );
+                }
+                _ => ui::error(&format!("{error:#}")),
+            }
+            return Ok(super::terminal_error_code(&error, ExitCode::Network));
+        }
+    };
+    if !is_invitation_token(&created.token) {
+        ui::error("the hub answered with a malformed invitation token; no link was printed.");
+        ui::hint(&format!(
+            "revoke the unusable invitation in {settings} (Invite by link)"
+        ));
+        return Ok(ExitCode::Network);
+    }
+
+    let next = session
+        .as_ref()
+        .map(|(branch, id)| session_path(owner, name, id, branch));
+    let sharer = crate::infra::credentials::load(hub).map(|credential| credential.username);
+    let url = invite_link(hub, &created.token, next.as_deref(), sharer.as_deref());
+    let session_url = next.as_ref().map(|path| format!("{hub}{path}"));
+
+    if super::json::requested() {
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "operation": "invite",
+            "repository": slug,
+            "url": url,
+            "role": role.as_str(),
+            "invitation_id": created.invitation.id,
+            "created_at": created.invitation.created_at,
+            "expires_at": null,
+            "settings_url": settings,
+        });
+        if let (Some((branch, id)), Some(session_url)) = (&session, &session_url) {
+            value["branch"] = serde_json::json!(branch);
+            value["session_id"] = serde_json::json!(id);
+            value["session_url"] = serde_json::json!(session_url);
+        }
+        println!("{value}");
+        return Ok(ExitCode::Ok);
+    }
+
+    ui::success(&format!(
+        "invite link created for {}",
+        match &session {
+            Some((branch, _)) => format!("{slug}@{branch}"),
+            None => slug.clone(),
+        }
+    ));
+    let mut rows = vec![
+        ("invite link", ui::accent(&url)),
+        ("repository", slug.clone()),
+    ];
+    if let Some(session_url) = &session_url {
+        rows.push(("session", session_url.clone()));
+    }
+    rows.push(("role", format!("{} ({})", role.as_str(), role.grants())));
+    rows.push((
+        "expires",
+        "never; anyone holding the link can accept it until it is revoked".into(),
+    ));
+    print!("{}", ui::table::key_values(&rows));
+    if role == InviteRole::Owner {
+        ui::warning(&format!(
+            "an owner link hands out full control of {slug}; share it only with people you would make owners"
+        ));
+    }
+    ui::hint(&format!("revoke it in {settings} (Invite by link)"));
+    Ok(ExitCode::Ok)
+}
+
 fn rename(repo: &str, new_name: &str) -> CmdResult {
     let Some((owner, name)) = super::parse_slug(repo).ok() else {
         ui::error("expected the form owner/repo.");
@@ -794,6 +1195,168 @@ mod tests {
     }
 
     use super::*;
+
+    /// The role defaults to read and accepts only the hub's roles; the target keeps a branch
+    /// with slashes whole and refuses an empty one instead of widening it to the repository.
+    #[test]
+    fn invite_arguments_default_to_read_and_keep_the_branch_whole() {
+        use clap::Parser as _;
+        use clap::error::ErrorKind;
+        let parse = |argv: &[&str]| match crate::commands::Cli::try_parse_from(argv) {
+            Ok(crate::commands::Cli {
+                command:
+                    Some(crate::commands::Commands::Repo(Args {
+                        cmd: Cmd::Invite { repo, branch, role },
+                    })),
+                ..
+            }) => Ok((
+                match branch {
+                    Some(branch) => format!("{repo} -b {branch}"),
+                    None => repo,
+                },
+                role,
+            )),
+            Ok(_) => panic!("not an invite: {argv:?}"),
+            Err(error) => Err(error.kind()),
+        };
+        assert_eq!(
+            parse(&["agit", "repo", "invite", "alice/notes"]),
+            Ok(("alice/notes".into(), InviteRole::Read))
+        );
+        assert_eq!(
+            parse(&[
+                "agit",
+                "repo",
+                "invite",
+                "alice/notes@a",
+                "--role",
+                "owner",
+                "--json"
+            ]),
+            Ok(("alice/notes@a".into(), InviteRole::Owner))
+        );
+        assert_eq!(
+            parse(&["agit", "repo", "invite", "alice/notes", "-b", "feat/cache"]),
+            Ok(("alice/notes -b feat/cache".into(), InviteRole::Read))
+        );
+        assert_eq!(
+            parse(&["agit", "repo", "invite", "alice/notes", "--role", "admin"]),
+            Err(ErrorKind::InvalidValue)
+        );
+        assert_eq!(
+            parse(&["agit", "repo", "invite"]),
+            Err(ErrorKind::MissingRequiredArgument)
+        );
+
+        assert_eq!(
+            parse_invite_target("alice/notes").unwrap(),
+            InviteTarget {
+                owner: "alice".into(),
+                name: "notes".into(),
+                branch: None
+            }
+        );
+        assert_eq!(
+            parse_invite_target("alice/notes@feat/cache")
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("feat/cache")
+        );
+        for refused in ["alice/notes@", "notes", "Alice/notes", "alice/notes/x@y"] {
+            assert!(parse_invite_target(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The session page travels in the fragment as one `encodeURIComponent` value, so a branch's
+    /// `/`, `&` or `+` can neither split it nor decode differently in `URLSearchParams`. Leaving
+    /// `/` raw, escaping with the RFC 3986 set, or encoding the path only once changes these bytes.
+    #[test]
+    fn a_session_invite_carries_its_page_as_one_encoded_fragment_value() {
+        let token = "0f".repeat(32);
+        let session = format!("agit-{}", "a".repeat(40));
+        let hub = "https://hub.example.test";
+        assert_eq!(
+            invite_link(&format!("{hub}/"), &token, None, None),
+            format!("{hub}/invite#token={token}")
+        );
+        assert_eq!(
+            invite_link(hub, &token, None, Some("alice")),
+            format!("{hub}/invite?share=true&sharer=alice#token={token}")
+        );
+
+        let path = session_path("alice", "notes", &session, "feat/a&b+c");
+        assert_eq!(
+            path,
+            format!("/@alice/notes/s/{session}?ref=feat%2Fa%26b%2Bc")
+        );
+        assert_eq!(
+            invite_link(hub, &token, Some(&path), None),
+            format!(
+                "{hub}/invite#token={token}&next=%2F%40alice%2Fnotes%2Fs%2F{session}%3Fref%3Dfeat%252Fa%2526b%252Bc"
+            )
+        );
+        assert_eq!(encode_uri_component("Az09-_.!~*'()"), "Az09-_.!~*'()");
+        assert_eq!(
+            encode_uri_component("@/?&=+# %é"),
+            "%40%2F%3F%26%3D%2B%23%20%25%C3%A9"
+        );
+
+        assert!(is_invitation_token(&token));
+        assert!(!is_invitation_token(&token[1..]));
+        assert!(!is_invitation_token(&format!("zz{}", &token[2..])));
+    }
+
+    /// A session link names only a session the hub already has. Reading the local head instead
+    /// would print, for a branch that was never pushed, a link whose landing page is a 404.
+    #[test]
+    fn only_a_published_session_branch_can_be_a_landing_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("repo")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("file line").unwrap();
+
+        repo.git(&["checkout", "-b", "born"]).unwrap();
+        meta::write(
+            repo.root(),
+            &meta::Meta::new_session_line("claude-code".into(), "/work".into()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("birth").unwrap();
+
+        repo.git(&["checkout", "-b", "work"]).unwrap();
+        let session = format!("{}{}", meta::ID_PREFIX, "c".repeat(meta::ID_HEX_LEN));
+        meta::write(
+            repo.root(),
+            &meta::Meta::new(session.clone(), "claude-code".into(), "/work".into()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("turn").unwrap();
+        repo.git(&["branch", "local-only"]).unwrap();
+        for published in ["main", "born", "work"] {
+            repo.git(&[
+                "update-ref",
+                &format!("refs/remotes/origin/{published}"),
+                published,
+            ])
+            .unwrap();
+        }
+
+        assert_eq!(published_session(&repo, "work").unwrap(), Ok(session));
+        for (branch, refusal) in [
+            ("local-only", Unlinkable::Unpublished),
+            ("absent", Unlinkable::Missing),
+            ("main", Unlinkable::FileLine),
+            ("born", Unlinkable::Unsettled),
+            ("work~1", Unlinkable::BadName),
+        ] {
+            assert_eq!(published_session(&repo, branch).unwrap(), Err(refusal));
+        }
+    }
 
     #[test]
     fn materialize_leaves_a_pinned_repo_with_an_origin() {
