@@ -6,21 +6,30 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
-## [Unreleased]
+## [0.2.5] - 2026-09-23
 
 ### Added
 
 - **Invite links from the CLI.** `agit repo invite <owner/repo>` prints a link
   that adds whoever opens it as a collaborator (`--role read|write|owner`,
   default `read`). `agit repo invite <owner/repo>@<branch>` (or `-b <branch>`)
-  also lands the invitee on that branch's session page after they accept. Only repository
-  owners can create links; they do not expire and can be revoked in the
-  repository's settings (Invite by link). A session link requires the session
-  to be pushed already. `--json` reports the link, role, repository,
+  also lands the invitee on that branch's session page after they accept. Only
+  repository owners can create links; they do not expire and can be revoked in
+  the repository's settings (Invite by link). A session link requires the
+  session to be pushed already. `--json` reports the link, role, repository,
   invitation ID and, for a session, its page URL.
+
+### Changed
+
+- Remote Control history projection reuses compiled persona patterns, so long
+  shared histories page in faster.
 
 ### Fixed
 
+- `agit rc stop` now waits for the daemon to exit before reporting success, so
+  an immediate `agit rc start` no longer races the previous daemon.
+- Remote Control discovers native sessions when the same project folder is
+  bound through equivalent directory paths.
 - The `npx create-agit` installer's closing hint no longer suggests an
   outdated `agit import` invocation; it points to the quickstart instead.
 
