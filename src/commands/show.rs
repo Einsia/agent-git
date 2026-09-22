@@ -481,7 +481,31 @@ fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
     if status != Some(0) || published.is_empty() {
         return None;
     }
-    Some(format!("{hub}/@{owner}/{name}/s/{session_id}?ref={sha}"))
+    let sharer = super::link_sharer(&hub);
+    Some(session_page_url(
+        &hub,
+        &owner,
+        &name,
+        session_id,
+        sha,
+        sharer.as_deref(),
+    ))
+}
+
+/// The session page at a published point, naming the account that printed it when one is
+/// signed in to that Hub.
+fn session_page_url(
+    hub: &str,
+    owner: &str,
+    name: &str,
+    session_id: &str,
+    sha: &str,
+    sharer: Option<&str>,
+) -> String {
+    super::with_sharer(
+        format!("{hub}/@{owner}/{name}/s/{session_id}?ref={sha}"),
+        sharer,
+    )
 }
 
 fn append_saved_metadata(
@@ -1038,6 +1062,27 @@ fn render_envelopes(envelopes: &str, max_chars: usize) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    /// The sharer is one more query parameter after `ref`, present only for a signed-in account.
+    /// A builder that interpolates the stored name verbatim fails the last case, where the name
+    /// would smuggle in a parameter of its own.
+    #[test]
+    fn session_page_links_name_only_a_well_formed_sharer() {
+        let url = |sharer| {
+            super::session_page_url(
+                "https://hub.example.test/mount",
+                "alice",
+                "repo",
+                "agit-session",
+                "abc123",
+                sharer,
+            )
+        };
+        let bare = "https://hub.example.test/mount/@alice/repo/s/agit-session?ref=abc123";
+        assert_eq!(url(None), bare);
+        assert_eq!(url(Some("bob_2-x")), format!("{bare}&sharer=bob_2-x"));
+        assert_eq!(url(Some("bob&ref=main")), bare);
+    }
+
     #[test]
     fn local_display_restores_known_values_and_keeps_foreign_tokens_without_writing_git() {
         use crate::domain::{

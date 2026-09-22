@@ -155,6 +155,12 @@ pub(crate) fn emit(command: &str, selections: &[Selection]) -> bool {
     enabled
 }
 
+/// The top-level command dispatched on this thread. Library callers, and work moved onto other
+/// threads, see none rather than a command they were not started by.
+pub(crate) fn active_command() -> Option<&'static str> {
+    ACTIVE.with(|current| current.borrow().as_ref().map(|active| active.command))
+}
+
 /// Existing serialized or quiet output keeps its text without enabling nested human notices.
 pub(crate) fn legacy_output(command: &str) -> bool {
     ACTIVE.with(|current| {

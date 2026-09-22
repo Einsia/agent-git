@@ -554,19 +554,17 @@ pub fn run(args: Args) -> CmdResult {
                 .context("the version has no AgentGit metadata")?;
             let (owner, name) = super::parse_slug(&target.slug)?;
             let path = path.split('/').map(encoded).collect::<Vec<_>>().join("/");
-            let base = format!(
-                "{}/@{}/{}",
-                permalink_hub(repo, &owner, &name)?,
-                encoded(&owner),
-                encoded(&name)
-            );
+            let hub = permalink_hub(repo, &owner, &name)?;
+            let base = format!("{hub}/@{}/{}", encoded(&owner), encoded(&name));
             if metadata.is_file_line() {
                 println!("{base}?tab=files&ref={commit}&file={path}");
             } else {
-                println!(
+                let session = format!(
                     "{base}/s/{}?ref={commit}&tab=files&file={path}",
                     encoded(&metadata.session)
                 );
+                let sharer = super::link_sharer(&hub);
+                println!("{}", super::with_sharer(session, sharer.as_deref()));
             }
         }
     }

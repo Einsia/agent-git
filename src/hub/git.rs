@@ -127,6 +127,34 @@ fn quote_git_parameter(value: &str) -> String {
     quoted
 }
 
+/// The top-level agit command behind a Hub transport request. The Hub counts a download only
+/// for commands that fetch repository content on the user's behalf.
+const COMMAND_HEADER: &str = "X-AgentGit-Command";
+
+/// One random identifier per agit process. The Hub collapses every request that carries the
+/// same value for one repository into one download, so credential retries and negotiation
+/// rounds are not counted again.
+const OPERATION_HEADER: &str = "X-AgentGit-Operation";
+
+/// A fresh identifier per process links the requests of one invocation and nothing else; if it
+/// were persisted, separate invocations would collapse into one download.
+fn operation_id() -> &'static str {
+    static OPERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OPERATION.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Hub requests name the invocation, never its arguments. Outside a dispatched command the
+/// command header is omitted, so the Hub treats the request as unattributed instead of
+/// guessing.
+fn invocation_headers() -> Vec<(&'static str, &'static str)> {
+    let mut headers = Vec::new();
+    if let Some(command) = crate::commands::echo::active_command() {
+        headers.push((COMMAND_HEADER, command));
+    }
+    headers.push((OPERATION_HEADER, operation_id()));
+    headers
+}
+
 fn transport_env_after(
     inherited: Option<&OsStr>,
     token: Option<&str>,
@@ -134,6 +162,7 @@ fn transport_env_after(
     urls: &[String],
     accept_secret_findings: bool,
 ) -> Vec<(String, OsString)> {
+    let invocation = invocation_headers();
     let mut settings = vec![("http.extraHeader".to_string(), String::new())];
     for url in urls {
         let key = format!("http.{url}.extraHeader");
@@ -149,6 +178,10 @@ fn transport_env_after(
                     super::identity::EXPECTED_AGENT_ID_HEADER
                 ),
             ));
+        }
+        // The empty entry above resets inherited headers at this scope, so these must follow it.
+        for (name, value) in &invocation {
+            settings.push((key.clone(), format!("{name}: {value}")));
         }
         if accept_secret_findings {
             settings.push((key, "X-AgentGit-Accept-Secret-Findings: true".into()));
@@ -414,6 +447,9 @@ fn missing_lfs_uploads_with_transport(
                 .header(super::identity::EXPECTED_AGENT_ID_HEADER, agent_id);
             if let Some(token) = transport.token()? {
                 request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            for (name, value) in invocation_headers() {
+                request = request.header(name, value);
             }
             Ok(request.send_json(serde_json::json!({
                 "operation": "upload", "transfers": ["basic"], "objects": batch,
@@ -2709,7 +2745,76 @@ mod git_credential_lifecycle_tests {
             identity.then_some(AGENT_ID)
         );
         assert_eq!(request.header("X-AgentGit-Accept-Secret-Findings"), None);
+        assert_eq!(request.header(super::COMMAND_HEADER), None);
         assert!(request.body.is_empty());
+    }
+
+    /// Pins the download attribution contract: every Hub request of a Git fetch and clone, the
+    /// pack request after the advertisement included, names the dispatched agit command and
+    /// carries one version-4 UUID shared by the whole process. The dispatched names differ from
+    /// the Git verbs, so a command taken from the verb fails the grouping below; an identifier
+    /// minted per Git call or per request, or a pack request without the headers, fails the
+    /// equalities.
+    #[test]
+    fn hub_requests_name_the_command_and_share_one_operation_per_process() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|request| {
+            if request.method == "GET" {
+                advertisement()
+            } else {
+                Reply {
+                    status: 500,
+                    content_type: "text/plain",
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }
+            }
+        });
+        config::set_global("hub.url", Some(&hub.base)).unwrap();
+        credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+        let repo = crate::domain::repo::Repo::init(&home.workspace().join("fetched")).unwrap();
+        repo.git(&["config", "--global", "protocol.version", "0"])
+            .unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        let dispatched = [("pull", "fetch"), ("new", "clone")];
+        for (command, verb) in dispatched {
+            let cli =
+                <crate::commands::Cli as clap::Parser>::try_parse_from(["agit", command]).unwrap();
+            let _dispatch =
+                crate::commands::echo::Invocation::enter(cli.command.as_ref().unwrap(), false);
+            let outcome = if verb == "fetch" {
+                run_for_identity(Some(repo.root()), &["fetch", &url, "main"], &identity)
+            } else {
+                super::clone(&url, &home.workspace().join("cloned"), &identity)
+            };
+            assert!(!outcome.unwrap().ok(), "the fixture refuses every pack");
+        }
+        let requests = hub.finish();
+        let operation = requests[0].header(super::OPERATION_HEADER).unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(operation).unwrap().get_version_num(),
+            4
+        );
+        for request in &requests {
+            assert_eq!(request.header(super::OPERATION_HEADER), Some(operation));
+        }
+        for (command, _) in dispatched {
+            let methods: Vec<_> = requests
+                .iter()
+                .filter(|request| request.header(super::COMMAND_HEADER) == Some(command))
+                .map(|request| request.method.as_str())
+                .collect();
+            assert!(
+                methods.contains(&"GET") && methods.contains(&"POST"),
+                "{command}: {methods:?}"
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.header(super::COMMAND_HEADER).is_some())
+        );
     }
 
     #[test]
@@ -3394,7 +3499,8 @@ mod git_credential_lifecycle_tests {
                 "Git must parse each quoted key and value"
             );
             let expected = format!(
-                "\0Authorization: Bearer {token}\0X-AgentGit-Expected-Agent-Id: {AGENT_ID}\0"
+                "\0Authorization: Bearer {token}\0X-AgentGit-Expected-Agent-Id: {AGENT_ID}\0X-AgentGit-Operation: {}\0",
+                super::operation_id()
             );
             assert_eq!(output.stdout, expected.as_bytes());
             assert_eq!(

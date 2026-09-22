@@ -640,6 +640,32 @@ fn lands_on(remote_url: &str, hub: &str, me: Option<&str>, agent: &str) -> bool 
         && remote_slug(remote_url) == Some((me.to_string(), agent.to_string()))
 }
 
+/// The account signed in to `hub`, which a printed session page link names as its sharer so the
+/// Hub can credit visits that arrive through a pasted link. An expired sign-in names nobody.
+pub(crate) fn link_sharer(hub: &str) -> Option<String> {
+    crate::infra::credentials::load(hub)
+        .filter(|credential| !credential.refresh_expired())
+        .map(|credential| credential.username)
+}
+
+/// Appends `sharer` as one more query parameter. A name outside the Hub's username alphabet is
+/// left off rather than escaped: it could otherwise add parameters of its own, and the Hub
+/// ignores a sharer it cannot resolve anyway.
+pub(crate) fn with_sharer(mut url: String, sharer: Option<&str>) -> String {
+    let valid = |name: &&str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    };
+    if let Some(sharer) = sharer.filter(valid) {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("sharer=");
+        url.push_str(sharer);
+    }
+    url
+}
+
 /// The `(owner, name)` inside a hub address: the last two segments of `<hub>/<owner>/<name>.git`.
 ///
 /// Clone / push addresses are assembled by the server (`<public_url>/<owner>/<name>.git`) and the

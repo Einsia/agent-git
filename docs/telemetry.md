@@ -163,6 +163,30 @@ retention. The API envelope follows PostHog's
 The module is gated by the Cargo `cli` feature. Backend consumers using
 `default-features = false` do not link or execute this telemetry system.
 
+## Hub download attribution
+
+Separately from usage statistics, the Hub counts repository downloads and visits
+through shared links. Git and Git LFS requests that agit sends to the configured
+Hub carry two headers in addition to authorization and repository identity:
+
+| Header | Value |
+| --- | --- |
+| `X-AgentGit-Command` | The top-level command name, such as `clone`, `pull`, `fetch`, `run` or `new`; omitted when no command is dispatched |
+| `X-AgentGit-Operation` | A random UUID generated once per agit process and never stored |
+
+The Hub uses them to count one download per invocation and repository, so
+credential retries and negotiation rounds are not counted again. They contain no
+arguments, repository, branch or session names, paths or machine identifiers.
+They are scoped to the validated Hub repository URL like the authorization
+header: other Git remotes, Hub REST calls and PostHog never receive them. The
+usage statistics opt-outs above do not remove them, because the Hub serving the
+request already knows the account and repository it concerns.
+
+Session page links printed by `agit show` and `agit file link` append
+`sharer=<username>` when an account is signed in to that Hub, so the Hub can
+credit visits that arrive through a pasted link. Signed out, the link is
+unchanged.
+
 
 ## Acquisition funnel contract
 
