@@ -6,6 +6,21 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.6] - 2026-09-23
+
+### Changed
+
+- **Download counting on the Hub.** Git and Git LFS requests that agit sends to
+  the configured Hub carry `X-AgentGit-Command` (the top-level command, such as
+  `clone` or `pull`) and `X-AgentGit-Operation` (a random ID generated once per
+  process), so the Hub counts one download per invocation and repository
+  instead of one per negotiation round or credential retry. The headers contain
+  no arguments, names, paths or machine identifiers, and other Git remotes never
+  receive them. See [Hub download attribution](docs/telemetry.md#hub-download-attribution).
+- Session page links printed by `agit show` and `agit file link` add
+  `sharer=<username>` when you are signed in to that Hub, so visits through a
+  link you paste are credited to you. Signed out, links are unchanged.
+
 ## [0.2.5] - 2026-09-23
 
 ### Added
