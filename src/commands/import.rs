@@ -1181,8 +1181,29 @@ fn birth_session_branch(
             }
         }
         created = repo.has_ref(&head_ref);
-        if let Some(published) = declare_session_line(&repo, &branch, lk)? {
-            created_oid = Some(published);
+        match declare_session_line(&repo, &branch, lk) {
+            Ok(Some(published)) => created_oid = Some(published),
+            Ok(None) => {}
+            Err(error) => {
+                if !created {
+                    return Err(
+                        error.context("session line declaration failed before branch creation")
+                    );
+                }
+                let Some(expected) = created_oid.as_deref() else {
+                    return Err(error.context(format!(
+                        "session line declaration failed; branch `{branch}` has no expected tip and was left in place"
+                    )));
+                };
+                if let Err(cleanup) = repo.git(&["update-ref", "-d", &head_ref, expected]) {
+                    return Err(error.context(format!(
+                        "session line declaration failed and branch `{branch}` could not be removed with its expected tip: {cleanup:#}"
+                    )));
+                }
+                return Err(error.context(format!(
+                    "session line declaration failed; branch `{branch}` was removed before retry"
+                )));
+            }
         }
     }
     if !created {
@@ -1383,7 +1404,13 @@ pub(super) fn declare_session_line(
     if meta::read_at_ref(repo, &head).is_some_and(|m| m.is_session_line()) {
         return Ok(None);
     }
-    let born = Meta::new_session_line(lk.source.clone(), lk.cwd.clone().unwrap_or_default());
+    let mut born = Meta::new_session_line(lk.source.clone(), lk.cwd.clone().unwrap_or_default());
+    // The birth metadata is already part of publishable history, so it must use the same
+    // reversible projection as later settlement metadata. Leaving `cwd` in this commit gives the
+    // publication scan an older cleartext object to inspect even when the first turn is protected.
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    dictionary.protect_metadata(&mut born, &global)?;
     let born_text = meta::to_text(&born)?;
     let tree = super::new::fresh_session_tree(repo, &head, &born_text)?;
     let commit = super::plumbing::commit_tree(
@@ -1974,6 +2001,89 @@ mod tests {
             meta::is_file_line_at(&r, "refs/heads/mine"),
             "the base is the file line"
         );
+    }
+
+    /// The declaration commit has to carry the same protected workspace metadata as a turn.
+    #[test]
+    fn a_new_session_line_projects_its_workspace_metadata_before_publishing() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&d.path().join("repo")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        super::super::init::scaffold(repo.root()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("main file line").unwrap();
+        repo.git(&["branch", "session"]).unwrap();
+
+        let cwd = "/Users/Use9rK2mQ7xR4vB1nT8sW3zY6cL5jH0gF2aE4pU-w";
+        let link = Link {
+            source: "codex".into(),
+            session_id: "synthetic-session".into(),
+            cwd: Some(cwd.into()),
+            ..Link::new("codex", "synthetic-session", None)
+        };
+        let published = declare_session_line(&repo, "session", &link)
+            .unwrap()
+            .expect("the branch tip must move");
+        let metadata = meta::read_at_ref(&repo, &published).unwrap();
+
+        assert_ne!(metadata.cwd, cwd);
+        assert!(metadata.cwd.contains("AGIT_SECRET_V1:"));
+        assert!(!repo.show_raw(&published, meta::FILE).unwrap().contains(cwd));
+    }
+
+    /// A failed birth leaves no branch that can masquerade as a file line on the next retry.
+    #[test]
+    fn failed_birth_protection_removes_the_branch_before_retry() {
+        let d = tempfile::tempdir().unwrap();
+        let repo_dir = d.path().join("repo");
+        let repo = Repo::init(&repo_dir).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        super::super::init::scaffold(repo.root()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("main file line").unwrap();
+
+        let store = Store::at(d.path().join("store"));
+        let mut link = Link::new("codex", "retry-session", None);
+        link.cwd = Some("/work".into());
+        link::write(&store, &link).unwrap();
+
+        let vault = repo_dir.join(".git/agit/secret-dictionary/vault.json");
+        std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, b"corrupt dictionary").unwrap();
+        let failed = birth_session_branch(
+            &mut link,
+            &store,
+            "photo",
+            "alice",
+            "alice",
+            repo_dir.clone(),
+            repo,
+            "retry".into(),
+            None,
+            None,
+            None,
+        );
+        assert!(failed.is_err());
+        let repo = Repo::open(&repo_dir).unwrap();
+        assert!(!repo.has_ref("refs/heads/retry"));
+
+        std::fs::remove_file(&vault).unwrap();
+        let retried = birth_session_branch(
+            &mut link,
+            &store,
+            "photo",
+            "alice",
+            "alice",
+            repo_dir.clone(),
+            repo,
+            "retry".into(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(retried, Placed::Ready(_)));
+        assert!(Repo::open(&repo_dir).unwrap().has_ref("refs/heads/retry"));
     }
 
     /// A legacy repo with no `main` still yields a base (the current head) instead of failing.

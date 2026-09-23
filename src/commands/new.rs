@@ -271,6 +271,11 @@ pub fn run(args: Args) -> CmdResult {
     // settlement for a turn that never happened.
     snap.kind = meta::Kind::File;
     snap.milestone = Some(format!("new session (from {from_ref})"));
+    // The birth metadata is already part of publishable history, so project workspace
+    // observations before writing the branch tip just as settlement does.
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+    dictionary.protect_metadata(&mut snap, &global)?;
     let snap_text = meta::to_text(&snap)?;
     // The new session's tree = the shared files at from, with a `line: session` meta swapped in,
     // and empty LOG / VIEW written once every old session carrier is cleared: an empty VIEW is
