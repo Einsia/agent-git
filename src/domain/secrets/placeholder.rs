@@ -5,9 +5,11 @@ use std::sync::LazyLock;
 
 pub(crate) const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V1:";
 pub(crate) const TOKEN_SUFFIX: &str = "}}";
-#[cfg(feature = "secret-vault")]
 pub(crate) const CANONICAL_TOKEN_LEN: usize =
     TOKEN_PREFIX.len() + 36 + 1 + 4 + 32 + TOKEN_SUFFIX.len();
+const MAX_TOKEN_LEN: usize = CANONICAL_TOKEN_LEN + 2;
+#[cfg(feature = "secret-vault")]
+const MAX_ESCAPED_TOKEN_LEN: usize = MAX_TOKEN_LEN * 6;
 
 static CANONICAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\A\{\{AGIT_SECRET_V1:[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}:sec_[0-9A-Fa-f]{32}\}\}\z")
@@ -16,6 +18,18 @@ static CANONICAL: LazyLock<Regex> = LazyLock::new(|| {
 
 pub(crate) fn token_segments(text: &str) -> TokenSegments<'_> {
     TokenSegments { text, cursor: 0 }
+}
+
+/// Recognize repository tokens after decoding literal and JSON unicode-escaped bytes. Raw scans
+/// run before JSON decoding, so every accepted spelling must remain opaque in both forms.
+fn valid_token(token: &str) -> bool {
+    if CANONICAL.is_match(token) {
+        return true;
+    }
+    token
+        .strip_prefix(TOKEN_PREFIX)
+        .and_then(|body| body.strip_suffix(TOKEN_SUFFIX))
+        .is_some_and(valid_legacy_token_body)
 }
 
 /// Return the start of an opaque repository token that is complete and crosses
@@ -32,53 +46,193 @@ pub(crate) fn streaming_token_start(text: &str, cut: usize) -> Option<usize> {
     // starts close enough to the buffer end to remain an incomplete token, so
     // malformed input cannot make the stream buffer grow without bound.
     for (start, _) in text.rmatch_indices('{') {
-        if text.len().saturating_sub(start) >= CANONICAL_TOKEN_LEN {
+        if text.len().saturating_sub(start) >= MAX_ESCAPED_TOKEN_LEN {
             break;
         }
-        if start < cut && canonical_token_prefix(&text[start..]) {
+        if start < cut && token_prefix(&text[start..]) {
+            earliest = Some(earliest.map_or(start, |current| current.min(start)));
+        }
+    }
+    for (start, _) in text.rmatch_indices("\\u") {
+        if text.len().saturating_sub(start) >= MAX_ESCAPED_TOKEN_LEN {
+            break;
+        }
+        if start < cut && token_prefix(&text[start..]) {
             earliest = Some(earliest.map_or(start, |current| current.min(start)));
         }
     }
     earliest
 }
 
-#[cfg(feature = "secret-vault")]
-fn canonical_token_prefix(fragment: &str) -> bool {
-    if fragment.is_empty() || fragment.len() >= CANONICAL_TOKEN_LEN {
-        return false;
+#[cfg(any(feature = "secret-vault", test))]
+fn token_prefix(fragment: &str) -> bool {
+    let bytes = fragment.as_bytes();
+    let mut decoded = Vec::with_capacity(MAX_TOKEN_LEN);
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            let remaining = &bytes[cursor..];
+            if remaining.len() < 6 {
+                return partial_escape_prefix(&decoded, remaining);
+            }
+        }
+        let Some((byte, next)) = decoded_unit(fragment, cursor) else {
+            return false;
+        };
+        decoded.push(byte);
+        cursor = next;
+        if decoded.len() > MAX_TOKEN_LEN {
+            return false;
+        }
     }
-    fragment
-        .bytes()
-        .enumerate()
-        .all(|(index, byte)| canonical_token_byte(index, byte))
+    token_prefix_bytes(&decoded)
 }
 
-#[cfg(feature = "secret-vault")]
-fn canonical_token_byte(index: usize, byte: u8) -> bool {
-    if index < TOKEN_PREFIX.len() {
-        return TOKEN_PREFIX.as_bytes()[index] == byte;
+#[cfg(any(feature = "secret-vault", test))]
+fn partial_escape_prefix(decoded: &[u8], fragment: &[u8]) -> bool {
+    if fragment.is_empty() || fragment[0] != b'\\' {
+        return false;
     }
+    let digits = match fragment {
+        [b'\\'] | [b'\\', b'u'] => &[][..],
+        [b'\\', b'u', rest @ ..] if rest.len() < 5 => rest,
+        _ => return false,
+    };
+    if digits.iter().any(|digit| !digit.is_ascii_hexdigit()) {
+        return false;
+    }
+    (0..=u8::MAX).any(|value| {
+        let hex = [
+            b'0',
+            b'0',
+            b"0123456789abcdef"[(value >> 4) as usize],
+            b"0123456789abcdef"[(value & 0x0f) as usize],
+        ];
+        let mut extended = decoded.to_vec();
+        extended.push(value);
+        hex[..digits.len()] == digits[..] && token_prefix_bytes(&extended)
+    })
+}
 
-    let uuid_index = index - TOKEN_PREFIX.len();
-    if uuid_index < 36 {
-        return if matches!(uuid_index, 8 | 13 | 18 | 23) {
-            byte == b'-'
-        } else {
+#[cfg(any(feature = "secret-vault", test))]
+#[derive(Clone, Copy)]
+enum UuidShape {
+    Hyphenated,
+    Simple,
+    Braced,
+}
+
+#[cfg(any(feature = "secret-vault", test))]
+fn token_prefix_bytes(decoded: &[u8]) -> bool {
+    if decoded.len() <= TOKEN_PREFIX.len() {
+        return TOKEN_PREFIX.as_bytes().starts_with(decoded);
+    }
+    let body = &decoded[TOKEN_PREFIX.len()..];
+    [UuidShape::Hyphenated, UuidShape::Simple, UuidShape::Braced]
+        .into_iter()
+        .any(|shape| token_body_prefix(body, shape))
+}
+
+#[cfg(any(feature = "secret-vault", test))]
+fn token_body_prefix(body: &[u8], shape: UuidShape) -> bool {
+    let uuid_len = match shape {
+        UuidShape::Hyphenated => 36,
+        UuidShape::Simple => 32,
+        UuidShape::Braced => 38,
+    };
+    let body_len = uuid_len + 1 + 4 + 32 + 2;
+    if body.len() > body_len {
+        return false;
+    }
+    body.iter().enumerate().all(|(index, &byte)| {
+        if index < uuid_len {
+            return match shape {
+                UuidShape::Hyphenated => {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                }
+                UuidShape::Simple => byte.is_ascii_hexdigit(),
+                UuidShape::Braced => match index {
+                    0 => byte == b'{',
+                    37 => byte == b'}',
+                    inner => {
+                        let inner = inner - 1;
+                        if matches!(inner, 8 | 13 | 18 | 23) {
+                            byte == b'-'
+                        } else {
+                            byte.is_ascii_hexdigit()
+                        }
+                    }
+                },
+            };
+        }
+        let after_uuid = index - uuid_len;
+        if after_uuid == 0 {
+            byte == b':'
+        } else if (1..5).contains(&after_uuid) {
+            b"sec_"[after_uuid - 1] == byte
+        } else if (5..37).contains(&after_uuid) {
             byte.is_ascii_hexdigit()
-        };
-    }
+        } else {
+            TOKEN_SUFFIX.as_bytes()[after_uuid - 37] == byte
+        }
+    })
+}
 
-    let after_uuid = uuid_index - 36;
-    if after_uuid == 0 {
-        return byte == b':';
+fn decoded_unit(text: &str, start: usize) -> Option<(u8, usize)> {
+    let bytes = text.as_bytes();
+    match bytes.get(start) {
+        Some(b'\\') if bytes.get(start + 1) == Some(&b'u') => {
+            let digits = bytes.get(start + 2..start + 6)?;
+            let mut value = 0u32;
+            for &digit in digits {
+                value = value.checked_mul(16)?.checked_add(match digit {
+                    b'0'..=b'9' => u32::from(digit - b'0'),
+                    b'a'..=b'f' => u32::from(digit - b'a' + 10),
+                    b'A'..=b'F' => u32::from(digit - b'A' + 10),
+                    _ => return None,
+                })?;
+            }
+            (value <= u32::from(u8::MAX)).then_some((value as u8, start + 6))
+        }
+        Some(byte) if byte.is_ascii() => Some((*byte, start + 1)),
+        _ => None,
     }
-    if (1..5).contains(&after_uuid) {
-        return b"sec_"[after_uuid - 1] == byte;
+}
+
+fn decoded_token_end(text: &str, start: usize) -> Option<usize> {
+    let mut decoded = Vec::with_capacity(MAX_TOKEN_LEN);
+    let mut cursor = start;
+    while cursor < text.len() && decoded.len() < MAX_TOKEN_LEN {
+        let (byte, next) = decoded_unit(text, cursor)?;
+        decoded.push(byte);
+        cursor = next;
+        if decoded.len() <= TOKEN_PREFIX.len() && !TOKEN_PREFIX.as_bytes().starts_with(&decoded) {
+            return None;
+        }
+        if decoded.ends_with(TOKEN_SUFFIX.as_bytes()) {
+            let decoded = std::str::from_utf8(&decoded).ok()?;
+            return valid_token(decoded).then_some(cursor);
+        }
     }
-    if (5..37).contains(&after_uuid) {
-        return byte.is_ascii_hexdigit();
+    None
+}
+
+fn next_token(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let mut search = cursor;
+    loop {
+        // Search both starts together so an absent spelling cannot rescan the remaining text.
+        let start = search + text[search..].find(['{', '\\'])?;
+        if decoded_unit(text, start).is_some_and(|(byte, _)| byte == b'{')
+            && let Some(end) = decoded_token_end(text, start)
+        {
+            return Some((start, end));
+        }
+        search = start + 1;
     }
-    TOKEN_SUFFIX.as_bytes()[after_uuid - 37] == byte
 }
 
 pub(crate) struct TokenSegments<'a> {
@@ -90,22 +244,9 @@ impl<'a> Iterator for TokenSegments<'a> {
     type Item = (usize, usize, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(relative) = self.text[self.cursor..].find(TOKEN_PREFIX) {
-            let start = self.cursor + relative;
-            let content_start = start + TOKEN_PREFIX.len();
-            let Some(close) = self.text[content_start..].find(TOKEN_SUFFIX) else {
-                self.cursor = self.text.len();
-                return None;
-            };
-            let end = content_start + close + TOKEN_SUFFIX.len();
-            let body = &self.text[content_start..content_start + close];
-            if CANONICAL.is_match(&self.text[start..end]) || valid_legacy_token_body(body) {
-                self.cursor = end;
-                return Some((start, end, &self.text[start..end]));
-            }
-            self.cursor = content_start;
-        }
-        None
+        let (start, end) = next_token(self.text, self.cursor)?;
+        self.cursor = end;
+        Some((start, end, &self.text[start..end]))
     }
 }
 
@@ -154,7 +295,94 @@ mod tests {
             assert_eq!(token_segments(&invalid).count(), 0);
         }
         for split in 1..generated.len() {
-            assert!(canonical_token_prefix(&generated[..split]));
+            assert!(token_prefix(&generated[..split]));
+        }
+    }
+
+    #[test]
+    fn escaped_json_placeholders_are_opaque_without_widening_the_shape() {
+        let token = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}";
+        let escaped = token
+            .chars()
+            .map(|ch| match ch {
+                '{' => "\\u007b".to_owned(),
+                '}' => "\\u007d".to_owned(),
+                _ => ch.to_string(),
+            })
+            .collect::<String>();
+        let text = format!("before {escaped} after");
+        let segments = token_segments(&text)
+            .map(|(_, _, token)| token)
+            .collect::<Vec<_>>();
+        assert_eq!(segments, vec![escaped.as_str()]);
+        assert!(
+            token_segments("\\u007b\\u007bAGIT_SECRET_V1:bad\\u007d\\u007d")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mixed_escaped_braces_and_invalid_prefixes_do_not_hide_tokens() {
+        let token = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}";
+        let variants = [
+            format!("{{\\u007b{}", &token[2..]),
+            format!("\\u007b{{{}", &token[2..]),
+            format!("{}\\u007d", &token[..token.len() - 1]),
+        ];
+        for variant in variants {
+            assert_eq!(token_segments(&variant).count(), 1, "{variant}");
+        }
+        let escaped = token
+            .chars()
+            .map(|ch| match ch {
+                '{' => "\\u007b".to_owned(),
+                '}' => "\\u007d".to_owned(),
+                _ => ch.to_string(),
+            })
+            .collect::<String>();
+        let text = format!("{{{{AGIT_SECRET_V1:bad {escaped}");
+        assert_eq!(token_segments(&text).count(), 1);
+    }
+
+    #[test]
+    fn escaped_legacy_uuid_spellings_are_opaque() {
+        let record = "sec_00000000000000000000000000000000";
+        for vault in [
+            "00000000-0000-0000-0000-000000000000",
+            "00000000000000000000000000000000",
+            "{00000000-0000-0000-0000-000000000000}",
+        ] {
+            let token = format!("{TOKEN_PREFIX}{vault}:{record}{TOKEN_SUFFIX}");
+            let escaped = token
+                .chars()
+                .map(|ch| match ch {
+                    '{' => "\\u007b".to_owned(),
+                    '}' => "\\u007d".to_owned(),
+                    _ => ch.to_string(),
+                })
+                .collect::<String>();
+            assert_eq!(token_segments(&escaped).count(), 1, "{escaped}");
+            for split in 1..escaped.len() {
+                assert!(token_prefix(&escaped[..split]), "split {split}: {escaped}");
+            }
+        }
+    }
+
+    #[test]
+    fn many_placeholders_are_each_found_once() {
+        let token = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}";
+        let escaped = token.replace('{', "\\u007b").replace('}', "\\u007d");
+        for (unit, expected) in [
+            (token.to_owned(), 1),
+            (escaped.clone(), 1),
+            (format!("{token}\\u0020"), 1),
+            (format!("{token}{escaped}"), 2),
+            (format!("\\x\\{token}"), 1),
+            ("\\u0020".to_owned(), 0),
+        ] {
+            let text = unit.repeat(128);
+            assert_eq!(token_segments(&text).count(), expected * 128, "{unit}");
         }
     }
 }

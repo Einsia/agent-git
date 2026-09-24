@@ -5409,11 +5409,31 @@ mod tests {
     #[test]
     fn registered_scanner_ignores_repository_placeholder_internals() {
         let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_short", "AGIT")]);
-        let text = r#"{"value":"{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}"}"#;
-        let (hits, truncated) =
-            registered_hits_semantic_capped(text, 10, &matcher, &HashSet::new());
-        assert!(!truncated);
-        assert!(hits.is_empty());
+        let literal = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}";
+        let escaped = literal
+            .chars()
+            .map(|ch| match ch {
+                '{' => "\\u007b".to_owned(),
+                '}' => "\\u007d".to_owned(),
+                _ => ch.to_string(),
+            })
+            .collect::<String>();
+        for value in [literal.to_owned(), escaped] {
+            let text = format!(r#"{{"value":"{value}"}}"#);
+            let (hits, truncated) =
+                registered_hits_semantic_capped(&text, 10, &matcher, &HashSet::new());
+            assert!(!truncated);
+            assert!(
+                hits.is_empty(),
+                "placeholder internals are not secrets: {hits:?}"
+            );
+            let built_in = scan_text_capped(&text, &HashSet::new(), Policy::CLIENT, 10);
+            assert!(
+                built_in.hits.is_empty(),
+                "built-in rules must not inspect placeholder internals: {:?}",
+                built_in.hits
+            );
+        }
     }
 
     // All three scan paths collect into the **one** `HitCollector` the caller holds (only the
