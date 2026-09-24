@@ -429,10 +429,18 @@ fn remedy_hint(r: SecretRemedy) -> String {
 /// returning "clean scan" is fail open — a gate allowing the input it cannot reach, and saying
 /// nothing about it. So this prints both the reason and the next step the user can actually take;
 /// the verdict is the caller's, by the same rule (stop, unless `AGIT_ALLOW_SECRETS`).
+pub fn report_binary_carriers(count: u64) {
+    if count > 0 {
+        crate::ui::warning(&format!(
+            "Read {count} binary carriers: artifact publication does not text-scan or unpack their contents. Review these artifacts before publishing; absence of text findings does not establish that they are safe."
+        ));
+    }
+}
+
 pub fn report_unscanned(u: &secrets::Unscanned) {
     if !u.unsupported.is_empty() {
         crate::ui::error(
-            "Some carriers were unreadable or outside UTF-8 inspection; absence of findings does not establish that their content is safe.",
+            "Some carriers could not be read completely; absence of findings does not establish that their content is safe.",
         );
         for label in u.unsupported.iter().take(5) {
             crate::ui::hint(label);

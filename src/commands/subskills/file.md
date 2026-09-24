@@ -70,11 +70,18 @@ agit file link artifacts/demo.mp4
 Moving a tracked file with `agit file mv` retains its LFS tracking. The same
 isolated index and explicit commit rules apply to ordinary files and LFS files.
 
-`agit push` verifies and scans the actual payloads, then uploads every LFS object
+`agit push` verifies the actual payloads and scans text payloads, then uploads every LFS object
 reachable from the selected refs, including older versions, before publishing
 Git history. Missing or corrupt local objects and incomplete scans stop
 publication. It does not upload objects from unrelated branches. Upload success
 alone does not publish a file; the Git push must also succeed.
+
+Binary artifacts are reported separately and are not decoded or secret-scanned as text.
+They are not reported as unreadable merely because they are non-UTF-8. Review their
+contents before publishing; archives and embedded documents are not unpacked by the scan.
+Shared-file text protection has a bounded read limit. Its error recommends `file add --lfs`
+when a file exceeds that limit; tracking a later version does not remove ordinary blobs
+from older commits.
 
 Cloning and checking out history leave cold LFS entries as pointers. To read or
 edit an artifact, extract its payload explicitly:

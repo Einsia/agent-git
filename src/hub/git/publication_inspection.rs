@@ -271,6 +271,7 @@ fn inspect_content<R: Read>(
             return (
                 InspectionReport {
                     scan: ScanReport {
+                        binary_carriers: 0,
                         hits: Vec::new(),
                         truncated: false,
                         unscanned: Unscanned::default(),

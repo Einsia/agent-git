@@ -291,6 +291,11 @@ fn add(
         let mut argv = vec!["--literal-pathspecs", "add", "--"];
         argv.extend(stage.iter().map(String::as_str));
         repo.git(&argv)?;
+        if lfs {
+            // Attribute changes must reapply the clean filter even when cached file stats match.
+            argv.insert(2, "--renormalize");
+            repo.git(&argv)?;
+        }
     }
     ui::success(&format!(
         "staged {} file(s); run `agit file commit -m <message>` to record them",

@@ -368,8 +368,10 @@ Automatic file projection supports UTF-8 text, with decoded JSON keys and values
 carriers. Non-UTF-8 or NUL-bearing shared files are retained with an explicit unsupported-text
 notice. Memory collection retains unsupported content in its native source and reports the
 reason. Binary/archive/container decoding is outside this text protection boundary. Publication
-reports binary/unreadable coverage separately; absence of text findings is not proof that a
-binary payload is safe. LFS text payload inspection also reports size and availability failures.
+reports fully read binary artifacts separately from unreadable content; binary artifacts may
+be published without text scanning, but absence of text findings is not proof that their
+contents are safe. This policy is shared by ordinary push, audit and LFS upload. LFS text
+payload inspection still refuses size, integrity and availability failures.
 
 Repository `allow` is a local decision to stop future projection and client findings for that
 exact value; old tokens continue to hydrate. Strict server policy does not inherit a local allow

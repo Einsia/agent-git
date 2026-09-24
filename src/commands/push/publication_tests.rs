@@ -290,6 +290,7 @@ fn explicit_acceptance_requires_prepared_complete_scan() {
     };
     for accepted in [false, true] {
         let clean = secrets::ScanReport {
+            binary_carriers: 0,
             hits: Vec::new(),
             truncated: false,
             unscanned: Default::default(),
@@ -332,6 +333,7 @@ fn explicit_acceptance_requires_prepared_complete_scan() {
         ] {
             for findings in [Vec::new(), hits()] {
                 let report = secrets::ScanReport {
+                    binary_carriers: 0,
                     hits: findings,
                     truncated: false,
                     unscanned: unscanned.clone(),
@@ -343,6 +345,7 @@ fn explicit_acceptance_requires_prepared_complete_scan() {
             }
         }
         let report = secrets::ScanReport {
+            binary_carriers: 0,
             hits: hits(),
             truncated: false,
             unscanned: Default::default(),

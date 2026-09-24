@@ -1491,6 +1491,7 @@ fn finish_secret_scan(
         }
     };
 
+    super::report_binary_carriers(scan.binary_carriers);
     let hits = scan.hits;
     let unscanned = scan.unscanned;
     if hits.is_empty() && unscanned.is_empty() {

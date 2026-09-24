@@ -89,14 +89,27 @@ fn lfs_files_stage_pointers_and_preserve_payloads_across_file_operations() {
     repo.git(&["config", "lfs.storage", cache.to_str().unwrap()])
         .unwrap();
     let source = workspace.join("sample [one].mp4");
-    let payload = b"a video payload\0with binary bytes\n";
-    fs::write(&source, payload).unwrap();
-    lab.ok("first", &["file", "add", "--lfs", source.to_str().unwrap()]);
+    let payload = vec![0xff; 9 * 1024 * 1024];
+    fs::write(&source, &payload).unwrap();
+    lab.ok("first", &["file", "add", source.to_str().unwrap()]);
+    let refused = lab.call(
+        "first",
+        &["file", "commit", "-m", "ordinary oversized artifact"],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("agit file add --lfs"));
     let selected = "artifacts/sample [one].mp4";
+    let staged_path = repo.root().join(selected);
+    lab.ok(
+        "first",
+        &["file", "add", "--lfs", staged_path.to_str().unwrap()],
+    );
     let staged = repo
         .git_bytes_result(&["show", &format!(":{selected}")])
         .unwrap();
-    let pointer = agit::domain::lfs::Pointer::parse(&staged).unwrap().unwrap();
+    let pointer = agit::domain::lfs::Pointer::parse(&staged)
+        .unwrap()
+        .expect("LFS restaging must replace an ordinary blob with a pointer");
     assert!(
         agit::domain::lfs::local::object_path(&repo, &pointer)
             .unwrap()
@@ -114,6 +127,13 @@ fn lfs_files_stage_pointers_and_preserve_payloads_across_file_operations() {
             .is_empty()
     );
     lab.ok("first", &["file", "commit", "-m", "save large artifact"]);
+    let scan = lab.ok("first", &["scan", "me/files@first", "--secrets", "--json"]);
+    assert!(scan.contains("[]"));
+    let report =
+        agit::domain::secrets::scan_agent_repo(&repo, &agit::domain::secrets::ScanPlan::full())
+            .unwrap();
+    assert!(report.unscanned.is_empty());
+    assert!(report.binary_carriers > 0);
     let first = repo.git(&["rev-parse", "HEAD"]).unwrap();
     assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
     let output = workspace.join("download.mp4");

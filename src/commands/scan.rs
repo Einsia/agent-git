@@ -197,6 +197,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
     let found = collect(&repo, &n)?;
+    super::report_binary_carriers(found.binary_carriers);
     echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
     let any_hit = !found.hits.is_empty();
     let truncated = found.truncated;
@@ -280,7 +281,11 @@ pub fn run(args: Args) -> CmdResult {
             // Never "N refs": what is scanned is the whole repo's publish surface, not the
             // union of the refs on the command line. Reporting it as a per-ref count makes the
             // user believe "scan again with another ref" shows something else.
-            ui::success_result("clean scan");
+            ui::success_result(if found.binary_carriers == 0 {
+                "clean scan"
+            } else {
+                "no text findings; binary artifacts were not text-scanned"
+            });
         }
         Ok(ExitCode::Ok)
     }
@@ -481,6 +486,7 @@ pub(super) fn sensitive_report(
 
 /// Every hit from one `--secrets` scan, each carrying **the location it really belongs to**.
 struct Found {
+    binary_carriers: u64,
     /// `(display location, hit)`. The location is the hit's own carrier label, never prefixed
     /// with a ref name.
     hits: Vec<(String, secrets::Hit)>,
@@ -528,6 +534,7 @@ fn collect(repo: &Repo, agent: &str) -> crate::Result<Found> {
         .map(|h| (h.file.clone().unwrap_or_else(|| "?".into()), h))
         .collect();
     Ok(Found {
+        binary_carriers: wide.binary_carriers,
         hits,
         truncated: wide.truncated,
         unscanned: wide.unscanned,

@@ -306,6 +306,7 @@ struct HitCollector {
     hits: Vec<Hit>,
     seen: HashSet<String>,
     truncated: bool,
+    binary_carriers: u64,
 }
 
 impl HitCollector {
@@ -314,6 +315,7 @@ impl HitCollector {
             hits: Vec::new(),
             seen: HashSet::new(),
             truncated: false,
+            binary_carriers: 0,
         }
     }
 
@@ -438,6 +440,8 @@ impl HitCollector {
 /// loop with no way out. The verdict is unaffected (non-empty is a refusal), but "there is more"
 /// has to reach the layer that prints the report.
 pub struct ScanReport {
+    /// Fully read binary carriers are publishable artifacts, not text-scanned credentials.
+    pub binary_carriers: u64,
     pub hits: Vec<Hit>,
     /// The cap filled up and there are unreported hits behind it.
     pub truncated: bool,
@@ -501,7 +505,7 @@ pub struct Unscanned {
     /// **Working-tree files** over the line that were not read: `(path relative to the repo,
     /// byte count)`.
     pub oversized_files: Vec<(String, u64)>,
-    /// Bounded samples of carriers outside UTF-8 inspection, or whose bytes could not be read.
+    /// Bounded samples of carriers whose bytes could not be read completely.
     pub unsupported: Vec<String>,
 }
 
@@ -1296,6 +1300,7 @@ pub fn scan_text_capped(
         // No budget at all = not one byte was scanned. The verdict is unaffected (no hit could
         // be reported from here anyway), but "this is all of it" must not be said.
         return ScanReport {
+            binary_carriers: 0,
             hits: vec![],
             truncated: true,
             unscanned: Unscanned::default(),
@@ -1316,6 +1321,7 @@ pub fn scan_text_capped(
     });
     let lines = pragma_lines.unwrap_or_else(|| Lines::new(&view));
     let mut report = ScanReport {
+        binary_carriers: 0,
         hits: raw
             .into_iter()
             .map(|h| Hit {
@@ -1450,6 +1456,7 @@ fn scan_text_capped_registered_views(
     {
         if cap == 0 {
             return ScanReport {
+                binary_carriers: 0,
                 hits: vec![],
                 truncated: true,
                 unscanned: Unscanned::default(),
@@ -1495,6 +1502,7 @@ fn scan_text_capped_registered_views(
 
         if registered_truncated {
             return ScanReport {
+                binary_carriers: 0,
                 hits,
                 truncated: true,
                 unscanned: Unscanned::default(),
@@ -1507,6 +1515,7 @@ fn scan_text_capped_registered_views(
             // the report can still answer whether it is complete.
             let more = scan_text_capped(text, allowlist, policy, 1);
             return ScanReport {
+                binary_carriers: 0,
                 hits,
                 truncated: more.truncated || !more.hits.is_empty(),
                 unscanned: Unscanned::default(),
@@ -1516,6 +1525,7 @@ fn scan_text_capped_registered_views(
         let built_in = scan_text_capped(text, allowlist, policy, remaining);
         hits.extend(built_in.hits);
         ScanReport {
+            binary_carriers: 0,
             hits,
             truncated: built_in.truncated,
             unscanned: Unscanned::default(),
@@ -3777,61 +3787,42 @@ fn scan_agent_repo_selected_inner(
             unscanned.record_unsupported(format!("unreadable working-tree file {rel}"));
             continue;
         };
-        if size > plan.limits.max_object_bytes && is_lfs_worktree_file(repo, &rel)? {
-            let mut remaining = plan.limits.budget_bytes.saturating_sub(spent);
-            let inspected = crate::domain::lfs::inspection::read(
-                std::fs::File::open(entry.path())?,
-                size,
-                None,
-                plan.limits.max_object_bytes,
-                &mut remaining,
-            )?;
-            spent = plan.limits.budget_bytes - remaining;
-            if inspected == crate::domain::lfs::inspection::Payload::Binary {
-                unscanned.record_unsupported(format!("binary LFS working-tree file {rel}"));
-                continue;
-            }
-        }
-        if size > plan.limits.max_object_bytes {
-            // Booked in **the working tree's own ledger**: the handle here is a path, not an
-            // oid (see [`Unscanned`]). A file over the line is not read at all, so not one of
-            // its bytes belongs in the cumulative budget — it is booked separately in
-            // `oversized_files` and must not eat the total (the same rule by which
-            // [`estimate_object_bytes`] skips objects over the line).
+        if size > plan.limits.max_object_bytes && !is_lfs_worktree_file(repo, &rel)? {
             unscanned.oversized_files.push((rel, size));
             continue;
         }
-        // **Book it first, then read**, and with the size metadata reports rather than the
-        // length that comes back.
-        //
-        // The other order (`read_to_string` first, `spent += size` after) leaves the budget with
-        // effect only after the fact: the per-file cap stops nothing when a pile of files are
-        // **each within it**, and the cumulative budget only reaches a verdict once the whole
-        // working tree has been walked and the object pass begins — so enough files can read
-        // bytes far past the budget entirely into memory and only then be told "over budget".
-        // The promise "over the budget means no work" would not be kept by a word.
-        spent = spent.saturating_add(size);
-        if spent > plan.limits.budget_bytes {
-            // Stop where it stands: the remaining working-tree files are not read, and the
-            // object pass is not even asked (see the guard below). What is recorded is `spent`
-            // **as it is now** — a lower bound, for the reason in [`Unscanned::over_budget`].
-            unscanned.over_budget = Some((spent, plan.limits.budget_bytes));
+        if size > plan.limits.budget_bytes.saturating_sub(spent) {
+            unscanned.over_budget = Some((spent.saturating_add(size), plan.limits.budget_bytes));
             break;
         }
-        // One file failing to read (binary, permissions) does not interrupt the whole scan.
-        //
-        // But it **has already been booked**: the cost of `read_to_string` was paid at the moment
-        // it failed (the whole file went through memory), and booking it after this `continue`
-        // would let arbitrarily many bytes that are not valid UTF-8 through the budget for free
-        // — and binary files are the easiest thing in a working tree to pile up.
-        let text = match std::fs::read_to_string(entry.path()) {
-            Ok(text) => text,
+        let mut remaining = plan.limits.budget_bytes - spent;
+        let inspected = std::fs::File::open(entry.path())
+            .map_err(anyhow::Error::from)
+            .and_then(|input| {
+                crate::domain::lfs::inspection::read(
+                    input,
+                    size,
+                    None,
+                    plan.limits.max_object_bytes,
+                    &mut remaining,
+                )
+            });
+        spent = plan.limits.budget_bytes - remaining;
+        let text = match inspected {
+            Ok(crate::domain::lfs::inspection::Payload::Text(text)) => text,
+            Ok(crate::domain::lfs::inspection::Payload::Binary) => {
+                out.binary_carriers += 1;
+                continue;
+            }
+            Ok(crate::domain::lfs::inspection::Payload::TooLarge) => {
+                unscanned.oversized_files.push((rel, size));
+                continue;
+            }
             Err(_) => {
                 unscanned.record_unsupported(format!("working-tree file {rel}"));
                 continue;
             }
         };
-        let mut remaining = plan.limits.budget_bytes.saturating_sub(spent);
         let payload = inspect_lfs_text(
             repo,
             text.as_bytes(),
@@ -3843,7 +3834,7 @@ fn scan_agent_repo_selected_inner(
             payload,
             Some(crate::domain::lfs::inspection::Payload::Binary)
         ) {
-            unscanned.record_unsupported(format!("LFS payload for {rel}"));
+            out.binary_carriers += 1;
         }
         if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = payload {
             let pointer = crate::domain::lfs::Pointer::parse(text.as_bytes())?.unwrap();
@@ -3908,6 +3899,7 @@ fn scan_agent_repo_selected_inner(
         scan_publish_objects(&context, spent, &mut out, &mut unscanned)?;
     }
     Ok(ScanReport {
+        binary_carriers: out.binary_carriers,
         truncated: out.was_truncated(),
         hits: out.into_hits(),
         unscanned,
@@ -4491,7 +4483,7 @@ fn scan_blob_batch(
                 inspected,
                 Some(crate::domain::lfs::inspection::Payload::Binary)
             ) {
-                unscanned.record_unsupported(format!("LFS payload for blob {oid}"));
+                out.binary_carriers += 1;
             }
             if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = inspected {
                 let pointer = crate::domain::lfs::Pointer::parse(payload)?.unwrap();
@@ -4504,10 +4496,9 @@ fn scan_blob_batch(
                 Some(crate::domain::lfs::inspection::Payload::Text(text)) => Some(text.as_str()),
                 _ => None,
             };
-            // Non-UTF-8 (binary) is skipped, the same test as `read_to_string` on the
-            // working-tree path.
+            // Binary artifacts share the audit and LFS publication policy; their coverage is reported.
             let Ok(text) = std::str::from_utf8(payload) else {
-                unscanned.record_unsupported(format!("blob {oid}"));
+                out.binary_carriers += 1;
                 return Ok(());
             };
             for text in std::iter::once(text).chain(decoded) {
@@ -5487,6 +5478,52 @@ mod tests {
     const INTERNAL_HEX: &str = "9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb3";
     const UNTRUSTED_HEX: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    /// Working-tree and history inspections each count a binary payload once, including LFS indirection.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn binary_carrier_counts_do_not_double_count_ordinary_blobs() {
+        use crate::domain::{lfs, repo::Repo};
+        use sha2::{Digest, Sha256};
+
+        for indirect in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = Repo::init(directory.path()).unwrap();
+            let bytes = b"artifact\x00\xff";
+            let contents = if indirect {
+                if let Err(error) = lfs::local::require_client(&repo) {
+                    assert!(
+                        std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                        "{error:#}"
+                    );
+                    continue;
+                }
+                let pointer = lfs::Pointer {
+                    oid: hex::encode(Sha256::digest(bytes)),
+                    size: bytes.len() as u64,
+                };
+                let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
+                std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+                std::fs::write(cache, bytes).unwrap();
+                format!(
+                    "version {}\noid sha256:{}\nsize {}\n",
+                    lfs::VERSION,
+                    pointer.oid,
+                    pointer.size
+                )
+                .into_bytes()
+            } else {
+                bytes.to_vec()
+            };
+            std::fs::write(repo.root().join("artifact.bin"), contents).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("record artifact").unwrap();
+            let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
+            assert!(report.hits.is_empty());
+            assert!(report.unscanned.is_empty());
+            assert_eq!(report.binary_carriers, 2, "LFS indirection: {indirect}");
+        }
+    }
+
     #[cfg(feature = "cli")]
     #[test]
     fn lfs_scanning_reads_historical_payloads_and_refuses_missing_or_corrupt_content() {
@@ -5596,16 +5633,20 @@ mod tests {
             let report = scan_agent_repo(&repo, &plan).unwrap();
             if name == "video.bin" {
                 assert!(
-                    !report.unscanned.unsupported.is_empty()
-                        && report.unscanned.oversized.is_empty()
-                        && report.unscanned.oversized_files.is_empty(),
+                    report.binary_carriers > 0 && report.unscanned.is_empty(),
                     "hits: {:?}, unread: {:?}",
                     report.hits,
                     report.unscanned
                 );
                 let mut tight = plan.clone();
                 tight.limits.budget_bytes = pointer.size - 1;
-                assert!(scan_agent_repo(&repo, &tight).is_err());
+                assert!(
+                    scan_agent_repo(&repo, &tight)
+                        .unwrap()
+                        .unscanned
+                        .over_budget
+                        .is_some()
+                );
             } else {
                 assert!(
                     !report.unscanned.oversized.is_empty(),

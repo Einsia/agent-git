@@ -3536,12 +3536,13 @@ fn protect_file_commit_index(
 }
 
 fn read_protected_file_blob(repo: &Repo, oid: &str, path: &str) -> crate::Result<Vec<u8>> {
+    const FILE_PROTECTION_LIMIT: usize = 8 * 1024 * 1024;
     let mut bytes = Vec::new();
-    repo.git_cat_file_batch(vec![oid.to_owned()], 8 * 1024 * 1024, |_, _, body| {
+    repo.git_cat_file_batch(vec![oid.to_owned()], FILE_PROTECTION_LIMIT, |_, _, body| {
         match body {
             crate::domain::repo::ObjectBody::Read(content) => bytes.extend_from_slice(content),
-            crate::domain::repo::ObjectBody::TooLarge(_) => anyhow::bail!(
-                "shared file inspection limit exceeded for {path}; no commit was published"
+            crate::domain::repo::ObjectBody::TooLarge(size) => anyhow::bail!(
+                "shared file inspection limit exceeded for {path}: {size} bytes exceeds the {FILE_PROTECTION_LIMIT}-byte text protection limit; no commit was published. Stage this artifact with `agit file add --lfs <path>` and commit again. LFS does not remove ordinary blobs already present in history"
             ),
         }
         Ok(())

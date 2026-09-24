@@ -266,7 +266,10 @@ impl<'a> Inspector<'a> {
                     .push((format!("lfs:{}", pointer.oid), pointer.size));
                 Err(InspectionFailure::Incomplete)
             }
-            inspection::Payload::Binary => Ok(true),
+            inspection::Payload::Binary => {
+                self.out.binary_carriers += 1;
+                Ok(true)
+            }
             inspection::Payload::Text(text) => {
                 let report = scan_repository_payload_capped(
                     &text,
@@ -300,6 +303,7 @@ impl<'a> Inspector<'a> {
     pub(crate) fn finish(self) -> (ScanReport, u64) {
         (
             ScanReport {
+                binary_carriers: self.binary_git + self.out.binary_carriers,
                 truncated: self.out.was_truncated(),
                 hits: self.out.into_hits(),
                 unscanned: self.unscanned,
