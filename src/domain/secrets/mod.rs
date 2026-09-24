@@ -39,6 +39,7 @@
 //! `every_rule_compiles` tells you whether there is a new rule Rust's `regex` cannot compile.
 
 pub(crate) mod identity;
+pub(crate) mod media;
 pub(crate) mod placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
@@ -869,9 +870,9 @@ struct Raw {
 /// by line multiplies every rule's regex startup cost by the line count), and fidelity — rules
 /// such as `private-key` and `curl-auth-user` span lines by nature, and a line-by-line scan
 /// misses them.
-fn raw_hits(view: &str) -> Vec<Raw> {
+fn raw_hits(text: &str) -> Vec<Raw> {
     // A budget of `usize::MAX` is never used up, so the "the bound was reached" flag is false.
-    raw_hits_capped(view, usize::MAX, |_, _| true).0
+    raw_hits_capped(text, usize::MAX, |_, _| true).0
 }
 
 /// A budget counted in **unique spans**.
@@ -986,8 +987,17 @@ impl SpanBudget {
 /// passed explicitly out of the producing layer, all the way to
 /// [`HitCollector::mark_truncated`].
 fn raw_hits_capped(
+    text: &str,
+    cap: usize,
+    keep: impl FnMut(&str, usize) -> bool,
+) -> (Vec<Raw>, bool) {
+    raw_hits_capped_in(&view_of(text), cap, &media::regions(text), keep)
+}
+
+fn raw_hits_capped_in(
     view: &str,
     cap: usize,
+    media: &[(usize, usize)],
     mut keep: impl FnMut(&str, usize) -> bool,
 ) -> (Vec<Raw>, bool) {
     let mut out: Vec<Raw> = vec![];
@@ -1059,6 +1069,9 @@ fn raw_hits_capped(
         }
     }
     for (start, end) in bare_candidate_spans(view) {
+        if media::contains(media, start, end) {
+            continue;
+        }
         let secret = &view[start..end];
         if rules::preset_allows(secret) || !keep(secret, start) {
             continue;
@@ -1310,7 +1323,7 @@ pub fn scan_text_capped(
     // With no line carrying the annotation, not even the line index is built.
     let any_pragma = policy.inline_pragma && view.contains(INLINE_PRAGMA);
     let pragma_lines = any_pragma.then(|| Lines::new(&view));
-    let (raw, truncated) = raw_hits_capped(&view, cap, |found, start| {
+    let (raw, truncated) = raw_hits_capped_in(&view, cap, &media::regions(text), |found, start| {
         if policy.allowlist && is_allowlisted(found, allowlist) {
             return false;
         }
@@ -1362,6 +1375,7 @@ fn scan_semantic_strings(
             break;
         }
         if value.is_some() {
+            let media = media::regions(chunk);
             let mut previous: Option<(usize, String)> = None;
             for (start, end) in json_string_regions(chunk) {
                 let Ok(decoded) = serde_json::from_str::<String>(&chunk[start - 1..end + 1]) else {
@@ -1379,8 +1393,13 @@ fn scan_semantic_strings(
                         !(policy.allowlist && is_allowlisted(found, allowlist))
                             && seen.insert((line, fingerprint(found)))
                     };
+                    let media = if media::contains(&media, start, end) {
+                        vec![(0, view.len())]
+                    } else {
+                        Vec::new()
+                    };
                     let (mut raw, mut truncated) =
-                        raw_hits_capped(&view, remaining.saturating_add(1), &mut record);
+                        raw_hits_capped_in(&view, remaining.saturating_add(1), &media, &mut record);
                     if !truncated && field.is_some_and(is_credential_field) {
                         for (start, end) in entropy_candidate_spans(&view, true) {
                             if !rules::preset_allows(&view[start..end])
@@ -1651,11 +1670,26 @@ pub(crate) fn oversized_finding_spans(
     threshold: usize,
     include: impl Fn(&str) -> bool,
 ) -> Vec<(usize, usize)> {
+    oversized_finding_spans_in(text, threshold, false, include)
+}
+
+#[cfg(feature = "secret-vault")]
+pub(crate) fn oversized_finding_spans_in(
+    text: &str,
+    threshold: usize,
+    image: bool,
+    include: impl Fn(&str) -> bool,
+) -> Vec<(usize, usize)> {
     let view = view_of(text);
+    let media = if image {
+        vec![(0, view.len())]
+    } else {
+        media::regions(text)
+    };
     let mut spans: Vec<(usize, usize)> = vec![];
     // `keep` always refuses, so no `Raw` is materialized and no span budget is
     // charged: this pass exists only to observe where the long findings are.
-    let (_, _) = raw_hits_capped(&view, usize::MAX, |found, start| {
+    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, |found, start| {
         if found.len() > threshold && include(&text[start..start + found.len()]) {
             spans.push((start, start + found.len()));
         }
@@ -1699,12 +1733,15 @@ pub(crate) fn secret_candidates_jsonl_bounded(
             continue;
         }
         match value {
-            Some(value) => visit_candidate_values(&value, None, &mut |candidate, field| {
-                collect_candidate(candidate, field, &mut batch, &mut include)
-            }),
+            Some(value) => {
+                visit_candidate_values(&value, None, false, &mut |candidate, field, image| {
+                    collect_candidate(candidate, field, image, &mut batch, &mut include)
+                })
+            }
             None => collect_candidate(
                 chunk.strip_suffix('\n').unwrap_or(chunk),
                 None,
+                false,
                 &mut batch,
                 &mut include,
             ),
@@ -1842,6 +1879,7 @@ pub(crate) fn mask_verified_git_headers(
 fn collect_candidate(
     text: &str,
     field: Option<&str>,
+    image: bool,
     batch: &mut CandidateBatch,
     include: &mut impl FnMut(&str) -> bool,
 ) {
@@ -1875,7 +1913,12 @@ fn collect_candidate(
         newly_seen.push(Zeroizing::new(literal.to_string()));
         true
     };
-    let (_, _) = raw_hits_capped(&view, usize::MAX, &mut record);
+    let media = if image {
+        vec![(0, view.len())]
+    } else {
+        media::regions(text)
+    };
+    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, &mut record);
     if field.is_some_and(is_credential_field) {
         for (start, end) in entropy_candidate_spans(&view, true) {
             if over_capacity {
@@ -1926,14 +1969,15 @@ fn is_credential_field(field: &str) -> bool {
 fn visit_candidate_values(
     value: &serde_json::Value,
     field: Option<&str>,
-    visit: &mut impl FnMut(&str, Option<&str>),
+    image: bool,
+    visit: &mut impl FnMut(&str, Option<&str>, bool),
 ) {
     let verified_envelope = field.is_none() && is_verified_envelope(value);
     match value {
-        serde_json::Value::String(text) => visit(text, field),
+        serde_json::Value::String(text) => visit(text, field, image),
         serde_json::Value::Array(values) => {
             for value in values {
-                visit_candidate_values(value, field, visit);
+                visit_candidate_values(value, field, false, visit);
             }
         }
         serde_json::Value::Object(map) => {
@@ -1941,8 +1985,9 @@ fn visit_candidate_values(
                 if verified_envelope && key == "_object_hash" {
                     continue;
                 }
-                visit(key, None);
-                visit_candidate_values(value, Some(key), visit);
+                visit(key, None, false);
+                let image = key == "data" && media::image_data(map).is_some();
+                visit_candidate_values(value, Some(key), image, visit);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
@@ -5139,9 +5184,8 @@ fn scan_messages(
 /// Overlapping findings cover their union. Selecting only an inner finding
 /// would leave the outer sensitive region partly exposed.
 pub fn scrub(text: &str) -> (String, usize) {
-    let view = view_of(text);
     let mut writer = RedactionWriter::new(text);
-    for hit in raw_hits(&view) {
+    for hit in raw_hits(text) {
         writer.add(hit);
     }
     writer.finish()
@@ -5152,8 +5196,7 @@ pub(crate) fn scrub_registered(
     text: &str,
     registered: &RegisteredMatcher,
 ) -> (String, usize, Vec<String>) {
-    let view = view_of(text);
-    let mut raw = raw_hits(&view).into_iter().peekable();
+    let mut raw = raw_hits(text).into_iter().peekable();
     let mut writer = RedactionWriter::new(text);
     let mut seen = HashSet::new();
     let mut ids = Vec::new();

@@ -183,7 +183,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 allowlist,
             )?;
             state.oversized_threshold = Some(MAX_REPOSITORY_SECRET_BYTES);
-            let (text, replacements) = transform_jsonl(text, |s| state.protect_string(s))?;
+            let (text, replacements) = transform_jsonl_in(text, |s, image| state.protect_string_in(s, image))?;
             let new_records = state.new_records;
             let new_heuristic_records = state.new_heuristic_records;
             let intact = state.intact_hits;
@@ -411,7 +411,8 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     pub fn protect_existing_jsonl(&self, text: &str) -> crate::Result<ProtectionReport> {
         self.store.with_lock(|| {
             let mut state = ProtectionState::load(&self.store, &Matcher::empty(), &[])?;
-            let (text, replacements) = transform_jsonl(text, |s| state.protect_string(s))?;
+            let (text, replacements) =
+                transform_jsonl_in(text, |s, image| state.protect_string_in(s, image))?;
             state.persist()?;
             Ok(ProtectionReport {
                 text,
@@ -612,7 +613,8 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 &[],
                 ExistingRecordScope::Registered,
             )?;
-            let (text, replacements) = transform_jsonl(text, |s| state.protect_string(s))?;
+            let (text, replacements) =
+                transform_jsonl_in(text, |s, image| state.protect_string_in(s, image))?;
             state.persist()?;
             Ok(ProtectionReport {
                 text,
@@ -936,9 +938,24 @@ impl MergedSources {
 }
 
 struct ProjectionBuffer {
+    base64: bool,
     out: String,
     cursor: usize,
     replacements: usize,
+}
+
+impl ProjectionBuffer {
+    fn start(&self, offset: usize) -> usize {
+        if self.base64 { offset / 4 * 4 } else { offset }
+    }
+
+    fn end(&self, offset: usize) -> usize {
+        if self.base64 {
+            offset.div_ceil(4) * 4
+        } else {
+            offset
+        }
+    }
 }
 
 struct PatternSpec {
@@ -1107,6 +1124,10 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     }
 
     fn protect_string(&mut self, text: &str) -> crate::Result<(String, usize)> {
+        self.protect_string_in(text, false)
+    }
+
+    fn protect_string_in(&mut self, text: &str, image: bool) -> crate::Result<(String, usize)> {
         // Two kinds of region are opaque to projection.
         //
         // A syntactically valid placeholder, because a user may register a
@@ -1127,14 +1148,19 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         // alone is right; reporting nothing is not. `agit push` will reject
         // them, and the line `agit commit` prints is where the user gets to
         // hear that first.
-        let oversized = self.oversized_spans(text);
+        let oversized = self.oversized_spans(text, image);
         self.intact_hits = self.intact_hits.saturating_add(oversized.len());
 
         let Some(ac) = self.ac.clone() else {
             return Ok((text.to_string(), 0));
         };
         if oversized.is_empty() {
-            return self.protect_between(text, &ac, token_segments(text).map(|(s, e, _)| (s, e)));
+            return self.protect_between(
+                text,
+                &ac,
+                image,
+                token_segments(text).map(|(s, e, _)| (s, e)),
+            );
         }
         let mut opaque: Vec<(usize, usize)> =
             token_segments(text).map(|(s, e, _)| (s, e)).collect();
@@ -1150,7 +1176,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
                 _ => fused.push((start, end)),
             }
         }
-        self.protect_between(text, &ac, fused.into_iter())
+        self.protect_between(text, &ac, image, fused.into_iter())
     }
 
     /// Project everything outside `opaque`, copying each opaque region as it
@@ -1159,6 +1185,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         &mut self,
         text: &str,
         ac: &AhoCorasick,
+        image: bool,
         opaque: impl Iterator<Item = (usize, usize)>,
     ) -> crate::Result<(String, usize)> {
         let mut out = String::with_capacity(text.len());
@@ -1166,7 +1193,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         let mut cursor = 0usize;
         for (start, end) in opaque {
             if start > cursor {
-                let (part, count) = self.protect_segment(&text[cursor..start], ac)?;
+                let (part, count) = self.protect_segment(&text[cursor..start], ac, image)?;
                 out.push_str(&part);
                 replacements = replacements.saturating_add(count);
             }
@@ -1174,10 +1201,14 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             cursor = end;
         }
         if cursor < text.len() {
-            let (part, count) = self.protect_segment(&text[cursor..], ac)?;
+            let (part, count) = self.protect_segment(&text[cursor..], ac, image)?;
             out.push_str(&part);
             replacements = replacements.saturating_add(count);
         }
+        anyhow::ensure!(
+            !image || replacements == 0 || crate::domain::secrets::media::valid_image(&out),
+            "a credential overlaps required image framing; cannot preserve a verifiable image after protection"
+        );
         Ok((out, replacements))
     }
 
@@ -1186,19 +1217,30 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     /// The length guard is the bound: the scan runs only for a string that
     /// could actually contain such a match, which in a session transcript is
     /// almost never.
-    fn oversized_spans(&self, text: &str) -> Vec<(usize, usize)> {
+    fn oversized_spans(&self, text: &str, image: bool) -> Vec<(usize, usize)> {
         match self.oversized_threshold {
             Some(threshold) if text.len() > threshold => {
-                crate::domain::secrets::oversized_finding_spans(text, threshold, |value| {
-                    !self.allowlist.contains(value)
-                })
+                let include = |value: &str| !self.allowlist.contains(value);
+                if image {
+                    crate::domain::secrets::oversized_finding_spans_in(
+                        text, threshold, true, include,
+                    )
+                } else {
+                    crate::domain::secrets::oversized_finding_spans(text, threshold, include)
+                }
             }
             _ => vec![],
         }
     }
 
-    fn protect_segment(&mut self, text: &str, ac: &AhoCorasick) -> crate::Result<(String, usize)> {
+    fn protect_segment(
+        &mut self,
+        text: &str,
+        ac: &AhoCorasick,
+        image: bool,
+    ) -> crate::Result<(String, usize)> {
         let mut projection = ProjectionBuffer {
+            base64: image,
             out: String::with_capacity(text.len()),
             cursor: 0,
             replacements: 0,
@@ -1227,7 +1269,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
                     "overlapping secret matches exceed the bounded protection limit; no dictionary update was written"
                 );
             }
-            let safe_end = max_end.saturating_sub(ac.max_pattern_len());
+            let safe_end = projection.start(max_end.saturating_sub(ac.max_pattern_len()));
             if pending.len() >= OVERLAPPING_MATCH_BATCH && safe_end >= blocked_until {
                 self.flush_components(
                     text,
@@ -1276,11 +1318,11 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         let mut ready = 0usize;
         let mut index = 0usize;
         while index < pending.len() {
-            let (_, mut region_end, _) = pending[index];
+            let mut region_end = projection.end(pending[index].1);
             let component_start = index;
             index += 1;
-            while index < pending.len() && pending[index].0 < region_end {
-                region_end = region_end.max(pending[index].1);
+            while index < pending.len() && projection.start(pending[index].0) < region_end {
+                region_end = region_end.max(projection.end(pending[index].1));
                 index += 1;
             }
             if region_end > safe_end {
@@ -1330,6 +1372,14 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
                 sources.add(record);
             }
         }
+        // A media placeholder replaces complete base64 quartets, so public inspection can
+        // validate the remaining encoding without recovering dictionary plaintext.
+        let aligned_start = projection.start(region_start);
+        let aligned_end = projection.end(region_end).min(text.len());
+        if aligned_start != region_start || aligned_end != region_end {
+            exact_id = None;
+        }
+        let (region_start, region_end) = (aligned_start, aligned_end);
         let id =
             if region_end - region_start > MAX_REPOSITORY_SECRET_BYTES {
                 self.intact_hits = self.intact_hits.saturating_add(1);
@@ -1701,20 +1751,31 @@ fn transform_jsonl(
     text: &str,
     mut transform: impl FnMut(&str) -> crate::Result<(String, usize)>,
 ) -> crate::Result<(String, usize)> {
+    transform_jsonl_in(text, |text, _image| transform(text))
+}
+
+fn transform_jsonl_in(
+    text: &str,
+    mut transform: impl FnMut(&str, bool) -> crate::Result<(String, usize)>,
+) -> crate::Result<(String, usize)> {
     let mut out = String::with_capacity(text.len());
     let mut replacements = 0usize;
     for (chunk, value) in crate::domain::secrets::jsonl_chunks(text) {
         match value {
             Some(mut value) => {
-                replacements =
-                    replacements.saturating_add(transform_value(&mut value, &mut transform)?);
+                replacements = replacements.saturating_add(transform_value(
+                    &mut value,
+                    false,
+                    &mut transform,
+                )?);
                 out.push_str(&serde_json::to_string(&value)?);
                 if chunk.ends_with('\n') {
                     out.push('\n');
                 }
             }
             None => {
-                let (protected, count) = transform(chunk.strip_suffix('\n').unwrap_or(chunk))?;
+                let (protected, count) =
+                    transform(chunk.strip_suffix('\n').unwrap_or(chunk), false)?;
                 out.push_str(&protected);
                 if chunk.ends_with('\n') {
                     out.push('\n');
@@ -1728,28 +1789,31 @@ fn transform_jsonl(
 
 fn transform_value(
     value: &mut Value,
-    transform: &mut impl FnMut(&str) -> crate::Result<(String, usize)>,
+    image: bool,
+    transform: &mut impl FnMut(&str, bool) -> crate::Result<(String, usize)>,
 ) -> crate::Result<usize> {
     match value {
         Value::String(text) => {
-            let (next, count) = transform(text)?;
+            let (next, count) = transform(text, image)?;
             *text = next;
             Ok(count)
         }
         Value::Array(values) => {
             let mut total = 0usize;
             for value in values {
-                total = total.saturating_add(transform_value(value, transform)?);
+                total = total.saturating_add(transform_value(value, false, transform)?);
             }
             Ok(total)
         }
         Value::Object(map) => {
+            let has_image = crate::domain::secrets::media::image_data(map).is_some();
             let old = std::mem::take(map);
             let mut total = 0usize;
             for (key, mut value) in old {
-                let (key, key_count) = transform(&key)?;
+                let image = has_image && key == "data";
+                let (key, key_count) = transform(&key, false)?;
                 total = total.saturating_add(key_count);
-                total = total.saturating_add(transform_value(&mut value, transform)?);
+                total = total.saturating_add(transform_value(&mut value, image, transform)?);
                 if map.insert(key, value).is_some() {
                     anyhow::bail!("secret placeholder replacement produced a duplicate JSON key");
                 }
@@ -1873,6 +1937,62 @@ mod tests {
             serde_json::to_value(protected).unwrap()
         );
         assert!(!missing.parent().unwrap().exists());
+    }
+
+    /// Structured screenshots stay reversible without consuming secret records; adjacent secrets do not.
+    #[test]
+    fn mcp_image_protection_preserves_media_and_protects_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let data = crate::domain::secrets::media::fixture();
+        assert!(data.len() > MAX_REPOSITORY_SECRET_BYTES);
+        let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let input = serde_json::json!({"content":[
+            {"type":"image","mimeType":"image/png","data":data},
+            {"type":"text","text":credential}
+        ]})
+        .to_string();
+        let report = dictionary.protect_jsonl(&input, &Matcher::empty()).unwrap();
+        assert_eq!(report.intact, 0);
+        assert_eq!(report.new_heuristic_records, 1);
+        let value: Value = serde_json::from_str(&report.text).unwrap();
+        assert_eq!(value["content"][0]["data"], data);
+        assert!(!report.text.contains(credential));
+        assert_eq!(dictionary.hydrate_jsonl(&report.text).unwrap().text, input);
+        assert!(crate::domain::secrets::scan_text(&report.text, &HashSet::new()).is_empty());
+
+        for fragments in [vec![&data[12..36]], vec![&data[13..30], &data[31..45]]] {
+            let patterns: Vec<_> = fragments
+                .iter()
+                .map(|fragment| ("explicit", *fragment))
+                .collect();
+            let registered = Matcher::for_test(&patterns);
+            let report = dictionary.protect_jsonl(&input, &registered).unwrap();
+            assert_eq!(report.intact, 0);
+            let value: Value = serde_json::from_str(&report.text).unwrap();
+            assert_ne!(value["content"][0]["data"], data);
+            let scanned = crate::domain::secrets::scan_text_capped(
+                &report.text,
+                &HashSet::new(),
+                crate::domain::secrets::Policy::STRICT,
+                100,
+            );
+            assert!(scanned.hits.is_empty() && !scanned.truncated);
+            let repeated = dictionary.protect_jsonl(&report.text, &registered).unwrap();
+            assert_eq!(repeated.intact, 0);
+            assert_eq!(repeated.replacements, 0);
+            assert_eq!(repeated.text, report.text);
+            assert_eq!(dictionary.hydrate_jsonl(&report.text).unwrap().text, input);
+        }
+        let framing = Matcher::for_test(&[("explicit-framing", &data[..8])]);
+        assert!(
+            dictionary
+                .protect_jsonl(&input, &framing)
+                .unwrap_err()
+                .to_string()
+                .contains("image framing")
+        );
     }
 
     #[test]

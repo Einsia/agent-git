@@ -294,7 +294,7 @@ hard to guess" is not a replay defense.
   publishing a version; the native source remains intact, and a PEM header is never replaced
   on its own in a way that conceals the remaining sensitive block. The payload of a base64
   data URL whose bytes open with a media or archive file header (an inline screenshot, a PDF,
-  a gzip or zip body) is neither a candidate nor such a hit, so a pasted image never blocks
+  a gzip or zip body) is neither a candidate nor such a hit, so a pasted image does not block
   settlement; the same bytes outside that carrier, or a token that merely starts like a file
   header, are still reported;
 - old history still holds plaintext: the push gate keeps refusing, and commits/tags are never
@@ -379,3 +379,18 @@ decision, so it can still reject the plaintext.
 The device allowlist matches complete values, never provider-prefix substrings. Inline pragmas
 and explicit publication overrides are disclosure decisions with their existing client/server
 scope. Default suspicion handling uses reversible projection and needs none of these overrides.
+
+MCP image content blocks (`type: "image"`, an image `mimeType`, and base64 `data`) retain their
+media context during candidate discovery, protection, and publication scanning. The complete
+base64 encoding and decoded image framing must validate. The actual image format may differ
+from its MIME label, as screenshot producers can mislabel JPEG as PNG. This excludes entropy
+findings only: provider-specific rules and explicitly registered credentials still apply.
+Identical bytes in an unrelated text field remain eligible for scanning. Images are preserved
+without allocating secret dictionary records; this does not provide OCR or embedded-content
+inspection. Shared server scans require updating the backend's pinned `agit` dependency.
+
+If image data contains a credential, its reversible projection covers complete base64 quartets.
+Public inspection recognizes dictionary placeholders only at those boundaries and validates the
+remaining encoding, padding, and visible image framing without dictionary access. It still rejects
+malformed base64 and does not infer missing headers or trailers. Protection fails explicitly if a
+credential overlaps framing needed to identify the image. The secret record size limit still applies.
