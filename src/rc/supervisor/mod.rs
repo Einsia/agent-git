@@ -1162,6 +1162,7 @@ impl Session {
         let cwd = spec.cwd.clone();
         let mut redactor =
             redact::Redactor::with_registered(redact::Persona::this_machine(), secret_filter)
+                .for_device_control()
                 .require_repository();
         if let Some(session) = &agit_session {
             let repo = session

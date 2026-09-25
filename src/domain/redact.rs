@@ -129,6 +129,7 @@ impl Persona {
 #[derive(Clone)]
 pub struct Redactor {
     persona: Persona,
+    preserve_device_identity: bool,
     username_pattern: Option<Regex>,
     hostname_pattern: Option<Regex>,
     #[cfg(feature = "secret-vault")]
@@ -251,6 +252,7 @@ impl Redactor {
             username_pattern: token_pattern(persona.username.as_deref()),
             hostname_pattern: token_pattern(persona.hostname.as_deref()),
             persona,
+            preserve_device_identity: false,
             #[cfg(feature = "secret-vault")]
             require_repository: false,
             buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
@@ -261,6 +263,13 @@ impl Redactor {
             #[cfg(feature = "rc")]
             native: None,
         }
+    }
+
+    /// Authorized RC views need copyable device paths; secret and IP protection still apply.
+    #[cfg(feature = "rc")]
+    pub(crate) fn for_device_control(mut self) -> Self {
+        self.preserve_device_identity = true;
+        self
     }
 
     #[cfg(feature = "secret-vault")]
@@ -578,69 +587,71 @@ impl Redactor {
         let mut out = protected.to_owned();
         let mut paths = 0;
 
-        // ── 2. The full home prefix ──
-        if let Some(home) = &self.persona.home
-            && home.len() > 1
-        {
-            paths += out.matches(home.as_str()).count();
-            out = out.replace(home.as_str(), "~");
-        }
-
-        // ── 3. /home/<name>, /Users/<name>, C:\Users\<name> ──
-        let persona_user = self.persona.username.as_deref();
-        let mut aliases: HashMap<String, usize> = HashMap::new();
-        {
-            let view = crate::domain::secrets::view_of(&out);
-            for m in HOME_USER_RE.captures_iter(&view) {
-                let name = m[1].to_string();
-                if Some(name.as_str()) == persona_user
-                    || matches!(name.as_str(), "Shared" | "Guest")
-                {
-                    continue;
-                }
-                let next = aliases.len() + 1;
-                aliases.entry(name).or_insert(next);
+        if !self.preserve_device_identity {
+            // ── 2. The full home prefix ──
+            if let Some(home) = &self.persona.home
+                && home.len() > 1
+            {
+                paths += out.matches(home.as_str()).count();
+                out = out.replace(home.as_str(), "~");
             }
-            let mut spans: Vec<(usize, usize, String)> = vec![];
-            for c in HOME_USER_RE.captures_iter(&view) {
-                let m = c.get(0).unwrap();
-                let name = &c[1];
-                let repl = if Some(name) == persona_user {
-                    Some("~".to_string())
-                } else {
-                    aliases.get(name).map(|n| format!("~user{n}"))
-                };
-                if let Some(r) = repl {
-                    spans.push((m.start(), m.end(), r));
-                }
-            }
-            apply_spans(&mut out, &spans, &mut paths);
 
-            let view = crate::domain::secrets::view_of(&out);
-            let mut spans: Vec<(usize, usize, String)> = vec![];
-            for c in WIN_USER_RE.captures_iter(&view) {
-                let m = c.get(0).unwrap();
-                let name = c[2].to_string();
-                let repl = if Some(name.as_str()) == persona_user {
-                    "~".to_string()
-                } else if matches!(name.as_str(), "Shared" | "Guest") {
-                    continue;
-                } else {
+            // ── 3. /home/<name>, /Users/<name>, C:\Users\<name> ──
+            let persona_user = self.persona.username.as_deref();
+            let mut aliases: HashMap<String, usize> = HashMap::new();
+            {
+                let view = crate::domain::secrets::view_of(&out);
+                for m in HOME_USER_RE.captures_iter(&view) {
+                    let name = m[1].to_string();
+                    if Some(name.as_str()) == persona_user
+                        || matches!(name.as_str(), "Shared" | "Guest")
+                    {
+                        continue;
+                    }
                     let next = aliases.len() + 1;
-                    let n = *aliases.entry(name).or_insert(next);
-                    format!(r"C:\Users\user{n}")
-                };
-                spans.push((m.start(), m.end(), repl));
-            }
-            apply_spans(&mut out, &spans, &mut paths);
-        }
+                    aliases.entry(name).or_insert(next);
+                }
+                let mut spans: Vec<(usize, usize, String)> = vec![];
+                for c in HOME_USER_RE.captures_iter(&view) {
+                    let m = c.get(0).unwrap();
+                    let name = &c[1];
+                    let repl = if Some(name) == persona_user {
+                        Some("~".to_string())
+                    } else {
+                        aliases.get(name).map(|n| format!("~user{n}"))
+                    };
+                    if let Some(r) = repl {
+                        spans.push((m.start(), m.end(), r));
+                    }
+                }
+                apply_spans(&mut out, &spans, &mut paths);
 
-        // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
-        if let (Some(user), Some(pattern)) = (persona_user, &self.username_pattern) {
-            out = replace_token(&out, user, pattern, "user", &mut paths);
-        }
-        if let (Some(host), Some(pattern)) = (&self.persona.hostname, &self.hostname_pattern) {
-            out = replace_token(&out, host, pattern, "host", &mut paths);
+                let view = crate::domain::secrets::view_of(&out);
+                let mut spans: Vec<(usize, usize, String)> = vec![];
+                for c in WIN_USER_RE.captures_iter(&view) {
+                    let m = c.get(0).unwrap();
+                    let name = c[2].to_string();
+                    let repl = if Some(name.as_str()) == persona_user {
+                        "~".to_string()
+                    } else if matches!(name.as_str(), "Shared" | "Guest") {
+                        continue;
+                    } else {
+                        let next = aliases.len() + 1;
+                        let n = *aliases.entry(name).or_insert(next);
+                        format!(r"C:\Users\user{n}")
+                    };
+                    spans.push((m.start(), m.end(), repl));
+                }
+                apply_spans(&mut out, &spans, &mut paths);
+            }
+
+            // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
+            if let (Some(user), Some(pattern)) = (persona_user, &self.username_pattern) {
+                out = replace_token(&out, user, pattern, "user", &mut paths);
+            }
+            if let (Some(host), Some(pattern)) = (&self.persona.hostname, &self.hostname_pattern) {
+                out = replace_token(&out, host, pattern, "host", &mut paths);
+            }
         }
 
         // ── 5. Public IPs ──
@@ -1051,6 +1062,27 @@ mod tests {
 
     fn scrub(p: Persona, text: &str) -> Report {
         Redactor::new(p).scrub(text)
+    }
+
+    #[cfg(all(feature = "rc", feature = "secret-vault"))]
+    #[test]
+    fn device_control_keeps_copyable_paths_but_still_protects_secrets() {
+        let secret = "private-device-control-credential";
+        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_device", secret)]);
+        let redactor = Redactor::with_registered(
+            persona(),
+            crate::domain::secret_filter::MatcherHandle::new(matcher),
+        )
+        .for_device_control();
+        let path = "/cluster/home/hongdeyao/sci-100/tasks";
+        let own_path = "/cluster/home/nana/projects/dataflow";
+        let input = serde_json::json!({"path": path, "text": format!("nana {own_path} {secret}")});
+        let report = redactor.scrub_json(&input);
+        assert_eq!(report.value["path"], path);
+        assert!(report.value["text"].as_str().unwrap().contains(own_path));
+        assert!(!report.value.to_string().contains(secret));
+        assert_eq!(report.secrets, 1);
+        assert_ne!(Redactor::new(persona()).scrub(path).text, path);
     }
 
     #[test]

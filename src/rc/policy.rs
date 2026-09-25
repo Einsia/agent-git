@@ -161,10 +161,8 @@ pub fn require_within(target: &Path, roots: &CanonicalRoots) -> Result<PathBuf, 
 
 /// Validate a directory that is about to be bound as a project.
 ///
-/// **Deliberately different** from [`require_dir_under_home`] (the folder picker): a project
-/// may live in `/srv`, `/opt` or `/workspace`, and pinning it to `$HOME` makes the feature
-/// unusable for half the real repos. Three things are guarded here: it must really exist, it
-/// must be a directory, and it must not be a system root.
+/// A project may live outside the home directory. It must exist, be a directory,
+/// and not be a system root. Browsing a directory does not grant project access.
 ///
 /// "Who may bind" is judged by the hub (the owner only); "what may be bound" is judged here.
 /// Each side holds half, because only the machine sees its own filesystem and only the hub
@@ -208,15 +206,16 @@ pub fn require_bindable_dir(target: &Path) -> Result<PathBuf, PolicyError> {
 /// once before the comparison, and the comparison against the **raw** path is kept as well —
 /// the `/etc` the user typed and its real name must both be stopped.
 fn is_never_bind(canonical_target: &Path, raw_target: &Path) -> bool {
-    NEVER_BIND.iter().any(|d| {
-        let listed = Path::new(d);
-        canonical_target == listed
+    canonical_target.parent().is_none()
+        || NEVER_BIND.iter().any(|d| {
+            let listed = Path::new(d);
+            canonical_target == listed
             || raw_target == listed
             // Resolve the listed entry too: `/etc` is `/private/etc` on macOS.
             || listed
                 .canonicalize()
                 .is_ok_and(|resolved| canonical_target == resolved)
-    })
+        })
 }
 
 /// Any one of these **outside** quotes means we do not know what this line ends up running.

@@ -35,26 +35,28 @@ impl Daemon {
                 } else {
                     PathBuf::from(&p.path)
                 };
-                // Scoped by ownership, not by allowlist: this runs before any
-                // project exists, so it is how the folder picker works at all.
-                let dir = policy::require_dir_under_home(&target).map_err(|e| {
+                // Browsing is owner-only and does not add a directory to the project allowlist.
+                let dir = std::fs::canonicalize(&target).map_err(|e| {
                     RpcError::new(ErrorCode::PathNotAllowed, e.to_string())
-                        .with_hint("the picker only browses inside your home directory")
+                })?;
+                let rd = std::fs::read_dir(&dir).map_err(|e| {
+                    RpcError::new(ErrorCode::PathNotAllowed, e.to_string())
                 })?;
                 let mut entries = vec![];
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for e in rd.flatten() {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            continue;
-                        }
-                        let is_dir = e.path().is_dir();
-                        entries.push(crate::protocol::DirEntry {
-                            is_git_repo: is_dir && e.path().join(".git").exists(),
-                            name,
-                            is_dir,
-                        });
+                for entry in rd {
+                    let e = entry.map_err(|e| {
+                        RpcError::new(ErrorCode::PathNotAllowed, e.to_string())
+                    })?;
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') {
+                        continue;
                     }
+                    let is_dir = e.path().is_dir();
+                    entries.push(crate::protocol::DirEntry {
+                        is_git_repo: is_dir && e.path().join(".git").exists(),
+                        name,
+                        is_dir,
+                    });
                 }
                 entries.sort_by(|a, b| {
                     (!a.is_dir, a.name.to_lowercase()).cmp(&(!b.is_dir, b.name.to_lowercase()))
@@ -69,10 +71,7 @@ impl Daemon {
             method::PROJECT_BIND => {
                 let p: ProjectBind = f.params_as()?;
                 let path = PathBuf::from(&p.local_path);
-                // The test for binding is **deliberately different** from the file picker's:
-                // projects live under /srv, /opt, /workspace, and confining them to $HOME would
-                // rule out half the real repos. What this guards is "exists, is a directory, is
-                // not a system root".
+                // Only binding widens project access; browsing a parent does not authorize it.
                 let dir = self
                     .mirror
                     .bind(&p.workspace_id, &p.project_id, &path)

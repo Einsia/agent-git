@@ -1172,3 +1172,38 @@ async fn exact_turn_completion_requires_the_matching_prearm_token() {
         .expect_err("the same token cannot change its expected mode");
     assert!(error.to_string().contains("no longer matches"));
 }
+
+#[tokio::test]
+async fn owner_browsing_does_not_bind_roots_or_allow_members_to_browse() {
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let (frames, _rx) = mpsc::channel(1);
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("project")).unwrap();
+    let root = temp.path().ancestors().last().unwrap();
+    let mut frame = Frame::request(
+        method::FS_READ_DIRECTORY,
+        serde_json::json!({
+            "workspace_id":"ws", "path": root,
+        }),
+    );
+    frame.caller = Some(claim("owner", "ws"));
+    let mut state = daemon.lock().await;
+    let listing = state.dispatch(&frame, &frames).await.unwrap();
+    assert_eq!(
+        PathBuf::from(listing["path"].as_str().unwrap()),
+        root.canonicalize().unwrap()
+    );
+    assert!(state.mirror.roots("ws").is_empty());
+    assert!(policy::require_bindable_dir(root).is_err());
+    for role in ["viewer", "operator"] {
+        frame.caller = Some(claim(role, "ws"));
+        assert!(state.dispatch(&frame, &frames).await.is_err());
+    }
+    frame.caller = Some(claim("owner", "ws"));
+    frame.params = Some(serde_json::json!({"workspace_id":"ws", "path":temp.path()}));
+    let listing = state.dispatch(&frame, &frames).await.unwrap();
+    assert_eq!(listing["entries"][0]["name"], "project");
+    frame.params =
+        Some(serde_json::json!({"workspace_id":"ws", "path":temp.path().join("missing")}));
+    assert!(state.dispatch(&frame, &frames).await.is_err());
+}
