@@ -14,6 +14,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const FILE_BUDGET_UNIT: u64 = 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_TOTAL_FILE_UNITS: usize = 32 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 const LIFETIME: Duration = Duration::from_secs(600);
 
@@ -22,6 +25,7 @@ struct Snapshot {
     native_items: Option<Vec<Value>>,
     bytes: u64,
     _budget: OwnedSemaphorePermit,
+    _file_budget: Option<OwnedSemaphorePermit>,
 }
 
 struct CachedSnapshot {
@@ -75,6 +79,7 @@ struct Cache {
     entries: Mutex<HashMap<String, CachedSnapshot>>,
     inflight: Mutex<HashMap<String, Arc<InFlightCapture>>>,
     bytes: Arc<Semaphore>,
+    file_units: Arc<Semaphore>,
 }
 
 impl Default for Cache {
@@ -83,6 +88,7 @@ impl Default for Cache {
             entries: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             bytes: Arc::new(Semaphore::new(MAX_TOTAL_BYTES as usize)),
+            file_units: Arc::new(Semaphore::new(MAX_TOTAL_FILE_UNITS)),
         }
     }
 }
@@ -184,13 +190,26 @@ impl Cache {
     }
 
     fn reserve(&self, bytes: u32) -> crate::Result<OwnedSemaphorePermit> {
-        if let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) {
+        self.reserve_from(&self.bytes, bytes)
+    }
+
+    fn reserve_files(&self, bytes: u64) -> crate::Result<OwnedSemaphorePermit> {
+        ensure!(bytes <= MAX_FILE_BYTES, Failure::Limit);
+        self.reserve_from(&self.file_units, bytes.div_ceil(FILE_BUDGET_UNIT) as u32)
+    }
+
+    fn reserve_from(
+        &self,
+        pool: &Arc<Semaphore>,
+        units: u32,
+    ) -> crate::Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = pool.clone().try_acquire_many_owned(units) {
             return Ok(permit);
         }
         let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
         // A live reader owns its byte reservation even after its cache entry is evicted.
         loop {
-            if let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) {
+            if let Ok(permit) = pool.clone().try_acquire_many_owned(units) {
                 return Ok(permit);
             }
             let oldest = entries
@@ -307,6 +326,7 @@ pub(super) fn read(
 fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Result<Snapshot> {
     let mut snapshot = Snapshot {
         _budget: cache.reserve(0)?,
+        _file_budget: None,
         parts: vec![],
         native_items: None,
         bytes: 0,
@@ -351,13 +371,12 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
                 source: path,
             }]
         };
+        snapshot.bytes = parts.iter().try_fold(0u64, |bytes, part| {
+            bytes.checked_add(part.end).context(Failure::Limit)
+        })?;
+        // File-backed snapshots consume disk capacity, not a transcript-sized read buffer.
+        snapshot._file_budget = Some(cache.reserve_files(snapshot.bytes)?);
         for mut part in parts {
-            snapshot.bytes = snapshot
-                .bytes
-                .checked_add(part.end)
-                .context(Failure::Limit)?;
-            ensure!(snapshot.bytes <= MAX_BYTES, Failure::Limit);
-            snapshot._budget.merge(cache.reserve(part.end as u32)?);
             if part.end > 0 {
                 part.file.seek(SeekFrom::Start(part.end - 1))?;
                 let mut delimiter = [0];
@@ -365,16 +384,7 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
                 ensure!(delimiter == *b"\n", Failure::Incomplete);
             }
             let before = part.version;
-            let mut copy = tempfile::tempfile()?;
-            part.file.seek(SeekFrom::Start(0))?;
-            let mut remaining = part.end;
-            let mut buffer = [0; 64 * 1024];
-            while remaining > 0 {
-                let count = remaining.min(buffer.len() as u64) as usize;
-                part.file.read_exact(&mut buffer[..count])?;
-                copy.write_all(&buffer[..count])?;
-                remaining -= count as u64;
-            }
+            let copy = copy_prefix(&mut part.file, part.end)?;
             let after = part.file.metadata()?;
             ensure!(
                 before.len() == after.len() && before.modified()? == after.modified()?,
@@ -391,6 +401,90 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
     Ok(snapshot)
 }
 
+fn copy_prefix(source: &mut std::fs::File, end: u64) -> crate::Result<std::fs::File> {
+    if let Some(copy) = clone_file(source)? {
+        ensure!(copy.metadata()?.len() >= end, Failure::Changed);
+        copy.set_len(end)?;
+        return Ok(copy);
+    }
+    let mut copy = tempfile::tempfile()?;
+    source.seek(SeekFrom::Start(0))?;
+    let mut remaining = end;
+    let mut buffer = [0; 64 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        source.read_exact(&mut buffer[..count])?;
+        copy.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    Ok(copy)
+}
+
+// Clone the open source so a path replacement cannot substitute a different transcript.
+// Unsupported filesystems use a bounded streaming copy with the same immutable result.
+#[cfg(target_os = "macos")]
+fn clone_directory() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let directory = clone_directory()?;
+    let target = directory.path().join("history");
+    let directory_file = std::fs::File::open(directory.path())?;
+    let result = unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            directory_file.as_raw_fd(),
+            c"history".as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+            .map(Some);
+    }
+    clone_unavailable(std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file(source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let copy = tempfile::tempfile()?;
+    let result = unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    if result == 0 {
+        return Ok(Some(copy));
+    }
+    clone_unavailable(std::io::Error::last_os_error())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn clone_unavailable(error: std::io::Error) -> std::io::Result<Option<std::fs::File>> {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY | libc::ENOSYS)
+    ) || error.raw_os_error() == Some(libc::ENOTSUP)
+    {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn clone_file(_source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +495,49 @@ mod tests {
     };
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn clone_staging_is_private_before_source_permissions_are_copied() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = clone_directory().unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            clone_unavailable(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_snapshots_keep_the_captured_prefix_without_reserving_transcript_sized_memory() {
+        let cache = Cache::default();
+        let disk = cache.reserve_files(MAX_BYTES + 1).unwrap();
+        assert_eq!(cache.bytes.available_permits(), MAX_TOTAL_BYTES as usize);
+        assert_eq!(
+            cache.file_units.available_permits(),
+            MAX_TOTAL_FILE_UNITS - (MAX_BYTES + 1).div_ceil(FILE_BUDGET_UNIT) as usize
+        );
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"first\nsecond\n").unwrap();
+        let mut captured = copy_prefix(&mut source, 6).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+        source.write_all(b"changed\nthird\n").unwrap();
+        source.set_len(0).unwrap();
+        captured.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = String::new();
+        captured.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "first\n");
+        drop(disk);
+        assert_eq!(cache.file_units.available_permits(), MAX_TOTAL_FILE_UNITS);
+    }
+
+    #[test]
     fn captures_and_readers_do_not_lock_unrelated_history_or_release_live_bytes() {
         let cache = Cache::default();
         let make = || {
@@ -409,6 +546,7 @@ mod tests {
                 native_items: None,
                 bytes: 1,
                 _budget: cache.reserve(1)?,
+                _file_budget: None,
             })
         };
         let (token, first) = cache
@@ -467,6 +605,7 @@ mod tests {
                     native_items: None,
                     bytes: 1,
                     _budget: leader_cache.reserve(1)?,
+                    _file_budget: None,
                 })
             })
         });
@@ -484,6 +623,7 @@ mod tests {
                     native_items: None,
                     bytes: 1,
                     _budget: follower_cache.reserve(1)?,
+                    _file_budget: None,
                 })
             })
         });

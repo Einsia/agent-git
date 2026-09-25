@@ -23,6 +23,22 @@ request; snapshot reads neither launch nor resume a harness. Copies have bounded
 size, cache capacity and idle lifetime; the constants live in
 `src/rc/local_history/snapshot.rs`. Eviction or daemon restart expires the token.
 
+File-backed history has a separate logical disk budget from OpenCode's in-memory
+projection: up to 8 GiB per snapshot and 32 GiB across retained file snapshots.
+macOS and Linux attempt a filesystem copy-on-write clone of each open source;
+unsupported filesystems and other platforms stream into private scratch files
+with a fixed buffer. Neither method loads the whole transcript into RAM. Page
+and RPC response limits still apply. Clones stay isolated from subsequent source
+appends, truncation and replacement. A streaming capture can take longer and
+retries if the source changes during copying.
+
+If history shows a local privacy-protection failure, inspect the executor log.
+On macOS an existing dictionary may need Keychain authorization before its key
+can migrate to repository-local storage. Run `agit secrets review --repo
+<Agent-repository-path>` in an interactive terminal using the same installed CLI
+and approve the system dialog. This prints record summaries, never secret values.
+Keep the existing vault and keystore; replacing either cannot recover its key.
+
 `source_id` identifies the same native event part in pages, watch and supervised
 projections. File identities combine carrier, byte position and the projected
 record hash; separate repeated records retain separate identities. OpenCode uses
