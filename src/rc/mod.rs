@@ -90,6 +90,7 @@ pub mod local_history;
 pub mod local_repository;
 pub mod mirror;
 pub(crate) mod native_inbox;
+mod native_settings;
 pub(crate) mod navigation;
 pub mod outbound;
 pub mod peers;

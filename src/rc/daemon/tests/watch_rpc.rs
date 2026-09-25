@@ -57,6 +57,8 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         before_cursor: 0,
         history_error: None,
         native_inbox: None,
+        settings: None,
+        settings_boundary: None,
     }
 }
 
@@ -77,7 +79,11 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
     std::fs::write(
         cwd.join("history.jsonl"),
         format!(
-            "{}\n",
+            "{}\n{}\n",
+            serde_json::json!({"type":"turn_context","payload":{
+                "model":"observed-model","effort":"high","approval_policy":"never",
+                "sandbox_policy":{"type":"workspace-write"}
+            }}),
             serde_json::json!({"type":"response_item","payload":{
                 "type":"message","role":"assistant",
                 "content":[{"type":"output_text","text":format!("Preview answer {registered} {credential}")}]
@@ -92,13 +98,36 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
             crate::domain::secret_filter::Matcher::for_test(&[("preview", registered)]),
         );
         let request = request(method::SESSION_WATCH, "ws", "native");
-        let scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd);
-        state.finish_watch_scan(&request, scan, &frames).unwrap();
+        let mut scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd.clone());
+        let index = cwd.join("state.sqlite");
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT,rollout_path TEXT,model TEXT,reasoning_effort TEXT,approval_mode TEXT,sandbox_policy TEXT)").unwrap();
+        db.execute("INSERT INTO threads VALUES ('native',?1,'current-model','max','never','{\"type\":\"disabled\"}')", [cwd.join("history.jsonl").to_str().unwrap()]).unwrap();
+        scan.settings =
+            crate::rc::native_settings::indexed_at(&index, &cwd.join("history.jsonl"), "native");
+        scan.settings_boundary = Some(std::fs::metadata(cwd.join("history.jsonl")).unwrap().len());
+        if let WatchSource::File { handle, .. } = &mut scan.source {
+            *handle = Some(
+                same_file::Handle::from_file(
+                    std::fs::File::open(cwd.join("history.jsonl")).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let response = state.finish_watch_scan(&request, scan, &frames).unwrap();
+        assert_eq!(response["session"]["permission_mode"], "bypass");
+        assert_eq!(response["model_settings"]["model"], "current-model");
     }
     let item = ready(async {
         loop {
             let frame = received.recv().await.unwrap();
-            if frame.method() == method::ITEM_COMPLETED {
+            assert!(
+                !matches!(frame.method(), "session.model" | "session.permissionMode"),
+                "historical contexts must not override the index snapshot"
+            );
+            if frame.method() == method::ITEM_COMPLETED
+                && frame.params.as_ref().unwrap()["event"]["kind"] == "assistant_reply"
+            {
                 break serde_json::to_value(frame).unwrap();
             }
         }
@@ -112,6 +141,44 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
     let wire = item.to_string();
     assert!(!wire.contains(registered) && !wire.contains(credential));
     assert!(!wire.contains("protection_error"));
+    ready(async {
+        while let Some(frame) = received.recv().await {
+            assert!(!matches!(
+                frame.method(),
+                "session.model" | "session.permissionMode"
+            ));
+            if frame.method() == "session.history.status" {
+                break;
+            }
+        }
+    })
+    .await;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(cwd.join("history.jsonl"))
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"turn_context","payload":{"model":"next-model","effort":"high","approval_policy":"never","sandbox_policy":{"type":"workspace-write"}}})).unwrap();
+    }
+    ready(async {
+        let mut model_seen = false;
+        while let Some(frame) = received.recv().await {
+            if frame.method() == "session.model" {
+                let params = frame.params.as_ref().unwrap();
+                assert_eq!(params["settings"]["model"], "next-model");
+                assert_eq!(params["settings"]["effort"], "high");
+                assert_eq!(params["session_id"], "agit-watch-ws-native");
+                model_seen = true;
+            }
+            if frame.method() == "session.permissionMode" {
+                assert!(model_seen);
+                assert_eq!(frame.params.as_ref().unwrap()["mode"], "auto");
+                break;
+            }
+        }
+    })
+    .await;
     daemon
         .lock()
         .await

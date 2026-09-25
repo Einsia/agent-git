@@ -53,6 +53,21 @@ pub fn agit_home() -> Result<PathBuf> {
     Ok(home.join(".agit"))
 }
 
+#[cfg(unix)]
+pub(crate) fn state_ancestors(path: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut ancestors = std::collections::BTreeSet::new();
+    // Both path spellings must prevent replacement before private state is trusted.
+    for path in [std::path::absolute(path)?, path.canonicalize()?] {
+        ancestors.extend(
+            path.parent()
+                .into_iter()
+                .flat_map(std::path::Path::ancestors)
+                .map(std::path::Path::to_path_buf),
+        );
+    }
+    Ok(ancestors.into_iter().collect())
+}
+
 /// New authority directories must not inherit a group-writable shell umask.
 pub(crate) fn create_state_dir(path: &std::path::Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();

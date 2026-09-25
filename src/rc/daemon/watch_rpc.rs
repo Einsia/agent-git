@@ -33,6 +33,8 @@ pub(super) struct PreparedWatch {
     before_cursor: u64,
     history_error: Option<String>,
     native_inbox: Option<String>,
+    settings: Option<crate::rc::native_settings::Settings>,
+    settings_boundary: Option<u64>,
 }
 
 enum WatchSource {
@@ -139,6 +141,23 @@ impl WatchScan {
             WatchSource::File { path, offset, .. } => watch_seed_event(&runtime, path, *offset),
             WatchSource::Native { .. } => None,
         };
+        let settings_boundary = match &source {
+            WatchSource::File {
+                handle: Some(handle),
+                ..
+            } if runtime == "codex" => handle
+                .as_file()
+                .metadata()
+                .ok()
+                .map(|metadata| metadata.len()),
+            _ => None,
+        };
+        let settings = match &source {
+            WatchSource::File { path, .. } if runtime == "codex" => Some(
+                crate::rc::native_settings::read_codex(path, &request.session_id),
+            ),
+            _ => None,
+        };
         Ok(PreparedWatch {
             request,
             roots,
@@ -153,6 +172,8 @@ impl WatchScan {
             before_cursor,
             history_error,
             native_inbox: None,
+            settings,
+            settings_boundary,
         })
     }
 }
@@ -211,6 +232,8 @@ impl Daemon {
             before_cursor,
             history_error,
             native_inbox,
+            settings,
+            mut settings_boundary,
         } = prepared;
         if request != p {
             return Err(RpcError::new(
@@ -286,7 +309,9 @@ impl Daemon {
                 &cwd.to_string_lossy(),
             )
             .ever_dangerous(),
-            permission_mode: None,
+            permission_mode: settings
+                .as_ref()
+                .and_then(|settings| settings.permission_mode),
             created_at: now.clone(),
             updated_at: now,
         };
@@ -305,10 +330,33 @@ impl Daemon {
         if stale {
             self.take_watch(&watch_id);
         }
+        // A read-only follow and a supervised session take the same outbound
+        // path, so they share the daemon's secret filter: loading a copy here
+        // freezes a snapshot on this stream, which keeps allowing by the old
+        // rules after `agit rc secrets reload`.
+        let secret_filter = self.secret_filter.clone();
+        let mut redactor = crate::domain::redact::Redactor::with_registered(
+            crate::domain::redact::Persona::this_machine(),
+            secret_filter,
+        )
+        .for_device_control();
+        if let Some(root) = &protection_repo {
+            redactor = redactor.with_repository(root).map_err(|_| {
+                RpcError::new(
+                    ErrorCode::RuntimeUnavailable,
+                    "session protection context is unavailable",
+                )
+            })?;
+            redactor = redactor.with_native_context(&runtime, &request.session_id, &cwd, root);
+        }
+        let model_settings = settings
+            .as_ref()
+            .map(|settings| redactor.scrub_json(&settings.model()).value);
         match self.watches.get_mut(&watch_id) {
             // Someone is already watching (and that tail really is alive): add a
             // subscriber rather than start a second one.
             Some(w) => {
+                w.info.permission_mode = info.permission_mode;
                 if let Some(owner) = frame.authority.watch_owner() {
                     w.shared_viewers.insert(owner, frame.authority.clone());
                 } else {
@@ -330,26 +378,6 @@ impl Daemon {
                 let notes = self.notes.clone();
                 let stream = watch_id.clone();
                 let rt = runtime.clone();
-                // A read-only follow and a supervised session take the same outbound
-                // path, so they share the daemon's secret filter: loading a copy here
-                // freezes a snapshot on this stream, which keeps allowing by the old
-                // rules after `agit rc secrets reload`.
-                let secret_filter = self.secret_filter.clone();
-                let mut redactor = crate::domain::redact::Redactor::with_registered(
-                    crate::domain::redact::Persona::this_machine(),
-                    secret_filter,
-                )
-                .for_device_control();
-                if let Some(root) = &protection_repo {
-                    redactor = redactor.with_repository(root).map_err(|_| {
-                        RpcError::new(
-                            ErrorCode::RuntimeUnavailable,
-                            "session protection context is unavailable",
-                        )
-                    })?;
-                    redactor =
-                        redactor.with_native_context(&runtime, &request.session_id, &cwd, root);
-                }
                 let handle = tokio::spawn(async move {
                     // Read from the start of the window instead of reading from the
                     // beginning and discarding — the latter costs memory the size of
@@ -465,6 +493,7 @@ impl Daemon {
                         if tailer.take_reset() {
                             history_status(&frames, &stream, "reset", None).await;
                             initial = true;
+                            settings_boundary = None;
                         }
                         if lines.iter().any(|line| {
                             !line.text.trim().is_empty()
@@ -489,8 +518,17 @@ impl Daemon {
                             // A read-only follow has no session identity, and
                             // `secret.detected` is a session-level alert: this only
                             // guarantees the content is redacted.
-                            for mut frame in watch_frames(&rt, &redactor, &lines, mode) {
+                            for mut frame in
+                                watch_frames(&rt, &redactor, &lines, mode, settings_boundary)
+                            {
                                 frame.stream = Some(stream.clone());
+                                if matches!(
+                                    frame.method(),
+                                    "session.model" | "session.permissionMode"
+                                ) {
+                                    frame.params.as_mut().unwrap()["session_id"] =
+                                        stream.clone().into();
+                                }
                                 if frames.send(frame).await.is_err() {
                                     return;
                                 }
@@ -552,6 +590,7 @@ impl Daemon {
             absolute_lines,
             read_only: true,
             native_inbox,
+            model_settings,
         })
         .unwrap())
     }
@@ -749,6 +788,7 @@ fn watch_frames(
     redactor: &crate::domain::redact::Redactor,
     lines: &[crate::rc::tail::TailedLine],
     mode: crate::rc::codex_history::HistoryMode,
+    settings_boundary: Option<u64>,
 ) -> Vec<Frame> {
     let (items, _) =
         crate::rc::supervisor::items_from_lines_with_mode(runtime, redactor, lines, mode);
@@ -757,6 +797,32 @@ fn watch_frames(
     for line in lines {
         if let Some(frame) = watch_turn_event(runtime, &line.text) {
             frames.push(frame);
+        }
+        // Replayed contexts precede the current native settings snapshot.
+        let current_observation = settings_boundary.is_none_or(|boundary| {
+            line.source
+                .as_deref()
+                .and_then(|source| source.rsplit(':').next()?.parse::<u64>().ok())
+                .is_some_and(|start| start.saturating_add(line.text.len() as u64 + 1) > boundary)
+        });
+        if runtime == "codex"
+            && current_observation
+            && let Some(settings) = crate::rc::native_settings::context(&line.text)
+        {
+            frames.push(Frame::notification(
+                "session.model",
+                serde_json::json!({
+                    "settings":redactor.scrub_json(&settings.model()).value
+                }),
+            ));
+            if let Some(mode) = settings.permission_mode {
+                frames.push(Frame::notification(
+                    "session.permissionMode",
+                    serde_json::json!({
+                        "mode":mode,"applied":"immediate"
+                    }),
+                ));
+            }
         }
         while items.peek().is_some_and(|item| item.line == line.lineno) {
             frames.push(Frame::notification(
@@ -839,6 +905,7 @@ mod watch_activity_tests {
             &redactor,
             &lines,
             crate::rc::codex_history::HistoryMode::Model,
+            None,
         );
         assert_eq!(
             frames

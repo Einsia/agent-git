@@ -6,6 +6,25 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.7] - 2026-09-25
+
+### Fixed
+
+- Validate lexical and canonical private-state ancestors consistently for Remote
+  Control and bundled Git. Sticky shared home directories remain usable while
+  replaceable ancestors and writable private state are rejected.
+- Page large protected conversations without loading the entire history into
+  memory or exhausting the snapshot byte budget.
+- Preserve real device paths in Remote Control and allow authorized folder
+  browsing outside the home directory. Report unreadable folders as errors and
+  reject binding the filesystem root as a project.
+- Expose the observed model, reasoning effort, and permission mode while
+  following a native Codex conversation without acquiring its writer. Setting
+  changes remain under the original controller's authority.
+- Protect imported and newly created session metadata, retain structured MCP
+  image context, and handle escaped repository placeholders correctly.
+- Apply consistent publication inspection to binary artifacts and Git LFS content.
+
 ## [0.2.6] - 2026-09-23
 
 ### Changed

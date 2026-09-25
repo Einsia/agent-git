@@ -208,6 +208,101 @@ fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+#[tokio::test]
+async fn sticky_shared_home_allows_watch_and_settlement_without_trusting_replaceable_ancestors() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let lab = Lab::new(0o002);
+    fs::set_permissions(&lab.root, fs::Permissions::from_mode(0o3775)).unwrap();
+    lab.prepare();
+    lab.import(NATIVE, "work");
+    lab.append_turn(NATIVE, 2);
+    lab.assert_saved(NATIVE, "work");
+
+    struct Stop<'a>(&'a Lab);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.command(&["rc", "local", "stop"]).output();
+        }
+    }
+    let _stop = Stop(&lab);
+    let bin = lab.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("codex"), "#!/bin/sh\n[ \"$1\" = --version ]\n").unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    success(
+        lab.command(&["rc", "local", "start", "--detach", "--json"])
+            .env("PATH", path)
+            .output()
+            .unwrap(),
+    );
+    let mut bridge = tokio::process::Command::from(lab.command(&["rc", "local", "bridge"]))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = bridge.stdin.take().unwrap();
+    let mut output = BufReader::new(bridge.stdout.take().unwrap()).lines();
+    for (id, method, params) in [
+        (
+            1,
+            "project.bind",
+            serde_json::json!({"project_id":"project","local_path":lab.project}),
+        ),
+        (2, "session.watch", serde_json::json!({"session_id":NATIVE})),
+        (3, "session.watch", serde_json::json!({"session_id":NATIVE})),
+        (4, "session.watch", serde_json::json!({"session_id":NATIVE})),
+    ] {
+        if id == 3 {
+            fs::set_permissions(&lab.root, fs::Permissions::from_mode(0o2775)).unwrap();
+        }
+        if id == 4 {
+            fs::set_permissions(&lab.root, fs::Permissions::from_mode(0o3775)).unwrap();
+            fs::set_permissions(
+                lab.state.join("store/codex"),
+                fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+        }
+        let mut params = params;
+        params["workspace_id"] = "local-owner".into();
+        input
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+                if frame["id"] == id {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if id >= 3 {
+            assert_eq!(response["error"]["code"], 305, "{response}");
+        } else {
+            assert!(response["error"].is_null(), "{response}");
+        }
+    }
+    assert_eq!(
+        fs::metadata(&lab.root).unwrap().permissions().mode() & 0o7777,
+        0o3775
+    );
+}
+
 #[test]
 fn fresh_import_and_strict_settlement_are_umask_safe() {
     let lab = Lab::new(0o002);

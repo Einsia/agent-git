@@ -43,6 +43,11 @@ fn copied_cli_records_and_restores_lfs_without_system_git_or_profile_changes() {
     for path in [&home, &workspace, &install] {
         fs::create_dir_all(path).unwrap();
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o1777)).unwrap();
+    }
     let primary = Repo::init(&store.join("repos/me/files")).unwrap();
     primary
         .set_remote("https://files.test/me/files.git")

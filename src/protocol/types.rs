@@ -716,6 +716,9 @@ pub struct SessionWatchResult {
     /// Messages may be submitted to the existing runtime without resuming another writer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_inbox: Option<String>,
+    /// Observed native settings remain readable without granting runtime controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_settings: Option<serde_json::Value>,
 }
 
 /// An older daemon sends no `absolute_lines`, and its numbers **are** physical

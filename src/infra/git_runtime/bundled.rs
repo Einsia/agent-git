@@ -59,12 +59,15 @@ fn private_directory(path: &Path) -> Result<()> {
 fn validate_unix_cache(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let owner = unsafe { libc::geteuid() };
-    let canonical = std::fs::canonicalize(path)?;
-    for (index, ancestor) in canonical.ancestors().enumerate() {
+    let ancestors = crate::infra::config::state_ancestors(path)?;
+    for (index, ancestor) in std::iter::once(path)
+        .chain(ancestors.iter().map(PathBuf::as_path))
+        .enumerate()
+    {
         let metadata = std::fs::symlink_metadata(ancestor)?;
         ensure!(
-            metadata.is_dir(),
-            "Git runtime ancestors must be directories"
+            metadata.is_dir() || (index > 0 && metadata.file_type().is_symlink()),
+            "Git runtime ancestors must be directories or symbolic links"
         );
         if index == 0 {
             ensure!(
@@ -78,7 +81,9 @@ fn validate_unix_cache(path: &Path) -> Result<()> {
         } else {
             ensure!(
                 (metadata.uid() == owner || metadata.uid() == 0)
-                    && (metadata.mode() & 0o022 == 0 || metadata.mode() & 0o1000 != 0),
+                    && (metadata.file_type().is_symlink()
+                        || metadata.mode() & 0o022 == 0
+                        || metadata.mode() & 0o1000 != 0),
                 "Git runtime ancestors must prevent replacement by other users: {}",
                 ancestor.display()
             );

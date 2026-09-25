@@ -1067,20 +1067,9 @@ fn checked_carrier(
 pub(crate) fn validate_unix_ancestors(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let absolute = std::path::absolute(path)?;
-    let canonical = std::fs::canonicalize(path)?;
     let current_user = unsafe { libc::geteuid() };
-    let mut visited = BTreeSet::new();
-    for ancestor in absolute
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .chain(canonical.parent().into_iter().flat_map(Path::ancestors))
-    {
-        if !visited.insert(ancestor) {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(ancestor)?;
+    for ancestor in crate::infra::config::state_ancestors(path)? {
+        let metadata = std::fs::symlink_metadata(&ancestor)?;
         ensure!(
             (metadata.uid() == current_user || metadata.uid() == 0)
                 && (metadata.is_dir() || metadata.file_type().is_symlink()),
