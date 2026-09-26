@@ -142,6 +142,30 @@ impl Registry {
         self.register_inner(home, executable, None, None, true)
     }
 
+    pub(crate) fn pin_for_launch(
+        &self,
+        reference: &crate::protocol::NativeSourceRef,
+    ) -> crate::Result<()> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let source = state
+            .sources
+            .iter_mut()
+            .find(|source| source.source_id == reference.source_id)
+            .context("unknown runtime source")?;
+        source.validate()?;
+        ensure!(
+            source.generation == reference.generation,
+            "native source changed before attachment"
+        );
+        if source.executable_origin.as_deref() == Some("path") && source.executable.is_some() {
+            // Discovery cannot replace a launcher's program while its child opens the source.
+            source.executable_origin = Some("launch".into());
+            self.save(&state)?;
+        }
+        Ok(())
+    }
+
     pub fn resolve(&self, source_id: &str) -> crate::Result<RuntimeSource> {
         let source = self
             .read()?
@@ -591,6 +615,37 @@ mod tests {
         }
         assert_eq!(registry.list().unwrap().len(), 4);
     }
+    #[test]
+    fn a_launch_binding_survives_observing_its_child_but_not_explicit_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("native");
+        std::fs::create_dir(&home).unwrap();
+        let launcher = root.path().join("launcher");
+        let native = root.path().join("native-binary");
+        std::fs::write(&launcher, "launcher").unwrap();
+        std::fs::write(&native, "native").unwrap();
+        let registry = Registry::at(root.path().join("registry")).unwrap();
+        let source = registry
+            .register(&home, Some(&launcher), None, None)
+            .unwrap();
+        let mut state = registry.read().unwrap();
+        state.sources[0].executable_origin = Some("path".into());
+        registry.save(&state).unwrap();
+        let reference = crate::protocol::NativeSourceRef {
+            source_id: source.source_id.clone(),
+            generation: source.generation,
+        };
+        registry.pin_for_launch(&reference).unwrap();
+        let observed = registry.enroll_observed(&home, Some(&native)).unwrap();
+        assert_eq!(observed.generation, source.generation);
+        assert_eq!(observed.executable, source.executable);
+        registry.pin_for_launch(&reference).unwrap();
+        let replaced = registry.register(&home, Some(&native), None, None).unwrap();
+        assert!(replaced.generation > source.generation);
+        assert!(registry.pin_for_launch(&reference).is_err());
+        assert_eq!(replaced.executable, Some(native.canonicalize().unwrap()));
+    }
+
     #[test]
     fn automatic_enrollment_never_revives_removed_or_replaced_homes() {
         let root = tempfile::tempdir().unwrap();

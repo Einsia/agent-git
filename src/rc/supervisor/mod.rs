@@ -1221,6 +1221,7 @@ impl Session {
             .as_ref()
             .map(|source| {
                 let registry = crate::rc::runtime_sources::Registry::open()?;
+                registry.pin_for_launch(source)?;
                 let context = crate::rc::runtime_context::RuntimeContext::resolve(
                     &registry,
                     &source.source_id,
