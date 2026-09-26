@@ -1,0 +1,91 @@
+name: Restore pinned Git runtime cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing, reviewed production tag'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git-runtime-cache-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86_64, aarch64]
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+    steps:
+      - name: Validate tag input
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^agit-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Verify immutable tag checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git tag --points-at HEAD | grep -Fx "$RELEASE_TAG")" = "$RELEASE_TAG"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Tag builds can restore the default branch cache, but not a sibling tag's cache.
+      - uses: actions/cache@v4
+        with:
+          path: .cache/git-runtime
+          key: git-runtime-v1-${{ matrix.architecture }}-unknown-linux-musl-${{ hashFiles('scripts/git-runtime-lock.json', 'scripts/prepare-git-runtime.py') }}
+
+      - name: Recover checksum-pinned Alpine downloads
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import urllib.request
+
+          lock = json.loads(Path("scripts/git-runtime-lock.json").read_text())
+          cache = Path(".cache/git-runtime")
+          cache.mkdir(parents=True, exist_ok=True)
+          upstream = "https://dl-cdn.alpinelinux.org/alpine/"
+          mirror = "https://repo.huaweicloud.com/repository/alpine/"
+          for pin in lock["linux"][os.environ["ARCHITECTURE"]]:
+              url = pin["url"]
+              if not url.startswith(upstream):
+                  raise ValueError("Alpine recovery requires a pinned official upstream URL")
+              path = cache / (pin["sha256"] + "-" + url.rsplit("/", 1)[-1])
+              if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == pin["sha256"]:
+                  continue
+              with urllib.request.urlopen(mirror + url.removeprefix(upstream), timeout=120) as response:
+                  body = response.read()
+              if hashlib.sha256(body).hexdigest() != pin["sha256"]:
+                  raise ValueError("Recovered download does not match the immutable tag checksum: " + url)
+              path.write_bytes(body)
+              print("Recovered pinned download: " + url)
+          PY
+
+      - name: Verify bundled runtime assembly
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare-git-runtime.py "$ARCHITECTURE-unknown-linux-musl" .cache/git-runtime/payload.tar.gz
