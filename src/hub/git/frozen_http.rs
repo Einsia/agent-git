@@ -123,7 +123,7 @@ pub(super) fn prepare(
         }
         config = config.user_agent(value.clone());
     }
-    Ok(config.build().into())
+    Ok(crate::hub::transport::agent(config.build()))
 }
 
 fn refuse_tls(values: &BTreeMap<String, String>, keys: &[&str]) -> Result<()> {

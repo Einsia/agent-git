@@ -1,22 +1,184 @@
 //! SOCKS negotiation shares the request deadline with proxy resolution and TCP connection.
+//! A host with several addresses is dialed by racing them, so one unreachable address costs
+//! at most an attempt delay instead of its share of the connection deadline.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::IpAddr;
-use std::time::Instant;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
-use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::resolver::{DefaultResolver, Resolver};
 use ureq::unversioned::transport::{
-    ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector,
-    TcpConnector, Transport, TransportAdapter,
+    ConnectProxyConnector, ConnectionDetails, Connector, Either, NextTimeout, RustlsConnector,
+    TcpConnector, Transport, TransportAdapter, time,
 };
 use ureq::{Error, Proxy, ProxyProtocol};
 
 pub(crate) fn agent(config: ureq::config::Config) -> ureq::Agent {
     let connector = SocksConnector
         .chain(ConnectProxyConnector::default())
-        .chain(TcpConnector::default())
+        .chain(RacingTcpConnector)
         .chain(RustlsConnector::default());
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+}
+
+/// How long a pending attempt runs alone before the next address joins the race.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Direct TCP connection that races the resolved addresses.
+///
+/// ureq's own connector tries addresses strictly in turn and gives the first one the largest
+/// share of the connection deadline, so an address that silently drops packets delays every
+/// connection by that whole share before a reachable address is tried. Here the next address
+/// starts whenever the running attempts have neither connected nor failed within
+/// [`ATTEMPT_DELAY`], a failure hands over at once, and the first connection wins.
+#[derive(Debug)]
+struct RacingTcpConnector;
+
+impl<In: Transport> Connector<In> for RacingTcpConnector {
+    type Out = Either<In, Box<dyn Transport>>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, Error> {
+        // A proxy connector already produced the connection this one would open.
+        if chained.is_some() {
+            return Ok(chained.map(Either::A));
+        }
+        connect_tcp(details).map(|transport| Some(Either::B(transport)))
+    }
+}
+
+fn tcp(details: &ConnectionDetails) -> Result<Box<dyn Transport>, Error> {
+    TcpConnector::default()
+        .connect(details, None::<()>)?
+        .map(|transport| transport.boxed())
+        .ok_or_else(|| Error::Io(invalid("TCP connection is missing")))
+}
+
+fn connect_tcp(details: &ConnectionDetails) -> Result<Box<dyn Transport>, Error> {
+    if details.addrs.len() < 2 {
+        return tcp(details);
+    }
+    // Each attempt owns what it borrows: a losing attempt keeps running until it connects or
+    // the deadline passes, after this call has returned the winner.
+    let uri = details.uri.clone();
+    let config = details.config.clone();
+    let request_level = details.request_level;
+    let reason = details.timeout.reason;
+    let current_time = details.current_time.clone();
+    let run_connector = details.run_connector.clone();
+    let attempt = move |addr: SocketAddr, left: Option<Duration>| {
+        let resolver = DefaultResolver::default();
+        let mut addrs = resolver.empty();
+        addrs.push(addr);
+        tcp(&ConnectionDetails {
+            uri: &uri,
+            addrs,
+            config: &config,
+            request_level,
+            resolver: &resolver,
+            now: current_time(),
+            timeout: NextTimeout {
+                after: left.map_or(time::Duration::NotHappening, Into::into),
+                reason,
+            },
+            current_time: current_time.clone(),
+            run_connector: run_connector.clone(),
+        })
+    };
+    let budget = (!details.timeout.after.is_not_happening()).then(|| *details.timeout.after);
+    race(
+        interleave(&details.addrs),
+        budget,
+        ATTEMPT_DELAY,
+        Arc::new(attempt),
+        move || Error::Timeout(reason),
+    )
+}
+
+/// Alternate address families, starting with the resolver's first choice, so a family that is
+/// broken on this network cannot queue every address of the working one behind it.
+fn interleave(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut second): (VecDeque<_>, VecDeque<_>) = addrs
+        .iter()
+        .copied()
+        .partition(|addr| addr.is_ipv6() == first_v6);
+    let mut ordered = Vec::with_capacity(addrs.len());
+    while let Some(addr) = first.pop_front() {
+        ordered.push(addr);
+        ordered.extend(second.pop_front());
+    }
+    ordered.extend(second);
+    ordered
+}
+
+type Attempt<T> = dyn Fn(SocketAddr, Option<Duration>) -> Result<T, Error> + Send + Sync;
+
+/// Start `addrs` in order, each after `delay` or after the previous failure, and return the
+/// first success. `attempt` receives what is left of `budget`; `None` means no deadline.
+/// When every attempt fails, the last failure is returned.
+fn race<T: Send + 'static>(
+    addrs: Vec<SocketAddr>,
+    budget: Option<Duration>,
+    delay: Duration,
+    attempt: Arc<Attempt<T>>,
+    timeout: impl FnOnce() -> Error,
+) -> Result<T, Error> {
+    let deadline = budget.map(|budget| Instant::now() + budget);
+    let (sender, results) = mpsc::channel();
+    let mut queue = addrs.into_iter().peekable();
+    let mut next_start = Instant::now();
+    let mut running = 0usize;
+    let mut failure = None;
+    loop {
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(timeout());
+        }
+        if now >= next_start
+            && let Some(addr) = queue.next()
+        {
+            let sender = sender.clone();
+            let attempt = Arc::clone(&attempt);
+            let left = deadline.map(|deadline| deadline.saturating_duration_since(now));
+            std::thread::spawn(move || {
+                // Nobody receives a result once another attempt has won; dropping it closes
+                // the late connection.
+                let _ = sender.send(attempt(addr, left));
+            });
+            running += 1;
+            next_start = now + delay;
+        }
+        if running == 0 {
+            return Err(failure.unwrap_or_else(timeout));
+        }
+        let wake = [queue.peek().map(|_| next_start), deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        let received = match wake {
+            Some(wake) => results.recv_timeout(wake.saturating_duration_since(now)),
+            None => results
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(error)) => {
+                running -= 1;
+                failure = Some(error);
+                next_start = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // `sender` lives in this frame, so the channel cannot close while it waits.
+            Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -59,11 +221,9 @@ impl Connector for SocksConnector {
             current_time: details.current_time.clone(),
             run_connector: details.run_connector.clone(),
         };
-        let transport = TcpConnector::default()
-            .connect(&proxy_details, None::<()>)?
-            .ok_or_else(|| invalid("SOCKS proxy connection is missing"))?;
+        let transport = connect_tcp(&proxy_details)?;
         let mut stream = Handshake {
-            io: TransportAdapter::new(transport.boxed()),
+            io: TransportAdapter::new(transport),
             deadline,
         };
         let host = details
@@ -251,4 +411,63 @@ fn push_string(packet: &mut Vec<u8>, value: &str) -> io::Result<()> {
     packet.push(length);
     packet.extend(value.as_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, last], 443))
+    }
+
+    /// An address that never answers must not hold a reachable one for its share of the
+    /// deadline: dialing in turn spends most of the budget on the first address before the
+    /// second is tried, which is far outside the bound asserted here.
+    #[test]
+    fn a_silent_address_does_not_delay_a_reachable_one() {
+        let (silent, reachable) = (addr(1), addr(2));
+        let started = Instant::now();
+        let winner = race(
+            vec![silent, reachable],
+            Some(Duration::from_secs(30)),
+            ATTEMPT_DELAY,
+            Arc::new(move |target: SocketAddr, left: Option<Duration>| {
+                if target == silent {
+                    std::thread::sleep(left.unwrap());
+                    return Err(Error::Timeout(ureq::Timeout::Connect));
+                }
+                Ok(target)
+            }),
+            || Error::Timeout(ureq::Timeout::Connect),
+        );
+        assert_eq!(winner.unwrap(), reachable);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reachable address waited {:?} behind a silent one",
+            started.elapsed()
+        );
+    }
+
+    /// Any failure of one address hands over to the next; an implementation that retries only
+    /// refused connections gives up on a host whose first address is unroutable.
+    #[test]
+    fn an_unroutable_address_hands_over_to_the_next() {
+        let (unroutable, reachable) = (addr(1), addr(2));
+        let winner = race(
+            vec![unroutable, reachable],
+            Some(Duration::from_secs(30)),
+            ATTEMPT_DELAY,
+            Arc::new(move |target: SocketAddr, _: Option<Duration>| {
+                if target == unroutable {
+                    return Err(Error::Io(io::Error::from(
+                        io::ErrorKind::NetworkUnreachable,
+                    )));
+                }
+                Ok(target)
+            }),
+            || Error::Timeout(ureq::Timeout::Connect),
+        );
+        assert_eq!(winner.unwrap(), reachable);
+    }
 }

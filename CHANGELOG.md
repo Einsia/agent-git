@@ -6,6 +6,18 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Reach the Hub without a fixed stall when one of its addresses is unreachable
+  from your network. agit dialed the resolved addresses one after another and
+  gave the first one most of the connection budget, so every command that talked
+  to the Hub could wait about 20 seconds before trying the next address. The
+  addresses now race: the next one starts after 250 ms or as soon as the
+  previous one fails. Hub API requests, SOCKS proxy connections, LFS
+  availability checks and `agit upgrade` downloads all use it.
+
 ## [0.2.10] - 2026-09-28
 
 ### Fixed
