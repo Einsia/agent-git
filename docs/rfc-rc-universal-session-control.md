@@ -1,6 +1,32 @@
 # RFC: Discover and control conversations across native runtime owners
 
-Status: Proposed. This document specifies follow-up work; release 0.2.7 does not implement it.
+Status: Implemented in CLI 0.2.8 with deployed backend support. Final production
+browser interaction acceptance remains open; this RFC is not fully accepted yet.
+
+## Delivery status
+
+[CLI 0.2.8](https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.8)
+ships runtime-source registration, source-qualified discovery and control, shared
+Codex attachment, and fallback-only intent expiry. The production backend source
+is `4fa3458c39d5cb219e12a5cef0b9b4668a583595`; deployment uses the same verified
+image in all three regions.
+
+Actual Codex 0.155.1 acceptance covers both launch orders on the standard socket,
+co-control, queue execution, reconnect/replay, and shared streams beyond the
+fallback deadline. The server and active native task survive Agit exit. A separate
+real fallback run verifies background release without stopping execution or losing
+subsequent output. The default remains fifteen minutes.
+
+Read-only production acceptance on the affected device verifies its existing
+custom-home conversations, history, models, and permissions without acquiring
+control. The production in-app browser displays a disposable conversation's
+complete replies, model, and permission mode. Browser send, queue, refresh, and
+device-removal interactions remain unverified because the browser-control tool
+times out. Protocol-level acceptance does not substitute for those interactions.
+
+The partial-discovery notice follow-up is merged in backend MR !593 and awaits
+verified deployment. Issue #63 is closed; issues #64 and #65 remain open until
+the remaining production acceptance and evidence updates are complete.
 
 ## Decision
 
@@ -25,7 +51,7 @@ controller are different identities. "Any owner" means any runtime writer within
 the device's authorized execution scope. Workspace membership does not grant
 access to another OS account or to unshared project roots.
 
-## Evidence and current gaps
+## Baseline audit and design evidence
 
 Audited CLI source: `88e13b675d07e2c3cd6b71d43ed94965eacc4483`.
 Audited web source: `1ebeb7bce77fed3b5821b3ef2c14274cbf062be4`.
@@ -36,7 +62,7 @@ with their native index recording the same project cwd as RC. The daemon has no
 individual Codex homes. This is not a requirement to launch conversations through
 Agit: existing discovery already supports external sessions in the default store.
 
-| Path | Current limitation | Required change |
+| Path | Baseline limitation | Required change |
 | --- | --- | --- |
 | `src/adapter/codex.rs`, `codex_index.rs` | Home is resolved from daemon-wide environment; project query uses exact cwd equality | Explicit runtime context and canonical project containment |
 | `src/rc/daemon/sessions.rs` | Scans one environment per adapter, skips unavailable executables, truncates project results, silently skips source errors | Durable multi-source catalog, pagination, partial-source diagnostics |
@@ -434,9 +460,9 @@ and commands independently of whether the runtime continues locally.
    advertised device capability. Old devices keep their existing limited catalog
    with an explicit upgrade/coverage notice; bare IDs resolve only when unambiguous.
 
-Do not put these unimplemented changes into 0.2.7 release notes. They require a
-separate CLI release and backend/web changes. The design preserves the existing
-project delegation ceiling and the agreed device-owner folder-add restriction.
+These changes belong to CLI 0.2.8 and its backend/web deployment, not the 0.2.7
+release notes. The design preserves the existing project delegation ceiling and
+the agreed device-owner folder-add restriction.
 
 ## Acceptance gates
 
