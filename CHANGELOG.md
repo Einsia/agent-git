@@ -6,6 +6,21 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.9] - 2026-09-27
+
+### Fixed
+
+- Accept start and steer instructions for attached, source-qualified Codex
+  conversations through Cloud controllers. Managed conversations retain their
+  executor identity and control policy; catalog entries alone do not authorize
+  these operations.
+- Keep runtime source identities when local builds differ in directory creation
+  time support. Device and inode checks remain required, and conflicting known
+  creation times still reject a replaced directory.
+
+- Preserve the enrolled runtime source when resolving a saved conversation after
+  a daemon restart, so Cloud controllers resume the same native conversation.
+
 ## [0.2.8] - 2026-09-27
 
 ### Added

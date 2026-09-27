@@ -8,7 +8,7 @@ browser interaction acceptance remains open; this RFC is not fully accepted yet.
 [CLI 0.2.8](https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.8)
 ships runtime-source registration, source-qualified discovery and control, shared
 Codex attachment, and fallback-only intent expiry. The production backend source
-is `4fa3458c39d5cb219e12a5cef0b9b4668a583595`; deployment uses the same verified
+is `faa838190bd8a732801f74849a0a5d834646b117`; deployment uses the same verified
 image in all three regions.
 
 Actual Codex 0.155.1 acceptance covers both launch orders on the standard socket,
@@ -17,15 +17,38 @@ fallback deadline. The server and active native task survive Agit exit. A separa
 real fallback run verifies background release without stopping execution or losing
 subsequent output. The default remains fifteen minutes.
 
+Additional actual-native acceptance verifies concurrent startup, overlapping
+execution of distinct conversations on one server, a registered nonstandard
+endpoint, and explicit handshake rejection without embedded fallback. A config
+override disables implicit reuse in the tested launcher; selecting the endpoint
+explicitly preserves the model override and attaches to the shared service.
+
 Read-only production acceptance on the affected device verifies its existing
 custom-home conversations, history, models, and permissions without acquiring
 control. The production in-app browser displays a disposable conversation's
-complete replies, model, and permission mode. Browser send, queue, refresh, and
-device-removal interactions remain unverified because the browser-control tool
-times out. Protocol-level acceptance does not substitute for those interactions.
+complete replies, model, and permission mode after refresh. Actual browser sending
+revealed that CLI 0.2.8 rejects `turn.start` and `turn.steer` for attached native
+sources while accepting `session.enqueue`. CLI 0.2.9 prepares the admission
+correction; its release and production-page acceptance remain required. Browser
+queue and device-removal acceptance remain open. Protocol-level acceptance does
+not substitute for those interactions.
 
-The partial-discovery notice follow-up is merged in backend MR !593 and awaits
-verified deployment. Issue #63 is closed; issues #64 and #65 remain open until
+Switching the disposable executor from a musl build to the GNU validation build
+also exposed a source identity compatibility error: creation time metadata became
+available while the directory device and inode remained unchanged. The prepared
+correction compares creation times when both builds report them, while preserving
+device/inode and principal checks. Source identity and generation must survive the
+build transition; actual execution and the formal release remain acceptance gates.
+
+Cold Cloud resume also requires the executor to retain the enrolled source in
+its saved-identity resolution receipt. Omitting it turns a source-qualified
+conversation into a raw native ID when the shared controller is selected. The
+prepared correction keeps that source and generation, with current read authority
+still checked; production cold resume remains required.
+
+The partial-discovery notice follow-up in backend MR !593 is verified in every
+production region at GitOps commit `b81efa6b20b443f73a6ee4855437df070ae4d595`.
+Issue #63 is closed; issues #64 and #65 remain open until
 the remaining production acceptance and evidence updates are complete.
 
 ## Decision

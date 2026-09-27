@@ -16,6 +16,18 @@ pub struct FileIdentity {
     created_nanos: Option<u64>,
 }
 
+impl FileIdentity {
+    fn matches(&self, current: &Self) -> bool {
+        // Creation time availability depends on the filesystem and local build.
+        self.volume == current.volume
+            && self.file == current.file
+            && match (self.created_nanos, current.created_nanos) {
+                (Some(saved), Some(current)) => saved == current,
+                _ => true,
+            }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSource {
     pub source_id: String,
@@ -50,7 +62,7 @@ impl RuntimeSource {
             "runtime home now resolves to a different directory; register it again"
         );
         ensure!(
-            file_identity(&home)? == self.identity,
+            self.identity.matches(&file_identity(&home)?),
             "runtime home was replaced; register it again"
         );
         Ok(())
@@ -258,7 +270,7 @@ impl Registry {
             && let Some(source) = state.sources.iter_mut().find(|source| source.home == home)
         {
             let enrich = source.enabled
-                && source.identity == identity
+                && source.identity.matches(&identity)
                 && source.principal == principal
                 && (source.executable.is_none()
                     || source.executable_origin.as_deref() == Some("path"))
@@ -280,7 +292,9 @@ impl Registry {
             return Ok(source);
         }
         if let Some(source) = state.sources.iter_mut().find(|source| {
-            source.home == home && source.identity == identity && source.principal == principal
+            source.home == home
+                && source.identity.matches(&identity)
+                && source.principal == principal
         }) {
             let changed = !source.enabled
                 || (rename_requested && source.name != name)
@@ -520,6 +534,37 @@ fn file_identity(path: &Path) -> crate::Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_time_availability_preserves_registered_source_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("native");
+        std::fs::create_dir(&home).unwrap();
+        let registry = Registry::at(root.path().join("registry")).unwrap();
+        let source = registry.register(&home, None, None, None).unwrap();
+        let mut state = registry.read().unwrap();
+        state.sources[0].identity.created_nanos = None;
+        registry.save(&state).unwrap();
+        registry.resolve(&source.source_id).unwrap();
+        let enrolled = registry.register(&home, None, None, None).unwrap();
+        assert_eq!(enrolled.source_id, source.source_id);
+        assert_eq!(enrolled.generation, source.generation);
+        let mut known = source.identity.clone();
+        known.created_nanos = Some(1);
+        let mut unavailable = known.clone();
+        unavailable.created_nanos = None;
+        assert!(known.matches(&unavailable));
+        assert!(unavailable.matches(&known));
+        let mut replaced = known.clone();
+        replaced.created_nanos = Some(2);
+        assert!(!known.matches(&replaced));
+        replaced.created_nanos = None;
+        replaced.file += 1;
+        assert!(!unavailable.matches(&replaced));
+        replaced = unavailable.clone();
+        replaced.volume += 1;
+        assert!(!unavailable.matches(&replaced));
+    }
 
     #[test]
     fn independent_stores_and_replacements_never_reuse_conversation_identity() {

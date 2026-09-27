@@ -134,13 +134,17 @@ impl Permit {
                             && session.access(policy, principal).can_read()
                     })
                     .map_or(serde_json::Value::Null, |session| {
-                        serde_json::json!({
+                        let mut identity = serde_json::json!({
                             "session_id":session.id,
                             "runtime_session_id":session.native_id,
                             "runtime":session.runtime,
                             "project_id":session.project,
                             "workspace_id":super::super::endpoint::WORKSPACE,
-                        })
+                        });
+                        if let Some(source) = &session.source {
+                            identity["native_source"] = serde_json::json!(source);
+                        }
+                        identity
                     });
             }
             if let Some(start_id) = &self.start_id {
@@ -227,6 +231,8 @@ pub fn authorize(
                             | "session.model"
                             | "session.commands"
                             | "session.enqueue"
+                            | "turn.start"
+                            | "turn.steer"
                             | "session.setModel"
                             | "session.setPermissionMode"
                             | "approval.decide"
@@ -380,6 +386,98 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn managed_source_turns_require_control_and_use_executor_identity() {
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "operator".into(),
+        };
+        let source = crate::protocol::NativeSourceRef {
+            source_id: "source-a".into(),
+            generation: 3,
+        };
+        let reference = source.session_ref("native");
+        let policy = |access| {
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Session(reference.clone()),
+                    access,
+                }],
+            )
+            .unwrap()
+        };
+        let mut resources = Resources::default();
+        resources.observe(
+            "workspace.list",
+            &json!({"workspaces":[{"workspace_id":"local-owner", "projects":[{
+                "project_id":"project", "local_path":"/project"
+            }]}]}),
+        );
+        resources.observe(
+            "session.catalog.list",
+            &json!({"rows":[{
+                "session_ref":reference, "source_id":"source-a", "source_generation":3,
+                "native_session_id":"native", "runtime":"codex", "cwd":"/project"
+            }]}),
+        );
+        assert!(resources.session(&reference).is_some());
+        resources.observe(
+            "session.start",
+            &json!({"session": {
+                "session_id":"agit-managed", "runtime_session_id":"native",
+                "workspace_id":"local-owner", "project_id":"project", "runtime":"codex",
+                "native_source":{"source_id":"source-a", "generation":3}
+            }}),
+        );
+        for method in ["turn.start", "turn.steer"] {
+            let request = Frame::request(
+                method,
+                json!({
+                    "session_id":"agit-managed", "message":"Continue the task",
+                    "source_id":"forged", "source_generation":1,
+                    "native_session_id":"foreign", "expected_cwd":"/private"
+                }),
+            );
+            let (admitted, permit) = authorize(
+                request.clone(),
+                &principal,
+                &policy(Access::Control),
+                &mut resources,
+            )
+            .unwrap();
+            let params = admitted.params.unwrap();
+            assert_eq!(params["session_id"], "agit-managed");
+            assert_eq!(params["source_id"], "source-a");
+            assert_eq!(params["source_generation"], 3);
+            assert_eq!(params["native_session_id"], "native");
+            assert_eq!(params["expected_cwd"], "/project");
+            assert!(!permit.authority_matches(
+                &resources,
+                &policy(Access::Read),
+                &principal,
+                "operator"
+            ));
+            assert!(authorize(request, &principal, &policy(Access::Read), &mut resources).is_err());
+            let unattached = Frame::request(
+                method,
+                json!({
+                    "session_id":reference, "message":"Continue the task"
+                }),
+            );
+            assert!(
+                authorize(
+                    unattached,
+                    &principal,
+                    &policy(Access::Control),
+                    &mut resources
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn saved_identity_resolution_uses_executor_records_and_current_read_authority() {
         let principal = Principal {
             issuer: "https://cloud.example".into(),
@@ -417,7 +515,10 @@ mod tests {
             &mut resources,
         )
         .unwrap();
-        let response = Frame::response(request.id.unwrap(), json!({"sessions":[], "local":[]}));
+        let response = Frame::response(
+            request.id.clone().unwrap(),
+            json!({"sessions":[], "local":[]}),
+        );
         let result = permit
             .response(response.clone(), &resources, &policy, &principal)
             .result
@@ -430,6 +531,28 @@ mod tests {
                 "project_id":"project", "workspace_id":"local-owner",
             })
         );
+        let revoked = permit.response(response, &resources, &Policy::default(), &principal);
+        assert!(revoked.result.unwrap()["resolved_session"].is_null());
+
+        let source = crate::protocol::NativeSourceRef {
+            source_id: "enrolled-home".into(),
+            generation: 3,
+        };
+        resources.observe(
+            "session.list",
+            &json!({"sessions":[{
+                "session_id":"saved", "runtime_session_id":"native", "runtime":"codex",
+                "project_id":"project", "workspace_id":"local-owner", "native_source":source,
+            }]}),
+        );
+        let response = Frame::response(request.id.unwrap(), json!({"sessions":[], "local":[]}));
+        let result = permit
+            .response(response.clone(), &resources, &policy, &principal)
+            .result
+            .unwrap();
+        assert_eq!(result["resolved_session"]["native_source"], json!(source));
+        assert_eq!(result["resolved_session"]["runtime_session_id"], "native");
+        assert!(result["sessions"].as_array().unwrap().is_empty());
         let revoked = permit.response(response, &resources, &Policy::default(), &principal);
         assert!(revoked.result.unwrap()["resolved_session"].is_null());
     }
