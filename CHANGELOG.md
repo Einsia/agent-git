@@ -6,6 +6,15 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.10] - 2026-09-28
+
+### Fixed
+
+- Preserve native catalog scan health through delegated permission filtering,
+  including incremental responses with no changed conversations. Remote Control
+  can distinguish a running scan from an unavailable source while source
+  identities remain scoped to readable conversations.
+
 ## [0.2.9] - 2026-09-27
 
 ### Fixed

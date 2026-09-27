@@ -501,6 +501,23 @@ impl Resources {
 
     pub fn filter(&self, method: &str, result: &mut Value, policy: &Policy, principal: &Principal) {
         if method == "session.catalog.list" {
+            // Scan health survives permission filtering even when a delta has no visible sources.
+            let coverage_status = match result["coverage"].as_array() {
+                Some(sources) if !sources.is_empty() => {
+                    if sources.iter().any(|source| {
+                        !matches!(source["status"].as_str(), Some("ready" | "scanning"))
+                    }) {
+                        "unavailable"
+                    } else if sources.iter().any(|source| source["status"] == "scanning") {
+                        "scanning"
+                    } else {
+                        "ready"
+                    }
+                }
+                _ if result["complete"] == true => "ready",
+                _ => "unavailable",
+            };
+            result["coverage_status"] = serde_json::json!(coverage_status);
             if let Some(rows) = result["rows"].as_array_mut() {
                 rows.retain(|row| {
                     self.catalog_session(row)
@@ -866,13 +883,25 @@ mod tests {
         let mut result = json!({"rows":[
             {"session_ref":"local-a","source_id":"source-a","source_generation":1,"native_session_id":"copied","runtime":"codex","cwd":"/workspace/allowed"},
             {"session_ref":"local-b","source_id":"source-b","source_generation":2,"native_session_id":"copied","runtime":"codex","cwd":"/workspace/private"}
-        ],"coverage":[{"source_id":"source-a"},{"source_id":"source-b"}]});
+        ],"complete":false,"coverage":[{"source_id":"source-a","status":"ready"},{"source_id":"source-b","status":"scanning"}]});
         resources.observe("session.catalog.list", &result);
         assert!(resources.session("copied").is_none());
         resources.filter("session.catalog.list", &mut result, &policy, &principal);
         assert_eq!(result["rows"].as_array().unwrap().len(), 1);
         assert_eq!(result["rows"][0]["session_ref"], "local-a");
-        assert_eq!(result["coverage"], json!([{"source_id":"source-a"}]));
+        assert_eq!(
+            result["coverage"],
+            json!([{"source_id":"source-a","status":"ready"}])
+        );
+        assert_eq!(result["coverage_status"], "scanning");
+        for status in ["scanning", "unavailable", "ready"] {
+            let mut delta = json!({"rows":[],"complete":status == "ready",
+                "coverage":[{"source_id":"source-a","status":status}]});
+            resources.filter("session.catalog.list", &mut delta, &policy, &principal);
+            assert_eq!(delta["coverage_status"], status);
+            assert_eq!(delta["coverage"], json!([]));
+            assert_eq!(delta["rows"], json!([]));
+        }
         let frame = crate::protocol::Frame::request(
             "session.catalog.settings",
             json!({

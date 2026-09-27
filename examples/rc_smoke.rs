@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         project_id: Some("p1".into()),
         runtime: runtime.clone(),
         runtime_session_id: None,
+        native_source: None,
         agent: None,
         branch: None,
         status: SessionStatus::Idle,
