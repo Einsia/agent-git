@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-09-28
+
+### Fixed
+
+- Retry RC daemon reconciliation when a global npm installation's lifecycle
+  scripts are disabled. The next CLI invocation schedules the guarded handoff
+  in the background, while project-local and temporary npm packages cannot
+  replace a persistent daemon.
+
 ## [0.2.11] - 2026-09-28
 
 ### Fixed

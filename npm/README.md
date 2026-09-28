@@ -65,6 +65,9 @@ Unsupported operating system and architecture pairs get no prebuilt binary: runn
   recipe.
 - `agit setup` failing in postinstall never blocks the install — the CLI is on
   disk; re-run `agit setup` any time.
+- If npm suppresses postinstall, the next invocation of a globally installed
+  `agit` schedules a guarded RC daemon reconciliation in the background.
+  npm cannot run the daemon handoff at install time when it suppresses scripts.
 
 ## Environment variables
 

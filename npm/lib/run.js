@@ -5,10 +5,10 @@ const path = require('path');
 const platform = require('./platform');
 const { resolveBinary } = require('./resolve');
 const log = require('./log');
+const { scheduleReconciliation } = require('./reconcile');
 
-// Entry point for the `agit` command. Thin is deliberate: forward argv / stdio /
-// exit code, nothing else. agit gets written into scripts and hooks, so exit
-// codes and stdio pass-through are load-bearing semantics and must not change.
+// Forward argv, stdio, and exit status unchanged. Hooks rely on those semantics;
+// daemon reconciliation therefore runs independently of the forwarded command.
 function run() {
   const pkgRoot = path.join(__dirname, '..');
   let bin = null;
@@ -37,13 +37,22 @@ function run() {
     process.exit(127);
   }
 
-  const r = spawnSync(bin, process.argv.slice(2), {
+  const args = process.argv.slice(2);
+  // A bridge may stay open indefinitely, so queue its install check before forwarding.
+  // Other commands finish first to avoid racing their own daemon operation.
+  if (args[0] === 'rc' && args[1] === 'local' && args[2] === 'bridge') {
+    scheduleReconciliation(bin, pkgRoot);
+  }
+  const r = spawnSync(bin, args, {
     stdio: 'inherit',
     env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
   });
   if (r.error) {
     log.error(`failed to start ${bin}: ${r.error.message}`);
     process.exit(1);
+  }
+  if (!(args[0] === 'rc' && args[1] === 'local' && args[2] === 'bridge')) {
+    scheduleReconciliation(bin, pkgRoot);
   }
   process.exit(r.status === null ? 1 : r.status);
 }
