@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agit"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "aes-gcm",
  "agit-controller",

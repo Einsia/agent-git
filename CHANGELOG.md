@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-09-28
+
 ### Fixed
 
 - Reconcile the local RC daemon after self-upgrade, global npm installation, or
