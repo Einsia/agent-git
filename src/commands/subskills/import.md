@@ -63,6 +63,16 @@ git -C "$(agit repo path szh/p1)" show-ref --verify refs/heads/fix-auth
 agit status
 ```
 
+When a runtime session variable names the current conversation (for example
+`CODEBUDDY_SESSION_ID` in WorkBuddy), the candidate list and the empty-list message
+say which conversation that is and, when it is already saved, the `agit commit` and
+`agit push` commands for its target. Importing a session of the same runtime other
+than that conversation prints a warning naming both native IDs (a `warning` row in
+JSON `diagnostics.stderr`) and continues: nested runtimes and deliberate imports of an
+earlier conversation are legitimate. Such an import is saved locally but not pushed
+automatically, even with `push.auto` on; recheck the ID, then publish it with
+`agit push <owner>/<repo>@<branch>`.
+
 `--name` names a repo; it does not create a branch by itself. Prefer the qualified `--into` form when reusing a repository, especially in an organization namespace. Import does not change the parent shell's environment: subsequent commands need a full target or an explicitly set `AGIT_SESSION`.
 
 ## Inspect possible local lineage

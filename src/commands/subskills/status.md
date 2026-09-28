@@ -100,7 +100,26 @@ runtime indexes available to this machine, rather than proving that no other
 conversation exists.
 
 - `no session target supplied through AGIT_SESSION`: no usable explicit process identity.
+- `runtime session`: the conversation a runtime session variable names (for example
+  `CODEBUDDY_SESSION_ID` in WorkBuddy), with `saved to` showing its active claim's
+  `<owner>/<repo>@<branch>`. It is display only and never becomes the command target.
+  When it is saved, a hint names `agit commit <target>` and `agit push <target>`; when it
+  is not, the hint names the import command with its native ID.
 - `bound repo`: the cwd's Agent repo route; it does not prove that a branch exists.
+
+JSON reports the same under `runtime_session`: `state` is `none`, `detected` or
+`ambiguous`; `session` holds `runtime`, `session_id`, `variable`, `managed` and a
+nullable `target` when exactly one conversation is named; `candidates` lists every
+named conversation. `managed` means the store holds ownership evidence for the
+conversation (an agent, branch, baseline or archive role); a hook placeholder or a
+`--link-only` link is not managed. A variable counts only when its runtime's transcript file exists,
+or when the runtime keeps sessions in a database status does not open. Nested runtimes
+inherit their parent's variables, so `ambiguous` means the environment cannot say which
+conversation this is; name it explicitly instead of choosing one.
+
+`--check-missing` leaves every session with a link out of its list, the current
+conversation included, and says so for the current conversation. The only unsaved
+candidate is not necessarily the current conversation.
 
 The repository table lists branches even when no runtime session has been adopted. Each row
 includes the last commit and its tracking ref. An explicit upstream takes precedence; otherwise

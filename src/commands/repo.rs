@@ -189,9 +189,7 @@ fn create(name: &str, private: bool) -> CmdResult {
                 ));
                 return Ok(ExitCode::Precondition);
             }
-            if let Some(value) = auto_push {
-                Repo::at(&dir).set_auto_push(Some(value))?;
-            }
+            auto_push.apply(&Repo::at(&dir), &format!("{}/{}", resp.owner, resp.name))?;
             println!("  next:");
             println!(
                 "    cd <your-project> && agit init {}    # lays down the main file line",
@@ -403,7 +401,7 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
         None,
     ) {
         Ok(Some(typed)) if typed == format!("{owner}/{name}") => {}
-        Err(_) | Ok(None) if !ui::is_tty() => {
+        Err(_) | Ok(None) if !ui::prompt::can_ask() => {
             ui::error(
                 "changing visibility needs interactive confirmation (typing the full name); refused without a TTY.",
             );
@@ -512,7 +510,7 @@ fn set_public_visibility(
         None,
     ) {
         Ok(Some(typed)) if typed == prepared.confirmation_phrase => {}
-        Err(_) | Ok(None) if !ui::is_tty() => {
+        Err(_) | Ok(None) if !ui::prompt::can_ask() => {
             ui::error(
                 "making a repository public needs interactive confirmation; refused without a TTY.",
             );

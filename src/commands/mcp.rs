@@ -61,7 +61,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "status", "description": "who am I + sync status", "inputSchema": {"type":"object","properties":{}}},
-                    {"name": "commit", "description": "settle the current session", "inputSchema": {"type":"object","properties":{"milestone":{"type":"string"}}}},
+                    {"name": "commit", "description": "Settle a saved session's completed turns. target (owner/repo@branch) selects it; omitted, only this server's AGIT_SESSION selects it. Without either, nothing is settled and the error names the saved target of the runtime session this server's environment names, to pass as target once you have confirmed it is this conversation.", "inputSchema": {"type":"object","properties":{"target":{"type":"string","description":"owner/repo@branch"},"milestone":{"type":"string"}}}},
                     {"name": "rc_status", "description": "Is this machine connected to a hub, and what sessions is the daemon supervising? Use it to find out whether you are being watched remotely.", "inputSchema": {"type":"object","properties":{}}},
                     {"name": "rc_list", "description": "The machines paired to this account (including offline ones)", "inputSchema": {"type":"object","properties":{}}},
                 ]
@@ -217,7 +217,14 @@ fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
             cmd.arg("status");
         }
         "commit" => {
+            let target = match commit_target(args) {
+                Ok(target) => target,
+                Err(error) => return ToolOutput::error(error),
+            };
             cmd.arg("commit");
+            if let Some(target) = target {
+                cmd.arg(target);
+            }
             if let Some(m) = args.get("milestone").and_then(|v| v.as_str()) {
                 cmd.args(["--milestone", m]);
             }
@@ -239,10 +246,9 @@ fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
                     text: mcp_result(name, &stdout),
                     is_error: false,
                 }
+            } else if serde_json::from_str::<serde_json::Value>(&stdout).is_ok() {
+                ToolOutput::error(stdout.into_owned())
             } else {
-                if serde_json::from_str::<serde_json::Value>(&stdout).is_ok() {
-                    return ToolOutput::error(stdout.into_owned());
-                }
                 ToolOutput::error(format!(
                     "(exit {})\n{}{}",
                     o.status.code().unwrap_or(-1),
@@ -253,6 +259,56 @@ fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
         }
         Err(e) => ToolOutput::error(format!("could not run the tool: {e}")),
     }
+}
+
+/// The target the caller named. `null` and an empty string are how tool callers leave an optional
+/// argument unset, so both mean "not named"; anything else must be a target string that cannot be
+/// read as an option.
+fn explicit_commit_target(args: &serde_json::Value) -> Result<Option<String>, String> {
+    match args.get("target") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(target)) if target.is_empty() => Ok(None),
+        Some(serde_json::Value::String(target)) if !target.starts_with('-') => {
+            Ok(Some(target.clone()))
+        }
+        Some(_) => Err("invalid commit target: expected owner/repo@branch".into()),
+    }
+}
+
+/// The commit tool's target: the explicit argument, else none so that the server's
+/// `AGIT_SESSION` selects it.
+///
+/// The server's environment is fixed when it starts, so after a `/clear`, or in a server shared
+/// across conversations, a runtime variable can name an earlier conversation than the caller's.
+/// Settling that conversation's target would save, and with automatic push publish, turns the
+/// caller never asked about, and no later call can undo it. So a runtime identity never selects
+/// the target here: without a target or `AGIT_SESSION` nothing runs, and the error names the
+/// saved target of the conversation the environment names for the caller to confirm and pass.
+fn commit_target(args: &serde_json::Value) -> Result<Option<String>, String> {
+    if let Some(target) = explicit_commit_target(args)? {
+        return Ok(Some(target));
+    }
+    if std::env::var_os("AGIT_SESSION").is_some_and(|value| !value.is_empty()) {
+        return Ok(None);
+    }
+    let sessions = super::context::runtime_sessions();
+    Err(match sessions.as_slice() {
+        [] => "no session target: pass `target` as owner/repo@branch; this server's environment names no runtime session and carries no AGIT_SESSION".into(),
+        [one] => match &one.target {
+            Some(target) => format!(
+                "no session target: nothing was settled. This MCP server's environment names {} session {} (via {}), saved to {target}; the environment is fixed when the server starts and can name an earlier conversation. If {} is this conversation's id, call commit again with target \"{target}\"",
+                one.runtime, one.session_id, one.variable, one.session_id
+            ),
+            None => format!(
+                "no session target: nothing was settled. {}",
+                super::context::runtime_session_note(&sessions).unwrap_or_default()
+            ),
+        },
+        _ => format!(
+            "no session target: nothing was settled. {}; pass `target` as owner/repo@branch",
+            super::context::runtime_session_note(&sessions).unwrap_or_default()
+        ),
+    })
 }
 
 /// The VIEW tool returns its structured value directly; the CLI envelope is transport.
@@ -356,6 +412,27 @@ mod workspace_tool_tests {
             assert_eq!(args.repo.as_deref(), Some("alice/demo"));
         }
         assert!(super::search_arguments(&serde_json::json!({"local":"true"})).is_err());
+    }
+
+    /// Tool callers leave an optional argument unset by sending `null` or an empty string; both
+    /// count as omitted, while a value that parses as an option is refused. An implementation that type-checks `target` as a present string rejects the
+    /// unset forms here.
+    #[test]
+    fn commit_target_treats_null_and_empty_as_unset() {
+        use serde_json::json;
+        for unset in [json!({}), json!({"target": null}), json!({"target": ""})] {
+            assert_eq!(super::explicit_commit_target(&unset), Ok(None), "{unset}");
+        }
+        assert_eq!(
+            super::explicit_commit_target(&json!({"target": "me/demo@work"})),
+            Ok(Some("me/demo@work".into()))
+        );
+        for invalid in [json!({"target": "--help"}), json!({"target": 1})] {
+            assert!(
+                super::explicit_commit_target(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

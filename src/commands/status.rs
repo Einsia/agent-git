@@ -79,6 +79,8 @@ pub fn run(args: Args) -> CmdResult {
         }
         Err(error) => println!("  session target unavailable: {error}"),
     }
+    let runtime_sessions = super::context::runtime_sessions();
+    print_runtime_sessions(&runtime_sessions, !args.check_missing);
     if let Some(ws) = crate::domain::workspace::read(&cwd) {
         println!("  {}", ui::dim(&format!("bound repo: {}", ws.repo)));
     }
@@ -268,6 +270,9 @@ pub fn run(args: Args) -> CmdResult {
         let discovery = uncaptured(&links, inventory_complete);
         let missing = &discovery.sessions;
         sp.finish_and_clear();
+        if let Some(note) = super::context::runtime_session_note(&runtime_sessions) {
+            println!("  {note}");
+        }
         if missing.is_empty() && discovery.errors.is_empty() {
             println!(
                 "  {} no unadopted sessions found in the checked indexes",
@@ -305,6 +310,62 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     Ok(ExitCode::Ok)
+}
+
+/// The "who am I" lines for the conversation the runtime environment names.
+///
+/// It is labeled as display only: the explicit-target rule above still decides what commands
+/// act on, and this line must not read as a second way to select a session.
+fn print_runtime_sessions(sessions: &[super::context::RuntimeSession], with_note: bool) {
+    match sessions {
+        [] => {}
+        [one] => {
+            println!(
+                "  runtime session: {} {} ({}; display only, not a command target)",
+                one.runtime, one.session_id, one.variable
+            );
+            match &one.target {
+                Some(target) => println!("  {}", ui::dim(&format!("saved to: {target}"))),
+                None if one.managed => {
+                    println!("  {}", ui::dim("saved to: no active complete claim"))
+                }
+                None => println!("  {}", ui::dim("saved to: not saved yet")),
+            }
+        }
+        many => {
+            println!(
+                "  runtime session: ambiguous ({}; display only, not a command target)",
+                many.iter()
+                    .map(|session| format!(
+                        "{}={} ({})",
+                        session.variable, session.session_id, session.runtime
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    if with_note && let Some(note) = super::context::runtime_session_note(sessions) {
+        ui::hint(&note);
+    }
+}
+
+/// Typed display-only form of [`print_runtime_sessions`]. `state` is `none`, `detected` (exactly
+/// one conversation, also in `session`) or `ambiguous` (`session` is null and `candidates` lists
+/// every conversation the variables name).
+fn runtime_session_json(sessions: &[super::context::RuntimeSession]) -> serde_json::Value {
+    serde_json::json!({
+        "state": match sessions.len() {
+            0 => "none",
+            1 => "detected",
+            _ => "ambiguous",
+        },
+        "session": match sessions {
+            [one] => one.to_json(),
+            _ => serde_json::Value::Null,
+        },
+        "candidates": sessions.iter().map(super::context::RuntimeSession::to_json).collect::<Vec<_>>(),
+    })
 }
 
 fn structured(args: &Args) -> CmdResult {
@@ -382,7 +443,11 @@ fn structured(args: &Args) -> CmdResult {
     }
     let shared_files = shared::inspect(&agents);
     let merge_transactions = merges::page(&agents);
+    let runtime_sessions = super::context::runtime_sessions();
     let missing = if args.check_missing {
+        if let Some(note) = super::context::runtime_session_note(&runtime_sessions) {
+            ui::hint(&note);
+        }
         let discovery = uncaptured(&links, inventory_complete);
         Some((discovery.sessions.into_iter().map(|(runtime, session_id)| {
             serde_json::json!({"runtime": runtime, "session_id": session_id})
@@ -402,6 +467,7 @@ fn structured(args: &Args) -> CmdResult {
         });
     let result = serde_json::json!({
         "schema_version": 1, "cwd": cwd, "selection": selection,
+        "runtime_session": runtime_session_json(&runtime_sessions),
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,

@@ -173,6 +173,22 @@ inventory changes invalidate project labels alongside the other observed details
 Superseded and merge-exploration rows may report their recorded cwd match, but
 their code-origin relationship remains unavailable.
 
+## Runtime session in status
+
+`runtime_session` describes the conversation that runtime session variables name,
+such as `CODEBUDDY_SESSION_ID` or `CLAUDE_CODE_SESSION_ID`. `state` is `none`,
+`detected` or `ambiguous`. `session` is non-null only for `detected` and holds
+`runtime`, `session_id`, `variable`, boolean `managed` and nullable `target`
+(`<owner>/<repo>@<branch>` of an active complete claim). `managed` is true when the
+store holds ownership evidence for the conversation (an agent, branch, baseline or
+archive role); a hook placeholder or a `--link-only` link is not managed.
+`candidates` lists every named conversation; nested runtimes inherit their parent's
+variables, so more than one candidate is reported as `ambiguous` rather than
+resolved. A file-backed runtime
+counts only when its transcript exists; a database-backed runtime is not opened.
+The field is display only: `selection` and every command target still come from
+explicit arguments or `AGIT_SESSION`. Both envelope versions carry it.
+
 ## Shared files and merge transactions in status
 
 `shared_files` contains `items` and `incomplete`. Each item separates `repo`, nullable `branch`,

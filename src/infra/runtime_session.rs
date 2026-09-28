@@ -59,6 +59,55 @@ pub fn has_managed_env() -> bool {
         .is_some()
 }
 
+/// One runtime session variable and the native session it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    /// The environment variable that carries the identity.
+    pub variable: &'static str,
+    pub runtime: &'static str,
+    pub session_id: String,
+}
+
+/// Every distinct session the runtime variables name, in lookup order.
+///
+/// A runtime that keeps its sessions in files must have that transcript on disk, so a variable
+/// holding a deleted id names nothing. A runtime whose sessions live in a database is taken at its
+/// variable's word: opening that database, even read-only, can create WAL coordination files, and
+/// the callers of this function promise to leave native state untouched.
+///
+/// A nested runtime inherits its parent's variables, so more than one entry means the environment
+/// alone does not say which conversation this process belongs to. Callers report that instead of
+/// choosing one; none of them turns an entry into a command target.
+pub fn named() -> Vec<Named> {
+    use crate::adapter::native_snapshot::{self, Limits, Unavailable};
+    let mut named: Vec<Named> = Vec::new();
+    for &(variable, runtime) in ENV_SESSIONS {
+        let Ok(session_id) = std::env::var(variable) else {
+            continue;
+        };
+        if session_id.trim().is_empty()
+            || named
+                .iter()
+                .any(|seen| seen.runtime == runtime && seen.session_id == session_id)
+        {
+            continue;
+        }
+        match native_snapshot::lookup_files_without_database(
+            runtime,
+            &session_id,
+            Limits::default(),
+        ) {
+            Ok(_) | Err(Unavailable::Unsupported) => named.push(Named {
+                variable,
+                runtime,
+                session_id,
+            }),
+            Err(_) => {}
+        }
+    }
+    named
+}
+
 /// The runtime session in the current process environment that resolves to a real transcript.
 ///
 /// A stale environment variable with no transcript is not a live session. The store is read

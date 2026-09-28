@@ -149,9 +149,9 @@ pub fn check_audit_environment() -> crate::Result<()> {
 }
 
 pub fn run(mut args: Args) -> CmdResult {
-    if args.audit && !ui::prompt::interactive() {
+    if args.audit && !ui::prompt::can_ask() {
         ui::error(
-            "push --audit requires an interactive terminal for review and final confirmation",
+            "push --audit requires a person at an interactive terminal (not an agent session) for review and final confirmation",
         );
         return Ok(ExitCode::Interactive);
     }
@@ -217,7 +217,7 @@ pub fn run(mut args: Args) -> CmdResult {
     };
 
     let Some(checkout) = pick_checkout(&me, want_owner.as_deref(), &agent)? else {
-        return Ok(if ui::prompt::interactive() {
+        return Ok(if ui::prompt::can_ask() {
             ExitCode::Ref
         } else {
             ExitCode::Interactive

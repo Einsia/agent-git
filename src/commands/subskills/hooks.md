@@ -22,7 +22,7 @@ agit hooks settle < hook.json    # Stop
 
 | Subcommand | Event | Meaning |
 |---|---|---|
-| `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` claims that branch; `resume`, `clear`, and Claude `fork` register unmanaged sessions for explicit adoption; `compact` leaves the binding alone. Existing bindings win over inherited environment values. Both runtimes receive the explicit destination or adoption guidance. Claude gets a default title only when its payload has no title, on events that support titles. |
+| `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` claims that branch; `resume`, `clear`, and Claude `fork` register unmanaged sessions for explicit adoption; `compact` leaves the binding alone. Existing bindings win over inherited environment values. Claude Code, Codex and WorkBuddy receive the native session ID with the explicit destination and its `agit commit`/`agit push` commands, or the adoption command. Claude gets a default title only when its payload has no title, on events that support titles. |
 | `settle` | Stop | Settle the turn that just ended. The target branch is resolved from the payload's `session_id` through the store link — **never from the environment**. A session that was never adopted is not settled. |
 
 ## Options
@@ -34,7 +34,7 @@ agit hooks settle < hook.json    # Stop
 
 ## Notes
 
-Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful SessionStart returns one structured hook response; Codex receives context without Claude's title field. A user's existing title survives resume. Claude ignores titles on `clear`, so that event only receives context. Compact and unknown entry events stay silent. To turn automatic settlement off:
+Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful SessionStart returns one structured hook response; Codex and WorkBuddy receive context without Claude's title field. A user's existing title survives resume. Claude ignores titles on `clear`, so that event only receives context. Compact and unknown entry events stay silent. To turn automatic settlement off:
 
 ```bash
 agit config commit.auto false

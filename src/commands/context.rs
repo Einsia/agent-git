@@ -175,6 +175,105 @@ fn from_harness_env() -> Option<(Context, bool)> {
     None
 }
 
+/// A conversation the runtime environment names, described for display.
+///
+/// Ordinary commands never take their target from it: a nested runtime inherits its parent's
+/// variables and a switched session keeps a stale value. It exists so an agent can tell which
+/// listed session is its own conversation, and what that conversation is already saved to.
+#[derive(Debug, Clone)]
+pub struct RuntimeSession {
+    pub variable: &'static str,
+    pub runtime: &'static str,
+    pub session_id: String,
+    /// The store holds ownership evidence for this conversation (an agent, branch, baseline or
+    /// archive role), complete or not; a hook placeholder or `--link-only` link is not managed.
+    pub managed: bool,
+    /// `<owner>/<repo>@<branch>` of an active complete claim; `agit commit` accepts it verbatim.
+    pub target: Option<String>,
+}
+
+impl RuntimeSession {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "runtime": self.runtime, "session_id": self.session_id, "variable": self.variable,
+            "managed": self.managed, "target": self.target,
+        })
+    }
+}
+
+/// Describe every conversation the runtime variables name, reading the store without creating it.
+pub fn runtime_sessions() -> Vec<RuntimeSession> {
+    let store = crate::domain::store::Store::open().ok().flatten();
+    crate::infra::runtime_session::named()
+        .into_iter()
+        .map(|named| {
+            let claim = store
+                .as_ref()
+                .and_then(|store| link::get(store, named.runtime, &named.session_id));
+            let target = claim
+                .as_ref()
+                .filter(|claim| claim.is_active())
+                .and_then(|claim| {
+                    Some(format!(
+                        "{}@{}",
+                        slug_of_link(claim)?,
+                        claim.branch.as_deref()?
+                    ))
+                });
+            RuntimeSession {
+                variable: named.variable,
+                runtime: named.runtime,
+                session_id: named.session_id,
+                managed: claim.as_ref().is_some_and(link::is_managed),
+                target,
+            }
+        })
+        .collect()
+}
+
+/// What an agent needs to hear about its own conversation before it picks from a session list.
+///
+/// A candidate list omits every session that already has a link, so "the only unsaved session"
+/// is easily taken for the current one when the current one is already saved. This names the
+/// current conversation and its next command instead. `None` when the environment names none.
+pub fn runtime_session_note(sessions: &[RuntimeSession]) -> Option<String> {
+    use crate::ui::session::shell_arg;
+    match sessions {
+        [] => None,
+        [one] => Some(match &one.target {
+            Some(target) => format!(
+                "this conversation ({} {}, from {}) is already saved at {target}; save its new turns with `agit commit {quoted}` and publish them with `agit push {quoted}` — do not import another session in its place",
+                one.runtime,
+                one.session_id,
+                one.variable,
+                quoted = shell_arg(target)
+            ),
+            None if one.managed => format!(
+                "this conversation ({} {}, from {}) has an incomplete or superseded claim; inspect it in `agit status` before importing anything",
+                one.runtime, one.session_id, one.variable
+            ),
+            None => format!(
+                "this conversation is {} {} (from {}) and is not saved yet; save it with `agit import {} --from {} --into <owner>/<repo>@<branch>`",
+                one.runtime,
+                one.session_id,
+                one.variable,
+                shell_arg(&one.session_id),
+                one.runtime
+            ),
+        }),
+        many => Some(format!(
+            "the runtime session variables name different conversations ({}); a nested runtime inherits its parent's variables, so name this conversation's native id explicitly",
+            many.iter()
+                .map(|session| format!(
+                    "{}={} ({})",
+                    session.variable, session.session_id, session.runtime
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// Replace `@` with the branch explicitly supplied through `AGIT_SESSION`.
 ///
 /// The resolution layer ([`crate::domain::refs::resolve`]) does not read the environment, so a

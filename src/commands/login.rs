@@ -57,7 +57,7 @@ pub fn run(args: Args) -> CmdResult {
     if !args.with_token
         && args.complete.is_none()
         && !args.device
-        && (super::json::is_capturing() || !ui::prompt::interactive())
+        && (super::json::is_capturing() || !ui::prompt::can_ask())
     {
         return start_browser_handoff(&hub);
     }

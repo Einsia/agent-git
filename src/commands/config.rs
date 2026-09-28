@@ -252,26 +252,74 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// The automatic-push setting a repository receives when it is created.
+pub(super) struct RepoAutoPush {
+    /// A per-repository override; `None` inherits the user preference.
+    pub(super) value: Option<bool>,
+    /// Nobody could be asked, so creation names the inherited preference and its override.
+    unasked: bool,
+}
+
+impl RepoAutoPush {
+    /// A choice made on the command line or in a screen; creation records it without comment.
+    pub(super) fn explicit(value: Option<bool>) -> Self {
+        Self {
+            value,
+            unasked: false,
+        }
+    }
+
+    /// Record the choice on the repository just created as `slug`.
+    ///
+    /// The line about an unasked question is printed here rather than where the question was
+    /// skipped: a refusal between the two creates nothing, and only the final owner names the
+    /// repository that exists.
+    pub(super) fn apply(&self, repo: &crate::domain::repo::Repo, slug: &str) -> crate::Result<()> {
+        if let Some(value) = self.value {
+            return repo.set_auto_push(Some(value));
+        }
+        if self.unasked {
+            // An unreadable user preference must not fail a creation that never asked about it;
+            // settlement reports that preference when it next consults it.
+            let inherited = match config::auto_push_default() {
+                Ok(true) => " (on)",
+                Ok(false) => " (off)",
+                Err(_) => "",
+            };
+            ui::progress(format_args!(
+                "{slug}: automatic push inherits the user preference{inherited}; set it for this repository with `agit config --repo {slug} push.auto <true|false>`"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Ask only at an interactive repository creation boundary; unattended commands inherit.
-pub(super) fn choose_repo_auto_push() -> crate::Result<Option<bool>> {
-    if super::json::requested() || !ui::prompt::interactive() {
-        return Ok(None);
+///
+/// Callers ask before taking branch or link locks: a question that waits for an answer while
+/// holding them stalls every other writer of that session until someone replies. The answer is
+/// applied with [`RepoAutoPush::apply`] once the repository is actually created.
+pub(super) fn choose_repo_auto_push() -> crate::Result<RepoAutoPush> {
+    if !ui::prompt::may_prompt() {
+        return Ok(RepoAutoPush {
+            value: None,
+            unasked: true,
+        });
     }
     let inherited = config::auto_push_default()?;
     let label = format!(
         "Inherit user preference ({})",
         if inherited { "on" } else { "off" }
     );
-    Ok(
-        match ui::prompt::select(
-            "Automatically push settled turns from this repository?",
-            &[&label, "On", "Off"],
-        )? {
-            Some(1) => Some(true),
-            Some(2) => Some(false),
-            _ => None,
-        },
-    )
+    let value = match ui::prompt::select(
+        "Automatically push settled turns from this repository?",
+        &[&label, "On", "Off"],
+    )? {
+        Some(1) => Some(true),
+        Some(2) => Some(false),
+        _ => None,
+    };
+    Ok(RepoAutoPush::explicit(value))
 }
 
 fn structured_entry(operation: &str, key: &str) -> CmdResult {

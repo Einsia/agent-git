@@ -29,7 +29,7 @@ agit push [owner/repo@branch] [options]
 | `--dry-run` | Scan and show the plan without uploading |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
-Visibility is settled once, at first publish. Without `--private` / `--public`, push takes the repo preference recorded by `agit init --private`, then the global `push.visibility` (`public` or `private`; `ask` means ask), and otherwise asks on a TTY (non-interactive runs default to private). `--dry-run` prints which of these applies.
+Visibility is settled once, at first publish. Without `--private` / `--public`, push takes the repo preference recorded by `agit init --private`, then the global `push.visibility` (`public` or `private`; `ask` means ask), and otherwise asks a person at a terminal (non-interactive runs and agent sessions default to private). `--dry-run` prints which of these applies.
 
 A bare `agit push` in a human terminal selects a saved session in the TUI. The
 choice applies only to this invocation. Agent and script callers use a complete

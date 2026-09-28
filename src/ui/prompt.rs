@@ -6,8 +6,8 @@
 //! gets EOF immediately — done wrong, that becomes "silently took the default" or "hangs waiting
 //! for input that never comes".
 //!
-//! So every function checks for a tty first and returns `None` ("cannot ask") when there is
-//! none, leaving the caller to decide what to do. The caller usually raises a "say it explicitly
+//! So every function checks [`can_ask`] first and returns `None` ("cannot ask") when nobody can
+//! answer, leaving the caller to decide what to do. The caller usually raises a "say it explicitly
 //! with `--flag`" error — safer than guessing an answer.
 
 use crate::Result;
@@ -18,8 +18,33 @@ pub(crate) fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// Whether a question drawn now reaches a person who can answer it.
+///
+/// Terminals on stdin and stdout are necessary but not sufficient. An agent's tool shell can run
+/// commands under a pseudo-terminal that nobody types into, and a question there blocks the
+/// command until the tool call times out — while holding whatever locks it holds. So nothing is
+/// asked inside an agent session (`AGIT_SESSION` or any runtime session variable), or when
+/// stderr, where the question is drawn, is not a terminal. Every question in this module passes
+/// through this check, so a call site cannot bring the wait back; a caller that chooses between
+/// an interactive and an unattended flow tests this rather than [`interactive`].
+pub(crate) fn can_ask() -> bool {
+    interactive()
+        && std::io::stderr().is_terminal()
+        && crate::tui::Signals::from_process().agent_session.is_none()
+}
+
+/// Whether a repository-creation or selection question may be asked.
+///
+/// On top of [`can_ask`], nothing is asked when the answer is meant for a program: with `--json`
+/// or under `CI`. A caller that cannot ask takes its documented default and says which, or
+/// refuses and names the flag that answers. `-y` is an answer: a confirmation site honors it
+/// before consulting this, so skipping the question never turns a `-y` into a refusal.
+pub(crate) fn may_prompt() -> bool {
+    can_ask() && std::env::var_os("CI").is_none() && !crate::commands::json::requested()
+}
+
 pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
-    if !interactive() || options.is_empty() {
+    if !can_ask() || options.is_empty() {
         return Ok(None);
     }
     crate::telemetry::observe(crate::telemetry::Observation::Prompt);
@@ -35,7 +60,7 @@ pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
 /// Non-interactive returns None and **not** the default — a dangerous operation with no one to
 /// ask must refuse to run rather than take the default.
 pub fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
-    if !interactive() {
+    if !can_ask() {
         return Ok(None);
     }
     crate::telemetry::observe(crate::telemetry::Observation::Prompt);
@@ -46,7 +71,7 @@ pub fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
 }
 
 pub fn input(prompt: &str, default: Option<&str>) -> Result<Option<String>> {
-    if !interactive() {
+    if !can_ask() {
         return Ok(None);
     }
     // The builder methods take self by value, so this rebinds instead of calling on a mutable
@@ -61,7 +86,7 @@ pub fn input(prompt: &str, default: Option<&str>) -> Result<Option<String>> {
 
 /// Read a password without echoing it.
 pub fn password(prompt: &str) -> Result<Option<String>> {
-    if !interactive() {
+    if !can_ask() {
         return Ok(None);
     }
     crate::telemetry::observe(crate::telemetry::Observation::Prompt);

@@ -190,3 +190,136 @@ fn session_pages_preserve_runtime_identity_namespaces_and_supersession() {
     assert_eq!(last["items"][1]["active"], false);
     assert_eq!(last["items"][1]["superseded_by"], "codex/replacement");
 }
+
+/// A WorkBuddy conversation whose transcript exists and whose claim is saved to
+/// `local/demo@work`; returns its native id.
+fn saved_workbuddy_session(lab: &Lab) -> &'static str {
+    lab.run(&["--json", "init", "demo"]);
+    let id = "wb-00000000-0000-4000-8000-000000000001";
+    let cwd = lab.cwd.canonicalize().unwrap();
+    let project = lab.home.join(".workbuddy-ai/projects/work");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join(format!("{id}.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"message", "id":"u", "sessionId":id, "cwd":cwd,
+                "role":"user", "content":[{"type":"input_text", "text":"Save this"}]})
+        ),
+    )
+    .unwrap();
+    let links = lab.store.join("store/workbuddy");
+    fs::create_dir_all(&links).unwrap();
+    fs::write(
+        links.join(format!("{id}.json")),
+        serde_json::json!({"owner":"local", "agent":"demo", "branch":"work", "cwd":cwd})
+            .to_string(),
+    )
+    .unwrap();
+    id
+}
+
+/// The runtime variable names the conversation, and status reports it with the target its claim
+/// is saved to, while `selection` stays empty: the report is display only. WorkBuddy also exports
+/// a Claude-named variable that resolves to no Claude transcript; counting it would turn one
+/// conversation into a false ambiguity.
+#[test]
+fn status_reports_the_conversation_the_runtime_names_and_its_saved_target() {
+    let lab = Lab::new();
+    let id = saved_workbuddy_session(&lab);
+    let status = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .arg("status")
+            .current_dir(&lab.cwd)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &lab.home)
+            .env("AGIT_HOME", &lab.store)
+            .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("CODEBUDDY_SESSION_ID", id)
+            .env("CLAUDE_SESSION_ID", id)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output
+    };
+    let document: serde_json::Value = serde_json::from_slice(&status(true).stdout).unwrap();
+    let value = &document["result"]["value"];
+    assert!(value["selection"]["repo"].is_null(), "{value}");
+    let runtime = &value["runtime_session"];
+    assert_eq!(runtime["state"], "detected", "{runtime}");
+    assert_eq!(runtime["session"]["runtime"], "workbuddy");
+    assert_eq!(runtime["session"]["session_id"], id);
+    assert_eq!(runtime["session"]["variable"], "CODEBUDDY_SESSION_ID");
+    assert_eq!(runtime["session"]["managed"], true);
+    assert_eq!(runtime["session"]["target"], "local/demo@work");
+    let text = status(false);
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        stderr.contains("`agit commit local/demo@work`")
+            && stderr.contains("`agit push local/demo@work`"),
+        "{stderr}"
+    );
+}
+
+/// An MCP server's environment is fixed when it starts, so the conversation its runtime variable
+/// names can be an earlier one than the caller's. Without an explicit target the commit tool
+/// settles nothing and hands back that conversation's saved target to confirm; an implementation
+/// that settles the environment's target reaches the child `agit commit` and never returns the
+/// refusal asserted here.
+#[test]
+fn mcp_commit_without_a_target_settles_nothing_the_environment_names() {
+    let lab = Lab::new();
+    let id = saved_workbuddy_session(&lab);
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"commit","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"commit","arguments":{"target":null}}}),
+    ];
+    let mut server = Command::new(env!("CARGO_BIN_EXE_agit"))
+        .arg("mcp")
+        .current_dir(&lab.cwd)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &lab.home)
+        .env("AGIT_HOME", &lab.store)
+        .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("CODEBUDDY_SESSION_ID", id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut input = server.stdin.take().unwrap();
+        for request in requests {
+            writeln!(input, "{request}").unwrap();
+        }
+    }
+    let output = server.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let replies: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{text}");
+    for reply in &replies {
+        let result = &reply["result"];
+        assert_eq!(result["isError"], true, "{reply}");
+        assert_eq!(result["content"].as_array().unwrap().len(), 1, "{reply}");
+        let message = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            message.contains("nothing was settled")
+                && message.contains(id)
+                && message.contains("target \"local/demo@work\""),
+            "{message}"
+        );
+    }
+}

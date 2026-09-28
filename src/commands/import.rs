@@ -244,6 +244,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         Pick::One(f) => f,
         Pick::Explained(code) => return Ok(code),
     };
+    let other_conversation = warn_other_conversation(found.runtime, &found.session_id);
 
     // ── 3. The name ──
     //
@@ -475,12 +476,53 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         if args.privacy {
             protect_privacy_copy(&found, landing.repo_dir())?;
         }
-        super::commit::record_at(&store, lk, &agent, &namespace, &owner, landing.repo_dir())
+        super::commit::record_at(
+            &store,
+            lk,
+            &agent,
+            &namespace,
+            &owner,
+            landing.repo_dir(),
+            !other_conversation,
+        )
     })();
     if !matches!(outcome, Ok(ExitCode::Ok)) {
         landing.rollback();
     }
     outcome
+}
+
+/// Warn when an import resolves to a session other than the conversation the environment names,
+/// and report whether it did.
+///
+/// Importing another session is legitimate — a nested runtime, or saving an earlier conversation —
+/// so this never refuses. It names both identities, and the caller then leaves that import out of
+/// automatic pushing: a wrong pick stays local until someone publishes it on purpose. Only
+/// sessions of the imported runtime are compared, by resolved native id: a cross-runtime import
+/// says nothing about which conversation this is, and a selector spelled another way (a prefix, a
+/// thread link) still names the same session.
+fn warn_other_conversation(runtime: &str, session_id: &str) -> bool {
+    let sessions: Vec<_> = super::context::runtime_sessions()
+        .into_iter()
+        .filter(|session| session.runtime == runtime)
+        .collect();
+    if sessions.is_empty()
+        || sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+    {
+        return false;
+    }
+    for session in &sessions {
+        ui::warning(&format!(
+            "this conversation is {runtime} session {} ({}), but this import names {runtime} session {session_id}; continuing with {session_id}",
+            session.session_id, session.variable
+        ));
+    }
+    if let Some(note) = super::context::runtime_session_note(&sessions) {
+        ui::hint(&note);
+    }
+    true
 }
 
 /// Only the actual zero-argument form opens the picker. A flag changes the operation and must not
@@ -937,13 +979,13 @@ pub(super) fn place_legacy_commit_branch(
         return Ok(Placed::Refused(ExitCode::Precondition));
     }
     let preference = if !repo_dir.join(".git").exists() {
-        super::config::choose_repo_auto_push()?
+        Some(super::config::choose_repo_auto_push()?)
     } else {
         None
     };
     let repo = Repo::open_or_init(repo_dir)?;
-    if let Some(value) = preference {
-        repo.set_auto_push(Some(value))?;
+    if let Some(preference) = &preference {
+        preference.apply(&repo, &format!("{owner}/{agent}"))?;
     }
     place_resolved_branch(
         lk,
@@ -995,8 +1037,12 @@ fn place_resolved_branch(
             link::short(&lk.session_id)
         ));
         if std::env::var_os("AGIT_YES").is_none() {
-            match ui::prompt::confirm(&format!("re-claim it from `{prev}` onto `{next}`?"), false)?
-            {
+            let answer = if ui::prompt::may_prompt() {
+                ui::prompt::confirm(&format!("re-claim it from `{prev}` onto `{next}`?"), false)?
+            } else {
+                None
+            };
+            match answer {
                 Some(true) => {}
                 Some(false) => {
                     println!("cancelled.");
@@ -1046,6 +1092,13 @@ fn birth_session_branch(
     accepted: Option<&lineage::Accepted>,
     prepared: Option<&PreparedTarget>,
 ) -> crate::Result<Placed> {
+    let creates_repo =
+        (accepted.is_some() || prepared.is_some()) && !repo_dir.join(".git").exists();
+    let preference = if creates_repo {
+        Some(super::config::choose_repo_auto_push()?)
+    } else {
+        None
+    };
     // Import and materialization both create active branch claims. Serialize their branch/ref and
     // link updates under the same key so a concurrent `run --no-launch` cannot observe an empty
     // destination and install a second writer while this claim is being placed.
@@ -1093,14 +1146,10 @@ fn birth_session_branch(
         }
     }
     let repo = if accepted.is_some() || prepared.is_some() {
-        let preference = if !repo_dir.join(".git").exists() {
-            super::config::choose_repo_auto_push()?
-        } else {
-            None
-        };
+        let fresh = !repo_dir.join(".git").exists();
         let created = Repo::open_or_init(&repo_dir)?;
-        if let Some(value) = preference {
-            created.set_auto_push(Some(value))?;
+        if fresh && let Some(preference) = &preference {
+            preference.apply(&created, &format!("{owner}/{agent}"))?;
         }
         created
     } else {
@@ -1641,6 +1690,9 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
     cands.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
 
     let here = repo.to_string_lossy().to_string();
+    // Sessions that already have a link are left out of the list, the current conversation
+    // included; name it so the remaining candidates are not read as "mine".
+    let current_note = super::context::runtime_session_note(&super::context::runtime_sessions());
 
     if cands.is_empty() {
         println!(
@@ -1650,6 +1702,9 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
                 ui::tilde(&repo)
             ))
         );
+        if let Some(note) = &current_note {
+            ui::hint(note);
+        }
         ui::hint(
             "session ran in another directory? give the id directly: agit import <session-id> --from <runtime> --into <owner/repo>@<branch>",
         );
@@ -1657,12 +1712,8 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
     }
 
     // Before identity selection, an indexed gist is advisory; absent previews do not open native caches.
-    let signals = crate::tui::Signals::from_process();
-    let interactive = signals.interactive
-        && (legacy_preview
-            || (signals.off.is_none()
-                && signals.agent_session.is_none()
-                && std::env::var_os("CI").is_none()));
+    let interactive = ui::prompt::may_prompt()
+        && (legacy_preview || crate::tui::Signals::from_process().off.is_none());
     let labels: Vec<String> = cands
         .iter()
         .map(|(rt, p, id, indexed_gist, _, title)| {
@@ -1689,7 +1740,12 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
         .collect();
 
     if !interactive {
-        ui::error("a session must be selected explicitly; no interactive terminal is available.");
+        ui::error(
+            "a session must be selected explicitly; agit asks only a person at a terminal, never inside an agent session, with --json, -y, -q or --no-tui, or in CI.",
+        );
+        if let Some(note) = &current_note {
+            ui::hint(note);
+        }
         for label in &labels {
             eprintln!("  {label}");
         }
@@ -1709,11 +1765,9 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
             }))
         }
         None => {
-            // Nothing to ask with when non-interactive — list them and let the user be
-            // explicit; never guess.
-            ui::error(
-                "a session must be selected explicitly; no interactive terminal is available.",
-            );
+            // A dismissed picker selects nothing — list them and let the user be explicit;
+            // never guess.
+            ui::error("a session must be selected explicitly; the picker was dismissed.");
             for l in labels.iter().take(12) {
                 println!("  {l}");
             }

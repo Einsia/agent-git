@@ -1437,6 +1437,11 @@ fn settle_local_telemetry_inner(
         }
         return Ok(ExitCode::Precondition);
     }
+    let preference = if !quiet && !repo_dir.join(".git").exists() {
+        Some(super::config::choose_repo_auto_push()?)
+    } else {
+        None
+    };
     let _branch_guard = link::lock_branch(store, slug, branch)?;
     // Target resolution happens before the branch lock. Re-read this exact link after taking it:
     // a concurrent prepare may have superseded or re-routed the claim while commit was waiting.
@@ -1507,14 +1512,9 @@ fn settle_local_telemetry_inner(
         return Ok(ExitCode::Policy);
     }
     let fresh = !repo_dir.join(".git").exists();
-    let preference = if fresh && !quiet {
-        super::config::choose_repo_auto_push()?
-    } else {
-        None
-    };
     let primary = Repo::open_or_init(repo_dir)?;
-    if let Some(value) = preference {
-        primary.set_auto_push(Some(value))?;
+    if fresh && let Some(preference) = &preference {
+        preference.apply(&primary, slug)?;
     }
     let repo = match checkout_for_settlement(&primary, slug, branch)? {
         Ok(repo) => repo,
@@ -3891,10 +3891,13 @@ pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    record_at(store, lk, agent, owner, author, &repo_dir)
+    record_at(store, lk, agent, owner, author, &repo_dir, true)
 }
 
 /// Import settlement uses the repository selected before its adoption writes.
+///
+/// With `automatic_push` false the settlement stays local even when automatic pushing is on, and
+/// one line names the `agit push` that publishes it on purpose.
 pub(super) fn record_at(
     store: &Store,
     lk: Link,
@@ -3902,29 +3905,35 @@ pub(super) fn record_at(
     owner: &str,
     author: &str,
     repo_dir: &Path,
+    automatic_push: bool,
 ) -> CmdResult {
     let branch = lk
         .branch
         .clone()
         .ok_or_else(|| anyhow::anyhow!("the imported session has no explicit branch claim"))?;
     let slug = format!("{owner}/{agent}");
-    settle(
-        store,
-        repo_dir,
-        &slug,
-        &branch,
-        lk,
-        author,
-        SettleOpts {
-            milestone: None,
-            tag: None,
-            code: false,
-            historical: true,
-            message: None,
-            paths: vec![],
-            quiet: false,
-        },
-    )
+    let opts = SettleOpts {
+        milestone: None,
+        tag: None,
+        code: false,
+        historical: true,
+        message: None,
+        paths: vec![],
+        quiet: false,
+    };
+    if automatic_push {
+        return settle(store, repo_dir, &slug, &branch, lk, author, opts);
+    }
+    let result = settle_local(store, repo_dir, &slug, &branch, lk, author, opts);
+    if matches!(result, Ok(ExitCode::Ok)) && Repo::at(repo_dir).auto_push_enabled().unwrap_or(false)
+    {
+        let target = format!("{slug}@{branch}");
+        ui::warning(&format!(
+            "{target} is saved locally and not pushed automatically: this import names a session other than the current conversation; publish it on purpose with `agit push {}`",
+            ui::session::shell_arg(&target)
+        ));
+    }
+    result
 }
 
 #[cfg(test)]

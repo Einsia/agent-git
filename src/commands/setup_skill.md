@@ -56,6 +56,19 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
 - Machine output disables terminal pickers. Supply required targets and options;
   runtime-launching commands require `--no-launch` with `--json`. `--yes` only
   answers confirmation prompts and never selects a session identity.
+- agit never waits for an answer inside an agent session, even under a
+  pseudo-terminal: a question it cannot ask takes its documented default and
+  prints which, or fails with the flag that answers it. Create a repo from an
+  agent with an explicit publishing choice: `agit init <name> --auto-push=false`
+  (or `=true`). The `=` is required; `--auto-push false` is refused. Automatic
+  pushing needs an account: signed out, `--auto-push=true` prints a login link
+  for the human and stops before creating anything. A first `agit push` without
+  `--public` or `--private` publishes private when nobody can be asked.
+- Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
+  are released when the process holding them exits, and deleting a lock file lets
+  two writers in at once. `was already adopted` is informational; the import
+  continues. If a lock error persists, look for a still-running `agit` or `git`
+  process and report it to the user.
 - Search prior work with `agit search "question" --repo owner/name --json`.
   Repeat `--query` to batch related searches with shared filters. Read
   `references/commands/search.md` for pagination, limits, and uncertainty fields.
@@ -95,7 +108,11 @@ When the user asks to upload, save, or adopt the current conversation and its na
 agit status --check-missing
 ```
 
-This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet. The current transcript may already be adopted even when `AGIT_SESSION` is absent. Match its native session ID from the runtime or hook against the reported metadata; never choose by recency alone. When the user asks to upload, save, or adopt the current session, explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
+This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet. The current transcript may already be adopted even when `AGIT_SESSION` is absent. Match its native session ID from the runtime or hook against the reported metadata; never choose by recency alone.
+
+Status also reports the conversation the runtime names (`runtime_session` in JSON): its runtime, native ID, the variable it came from, and the target it is already saved to. It is display only and never selects a command target. In WorkBuddy the current native ID is `$CODEBUDDY_SESSION_ID`; in Claude Code it is `$CLAUDE_CODE_SESSION_ID`. When the current conversation is already saved, do not import anything: save its new turns with `agit commit <owner/repo>@<branch>` using the reported target, then publish with `agit push <owner/repo>@<branch>`. Candidate lists leave out every saved session, the current one included, so never import a different session because it is the only unsaved candidate. An import that names another session of the same runtime prints a warning with both IDs and is not pushed automatically; recheck the ID before publishing it with `agit push`. When the variables name several conversations (a nested runtime), ask the user which one to save.
+
+When the user asks to upload, save, or adopt the current session and it is not saved yet, explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
 
 ```bash
 agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
@@ -113,7 +130,7 @@ session and records its claim; it is not a read-only preview.
 
 | Goal | Command | Result |
 |---|---|---|
-| Create the first Agent repo | `agit init <name>` | Creates the local repo and `main`, optionally binding the directory |
+| Create the first Agent repo | `agit init <name> --auto-push=<true\|false>` | Creates the local repo and `main`, optionally binding the directory; omitting `--auto-push` inherits the user preference |
 | Start an empty session in an existing repo | `agit new <owner/repo> -b <branch>` | Creates a real session branch and starts a runtime |
 | Import an existing Codex/Claude conversation | `agit import <runtime-id> --from <runtime> --repo <owner/repo> -b <branch>` | Chooses lineage, then adopts and settles the transcript |
 | Open a line from an old point | `agit fork <source> -b <branch>` | Creates a branch; add `--resume` to start it |

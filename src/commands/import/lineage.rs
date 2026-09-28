@@ -359,13 +359,11 @@ pub(super) fn choose(args: &mut Args, json: bool) -> crate::Result<Decision> {
         return Ok(Decision::Stop(ExitCode::Ref));
     };
     prepared.report.operation = "choice_required";
-    let signals = crate::tui::Signals::from_process();
-    let may_prompt = !json
-        && signals.interactive
-        && signals.off.is_none()
-        && signals.agent_session.is_none()
-        && std::env::var_os("CI").is_none();
-    if !may_prompt || prepared.snapshot.is_none() {
+    if json
+        || !ui::prompt::may_prompt()
+        || crate::tui::Signals::from_process().off.is_some()
+        || prepared.snapshot.is_none()
+    {
         for action in prepared
             .report
             .candidates

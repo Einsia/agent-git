@@ -379,7 +379,10 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
 /// The SessionStart response the runtime may show or add to the conversation.
 ///
 /// Titles are defaults: a runtime title supplied by the user must survive resuming. Claude
-/// ignores titles on clear, while Codex has no title field. Both accept binding context.
+/// ignores titles on clear, while Codex and WorkBuddy take no title from this response. All three
+/// accept binding context. The context names the native session id: a runtime that exports no
+/// session variable to its tool shell leaves the agent no other way to learn which conversation
+/// it is, and an agent that cannot tell imports whichever session looks unsaved.
 fn session_annotation(
     runtime: &str,
     source: Source,
@@ -396,8 +399,9 @@ fn session_annotation(
 
     let additional_context = match binding {
         Some(binding) => format!(
-            "This session is already under agit version control at {}. Use that explicit repo and branch for session commands; a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again.",
-            sh_quote(binding)
+            "This {runtime} session ({}) is already under agit version control at {binding}. Save its new turns with `agit commit {quoted}` and publish them with `agit push {quoted}`; use that explicit repo and branch for session commands, since a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again, and do not import another session in its place.",
+            sh_quote(session_id),
+            quoted = sh_quote(binding)
         ),
         None => format!(
             "This runtime session has no active agit branch. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import {} --from {runtime} --into <owner/repo>@<branch>`.",
@@ -407,7 +411,7 @@ fn session_annotation(
     if runtime == "openclaw" {
         return Some(serde_json::json!({"context":additional_context}));
     }
-    if !matches!(runtime, "claude-code" | "codex") {
+    if !matches!(runtime, "claude-code" | "codex" | "workbuddy") {
         return None;
     }
 
@@ -829,6 +833,30 @@ mod tests {
         );
         assert!(
             super::session_annotation("cursor", Source::Startup, "SID-A", None, None).is_none()
+        );
+    }
+
+    /// WorkBuddy consumes the Claude-compatible `hookSpecificOutput` envelope. Its context must
+    /// name the native session id and the saved target's commands, and carry no title field;
+    /// leaving WorkBuddy out of the envelope, or dropping the id, fails here.
+    #[test]
+    fn a_workbuddy_session_learns_its_native_id_and_target() {
+        let response = super::session_annotation(
+            "workbuddy",
+            Source::Startup,
+            "SID-W",
+            Some("einsia/payments@work"),
+            None,
+        )
+        .unwrap();
+        let output = &response["hookSpecificOutput"];
+        assert_eq!(output["hookEventName"], "SessionStart");
+        assert!(output.get("sessionTitle").is_none());
+        let context = output["additionalContext"].as_str().unwrap();
+        assert!(context.contains("'SID-W'"), "{context}");
+        assert!(
+            context.contains("agit commit 'einsia/payments@work'"),
+            "{context}"
         );
     }
 

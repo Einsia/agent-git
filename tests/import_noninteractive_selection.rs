@@ -694,6 +694,81 @@ fn an_explicit_native_id_still_selects_only_that_transcript() {
     assert!(!stdout.contains("SYNTHETIC-CANDIDATE-0"), "{stdout}");
 }
 
+/// Importing a session other than the one the runtime variable names is allowed — nested runtimes
+/// and earlier conversations are legitimate — but it is never silent: a JSON warning names both
+/// identities, and with automatic pushing on that import stays local. Importing the conversation
+/// the variable names carries no warning and pushes as usual. A guard that refuses fails the first
+/// import; one that warns whenever a variable is set, or compares nothing, fails the second; one
+/// that only warns lets the first import reach the automatic push.
+#[test]
+fn importing_another_session_than_the_current_one_warns_with_both_ids() {
+    let lab = Lab::new(2);
+    let (current, other) = (&lab.sources[0].0, &lab.sources[1].0);
+    let configured = lab
+        .command()
+        .args(["config", "push.auto", "true"])
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    let import = |session: &str, branch: &str| {
+        let output = lab
+            .command()
+            .env("CLAUDE_CODE_SESSION_ID", current)
+            .args([
+                "--json",
+                "import",
+                session,
+                "--from",
+                "claude-code",
+                "--into",
+                &format!("me/qa@{branch}"),
+                "--independent",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["diagnostics"]["stderr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["level"] == "warning")
+            .filter_map(|row| row["message"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let names_both =
+        |message: &String| message.contains(current.as_str()) && message.contains(other.as_str());
+
+    let warnings = import(other, "work");
+    assert!(warnings.iter().any(names_both), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("not pushed automatically")),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|message| message.contains("automatic push failed")),
+        "{warnings:?}"
+    );
+    assert!(
+        lab.store
+            .join(format!("store/claude-code/{other}.json"))
+            .exists()
+    );
+
+    let warnings = import(current, "own");
+    assert!(!warnings.iter().any(names_both), "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("automatic push failed")),
+        "{warnings:?}"
+    );
+}
+
 #[test]
 fn a_link_only_retry_preserves_its_mode_without_inventing_a_target() {
     let lab = Lab::new(1);

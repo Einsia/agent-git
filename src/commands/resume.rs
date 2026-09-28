@@ -611,7 +611,7 @@ fn cwd_resume_decision(
         return Ok(CwdResumeDecision::Continue);
     }
 
-    if !ui::prompt::interactive() {
+    if !ui::prompt::can_ask() {
         return Err(super::InteractionRequired(
             "the resume cwd requires an explicit decision:\n  - continue anyway (--yes)\n  - continue and inject an environment notice (interactive terminal)\n  - cancel\nrerun from a terminal to choose, or pass --yes to continue without an environment notice"
                 .to_owned(),
@@ -1337,7 +1337,7 @@ fn confirm_conversion(from: &str, to: &str) -> crate::Result<()> {
             "  kept: messages, tool calls; arguments and paired outputs when recoverable from the source transcript, thinking (best effort)"
         );
         println!("  lost: encrypted reasoning, vendor encodings, compact boundaries");
-        if ui::is_tty() && std::env::var("AGIT_YES").is_err() {
+        if ui::prompt::can_ask() && std::env::var("AGIT_YES").is_err() {
             match ui::prompt::confirm("proceed?", false)? {
                 Some(true) => {}
                 _ => {

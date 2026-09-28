@@ -71,8 +71,23 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
-    // Name: an explicit argument > under a tty, the directory name as a suggestion that is
-    // retyped to confirm > an error without a tty.
+    if let Some(word) = bare_auto_push_value(&std::env::args_os().collect::<Vec<_>>())
+        && args.name.as_deref() == Some(word.as_str())
+    {
+        let value = if matches!(word.to_ascii_lowercase().as_str(), "true" | "on" | "yes") {
+            "true"
+        } else {
+            "false"
+        };
+        ui::error(&format!(
+            "`--auto-push {word}` would name the repository `{word}` and turn automatic pushing on; the value must be attached with `=`."
+        ));
+        ui::hint(&format!("write `agit init <name> --auto-push={value}`"));
+        return Ok(ExitCode::Usage);
+    }
+
+    // Name: an explicit argument > when a person can be asked, the directory name as a suggestion
+    // that is retyped to confirm > an error otherwise.
     let name = match args.name {
         Some(n) => match repo::valid_name(&n) {
             Ok(()) => n,
@@ -86,10 +101,15 @@ pub fn run(args: Args) -> CmdResult {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            match ui::prompt::input(&format!("repo name (suggestion: {suggestion})"), None) {
+            let typed = if ui::prompt::may_prompt() {
+                ui::prompt::input(&format!("repo name (suggestion: {suggestion})"), None)
+            } else {
+                Ok(None)
+            };
+            match typed {
                 Ok(Some(n)) if !n.trim().is_empty() => n.trim().to_string(),
                 _ => {
-                    ui::error("a name is required without a TTY.");
+                    ui::error("a repository name is required when agit cannot ask for one.");
                     ui::hint(&format!("e.g. `agit init {suggestion}`"));
                     return Ok(ExitCode::Interactive);
                 }
@@ -97,14 +117,19 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    if !preference_chosen {
-        args.auto_push = super::config::choose_repo_auto_push()?;
-    }
     let existing_owner =
         crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
-    let auto_push = match args.auto_push {
+    // An existing checkout already carries its setting, so the question belongs only to a
+    // repository this command creates.
+    let existing = Repo::open(crate::infra::config::repo_dir(&existing_owner, &name)?);
+    let preference = if preference_chosen || existing.is_some() {
+        super::config::RepoAutoPush::explicit(args.auto_push)
+    } else {
+        super::config::choose_repo_auto_push()?
+    };
+    let auto_push = match preference.value {
         Some(value) => value,
-        None => match Repo::open(crate::infra::config::repo_dir(&existing_owner, &name)?) {
+        None => match &existing {
             Some(repo) => repo.auto_push_enabled()?,
             None => crate::infra::config::auto_push_default()?,
         },
@@ -118,6 +143,9 @@ pub fn run(args: Args) -> CmdResult {
             complete: None,
         })?;
         if result != ExitCode::Ok {
+            ui::hint(&format!(
+                "once signed in, run this `agit init` again; to create it without automatic pushing: `agit init {name} --auto-push=false`"
+            ));
             return Ok(result);
         }
     }
@@ -175,9 +203,7 @@ pub fn run(args: Args) -> CmdResult {
         }
         None => Repo::init(&dir)?,
     };
-    if let Some(preference) = args.auto_push {
-        repo.set_auto_push(Some(preference))?;
-    }
+    preference.apply(&repo, &format!("{owner}/{name}"))?;
     scaffold(repo.root())?;
 
     let seeded = if let Some(picked) = args.seed_assets.as_deref() {
@@ -217,6 +243,25 @@ pub fn run(args: Args) -> CmdResult {
         ));
     }
     Ok(ExitCode::Ok)
+}
+
+/// The word right after a bare `--auto-push`, when it reads as a boolean.
+///
+/// `--auto-push` takes its value only with `=`, so `agit init --auto-push false` parses as the
+/// repository name `false` with automatic pushing on — the opposite of what was typed. The caller
+/// refuses that parse instead of creating the repository.
+fn bare_auto_push_value(argv: &[std::ffi::OsString]) -> Option<String> {
+    let arguments = argv.iter().take_while(|argument| *argument != "--");
+    let next = argv.iter().skip(1);
+    arguments.zip(next).find_map(|(flag, word)| {
+        let word = word.to_str()?;
+        (flag == "--auto-push"
+            && matches!(
+                word.to_ascii_lowercase().as_str(),
+                "true" | "false" | "on" | "off" | "yes" | "no"
+            ))
+        .then(|| word.to_owned())
+    })
 }
 
 /// The wizard represents only the zero-argument command. Flags keep their existing command-line
@@ -381,7 +426,10 @@ fn seed_policy(tty: bool, yes: bool) -> Seed {
 }
 
 fn pick_assets(found: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
-    let policy = seed_policy(ui::is_tty(), std::env::var_os("AGIT_YES").is_some());
+    let policy = seed_policy(
+        ui::prompt::can_ask(),
+        std::env::var_os("AGIT_YES").is_some(),
+    );
     if policy != Seed::AskEach {
         let take = policy == Seed::All;
         for (dst, src) in found {

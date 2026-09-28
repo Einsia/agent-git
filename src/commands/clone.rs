@@ -96,7 +96,6 @@ use crate::infra::config;
 use crate::{ExitCode, ui};
 use anyhow::Context;
 use clap::Args as ClapArgs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
@@ -165,9 +164,7 @@ pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     let repo = Repo::at(&dest);
     repo.set_remote(&a.clone_url)?;
     super::migration::finish_external_history_update(&repo, history_update)?;
-    if let Some(value) = super::config::choose_repo_auto_push()? {
-        repo.set_auto_push(Some(value))?;
-    }
+    super::config::choose_repo_auto_push()?.apply(&repo, &format!("{owner}/{name}"))?;
     Ok(repo)
 }
 
@@ -333,12 +330,13 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // four candidates — an ambiguity created out of nowhere.
     if plan.promoted_in_place {
         let preference = match args.auto_push {
-            Some(value) => Some(value),
+            Some(value) => super::config::RepoAutoPush::explicit(Some(value)),
             None => super::config::choose_repo_auto_push()?,
         };
-        if let Some(value) = preference {
-            Repo::at(config::repo_dir(&owner, &name)?).set_auto_push(Some(value))?;
-        }
+        preference.apply(
+            &Repo::at(config::repo_dir(&owner, &name)?),
+            &format!("{owner}/{name}"),
+        )?;
         progress.line(format_args!(
             "{}",
             ui::dim(&format!(
@@ -436,8 +434,8 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
 
     if let Some(value) = args.auto_push {
         store.set_auto_push(Some(value))?;
-    } else if !existed && let Some(value) = super::config::choose_repo_auto_push()? {
-        store.set_auto_push(Some(value))?;
+    } else if !existed {
+        super::config::choose_repo_auto_push()?.apply(&store, &format!("{owner}/{name}"))?;
     }
 
     // ── 4. Local branches ──
@@ -1247,7 +1245,7 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Selection> {
 
 /// Let the user pick when there are several candidates.
 fn pick(candidates: &[RemoteAgent]) -> crate::Result<Selection> {
-    if !std::io::stdin().is_terminal() || !ui::is_tty() {
+    if !ui::prompt::can_ask() {
         ui::error("multiple candidates and nothing interactive to ask with.");
         for a in candidates {
             eprintln!("  {}", a.slug());

@@ -181,7 +181,7 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
     } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {
         ExitCode::Ref
     } else if error.is::<crate::domain::refs::Ambiguous>() {
-        if crate::ui::prompt::interactive() {
+        if crate::ui::prompt::can_ask() {
             ExitCode::Ref
         } else {
             ExitCode::Interactive

@@ -158,7 +158,7 @@ fn run_setup(mut args: Args) -> CmdResult {
         super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;
     } else if all
         && !super::json::requested()
-        && ui::prompt::interactive()
+        && ui::prompt::can_ask()
         && !crate::telemetry::state::positive("AGIT_YES")
     {
         let current = crate::infra::config::auto_push_default()?;

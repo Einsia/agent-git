@@ -233,6 +233,33 @@ fn list_at(root: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
     Ok(sessions)
 }
 
+/// Label human-facing choices with the desktop app's session titles; transcripts carry none.
+///
+/// `workbuddy.db` is the desktop app's private metadata and is absent for sessions the CLI
+/// started, so a missing database, a changed schema or a busy lock leaves titles unset rather than
+/// failing discovery. The connection is read-only.
+fn apply_titles(root: &Path, sessions: &mut [SessionRef]) {
+    let _ = read_titles(&root.join("workbuddy.db"), sessions);
+}
+
+fn read_titles(path: &Path, sessions: &mut [SessionRef]) -> Result<()> {
+    use rusqlite::OptionalExtension as _;
+    if sessions.is_empty() || !path.is_file() {
+        return Ok(());
+    }
+    let connection = super::sqlite_native::open(path, Default::default())?;
+    let mut statement = connection
+        .prepare("SELECT COALESCE(NULLIF(custom_title, ''), title) FROM sessions WHERE id = ?1")?;
+    for session in sessions.iter_mut() {
+        let title: Option<String> = statement
+            .query_row([&session.id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        session.title = title.as_deref().and_then(super::codex_titles::preview);
+    }
+    Ok(())
+}
+
 fn install_at(root: &Path, content: &str, id: &str, cwd: &Path) -> Result<PathBuf> {
     validate_id(id)?;
     let content = WorkBuddy.localize(content, id, cwd)?;
@@ -317,6 +344,12 @@ impl Adapter for WorkBuddy {
     }
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         list_at(&home()?, Some(repo))
+    }
+    fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
+        let root = home()?;
+        let mut sessions = list_at(&root, Some(repo))?;
+        apply_titles(&root, &mut sessions);
+        Ok(sessions)
     }
     fn all_sessions(&self) -> Result<Vec<SessionRef>> {
         list_at(&home()?, None)
@@ -520,6 +553,41 @@ mod tests {
             session.events.last().unwrap().text.as_deref(),
             Some("Continue")
         );
+    }
+
+    /// A desktop title labels its candidate, a custom title wins over the generated one, and a
+    /// session missing from the desktop table stays untitled. An implementation that reads only
+    /// `title`, or that fails the listing on a missing row, is caught here.
+    #[test]
+    fn choices_carry_desktop_titles_and_tolerate_missing_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("projects").join("workspace");
+        std::fs::create_dir_all(&project).unwrap();
+        for id in ["titled", "renamed", "cli-only"] {
+            std::fs::write(project.join(format!("{id}.jsonl")), RAW).unwrap();
+        }
+        let database = rusqlite::Connection::open(root.path().join("workbuddy.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, title TEXT, custom_title TEXT);
+                 INSERT INTO sessions VALUES ('titled', '/workspace', 'Install AgentGit', NULL);
+                 INSERT INTO sessions VALUES ('renamed', '/workspace', 'Generated', 'ID card guide');",
+            )
+            .unwrap();
+        drop(database);
+        let mut sessions = list_at(root.path(), None).unwrap();
+        apply_titles(root.path(), &mut sessions);
+        let title = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap()
+                .title
+                .clone()
+        };
+        assert_eq!(title("titled").as_deref(), Some("Install AgentGit"));
+        assert_eq!(title("renamed").as_deref(), Some("ID card guide"));
+        assert_eq!(title("cli-only"), None);
     }
 
     #[test]
