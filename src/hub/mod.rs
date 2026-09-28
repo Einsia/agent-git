@@ -27,6 +27,8 @@ pub mod git;
 /// The repo-local, immutable pin of the remote identity.
 pub mod identity;
 mod json_response;
+/// Session reuse receipts that `agit run` sends when it starts from a session.
+pub mod reuse;
 pub(crate) mod transport;
 
 pub use client::Client;

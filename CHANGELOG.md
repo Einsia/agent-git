@@ -8,6 +8,24 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Changed
+
+- **Session reuse and invitation counts on the Hub.** When `agit run` continues
+  a session line or forks from a point on one, it sends the Hub one receipt
+  naming the repository, the source session ID and commit, whether the run
+  continues or forks, and the per-process operation ID, so the Hub can count
+  how often sessions are picked up. A continue is reported once the session is
+  ready to launch, a fork once its branch exists, and a `--mine` fork to the
+  repository it copied. The receipt is sent in the background only for
+  checkouts of the configured Hub, only from a settled session, and never with
+  renewed credentials: an expired sign-in sends nothing. A Hub that is
+  unreachable or refuses it never changes the run's output or exit code.
+  `agit fork` and `agit resume` stay offline.
+  `agit repo invite <owner/repo>@<branch>` also tells the Hub which session its
+  link opens. The download attribution headers still carry no arguments or
+  names. See
+  [Session reuse and invitations](docs/telemetry.md#session-reuse-and-invitations).
+
 ## [0.2.12] - 2026-09-28
 
 ### Fixed

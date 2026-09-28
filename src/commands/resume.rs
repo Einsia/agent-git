@@ -73,6 +73,13 @@ pub struct Resumed {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    run_when_ready(args, || ())
+}
+
+/// [`run`], calling `ready` once every precondition has passed and the session is about to be
+/// printed or launched; what `ready` returns is kept until the launch returns. A refused or
+/// cancelled resume never calls it.
+pub(crate) fn run_when_ready<T>(args: Args, ready: impl FnOnce() -> T) -> CmdResult {
     let cwd_now = std::env::current_dir()?;
 
     // No argument + someone sitting at a terminal = hand over to the resident Sessions screen.
@@ -116,7 +123,10 @@ pub fn run(args: Args) -> CmdResult {
         })
         .unwrap_or(super::echo::Source::Interactive);
     match resume_branch_for(&repo, &slug, &branch, &args, None, Some(source))? {
-        Some(res) => finish(res, args.no_launch),
+        Some(res) => {
+            let _ready = ready();
+            finish(res, args.no_launch)
+        }
         None => Ok(ExitCode::Precondition),
     }
 }

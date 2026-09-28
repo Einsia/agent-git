@@ -336,6 +336,38 @@ fn run_mine_echoes_the_promoted_source_before_output_and_keeps_promotion_diagnos
     assert_eq!(claims[0].source, "claude-code");
 }
 
+/// The fork `--mine` makes in the caller's copy is reported to the repository it was copied
+/// from, which holds the same session and commit. Reported to the copy, the Hub would see the
+/// caller reusing their own repository and never count it.
+#[test]
+fn run_mine_reports_the_reuse_to_the_source_repository() {
+    let lab = Lab::new();
+    lab.run(&[
+        "run",
+        "alice/qa@work",
+        "--mine",
+        "-b",
+        "continued",
+        "--no-launch",
+    ]);
+    let receipts: Vec<String> = lab
+        .hub
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|route| route.ends_with("/reuses"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        receipts,
+        [format!(
+            "POST /api/agents/alice/qa/sessions/agit-{}/reuses",
+            "a".repeat(40)
+        )]
+    );
+}
+
 #[test]
 fn standalone_clone_keeps_promotion_progress_on_stdout() {
     let lab = Lab::new();

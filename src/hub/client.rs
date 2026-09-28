@@ -236,6 +236,21 @@ impl Client {
         client
     }
 
+    /// [`Self::from_env_without_refresh`] for a request that must speak for the signed-in
+    /// account or not be sent at all.
+    ///
+    /// `None` when the saved access token has expired: without a renewal the Hub refuses the
+    /// token, and sending the request without it would attribute the account's own work to
+    /// nobody. Signed out, the client is anonymous as usual.
+    pub(crate) fn from_env_with_live_access(timeout: Duration) -> Option<Client> {
+        let mut client = Self::from_env_with_timeout(timeout);
+        if client.access_expired() {
+            return None;
+        }
+        *client.cred.get_mut() = None;
+        Some(client)
+    }
+
     /// A named hub plus a whole credential: requests carry its access token, and a 401 renews
     /// with its own refresh token and stores the new pair back under **its** hub.
     pub fn for_credential(hub: &str, cred: &credentials::HubCredential) -> Client {
@@ -585,19 +600,7 @@ impl Client {
     }
 
     fn delete_inner(&self, path: &str, expected_agent_id: Option<&str>) -> Result<()> {
-        crate::telemetry::allow_uploads();
-        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
-            self.delete_inner_telemetry_inner(path, expected_agent_id)
-        })
-    }
-
-    fn delete_inner_telemetry_inner(
-        &self,
-        path: &str,
-        expected_agent_id: Option<&str>,
-    ) -> Result<()> {
-        self.ensure_destination()?;
-        let send = |token: Option<&str>| {
+        self.send_expecting_success(path, |token| {
             let mut req = self.agent.delete(self.url(path));
             if let Some(expected_agent_id) = expected_agent_id {
                 req = req.header(super::identity::EXPECTED_AGENT_ID_HEADER, expected_agent_id);
@@ -606,7 +609,38 @@ impl Client {
                 req = req.header("Authorization", &format!("Bearer {token}"));
             }
             req.call()
-        };
+        })
+    }
+
+    /// A POST whose success carries no body (`204 No Content`), which [`Self::post`] would fail
+    /// to decode as JSON.
+    fn post_expecting_success<B: serde::Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        self.send_expecting_success(path, |token| {
+            let mut req = self.agent.post(self.url(path));
+            if let Some(token) = token {
+                req = req.header("Authorization", &format!("Bearer {token}"));
+            }
+            req.send_json(body)
+        })
+    }
+
+    /// A request that only cares whether it succeeded. A 401 renews the token once and retries,
+    /// like [`Self::with_retry`].
+    fn send_expecting_success<F>(&self, path: &str, send: F) -> Result<()>
+    where
+        F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    {
+        crate::telemetry::allow_uploads();
+        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+            self.send_expecting_success_telemetry_inner(path, send)
+        })
+    }
+
+    fn send_expecting_success_telemetry_inner<F>(&self, path: &str, send: F) -> Result<()>
+    where
+        F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    {
+        self.ensure_destination()?;
         let mut resp = {
             let token = self.token.borrow();
             send(token.as_deref())
@@ -819,19 +853,35 @@ impl Client {
     }
 
     /// Mint an invitation link (owners only; anyone else gets the same 404 as a missing repo).
+    ///
+    /// `session_id` is the session the link opens, when it opens one; the Hub counts the
+    /// invitation against that session. A Hub that does not know the field ignores it.
     pub fn create_invitation(
         &self,
         owner: &str,
         name: &str,
         role: &str,
         expected_agent_id: &str,
+        session_id: Option<&str>,
     ) -> Result<super::CreatedInvitation> {
         self.post(
             &format!("api/agents/{owner}/{name}/invitations"),
-            &serde_json::json!({
-                "role": role,
-                "expected_agent_id": expected_agent_id,
-            }),
+            &invitation_request(role, expected_agent_id, session_id),
+        )
+    }
+
+    /// Record that this process starts work from a session: `receipt` names the repository,
+    /// the source session and commit, and whether the work continues that line or forks it.
+    /// The Hub decides whether the caller reuses someone else's session.
+    pub fn record_session_reuse(&self, receipt: &super::reuse::SessionReuse) -> Result<()> {
+        self.post_expecting_success(
+            &format!(
+                "api/agents/{}/{}/sessions/{}/reuses",
+                receipt.owner(),
+                receipt.name(),
+                receipt.session_id()
+            ),
+            &session_reuse_request(receipt, super::git::operation_id()),
         )
     }
 
@@ -1152,6 +1202,35 @@ impl Client {
     pub fn search_counts(&self, query: &str) -> Result<SearchCounts> {
         self.get(&format!("api/search/counts?q={}", urlencode(query)))
     }
+}
+
+/// `session_id` is left out rather than sent as null when the link opens no session, so the
+/// body of a repository invitation stays what every Hub already accepts.
+fn invitation_request(
+    role: &str,
+    expected_agent_id: &str,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "role": role,
+        "expected_agent_id": expected_agent_id,
+    });
+    if let Some(session_id) = session_id {
+        body["session_id"] = serde_json::json!(session_id);
+    }
+    body
+}
+
+/// The operation id lets the Hub record one receipt per invocation however often it arrives.
+fn session_reuse_request(
+    receipt: &super::reuse::SessionReuse,
+    operation_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mode": receipt.mode().as_str(),
+        "commit": receipt.commit(),
+        "operation_id": operation_id,
+    })
 }
 
 fn clone_agent_request(as_name: Option<&str>, expected_source_agent_id: &str) -> serde_json::Value {
@@ -2102,6 +2181,39 @@ mod tests {
         assert_eq!(hub.join().unwrap().len(), 1);
     }
 
+    /// A client for a request that may be cut off at exit never spends the refresh token: with
+    /// an expired access token there is no client at all, and with a live one a 401 is final.
+    /// A client that renewed would lose the rotated pair when the process exits mid-exchange;
+    /// one that dropped the expired token would send the request anonymously instead.
+    #[test]
+    fn a_live_access_client_is_withheld_when_expired_and_never_renews() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(1, |_| {
+            (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+        });
+        unsafe { std::env::set_var("AGIT_HUB_URL", &base) };
+        let mut cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        assert!(Client::from_env_with_live_access(Duration::from_secs(3)).is_none());
+
+        cred.access_expires_at = "2099-01-01T00:00:00Z".into();
+        credentials::save(&base, &cred).unwrap();
+        let client = Client::from_env_with_live_access(Duration::from_secs(3)).unwrap();
+        let error = client.logout().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ApiError>().map(|e| e.status),
+            Some(401)
+        );
+        let seen = hub.join().unwrap();
+        assert_eq!(seen.len(), 1, "no refresh exchange may follow the 401");
+        assert!(seen[0].contains("Bearer at-old"), "{}", seen[0]);
+        let saved = credentials::load(&base).unwrap();
+        assert_eq!(
+            (saved.access_token.as_str(), saved.refresh_token.as_str()),
+            ("at-old", "rt-old")
+        );
+    }
+
     /// A bare token has no refresh token to use: a 401 stays a 401, and no other hub's
     /// credentials are used to refresh it.
     #[test]
@@ -2158,39 +2270,103 @@ mod tests {
         assert_eq!(body.as_object().unwrap().len(), 2);
     }
 
-    /// Minting an invitation posts exactly the role and the pinned identity to the repository's
-    /// invitation collection. A body that dropped `expected_agent_id` is refused by the hub, and
-    /// one that carried extra fields (a branch, a session) would put the landing page on the
-    /// server when it lives only in the link fragment.
+    /// Minting an invitation posts the role and the pinned identity to the repository's
+    /// invitation collection, plus `session_id` exactly when the link opens a session. A body
+    /// that dropped `expected_agent_id` is refused by the hub; one that omitted `session_id` for
+    /// a session invitation leaves that session's invitations uncounted, and one that named a
+    /// session for a repository invitation counts it against a page the link never opens.
     #[test]
-    fn an_invitation_posts_only_the_role_and_the_pinned_identity() {
+    fn an_invitation_names_the_session_only_when_its_link_opens_one() {
         let id = "00000000-0000-0000-0000-000000000001";
+        let session = format!("agit-{}", "c".repeat(40));
         let token = "ab".repeat(32);
         let reply = serde_json::json!({
             "invitation": {"id": "inv-1", "role": "read", "created_by": "alice", "created_at": "2026-09-23T00:00:00Z"},
             "token": token,
         })
         .to_string();
-        let (base, hub) = fake_hub(1, move |_| (200, reply.clone()));
+        let (base, hub) = fake_hub(2, move |_| (200, reply.clone()));
         let created = client(&base)
-            .create_invitation("alice", "notes", "read", id)
+            .create_invitation("alice", "notes", "read", id, None)
             .unwrap();
         assert_eq!(created.token, token);
         assert_eq!(created.invitation.id, "inv-1");
         assert_eq!(created.invitation.role, "read");
+        client(&base)
+            .create_invitation("alice", "notes", "read", id, Some(&session))
+            .unwrap();
 
         let seen = hub.join().unwrap();
-        let request = &seen[0];
-        assert!(
-            request.starts_with("POST /api/agents/alice/notes/invitations HTTP/1.1\r\n"),
-            "{request}"
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .map(|request| {
+                assert!(
+                    request.starts_with("POST /api/agents/alice/notes/invitations HTTP/1.1\r\n"),
+                    "{request}"
+                );
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+            })
+            .collect();
         assert_eq!(
-            body,
-            serde_json::json!({"role": "read", "expected_agent_id": id})
+            bodies,
+            [
+                serde_json::json!({"role": "read", "expected_agent_id": id}),
+                serde_json::json!({"role": "read", "expected_agent_id": id, "session_id": session}),
+            ]
         );
+    }
+
+    /// A reuse receipt posts to the source session's `reuses` collection with the mode, the
+    /// full source commit and this process's operation id, under the caller's token, and a
+    /// `204` with no body counts as success. Decoding the answer as JSON would turn every
+    /// accepted receipt into an error; dropping the token would record the caller as anonymous,
+    /// so the Hub could not tell the repository owner's own runs apart.
+    #[test]
+    fn a_reuse_receipt_posts_the_source_point_under_the_callers_token() {
+        use super::super::reuse::{ReuseMode, SessionReuse};
+        let session = format!("agit-{}", "a".repeat(40));
+        let commit = "b".repeat(40);
+        let (base, hub) = fake_hub(2, |_| (204, String::new()));
+        let fork = SessionReuse::new("alice", "notes", &session, &commit, ReuseMode::Fork).unwrap();
+        Client::for_hub_with_token(&base, "at-reader")
+            .record_session_reuse(&fork)
+            .unwrap();
+        let resume =
+            SessionReuse::new("alice", "notes", &session, &commit, ReuseMode::Continue).unwrap();
+        client(&base).record_session_reuse(&resume).unwrap();
+
+        let seen = hub.join().unwrap();
+        for (request, mode, token) in [
+            (&seen[0], "fork", Some("at-reader")),
+            (&seen[1], "continue", None),
+        ] {
+            assert!(
+                request.starts_with(&format!(
+                    "POST /api/agents/alice/notes/sessions/{session}/reuses HTTP/1.1\r\n"
+                )),
+                "{request}"
+            );
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let authorization = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim())
+            });
+            assert_eq!(
+                authorization,
+                token.map(|token| format!("Bearer {token}")).as_deref(),
+                "{head}"
+            );
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "mode": mode,
+                    "commit": commit,
+                    "operation_id": super::super::git::operation_id(),
+                })
+            );
+        }
     }
 
     #[test]

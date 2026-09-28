@@ -15,8 +15,10 @@
 //! first).
 
 use super::CmdResult;
+use crate::domain::meta;
 use crate::domain::refs::{self};
 use crate::domain::repo::Repo;
+use crate::hub::reuse::{self, ReuseMode, SessionReuse};
 use crate::infra::config;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
@@ -59,6 +61,10 @@ pub fn run(args: Args) -> CmdResult {
         notes: Vec::new(),
     };
 
+    // The repository `--mine` copied from, when it belongs to someone else: its sessions are
+    // the ones this run takes up, though the run works in the copy.
+    let mut copied_from: Option<(String, String)> = None;
+
     // ── 1. Fetch. owner-qualified = explicitly networked ──
     let (slug, networked) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {
@@ -73,6 +79,9 @@ pub fn run(args: Args) -> CmdResult {
                     return Ok(super::terminal_error_code(&e, ExitCode::Network));
                 }
                 let me = crate::infra::credentials::current_user().unwrap_or_default();
+                if *o != me {
+                    copied_from = Some((o.clone(), n.clone()));
+                }
                 (format!("{me}/{n}"), true)
             } else if Repo::open(config::repo_dir(o, n).unwrap_or_default()).is_some() {
                 if !fetch_quiet(o, n) {
@@ -297,13 +306,25 @@ pub fn run(args: Args) -> CmdResult {
             "{}",
             ui::dim(&format!("  arbitration: {head} → continue (resume)"))
         );
-        return super::resume::run(super::resume::Args {
-            target: Some(format!("{slug}@{base_name}")),
-            as_runtime: args.as_runtime,
-            cwd: args.cwd,
-            no_launch: args.no_launch,
-            force: false,
-        });
+        // The receipt names the head arbitration chose, and goes out only once resume has
+        // passed its own checks: a refused or cancelled continue has reused nothing.
+        let receipt = prepare_reuse(
+            &repo,
+            (&owner, &name),
+            None,
+            &format!("refs/heads/{base_name}"),
+            ReuseMode::Continue,
+        );
+        return super::resume::run_when_ready(
+            super::resume::Args {
+                target: Some(format!("{slug}@{base_name}")),
+                as_runtime: args.as_runtime,
+                cwd: args.cwd,
+                no_launch: args.no_launch,
+                force: false,
+            },
+            move || receipt.map(|(client, receipt)| reuse::send(client, receipt)),
+        );
     }
 
     let (full_ref, fork_base) = match resolve_fork(&spec, &slug, &base_name, &cwd)? {
@@ -386,6 +407,14 @@ pub fn run(args: Args) -> CmdResult {
     let Some(_) = super::fork::fork_branch(&fork_base, &full_ref, &new_name)? else {
         return Ok(ExitCode::Policy);
     };
+    let _receipt = prepare_reuse(
+        &fork_base.repo,
+        (&owner, &name),
+        copied_from.as_ref().map(|(o, n)| (o.as_str(), n.as_str())),
+        &fork_base.resolved.sha,
+        ReuseMode::Fork,
+    )
+    .map(|(client, receipt)| reuse::send(client, receipt));
     ui::success(&format!("forked out {slug} @ {new_name}"));
 
     // ── 4. Materialize + launch (= resume's loading) ──
@@ -487,6 +516,82 @@ fn ensure_mine(slug: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// The receipt for starting from the session at `point` of the checkout `checkout`, with the
+/// client that will carry it. `None` when there is nothing to send, or no live access to send
+/// it with (see [`reuse::client`]).
+fn prepare_reuse(
+    repo: &Repo,
+    checkout: (&str, &str),
+    copied_from: Option<(&str, &str)>,
+    point: &str,
+    mode: ReuseMode,
+) -> Option<(crate::hub::Client, SessionReuse)> {
+    let client = reuse::client()?;
+    let receipt = reuse_receipt(repo, client.base(), checkout, copied_from, point, mode)?;
+    Some((client, receipt))
+}
+
+/// The receipt for starting from `point`, when there is one to send to `hub`.
+///
+/// Only a checkout whose pinned origin is `checkout` on `hub` has one: a `local/` repository
+/// has no origin, and naming a session of another Hub's checkout to this one would disclose it
+/// to a server that does not hold it. A point without a settled session (the file line, a point
+/// with no meta, a line whose first turn has not settled) names nothing the Hub could count.
+///
+/// A copy made from `copied_from` holds that repository's sessions under the same ids and
+/// commits, so the receipt goes to `copied_from` when the checkout's `upstream` shows it was
+/// copied from there. Addressed to the copy, the Hub would see the caller reusing their own
+/// repository. Without that `upstream` the checkout is not known to be the copy, and the
+/// receipt stays with the checkout.
+fn reuse_receipt(
+    repo: &Repo,
+    hub: &str,
+    checkout: (&str, &str),
+    copied_from: Option<(&str, &str)>,
+    point: &str,
+    mode: ReuseMode,
+) -> Option<SessionReuse> {
+    let hub = crate::hub::identity::normalize_hub(hub).ok()?;
+    let (owner, name) = checkout;
+    if super::show::pinned_origin(repo)? != (hub.clone(), owner.to_owned(), name.to_owned()) {
+        return None;
+    }
+    let (owner, name) = match copied_from {
+        Some((source_owner, source_name))
+            if upstream_on(repo, &hub)
+                == Some((source_owner.to_owned(), source_name.to_owned())) =>
+        {
+            (source_owner, source_name)
+        }
+        _ => (owner, name),
+    };
+    let commit = repo.git_opt(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{point}^{{commit}}"),
+    ])?;
+    let commit = commit.trim();
+    let snapshot = meta::read_at_ref(repo, commit)?;
+    if snapshot.is_file_line() {
+        return None;
+    }
+    SessionReuse::new(owner, name, &snapshot.session, commit, mode)
+}
+
+/// The `(owner, name)` the checkout's `upstream` remote names on `hub`, which a copy made with
+/// `--mine` records as its source.
+fn upstream_on(repo: &Repo, hub: &str) -> Option<(String, String)> {
+    let remote = repo.upstream_url()?;
+    crate::infra::hub_authority::HubAuthority::parse(&remote).ok()?;
+    let remote = crate::hub::identity::normalize_hub(&remote).ok()?;
+    let (owner, name) = super::remote_slug(&remote)?;
+    crate::domain::repo::valid_name(&owner).ok()?;
+    crate::domain::repo::valid_name(&name).ok()?;
+    let expected = format!("{hub}/{owner}/{name}");
+    (remote == expected || remote == format!("{expected}.git")).then_some((owner, name))
+}
+
 fn fetch_quiet(owner: &str, name: &str) -> bool {
     let Ok(dir) = config::repo_dir(owner, name) else {
         return false;
@@ -501,5 +606,139 @@ fn fetch_quiet(owner: &str, name: &str) -> bool {
     match crate::hub::git::run(&repo, &["fetch", "origin", "--tags", "--prune"]) {
         Ok(o) => o.ok(),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::identity::{self, RemoteIdentity};
+
+    fn commit_meta(repo: &Repo, snapshot: &meta::Meta, message: &str) -> String {
+        meta::write(repo.root(), snapshot).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(message).unwrap();
+        repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned()
+    }
+
+    /// A receipt names the settled session recorded at the point itself and that point's full
+    /// commit, and exists only for a checkout whose pinned origin is the named repository on the
+    /// current Hub. Reading the session at the branch head or HEAD instead names the wrong
+    /// session for a historic point; skipping the origin check names a `local/` repository's or
+    /// another Hub's sessions to this Hub.
+    #[test]
+    fn a_receipt_names_the_settled_session_at_its_point_on_the_pinned_hub() {
+        let hub = "https://hub.example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("notes")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        commit_meta(&repo, &meta::Meta::new_file_line(), "file line");
+        repo.git(&["checkout", "-b", "born"]).unwrap();
+        commit_meta(
+            &repo,
+            &meta::Meta::new_session_line("claude-code".into(), "/work".into()),
+            "birth",
+        );
+        let earlier = format!("{}{}", meta::ID_PREFIX, "a".repeat(meta::ID_HEX_LEN));
+        let later = format!("{}{}", meta::ID_PREFIX, "b".repeat(meta::ID_HEX_LEN));
+        repo.git(&["checkout", "-b", "work"]).unwrap();
+        let historic = commit_meta(
+            &repo,
+            &meta::Meta::new(earlier.clone(), "claude-code".into(), "/work".into()),
+            "earlier turn",
+        );
+        let head = commit_meta(
+            &repo,
+            &meta::Meta::new(later.clone(), "claude-code".into(), "/work".into()),
+            "later turn",
+        );
+        repo.git(&["checkout", "--detach", "main"]).unwrap();
+
+        let receipt = |hub: &str, owner: &str, point: &str, mode| {
+            reuse_receipt(&repo, hub, (owner, "notes"), None, point, mode)
+        };
+        assert_eq!(
+            receipt(hub, "alice", "refs/heads/work", ReuseMode::Continue),
+            None,
+            "a checkout with no pinned origin has no Hub to tell"
+        );
+
+        let agent_id = "01a05c78-4273-7110-9d90-6cc202250000";
+        identity::pin(&repo, &RemoteIdentity::new(hub, agent_id).unwrap()).unwrap();
+        repo.git(&["remote", "add", "origin", &format!("{hub}/alice/notes.git")])
+            .unwrap();
+
+        assert_eq!(
+            receipt(
+                &format!("{hub}/"),
+                "alice",
+                "refs/heads/work",
+                ReuseMode::Continue
+            ),
+            SessionReuse::new("alice", "notes", &later, &head, ReuseMode::Continue)
+        );
+        assert_eq!(
+            receipt(hub, "alice", &historic, ReuseMode::Fork),
+            SessionReuse::new("alice", "notes", &earlier, &historic, ReuseMode::Fork)
+        );
+        for (hub, owner, point) in [
+            ("https://other.example.test", "alice", "refs/heads/work"),
+            (hub, "bob", "refs/heads/work"),
+            (hub, "alice", "refs/heads/main"),
+            (hub, "alice", "refs/heads/born"),
+            (hub, "alice", "refs/heads/absent"),
+        ] {
+            assert_eq!(
+                receipt(hub, owner, point, ReuseMode::Fork),
+                None,
+                "{hub} {owner} {point}"
+            );
+        }
+    }
+
+    /// A copy made with `--mine` reports to the repository it was copied from, which holds the
+    /// same session and commit; addressed to the copy, the Hub sees the caller reusing their own
+    /// work. The source is trusted only as far as the copy's `upstream` names it on this Hub, so
+    /// an unrelated repository that merely shares the name is never credited.
+    #[test]
+    fn a_copy_reports_the_session_to_the_repository_it_was_copied_from() {
+        let hub = "https://hub.example.test";
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("notes")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let session = format!("{}{}", meta::ID_PREFIX, "a".repeat(meta::ID_HEX_LEN));
+        let point = commit_meta(
+            &repo,
+            &meta::Meta::new(session.clone(), "claude-code".into(), "/work".into()),
+            "turn",
+        );
+        let agent_id = "01a05c78-4273-7110-9d90-6cc202250000";
+        identity::pin(&repo, &RemoteIdentity::new(hub, agent_id).unwrap()).unwrap();
+        repo.git(&["remote", "add", "origin", &format!("{hub}/bob/notes.git")])
+            .unwrap();
+        let receipt = || {
+            reuse_receipt(
+                &repo,
+                hub,
+                ("bob", "notes"),
+                Some(("alice", "notes")),
+                &point,
+                ReuseMode::Fork,
+            )
+        };
+
+        let to = |owner: &str| SessionReuse::new(owner, "notes", &session, &point, ReuseMode::Fork);
+        assert_eq!(receipt(), to("bob"), "no upstream: not known to be a copy");
+        for (upstream, expected) in [
+            (
+                "https://other.example.test/alice/notes.git".to_string(),
+                "bob",
+            ),
+            (format!("{hub}/carol/notes.git"), "bob"),
+            (format!("{hub}/alice/notes.git"), "alice"),
+        ] {
+            repo.set_upstream(&upstream).unwrap();
+            assert_eq!(receipt(), to(expected), "{upstream}");
+        }
     }
 }

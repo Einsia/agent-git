@@ -703,8 +703,9 @@ fn session_path(owner: &str, name: &str, session_id: &str, branch: &str) -> Stri
     )
 }
 
-/// The token and the landing path ride in the fragment, which browsers never send to the server.
-/// The creator's account rides in the query as `share=true&sharer=<account>`, the attribution the
+/// The token and the landing path ride in the fragment, which browsers never send to the server;
+/// the Hub learns the landing session only from the request that mints the invitation. The
+/// creator's account rides in the query as `share=true&sharer=<account>`, the attribution the
 /// hub counts share clicks and share-driven signups by; it names no secret.
 fn invite_link(hub: &str, token: &str, next: Option<&str>, sharer: Option<&str>) -> String {
     let mut link = format!("{}/invite", hub.trim_end_matches('/'));
@@ -896,7 +897,13 @@ fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
     };
     let settings = format!("{hub}/@{slug}/settings");
 
-    let created = match client.create_invitation(owner, name, role.as_str(), &identity.agent_id) {
+    let created = match client.create_invitation(
+        owner,
+        name,
+        role.as_str(),
+        &identity.agent_id,
+        session.as_ref().map(|(_, id)| id.as_str()),
+    ) {
         Ok(created) => created,
         Err(error) => {
             super::fix::register_terminal_api_error(&error);

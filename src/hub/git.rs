@@ -137,15 +137,22 @@ const COMMAND_HEADER: &str = "X-AgentGit-Command";
 const OPERATION_HEADER: &str = "X-AgentGit-Operation";
 
 /// A fresh identifier per process links the requests of one invocation and nothing else; if it
-/// were persisted, separate invocations would collapse into one download.
-fn operation_id() -> &'static str {
+/// were persisted, separate invocations would collapse into one download. The session reuse
+/// receipt carries the same value in its body, so the Hub records a retried receipt once.
+pub(crate) fn operation_id() -> &'static str {
     static OPERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     OPERATION.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Hub requests name the invocation, never its arguments. Outside a dispatched command the
-/// command header is omitted, so the Hub treats the request as unattributed instead of
-/// guessing.
+/// These headers name the invocation, never its arguments: no repository, branch or session
+/// name, path or machine identifier. Outside a dispatched command the command header is
+/// omitted, so the Hub treats the request as unattributed instead of guessing.
+///
+/// A REST call names a session only when naming it is the call's purpose: the reuse receipt
+/// `agit run` sends ([`super::Client::record_session_reuse`]) names the repository, the source
+/// session and commit, whether the run forks or continues, and this operation id; an invitation
+/// minted by `agit repo invite owner/name@branch` names the session its link opens
+/// ([`super::Client::create_invitation`]).
 fn invocation_headers() -> Vec<(&'static str, &'static str)> {
     let mut headers = Vec::new();
     if let Some(command) = crate::commands::echo::active_command() {

@@ -187,6 +187,55 @@ Session page links printed by `agit show` and `agit file link` append
 credit visits that arrive through a pasted link. Signed out, the link is
 unchanged.
 
+## Session reuse and invitations
+
+The Hub also counts how often a session is picked up and invited to. For that
+count, `agit run` and `agit repo invite` name a session in the Hub requests
+described here.
+
+**Reuse receipt.** When `agit run` continues a session line or forks from a
+point on one, it sends one request to the Hub:
+`POST /api/agents/<owner>/<name>/sessions/<session>/reuses` with the JSON body
+`{"mode": "continue" | "fork", "commit": "<source commit>", "operation_id": "<UUID>"}`.
+It names the repository, the source session ID (`agit-` plus 40 hex characters,
+the ID in the session page URL), the full source commit, whether the run
+continues or forks, and the same per-process `operation_id` UUID as
+`X-AgentGit-Operation`, so a retried receipt is recorded once. No branch names,
+paths, transcript content or machine identifiers are sent. The Hub decides
+whether the run reuses someone else's session by comparing the caller with the
+repository owner.
+
+The receipt carries the signed-in account's access token like other Hub REST
+calls, and no authorization when you are signed out. It never renews
+credentials: if the saved access token has expired, no receipt is sent, rather
+than one that would count your own run as anonymous. A continue is reported only
+once `agit resume` has passed its checks and the session is about to be printed
+or launched, so a continue that is refused or cancelled sends nothing; a fork is
+reported once its branch has been created.
+
+The receipt is sent only for a checkout whose origin is a repository on the
+configured Hub, so `local/` repositories and checkouts of another Hub send
+nothing, and only when the source point has a settled session (the file line
+and points with no session metadata send nothing). It names the checkout's own
+repository, except that `agit run <owner/repo>@<ref> --mine` names
+`<owner/repo>`, the repository your copy was made from, when the copy's
+`upstream` remote records it. A run that names your copy directly, such as
+`agit run <you>/<repo>@<ref>` after `agit clone --mine`, reports the copy, which
+the Hub sees as work in your own repository and does not count.
+
+The receipt travels in the background while the session is prepared and
+launched, as a single request with a short timeout. A failure, a refusal or an
+unreachable Hub is ignored: the output, exit code and launched session are the
+same either way. `agit fork` and `agit resume` stay offline and send no receipt.
+Like the attribution headers, the receipt is not part of usage statistics, and
+the opt-outs above do not remove it.
+
+**Invitations.** `agit repo invite <owner/repo>@<branch>` sends the ID of the
+session its link opens as `session_id` in the request that creates the
+invitation, so the Hub can count invitations per session. An invitation to the
+whole repository sends no session. The printed link still carries its token and
+landing page only in the URL fragment, which browsers do not send to the Hub.
+
 
 ## Acquisition funnel contract
 
