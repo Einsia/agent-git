@@ -1577,14 +1577,25 @@ mod unix {
             lab.git(&bare, &["init", "--bare", "--quiet"]);
             let hub = Hub::new(|_| {
                 (0..2)
-                    .map(|_| Step {
-                        method: "GET",
-                        target: "/api/agents/me/qa".into(),
-                        bearer: Some(OLD_ACCESS),
-                        status: 200,
-                        response: json!({"agent_id": AGENT_ID, "owner": "me", "name": "qa",
-                    "clone_url": bare.to_str().unwrap(), "visibility": "private"}),
-                        after_response: None,
+                    .flat_map(|_| {
+                        let remote = || Step {
+                            method: "GET",
+                            target: "/api/agents/me/qa".into(),
+                            bearer: Some(OLD_ACCESS),
+                            status: 200,
+                            response: json!({"agent_id": AGENT_ID, "owner": "me", "name": "qa",
+                                "clone_url": bare.to_str().unwrap(), "visibility": "private"}),
+                            after_response: None,
+                        };
+                        [remote(), Step {
+                            method: "GET",
+                            target: format!("/api/agents/me/qa/secret-allowances?expected_agent_id={AGENT_ID}"),
+                            bearer: Some(OLD_ACCESS),
+                            status: 200,
+                            response: json!({"version":1,"agent_id":AGENT_ID,"revision":0,
+                                "value_identity_scheme":"sha256-v1","decisions":[]}),
+                            after_response: None,
+                        }, remote()]
                     })
                     .collect()
             });
@@ -1617,7 +1628,7 @@ mod unix {
                     pin_before
                 );
             }
-            assert_eq!(hub.finish().len(), 2);
+            assert_eq!(hub.finish().len(), 6);
         }
     }
 
@@ -1665,18 +1676,11 @@ mod unix {
     fn pinned_push_keeps_the_terminal_error_source_through_its_context() {
         let lab = Lab::new();
         let hub = Hub::new(|_| {
-            vec![
-                Step::error(
-                    "GET",
-                    "/api/agents/me/qa",
-                    authentication_error("synthetic ignored push probe"),
-                ),
-                Step::error(
-                    "GET",
-                    "/api/agents/me/qa",
-                    authentication_error("synthetic terminal pinned push"),
-                ),
-            ]
+            vec![Step::error(
+                "GET",
+                "/api/agents/me/qa",
+                authentication_error("synthetic terminal pinned push"),
+            )]
         });
         lab.seed_credentials(&hub.base, false);
         let repo = lab.initialize_repo(&hub.base);
@@ -1685,10 +1689,9 @@ mod unix {
         let value = lab.json(&hub.base, &["--json", "push", "me/qa", "-b", "main"], 5);
         lab.assert_login(&value, &hub.base);
         assert!(value.to_string().contains("synthetic terminal pinned push"));
-        assert!(!value.to_string().contains("synthetic ignored push probe"));
         assert_eq!(lab.git(&repo, &["show-ref"]), refs_before);
         assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config_before);
-        assert_eq!(hub.finish().len(), 2);
+        assert_eq!(hub.finish().len(), 1);
     }
 
     #[test]

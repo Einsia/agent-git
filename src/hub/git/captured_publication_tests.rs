@@ -20,6 +20,60 @@ fn captured_inspected(
     }
 }
 
+/// A copy's policy is checked against reviewed payload bytes even after relocation or cache loss.
+#[test]
+fn copied_capture_rechecks_policy_without_replacing_reviewed_payloads() {
+    if !isolated("copied_capture_rechecks_policy_without_replacing_reviewed_payloads") {
+        return;
+    }
+    use crate::domain::secret_filter::{DeclarationTarget, RepositoryDictionary};
+    use crate::domain::secrets::ScanLimits;
+    use crate::hub::git::{CapturedPublication, ContentInspection};
+
+    let home = IsolatedHome::new();
+    let hub = FakeHub::new(|_| panic!("copy policy inspection must not contact the destination"));
+    let (repo, _, _, identity) = captured_source(&home, &hub.base);
+    let value = "source approved fixture";
+    assert!(crate::domain::secrets::scan_text(value, &Default::default()).is_empty());
+    let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
+    let declared = dictionary.allow_value(value.to_owned().into(), None).unwrap();
+    assert_eq!(declared.origins, vec!["declaration"]);
+    let source = DeclarationTarget {
+        hub: identity.hub,
+        repository_id: identity.agent_id,
+    };
+    dictionary.bind_declarations(&source).unwrap();
+    let pointer = prepared_pointer(value.as_bytes());
+    record_prepared_pointer(&repo, "source-allowed.lfs", &pointer);
+    let cache = prepared_cache(&repo, &pointer, value.as_bytes());
+    let plan = prepared_plan(&repo);
+    let complete =
+        captured_inspected(CapturedPublication::capture(&repo, &plan, pointer.size).unwrap());
+    assert!(!complete.has_findings());
+
+    dictionary.reset_policy_for_copy(&source).unwrap();
+    std::fs::remove_file(cache).unwrap();
+    let moved = home.workspace().join("policy-copy");
+    std::fs::rename(repo.root(), &moved).unwrap();
+    let moved_repo = Repo::at(moved);
+    let inspected = complete.reinspect(&moved_repo, ScanLimits::DEFAULT).unwrap();
+    let ContentInspection::Complete(complete) = inspected else {
+        panic!("owned payloads must remain readable after the live cache disappears");
+    };
+    assert!(complete.has_findings());
+    assert_eq!(complete.captured().plan(), &plan);
+    let mut retained = Vec::new();
+    complete
+        .captured()
+        .open_payload(&pointer)
+        .unwrap()
+        .read_to_end(&mut retained)
+        .unwrap();
+    assert_eq!(retained, value.as_bytes());
+    assert!(hub.finish().is_empty());
+    println!("{COMPLETE}");
+}
+
 #[test]
 fn full_capture_has_no_destination_and_requires_every_payload_locally() {
     if !isolated("full_capture_has_no_destination_and_requires_every_payload_locally") {

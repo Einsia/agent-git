@@ -258,9 +258,8 @@ pub fn run(mut args: Args) -> CmdResult {
 
     // ── 2. Local preconditions ──
     //
-    // Every local judgement runs before the network is touched: with the backend down, a
-    // "detached HEAD" hidden behind a connection failure is the hardest class of error to track
-    // down.
+    // Repository and branch selection must be valid before declaration synchronization or
+    // publication can act on the selected destination.
     //
     // The context branch counts only when the context names **this** repo: running
     // `agit push notes` from a session in `me/payments` names a branch that belongs to another
@@ -377,6 +376,17 @@ pub fn run(mut args: Args) -> CmdResult {
     // for itself. `checkout.name` is the name `ensure_remote` below creates or fetches (a
     // read-only promotion swaps only the owner, see `target` in `promote_if_read_only`), so what
     // is asked here and what is done there are the same destination.
+    if let Some(code) = super::secret_vault::synchronize_before_push(
+        &repo,
+        &client,
+        &checkout.owner,
+        &checkout.name,
+        args.dry_run,
+        args.allow_secrets,
+    )? {
+        return Ok(code);
+    }
+    super::secret_vault::report_pending_declarations(&repo)?;
     let asked_url = repo.remote_url();
     let super::PublishDestination {
         scan: dest,
@@ -394,19 +404,9 @@ pub fn run(mut args: Args) -> CmdResult {
 
     // ── 4. --dry-run stops here ──
     //
-    // "Run every local judgement, send not one **write**": the read-only `get_agent` query is
-    // not sent either — it changes nothing, but one failure ends the whole rehearsal in a
-    // network error, while everything it would tell you is available locally.
+    // Dry run permits read-only destination and policy checks. It cannot synchronize a
+    // declaration, create or promote a repository, upload a payload, or publish a ref.
     //
-    // The `ls-remote` above is the exception under the same standard, because it **cannot** fail
-    // the rehearsal: no answer means falling back to a full scan
-    // ([`super::publish_destination`]). Without it, a rehearsal's verdict can differ from the
-    // real push's, and that verdict is this command's only purpose.
-    //
-    // This return sits **before** the read-only promotion in step 5, so the `origin` a rehearsal
-    // sees is always the one from before the promotion. In a read-only checkout that is the
-    // source author's copy, not this push's destination — so the scan surface falls back to full
-    // in such a repo; the test is in [`super::publish_destination`].
     // Reminder before publishing: memory on the session branch that has not been distilled into
     // main does not travel with main.
     for branch in &branches {
@@ -425,11 +425,12 @@ pub fn run(mut args: Args) -> CmdResult {
     // The destination's namespace: without a promotion it is the checkout's own (my name, or an
     // organization I belong to); after one it is my name. Remote lookup and creation both follow
     // it — looking for an organization repo under "me" finds nothing.
-    let (repo, agent, namespace) = match promote_if_read_only(&client, &me, &checkout, &repo)? {
-        Promotion::Ready => (repo, agent, checkout.owner.clone()),
-        Promotion::Promoted { repo, name } => (repo, name, me.to_string()),
-        Promotion::Refused(code) => return Ok(code),
-    };
+    let (repo, agent, namespace, promoted) =
+        match promote_if_read_only(&client, &me, &checkout, &repo)? {
+            Promotion::Ready => (repo, agent, checkout.owner.clone(), false),
+            Promotion::Promoted { repo, name } => (repo, name, me.to_string(), true),
+            Promotion::Refused(code) => return Ok(code),
+        };
 
     // ── 6. Make sure the remote agent exists ──
     let wanted = wanted_visibility(&args, &repo).value();
@@ -465,6 +466,39 @@ pub fn run(mut args: Args) -> CmdResult {
             if want { "public" } else { "private" }
         ));
     }
+    if promoted {
+        if let Some(code) = super::secret_vault::synchronize_push_target(
+            &repo,
+            &client,
+            &owner,
+            &name,
+            &remote_identity,
+            args.allow_secrets,
+        )? {
+            return Ok(code);
+        }
+    } else if super::secret_vault::has_policy_state(&repo)? {
+        let pending = !super::secret_vault::pending_declarations(&repo)?.is_empty();
+        let result = if first_publish || (pending && !args.allow_secrets) {
+            super::secret_vault::synchronize_target(
+                &repo,
+                &client,
+                &owner,
+                &name,
+                &remote_identity,
+                false,
+            )
+        } else {
+            crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+                .bind_declarations(&crate::domain::secret_filter::DeclarationTarget {
+                    hub: remote_identity.hub.clone(),
+                    repository_id: remote_identity.agent_id.clone(),
+                })
+        };
+        if let Some(code) = super::secret_vault::report_sync_for_push(result, args.allow_secrets)? {
+            return Ok(code);
+        }
+    }
     repo.set_remote(&push_url)?;
 
     // ── 6b. Did the destination change after the scan ──
@@ -482,10 +516,8 @@ pub fn run(mut args: Args) -> CmdResult {
     // pushed at all must not first leave a record on the server and ask a "public or private"
     // question along the way. The promotion in step 5 is the same.
     //
-    // So the scan stays ahead of the write actions, and the cost is that step 3 can only ask
-    // about "the origin as it was then"; this step closes that gap. `narrowed` is the necessary
-    // guard: when step 3 scanned in full anyway, a changed destination misses nothing and
-    // rescanning only burns time.
+    // The scan stays ahead of write actions, so step 3 can only ask about the original origin.
+    // A destination change invalidates narrowing; a copy also invalidates the source policy.
     // Advertised refs only narrow scanning while the selected remote identity stays the same.
     let destination_changed = first_publish
         || asked_url.as_deref() != Some(push_url.as_str())
@@ -493,10 +525,13 @@ pub fn run(mut args: Args) -> CmdResult {
     if destination_changed {
         advertised_tags.clear();
     }
-    if narrowed && destination_changed {
+    // A copy changes policy authority even when the source scan covered the full history.
+    if promoted || (narrowed && destination_changed) {
         ui::warning(&format!(
             "the destination changed while preparing this push ({}) — re-checking the full history.",
-            if first_publish {
+            if promoted {
+                "the checkout is now a copy with its own repository policy"
+            } else if first_publish {
                 "a first-publication destination was confirmed on the hub"
             } else {
                 "origin now points somewhere else"
@@ -1537,10 +1572,9 @@ fn finish_secret_scan(
             "{} suspected secrets found — publish blocked.",
             hits.len()
         ));
-        ui::hint(&format!(
-            "· false positive? add the string to {}",
-            ui::tilde(&config::agit_home()?.join(secrets::ALLOWLIST_FILE))
-        ));
+        ui::hint(
+            "· reviewed false positive? use `agit secrets allow <record-id> --repo <path> --reason <reason>`, or pipe its exact value to `agit secrets allow --stdin --repo <path>`; check the reported synchronization status",
+        );
     }
     if unscanned.is_empty() {
         ui::hint("to accept these findings explicitly, repeat the push with --allow-secrets");

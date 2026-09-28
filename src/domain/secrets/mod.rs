@@ -40,6 +40,10 @@
 
 pub(crate) mod identity;
 pub(crate) mod media;
+pub mod repository_policy;
+pub use repository_policy::value_identity;
+
+mod paths;
 pub(crate) mod placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
@@ -171,6 +175,9 @@ pub(crate) struct SecretCandidateBatch {
 /// far inside it, and one past it refuses before any dictionary update is written.
 #[cfg(feature = "secret-vault")]
 pub(crate) const MAX_NEW_CANDIDATE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Length limits entropy-only discovery, not credential rules or repository record storage.
+pub(crate) const MAX_BARE_ENTROPY_BYTES: usize = 16 * 1024;
 
 /// Media types a data URL may declare, each with the file header its decoded payload must open
 /// with: JPEG, PNG, GIF, WebP (a RIFF container), PDF, gzip and zip.
@@ -870,9 +877,24 @@ struct Raw {
 /// by line multiplies every rule's regex startup cost by the line count), and fidelity — rules
 /// such as `private-key` and `curl-auth-user` span lines by nature, and a line-by-line scan
 /// misses them.
-fn raw_hits(text: &str) -> Vec<Raw> {
+fn raw_hits(text: &str, credential_field: bool) -> Vec<Raw> {
     // A budget of `usize::MAX` is never used up, so the "the bound was reached" flag is false.
-    raw_hits_capped(text, usize::MAX, |_, _| true).0
+    let mut hits = raw_hits_capped(text, usize::MAX, |_, _| true).0;
+    if credential_field {
+        let view = view_of(text);
+        for (start, end) in entropy_candidate_spans(&view, true) {
+            if !rules::preset_allows(&view[start..end]) {
+                hits.push(Raw {
+                    rule: "high-entropy-value",
+                    start,
+                    end,
+                });
+            }
+        }
+        hits.sort_by_key(|hit| (hit.start, hit.end));
+        dedupe_same_span(&mut hits);
+    }
+    hits
 }
 
 /// A budget counted in **unique spans**.
@@ -991,7 +1013,28 @@ fn raw_hits_capped(
     cap: usize,
     keep: impl FnMut(&str, usize) -> bool,
 ) -> (Vec<Raw>, bool) {
-    raw_hits_capped_in(&view_of(text), cap, &media::regions(text), keep)
+    raw_hits_capped_in(&view_of(text), cap, &entropy_exempt_regions(text), keep)
+}
+
+fn entropy_exempt_regions(text: &str) -> Vec<(usize, usize)> {
+    let mut regions = media::regions(text);
+    regions.extend(paths::regions(text));
+    merge_regions(regions)
+}
+
+fn merge_regions(mut regions: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    regions.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in regions {
+        if let Some((_, last)) = merged.last_mut()
+            && start <= *last
+        {
+            *last = (*last).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
 }
 
 fn raw_hits_capped_in(
@@ -1100,16 +1143,38 @@ fn entropy_candidate_spans(
     credential_field: bool,
 ) -> impl Iterator<Item = (usize, usize)> + '_ {
     let bytes = text.as_bytes();
+    let locations = if credential_field {
+        Vec::new()
+    } else {
+        paths::regions(text)
+    };
+    let mut location = 0;
     let mut start = 0;
     std::iter::from_fn(move || {
         while start < bytes.len() {
+            while location < locations.len() && locations[location].1 <= start {
+                location += 1;
+            }
+            if let Some(&(left, right)) = locations.get(location)
+                && left <= start
+            {
+                start = right;
+                continue;
+            }
             if !is_token_byte(bytes[start]) {
                 start += 1;
                 continue;
             }
             let mut end = start + 1;
-            while end < bytes.len() && is_token_byte(bytes[end]) {
+            while end < bytes.len()
+                && is_token_byte(bytes[end])
+                && locations.get(location).is_none_or(|(left, _)| end < *left)
+            {
                 end += 1;
+            }
+            if !credential_field && end - start > MAX_BARE_ENTROPY_BYTES {
+                start = end;
+                continue;
             }
             let candidate = &text[start..end];
             let hex_candidate = ["agit-", "sha1-", "sha256-"]
@@ -1135,6 +1200,8 @@ fn entropy_candidate_spans(
                 3.5
             } else if is_hex {
                 3.2
+            } else if candidate.len() > 24 {
+                if has_separator { 4.45 } else { 4.3 }
             } else if is_alpha {
                 3.8
             } else if has_separator {
@@ -1192,6 +1259,106 @@ fn json_string_regions(text: &str) -> Vec<(usize, usize)> {
         cursor = end;
     }
     strings
+}
+
+/// A raw detector span inside valid JSON identifies decoded bytes, including escaped newlines.
+/// Fragment boundaries must not cut an escape; an outer string's allowance cannot waive a span.
+fn semantic_match_value<'a>(
+    text: &'a str,
+    strings: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> Option<std::borrow::Cow<'a, str>> {
+    let raw = text.get(start..end)?;
+    let index = strings.partition_point(|(s, _)| *s <= start);
+    let Some(&(string_start, string_end)) = index.checked_sub(1).and_then(|i| strings.get(i))
+    else {
+        return Some(raw.into());
+    };
+    if end > string_end {
+        return Some(raw.into());
+    }
+    let boundary = |offset: usize| {
+        let bytes = text.as_bytes();
+        for escape in offset.saturating_sub(5).max(string_start)..offset {
+            if bytes[escape] != b'\\' {
+                continue;
+            }
+            let mut preceding = escape;
+            while preceding > string_start && bytes[preceding - 1] == b'\\' {
+                preceding -= 1;
+            }
+            if (escape - preceding) % 2 != 0 {
+                continue;
+            }
+            let width = if bytes.get(escape + 1) == Some(&b'u') {
+                6
+            } else {
+                2
+            };
+            if escape + width > offset {
+                return false;
+            }
+        }
+        true
+    };
+    if !boundary(start) || !boundary(end) {
+        return None;
+    }
+    if !raw.contains('\\') {
+        return Some(raw.into());
+    }
+    serde_json::from_str::<String>(&format!("\"{raw}\""))
+        .ok()
+        .map(Into::into)
+}
+
+/// Selected fields retain their context through arrays, but nested object keys supply their own context.
+fn field_value_regions(text: &str, matches_field: fn(&str) -> bool) -> Vec<(usize, usize)> {
+    use serde_json::value::RawValue;
+
+    fn collect(
+        raw: &RawValue,
+        base: usize,
+        selected: bool,
+        matches_field: fn(&str) -> bool,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        match raw.get().as_bytes().first() {
+            Some(b'"') if selected => {
+                let start = raw.get().as_ptr() as usize - base;
+                out.push((start + 1, start + raw.get().len() - 1));
+            }
+            Some(b'{') => {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()) {
+                    for (key, value) in map {
+                        collect(value, base, matches_field(&key), matches_field, out);
+                    }
+                }
+            }
+            Some(b'[') => {
+                if let Ok(values) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) {
+                    for value in values {
+                        collect(value, base, selected, matches_field, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut regions = Vec::new();
+    if let Ok(raw) = serde_json::from_str::<&RawValue>(text) {
+        collect(
+            raw,
+            text.as_ptr() as usize,
+            false,
+            matches_field,
+            &mut regions,
+        );
+    }
+    regions.sort_unstable();
+    regions
 }
 
 /// When two rules recognize the same characters, keep one.
@@ -1309,6 +1476,17 @@ pub fn scan_text_capped(
     policy: Policy,
     cap: usize,
 ) -> ScanReport {
+    scan_text_capped_with_repository_policy(text, allowlist, policy, cap, &HashSet::new())
+}
+
+/// The caller authorizes repository identities; strict scans still ignore local waivers.
+pub fn scan_text_capped_with_repository_policy(
+    text: &str,
+    allowlist: &HashSet<String>,
+    policy: Policy,
+    cap: usize,
+    repository_identities: &HashSet<String>,
+) -> ScanReport {
     if cap == 0 {
         // No budget at all = not one byte was scanned. The verdict is unaffected (no hit could
         // be reported from here anyway), but "this is all of it" must not be said.
@@ -1323,8 +1501,32 @@ pub fn scan_text_capped(
     // With no line carrying the annotation, not even the line index is built.
     let any_pragma = policy.inline_pragma && view.contains(INLINE_PRAGMA);
     let pragma_lines = any_pragma.then(|| Lines::new(&view));
-    let (raw, truncated) = raw_hits_capped_in(&view, cap, &media::regions(text), |found, start| {
-        if policy.allowlist && is_allowlisted(found, allowlist) {
+    // JSON strings receive entropy inspection after decoding. Wire escapes cannot split a long
+    // semantic token into short findings; provider rules still inspect both representations.
+    let mut json_regions = Vec::new();
+    let mut offset = 0;
+    for (chunk, value) in jsonl_chunks(text) {
+        if value.is_some() {
+            json_regions.extend(
+                json_string_regions(chunk)
+                    .into_iter()
+                    .map(|(start, end)| (start + offset, end + offset)),
+            );
+        }
+        offset += chunk.len();
+    }
+    let mut semantic_regions = json_regions.clone();
+    semantic_regions.extend(paths::regions(text));
+    let semantic_regions = merge_regions(semantic_regions);
+    let (raw, truncated) = raw_hits_capped_in(&view, cap, &semantic_regions, |found, start| {
+        if (!repository_identities.is_empty() || (policy.allowlist && !allowlist.is_empty()))
+            && semantic_match_value(text, &json_regions, start, start + found.len()).is_some_and(
+                |value| {
+                    repository_policy::allows(repository_identities, &value)
+                        || (policy.allowlist && is_allowlisted(&value, allowlist))
+                },
+            )
+        {
             return false;
         }
         match &pragma_lines {
@@ -1350,7 +1552,14 @@ pub fn scan_text_capped(
         unscanned: Unscanned::default(),
     };
     if !report.truncated {
-        scan_semantic_strings(text, allowlist, policy, cap, &mut report);
+        scan_semantic_strings(
+            text,
+            allowlist,
+            policy,
+            cap,
+            &mut report,
+            repository_identities,
+        );
     }
     report
 }
@@ -1362,6 +1571,7 @@ fn scan_semantic_strings(
     policy: Policy,
     cap: usize,
     report: &mut ScanReport,
+    repository_identities: &HashSet<String>,
 ) {
     let mut seen: HashSet<_> = report
         .hits
@@ -1376,31 +1586,34 @@ fn scan_semantic_strings(
         }
         if value.is_some() {
             let media = media::regions(chunk);
-            let mut previous: Option<(usize, String)> = None;
+            let credentials = field_value_regions(chunk, is_credential_field);
+            let path_fields = field_value_regions(chunk, paths::is_path_field);
             for (start, end) in json_string_regions(chunk) {
                 let Ok(decoded) = serde_json::from_str::<String>(&chunk[start - 1..end + 1]) else {
                     continue;
                 };
-                let field = previous.as_ref().and_then(|(previous_end, key)| {
-                    (chunk[*previous_end..start - 1].trim() == ":").then_some(key.as_str())
-                });
                 let line = lines.number_at(offset + start);
                 if !(policy.inline_pragma && lines.text_at(offset + start).contains(INLINE_PRAGMA))
                 {
                     let view = view_of(&decoded);
                     let remaining = cap.saturating_sub(report.hits.len());
-                    let mut record = |found: &str, _start: usize| {
-                        !(policy.allowlist && is_allowlisted(found, allowlist))
+                    let mut record = |found: &str, start: usize| {
+                        let value = &decoded[start..start + found.len()];
+                        !(policy.allowlist && is_allowlisted(value, allowlist))
+                            && !repository_policy::allows(repository_identities, value)
                             && seen.insert((line, fingerprint(found)))
                     };
-                    let media = if media::contains(&media, start, end) {
+                    let media = if media::contains(&media, start, end)
+                        || (media::contains(&path_fields, start, end)
+                            && paths::field_path(&decoded))
+                    {
                         vec![(0, view.len())]
                     } else {
-                        Vec::new()
+                        paths::regions(&decoded)
                     };
                     let (mut raw, mut truncated) =
                         raw_hits_capped_in(&view, remaining.saturating_add(1), &media, &mut record);
-                    if !truncated && field.is_some_and(is_credential_field) {
+                    if !truncated && media::contains(&credentials, start, end) {
                         for (start, end) in entropy_candidate_spans(&view, true) {
                             if !rules::preset_allows(&view[start..end])
                                 && record(&view[start..end], start)
@@ -1432,7 +1645,6 @@ fn scan_semantic_strings(
                             }
                         }));
                 }
-                previous = Some((end + 1, decoded));
                 if report.truncated {
                     break;
                 }
@@ -1532,7 +1744,13 @@ fn scan_text_capped_registered_views(
         if remaining == 0 {
             // When the registered rules fill the budget exactly, probe for one built-in hit so
             // the report can still answer whether it is complete.
-            let more = scan_text_capped(text, allowlist, policy, 1);
+            let more = scan_text_capped_with_repository_policy(
+                text,
+                allowlist,
+                policy,
+                1,
+                registered.repository_identities(),
+            );
             return ScanReport {
                 binary_carriers: 0,
                 hits,
@@ -1541,7 +1759,13 @@ fn scan_text_capped_registered_views(
             };
         }
 
-        let built_in = scan_text_capped(text, allowlist, policy, remaining);
+        let built_in = scan_text_capped_with_repository_policy(
+            text,
+            allowlist,
+            policy,
+            remaining,
+            registered.repository_identities(),
+        );
         hits.extend(built_in.hits);
         ScanReport {
             binary_carriers: 0,
@@ -1670,7 +1894,7 @@ pub(crate) fn oversized_finding_spans(
     threshold: usize,
     include: impl Fn(&str) -> bool,
 ) -> Vec<(usize, usize)> {
-    oversized_finding_spans_in(text, threshold, false, include)
+    oversized_finding_spans_in(text, threshold, false, false, include)
 }
 
 #[cfg(feature = "secret-vault")]
@@ -1678,23 +1902,32 @@ pub(crate) fn oversized_finding_spans_in(
     text: &str,
     threshold: usize,
     image: bool,
+    credential_field: bool,
     include: impl Fn(&str) -> bool,
 ) -> Vec<(usize, usize)> {
     let view = view_of(text);
     let media = if image {
         vec![(0, view.len())]
     } else {
-        media::regions(text)
+        entropy_exempt_regions(text)
     };
     let mut spans: Vec<(usize, usize)> = vec![];
     // `keep` always refuses, so no `Raw` is materialized and no span budget is
     // charged: this pass exists only to observe where the long findings are.
-    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, |found, start| {
+    let mut record = |found: &str, start: usize| {
         if found.len() > threshold && include(&text[start..start + found.len()]) {
             spans.push((start, start + found.len()));
         }
         false
-    });
+    };
+    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, &mut record);
+    if credential_field {
+        for (start, end) in entropy_candidate_spans(&view, true) {
+            if !rules::preset_allows(&view[start..end]) {
+                record(&view[start..end], start);
+            }
+        }
+    }
     spans.sort_unstable();
     spans.dedup();
     spans
@@ -1913,10 +2146,10 @@ fn collect_candidate(
         newly_seen.push(Zeroizing::new(literal.to_string()));
         true
     };
-    let media = if image {
+    let media = if image || (field.is_some_and(paths::is_path_field) && paths::field_path(text)) {
         vec![(0, view.len())]
     } else {
-        media::regions(text)
+        entropy_exempt_regions(text)
     };
     let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, &mut record);
     if field.is_some_and(is_credential_field) {
@@ -1946,7 +2179,7 @@ fn collect_candidate(
     batch.over_capacity |= over_capacity;
 }
 
-fn is_credential_field(field: &str) -> bool {
+pub(crate) fn is_credential_field(field: &str) -> bool {
     field
         .to_ascii_lowercase()
         .split(['_', '-', '.'])
@@ -1981,12 +2214,14 @@ fn visit_candidate_values(
             }
         }
         serde_json::Value::Object(map) => {
+            let has_image = image || media::image_data(map).is_some();
+            let has_image_source = media::image_source(map);
             for (key, value) in map {
                 if verified_envelope && key == "_object_hash" {
                     continue;
                 }
                 visit(key, None, false);
-                let image = key == "data" && media::image_data(map).is_some();
+                let image = (key == "data" && has_image) || (key == "source" && has_image_source);
                 visit_candidate_values(value, Some(key), image, visit);
             }
         }
@@ -5184,8 +5419,12 @@ fn scan_messages(
 /// Overlapping findings cover their union. Selecting only an inner finding
 /// would leave the outer sensitive region partly exposed.
 pub fn scrub(text: &str) -> (String, usize) {
+    scrub_in(text, false)
+}
+
+pub(crate) fn scrub_in(text: &str, credential_field: bool) -> (String, usize) {
     let mut writer = RedactionWriter::new(text);
-    for hit in raw_hits(text) {
+    for hit in raw_hits(text, credential_field) {
         writer.add(hit);
     }
     writer.finish()
@@ -5195,8 +5434,9 @@ pub fn scrub(text: &str) -> (String, usize) {
 pub(crate) fn scrub_registered(
     text: &str,
     registered: &RegisteredMatcher,
+    credential_field: bool,
 ) -> (String, usize, Vec<String>) {
-    let mut raw = raw_hits(text).into_iter().peekable();
+    let mut raw = raw_hits(text, credential_field).into_iter().peekable();
     let mut writer = RedactionWriter::new(text);
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
@@ -5287,6 +5527,109 @@ mod tests {
 
     fn none() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// Plain identifiers need stronger evidence, while credential fields retain discovery.
+    #[test]
+    fn long_plaintext_is_not_a_bare_secret_but_credential_context_still_counts() {
+        for value in [
+            "process.env.CI_MERGE_REQUEST_DIFF_BASE_SHA",
+            "process.env.CI_DEFAULT_BRANCH",
+            "synchronizeRepositoryDeclarations",
+            "CustomerAccountConfiguration20260928",
+        ] {
+            assert!(scan_text(value, &none()).is_empty(), "{value}");
+            assert_eq!(scrub(value), (value.to_owned(), 0));
+            let credential = serde_json::json!({"authorization":value}).to_string();
+            assert!(!scan_text(&credential, &none()).is_empty(), "{value}");
+        }
+    }
+
+    /// Compact bare credentials retain discovery at the transition to stronger long-token evidence.
+    #[test]
+    fn short_bare_values_keep_their_entropy_floor_at_the_length_boundary() {
+        for value in [
+            "eXhMRMpsLYICuvLwBGGclKDR",
+            "doFUmVzsZg5twmD0nIBsiRzD",
+            "Mg05q0StrfACFEJhoJElr_ZU",
+        ] {
+            assert_eq!(value.len(), 24);
+            assert!(
+                scan_text(value, &none())
+                    .iter()
+                    .any(|hit| hit.rule == "high-entropy-value")
+            );
+            let extended = format!("{value}{}", &value[..1]);
+            assert_eq!(extended.len(), 25);
+            assert!(scan_text(&extended, &none()).is_empty(), "{extended}");
+        }
+        let hex = "38b3c7f3654666d50c60cbad4d5df86b";
+        assert!(
+            scan_text(hex, &none())
+                .iter()
+                .any(|hit| hit.rule == "high-entropy-value")
+        );
+    }
+
+    /// The length cutoff applies to whole entropy-only tokens, while evidence still finds credentials.
+    #[test]
+    fn bare_entropy_limit_preserves_evidenced_findings() {
+        let data = media::fixture();
+        for length in [16_383, 16_384, 16_385, data.len()] {
+            let token = &data[..length];
+            let text = serde_json::json!({"message":token}).to_string();
+            let report = scan_text_capped(&text, &none(), Policy::STRICT, 100);
+            assert!(!report.truncated);
+            assert_eq!(report.hits.len(), usize::from(length <= 16_384));
+            if let Some(hit) = report.hits.first() {
+                assert_eq!(hit.fingerprint, fingerprint(token));
+            }
+        }
+
+        for text in [
+            serde_json::json!({"authorization":data}).to_string(),
+            serde_json::json!({"authorization":["", [data]]}).to_string(),
+        ] {
+            let report = scan_text_capped(&text.replace('/', "\\/"), &none(), Policy::STRICT, 100);
+            assert!(!report.truncated);
+            assert!(
+                report
+                    .hits
+                    .iter()
+                    .any(|hit| hit.fingerprint == fingerprint(&data))
+            );
+        }
+        let text = serde_json::json!({"message":data}).to_string();
+        let report = scan_text_capped(&text.replace('/', "\\/"), &none(), Policy::STRICT, 100);
+        assert!(!report.truncated && report.hits.is_empty());
+
+        let mut embedded = data.clone();
+        embedded.insert_str(40, "/AKIA4X7QZ2M5RT6VW3JH///");
+        assert!(
+            scan_text(&embedded, &none())
+                .iter()
+                .any(|hit| hit.rule == "aws-access-token")
+        );
+        let short = &data[4..44];
+        assert!(
+            scan_text(&format!("{data} {short}"), &none())
+                .iter()
+                .any(|hit| hit.fingerprint == fingerprint(short))
+        );
+
+        #[cfg(feature = "secret-vault")]
+        {
+            let secret = &data[13..40];
+            let registered =
+                crate::domain::secret_filter::Matcher::for_test(&[("explicit", secret)]);
+            assert!(
+                scan_text_registered_with(&data, &none(), &registered)
+                    .iter()
+                    .any(|hit| {
+                        hit.rule == "registered-secret" && hit.fingerprint == fingerprint(secret)
+                    })
+            );
+        }
     }
 
     #[cfg(feature = "secret-vault")]
@@ -10134,14 +10477,10 @@ mod media_payload_tests {
             + "\n"
     }
 
-    /// An inline image is neither a dictionary candidate nor an oversized finding only when it
-    /// is the payload of a `data:` URL whose declared media type matches the decoded file
-    /// header. The same bytes outside that carrier, behind text that merely ends in
-    /// `;base64,`, behind a data URL declaring another type, or a token that only starts like a
-    /// header, are all still reported.
+    /// Within the entropy discovery limit, only a matching data URL exempts an image payload.
     #[test]
     fn base64_media_payloads_are_exempt_only_inside_a_matching_data_url() {
-        let threshold = 64 * 1024;
+        let threshold = MAX_BARE_ENTROPY_BYTES / 2;
         for (media_type, prefix) in [
             ("image/jpeg", "/9j/4AAQSkZJRg"),
             ("image/png", "iVBORw0KGgoAAAANSUhEUg"),

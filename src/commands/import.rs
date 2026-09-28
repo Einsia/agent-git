@@ -2003,7 +2003,7 @@ mod tests {
         );
     }
 
-    /// The declaration commit has to carry the same protected workspace metadata as a turn.
+    /// The declaration commit must protect credentials in workspace paths before they enter history.
     #[test]
     fn a_new_session_line_projects_its_workspace_metadata_before_publishing() {
         let d = tempfile::tempdir().unwrap();
@@ -2014,11 +2014,12 @@ mod tests {
         repo.commit("main file line").unwrap();
         repo.git(&["branch", "session"]).unwrap();
 
-        let cwd = "/Users/Use9rK2mQ7xR4vB1nT8sW3zY6cL5jH0gF2aE4pU-w";
+        let secret = "AKIA4X7QZ2M5RT6VW3JH";
+        let cwd = format!("/work/{secret}");
         let link = Link {
             source: "codex".into(),
             session_id: "synthetic-session".into(),
-            cwd: Some(cwd.into()),
+            cwd: Some(cwd.clone()),
             ..Link::new("codex", "synthetic-session", None)
         };
         let published = declare_session_line(&repo, "session", &link)
@@ -2028,7 +2029,12 @@ mod tests {
 
         assert_ne!(metadata.cwd, cwd);
         assert!(metadata.cwd.contains("AGIT_SECRET_V1:"));
-        assert!(!repo.show_raw(&published, meta::FILE).unwrap().contains(cwd));
+        assert!(
+            !repo
+                .show_raw(&published, meta::FILE)
+                .unwrap()
+                .contains(secret)
+        );
     }
 
     /// A failed birth leaves no branch that can masquerade as a file line on the next retry.

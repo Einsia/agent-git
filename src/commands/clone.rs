@@ -980,9 +980,8 @@ fn validate_copy_response(
 
 /// Promote a read-only checkout into "the one under your name".
 ///
-/// Four things, and the order matters: have the hub create the copy first (a failure there has
-/// touched nothing locally), then change origin and upstream, and move the directory last. Moving
-/// the directory goes last because it is the only step whose failure needs a person to clean up.
+/// Remote copy creation precedes local changes. Source policy is detached before the checkout
+/// adopts the copy's identity, and remotes change before the directory moves.
 ///
 /// The directory has to move: `~/.agit/repos/<owner>/<name>` records which repo on the hub this is
 /// a checkout of, and after the promotion that agent is yours, so the path following along is what
@@ -1152,6 +1151,12 @@ fn relocate_promoted_checkout(
         );
     }
 
+    crate::domain::secret_filter::RepositoryDictionary::open(checkout)?.reset_policy_for_copy(
+        &crate::domain::secret_filter::DeclarationTarget {
+            hub: source_identity.hub.clone(),
+            repository_id: source_identity.agent_id.clone(),
+        },
+    )?;
     identity::rebind(repo, source_identity, copy_identity)?;
     repo.set_remote(push_url)?;
     repo.set_upstream(&source.clone_url)?;

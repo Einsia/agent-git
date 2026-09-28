@@ -497,7 +497,7 @@ impl Redactor {
         })
     }
 
-    #[cfg(feature = "rc")]
+    #[cfg(feature = "secret-vault")]
     fn scrub_persona_json(
         &self,
         value: &mut serde_json::Value,
@@ -572,6 +572,10 @@ impl Redactor {
 
     /// Mapping persistence must succeed before any protected bytes leave this call.
     pub fn try_scrub(&self, text: &str) -> crate::Result<Report> {
+        self.try_scrub_in(text, false)
+    }
+
+    fn try_scrub_in(&self, text: &str, credential_field: bool) -> crate::Result<Report> {
         // ── 1. Secrets first: later rewrites must not change rule hits, or the reverse ──
         // Inspect both policies on original bytes. Rewriting either first can
         // destroy the evidence needed to recognize an overlapping sensitive region.
@@ -584,8 +588,11 @@ impl Redactor {
             );
             (report.text, report.replacements, Vec::new())
         } else {
-            let scrubbed =
-                crate::domain::secrets::scrub_registered(text, &self.registered.snapshot());
+            let scrubbed = crate::domain::secrets::scrub_registered(
+                text,
+                &self.registered.snapshot(),
+                credential_field,
+            );
             anyhow::ensure!(
                 !self.require_repository || scrubbed.1 == 0,
                 "content withheld: reversible protection requires the session's Agent repository"
@@ -594,7 +601,7 @@ impl Redactor {
         };
 
         #[cfg(not(feature = "secret-vault"))]
-        let (out, secrets) = crate::domain::secrets::scrub(text);
+        let (out, secrets) = crate::domain::secrets::scrub_in(text, credential_field);
         #[cfg(not(feature = "secret-vault"))]
         let registered_ids = Vec::new();
 
@@ -759,26 +766,33 @@ impl Redactor {
     }
 
     pub fn try_scrub_json(&self, value: &serde_json::Value) -> crate::Result<JsonReport> {
+        #[cfg(feature = "secret-vault")]
+        if let Some(dictionary) = &self.dictionary {
+            let protected = dictionary
+                .protect_jsonl(&serde_json::to_string(value)?, &self.registered.snapshot())?;
+            anyhow::ensure!(
+                protected.intact == 0,
+                "JSON exceeds the reversible protection limit"
+            );
+            let mut value = serde_json::from_str(&protected.text)?;
+            let mut totals = JsonTotals::default();
+            self.scrub_persona_json(&mut value, &mut totals)?;
+            return Ok(JsonReport {
+                value,
+                secrets: protected.replacements,
+                paths: totals.paths,
+                ips: totals.ips,
+                registered_ids: Vec::new(),
+            });
+        }
         let mut value = value.clone();
         let mut totals = JsonTotals::default();
-        self.scrub_json_inner(&mut value, &mut totals)?;
+        self.scrub_json_inner(&mut value, &mut totals, false)?;
         // Some built-in gitleaks rules need assignment context spanning a JSON
         // key and value. Preserve the previous whole-wire pass after semantic
         // registered matching; otherwise `{"token":"..."}` could regress
         // even though quoted/newline registered values are now handled safely.
         let wire = serde_json::to_string(&value)?;
-        #[cfg(feature = "secret-vault")]
-        let (wire, built_in) = if let Some(dictionary) = &self.dictionary {
-            let report = dictionary.protect_jsonl(&wire, &self.registered.snapshot())?;
-            anyhow::ensure!(
-                report.intact == 0,
-                "JSON exceeds the reversible protection limit"
-            );
-            (report.text, report.replacements)
-        } else {
-            crate::domain::secrets::scrub(&wire)
-        };
-        #[cfg(not(feature = "secret-vault"))]
         let (wire, built_in) = crate::domain::secrets::scrub(&wire);
         if built_in > 0
             && let Ok(scrubbed) = serde_json::from_str(&wire)
@@ -799,16 +813,17 @@ impl Redactor {
         &self,
         value: &mut serde_json::Value,
         totals: &mut JsonTotals,
+        credential_field: bool,
     ) -> crate::Result<()> {
         match value {
             serde_json::Value::String(text) => {
-                let report = self.try_scrub(text)?;
+                let report = self.try_scrub_in(text, credential_field)?;
                 totals.add(&report);
                 *text = report.text;
             }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    self.scrub_json_inner(value, totals)?;
+                    self.scrub_json_inner(value, totals, credential_field)?;
                 }
             }
             serde_json::Value::Object(map) => {
@@ -816,7 +831,11 @@ impl Redactor {
                 for (key, mut value) in old {
                     let key_report = self.try_scrub(&key)?;
                     totals.add(&key_report);
-                    self.scrub_json_inner(&mut value, totals)?;
+                    self.scrub_json_inner(
+                        &mut value,
+                        totals,
+                        crate::domain::secrets::is_credential_field(&key),
+                    )?;
                     // Redaction can theoretically collapse two keys. Keep the
                     // first instead of losing the whole object or restoring a
                     // secret-bearing key on the outbound path.
@@ -1074,6 +1093,65 @@ mod tests {
         assert!(projected[2].secret_projection);
     }
 
+    /// Device-control streams and native history preserve ordinary links while exact allowances retain restoration.
+    #[cfg(feature = "rc")]
+    #[test]
+    fn device_control_preserves_locations_across_stream_and_history() {
+        use crate::domain::secret_filter::{Matcher, RepositoryDictionary};
+        let directory = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(directory.path()).unwrap();
+        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
+        let redactor = Redactor::new(persona())
+            .for_device_control()
+            .with_repository(repo.root())
+            .unwrap()
+            .with_native_context("codex", "", repo.root(), repo.root());
+        let path = "/Users/alice/Projects/onepager-qa/reports/frontier-code-2026-09-28.md";
+        let url = "https://docs.example.org/docx/R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let text = format!("[Local report]({path})\n[Web report]({url})");
+        let mut stream = redactor.stream();
+        assert!(stream.push(&text[..35]).unwrap().text.is_empty());
+        assert!(stream.push(&text[35..]).unwrap().text.is_empty());
+        assert_eq!(stream.flush().unwrap().text, text);
+        let value = serde_json::json!({"text":text,"file_path":"artifacts/R7kQ2mXv9LpZ4tNc8WjF3bHy/output"});
+        assert_eq!(redactor.try_scrub_json(&value).unwrap().value, value);
+        let page = redactor.scrub_native_batch(&[(&value, &[])]);
+        assert_eq!(page[0].value, value);
+        assert!(!page[0].secret_projection);
+        assert!(dictionary.review().unwrap().is_empty());
+
+        let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let value_with_secret = serde_json::json!({"text":format!("{text} {credential}")});
+        let page = redactor.scrub_native_batch(&[(&value_with_secret, &[])]);
+        let protected = page[0].value["text"].as_str().unwrap();
+        assert!(protected.contains(&text));
+        assert!(!protected.contains(credential));
+
+        let prior = serde_json::json!({"password":path}).to_string();
+        let protected = dictionary.protect_jsonl(&prior, &Matcher::empty()).unwrap();
+        assert!(!protected.text.contains(path));
+        let value = serde_json::json!({"text":format!("[Local report]({path})")});
+        let page = redactor.scrub_native_batch(&[(&value, &[])]);
+        assert_ne!(page[0].value, value);
+        let token = serde_json::from_str::<serde_json::Value>(&protected.text).unwrap();
+        let id = token["password"]
+            .as_str()
+            .unwrap()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .trim_end_matches('}');
+        dictionary.allow(id).unwrap();
+        assert_eq!(
+            redactor.scrub_native_batch(&[(&value, &[])])[0].value,
+            value
+        );
+        assert_eq!(
+            dictionary.hydrate_jsonl(&protected.text).unwrap().text,
+            prior
+        );
+    }
+
     fn persona() -> Persona {
         Persona {
             username: Some("nana".into()),
@@ -1202,6 +1280,42 @@ mod tests {
         let r = Redactor::new(Persona::default()).scrub("no persona here");
         assert_eq!(r.text, "no persona here");
         assert_eq!(r.paths, 0);
+    }
+
+    /// Credential context survives arrays but ends at nested object fields, without a repository.
+    #[test]
+    fn json_credentials_above_the_bare_entropy_limit_remain_redacted() {
+        let redactor = Redactor::new(Persona::default());
+        let data = crate::domain::secrets::media::fixture().replace(['/', '+'], "_");
+        for length in [16_384, 16_385, 32_768] {
+            let token = &data[..length];
+            let input = serde_json::json!({
+                "authorization": token,
+                "credentials": ["", [token], {"message": token}],
+                "message": token,
+            });
+            let report = redactor.try_scrub_json(&input).unwrap();
+            assert_eq!(
+                report.value["authorization"],
+                "[redacted:high-entropy-value]"
+            );
+            assert_eq!(
+                report.value["credentials"][1][0],
+                "[redacted:high-entropy-value]"
+            );
+            assert_eq!(report.value["credentials"][0], "");
+            if length > crate::domain::secrets::MAX_BARE_ENTROPY_BYTES {
+                assert_eq!(report.secrets, 2);
+                assert_eq!(report.value["message"], token);
+                assert_eq!(report.value["credentials"][2]["message"], token);
+            }
+            #[cfg(feature = "rc")]
+            {
+                let page = redactor.scrub_native_batch(&[(&input, &[])]);
+                assert!(page[0].secret_projection);
+                assert_eq!(page[0].value, report.value);
+            }
+        }
     }
 
     #[cfg(feature = "secret-vault")]

@@ -36,6 +36,21 @@ choice applies only to this invocation. Agent and script callers use a complete
 target or `AGIT_SESSION`; workspace bindings, native IDs, and the newest session
 do not choose what to publish. `--yes` does not select a missing target.
 
+## Review secret protection before pushing
+
+Before an authorized push, complete this review using the selected Agent repo, not the source-code repository:
+
+1. Inspect `agit secrets review --repo <agent-repo-path> --json` and run `agit scan <owner/repo>@<branch> --secrets --json`. Review existing protection candidates even when the scan is clean: already protected values appear as placeholders and may include false positives.
+2. Check the actual values in authorized local source content and assess them for the requested audience. `review` returns opaque IDs and policy metadata, not plaintext; a label or placeholder alone is insufficient evidence for `allow`. Keep real credentials and uncertain candidates protected.
+3. For each confirmed false positive, run `agit secrets allow <record-id> --repo <agent-repo-path> --reason <reason>`. When supplying the exact value directly, pipe it into `agit secrets allow --stdin --repo <agent-repo-path> --reason <reason>`. See [secrets](secrets.md) for input limits and structured local/synchronization results.
+4. Rescan after each batch of allowance changes and inspect synchronization status, then proceed with the original push target and options. A truncated or sampled report is not the full finding set; finish reviewing remaining findings before publishing. Keep genuine credentials protected throughout this workflow.
+
+Declarations synchronize immediately when possible and again before publication. Offline decisions remain pending; check their status before relying on server policy. Ordinary push refreshes acknowledged policy and completes pending synchronization before LFS, branch or tag uploads. First publication may create the selected repository before synchronization. An older Hub without the protocol reports a missing capability. `--dry-run` checks and reports pending synchronization without remote writes. A clean local scan does not acknowledge server policy.
+
+Use exact `allow` decisions for routine false positives. When publication is already authorized and you have determined that all remaining findings are suitable for that audience, you may use `--allow-secrets` yourself. Explain the classification and report use of the flag. The review above is the agent's responsibility within the existing publication authorization; a scanner finding alone does not require another user confirmation. Unexamined findings in a bounded report still require review; incomplete scans, missing objects, integrity failures, authorization errors and other publication errors need their own diagnosis.
+
+`--allow-secrets` applies only to this command's branch and version-tag requests, including verified LFS content. It emits a warning and reports any declarations whose synchronization did not complete. An ordinary retry does not inherit acceptance. Hiding an event from VIEW leaves LOG and Git history available for publication; it does not clear a historical credential finding.
+
 ## Interactive publication review
 
 Ordinary push runs the deterministic secret scan. Add `--audit` to review disclosure

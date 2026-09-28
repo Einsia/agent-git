@@ -5,7 +5,32 @@ server scan. A rejection from a supporting server identifies the rule, file or
 Git object location, line number and redacted excerpt. Reports contain a bounded
 sample, so the displayed locations need not include every occurrence.
 
-Review those locations and remove unintended credentials before publishing.
+Review those locations and classify each exact value for the publication audience. A local
+non-secret declaration accepts an existing record ID or stdin:
+
+```sh
+agit secrets allow sec_record_id --repo /path/to/agent-repo --reason "Public identifier"
+printf %s "$VALUE" | agit secrets allow --stdin --repo /path/to/agent-repo --reason "Test fixture"
+agit secrets unallow sec_record_id --repo /path/to/agent-repo --json
+```
+
+Declarations retain reasons, pending operations and any retained immutable repository target.
+The CLI synchronizes them immediately when possible and retains pending operations offline.
+Commands report `local_applied` in JSON even when synchronization returns nonzero. `review --json`
+distinguishes local policy from server acknowledgement. Ordinary push refreshes repository
+policy and synchronizes before any LFS, branch or tag upload. First publication may create the
+selected destination and bind its immutable identity before synchronization. Dry run checks and
+reports the planned work without remote writes. A changed Hub or repository cannot inherit
+another destination's declarations. Remote revocations and revision conflicts require a new
+reviewed local decision before a conflicting write can be attempted.
+
+Only repository declarations synchronize. Global allowlists and built-in exemptions remain
+local. An older backend without the exact-policy endpoint blocks ordinary publication when
+synchronization is required. An explicitly accepted push retains its existing route and reports
+any declarations left pending. Deploy the backend policy support before releasing a CLI that
+relies on it; verify ordinary public Git and LFS publication against that deployment.
+
+Review all findings, including those omitted from bounded samples, before accepting a push.
 To deliberately accept findings for the selected push, use:
 
 ```sh

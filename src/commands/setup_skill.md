@@ -166,6 +166,12 @@ to extract verified payload bytes. A cold object is downloaded through that
 repository's authenticated Hub connection. Automatic checkout never follows a
 repository-supplied LFS endpoint.
 
+## Review secret protection before an authorized push
+
+Before running `agit push`, inspect `agit secrets review --repo <agent-repo-path> --json` and run `agit scan <owner/repo>@<branch> --secrets --json`. Verify which values need protection from their source context; keep real credentials and uncertain candidates protected. For each confirmed false positive, run `agit secrets allow <record-id> --repo <agent-repo-path> --reason <reason>`; use `allow --stdin` when supplying the exact value directly. Rescan after the allowance changes, then continue with the authorized push. Read [push](references/commands/push.md) for the review sequence and [secrets](references/commands/secrets.md) for local results and pending synchronization.
+
+Preserve the original repository, branches and publication scope. A truncated report is only a sample; finish reviewing the remaining findings. Check acknowledgement separately from local completion: offline declarations remain pending, and ordinary push must synchronize them before publication. Resolve version conflicts with a new reviewed decision. An older Hub may lack this capability. Handle routine false positives with exact `allow` decisions. Once all remaining findings are reviewed and appropriate for the audience, you may use `push --allow-secrets` within the user's publication authorization and report both the judgment and flag usage. A scanner finding alone does not require another user confirmation. Distinguish credential findings from pending synchronization, incomplete scans and other publication failures. Removing an event from VIEW leaves its LOG and Git history intact.
+
 ## Shared files on the file line
 
 `main` is the file line: it never carries a session, and it is where README.md, AGENTS.md, `memory/` and `skills/` live. Everything `agit new` inherits and everything teammates see when they `agit clone` comes from here. Updating it is a file commit — no `git add`, no session link:

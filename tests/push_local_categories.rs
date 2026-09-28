@@ -1,4 +1,7 @@
-//! Local publication refusals preserve their category without reaching the Hub or moving refs.
+//! Local publication refusals preserve their category without publishing content or moving refs.
+
+#[path = "support/publication_http.rs"]
+mod publication_http;
 
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
@@ -130,9 +133,11 @@ impl Lab {
     }
 
     fn push(&self, target: &str, mode: &str, supervised: bool) -> Output {
-        self.push_command(target, mode, supervised)
-            .output()
-            .unwrap()
+        self.push_output(&mut self.push_command(target, mode, supervised))
+    }
+
+    fn push_output(&self, command: &mut Command) -> Output {
+        publication_http::with_missing_agent_probe(&self.hub, || command.output().unwrap())
     }
 
     fn push_command(&self, target: &str, mode: &str, supervised: bool) -> Command {
@@ -238,7 +243,7 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
                 }
                 _ => {}
             }
-            let output = command.output().unwrap();
+            let output = lab.push_output(&mut command);
             assert_output(&output, mode, 4, "is malformed");
             assert_eq!(lab.state(), blocked);
             assert_eq!(lab.git(&repo, &["show-ref"]), refs);
@@ -250,7 +255,7 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
             if accepted {
                 command.arg("--allow-secrets");
             }
-            let invalid_config = command.output().unwrap();
+            let invalid_config = lab.push_output(&mut command);
             assert_output(&invalid_config, mode, 2, "takes `os` or `file`");
             assert_eq!(lab.state(), blocked);
             lab.no_requests();
@@ -270,11 +275,10 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
         assert!(!String::from_utf8_lossy(&policy.stdout).contains(SECRET));
         assert!(!String::from_utf8_lossy(&policy.stderr).contains(SECRET));
         assert_eq!(lab.state(), policy_state);
-        let allowed = lab
-            .push_command("alice/qa", mode, false)
-            .env("AGIT_ALLOW_SECRETS", "1")
-            .output()
-            .unwrap();
+        let allowed = lab.push_output(
+            lab.push_command("alice/qa", mode, false)
+                .env("AGIT_ALLOW_SECRETS", "1"),
+        );
         assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
         assert_eq!(lab.state(), policy_state);
         assert_eq!(lab.git(&repo, &["show-ref"]), refs);
@@ -352,11 +356,10 @@ fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
         &["commit", "-m", "Remove sensitive pointer from tip"],
     );
     let refs = lab.git(&repo, &["show-ref"]);
-    let output = lab
-        .command(env!("CARGO_BIN_EXE_agit"))
-        .args(["push", "alice/qa", "--all"])
-        .output()
-        .unwrap();
+    let output = lab.push_output(
+        lab.command(env!("CARGO_BIN_EXE_agit"))
+            .args(["push", "alice/qa", "--all"]),
+    );
     assert_output(&output, "human", 1, "cannot complete the secret scan");
     assert_eq!(lab.git(&repo, &["show-ref"]), refs);
     lab.no_requests();

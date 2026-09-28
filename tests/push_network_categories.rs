@@ -149,6 +149,14 @@ impl Lab {
         self.push_with_visibility(target, mode, dry_run, Some("--private"))
     }
 
+    fn warm_scan(&self, target: &str) {
+        let output = publication_http::with_missing_agent_probe(&self.hub, || {
+            self.push(target, "human", true)
+        });
+        assert!(output.status.success(), "{output:?}");
+        self.no_requests();
+    }
+
     fn push_with_visibility(
         &self,
         target: &str,
@@ -213,6 +221,76 @@ impl Lab {
             std::io::ErrorKind::WouldBlock
         );
     }
+
+    #[cfg(unix)]
+    fn confirmed_copy_push(&self) -> (u32, String) {
+        let template = self.command(env!("CARGO_BIN_EXE_agit"));
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        command.args(["push", "other/qa", "-b", "main"]);
+        command.cwd(template.get_current_dir().unwrap());
+        command.env_clear();
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command.env("TERM", "xterm");
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let mut writer = pty.master.take_writer().unwrap();
+        let text = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = Arc::clone(&text);
+        let reading = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..count]));
+            }
+        });
+        let mut child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut confirmed = false;
+        let status = loop {
+            if !confirmed
+                && text
+                    .lock()
+                    .unwrap()
+                    .contains("create alice/qa under your name and publish it?")
+            {
+                writer.write_all(b"y\n").unwrap();
+                writer.flush().unwrap();
+                confirmed = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(writer);
+        drop(pty.master);
+        publication_http::join(reading).unwrap();
+        let text = text.lock().unwrap().clone();
+        assert!(confirmed, "copy confirmation was not reached: {text}");
+        (
+            status
+                .unwrap_or_else(|| panic!("copy push timed out: {text}"))
+                .exit_code(),
+            text,
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -232,6 +310,7 @@ impl Drop for Lab {
 enum Reply {
     Status(u16),
     Json(Value),
+    Git(&'static str, String),
     Truncated,
 }
 
@@ -239,6 +318,8 @@ struct Step {
     request: String,
     reply: Reply,
     body: Option<Value>,
+    acceptance: bool,
+    agent_id: &'static str,
 }
 
 impl Step {
@@ -247,6 +328,8 @@ impl Step {
             request: request.into(),
             reply,
             body: None,
+            acceptance: false,
+            agent_id: AGENT_ID,
         }
     }
 
@@ -309,10 +392,17 @@ impl Server {
                     field("Authorization"),
                     Some("Bearer synthetic-publication-token")
                 );
+                assert_eq!(
+                    field("X-AgentGit-Accept-Secret-Findings"),
+                    step.acceptance.then_some("true")
+                );
                 if first.contains("service=git-receive-pack")
                     || first.contains("service=git-upload-pack")
                 {
-                    assert_eq!(field(identity::EXPECTED_AGENT_ID_HEADER), Some(AGENT_ID));
+                    assert_eq!(
+                        field(identity::EXPECTED_AGENT_ID_HEADER),
+                        Some(step.agent_id)
+                    );
                 }
                 let length =
                     field("Content-Length").map_or(0, |value| value.parse::<usize>().unwrap());
@@ -331,6 +421,11 @@ impl Server {
                     );
                 }
                 requests.push(step.request.clone());
+                if let Reply::Git(content_type, body) = &step.reply {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                    continue;
+                }
                 let (status, body) = match &step.reply {
                     Reply::Status(status) => (
                         *status,
@@ -346,6 +441,7 @@ impl Server {
                         stream.flush().unwrap();
                         continue;
                     }
+                    Reply::Git(..) => unreachable!(),
                 };
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 stream.flush().unwrap();
@@ -466,19 +562,22 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
                     ],
                 );
             }
-            // Warm only the ordinary local scan state; no Hub call or publication is admitted.
-            let dry = lab.push(&target, "human", true);
-            assert!(dry.status.success(), "{stage}: {dry:?}");
-            lab.no_requests();
+            lab.warm_scan(&target);
             let before = lab.state();
             let refs = lab.git(&path, &["show-ref"]);
             let get = format!("GET /api/agents/{target}");
             let steps = match stage {
                 "create-post" => vec![
                     Step::new(&get, Reply::Status(404)),
+                    Step::new(&get, Reply::Status(404)),
                     Step::new("POST /api/agents", reply),
                 ],
                 "foreign-access" => vec![
+                    Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
+                    Step::new(
+                        &format!("{get}/secret-allowances?expected_agent_id={AGENT_ID}"),
+                        Reply::Status(404),
+                    ),
                     Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
                     Step::new(
                         "GET /other/qa.git/info/refs?service=git-receive-pack",
@@ -486,6 +585,7 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
                     ),
                 ],
                 "foreign-org" => vec![
+                    Step::new(&get, Reply::Status(404)),
                     Step::new(&get, Reply::Status(404)),
                     Step::new("GET /api/orgs/other", reply),
                 ],
@@ -516,14 +616,13 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
             for rejection in [428, 503] {
                 let lab = Lab::new();
                 let path = lab.seed("team", "qa", true);
-                let dry = lab.push("team/qa", "human", true);
-                assert!(dry.status.success(), "{dry:?}");
-                lab.no_requests();
+                lab.warm_scan("team/qa");
                 let before = lab.state();
                 let refs = lab.git(&path, &["show-ref"]);
                 let server = Server::start(
                     &lab,
                     vec![
+                        Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                         Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                         Step::new(
                             "GET /api/orgs/team",
@@ -573,9 +672,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
     ] {
         let lab = Lab::new();
         let path = lab.seed("team", "qa", true);
-        let dry = lab.push("team/qa", "human", true);
-        assert!(dry.status.success(), "{dry:?}");
-        lab.no_requests();
+        lab.warm_scan("team/qa");
         let before = lab.state();
         let refs = lab.git(&path, &["show-ref"]);
         let confirmed = case == "confirmed-private";
@@ -620,6 +717,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
             _ => (Reply::Json(response), 4),
         };
         let mut steps = vec![
+            Step::new("GET /api/agents/team/qa", Reply::Status(404)),
             Step::new("GET /api/agents/team/qa", Reply::Status(404)),
             Step::new(
                 "GET /api/orgs/team",
@@ -690,9 +788,7 @@ fn identity_constraints_and_invalid_remote_ids_refuse_without_writes() {
                 )
                 .unwrap();
             }
-            let dry = lab.push("alice/qa", "human", true);
-            assert!(dry.status.success(), "{dry:?}");
-            lab.no_requests();
+            lab.warm_scan("alice/qa");
             let before = lab.state();
             let reply = match case {
                 "pinned-404" => Reply::Status(404),
@@ -739,9 +835,7 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
             &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
         )
         .unwrap();
-        let dry = lab.push("alice/qa", "human", true);
-        assert!(dry.status.success(), "{dry:?}");
-        lab.no_requests();
+        lab.warm_scan("alice/qa");
         let before = lab.state();
         let refs = lab.git(&path, &["show-ref"]);
         let url = format!("{}/alice/qa.git", lab.base);
@@ -754,6 +848,11 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
         let server = Server::start(
             &lab,
             vec![
+                Step::new(
+                    "GET /api/agents/alice/qa",
+                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
+                ),
+                Step::new(&policy_get(), Reply::Status(404)),
                 Step::new(
                     "GET /api/agents/alice/qa",
                     Reply::Json(remote(&lab, "alice", AGENT_ID)),
@@ -776,6 +875,491 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
         assert!(!lab.home.join("repos/alice/qa-2").exists());
         lab.no_requests();
     }
+}
+
+fn policy_view(revision: u64, decisions: Vec<Value>) -> Value {
+    json!({"version": 1, "agent_id": AGENT_ID, "revision": revision,
+        "value_identity_scheme": "sha256-v1", "decisions": decisions})
+}
+
+fn policy_get() -> String {
+    format!("GET /api/agents/alice/qa/secret-allowances?expected_agent_id={AGENT_ID}")
+}
+
+fn policy_decision(value: &str, state: &str, revision: u64) -> Value {
+    json!({"id":"policy-a", "value_identity":agit::domain::secrets::value_identity(value),
+        "state":state, "revision":revision, "reason":"Public fixture"})
+}
+
+fn declare_stdin(lab: &Lab, path: &Path, value: &str) -> Output {
+    let mut child = lab
+        .command(env!("CARGO_BIN_EXE_agit"))
+        .args([
+            "secrets",
+            "allow",
+            "--stdin",
+            "--reason",
+            "Public fixture",
+            "--json",
+            "--repo",
+        ])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn advertised_receive() -> Reply {
+    let packet = |text: &str| format!("{:04x}{text}", text.len() + 4);
+    Reply::Git(
+        "application/x-git-receive-pack-advertisement",
+        format!(
+            "{}0000{}0000",
+            packet("# service=git-receive-pack\n"),
+            packet(&format!(
+                "{} capabilities^{{}}\0report-status ofs-delta\n",
+                "0".repeat(40)
+            ))
+        ),
+    )
+}
+
+fn accepted_ref(reference: &str) -> Reply {
+    let packet = |text: &str| format!("{:04x}{text}", text.len() + 4);
+    Reply::Git(
+        "application/x-git-receive-pack-result",
+        format!(
+            "{}{}0000",
+            packet("unpack ok\n"),
+            packet(&format!("ok {reference}\n"))
+        ),
+    )
+}
+
+/// A remote allowance applies before the first local scan, independently of dictionary discovery.
+#[test]
+fn remote_declarations_enable_push_without_local_policy_state() {
+    use agit::domain::secret_filter::{Matcher, RepositoryDictionary};
+
+    for discovered in [false, true] {
+        let lab = Lab::new();
+        let path = lab.seed("alice", "qa", true);
+        let value = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        fs::write(path.join("AGENTS.md"), value).unwrap();
+        lab.git(&path, &["add", "."]);
+        lab.git(&path, &["commit", "-m", "Record public fixture"]);
+        let dictionary = RepositoryDictionary::open(&path).unwrap();
+        if discovered {
+            dictionary.protect_text(value, &Matcher::empty()).unwrap();
+        }
+        assert_eq!(dictionary.exists(), discovered);
+        assert!(!dictionary.has_policy_state().unwrap());
+
+        let remote = remote(&lab, "alice", AGENT_ID);
+        let server = Server::start(
+            &lab,
+            vec![
+                Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+                Step::new(
+                    &policy_get(),
+                    Reply::Json(policy_view(1, vec![policy_decision(value, "active", 1)])),
+                ),
+                Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
+                Step::new(
+                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                    advertised_receive(),
+                ),
+                Step::new(
+                    "POST /alice/qa.git/git-receive-pack",
+                    accepted_ref("refs/heads/main"),
+                ),
+            ],
+        );
+        let output = lab.push("alice/qa", "json2", false);
+        server.finish();
+        assert!(
+            output.status.success(),
+            "discovered={discovered}: {output:?}"
+        );
+        assert!(dictionary.has_policy_state().unwrap());
+        lab.no_requests();
+    }
+}
+
+/// An unsupported policy endpoint only blocks publication that depends on local declarations.
+#[test]
+fn old_hub_accepts_push_without_local_policy_state() {
+    let lab = Lab::new();
+    let path = lab.seed("alice", "qa", true);
+    let remote = remote(&lab, "alice", AGENT_ID);
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            Step::new(&policy_get(), Reply::Status(404)),
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
+            Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                advertised_receive(),
+            ),
+            Step::new(
+                "POST /alice/qa.git/git-receive-pack",
+                accepted_ref("refs/heads/main"),
+            ),
+        ],
+    );
+    let output = lab.push("alice/qa", "json2", false);
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!path.join(".git/agit/secret-dictionary/vault.json").exists());
+    lab.no_requests();
+}
+
+/// Copy confirmation changes policy authority even when the source history was fully scanned.
+#[cfg(unix)]
+#[test]
+fn confirmed_copy_push_uses_destination_policy_without_inheriting_source_allowances() {
+    for case in ["empty", "remote-allowance", "declaration-only"] {
+        let source_allows = case != "empty";
+        let lab = Lab::new();
+        let path = lab.seed("other", "qa", true);
+        identity::pin(
+            &Repo::at(&path),
+            &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+        )
+        .unwrap();
+        let value = if case == "declaration-only" {
+            "source approved fixture"
+        } else {
+            "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"
+        };
+        if case == "declaration-only" {
+            use agit::domain::secret_filter::{DeclarationTarget, RepositoryDictionary};
+            assert!(agit::domain::secrets::scan_text(value, &Default::default()).is_empty());
+            let dictionary = RepositoryDictionary::open(&path).unwrap();
+            let declared = dictionary
+                .allow_value(value.to_owned().into(), None)
+                .unwrap();
+            assert_eq!(declared.origins, vec!["declaration"]);
+            dictionary
+                .bind_declarations(&DeclarationTarget {
+                    hub: lab.base.clone(),
+                    repository_id: AGENT_ID.into(),
+                })
+                .unwrap();
+        }
+        if source_allows {
+            fs::write(path.join("AGENTS.md"), value).unwrap();
+            lab.git(&path, &["add", "."]);
+            lab.git(&path, &["commit", "-m", "Record source public fixture"]);
+        }
+        let source = remote(&lab, "other", AGENT_ID);
+        let destination = remote(&lab, "alice", OTHER_ID);
+        let source_policy = if source_allows {
+            policy_view(1, vec![policy_decision(value, "active", 1)])
+        } else {
+            policy_view(0, vec![])
+        };
+        let mut destination_policy = policy_view(0, vec![]);
+        destination_policy["agent_id"] = json!(OTHER_ID);
+        let mut steps = vec![
+            Step::new("GET /api/agents/other/qa", Reply::Json(source.clone())),
+            Step::new(
+                &format!("GET /api/agents/other/qa/secret-allowances?expected_agent_id={AGENT_ID}"),
+                Reply::Json(source_policy),
+            ),
+            Step::new("GET /api/agents/other/qa", Reply::Json(source.clone())),
+            Step::new(
+                "GET /other/qa.git/info/refs?service=git-receive-pack",
+                Reply::Status(403),
+            ),
+            Step::new("GET /api/agents/other/qa", Reply::Json(source)),
+            Step::new(
+                "POST /api/agents/other/qa/clone",
+                Reply::Json(json!({
+                    "agent_id":OTHER_ID, "forked_from":AGENT_ID, "owner":"alice", "name":"qa",
+                    "push_url":format!("{}/alice/qa.git",lab.base), "web_url":format!("{}/@alice/qa",lab.base)
+                })),
+            ),
+            Step::new("GET /api/agents/alice/qa", Reply::Json(destination)),
+            Step::new(
+                &format!("GET /api/agents/alice/qa/secret-allowances?expected_agent_id={OTHER_ID}"),
+                Reply::Json(destination_policy),
+            ),
+        ];
+        if !source_allows {
+            let mut advertise = Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                advertised_receive(),
+            );
+            advertise.agent_id = OTHER_ID;
+            steps.push(advertise);
+            steps.push(Step::new(
+                "POST /alice/qa.git/git-receive-pack",
+                accepted_ref("refs/heads/main"),
+            ));
+        }
+        let server = Server::start(&lab, steps);
+        let (status, output) = lab.confirmed_copy_push();
+        server.finish();
+        assert_eq!(
+            status,
+            if source_allows { 7 } else { 0 },
+            "{case}: {output}"
+        );
+        assert!(
+            !output.contains("cached repository policy belongs to a different"),
+            "{output}"
+        );
+        assert!(!path.exists());
+        let copied = Repo::at(lab.home.join("repos/alice/qa"));
+        assert_eq!(identity::read(&copied).unwrap().unwrap().agent_id, OTHER_ID);
+        assert_eq!(
+            copied.upstream_url(),
+            Some(format!("{}/other/qa.git", lab.base))
+        );
+        lab.no_requests();
+    }
+}
+
+#[test]
+fn exact_declaration_sync_enables_ordinary_branch_and_tag_push_but_not_another_value() {
+    use sha2::Digest as _;
+    let lab = Lab::new();
+    let path = lab.seed("alice", "qa", true);
+    let a = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let b = "ghp_T8nR4pYw6MkZ2sDc9XjH5bFu7vQe1aGt3iLs";
+    fs::create_dir_all(path.join("memory")).unwrap();
+    fs::write(path.join("memory/fixture.txt"), a).unwrap();
+    let pointer = agit::domain::lfs::Pointer {
+        oid: hex::encode(sha2::Sha256::digest(a.as_bytes())),
+        size: a.len() as u64,
+    };
+    fs::write(
+        path.join("memory/payload.txt"),
+        format!(
+            "version {}\noid sha256:{}\nsize {}\n",
+            agit::domain::lfs::VERSION,
+            pointer.oid,
+            pointer.size
+        ),
+    )
+    .unwrap();
+    let cache = agit::domain::lfs::local::object_path(&Repo::at(&path), &pointer).unwrap();
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(&cache, a).unwrap();
+    lab.git(&path, &["add", "."]);
+    lab.git(&path, &["commit", "-m", "Record public fixture"]);
+    lab.git(&path, &["tag", "-a", "fixture-version", "-m", a]);
+    let mut remote = remote(&lab, "alice", AGENT_ID);
+    remote["visibility"] = json!("public");
+    let decision = policy_decision(a, "active", 1);
+    let server = Server::start(&lab, vec![
+        Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+        Step::new(&policy_get(), Reply::Json(policy_view(0, vec![]))),
+        Step::new("POST /api/agents/alice/qa/secret-allowances", Reply::Json(json!({"version":1,"agent_id":AGENT_ID,"revision":1,"decision":decision})))
+            .with_body(json!({"version":1,"expected_agent_id":AGENT_ID,"expected_revision":0,"action":"allow","value_identity":agit::domain::secrets::value_identity(a),"reason":"Public fixture"})),
+    ]);
+    let output = declare_stdin(&lab, &path, a);
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let record = &result["result"]["value"]["record"];
+    assert_eq!(record["sync_status"], "synced", "{result}");
+    assert_eq!(record["server_policy_id"], "policy-a");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains(a));
+    assert!(!text.contains(&agit::domain::secrets::value_identity(a)));
+    let snapshot = policy_view(1, vec![decision.clone()]);
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            Step::new(&policy_get(), Reply::Json(snapshot.clone())),
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            Step::new("POST /alice/qa.git/info/lfs/objects/batch", Reply::Json(json!({"objects":[pointer]})))
+                .with_body(json!({"operation":"upload","transfers":["basic"],"objects":[pointer],"hash_algo":"sha256"})),
+            Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                advertised_receive(),
+            ),
+            Step::new(
+                "POST /alice/qa.git/git-receive-pack",
+                accepted_ref("refs/heads/main"),
+            ),
+            Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                advertised_receive(),
+            ),
+            Step::new(
+                "POST /alice/qa.git/git-receive-pack",
+                accepted_ref("refs/tags/fixture-version"),
+            ),
+        ],
+    );
+    let output = lab.push_with_visibility("alice/qa", "json2", false, Some("--public"));
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    fs::write(path.join("memory/unallowed.txt"), b).unwrap();
+    lab.git(&path, &["add", "."]);
+    lab.git(&path, &["commit", "-m", "Record unallowed fixture"]);
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
+            Step::new(&policy_get(), Reply::Json(snapshot)),
+        ],
+    );
+    let output = lab.push("alice/qa", "json2", false);
+    server.finish();
+    assert_failure(&output, "json2", 7);
+    lab.no_requests();
+    let refs = lab.git(&path, &["show-ref"]);
+    let revoked = policy_decision(a, "revoked", 2);
+    let server = Server::start(&lab, vec![
+        Step::new("GET /api/agents/alice/qa", Reply::Json(self::remote(&lab, "alice", AGENT_ID))),
+        Step::new(&policy_get(), Reply::Json(policy_view(1, vec![decision]))),
+        Step::new("POST /api/agents/alice/qa/secret-allowances", Reply::Json(json!({"version":1,"agent_id":AGENT_ID,"revision":2,"decision":revoked})))
+            .with_body(json!({"version":1,"expected_agent_id":AGENT_ID,"expected_revision":1,"action":"revoke","policy_id":"policy-a"})),
+    ]);
+    let output = lab
+        .command(env!("CARGO_BIN_EXE_agit"))
+        .args([
+            "secrets",
+            "unallow",
+            record["id"].as_str().unwrap(),
+            "--json",
+            "--repo",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["result"]["value"]["record"]["local_state"],
+        "default"
+    );
+    assert_eq!(result["result"]["value"]["record"]["server_version"], 2);
+    assert_eq!(lab.git(&path, &["show-ref"]), refs);
+}
+
+#[test]
+fn exact_declaration_offline_dry_run_and_first_publication_keep_policy_before_content() {
+    let lab = Lab::new();
+    let path = lab.seed("alice", "qa", true);
+    let a = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let server = Server::start(
+        &lab,
+        vec![Step::new("GET /api/agents/alice/qa", Reply::Status(503))],
+    );
+    let output = declare_stdin(&lab, &path, a);
+    server.finish();
+    assert_command_failure(&output, "json2", 6, "secrets");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["value"]["local_applied"], true);
+    assert_eq!(value["result"]["value"]["record"]["sync_status"], "pending");
+    let vault = path.join(".git/agit/secret-dictionary/vault.json");
+    let before = fs::read(&vault).unwrap();
+    let server = Server::start(
+        &lab,
+        vec![Step::new("GET /api/agents/alice/qa", Reply::Status(404))],
+    );
+    let output = lab.push_with_visibility("alice/qa", "json2", true, Some("--public"));
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read(&vault).unwrap(), before);
+    let mut remote = remote(&lab, "alice", AGENT_ID);
+    remote["visibility"] = json!("public");
+    let decision = policy_decision(a, "active", 1);
+    let server = Server::start(&lab, vec![
+        Step::new("GET /api/agents/alice/qa", Reply::Status(404)),
+        Step::new("GET /api/agents/alice/qa", Reply::Status(404)),
+        Step::new("POST /api/agents", Reply::Json(json!({"agent_id":AGENT_ID,"owner":"alice","name":"qa",
+            "push_url":format!("{}/alice/qa.git",lab.base),"web_url":format!("{}/@alice/qa",lab.base)})))
+            .with_body(json!({"name":"qa","public":true,"repo_origins":[]})),
+        Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
+        Step::new(&policy_get(), Reply::Json(policy_view(0, vec![]))),
+        Step::new("POST /api/agents/alice/qa/secret-allowances", Reply::Json(json!({"version":1,"agent_id":AGENT_ID,"revision":1,"decision":decision}))),
+        Step::new("GET /alice/qa.git/info/refs?service=git-receive-pack", advertised_receive()),
+        Step::new("POST /alice/qa.git/git-receive-pack", accepted_ref("refs/heads/main")),
+    ]);
+    let output = lab.push_with_visibility("alice/qa", "json2", false, Some("--public"));
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn exact_declaration_old_hub_requires_explicit_acceptance_each_time() {
+    let lab = Lab::new();
+    let path = lab.seed("alice", "qa", true);
+    let a = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let remote = remote(&lab, "alice", AGENT_ID);
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            Step::new(&policy_get(), Reply::Status(404)),
+        ],
+    );
+    let output = declare_stdin(&lab, &path, a);
+    server.finish();
+    assert_command_failure(&output, "json2", 4, "secrets");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["result"]["value"]["synchronization"]["kind"],
+        "unsupported"
+    );
+    let mut advertise = Step::new(
+        "GET /alice/qa.git/info/refs?service=git-receive-pack",
+        advertised_receive(),
+    );
+    advertise.acceptance = true;
+    let mut receive = Step::new(
+        "POST /alice/qa.git/git-receive-pack",
+        accepted_ref("refs/heads/main"),
+    );
+    receive.acceptance = true;
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            Step::new(&policy_get(), Reply::Status(404)),
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
+            advertise,
+            receive,
+        ],
+    );
+    let output = lab
+        .push_command("alice/qa", "json2", false, None)
+        .arg("--allow-secrets")
+        .output()
+        .unwrap();
+    server.finish();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("--allow-secrets"));
+    assert!(text.contains("pending"));
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
+            Step::new(&policy_get(), Reply::Status(404)),
+        ],
+    );
+    let output = lab.push("alice/qa", "json2", false);
+    server.finish();
+    assert_failure(&output, "json2", 4);
 }
 
 fn rc_land(lab: &Lab, mode: &str, stage: &str) -> Output {

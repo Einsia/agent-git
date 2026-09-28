@@ -207,6 +207,12 @@ impl CompleteContentInspection {
         self.captured.verify_source(repo)
     }
 
+    /// A copied repository must authorize the same captured bytes under its own policy.
+    /// Refreshing policy keeps owned payloads and frozen object IDs intact.
+    pub fn reinspect(self, repo: &Repo, limits: ScanLimits) -> anyhow::Result<ContentInspection> {
+        Ok(self.captured.refresh_policy(repo)?.inspect(limits))
+    }
+
     /// Bind only after review and publication consent, using the validated actual destination.
     /// Binding retains the same content owners and does not restage mutable cache payloads.
     pub fn bind_destination(

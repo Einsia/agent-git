@@ -37,18 +37,7 @@ impl GitContent {
         );
         let lfs_objects = super::lfs_cache::capture(source);
         let repo = Repo::at(&source.root);
-        let inspection_policy = (|| {
-            use crate::domain::secrets::publication::{CapturedPolicy, InspectionFailure};
-            let common = source
-                .text(&["rev-parse", "--git-common-dir"])
-                .map_err(|_| InspectionFailure::LocalState)?;
-            let common =
-                absolute_path(&source.root, &common).map_err(|_| InspectionFailure::LocalState)?;
-            let common = common
-                .canonicalize()
-                .map_err(|_| InspectionFailure::LocalState)?;
-            CapturedPolicy::capture(&common)
-        })();
+        let inspection_policy = Self::capture_policy(source);
         let lfs_inventory = if source.gitdir == "." {
             crate::domain::lfs::history::for_bare_publication(&repo, plan)?
         } else {
@@ -84,6 +73,18 @@ impl GitContent {
             plan: plan.clone(),
             lfs_inventory,
         })
+    }
+
+    fn capture_policy(source: &Source) -> std::result::Result<CapturedPolicy, InspectionFailure> {
+        let common = source
+            .text(&["rev-parse", "--git-common-dir"])
+            .map_err(|_| InspectionFailure::LocalState)?;
+        let common =
+            absolute_path(&source.root, &common).map_err(|_| InspectionFailure::LocalState)?;
+        let common = common
+            .canonicalize()
+            .map_err(|_| InspectionFailure::LocalState)?;
+        CapturedPolicy::capture(&common)
     }
 
     fn attach(&self, source: &Source) -> Result<()> {
@@ -227,6 +228,14 @@ impl CapturedPublication {
             })
             .collect::<Result<Vec<_>>>()?;
         self.plan().verify(repo, &branches)
+    }
+
+    pub(super) fn refresh_policy(mut self, repo: &Repo) -> Result<Self> {
+        self.verify_source(repo)?;
+        let source = Source::at(repo, self.source.environment.clone())?;
+        self.git.attach(&source)?;
+        self.git.inspection_policy = GitContent::capture_policy(&source);
+        Ok(self)
     }
 
     pub(super) fn bind_destination(

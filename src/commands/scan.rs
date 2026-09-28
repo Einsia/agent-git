@@ -197,31 +197,15 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
     let found = collect(&repo, &n)?;
+    super::secret_vault::report_pending_declarations(&repo)?;
     super::report_binary_carriers(found.binary_carriers);
     echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
     let any_hit = !found.hits.is_empty();
     let truncated = found.truncated;
     let shown = found.hits.len();
     let unscanned = found.unscanned.clone();
-    // The **carrier** of each hit, accumulated and handed to [`super::hint_secret_remedies`] at
-    // the end.
-    //
-    // For a hit inside a blob / commit / tag object, the hints below about annotating the line
-    // with `agit:allow-secret` and reverting the VIEW entry do not apply at all — those lines
-    // are not in the workspace, there is no line to annotate and no VIEW entry to revert.
-    //
-    // The way out of each of the object carriers is **different**, so they are recorded and
-    // stated separately: a blob is located by oid first and then the commits carrying it are
-    // rewritten, a commit is rewritten directly, a tag only needs to be cut again. Collapsing
-    // them into one "rewrite history" makes the user rebase needlessly over a tag; the other way
-    // round, promising "and a tag is just cut again" while only commits were scanned states
-    // something that holds for no hit at all. A way out that leads nowhere wastes more of the
-    // user's time than no way out.
-    //
-    // The branching itself lives in [`super::secret_remedies`], and the `agit push` gate calls
-    // the same function: this only accumulates carriers. The test is the **structured source**,
-    // not the human-readable `at` string — with the latter, a directory genuinely named
-    // `commit object x/...` flips the decision, and that is input a user can create.
+    // Carrier-specific guidance uses the structured source, not the display location that a
+    // user-controlled filename can imitate. Exact declarations apply across these carriers.
     let mut report: Vec<serde_json::Value> = vec![];
     for (at, h) in &found.hits {
         if args.json {
@@ -258,11 +242,15 @@ pub fn run(args: Args) -> CmdResult {
                 "· this report is incomplete: it shows {shown} findings and stops there, more remain — handle these, then run `agit scan` again to see the rest"
             ));
         }
-        ui::hint("· allowlist (local): write to $AGIT_HOME/.agit-allow-secrets");
         ui::hint(
-            "· blanket bypass (think twice before it enters history): AGIT_ALLOW_SECRETS=1 agit push — the server may still refuse it, and it will block going public later",
+            "· reviewed false positive? use `agit secrets allow <record-id> --repo <path> --reason <reason>`, or pipe its exact value to `agit secrets allow --stdin --repo <path>`; check the reported synchronization status",
         );
-        ui::hint("· remove from the VIEW: `agit revert @#n.k`");
+        ui::hint(
+            "· after reviewing all remaining findings for the intended audience, repeat the same push with --allow-secrets to accept findings for that operation only",
+        );
+        ui::hint(
+            "· removing an event from VIEW leaves LOG and Git history intact and does not clear a historical secret finding",
+        );
         // The carrier-specific hints come last: for a hit inside an object they are the only
         // actions that work at all, and they cost the most.
         super::hint_secret_hit_remedies(found.hits.iter().map(|(_, hit)| hit));

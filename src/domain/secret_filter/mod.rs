@@ -26,6 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "macos")]
 mod os_keychain;
 mod repository;
+mod repository_sync;
+pub use repository_sync::{PolicySyncConflict, RepositoryPolicyTransport};
 mod repository_keys;
 pub use repository_keys::RepositoryKeyStore;
 
@@ -33,7 +35,9 @@ pub(crate) use repository::HydrationBudgetExceeded;
 #[cfg(any(feature = "cli", test))]
 pub(crate) use repository::ReadonlyDictionaryLimits;
 pub use repository::{
-    HydrationReport, ProtectionReport, RepositoryDictionary, RepositoryRecordSummary,
+    DeclarationOperation, DeclarationTarget, HydrationReport, ProtectionReport,
+    RepositoryDeclaration, RepositoryDictionary, RepositoryRecordSummary,
+    validate_declaration_reason, validate_declaration_value,
 };
 
 const VAULT_VERSION: u32 = 1;
@@ -49,10 +53,10 @@ const FILE_KEYSTORE_UNIX_ONLY: &str = "the file keystore is available on Unix on
 const MIN_SECRET_BYTES: usize = 4;
 const DEFAULT_MIN_SECRET_BYTES: usize = 8;
 const MAX_SECRET_BYTES: usize = 512;
-pub(super) const MAX_REPOSITORY_SECRET_BYTES: usize = 64 * 1024;
+pub const MAX_REPOSITORY_SECRET_BYTES: usize = 64 * 1024;
 const MAX_NAME_BYTES: usize = 128;
 const PADDING_BUCKETS: &[usize] = &[
-    128, 256, 512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072, 262_144, 524_288,
 ];
 const PLACEHOLDER: &str = "[redacted:registered-secret]";
 const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -80,6 +84,8 @@ struct VaultFile {
     generation: u64,
     wrapped_dek: Sealed,
     records: Vec<SealedRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_policy: Option<Sealed>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +107,7 @@ enum RecordOrigin {
     Heuristic,
     Global,
     Explicit,
+    Declaration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -121,6 +128,8 @@ struct PlainRecord {
     heuristic_disposition: HeuristicDisposition,
     #[serde(default)]
     explicit_block: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declaration: Option<RepositoryDeclaration>,
     created_at: String,
     updated_at: String,
 }
@@ -132,6 +141,7 @@ struct DecryptedRecord {
     origins: Vec<RecordOrigin>,
     heuristic_disposition: HeuristicDisposition,
     explicit_block: bool,
+    declaration: Option<RepositoryDeclaration>,
     created_at: String,
     updated_at: String,
 }
@@ -798,6 +808,7 @@ impl<K: KeyStore> VaultStore<K> {
                 origins: vec![],
                 heuristic_disposition: HeuristicDisposition::Protect,
                 explicit_block: false,
+                declaration: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
@@ -930,6 +941,7 @@ impl<K: KeyStore> VaultStore<K> {
                 generation: 0,
                 wrapped_dek,
                 records: vec![],
+                repository_policy: None,
             },
             dek,
         })
@@ -1032,6 +1044,7 @@ pub struct Matcher {
 struct MatcherInner {
     generation: u64,
     allowlist: Vec<Zeroizing<String>>,
+    repository_identities: HashSet<String>,
     ac: Option<AhoCorasick>,
     ids: Vec<String>,
     explicit: Vec<bool>,
@@ -1059,6 +1072,7 @@ impl Matcher {
             inner: Arc::new(MatcherInner {
                 generation: 0,
                 allowlist: vec![],
+                repository_identities: HashSet::new(),
                 ac: None,
                 ids: vec![],
                 explicit: vec![],
@@ -1105,6 +1119,7 @@ impl Matcher {
             inner: Arc::new(MatcherInner {
                 generation,
                 allowlist: vec![],
+                repository_identities: HashSet::new(),
                 ac: Some(ac),
                 ids,
                 explicit,
@@ -1125,6 +1140,7 @@ impl Matcher {
                 origins: vec![],
                 heuristic_disposition: HeuristicDisposition::Protect,
                 explicit_block: false,
+                declaration: None,
                 created_at: "test".to_string(),
                 updated_at: "test".to_string(),
             })
@@ -1156,6 +1172,15 @@ impl Matcher {
         self.inner.allowlist.iter().map(|value| value.as_str())
     }
 
+    pub(crate) fn repository_identities(&self) -> &HashSet<String> {
+        &self.inner.repository_identities
+    }
+
+    pub(crate) fn with_repository_identities(mut self, identities: HashSet<String>) -> Self {
+        Arc::make_mut(&mut self.inner).repository_identities = identities;
+        self
+    }
+
     pub(crate) fn with_allowlist(mut self, values: impl IntoIterator<Item = String>) -> Self {
         Arc::make_mut(&mut self.inner).allowlist = values.into_iter().map(Zeroizing::new).collect();
         self
@@ -1182,6 +1207,7 @@ impl Matcher {
                 origins: vec![RecordOrigin::Heuristic],
                 heuristic_disposition: HeuristicDisposition::Protect,
                 explicit_block: *explicit,
+                declaration: None,
                 created_at: "runtime".to_string(),
                 updated_at: "runtime".to_string(),
             });
@@ -1194,19 +1220,37 @@ impl Matcher {
         records.retain(|record| !allowlist.contains(record.secret.as_str()));
         Ok(
             Self::build(self.generation().max(other.generation()), records)?
-                .with_allowlist(allowlist),
+                .with_allowlist(allowlist)
+                .with_repository_identities(
+                    self.repository_identities()
+                        .union(other.repository_identities())
+                        .cloned()
+                        .collect(),
+                ),
         )
     }
 
     /// Exclude values before overlap selection so an allowed outer match cannot hide another rule.
     pub(crate) fn excluding(&self, allowlist: &HashSet<String>) -> crate::Result<Self> {
-        if !self.patterns().any(|(_, value)| allowlist.contains(value)) {
+        if !self.patterns().any(|(_, value)| {
+            allowlist.contains(value)
+                || crate::domain::secrets::repository_policy::allows(
+                    self.repository_identities(),
+                    value,
+                )
+        }) {
             return Ok(self.clone());
         }
         let records = self
             .patterns()
             .zip(&self.inner.explicit)
-            .filter(|((_, value), _)| !allowlist.contains(*value))
+            .filter(|((_, value), _)| {
+                !allowlist.contains(*value)
+                    && !crate::domain::secrets::repository_policy::allows(
+                        self.repository_identities(),
+                        value,
+                    )
+            })
             .map(|((id, secret), explicit)| DecryptedRecord {
                 id: id.to_owned(),
                 name: id.to_owned(),
@@ -1218,12 +1262,14 @@ impl Matcher {
                 }],
                 heuristic_disposition: HeuristicDisposition::Protect,
                 explicit_block: *explicit,
+                declaration: None,
                 created_at: "runtime".into(),
                 updated_at: "runtime".into(),
             })
             .collect();
         Ok(Self::build(self.generation(), records)?
-            .with_allowlist(self.allowed_values().map(str::to_owned)))
+            .with_allowlist(self.allowed_values().map(str::to_owned))
+            .with_repository_identities(self.repository_identities().clone()))
     }
 
     /// Proven identity occurrences may bypass learned suspicion, never an explicit registration.
@@ -1239,12 +1285,14 @@ impl Matcher {
                 origins: vec![RecordOrigin::Explicit],
                 heuristic_disposition: HeuristicDisposition::Protect,
                 explicit_block: true,
+                declaration: None,
                 created_at: "runtime".into(),
                 updated_at: "runtime".into(),
             })
             .collect();
         Ok(Self::build(self.generation(), records)?
-            .with_allowlist(self.allowed_values().map(str::to_owned)))
+            .with_allowlist(self.allowed_values().map(str::to_owned))
+            .with_repository_identities(self.repository_identities().clone()))
     }
 
     pub fn find(&self, text: &str) -> Vec<RegisteredMatch> {
@@ -1624,7 +1672,9 @@ fn decrypt_records(file: &VaultFile, dek: &[u8]) -> crate::Result<Vec<DecryptedR
         let mut plain = decode_padded(&plaintext)
             .with_context(|| format!("cannot decode registered secret {}", stored.id))?;
         validate_name(&plain.name)?;
-        if plain.origins.contains(&RecordOrigin::Heuristic) {
+        if plain.origins.contains(&RecordOrigin::Heuristic)
+            || plain.origins.contains(&RecordOrigin::Declaration)
+        {
             anyhow::ensure!(
                 !plain.secret.is_empty() && plain.secret.len() <= MAX_REPOSITORY_SECRET_BYTES,
                 "stored heuristic secret has an invalid length"
@@ -1640,6 +1690,7 @@ fn decrypt_records(file: &VaultFile, dek: &[u8]) -> crate::Result<Vec<DecryptedR
             origins: plain.origins,
             heuristic_disposition: plain.heuristic_disposition,
             explicit_block: plain.explicit_block,
+            declaration: plain.declaration,
             created_at: plain.created_at,
             updated_at: plain.updated_at,
         });
@@ -1977,6 +2028,7 @@ mod tests {
             origins: vec![],
             heuristic_disposition: HeuristicDisposition::Protect,
             explicit_block: false,
+            declaration: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1986,6 +2038,7 @@ mod tests {
             origins: vec![],
             heuristic_disposition: HeuristicDisposition::Protect,
             explicit_block: false,
+            declaration: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };

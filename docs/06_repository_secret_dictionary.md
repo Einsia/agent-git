@@ -62,18 +62,51 @@ refuses before any dictionary update is written. Per value, an oversized finding
 clear and visible to the push scanner rather than becoming an irreversible record.
 
 The independent tokenizer accepts ASCII letters, digits and `_-+/=.!@#$%^&*?~`.
-It measures Shannon entropy in bits per character with these minimum length / entropy pairs:
-hex (including hyphenated hex or `agit-`, `sha1-` and `sha256-` prefixes), 32 / 3.2; mixed-case alphabetic,
-24 / 3.8; alphanumeric, 20 / 4.0; tokens containing symbols, 20 / 4.2. Tokens must contain
-mixed-case letters, a digit, or use the hex alphabet. Credential-related JSON properties
-add evidence and lower the pair to 10 / 3.5. These are best-effort discovery policies, not a
-guarantee that every credential is recognized. A path-like spelling alone is not an exemption.
+It measures Shannon entropy in bits per character. Bare values use length-dependent thresholds:
+
+| Alphabet | Minimum length | Entropy at length <= 24 | Entropy at length > 24 |
+| --- | ---: | ---: | ---: |
+| Hex, including hyphenated hex and `agit-`, `sha1-`, `sha256-` prefixes | 32 | - | 3.2 |
+| Mixed-case alphabetic | 24 | 3.8 | 4.3 |
+| Alphanumeric | 20 | 4.0 | 4.3 |
+| Tokens containing symbols | 20 | 4.2 | 4.45 |
+
+Tokens must contain mixed-case letters, a digit, or use the hex alphabet. Short values retain
+lower thresholds because their empirical entropy is limited by their length. The stronger
+long-value thresholds reduce ordinary-identifier findings at the cost of some bare-value
+discovery. Credential-related JSON properties add evidence and retain a minimum length of 10
+and an entropy threshold of 3.5. Provider rules and registered values use their existing policies.
+These are best-effort discovery policies, not a guarantee that every credential is recognized.
+Entropy-only discovery applies to complete tokens of at most 16 KiB (16,384 UTF-8 bytes).
+Longer tokens are skipped as a whole, not split into shorter entropy candidates. This cutoff
+does not apply to credential-related JSON properties, provider rules, private-key regions or
+registered secrets, including matches inside a longer token. It limits suspicion based only
+on randomness; it does not establish that a long value is safe.
+
+Recognized local file paths and `file://`, `http://` and `https://` links are excluded from
+generic entropy discovery. Path recognition handles rooted Unix and Windows spellings,
+home-relative and dot-relative paths, quoted or Markdown destinations with spaces, and relative
+paths in Markdown destinations or named path fields. A slash in an unrelated token does not
+establish path context. Recognition is lexical and does not access the filesystem or network.
+Provider-specific rules, credential-related fields and explicitly registered secrets still
+inspect these locations. Path and device-identity anonymization remains a separate policy.
+
+RC stream protection and native history use the same discovery rules. Device-control views
+preserve ordinary paths and Markdown link targets, and structured JSON retains its field
+context during protection. An already registered dictionary value still matches exactly:
+review an old path/link false positive and use `agit secrets allow <record-id> --repo <path>`
+to stop subsequent local protection. Keep the mapping so existing placeholders remain locally
+reversible. This does not rewrite saved history or enable plaintext restoration on outward
+RC/history boundaries. Updating the running `agitd` is required for new RC output to use the
+new policy; backend scans likewise require the updated shared dependency.
 
 An automatic repository candidate uses a 64 KiB plaintext cap and a padded ciphertext bucket
 of at most 128 KiB, enough to hold a common 4096-bit PEM private key reversibly; a manually
-registered global rule keeps its 512 UTF-8 byte cap. The dictionary reports an oversized
-finding without partially replacing its header. Settlement, file/memory projection and outward
-rendering must reject that incomplete result before publishing a version or emitting content.
+registered global rule keeps its 512 UTF-8 byte cap. The 64 KiB record cap remains independent
+of entropy discovery, so existing longer records still load, protect and hydrate. The dictionary
+reports an oversized finding without partially replacing its header. Settlement, file/memory
+projection and outward rendering must reject that incomplete result before publishing a version
+or emitting content.
 The original native input remains available; a resource failure never means the input was clean.
 
 PEM discovery covers the region from a private-key header through its matching
@@ -373,15 +406,24 @@ be published without text scanning, but absence of text findings is not proof th
 contents are safe. This policy is shared by ordinary push, audit and LFS upload. LFS text
 payload inspection still refuses size, integrity and availability failures.
 
-Repository `allow` is a local decision to stop future projection and client findings for that
-exact value; old tokens continue to hydrate. Strict server policy does not inherit a local allow
-decision, so it can still reject the plaintext.
+Repository `allow` stores an exact non-secret declaration and stops future local projection
+and client findings for that value; old tokens continue to hydrate. ID and stdin input reuse the
+same encrypted mapping. Revocation restores the original protection sources; a declaration-only
+record returns to normal detection. Reasons and pending operations stay in the encrypted record.
+The CLI synchronizes incremental decisions using immutable repository identity and server policy
+revision. It reports local completion, pending or conflicted synchronization, and acknowledgement
+separately. Ordinary push synchronizes before uploads; first publication can create the selected
+repository first. Remote revocations cannot be overwritten by stale local intent. `--allow-secrets`
+remains an explicit operation-wide path and reports any declarations that could not synchronize.
 The device allowlist matches complete values, never provider-prefix substrings. Inline pragmas
 and explicit publication overrides are disclosure decisions with their existing client/server
 scope. Default suspicion handling uses reversible projection and needs none of these overrides.
 
-MCP image content blocks (`type: "image"`, an image `mimeType`, and base64 `data`) retain their
-media context during candidate discovery, protection, and publication scanning. The complete
+MCP image content blocks (`type: "image"`, an image `mimeType`, and base64 `data`) and Claude
+image blocks (`type: "image"`, with `source.type: "base64"`, an image `source.media_type`, and
+`source.data`) retain their original structure and media context during candidate discovery,
+protection, and publication scanning. Only the image data receives the entropy exemption;
+other source fields and base64 sources without a typed image parent remain scanned. The complete
 base64 encoding and decoded image framing must validate. The actual image format may differ
 from its MIME label, as screenshot producers can mislabel JPEG as PNG. This excludes entropy
 findings only: provider-specific rules and explicitly registered credentials still apply.

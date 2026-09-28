@@ -56,6 +56,17 @@ pub(super) fn run(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing audit"
     );
+    if let Some(code) = super::super::secret_vault::synchronize_before_push(
+        &repo,
+        &client,
+        &checkout.owner,
+        &checkout.name,
+        args.dry_run,
+        args.allow_secrets,
+    )? {
+        return Ok(code);
+    }
+    super::super::secret_vault::report_pending_declarations(&repo)?;
     let plan = PublicationPlan::freeze(&repo, branches)?;
     let limits = secrets::ScanLimits::DEFAULT;
     let spinner = ui::spinner("capturing and inspecting outgoing history and LFS payloads…");
@@ -127,6 +138,54 @@ pub(super) fn run(
         .context("the confirmed publication destination is unavailable")?;
     intent.verify_observed(&observed, Some(&remote.identity.agent_id))?;
     intent.verify_write_access(&client, &remote.identity.agent_id)?;
+    let copied = matches!(intent.action, Action::Copy(_));
+    if copied {
+        if let Some(code) = super::super::secret_vault::synchronize_push_target(
+            &repo,
+            &client,
+            &intent.owner,
+            &intent.name,
+            &remote.identity,
+            args.allow_secrets,
+        )? {
+            return Ok(code);
+        }
+    } else if super::super::secret_vault::has_policy_state(&repo)? {
+        let result = super::super::secret_vault::synchronize_target(
+            &repo,
+            &client,
+            &intent.owner,
+            &intent.name,
+            &remote.identity,
+            false,
+        );
+        if let Some(code) =
+            super::super::secret_vault::report_sync_for_push(result, args.allow_secrets)?
+        {
+            return Ok(code);
+        }
+    }
+    let complete = if copied {
+        match complete.reinspect(&repo, limits)? {
+            ContentInspection::Complete(complete) => {
+                show_inspection(complete.report());
+                if complete.has_findings() && !args.allow_secrets {
+                    ui::error(
+                        "audit blocked: copied repository policy does not allow the credential findings",
+                    );
+                    return Ok(ExitCode::Policy);
+                }
+                complete
+            }
+            ContentInspection::Blocked(blocked) => {
+                show_inspection(blocked.report());
+                ui::error(&blocked.reason().to_string());
+                return Ok(inspection_failure_code(blocked.reason()));
+            }
+        }
+    } else {
+        complete
+    };
     let target = format!("{}/{}", intent.owner, intent.name);
     let prepared =
         complete.bind_destination_with_client(&repo, &remote.push_url, &remote.identity, client)?;

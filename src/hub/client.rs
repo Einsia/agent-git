@@ -979,6 +979,36 @@ impl Client {
         self.get(&format!("api/agents/{owner}/{name}"))
     }
 
+    pub fn secret_allowances(
+        &self,
+        owner: &str,
+        name: &str,
+        agent_id: &str,
+    ) -> Result<crate::domain::secrets::repository_policy::PolicySnapshot> {
+        self.get(&format!(
+            "/api/agents/{}/{}/secret-allowances?expected_agent_id={}",
+            urlencode(owner),
+            urlencode(name),
+            urlencode(agent_id)
+        ))
+    }
+
+    pub fn change_secret_allowance(
+        &self,
+        owner: &str,
+        name: &str,
+        change: &crate::domain::secrets::repository_policy::PolicyChange,
+    ) -> Result<crate::domain::secrets::repository_policy::PolicyChangeResponse> {
+        self.post(
+            &format!(
+                "/api/agents/{}/{}/secret-allowances",
+                urlencode(owner),
+                urlencode(name)
+            ),
+            change,
+        )
+    }
+
     /// **A server-side reverse lookup**: which agents have worked in this code repo.
     ///
     /// This is the entry point for `agit clone` with no arguments, and the server-side duty that

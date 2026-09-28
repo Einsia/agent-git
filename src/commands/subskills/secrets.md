@@ -9,7 +9,7 @@ description: Register device-local literal secrets and review the repository-loc
 
 Two layers of protection, both device-local. The **vault** holds literals you register explicitly — low-entropy values the heuristic rules would never catch on their own ("blue horse battery", an internal hostname). The **repository dictionary** holds what the heuristic rules found in session content by themselves; `agit commit` projects both into opaque `{{AGIT_SECRET_V1:...}}` placeholders before Git object ids are formed, and only this device can hydrate them back.
 
-Secrets never travel through argv: interactive input is hidden, automation must pass `--stdin`. There is no show/decrypt/export path — `list`, `status` and `review` only ever print opaque ids and the labels you chose.
+Values never travel through argv: interactive registration is hidden, and automation passes `--stdin`. Management output contains record IDs, labels and policy metadata. It never contains the stored value or its digest.
 
 ## Synopsis
 
@@ -26,8 +26,8 @@ agit secrets <subcommand>
 | `remove <id-or-name>` | Delete one record irreversibly | `--yes` skips the prompt |
 | `status` | Authenticate the vault and every encrypted record | `--json` |
 | `review` | Review this repository's candidate policy | `--repo <path>`, `--json` |
-| `allow <record-id>` | Allow an exact repository value in local projection and scans | `--repo <path>` |
-| `unallow <record-id>` | Restore default protection for an allowed candidate | `--repo <path>` |
+| `allow <record-id>` or `allow --stdin` | Declare an exact repository value non-secret | `--repo <path>`, `--reason <text>`, `--json` |
+| `unallow <record-id>` | Revoke a declaration and restore normal detection or prior protection | `--repo <path>`, `--json` |
 | `block add <name>` | Add an exact repository-local block rule | `--stdin`, `--allow-short`, `--repo <path>` |
 | `block remove <record-id>` | Clear the explicit block bit | `--repo <path>` |
 
@@ -39,7 +39,9 @@ printf %s "$TOKEN" | agit secrets add ci-token --stdin
 agit secrets list
 agit secrets status --json
 agit secrets review
-agit secrets allow sec_2f3a...
+agit secrets allow sec_2f3a... --reason "Public identifier"
+printf %s "$VALUE" | agit secrets allow --stdin --repo /path/to/agent-repo --reason "Test fixture"
+agit secrets unallow sec_2f3a... --repo /path/to/agent-repo --json
 agit secrets block add prod-hostname --stdin
 agit secrets remove ci-token --yes
 ```
@@ -48,7 +50,17 @@ agit secrets remove ci-token --yes
 
 `--allow-short` accepts a 4–7 byte rule. A short rule matches everywhere and materially raises both false positives and enumeration risk; prefer a longer literal when one exists.
 
-`allow` exempts the exact value from future local projection and client scans, even when a global registration or repository `block` also matches. The device's `$AGIT_HOME/.agit-allow-secrets` file has the same precedence. Preset allowances apply to all candidate sources, including entropy and registered literals. Reverse mappings remain available so old placeholders keep hydrating. Strict server scans do not inherit local allowances, and inline pragmas do not override registered rules.
+`allow` exempts the complete detector-matched value from future local projection and client scans, even when a global registration or repository `block` also matches. It does not exempt a distinct overlapping credential, a containing value, a rule or a file. JSON escapes are decoded before semantic matching. The same value in the same dictionary reuses its record ID, whether supplied by ID or stdin. Old placeholders still hydrate.
+
+Choose exactly one of `<record-id>` and `--stdin`. Stdin accepts 1 to 65,536 UTF-8 bytes, removing one final LF or CRLF and preserving other whitespace. The optional reason accepts up to 1,024 UTF-8 bytes; keep it descriptive and free of credentials. `unallow` restores the original protection sources. A value introduced only as a declaration returns to normal detection.
+
+Local intent is saved first, then the CLI immediately attempts synchronization with the current login and immutable repository target. Offline failures, missing capability and conflicts leave a durable pending operation and return nonzero while explicitly reporting local completion. JSON includes `local_applied`, the saved `record` and `synchronization`; `review --json` exposes `local_state`, `sync_status`, `pending_operation`, `target`, `server_policy_id`, `server_version` and `write_outcome_uncertain`. `synced` means the Hub acknowledged the decision; it does not mean refs were published. If an earlier write timed out without confirmation, an opposite decision remains pending until synchronization can establish that the earlier request cannot supersede it.
+
+Ordinary push refreshes confirmed policy and synchronizes pending operations before LFS or Git uploads. First publication can create the selected repository and bind its immutable ID before synchronizing. A Hub or repository identity change cannot transfer declarations. A remote revocation or version conflict never silently reactivates an old allowance. Inspect the current state, then issue a new `allow` or `unallow` decision to resolve a conflict. Old local allowances receive the same tombstone check on their first synchronization.
+
+`--dry-run` checks and reports planned synchronization without mutating remote policy or creating a repository. If remote policy has changed since the cached scan policy, it reports that a normal push must refresh it. An older Hub without the protocol blocks ordinary push when declarations need synchronization. An explicitly reviewed `--allow-secrets` push retains its operation-wide path and warning, reports any unsynchronized declarations and leaves them pending. Exact declarations never enable that flag automatically.
+
+The device's `$AGIT_HOME/.agit-allow-secrets` file and built-in exemptions remain local policy; they are not queued as repository declarations. Inline pragmas do not override registered rules.
 
 `remove` is irreversible: placeholders written under that record can no longer be hydrated anywhere. Unregister a value only when it is no longer a secret.
 

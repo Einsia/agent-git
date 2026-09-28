@@ -300,7 +300,7 @@ impl HttpWorker {
                     })
                 }));
                 let (status, body) = match requests.len() {
-                    0 => {
+                    0 | 2 => {
                         assert_eq!(first, "GET /api/agents/other/qa HTTP/1.1");
                         (
                             200,
@@ -313,6 +313,13 @@ impl HttpWorker {
                         )
                     }
                     1 => {
+                        assert_eq!(
+                            first,
+                            "GET /api/agents/other/qa/secret-allowances?expected_agent_id=9f2c3b53-7fe0-412f-b62a-bf68a6845ce7 HTTP/1.1"
+                        );
+                        (404, "{}".to_owned())
+                    }
+                    3 => {
                         assert_eq!(
                             first,
                             "GET /other/qa.git/info/refs?service=git-receive-pack HTTP/1.1"
@@ -405,7 +412,8 @@ fn noninteractive_copy_confirmation_preserves_the_foreign_checkout() {
         let lab = Lab::new(mode);
         let repo = lab.seed("other", "qa", true);
         // Initialize the ordinary local scan state before measuring the confirmation refusal.
-        let dry_run = lab.push("human", true);
+        let dry_run =
+            publication_http::with_missing_agent_probe(&lab.hub, || lab.push("human", true));
         assert!(dry_run.status.success(), "{dry_run:?}");
         lab.no_requests();
         eprintln!("publication mode={mode} stage=snapshot-before start");
@@ -418,7 +426,7 @@ fn noninteractive_copy_confirmation_preserves_the_foreign_checkout() {
         assert_refusal(&output, mode);
         assert_eq!(
             requests.len(),
-            2,
+            4,
             "the read capability proof must precede confirmation"
         );
         eprintln!("publication mode={mode} stage=postconditions start");

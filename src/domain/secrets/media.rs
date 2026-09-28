@@ -18,6 +18,23 @@ pub(crate) fn image_data(map: &Map<String, Value>) -> Option<&str> {
     .then_some(data)
 }
 
+/// A Claude source grants media context only to its data, under a typed image parent.
+#[cfg(feature = "secret-vault")]
+pub(crate) fn image_source(map: &Map<String, Value>) -> bool {
+    let Some(source) = map.get("source").and_then(Value::as_object) else {
+        return false;
+    };
+    source.get("type").and_then(Value::as_str) == Some("base64")
+        && match (
+            map.get("type").and_then(Value::as_str),
+            source.get("media_type").and_then(Value::as_str),
+            source.get("data").and_then(Value::as_str),
+        ) {
+            (Some(kind), Some(mime), Some(data)) => is_image(kind, mime, data),
+            _ => false,
+        }
+}
+
 fn is_image(kind: &str, mime: &str, data: &str) -> bool {
     kind == "image"
         && matches!(
@@ -163,17 +180,15 @@ fn collect(raw: &RawValue, base: usize, depth: usize, out: &mut Vec<(usize, usiz
             let Ok(map) = serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()) else {
                 return;
             };
-            if let (Some(kind), Some(mime), Some(data)) =
-                (map.get("type"), map.get("mimeType"), map.get("data"))
-                && let (Ok(kind), Ok(mime), Ok(decoded)) = (
-                    serde_json::from_str::<String>(kind.get()),
-                    serde_json::from_str::<String>(mime.get()),
-                    serde_json::from_str::<String>(data.get()),
-                )
-                && is_image(&kind, &mime, &decoded)
-            {
-                let start = data.get().as_ptr() as usize - base;
-                out.push((start + 1, start + data.get().len() - 1));
+            if raw_type(&map).as_deref() == Some("image") {
+                collect_data(&map, "mimeType", base, out);
+                if let Some(source) = map.get("source")
+                    && let Ok(source) =
+                        serde_json::from_str::<HashMap<String, &RawValue>>(source.get())
+                    && raw_type(&source).as_deref() == Some("base64")
+                {
+                    collect_data(&source, "media_type", base, out);
+                }
             }
             for child in map.values() {
                 collect(child, base, depth + 1, out);
@@ -190,6 +205,28 @@ fn collect(raw: &RawValue, base: usize, depth: usize, out: &mut Vec<(usize, usiz
     }
 }
 
+fn raw_type(map: &HashMap<String, &RawValue>) -> Option<String> {
+    serde_json::from_str(map.get("type")?.get()).ok()
+}
+
+fn collect_data(
+    map: &HashMap<String, &RawValue>,
+    mime_key: &str,
+    base: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if let (Some(mime), Some(data)) = (map.get(mime_key), map.get("data"))
+        && let (Ok(mime), Ok(decoded)) = (
+            serde_json::from_str::<String>(mime.get()),
+            serde_json::from_str::<String>(data.get()),
+        )
+        && is_image("image", &mime, &decoded)
+    {
+        let start = data.get().as_ptr() as usize - base;
+        out.push((start + 1, start + data.get().len() - 1));
+    }
+}
+
 pub(crate) fn contains(regions: &[(usize, usize)], start: usize, end: usize) -> bool {
     let index = regions.partition_point(|(left, _)| *left <= start);
     index > 0 && end <= regions[index - 1].1
@@ -197,9 +234,14 @@ pub(crate) fn contains(regions: &[(usize, usize)], start: usize, end: usize) -> 
 
 #[cfg(test)]
 pub(crate) fn fixture() -> String {
+    fixture_with_body_len(76800)
+}
+
+#[cfg(test)]
+fn fixture_with_body_len(bytes: usize) -> String {
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut data = String::from("/9j/");
-    for _ in 0..76800 {
+    for _ in 0..bytes {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -226,19 +268,24 @@ mod tests {
 
     /// An image exemption belongs to its occurrence, including when JSON escapes hide its bytes.
     #[test]
-    fn mcp_image_context_survives_raw_and_decoded_scans() {
-        let data = fixture();
-        let image = serde_json::json!({"type":"image", "mimeType":"image/png", "data":data});
-        let event = serde_json::json!({"type":"event_msg", "payload":{"item":{"type":"McpToolCall", "result":{"content":[image]}}}});
-        let text = event.to_string();
-        assert!(scan(&text).is_empty());
-        assert!(scan(&text.replace('/', "\\/")).is_empty());
-        let with_untyped_copy = serde_json::json!({"image":image,"message":data}).to_string();
-        assert!(
-            scan(&with_untyped_copy)
-                .iter()
-                .any(|hit| hit.rule == "high-entropy-value")
-        );
+    fn structured_image_context_survives_raw_and_decoded_scans() {
+        let data = fixture_with_body_len(super::super::MAX_BARE_ENTROPY_BYTES / 2);
+        let mcp = serde_json::json!({"type":"image", "mimeType":"image/png", "data":data});
+        let claude = serde_json::json!({"type":"image", "source":{"type":"base64", "media_type":"image/jpeg", "data":data}});
+        for event in [
+            serde_json::json!({"type":"event_msg", "payload":{"item":{"type":"McpToolCall", "result":{"content":[mcp]}}}}),
+            serde_json::json!({"type":"user", "message":{"role":"user", "content":[claude]}}),
+        ] {
+            let text = event.to_string();
+            assert!(scan(&text).is_empty());
+            assert!(scan(&text.replace('/', "\\/")).is_empty());
+            let with_untyped_copy = serde_json::json!({"event":event,"message":data}).to_string();
+            assert!(
+                scan(&with_untyped_copy)
+                    .iter()
+                    .any(|hit| hit.rule == "high-entropy-value")
+            );
+        }
         assert!(
             scan(&data)
                 .iter()
@@ -248,19 +295,54 @@ mod tests {
 
     /// Structural media classification never overrides provider-specific credential rules.
     #[test]
-    fn mcp_image_provider_findings_remain_visible() {
+    fn structured_image_provider_findings_remain_visible() {
         let mut data = fixture();
         data.insert_str(4, "/AKIA4X7QZ2M5RT6VW3JH///");
         assert!(valid_image(&data));
-        let text =
-            serde_json::json!({"type":"image","mimeType":"image/jpeg","data":data}).to_string();
-        assert!(scan(&text).iter().any(|hit| hit.rule == "aws-access-token"));
+        for image in [
+            serde_json::json!({"type":"image","mimeType":"image/jpeg","data":data}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data}}),
+        ] {
+            assert!(
+                scan(&image.to_string())
+                    .iter()
+                    .any(|hit| hit.rule == "aws-access-token")
+            );
+        }
+    }
+
+    /// Only data inside a valid image source is exempt; source metadata and unrelated carriers stay scanned.
+    #[test]
+    fn claude_image_source_scope_requires_parent_and_encoding() {
+        let data = fixture_with_body_len(super::super::MAX_BARE_ENTROPY_BYTES / 2);
+        let source = serde_json::json!({"type":"base64","media_type":"image/jpeg","data":data});
+        for object in [
+            source.clone(),
+            serde_json::json!({"type":"document","source":source}),
+            serde_json::json!({"type":"image","source":{"type":"url","media_type":"image/jpeg","data":data}}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"text/plain","data":data}}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data,"extra":data}}),
+        ] {
+            let text = object.to_string();
+            assert!(
+                scan(&text)
+                    .iter()
+                    .any(|hit| hit.rule == "high-entropy-value")
+            );
+            #[cfg(feature = "secret-vault")]
+            assert!(
+                super::super::secret_candidates_jsonl(&text, |_| true)
+                    .values
+                    .iter()
+                    .any(|candidate| candidate.as_str() == data)
+            );
+        }
     }
 
     /// Redaction gaps preserve quartet boundaries and cannot stand in for damaged encoding or framing.
     #[test]
     fn mcp_image_redaction_gaps_require_valid_surrounding_base64() {
-        let data = fixture();
+        let data = fixture_with_body_len(super::super::MAX_BARE_ENTROPY_BYTES / 2);
         let token = "{{AGIT_SECRET_V1:00000000-0000-4000-8000-000000000001:sec_00000000000000000000000000000001}}";
         let projected = format!("{}{token}{}", &data[..12], &data[36..]);
         assert!(valid_image(&projected));
@@ -317,7 +399,7 @@ mod tests {
     /// Field names, MIME claims and a header alone cannot exempt arbitrary token-like text.
     #[test]
     fn mcp_image_validation_rejects_untrusted_claims_and_incomplete_encodings() {
-        let data = fixture();
+        let data = fixture_with_body_len(super::super::MAX_BARE_ENTROPY_BYTES / 2);
         for object in [
             serde_json::json!({"data": data}),
             serde_json::json!({"type":"text","mimeType":"image/jpeg","data":data}),
