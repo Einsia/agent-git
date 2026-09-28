@@ -15,10 +15,11 @@
 import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { chmodSync, copyFileSync, mkdirSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { homedir, platform, arch } from 'node:os'
 import { join, delimiter } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { installBinary } from './install-binary.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -84,9 +85,7 @@ function main() {
   const target = join(targetDir, binaryName())
   const copying = performance.now()
   try {
-    mkdirSync(targetDir, { recursive: true })
-    copyFileSync(bin, target)
-    chmodSync(target, 0o755)
+    installBinary(bin, target)
     report('binary_copy', 'ok', copying)
   } catch (error) {
     report('binary_copy', 'error', copying, 'filesystem')
@@ -106,8 +105,34 @@ function main() {
   report('verification', 'ok', verifying)
   ok(`installed ${check.stdout.trim()} → ${target}`)
 
+  const reconciliation = spawnSync(target, ['rc', 'local', 'reconcile-installed', '--allow-other-installation'], {
+    encoding: 'utf8', timeout: 35000,
+    env: { ...installerEnv, AGIT_TELEMETRY_DEFER: '1' },
+  })
+  if (reconciliation.error || reconciliation.status !== 0) {
+    dim(`the CLI is installed, but the RC daemon could not be reconciled: ${(reconciliation.stderr || reconciliation.error?.message || `exit ${reconciliation.status}`).trim()}`)
+  } else {
+    try {
+      const outcome = JSON.parse(reconciliation.stdout)
+      if (outcome.status === 'restarted') ok('RC daemon restarted with the installed CLI')
+      if (outcome.status === 'deferred') dim(`RC daemon upgrade is pending: ${outcome.message}`)
+    } catch {
+      dim('the CLI is installed, but the RC daemon returned an unreadable reconciliation result')
+    }
+  }
+
   if (!process.env.PATH?.split(delimiter).includes(targetDir)) {
     dim(`note: ${targetDir} is not on your PATH — add it to your ${platform() === 'win32' ? 'user environment variables' : 'shell profile'}`)
+  }
+  const selected = process.env.PATH?.split(delimiter)
+    .map(directory => join(directory, binaryName()))
+    .find(candidate => existsSync(candidate))
+  let shadowed = selected && selected !== target
+  if (shadowed) {
+    try { shadowed = realpathSync(selected) !== realpathSync(target) } catch { /* PATH may contain an unreadable entry. */ }
+  }
+  if (shadowed) {
+    dim(`note: your shell selects another agit at ${selected}; put ${targetDir} first on PATH or invoke ${target} directly`)
   }
 
   // "installed by default at download time": hooks + skill + MCP + AGENTS.md in one pass. A

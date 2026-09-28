@@ -30,6 +30,7 @@ pub(super) fn rpc_test_live(
             created_at: "now".into(),
             updated_at: "now".into(),
         },
+        shared_executor: false,
         tx,
         runtime_thread_id: None,
         task: tokio::spawn(async {}),

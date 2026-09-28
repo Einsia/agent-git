@@ -10,6 +10,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Reconcile the local RC daemon after self-upgrade, global npm installation, or
+  `npx create-agit`, including installations at a different executable path.
+  Idle sessions attached to a persistent Codex server can detach for a safe
+  restart; busy daemons retry after their work clears.
+- Stage the `create-agit` executable before replacing it, so an installation
+  failure preserves the previous CLI. Report when another `agit` on `PATH`
+  shadows the installed copy.
 - Reach the Hub without a fixed stall when one of its addresses is unreachable
   from your network. agit dialed the resolved addresses one after another and
   gave the first one most of the connection budget, so every command that talked

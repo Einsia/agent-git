@@ -282,6 +282,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 let live = Live {
                     generation: 3,
                     info,
+                    shared_executor: false,
                     tx: cmd_tx,
                     runtime_thread_id: Some("native-1".into()),
                     task: tokio::spawn(async {}),

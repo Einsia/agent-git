@@ -1,14 +1,8 @@
 'use strict';
 
-// postinstall: the binary lands with the optional dep, so there is nothing to download. It
-// does two things in passing, each idempotent and neither able to block the install when it
-// fails:
-//
-// 1. Self-check that the binary really runs (an architecture mismatch, Rosetta and the like
-//    surface here rather than the first time the user types agit).
-// 2. Run `agit setup` — the product promise of "installed by default at download time":
-//    skills, hooks, MCP and AGENTS.md, all in one go. AGIT_SKIP_SETUP=1 turns it off
-//    (CI / hosted environments).
+// The binary lands with the optional dependency, so installation needs no download. Verify it
+// before setup or daemon reconciliation; neither follow-up can invalidate the installed CLI.
+// AGIT_SKIP_SETUP=1 leaves the installed binary available without configuring user integrations.
 //
 // npm displays postinstall output badly, so stay quiet: speak only when something is wrong.
 
@@ -58,6 +52,22 @@ function main() {
       stdio: ['ignore', 'inherit', 'inherit'],
       env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
     });
+  }
+  if (truthy(process.env.npm_config_global) && process.env.npm_command !== 'exec') {
+    const reconciled = spawnSync(bin, ['rc', 'local', 'reconcile-installed', '--allow-other-installation'], {
+      encoding: 'utf8', timeout: 35000,
+      env: { ...env, AGIT_INTERNAL_UPDATE_RESTART: '1' },
+    });
+    if (reconciled.error || reconciled.status !== 0) {
+      log.warn(`RC daemon reconciliation failed: ${(reconciled.stderr || reconciled.error?.message || `exit ${reconciled.status}`).trim()}`);
+    } else {
+      try {
+        const outcome = JSON.parse(reconciled.stdout);
+        if (outcome.status === 'deferred') log.warn(`RC daemon upgrade is pending: ${outcome.message}`);
+      } catch {
+        log.warn('RC daemon returned an unreadable reconciliation result.');
+      }
+    }
   }
   if (truthy(process.env.AGIT_SKIP_SETUP)) return;
   const setup = spawnSync(bin, ['setup'], { stdio: 'inherit', env });

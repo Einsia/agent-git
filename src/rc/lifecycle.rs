@@ -14,6 +14,7 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(50);
+const UPGRADE_RETRY: Duration = Duration::from_secs(5);
 const REQUIRED: &[&str] = &["peer-control-v1", "history-v2"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,10 @@ pub struct UpgradeTarget {
     pid: u32,
     instance_id: Option<String>,
     executable: PathBuf,
+    #[serde(default)]
+    allow_other_installation: bool,
+    #[serde(default)]
+    watch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,21 +341,28 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 pub fn upgrade_target(executable: &Path) -> crate::Result<Option<UpgradeTarget>> {
+    upgrade_target_for(executable, true)
+}
+
+fn upgrade_target_for(
+    executable: &Path,
+    allow_other_installation: bool,
+) -> crate::Result<Option<UpgradeTarget>> {
     super::select_local_authority();
     let Some(status) = probe()? else {
         return Ok(None);
     };
-    if status
-        .identity
-        .as_ref()
-        .is_some_and(|identity| !same_path(&identity.executable, executable))
-    {
+    if status.identity.as_ref().is_some_and(|identity| {
+        !allow_other_installation && !same_path(&identity.executable, executable)
+    }) {
         return Ok(None);
     }
     Ok(Some(UpgradeTarget {
         pid: status.pid,
         instance_id: status.identity.map(|identity| identity.instance_id),
         executable: executable.into(),
+        allow_other_installation,
+        watch_id: None,
     }))
 }
 
@@ -378,15 +390,23 @@ pub fn after_upgrade(target: UpgradeTarget) -> crate::Result<Outcome> {
             )
         };
     }
+    if target.allow_other_installation
+        && crate::commands::upgrade::is_older_than(env!("CARGO_PKG_VERSION"), &status.agit_version)
+            != Some(false)
+    {
+        return Ok(Outcome::Unchanged);
+    }
     if let Some(identity) = &status.identity {
         ensure!(
             same_path(&target.executable, &std::env::current_exe()?),
             "upgrade reconciliation must run from the installed executable"
         );
-        ensure!(
-            same_path(&identity.executable, &target.executable),
-            "the running daemon belongs to another installation"
-        );
+        if !target.allow_other_installation {
+            ensure!(
+                same_path(&identity.executable, &target.executable),
+                "the running daemon belongs to another installation"
+            );
+        }
         if identity.build_id == BUILD_ID {
             return Ok(Outcome::Unchanged);
         }
@@ -398,6 +418,140 @@ pub fn after_upgrade(target: UpgradeTarget) -> crate::Result<Outcome> {
             current_build: true,
         },
     )
+}
+
+/// Reconcile an out-of-band installer against the daemon that currently owns this executable.
+pub fn reconcile_installed(allow_other_installation: bool) -> crate::Result<Outcome> {
+    let exe = std::env::current_exe()?;
+    let Some(target) = upgrade_target_for(&exe, allow_other_installation)? else {
+        return Ok(Outcome::Absent);
+    };
+    let outcome = after_upgrade(target.clone())?;
+    if matches!(outcome, Outcome::Deferred { .. }) {
+        schedule_upgrade_watch(&exe, &target)?;
+    }
+    Ok(outcome)
+}
+
+/// Keep trying the guarded handoff while this installation remains the latest requested build.
+/// A later installer supersedes this watcher, and a competing safe restart can change the daemon.
+pub fn watch_upgrade(mut target: UpgradeTarget) -> crate::Result<()> {
+    use sha2::Digest as _;
+    let dir = super::rc_dir()?;
+    let path = dir.join("upgrade-watch.lock");
+    let latest = dir.join("upgrade-watch.latest");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    let digest = sha2::Sha256::digest(std::fs::read(&target.executable)?);
+    let mut last_error = None;
+    loop {
+        std::thread::sleep(UPGRADE_RETRY);
+        if target
+            .watch_id
+            .as_ref()
+            .is_some_and(|id| std::fs::read_to_string(&latest).ok().as_deref() != Some(id.as_str()))
+        {
+            return Ok(());
+        }
+        let Ok(installed) = std::fs::read(&target.executable) else {
+            continue;
+        };
+        if sha2::Sha256::digest(installed) != digest {
+            return Ok(());
+        }
+        let current = match probe() {
+            Ok(Some(status)) => status,
+            Ok(None) => return Ok(()),
+            Err(_) => continue,
+        };
+        if current.pid != target.pid
+            || current
+                .identity
+                .as_ref()
+                .map(|identity| &identity.instance_id)
+                != target.instance_id.as_ref()
+        {
+            if current
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.build_id == BUILD_ID)
+                || crate::commands::upgrade::is_older_than(
+                    env!("CARGO_PKG_VERSION"),
+                    &current.agit_version,
+                ) != Some(false)
+            {
+                return Ok(());
+            }
+            target.pid = current.pid;
+            target.instance_id = current.identity.map(|identity| identity.instance_id);
+        }
+        match after_upgrade(target.clone()) {
+            Ok(Outcome::Restarted) => {
+                eprintln!("Local daemon restarted with the installed build.");
+                return Ok(());
+            }
+            Ok(Outcome::Unchanged | Outcome::Absent) => return Ok(()),
+            Ok(Outcome::Deferred { .. }) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                if last_error.as_ref() != Some(&message) {
+                    eprintln!("Local daemon upgrade retry failed: {message}");
+                    last_error = Some(message);
+                }
+            }
+        }
+    }
+}
+
+pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    let mut watched = target.clone();
+    watched.watch_id = Some(uuid::Uuid::new_v4().to_string());
+    let mut log_options = std::fs::OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600);
+    }
+    let log = log_options.open(super::rc_dir()?.join("upgrade-watch.log"))?;
+    let mut command = crate::infra::background::command(exe);
+    command
+        .args(["rc", "local", "watch-upgrade", "--target"])
+        .arg(serde_json::to_string(&watched)?)
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .env(crate::commands::upgrade::RESTART_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .context("cannot start background daemon upgrade watcher")?;
+    if let Err(error) = std::fs::write(
+        super::rc_dir()?.join("upgrade-watch.latest"),
+        watched.watch_id.as_deref().unwrap_or_default(),
+    ) {
+        let _ = child.kill();
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn report(outcome: &Outcome) -> crate::Result<()> {

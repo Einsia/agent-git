@@ -266,10 +266,21 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
                 wait_for(lambda: has_stopped(binary, env))
                 install(old_binary, installed)
+                cross_install = start(str(installed), env)
+                cross_before = cross_install.request("machine.describe", {})["instance_id"]
+                cross_result = subprocess.run([binary, "rc", "local", "reconcile-installed", "--allow-other-installation"],
+                                              env=env, capture_output=True, text=True, timeout=40)
+                assert cross_result.returncode == 0, cross_result.stderr
+                assert json.loads(cross_result.stdout)["status"] == "restarted"
+                cross_status = control(home, op="status")
+                assert cross_status["identity"]["instance_id"] != cross_before
+                assert Path(cross_status["identity"]["executable"]).resolve() == Path(binary).resolve()
+                subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
+                wait_for(lambda: has_stopped(binary, env))
+                install(old_binary, installed)
                 busy = start(str(installed), env)
                 before = busy.request("machine.describe", {})
                 terminal = busy.request("terminal.open", dict(workspace_id="local-owner", project_id="fixture"))
-                install(binary, installed)
                 result = upgrade(env)
                 assert "deferred" in result.stderr.lower(), result.stdout + result.stderr
                 assert busy.request("machine.describe", {})["instance_id"] == before["instance_id"]
@@ -278,14 +289,19 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 assert blocked.returncode != 0 and b"local daemon" in blocked.stderr
                 assert str(home).encode() in blocked.stderr and b"restart --if-idle" in blocked.stderr
                 assert not blocked.stdout
+                latest = subprocess.run([binary, "rc", "local", "reconcile-installed", "--allow-other-installation"],
+                                        env=env, capture_output=True, text=True, timeout=40)
+                assert latest.returncode == 0, latest.stderr
+                assert json.loads(latest.stdout)["status"] == "deferred"
                 busy.request("terminal.close", dict(terminal_id=terminal["terminal_id"]))
-                def terminal_closed():
-                    busy.request("workspace.list", {})
-                    return any(event.get("method") == "terminal.exited" and
-                               event.get("params", {}).get("terminal_id") == terminal["terminal_id"]
-                               for event in busy.events)
+                def upgraded_after_terminal_close():
+                    try:
+                        return control(home, op="status")["identity"]["instance_id"] != before["instance_id"]
+                    except OSError:
+                        return False
 
-                wait_for(terminal_closed)
+                wait_for(upgraded_after_terminal_close, timeout=30)
+                assert Path(control(home, op="status")["identity"]["executable"]).resolve() == Path(binary).resolve()
                 bridges.extend([Bridge(str(installed), env, "--require-current-build") for _ in range(2)])
                 descriptions = [bridge.description() for bridge in bridges]
                 assert descriptions[0]["instance_id"] == descriptions[1]["instance_id"]
@@ -302,21 +318,28 @@ def replacement_checks(binary, old_binary, legacy_binary):
                 stale_identity = stale.request("machine.describe", {})["instance_id"]
                 install(binary, installed)
                 release.server.release_version = subprocess.check_output([binary, "--version"], text=True).split()[1]
-                current_result = upgrade(env)
-                assert "up to date" in current_result.stdout and "restarted" in current_result.stderr.lower()
+                current_result = subprocess.run([str(installed), "rc", "local", "reconcile-installed"],
+                                                env=env, capture_output=True, text=True, timeout=40)
+                assert current_result.returncode == 0, current_result.stderr
+                assert json.loads(current_result.stdout)["status"] == "restarted"
                 assert control(home, op="status")["identity"]["instance_id"] != stale_identity
                 subprocess.run([binary, "rc", "local", "stop"], env=env, check=True, capture_output=True)
                 wait_for(lambda: has_stopped(binary, env))
                 install(legacy_binary, installed)
                 legacy = start(str(installed), env)
                 legacy_identity = legacy.request("machine.describe", {})["instance_id"]
+                legacy_features = control(home, op="status")["identity"]["rpc_features"]
                 install(binary, installed)
                 legacy_result = subprocess.run([str(installed), "rc", "local", "bridge", "--ensure", "--require-current-build"],
                                               env=env, input=b"", capture_output=True, timeout=30)
-                assert legacy_result.returncode != 0 and b"safe restart" in legacy_result.stderr
                 assert not legacy_result.stdout
-                assert legacy.request("machine.describe", {})["instance_id"] == legacy_identity
-                print("PASS: real upgrade, same-version builds, state retention, busy deferral, concurrent bridges, legacy fallback, namespace isolation")
+                if "safe-restart-v1" in legacy_features:
+                    assert legacy_result.returncode == 0, legacy_result.stderr
+                    assert control(home, op="status")["identity"]["instance_id"] != legacy_identity
+                else:
+                    assert legacy_result.returncode != 0 and b"safe restart" in legacy_result.stderr
+                    assert legacy.request("machine.describe", {})["instance_id"] == legacy_identity
+                print("PASS: real upgrade, same-version builds, state retention, automatic busy retry, concurrent bridges, legacy fencing, namespace isolation")
             finally:
                 for bridge in bridges:
                     bridge.close()

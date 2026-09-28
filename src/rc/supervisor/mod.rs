@@ -1143,6 +1143,10 @@ fn danger_disarm_after_mode_result(
 }
 
 impl Session {
+    pub(crate) fn shared_executor(&self) -> bool {
+        self.driver.shared_executor()
+    }
+
     /// Drop both halves of every approval the harness can no longer answer.
     ///
     /// The supervisor copy is the machine-side authorization evidence; the

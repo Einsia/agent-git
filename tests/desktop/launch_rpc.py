@@ -29,6 +29,8 @@ for line in sys.stdin:
         result = {"thread": {"id": native}}
         with open(os.environ["AGIT_TEST_LAUNCH_LOG"], "a") as log:
             log.write(json.dumps({"event": "thread", "pid": os.getpid(), "id": native, "method": method}) + "\n")
+    elif method == "thread/metadata/update":
+        result = {"thread": {"id": request["params"]["threadId"]}}
     print(json.dumps({"id": request["id"], "result": result}), flush=True)
 '''
 

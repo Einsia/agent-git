@@ -481,10 +481,14 @@ struct SessionRpcBoundWait {
     stop: tokio::sync::watch::Receiver<bool>,
 }
 
+const COMMAND_QUEUE_CAPACITY: usize = 64;
+
 struct Live {
     /// Which generation on the same logical id. See `SessionNote::Ended`.
     generation: u64,
     info: SessionInfo,
+    /// A shared native server outlives this supervisor connection during a daemon replacement.
+    shared_executor: bool,
     tx: mpsc::Sender<Command>,
     /// The harness's own session id. **It exists only in this table** and never goes on the
     /// wire — viewers address sessions by logical session id alone, which is why "continue on

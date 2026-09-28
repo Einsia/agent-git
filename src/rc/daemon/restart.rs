@@ -46,8 +46,18 @@ impl Daemon {
             .freeze()
             .map_err(|reason| RestartRefusal::Busy(vec![reason]))?;
         let mut blockers = Vec::new();
-        if !self.sessions.is_empty() {
-            blockers.push("supervised sessions are still alive".into());
+        if self.sessions.values().any(|live| {
+            !live.shared_executor
+                || live.info.status != SessionStatus::Idle
+                || live.runtime_thread_id.is_none()
+                || live.tx.capacity() != COMMAND_QUEUE_CAPACITY
+                || live.rpc_guard_sensitive
+                || live.pending_mode.is_some()
+                || !live.confirmed_turn_guards.is_empty()
+                || live.inflight_turn_guard.is_some()
+                || live.ended
+        }) {
+            blockers.push("supervised work cannot be detached safely".into());
         }
         if !self.opening_sessions.is_empty() {
             blockers.push("session launches are still reserved".into());
@@ -159,5 +169,62 @@ mod tests {
             Err(RestartRefusal::Busy(_))
         ));
         assert!(admission.enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn safe_stop_detaches_only_idle_shared_executors_with_empty_command_queues() {
+        let (tx, mut commands) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let mut live = super::super::tests::rpc_test_live(
+            "shared",
+            1,
+            tx,
+            crate::protocol::PermissionMode::Default,
+        );
+        live.info.status = SessionStatus::Idle;
+        live.shared_executor = true;
+        live.runtime_thread_id = Some("native-thread".into());
+        let daemon = super::super::tests::rpc_test_daemon(
+            HashMap::from([("shared".into(), live)]),
+            Roster::default(),
+        );
+        let mut state = daemon.lock().await;
+        let (reply, _received) = std::sync::mpsc::sync_channel(1);
+        let (_written, written) = tokio::sync::oneshot::channel();
+        let request = SafeStopRequest {
+            instance_id: state.identity.instance_id.clone(),
+            build_id: state.identity.build_id.clone(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            reply,
+            written,
+        };
+        let admission = Admission::default();
+        let frozen = state
+            .prepare_safe_stop(&request, &admission, false, || false)
+            .expect("an idle shared executor can disconnect without stopping its native server");
+        assert!(admission.enter().is_none());
+        drop(frozen);
+        state.sessions.get_mut("shared").unwrap().info.status = SessionStatus::Running;
+        assert!(matches!(
+            state.prepare_safe_stop(&request, &admission, false, || false),
+            Err(RestartRefusal::Busy(_))
+        ));
+        state.sessions.get_mut("shared").unwrap().info.status = SessionStatus::Idle;
+        state
+            .sessions
+            .get_mut("shared")
+            .unwrap()
+            .tx
+            .try_send(Command::Shutdown)
+            .unwrap();
+        assert!(matches!(
+            state.prepare_safe_stop(&request, &admission, false, || false),
+            Err(RestartRefusal::Busy(_))
+        ));
+        assert!(matches!(commands.try_recv(), Ok(Command::Shutdown)));
+        state.sessions.get_mut("shared").unwrap().shared_executor = false;
+        assert!(matches!(
+            state.prepare_safe_stop(&request, &admission, false, || false),
+            Err(RestartRefusal::Busy(_))
+        ));
     }
 }

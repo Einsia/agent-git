@@ -1753,6 +1753,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
     let (tx, _rx) = mpsc::channel(1);
     let mut live = Live {
         generation: 1,
+        shared_executor: false,
         info: SessionInfo {
             session_id: "s-1".into(),
             native_source: None,

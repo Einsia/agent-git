@@ -154,7 +154,13 @@ fn reconcile_upgraded_daemon(
         }
         let outcome = serde_json::from_slice::<crate::rc::lifecycle::Outcome>(&output.stdout)
             .context("installed CLI returned an invalid daemon reconciliation result")?;
-        crate::rc::lifecycle::report(&outcome)
+        crate::rc::lifecycle::report(&outcome)?;
+        if matches!(outcome, crate::rc::lifecycle::Outcome::Deferred { .. }) {
+            ui::info(format_args!(
+                "Daemon upgrade will retry when safe; older supervised sessions may need to close."
+            ));
+        }
+        Ok(())
     })();
     if let Err(error) = result {
         ui::warning(&format!(
@@ -233,6 +239,10 @@ fn parse(v: &str) -> Option<(u64, u64, u64, bool)> {
         return None;
     }
     Some((parts[0], parts[1], parts[2], stable))
+}
+
+pub(crate) fn is_older_than(candidate: &str, running: &str) -> Option<bool> {
+    Some(parse(candidate)? < parse(running)?)
 }
 
 fn compare(current: &str, latest: &str) -> Ordering {
@@ -689,6 +699,9 @@ mod tests {
         assert_eq!(compare("dev-build", "0.2.0"), Ordering::Same);
         assert_eq!(compare("0.1.0", "garbage"), Ordering::Same);
         assert_eq!(compare("0.1.0", "v0.2"), Ordering::Less);
+        assert_eq!(is_older_than("0.2.10", "0.2.11"), Some(true));
+        assert_eq!(is_older_than("0.2.10", "0.2.10"), Some(false));
+        assert_eq!(is_older_than("unknown", "0.2.10"), None);
     }
 
     #[test]

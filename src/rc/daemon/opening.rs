@@ -322,7 +322,7 @@ impl Daemon {
         self.latest_session_generations
             .insert(session_id.clone(), generation);
         self.journal.resume(&session_id);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_QUEUE_CAPACITY);
         // Bootstrap is queued before the supervisor can run or a caller can address this Live.
         // The private queue has room for the entire bootstrap, so no global lock crosses a wait.
         if needs_claude_restart_guard_barrier(&info.runtime, &restart_guard_attempts) {
@@ -338,6 +338,7 @@ impl Daemon {
                 })
                 .map_err(|_| unknown_launch("the initial instruction could not be queued"))?;
         }
+        let shared_executor = session.shared_executor();
         let runtime_thread_id = session.runtime_thread_id().or(spec.resume_from);
         let task = tokio::spawn(session.run(cmd_rx));
         self.sessions.insert(
@@ -356,6 +357,7 @@ impl Daemon {
                 restart_guard_mode,
                 ended: false,
                 info: info.clone(),
+                shared_executor,
                 tx: cmd_tx,
                 runtime_thread_id,
             },

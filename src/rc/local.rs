@@ -87,6 +87,16 @@ enum Action {
         #[arg(long)]
         target: String,
     },
+    #[command(hide = true)]
+    WatchUpgrade {
+        #[arg(long)]
+        target: String,
+    },
+    #[command(hide = true)]
+    ReconcileInstalled {
+        #[arg(long)]
+        allow_other_installation: bool,
+    },
 }
 
 pub fn run(args: Args) -> crate::commands::CmdResult {
@@ -136,7 +146,20 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
             );
         }
         Action::AfterUpgrade { target } => {
-            let outcome = super::lifecycle::after_upgrade(serde_json::from_str(&target)?)?;
+            let target: super::lifecycle::UpgradeTarget = serde_json::from_str(&target)?;
+            let outcome = super::lifecycle::after_upgrade(target.clone())?;
+            if matches!(outcome, super::lifecycle::Outcome::Deferred { .. }) {
+                super::lifecycle::schedule_upgrade_watch(&std::env::current_exe()?, &target)?;
+            }
+            println!("{}", serde_json::to_string(&outcome)?);
+        }
+        Action::WatchUpgrade { target } => {
+            super::lifecycle::watch_upgrade(serde_json::from_str(&target)?)?;
+        }
+        Action::ReconcileInstalled {
+            allow_other_installation,
+        } => {
+            let outcome = super::lifecycle::reconcile_installed(allow_other_installation)?;
             println!("{}", serde_json::to_string(&outcome)?);
         }
         Action::Status => {
