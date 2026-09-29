@@ -534,7 +534,10 @@ impl Frame {
 /// literal string.
 pub mod method {
     // ── agitd → hub ──
+    pub const COMMIT_LOCAL_SETTLED: &str = "commit.localSettled";
     pub const COMMIT_SETTLED: &str = "commit.settled";
+    pub const SESSION_PUBLICATION_DELIVER: &str = "session.publication.deliver";
+    pub const SESSION_PUBLICATION_CHANGED: &str = "session.publication.changed";
 
     // ── hub / viewer → agitd (relayed) ──
     pub const WORKSPACE_LIST: &str = "workspace.list";
@@ -777,6 +780,7 @@ mod tests {
         );
 
         let session = SessionInfo {
+            publication: None,
             session_id: "agit-one".into(),
             native_source: None,
             runtime_session_id: None,

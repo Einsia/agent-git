@@ -185,7 +185,9 @@ impl Target<'_> {
             );
         }
         // A source-qualified transcript cannot inherit a bare native ID's repository mappings.
-        let redactor = crate::domain::redact::Redactor::try_this_machine()?.for_device_control();
+        let redactor = crate::domain::redact::Redactor::try_this_machine()?
+            .for_device_control()
+            .with_unbound_native_context(self.runtime, self.native);
         match self.entry.and_then(|entry| {
             entry
                 .agit_session

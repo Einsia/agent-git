@@ -8,7 +8,7 @@ use clap::Args as ClapArgs;
 
 /// The full set of valid keys. Adding a key means editing here; an unknown key is always rejected
 /// and this table printed.
-pub const KEYS: [(&str, &str); 7] = [
+pub const KEYS: [(&str, &str); 8] = [
     (
         "hub.url",
         "default hub address (AGIT_HUB_URL takes priority)",
@@ -24,6 +24,10 @@ pub const KEYS: [(&str, &str); 7] = [
     (
         "push.auto",
         "automatically publish settled turns: true | false (default false)",
+    ),
+    (
+        "privacy.encryption",
+        "encryption default for new Hub repositories: true | false (default true; existing repository modes are fixed)",
     ),
     ("commit.auto", "hooks auto-settlement switch: true | false"),
     (
@@ -78,6 +82,22 @@ pub(crate) struct Entry {
     pub environment: Option<String>,
 }
 
+impl Entry {
+    fn json(&self) -> crate::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        if self.key == "privacy.encryption" {
+            for field in ["effective", "stored"] {
+                if let Some(text) = value[field].as_str() {
+                    validate(self.key, text)?;
+                    value[field] = serde_json::Value::Bool(text == "true");
+                }
+            }
+            value["scope"] = "creation_default".into();
+        }
+        Ok(value)
+    }
+}
+
 /// The entry point other commands read config through; that `AGIT_HUB_URL` takes priority is a
 /// rule of the `config` module.
 pub fn get(key: &str) -> Option<String> {
@@ -103,6 +123,10 @@ pub fn run(args: Args) -> CmdResult {
     if args.list || (super::json::requested() && args.key.is_none() && !args.unset) {
         let entries = collect()?;
         if super::json::requested() {
+            let entries = entries
+                .iter()
+                .map(Entry::json)
+                .collect::<crate::Result<Vec<_>>>()?;
             println!(
                 "{}",
                 serde_json::json!({"schema_version": 1, "operation": "list", "settings": entries})
@@ -161,7 +185,11 @@ pub fn run(args: Args) -> CmdResult {
             if super::json::requested() {
                 return structured_entry("get", &key);
             }
-            let v = config::get_global(&key)?;
+            let v = if key == "privacy.encryption" {
+                Some(config::encryption_default()?.to_string())
+            } else {
+                config::get_global(&key)?
+            };
             match v {
                 Some(v) => println!("{v}"),
                 None => {
@@ -197,9 +225,18 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     };
     crate::input_argument(crate::domain::repo::valid_name(&owner))?;
     crate::input_argument(crate::domain::repo::valid_name(&name))?;
-    if args.key.as_deref().is_some_and(|key| key != "push.auto") {
+    if args
+        .key
+        .as_deref()
+        .is_some_and(|key| !matches!(key, "push.auto" | "privacy.encryption"))
+    {
         return crate::input_argument(Err(anyhow::anyhow!(
-            "only push.auto supports a repository override"
+            "only push.auto supports a repository override; privacy.encryption is read-only at repository scope"
+        )));
+    }
+    if args.key.as_deref() == Some("privacy.encryption") && (args.unset || args.value.is_some()) {
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "repository encryption mode is fixed at creation; create a different repository with --encryption=true or --encryption=false. Use `agit config --global privacy.encryption <true|false>` to change the creation default"
         )));
     }
     if args.unset && args.key.is_none() {
@@ -211,6 +248,18 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     let repo = Repo::open(config::repo_dir(&owner, &name)?).ok_or_else(|| {
         anyhow::anyhow!("{owner}/{name} is not a local Agent repository; clone it first")
     })?;
+    if args.key.as_deref() == Some("privacy.encryption") {
+        let entry = repository_encryption_entry(&repo, &owner, &name)?;
+        if super::json::requested() {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"operation":"get","repository":format!("{owner}/{name}"),"setting":entry})
+            );
+        } else {
+            show_repository_encryption(&entry);
+        }
+        return Ok(ExitCode::Ok);
+    }
     let operation = if args.unset {
         repo.set_auto_push(None)?;
         "unset"
@@ -229,10 +278,13 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
         "effective": effective.to_string(), "stored": stored.map(|value| value.to_string()),
         "source": if stored.is_some() { "repository" } else { "inherited" },
     });
+    let encryption = (operation == "list")
+        .then(|| repository_encryption_entry(&repo, &owner, &name))
+        .transpose()?;
     if super::json::requested() {
         let mut response = serde_json::json!({"schema_version": 1, "operation": operation, "repository": format!("{owner}/{name}")});
         if operation == "list" {
-            response["settings"] = serde_json::json!([entry]);
+            response["settings"] = serde_json::json!([entry, encryption]);
         } else {
             response["setting"] = entry;
         }
@@ -249,7 +301,62 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
             }
         );
     }
+    if !super::json::requested()
+        && let Some(entry) = encryption
+    {
+        show_repository_encryption(&entry);
+    }
+    if effective && matches!(operation, "set" | "unset") && !super::json::requested() {
+        ui::hint(&format!(
+            "run `agit push {owner}/{name}@<branch>` to preview and confirm the policy for automatic publication"
+        ));
+    }
     Ok(ExitCode::Ok)
+}
+
+fn repository_encryption_entry(
+    repo: &crate::domain::repo::Repo,
+    owner: &str,
+    name: &str,
+) -> crate::Result<serde_json::Value> {
+    use crate::hub::{Client, identity};
+    let publication = crate::rc::local_repository::publication::Destination::load(repo)?;
+    let (owner, name) = match publication {
+        Some(destination) => super::parse_slug(&destination.repository)?,
+        None => (owner.to_owned(), name.to_owned()),
+    };
+    if identity::read(repo)?.is_some() || repo.remote_url().is_some() {
+        let (identity, enabled) =
+            identity::repository_mode(repo, &Client::from_env(), &owner, &name)?;
+        Ok(serde_json::json!({
+            "key":"privacy.encryption", "effective":enabled, "stored":enabled,
+            "source":"hub", "scope":"repository_mode", "fixed":true,
+            "agent_id":identity.agent_id, "hub":identity.hub,
+            "publication_repository":format!("{owner}/{name}"),
+        }))
+    } else {
+        let stored = repo.creation_encryption()?;
+        Ok(serde_json::json!({
+            "key":"privacy.encryption", "effective":repo.encryption_for_creation(None)?,
+            "stored":stored, "source":if stored.is_some() { "local_intent" } else { "inherited" },
+            "scope":"creation_intent", "fixed":false,
+        }))
+    }
+}
+
+fn show_repository_encryption(entry: &serde_json::Value) {
+    println!(
+        "privacy.encryption = {} ({})",
+        entry["effective"],
+        if entry["fixed"] == true {
+            "Hub; fixed at creation"
+        } else {
+            "local creation intent; no Hub mode established"
+        }
+    );
+    if let Some(repository) = entry["publication_repository"].as_str() {
+        println!("publication repository: {repository}");
+    }
 }
 
 /// The automatic-push setting a repository receives when it is created.
@@ -329,7 +436,7 @@ fn structured_entry(operation: &str, key: &str) -> CmdResult {
         .ok_or_else(|| anyhow::anyhow!("unknown config key `{key}`"))?;
     println!(
         "{}",
-        serde_json::json!({"schema_version": 1, "operation": operation, "setting": entry})
+        serde_json::json!({"schema_version": 1, "operation": operation, "setting": entry.json()?})
     );
     Ok(ExitCode::Ok)
 }
@@ -396,6 +503,7 @@ fn default_value(key: &str) -> Option<&'static str> {
         "push.visibility" => Some("ask"),
         "commit.auto" => Some("true"),
         "push.auto" => Some("false"),
+        "privacy.encryption" => Some("true"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
         _ => None,
@@ -410,7 +518,7 @@ fn wants_tui(args: &Args) -> bool {
 pub(crate) fn validate(key: &str, v: &str) -> crate::Result<()> {
     let ok = match key {
         "push.visibility" => matches!(v, "ask" | "private" | "public"),
-        "commit.auto" | "push.auto" => matches!(v, "true" | "false"),
+        "commit.auto" | "push.auto" | "privacy.encryption" => matches!(v, "true" | "false"),
         "memory.track" => matches!(v, "session" | "off"),
         "runtime.default" => crate::adapter::normalize(v).is_ok(),
         "hub.url" => v.starts_with("http://") || v.starts_with("https://"),
@@ -454,6 +562,9 @@ mod tests {
         assert!(validate("push.visibility", "secret").is_err());
         assert!(validate("commit.auto", "true").is_ok());
         assert!(validate("commit.auto", "yes").is_err());
+        assert!(validate("privacy.encryption", "true").is_ok());
+        assert!(validate("privacy.encryption", "false").is_ok());
+        assert!(validate("privacy.encryption", "yes").is_err());
         assert!(validate("memory.track", "off").is_ok());
         assert!(validate("memory.track", "session").is_ok());
         assert!(validate("memory.track", "maybe").is_err());

@@ -24,6 +24,9 @@ pub enum Cmd {
         name: String,
         #[arg(long)]
         private: bool,
+        /// Fixed encryption mode for the new repository; omission uses privacy.encryption.
+        #[arg(long, require_equals = true, value_name = "true|false")]
+        encryption: Option<bool>,
     },
     /// List repos — local (or --remote for the hub).
     List {
@@ -115,7 +118,11 @@ pub enum CollabAction {
 
 pub fn run(args: Args) -> CmdResult {
     match args.cmd {
-        Cmd::Create { name, private } => create(&name, private),
+        Cmd::Create {
+            name,
+            private,
+            encryption,
+        } => create(&name, private, encryption),
         Cmd::List { remote } => list(remote),
         Cmd::Info { repo } => info(resolve_or_ctx(repo.as_deref())),
         Cmd::Visibility { repo, visibility } => set_visibility(&repo, &visibility),
@@ -138,50 +145,103 @@ fn resolve_or_ctx(arg: Option<&str>) -> Option<String> {
     }
 }
 
-fn create(name: &str, private: bool) -> CmdResult {
+fn create(name: &str, private: bool, encryption: Option<bool>) -> CmdResult {
     let client = super::require_login()?;
+    crate::input_argument(crate::domain::repo::valid_name(name))?;
+    let owner = client
+        .credential_username()
+        .ok_or_else(|| anyhow::anyhow!("the selected account is unavailable"))?;
     // The local check comes before the hub mutation: with a same-name repo
     // already on disk, failing after publish would occupy the remote name
     // and leave the user with both halves broken. The post-publish check in
     // materialize_at stays — this one cannot see a race.
     if let Some(me) = crate::infra::credentials::current_user()
         && let Ok(dir) = crate::infra::config::repo_dir(&me, name)
-        && Repo::open(dir.clone()).is_some()
+        && let Some(existing) = Repo::open(dir.clone())
     {
+        if let Some(selected) = encryption
+            && (crate::hub::identity::read(&existing)?.is_some() || existing.remote_url().is_some())
+        {
+            let (_, actual) =
+                crate::hub::identity::repository_mode(&existing, &client, &owner, name)?;
+            anyhow::ensure!(
+                selected == actual,
+                "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+            );
+        }
         ui::error(&format!(
             "a local repo already sits at {} — keep it if it is yours, or move it aside first",
             dir.display()
         ));
-        ui::hint("nothing was created on the hub");
+        ui::hint(
+            "choose a new repository name for a different encryption mode; nothing was created on the Hub",
+        );
         return Ok(ExitCode::Precondition);
     }
+    match client.get_agent(&owner, name) {
+        Ok(remote) => {
+            anyhow::ensure!(
+                remote.owner == owner && remote.name == name,
+                "the Hub returned another repository for creation"
+            );
+            let enabled = remote.require_encryption_enabled()?;
+            anyhow::ensure!(
+                encryption.is_none_or(|selected| selected == enabled),
+                "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+            );
+            ui::info(format_args!(
+                "{owner}/{name} already exists with encryption {}; its mode is unchanged",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+            ui::hint(&format!(
+                "use `agit clone {owner}/{name}` to retain its identity and history locally"
+            ));
+            return Ok(ExitCode::Precondition);
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::hub::client::ApiError>()
+                .is_some_and(|api| api.status == 404) => {}
+        Err(error) => return Err(error),
+    }
+    let encryption_enabled = match encryption {
+        Some(value) => value,
+        None => crate::infra::config::encryption_default()?,
+    };
     let auto_push = super::config::choose_repo_auto_push()?;
     match client.publish(&crate::hub::PublishRequest {
         name: name.to_string(),
         owner: None,
         public: !private,
+        encryption_enabled,
         repo_origins: vec![],
     }) {
         Ok(resp) => {
-            ui::success(&format!(
-                "created {}/{} ({})",
-                resp.owner,
-                resp.name,
-                if private { "private" } else { "public" }
-            ));
             // A hub row without a pinned local repo is a trap: the natural
             // `agit init <name>` next builds an unpinned repo of the same
             // name, and push must then refuse to adopt the remote silently.
             // What "create" promises is the pair — the remote and its pinned
             // local counterpart.
-            let dir = match crate::infra::config::repo_dir(&resp.owner, &resp.name) {
+            let dir = match crate::infra::config::repo_dir(&owner, name) {
                 Ok(d) => d,
                 Err(e) => {
                     ui::error(&format!("{e:#}"));
                     return Ok(ExitCode::Precondition);
                 }
             };
-            if let Err(e) = materialize_at(&dir, client.base(), &resp.agent_id, &resp.push_url) {
+            let remote = client.get_agent(&owner, name)?;
+            if let Err(e) = install_created_repository(
+                &Creation {
+                    owner: &owner,
+                    name,
+                    public: !private,
+                    encryption_enabled,
+                },
+                client.base(),
+                &dir,
+                &resp,
+                &remote,
+            ) {
                 ui::error(&format!("{e:#}"));
                 ui::hint(&format!(
                     "the hub repo exists; finish locally with `agit clone {}/{}`",
@@ -190,12 +250,35 @@ fn create(name: &str, private: bool) -> CmdResult {
                 return Ok(ExitCode::Precondition);
             }
             auto_push.apply(&Repo::at(&dir), &format!("{}/{}", resp.owner, resp.name))?;
+            ui::success(&format!(
+                "created {owner}/{name} ({}, encryption {})",
+                if private { "private" } else { "public" },
+                if encryption_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ));
+
             println!("  next:");
+            if encryption_enabled {
+                println!(
+                    "    agit privacy init {}/{}    # set up the repository viewing password",
+                    resp.owner, resp.name
+                );
+            }
             println!(
                 "    cd <your-project> && agit init {}    # lays down the main file line",
                 resp.name
             );
-            println!("    agit push {}/{} -b main", resp.owner, resp.name);
+            if encryption_enabled {
+                println!(
+                    "    agit push {}/{}@<session-branch>",
+                    resp.owner, resp.name
+                );
+            } else {
+                println!("    agit push {}/{} -b main", resp.owner, resp.name);
+            }
             Ok(ExitCode::Ok)
         }
         Err(e) => {
@@ -229,6 +312,123 @@ fn materialize_at(
     // usable but has no fencing identity.
     crate::hub::identity::pin(&repo, &identity)?;
     repo.set_remote(push_url)?;
+    Ok(())
+}
+
+/// Initialization may attach a new remote to imported history without rebuilding that history.
+pub(super) fn create_for_privacy(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    public: bool,
+    path: &std::path::Path,
+) -> crate::Result<crate::hub::RemoteAgent> {
+    use anyhow::ensure;
+    let existing = Repo::open(path.to_owned());
+    if let Some(repo) = &existing {
+        ensure!(
+            crate::hub::identity::read(repo)?.is_none(),
+            "a pinned local repository cannot adopt a replacement remote"
+        );
+        ensure!(
+            repo.upstream_url().is_none(),
+            "repository promotion requires a supported historical-key delivery contract"
+        );
+        let expected_url = format!(
+            "{}/{owner}/{name}.git",
+            crate::hub::identity::normalize_hub(client.base())?
+        );
+        ensure!(
+            repo.remote_url().is_none_or(|url| url == expected_url),
+            "the imported repository has another remote; refusing to replace its destination"
+        );
+    } else {
+        ensure!(
+            !path.exists(),
+            "the local repository path already exists; refusing to replace it"
+        );
+    }
+    let response = client.publish(&crate::hub::PublishRequest {
+        name: name.into(),
+        owner: Some(owner.into()),
+        public,
+        encryption_enabled: true,
+        repo_origins: vec![],
+    })?;
+    let remote = client.get_agent(owner, name)?;
+    install_created_repository(
+        &Creation {
+            owner,
+            name,
+            public,
+            encryption_enabled: true,
+        },
+        client.base(),
+        path,
+        &response,
+        &remote,
+    )?;
+    Ok(remote)
+}
+
+struct Creation<'a> {
+    owner: &'a str,
+    name: &'a str,
+    public: bool,
+    encryption_enabled: bool,
+}
+
+fn install_created_repository(
+    selected: &Creation<'_>,
+    hub: &str,
+    path: &std::path::Path,
+    response: &crate::hub::PublishResponse,
+    remote: &crate::hub::RemoteAgent,
+) -> crate::Result<()> {
+    use anyhow::ensure;
+    let Creation {
+        owner,
+        name,
+        public,
+        encryption_enabled,
+    } = *selected;
+    let identity = crate::hub::identity::RemoteIdentity::new(hub, &response.agent_id)?;
+    ensure!(
+        response.encryption_enabled == Some(encryption_enabled)
+            && remote.require_encryption_enabled()? == encryption_enabled,
+        "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+    );
+    let expected_url = format!("{}/{owner}/{name}.git", identity.hub);
+    ensure!(
+        response.owner == owner
+            && response.name == name
+            && response.forked_from.is_none()
+            && remote.owner == owner
+            && remote.name == name
+            && remote.agent_id == identity.agent_id
+            && response.push_url == expected_url
+            && remote.clone_url == expected_url
+            && remote.visibility == if public { "public" } else { "private" },
+        "created repository identity, URL or visibility differs from the confirmed destination"
+    );
+    if let Some(repo) = Repo::open(path.to_owned()) {
+        ensure!(
+            repo.upstream_url().is_none(),
+            "repository promotion requires a supported historical-key delivery contract"
+        );
+        ensure!(
+            repo.remote_url().is_none_or(|url| url == expected_url),
+            "the imported repository has another remote; refusing to replace its destination"
+        );
+        crate::hub::identity::pin(&repo, &identity)?;
+        repo.set_remote(&remote.clone_url)?;
+    } else {
+        ensure!(
+            !path.exists(),
+            "the local repository path appeared during creation; refusing to replace it"
+        );
+        materialize_at(path, hub, &identity.agent_id, &remote.clone_url)?;
+    }
     Ok(())
 }
 
@@ -314,6 +514,14 @@ fn info(repo: Option<String>) -> CmdResult {
     match client.get_agent(&owner, &name) {
         Ok(a) => {
             println!("remote    {} [{}]", a.slug(), a.visibility);
+            println!(
+                "encryption {} (Hub; fixed at creation)",
+                if a.require_encryption_enabled()? {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             println!("sessions  {}", a.session_count);
             println!("web       {}", config_hub_web(&a));
         }
@@ -1384,5 +1592,80 @@ mod tests {
             again.to_string().contains("already sits"),
             "an existing repo must never be overwritten: {again}"
         );
+    }
+
+    #[test]
+    fn privacy_initialization_retains_imported_history_and_refuses_replacement_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.root().join("imported"), "original session evidence").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("imported history").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let hub = "https://hub.example.test";
+        let id = "01a05c78-4273-7110-9d90-6cc202250000";
+        let url = format!("{hub}/owner/name.git");
+        let mut response = crate::hub::PublishResponse {
+            agent_id: id.into(),
+            encryption_enabled: Some(true),
+            forked_from: None,
+            owner: "owner".into(),
+            name: "name".into(),
+            push_url: url.clone(),
+            web_url: format!("{hub}/owner/name"),
+        };
+        let mut remote = crate::hub::RemoteAgent {
+            agent_id: id.into(),
+            encryption_enabled: Some(true),
+            owner: "owner".into(),
+            name: "name".into(),
+            clone_url: url.clone(),
+            visibility: "private".into(),
+            session_count: 0,
+            updated_at: None,
+            last_gist: None,
+        };
+        install_created_repository(
+            &Creation {
+                owner: "owner",
+                name: "name",
+                public: false,
+                encryption_enabled: true,
+            },
+            hub,
+            repo.root(),
+            &response,
+            &remote,
+        )
+        .unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("imported")).unwrap(),
+            "original session evidence"
+        );
+        assert_eq!(repo.remote_url().as_deref(), Some(url.as_str()));
+        response.agent_id = "01a05c78-4273-7110-9d90-6cc202250001".into();
+        remote.agent_id = response.agent_id.clone();
+        assert!(
+            install_created_repository(
+                &Creation {
+                    owner: "owner",
+                    name: "name",
+                    public: false,
+                    encryption_enabled: true
+                },
+                hub,
+                repo.root(),
+                &response,
+                &remote
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::hub::identity::read(&repo).unwrap().unwrap().agent_id,
+            id
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
     }
 }

@@ -124,8 +124,8 @@ fn command(repo: &Repo) -> Command {
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_GRAFT_FILE", "")
         .stderr(Stdio::null());
+    crate::infra::git_runtime::disable_grafts(&mut command);
     command
 }
 

@@ -39,6 +39,9 @@ pub fn install(
     cwd: &Path,
 ) -> Result<(Installed, bool)> {
     let dst = adapter::get(target_rt)?;
+    let physical_cwd =
+        (dst.format() == "claude-code").then(|| adapter::claude_code::canonical_cwd(cwd));
+    let cwd = physical_cwd.as_deref().unwrap_or(cwd);
 
     // Refuse **before any work**, not after rendering and writing the file.
     //
@@ -78,6 +81,9 @@ pub fn install(
 /// Restore an archived VIEW using each envelope's source instead of the latest writer's format.
 pub fn install_saved(envelopes: &str, target: &str, cwd: &Path) -> Result<(Installed, bool)> {
     let dst = adapter::get(target)?;
+    let physical_cwd =
+        (dst.format() == "claude-code").then(|| adapter::claude_code::canonical_cwd(cwd));
+    let cwd = physical_cwd.as_deref().unwrap_or(cwd);
     if !dst.installable() {
         dst.install("", "", cwd)?;
         anyhow::bail!("{target} does not support installing sessions");
@@ -90,6 +96,9 @@ pub fn install_saved(envelopes: &str, target: &str, cwd: &Path) -> Result<(Insta
     } else {
         dst.localize(&content, &id, cwd)?
     };
+    if dst.format() == "claude-code" {
+        crate::domain::transcript::recovery::validate_claude(&content, &id, cwd)?;
+    }
     Ok((dst.install(&content, &id, cwd)?, lossy))
 }
 

@@ -589,6 +589,7 @@ mod tests {
     fn watching_tail(stream: &str) -> WatchLive {
         WatchLive {
             info: SessionInfo {
+                publication: None,
                 session_id: stream.into(),
                 native_source: None,
                 runtime_session_id: None,

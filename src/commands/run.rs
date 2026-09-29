@@ -538,12 +538,10 @@ fn prepare_reuse(
 /// to a server that does not hold it. A point without a settled session (the file line, a point
 /// with no meta, a line whose first turn has not settled) names nothing the Hub could count.
 ///
-/// A copy made from `copied_from` holds that repository's sessions under the same ids and
-/// commits, so the receipt goes to `copied_from` when the checkout's `upstream` shows it was
-/// copied from there. Addressed to the copy, the Hub would see the caller reusing their own
-/// repository. Without that `upstream` the checkout is not known to be the copy, and the
-/// receipt stays with the checkout.
-fn reuse_receipt(
+/// Encrypted source points use authenticated accepted mappings. Other points require evidence
+/// in the selected remote's history; a pin alone does not make local history public. Copies
+/// report to `copied_from` only through its matching upstream and exchanged history.
+pub(crate) fn reuse_receipt(
     repo: &Repo,
     hub: &str,
     checkout: (&str, &str),
@@ -572,6 +570,36 @@ fn reuse_receipt(
         &format!("{point}^{{commit}}"),
     ])?;
     let commit = commit.trim();
+    let remote = if (owner, name) == checkout {
+        let identity = crate::hub::identity::read(repo).ok()??;
+        if let Some((session, public)) = crate::domain::privacy_git::accepted_session_identity(
+            repo,
+            point.strip_prefix("refs/heads/"),
+            commit,
+            &identity,
+        )
+        .ok()?
+        {
+            return SessionReuse::new(owner, name, &session, &public, mode);
+        }
+        "refs/remotes/origin/"
+    } else {
+        "refs/remotes/upstream/"
+    };
+    // Without an accepted projection, only history already exchanged with the selected
+    // remote can name a public session. Local-only points must never leave through telemetry.
+    let (status, published, _) = repo
+        .git_status_local(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            commit,
+            remote,
+        ])
+        .ok()?;
+    if status != Some(0) || published.is_empty() {
+        return None;
+    }
     let snapshot = meta::read_at_ref(repo, commit)?;
     if snapshot.is_file_line() {
         return None;
@@ -667,6 +695,13 @@ mod tests {
         identity::pin(&repo, &RemoteIdentity::new(hub, agent_id).unwrap()).unwrap();
         repo.git(&["remote", "add", "origin", &format!("{hub}/alice/notes.git")])
             .unwrap();
+        assert_eq!(
+            receipt(hub, "alice", &head, ReuseMode::Continue),
+            None,
+            "a pinned origin does not authorize disclosing an unpublished point"
+        );
+        repo.git(&["update-ref", "refs/remotes/origin/work", &head])
+            .unwrap();
 
         assert_eq!(
             receipt(
@@ -716,6 +751,8 @@ mod tests {
         identity::pin(&repo, &RemoteIdentity::new(hub, agent_id).unwrap()).unwrap();
         repo.git(&["remote", "add", "origin", &format!("{hub}/bob/notes.git")])
             .unwrap();
+        repo.git(&["update-ref", "refs/remotes/origin/work", &point])
+            .unwrap();
         let receipt = || {
             reuse_receipt(
                 &repo,
@@ -738,6 +775,11 @@ mod tests {
             (format!("{hub}/alice/notes.git"), "alice"),
         ] {
             repo.set_upstream(&upstream).unwrap();
+            if expected == "alice" {
+                assert_eq!(receipt(), None, "a copy needs source publication evidence");
+                repo.git(&["update-ref", "refs/remotes/upstream/work", &point])
+                    .unwrap();
+            }
             assert_eq!(receipt(), to(expected), "{upstream}");
         }
     }

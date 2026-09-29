@@ -94,6 +94,7 @@ fn audit_json_is_rejected_without_changing_ordinary_push_json() {
 fn remote() -> RemoteAgent {
     RemoteAgent {
         agent_id: "11111111-1111-4111-8111-111111111111".into(),
+        encryption_enabled: Some(true),
         owner: "me".into(),
         name: "qa".into(),
         clone_url: "https://hub.example/me/qa.git".into(),
@@ -113,7 +114,10 @@ fn intent() -> Intent {
         name: remote.name.clone(),
         url: remote.clone_url.clone(),
         visibility: remote.visibility.clone(),
+        encryption_enabled: true,
+        accept_secret_findings: false,
         action: Action::Existing(remote),
+        separate_target: None,
     }
 }
 
@@ -121,6 +125,19 @@ fn intent() -> Intent {
 fn reviewed_destination_rejects_identity_audience_namespace_and_url_drift() {
     let intent = intent();
     let original = remote();
+    for encryption_enabled in [None, Some(false)] {
+        assert!(
+            intent
+                .verify_observed(
+                    &RemoteAgent {
+                        encryption_enabled,
+                        ..original.clone()
+                    },
+                    Some(&original.agent_id)
+                )
+                .is_err()
+        );
+    }
     intent
         .verify_observed(&original, Some(&original.agent_id))
         .unwrap();
@@ -271,7 +288,7 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         assert_eq!(
             error.to_string(),
             format!(
-                "push --audit cannot inherit {key}; clear Git routing and injected configuration before retrying"
+                "push cannot inherit {key}; clear Git routing and injected configuration before retrying"
             )
         );
         assert!(!error.to_string().contains("PRIVATE_ROUTING_VALUE"));

@@ -7,7 +7,7 @@ description: Register device-local literal secrets and review the repository-loc
 
 ## Purpose
 
-Two layers of protection, both device-local. The **vault** holds literals you register explicitly — low-entropy values the heuristic rules would never catch on their own ("blue horse battery", an internal hostname). The **repository dictionary** holds what the heuristic rules found in session content by themselves; `agit commit` projects both into opaque `{{AGIT_SECRET_V1:...}}` placeholders before Git object ids are formed, and only this device can hydrate them back.
+Two layers of local protection. The **vault** holds literals you register explicitly — low-entropy values the heuristic rules would never catch on their own ("blue horse battery", an internal hostname). The **repository dictionary** holds what the heuristic rules found in session content by themselves; `agit commit` projects both into opaque `{{AGIT_SECRET_V1:...}}` placeholders before Git object ids are formed. These local handles require their dictionary to hydrate. Privacy publication encrypts the recovered session text and its used protection values for the viewing key; `agit privacy unlock` restores the text on another device and installs local protection for those values. It does not transfer the full dictionary or its keys.
 
 Values never travel through argv: interactive registration is hidden, and automation passes `--stdin`. Management output contains record IDs, labels and policy metadata. It never contains the stored value or its digest.
 

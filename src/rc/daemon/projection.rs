@@ -113,11 +113,31 @@ impl Daemon {
         {
             live.info.status = p.status;
         }
+        if frame.method() == method::SESSION_PUBLICATION_CHANGED
+            && let Some(status) = frame
+                .params
+                .as_ref()
+                .and_then(|value| value.get("publication"))
+            && let Ok(status) =
+                serde_json::from_value::<crate::protocol::SessionPublicationStatus>(status.clone())
+            && let Some(live) = self.sessions.get_mut(&stream)
+        {
+            live.info.publication = Some(status);
+        }
+        if frame.method() == method::COMMIT_LOCAL_SETTLED
+            && let Some(live) = self.sessions.get_mut(&stream)
+        {
+            let mut status = crate::protocol::SessionPublicationStatus::checking();
+            status.progress = crate::protocol::PublicationProgress::LocalSaved;
+            live.info.publication = Some(status);
+        }
         // `through_seq` is a journal coordinate. The supervisor cannot derive
         // it from transcript items because status/turn/approval events also
         // consume sequence numbers.
-        if frame.method() == method::COMMIT_SETTLED
-            && let Some(obj) = frame.params.as_mut().and_then(|p| p.as_object_mut())
+        if matches!(
+            frame.method(),
+            method::COMMIT_SETTLED | method::COMMIT_LOCAL_SETTLED
+        ) && let Some(obj) = frame.params.as_mut().and_then(|p| p.as_object_mut())
         {
             let settlement = *self.settlement.borrow();
             if !(self.opts.local_owner && settlement.local_owner) {
@@ -576,6 +596,17 @@ impl Daemon {
     /// throughout. That same-lock invariant is the whole reason the web can
     /// make that comparison.
     pub(super) fn stamped(&self, mut info: SessionInfo) -> SessionInfo {
+        if self.opts.local_owner {
+            let progress = info.publication.as_ref().map(|status| status.progress);
+            info.publication = Some(if info.agent.is_some() && info.branch.is_some() {
+                crate::protocol::SessionPublicationStatus::checking()
+            } else {
+                crate::protocol::SessionPublicationStatus::unbound()
+            });
+            if let (Some(status), Some(progress)) = (&mut info.publication, progress) {
+                status.progress = progress;
+            }
+        }
         info.last_seq = self.journal.last_seq(&info.session_id);
         if let Some(live) = self.sessions.get(&info.session_id) {
             info.runtime_session_id = live.runtime_thread_id.clone();
@@ -806,6 +837,7 @@ mod bound_lineage_tests {
                 .block_on(async {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
+                        publication: None,
                         session_id: "agit-S".into(),
                         native_source: None,
                         runtime_session_id: None,

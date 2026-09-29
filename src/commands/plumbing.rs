@@ -387,12 +387,41 @@ pub fn ensure_v1_namespace_available_in_worktree(repo: &Repo) -> Result<()> {
 /// the same command (resume/settlement), and Git is allowed to overwrite ignored files.
 pub fn ensure_v1_upgrade_preflight(repo: &Repo, source: &str) -> Result<()> {
     ensure_v1_namespace_available_at(repo, source)?;
-    let head = repo.git(&["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if storage_layout_at(repo, &head)? == meta::LayoutVersion::V0 {
-        ensure_v1_namespace_available_at(repo, &head)?;
-        ensure_v1_namespace_available_in_worktree(repo)?;
+    match checkout_head(repo)? {
+        Some(head) if storage_layout_at(repo, &head)? == meta::LayoutVersion::V1 => {}
+        head => {
+            if let Some(head) = head {
+                ensure_v1_namespace_available_at(repo, &head)?;
+            }
+            ensure_v1_namespace_available_in_worktree(repo)?;
+        }
     }
     Ok(())
+}
+
+/// An absent symbolic branch permits an initial checkout; a broken object or ref does not.
+fn checkout_head(repo: &Repo) -> Result<Option<String>> {
+    let error = match repo.git(&["rev-parse", "--verify", "HEAD^{commit}"]) {
+        Ok(head) => return Ok(Some(head)),
+        Err(error) => error,
+    };
+    if let Some(branch) = checked_out_branch(repo)? {
+        let output = crate::infra::git_runtime::command()
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(repo.root())
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()?;
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+    }
+    Err(error)
 }
 
 /// Fail-closed boundary before Git changes the active checkout to `target`.
@@ -415,8 +444,9 @@ pub fn ensure_safe_checkout(repo: &Repo, target: &str) -> Result<()> {
     if target_layout == meta::LayoutVersion::V1 {
         ensure_v1_upgrade_preflight(repo, target)?;
     }
-    let head = repo.git(&["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if storage_layout_at(repo, &head)? == meta::LayoutVersion::V1 {
+    if let Some(head) = checkout_head(repo)?
+        && storage_layout_at(repo, &head)? == meta::LayoutVersion::V1
+    {
         ensure_v1_namespace_absent_or_matches(repo, &head)?;
     }
     Ok(())

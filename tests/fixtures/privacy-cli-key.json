@@ -1,0 +1,21 @@
+{
+  "description": "Synthetic Rust KeyInput::wrap output, verified by Web unlockPrivacyPrivateKey.",
+  "key": {
+    "encrypted_private_key": {
+      "algorithm": "xsalsa20-poly1305",
+      "ciphertext": "pPZRWr7g1iRHhzor4fk5RVCfa5rK4S3Er39F9/gDGaH1W6Lz8/lLFJqR/LQk/VKV",
+      "nonce": "/RR0ijM7SdPqvxqbIIYAHZ6+lJOKy/+4",
+      "version": 2
+    },
+    "kdf": {
+      "algorithm": "argon2id13",
+      "memlimit": 268435456,
+      "opslimit": 3,
+      "salt": "pusBjhgycAmoTQdWHdz7OQ=="
+    },
+    "public_key": "D1dcIFhxxRAY+8wpk8JKFgb5KsCkfJvA4+f/hOkqOgw=",
+    "public_key_algorithm": "x25519"
+  },
+  "password": "synthetic-next-password",
+  "private_key": "B5H4f0zHCUMuMnZ8vQpIfUehiDB0F23/VhdzsVdevvc="
+}

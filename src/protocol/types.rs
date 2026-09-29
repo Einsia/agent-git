@@ -633,6 +633,8 @@ impl NativeSourceRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<SessionPublicationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_source: Option<NativeSourceRef>,
     /// Logical session id (`agit-…`) = branch. Never the harness's thread id.
     pub session_id: String,
@@ -666,6 +668,81 @@ pub struct SessionInfo {
     pub permission_mode: Option<PermissionMode>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationReadiness {
+    Unbound,
+    Checking,
+    SetupRequired,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationProgress {
+    Idle,
+    LocalSaved,
+    Publishing,
+    AwaitingAck,
+    Acknowledged,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationStage {
+    Capture,
+    Configuration,
+    Consent,
+    Publication,
+    Receiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationReason {
+    Unbound,
+    BindingInvalid,
+    PushDisabled,
+    DestinationMissing,
+    ConsentRequired,
+    EligibilityUnchecked,
+    PublicationPending,
+    PublicationFailed,
+    ReceiverUnavailable,
+    ReceiverRejected,
+}
+
+/// Readiness is a current observation; only matching receipt coverage proves acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicationStatus {
+    pub readiness: PublicationReadiness,
+    pub progress: PublicationProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<PublicationStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PublicationReason>,
+}
+
+impl SessionPublicationStatus {
+    pub fn unbound() -> Self {
+        Self {
+            readiness: PublicationReadiness::Unbound,
+            progress: PublicationProgress::Idle,
+            stage: Some(PublicationStage::Capture),
+            reason: Some(PublicationReason::Unbound),
+        }
+    }
+    pub fn checking() -> Self {
+        Self {
+            readiness: PublicationReadiness::Checking,
+            progress: PublicationProgress::Idle,
+            stage: Some(PublicationStage::Consent),
+            reason: Some(PublicationReason::EligibilityUnchecked),
+        }
+    }
 }
 
 /// Subscribe to a session's event stream. `after_seq` is the last seq the
@@ -998,9 +1075,16 @@ pub struct SecretDetected {
     pub source: String,
 }
 
-/// A turn was settled into the agent repo (`agit commit`). Lets the hub verify
-/// its projection against the commit and, after `agit push`, against the pushed
-/// transcript.
+/// Local persistence covers this live stream boundary. Private Git IDs remain on the device;
+/// this event provides no evidence of Hub publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitLocalSettled {
+    pub session_id: String,
+    pub through_seq: u64,
+}
+
+/// A protected publication completed. `commit_sha` names generated public history, independently
+/// of the local source commit and the native live stream's session identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitSettled {
     pub session_id: String,

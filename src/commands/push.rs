@@ -1,88 +1,16 @@
-//! `agit push [<owner/repo>@<branch>] [--all]` — publish a local repo to the hub.
+//! Publish inspected history in the destination's fixed encryption mode.
 //!
-//! # It is `git push`
-//!
-//! Recording a version (`agit import -n <agent>` or `agit commit`) has already written the
-//! content and the snapshot into `~/.agit/repos/<owner>/<name>/` and made a git commit. So this
-//! command has three things left: make sure the remote exists, scan for secrets, push the
-//! branches and the tags.
-//!
-//! **The local repo is the authoritative copy**, which makes re-running `agit push` an
-//! idempotent retry. A `drafts/<agent>/` staging area — fetch the remote → reset to its tip →
-//! copy the draft in → commit → tag → push, then **delete the draft** — costs two things: the
-//! next commit loses its comparison base, and the hint "the tags did not go up, re-run agit
-//! push" cannot be followed, because what would be re-pushed has been deleted.
-//!
-//! # What goes up is the **context branch**, not the branch the checkout sits on
-//!
-//! The branch comes from [`super::context::resolve`], the same source `commit` uses. Pushing
-//! `repo.current_branch()` without ever asking the context publishes the wrong thing the moment
-//! the two disagree — a rejected import leaves a ghost branch exactly where the checkout sits,
-//! and push sends it to the hub. When the context does not resolve and there is more than one
-//! branch, this **errors** instead of guessing (`-b` / `--all` say which one).
-//!
-//! `--all` publishes only the branches with **something new**: what gets published is selected,
-//! the same way memory is, and an experiment branch is not broadcast along the way.
-//!
-//! # A version ID is a tag
-//!
-//! `refs/tags/agit-<40hex>` points at a commit. Two tags colliding on a name means the parent,
-//! the cwd and the transcript bytes are all identical, which is the same state, so re-pushing is
-//! a no-op.
-//!
-//! Only the tags **reachable from the pushed branches** go up. `--tags` broadcasts the version
-//! IDs of every branch that was not selected too (an experiment line, somebody else's line
-//! fetched down here), and a version ID is itself evidence that the content exists.
-//!
-//! # Visibility is settled at first publish
-//!
-//! On a tty it asks (and says the transcript is a complete work record); a non-interactive run
-//! defaults to **private** — publishing a complete work transcript by default is a step that
-//! cannot be undone, and in CI there is nobody to nod. After that, push **never changes
-//! visibility**; it only reports the current value, and the person who most needs that line is
-//! the one who passed nothing. Change it with `agit repo visibility`.
-//!
-//! # The secret scan is here
-//!
-//! Because this is the first time the content leaves this machine. The client-side gate can be
-//! bypassed (patch the code, run `git push` directly), so the server scans too.
-//!
-//! **How much the server scans depends on the hub's version**: a newer hub scans only "the
-//! moment the content becomes readable by a third party" (a push to a public agent, private
-//! turning public, a PR carrying content into a public target); an older one scans on every
-//! push. So the user-facing wording is always "the server **may** still refuse" — pinning it to
-//! either behavior is wrong on the other hub, and the client and the hub are not guaranteed to
-//! ship together.
-//!
-//! One thing holds on either hub, and it is what the user actually needs to know: what entered
-//! history does not go away; it blocks you on the day you want to make this agent public.
-//!
-//! # In a read-only checkout it offers to promote, instead of hitting a wall
-//!
-//! The checkout `agit clone alice/photo` leaves behind (without `--mine`) has `origin` pointing
-//! at alice's copy, and there is no pushing into it. `agit push` there can mean only one thing:
-//! make it yours, then publish. So this **asks** and then does it, rather than raising an error
-//! that says "go run another command first" — that command holds no decision for anyone to make.
-//!
-//! It does have a side effect (creating an agent under your namespace on the server), so:
-//!
-//! * Interactive: ask "create `<you>/photo` under your name?"; no means nothing happens.
-//! * Non-interactive (CI, scripts): **error**, and give that command. A namespace write nobody
-//!   nodded at does not belong in automation, and [`ui::prompt::confirm`] returning None off a
-//!   tty means exactly that.
-//!
-//! The promotion itself is [`super::clone::promote`], the same code `agit clone --mine` uses —
-//! the repo state the two paths produce must be identical.
-//!
-//! # Publication identity
-//!
-//! Hub sessions and repository grants authorize publication. Git object hashes establish
-//! content integrity; they do not prove a signing identity.
+//! Selected session branches retain their ancestry. Generated commits and version tags live
+//! in isolated storage so native Git metadata and source objects cannot enter the outgoing pack.
+//! Ordinary and audited publication inspect the same frozen objects before confirmation.
 
 mod audit;
 mod audit_report;
 mod audit_workspace;
 mod audited_push;
+mod consent;
+pub(crate) use audited_push::automatic_publication_consent;
+mod preview;
 
 use super::{CmdResult, require_login};
 use crate::domain::meta;
@@ -105,14 +33,19 @@ pub struct Args {
     #[arg(value_name = "owner/repo@branch")]
     pub agent: Option<String>,
 
+    /// Publish to a separate repository without rebinding the source; local RC retains its confirmed target.
+    #[arg(long, value_name = "owner/repo")]
+    pub to: Option<String>,
+
+    /// Publish a separate copy from local RC without replacing its confirmed publication target.
+    #[arg(long, requires = "to")]
+    pub separate: bool,
+
     /// Branch to publish (repeatable). Default: the context branch.
     #[arg(short = 'b', long, value_name = "branch")]
     pub branch: Vec<String>,
 
-    /// Publish every branch the hub doesn’t already have in full.
-    ///
-    /// Deliberately not the default: publishing is selected, the same way memory is.
-    /// An experiment branch shouldn’t get broadcast just because it was lying around.
+    /// Publish every settled local branch; encrypted mode selects session branches only.
     #[arg(long, conflicts_with = "branch")]
     pub all: bool,
 
@@ -125,12 +58,15 @@ pub struct Args {
     #[arg(long, conflicts_with = "public")]
     pub private: bool,
 
-    /// First publish only: anyone can read it — including every transcript in it.
+    /// First publish only: anyone can read the published content.
     #[arg(long)]
     pub public: bool,
 
-    /// Explicitly accept credential findings for this push, including its version tags.
-    /// Incomplete server scans and repository authorization checks still apply.
+    /// Encryption for a new destination; an existing repository's mode is fixed.
+    #[arg(long, require_equals = true, value_name = "true|false")]
+    pub encryption: Option<bool>,
+
+    /// Accept secret findings in ordinary mode; encrypted publication requires a clean projection.
     #[arg(long)]
     pub allow_secrets: bool,
 
@@ -141,9 +77,13 @@ pub struct Args {
     /// Check without publishing. With --audit, the model review still runs and receives content.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Expand readable snapshot content after the summary; binary payloads are summarized.
+    #[arg(long)]
+    pub show_preview: bool,
 }
 
-/// Audit startup rejects inherited Git routing before storage preparation or native review.
+/// Publication rejects inherited Git routing before storage preparation or native review.
 pub fn check_audit_environment() -> crate::Result<()> {
     audited_push::check_environment(std::env::vars_os())
 }
@@ -155,9 +95,7 @@ pub fn run(mut args: Args) -> CmdResult {
         );
         return Ok(ExitCode::Interactive);
     }
-    if args.audit
-        && let Err(error) = check_audit_environment()
-    {
+    if let Err(error) = check_audit_environment() {
         ui::error(&error.to_string());
         return Ok(ExitCode::Usage);
     }
@@ -184,7 +122,6 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     }
     let client = require_login()?;
-    let s = ui::theme::symbols();
     let Some(me) = credentials::current_user() else {
         ui::error("no account name in the stored credentials.");
         ui::hint("re-run `agit login`");
@@ -234,17 +171,14 @@ pub fn run(mut args: Args) -> CmdResult {
         });
     };
 
-    if args.audit
-        && let Err(error) =
-            super::migration::check_readonly_repo_startup_local(&repo.clone().local_objects_only())
+    if let Err(error) =
+        super::migration::check_readonly_repo_startup_local(&repo.clone().local_objects_only())
     {
-        ui::error(&format!(
-            "audited push requires settled local storage: {error:#}"
-        ));
+        ui::error(&format!("push requires settled local storage: {error:#}"));
         return Ok(ExitCode::Precondition);
     }
 
-    let snap = match meta::resolve(repo.root()) {
+    let _snapshot = match meta::resolve(repo.root()) {
         Ok(v) => v,
         Err(e) => {
             ui::error(&format!(
@@ -278,13 +212,8 @@ pub fn run(mut args: Args) -> CmdResult {
         .filter(|c| c.repo == checkout.slug())
         .map(|c| c.branch.clone());
     let heads = repo.local_branches();
-    let branches = match plan_branches(
-        &explicit_branches,
-        args.all,
-        ctx_branch.as_deref(),
-        &repo,
-        &heads,
-    ) {
+    let branches = match plan_branches(&explicit_branches, args.all, ctx_branch.as_deref(), &heads)
+    {
         Ok(b) => b,
         Err(r) => {
             if r.code == ExitCode::Ok {
@@ -312,14 +241,6 @@ pub fn run(mut args: Args) -> CmdResult {
         (false, true) => super::echo::Source::Mixed,
         (false, false) => super::echo::Source::Environment,
     };
-    let selections: Vec<_> = branches
-        .iter()
-        .map(|branch| {
-            super::echo::Selection::new(format!("{}@{branch}", checkout.slug()), selection_source)
-                .role("source")
-        })
-        .collect();
-    super::echo::emit("push", &selections);
     // A branch that was born but has not settled a single turn is not published. See
     // [`has_settled_turns`].
     //
@@ -355,347 +276,15 @@ pub fn run(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    if args.audit {
-        return audited_push::run(&args, client, &me, checkout, repo, &branches);
-    }
-
-    // ── 3. Secret scan ──
-    //
-    // What is scanned is exactly "the bytes about to leave this machine". Only the destination
-    // answers "which bytes" — see [`super::publish_destination`]. That `ls-remote` is read-only
-    // and falls back to a full scan when it fails, so `--dry-run` goes through it too: a
-    // rehearsal whose verdict differs from the real push is worth nothing.
-    //
-    // This does **not** open its own check for "a read-only checkout whose `origin` points at
-    // the source author". That check lives in [`super::publish_destination`] (`lands_on`), and
-    // can only live there: `agit scan` and the `--dry-run` early return below do not pass
-    // through this layer, and three copies of one judgement sooner or later become two.
-    //
-    // The third field of the destination identity (which agent to publish to) comes from **this
-    // checkout**, not from reading `origin` backwards — that is letting the suspect URL vouch
-    // for itself. `checkout.name` is the name `ensure_remote` below creates or fetches (a
-    // read-only promotion swaps only the owner, see `target` in `promote_if_read_only`), so what
-    // is asked here and what is done there are the same destination.
-    if let Some(code) = super::secret_vault::synchronize_before_push(
-        &repo,
-        &client,
-        &checkout.owner,
-        &checkout.name,
-        args.dry_run,
-        args.allow_secrets,
-    )? {
-        return Ok(code);
-    }
-    super::secret_vault::report_pending_declarations(&repo)?;
-    let asked_url = repo.remote_url();
-    let super::PublishDestination {
-        scan: dest,
-        tags: mut advertised_tags,
-        identity: scanned_identity,
-    } = super::publish_destination(&repo, &checkout.name, true);
-    // Whether the destination narrowed the scan surface. Only a narrowed pass has to be redone
-    // after the destination changes.
-    let narrowed = dest.narrows();
-    if let Gate::Blocked(code) =
-        secret_gate(&repo, &secrets::ScanPlan::to(dest), args.allow_secrets)?
-    {
-        return Ok(code);
-    }
-
-    // ── 4. --dry-run stops here ──
-    //
-    // Dry run permits read-only destination and policy checks. It cannot synchronize a
-    // declaration, create or promote a repository, upload a payload, or publish a ref.
-    //
-    // Reminder before publishing: memory on the session branch that has not been distilled into
-    // main does not travel with main.
-    for branch in &branches {
-        super::memory::remind_pending(&repo, branch);
-    }
-    if args.dry_run {
-        return Ok(dry_run(&repo, &checkout, &me, &branches, &args));
-    }
-
-    // ── 5. Read-only checkout: offer to create a copy under your name ──
-    //
-    // **After** every local judgement: a promotion creates an agent under your namespace on the
-    // server, and a repo with no snapshot, or one whose scanned secrets block the push, must
-    // never produce that write. **Before** the network steps below: a promotion moves the
-    // directory, and every step after it holds the repo's path.
-    // The destination's namespace: without a promotion it is the checkout's own (my name, or an
-    // organization I belong to); after one it is my name. Remote lookup and creation both follow
-    // it — looking for an organization repo under "me" finds nothing.
-    let (repo, agent, namespace, promoted) =
-        match promote_if_read_only(&client, &me, &checkout, &repo)? {
-            Promotion::Ready => (repo, agent, checkout.owner.clone(), false),
-            Promotion::Promoted { repo, name } => (repo, name, me.to_string(), true),
-            Promotion::Refused(code) => return Ok(code),
-        };
-
-    // ── 6. Make sure the remote agent exists ──
-    let wanted = wanted_visibility(&args, &repo).value();
-    let remote = match ensure_remote(&client, &namespace, &agent, wanted, &snap, &repo) {
-        Ok(remote) => remote,
-        Err(error) if error.is::<FirstPublicationRefusal>() => {
-            ui::error(&format!("{error:#}"));
-            return Ok(ExitCode::Precondition);
-        }
-        Err(error) => return Err(error),
-    };
-    let Remote {
-        owner,
-        name,
-        push_url,
-        visibility,
-        first_publish,
-        identity: remote_identity,
-    } = remote;
-
-    // `--private` / `--public` do nothing to an agent that already exists, and that has to be
-    // said: passing the flag means believing this push changed who can read it.
-    if !first_publish
-        && let Some(want) = wanted
-        && want != (visibility == "public")
-    {
-        let asked = if want { "--public" } else { "--private" };
-        ui::warning(&format!(
-            "{owner}/{name} is already {visibility} on the hub — {asked} did nothing."
-        ));
-        ui::hint(&format!(
-            "visibility is settled at first publish; change it with `agit repo visibility {owner}/{name} {}`",
-            if want { "public" } else { "private" }
-        ));
-    }
-    if promoted {
-        if let Some(code) = super::secret_vault::synchronize_push_target(
-            &repo,
-            &client,
-            &owner,
-            &name,
-            &remote_identity,
-            args.allow_secrets,
-        )? {
-            return Ok(code);
-        }
-    } else if super::secret_vault::has_policy_state(&repo)? {
-        let pending = !super::secret_vault::pending_declarations(&repo)?.is_empty();
-        let result = if first_publish || (pending && !args.allow_secrets) {
-            super::secret_vault::synchronize_target(
-                &repo,
-                &client,
-                &owner,
-                &name,
-                &remote_identity,
-                false,
-            )
-        } else {
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-                .bind_declarations(&crate::domain::secret_filter::DeclarationTarget {
-                    hub: remote_identity.hub.clone(),
-                    repository_id: remote_identity.agent_id.clone(),
-                })
-        };
-        if let Some(code) = super::secret_vault::report_sync_for_push(result, args.allow_secrets)? {
-            return Ok(code);
-        }
-    }
-    point_origin(&repo, &format!("{namespace}/{agent}"), &push_url)?;
-
-    // ── 6b. Did the destination change after the scan ──
-    //
-    // Step 3 asked about the `origin` **as it was then**. Visibility settles only at
-    // `ensure_remote`, and that step may create a brand-new empty repo along the way
-    // (`first_publish`), or point `origin` somewhere else (`push_url` changed). In both cases what
-    // step 3 asked about is not this push's far side, and the difference that pass computed does
-    // not count — what goes out this time is the **full history**, so it is rescanned in full.
-    //
-    // # Why the order cannot be reversed (hoisting `ensure_remote` above the scan)
-    //
-    // Because it writes: a missing agent gets `publish`ed into your namespace, and the client
-    // decides visibility at exactly that moment. A repo whose scan finds secrets and cannot be
-    // pushed at all must not first leave a record on the server and ask a "public or private"
-    // question along the way. The promotion in step 5 is the same.
-    //
-    // The scan stays ahead of write actions, so step 3 can only ask about the original origin.
-    // A destination change invalidates narrowing; a copy also invalidates the source policy.
-    // Advertised refs only narrow scanning while the selected remote identity stays the same.
-    let destination_changed = first_publish
-        || asked_url.as_deref() != Some(push_url.as_str())
-        || scanned_identity.as_ref() != Some(&remote_identity);
-    if destination_changed {
-        advertised_tags.clear();
-    }
-    // A copy changes policy authority even when the source scan covered the full history.
-    if promoted || (narrowed && destination_changed) {
-        ui::warning(&format!(
-            "the destination changed while preparing this push ({}) — re-checking the full history.",
-            if promoted {
-                "the checkout is now a copy with its own repository policy"
-            } else if first_publish {
-                "a first-publication destination was confirmed on the hub"
-            } else {
-                "origin now points somewhere else"
-            }
-        ));
-        if let Gate::Blocked(code) =
-            secret_gate(&repo, &secrets::ScanPlan::full(), args.allow_secrets)?
-        {
-            return Ok(code);
-        }
-    }
-
-    // ── 7. Push branches and tags ──
-    let refs = refs_to_push(&branches, repo.has_ref("refs/heads/main"));
-    let lfs_refs: Vec<String> = refs
-        .iter()
-        .map(|branch| format!("refs/heads/{branch}"))
-        .collect();
-    crate::domain::lfs::local::upload_selected(
-        &repo,
-        &lfs_refs,
-        &remote_identity,
-        args.allow_secrets,
-    )?;
-    let git_args = publication_push_args(&refs, repo.ahead_behind().is_none());
-    if args.allow_secrets {
-        ui::warning(
-            "--allow-secrets explicitly accepts credential findings for this push and its version tags; public history can be copied by anyone.",
-        );
-    }
-    let out =
-        crate::hub::git::push_for_remote(&repo, &git_args, &remote_identity, args.allow_secrets)?;
-    if !out.ok() {
-        ui::error("pushing the branch failed.");
-        for line in diagnose(&out, &owner, &name) {
-            ui::hint(&line);
-        }
-        ui::hint(&format!(
-            "remote: {}",
-            crate::hub::git::redact_url(&push_url)
-        ));
-        return Ok(branch_failure_code(&out));
-    }
-
-    // Tags are pushed separately: `git push <branch>` carries no tags, and a tag is the version
-    // ID.
-    //
-    // **Every** tag reachable from these branches goes up, not just the one on HEAD: several
-    // commits and then one push is the natural usage, and pushing only the last one leaves the
-    // snapshots in between with no version ID on the hub to point at. A tag name is derived from
-    // the content, so "same name, different value" cannot happen and re-pushing is a safe
-    // idempotent operation.
-    let tags = tags_to_push(&repo, &refs);
-    let missing_tags = tags_missing_from_remote(&repo, &tags, &advertised_tags);
-    if let Err(out) = push_tags(&repo, &missing_tags, &remote_identity, args.allow_secrets) {
-        ui::warning("branches pushed, but version tags didn’t go up.");
-        for line in diagnose(&out, &owner, &name) {
-            ui::hint(&line);
-        }
-        // The local repo is still where it was, so this hint can be followed.
-        ui::hint("re-run `agit push` to retry (the local repo is kept)");
-    }
-
-    // ── 8. Report ──
-    //
-    // The `@` before the owner is not optional: the web interface treats `@<owner>` as a
-    // namespace, which is what separates it syntactically from reserved paths like `/login` and
-    // `/settings`. One character short is a link that 404s, and this link is precisely what the
-    // user sends a teammate.
-    let web = format!("{}/@{owner}/{name}", client.base());
-    let published = published_versions(&repo, &branches);
-    let id = if published.len() == 1 {
-        published[0].1.as_str()
-    } else {
-        ""
-    };
-    println!(
-        "\n{} {} {}",
-        ui::ok(s.check),
-        ui::bold(&format!("{owner}/{name}")),
-        id
-    );
-    let mut kv: Vec<(&str, String)> = vec![("branches", refs.join(", "))];
-    for (branch, version) in &published {
-        kv.push((branch, version.clone()));
-    }
-    if !tags.is_empty() {
-        kv.push(("versions", tags.len().to_string()));
-    }
-    if let Some(c) = &snap.code {
-        kv.push(("code", c.clone()));
-    }
-    // Every push reports visibility, even when this one changed nothing. The person who most
-    // needs this line is the one who passed nothing — they do not know what they published.
-    kv.push(("visibility", visibility_label(&visibility).to_string()));
-    kv.push(("link", web));
-    print!("{}", ui::table::key_values(&kv));
-
-    // Warn only on the first publication. Shouting it on every push afterwards teaches the
-    // reader to stop reading it.
-    if first_publish && visibility == "public" {
-        ui::warning("this agent is public — anyone can read its full transcripts.");
-        ui::hint(&format!(
-            "back to private: agit repo visibility {owner}/{name} private"
-        ));
-    }
-    println!(
-        "{}",
-        ui::dim(&format!("  teammates: agit clone {owner}/{name}"))
-    );
-    Ok(ExitCode::Ok)
-}
-
-/// `--dry-run`: list what would go up, unchanged, and send not one byte.
-fn dry_run(
-    repo: &Repo,
-    checkout: &super::clone::Checkout,
-    me: &str,
-    branches: &[String],
-    args: &Args,
-) -> ExitCode {
-    let refs = refs_to_push(branches, repo.has_ref("refs/heads/main"));
-    let tags = tags_to_push(repo, &refs);
-
-    println!("\n{}", ui::bold("dry run — nothing left this machine"));
-    let mut kv: Vec<(&str, String)> = vec![
-        ("repo", checkout.slug()),
-        ("branches", refs.join(", ")),
-        ("versions", tags.len().to_string()),
-    ];
-    kv.push((
-        "remote",
-        repo.remote("origin")
-            .map(|u| crate::hub::git::redact_url(&u))
-            .unwrap_or_else(|| "none yet (a real push would create it)".into()),
-    ));
-    kv.push((
-        "visibility",
-        match wanted_visibility(args, repo) {
-            Wanted::Flag(v) => format!("{} (--{0}, first publish only)", visibility_word(v)),
-            Wanted::Repo(v) => format!(
-                "{} (this repo’s preference from `agit init --private`, first publish only)",
-                visibility_word(v)
-            ),
-            Wanted::Global(v) => format!(
-                "{} (config push.visibility, first publish only)",
-                visibility_word(v)
-            ),
-            Wanted::Ask => "asked at first publish; unchanged after that".into(),
-        },
-    ));
-    print!("{}", ui::table::key_values(&kv));
-
-    // A real push from a read-only checkout first asks "create a copy under your name?" — the
-    // rehearsal must say so, or the user reads this push as landing on `alice/photo`.
-    if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
-        ui::warning(&format!(
-            "{} belongs to {} — a real push asks the hub whether you may write to it; if not, it would offer to create {me}/{} under your name.",
-            checkout.slug(),
-            checkout.owner,
-            checkout.name
-        ));
-    }
-    ExitCode::Ok
+    audited_push::run(
+        &args,
+        client,
+        &me,
+        checkout,
+        repo,
+        &branches,
+        selection_source,
+    )
 }
 
 /// Normalize the unified human-facing target.  The old bare repo spelling is
@@ -820,93 +409,9 @@ fn ask_visibility(agent: &str) -> crate::Result<Option<bool>> {
         "{} isn’t on the hub yet — this first push settles who can read it.",
         ui::bold(agent)
     );
-    println!(
-        "{}",
-        ui::dim(
-            "  a session is a complete work record: every prompt, every tool call, every file it read."
-        )
-    );
-    ui::prompt::confirm(
-        "make it public (anyone can read the full transcripts)?",
-        false,
-    )
+    ui::prompt::confirm("make the published content readable by anyone?", false)
 }
 
-/// Keep remediation aligned with the server rejection category.
-/// Git transport can hide the response body; a content or provenance rejection must not be
-/// presented as missing authentication or remote branch movement.
-fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<String> {
-    let err = &out.stderr;
-
-    if err.contains("HTTP 422 secrets_rejected:") {
-        return vec![
-            "the server found credentials; review the rule, file and line locations above".into(),
-            format!("remove unintended credentials, or explicitly accept them: agit push {owner}/{name}@<branch> --allow-secrets"),
-            "use the same branch or --all selection as the rejected push; acceptance applies to its version tags too".into(),
-        ];
-    }
-    if err.contains("HTTP 422 secret_scan_incomplete:") {
-        return vec![
-            "the server could not complete the scan; --allow-secrets cannot accept unread content"
-                .into(),
-            "follow the scan budget or object-read guidance above, then retry".into(),
-        ];
-    }
-    if err.contains("HTTP 422 provenance_rejected:") {
-        return vec!["the server rejected session provenance; credential acceptance cannot override this check".into(),
-            "inspect the provenance error above and repair the affected session before retrying".into()];
-    }
-
-    match out.http_status() {
-        // Content rejection includes secret scanning, provenance, and branch identity changes.
-        Some(422) => vec![
-            "the server rejected the content (HTTP 422: secret scan or provenance check)".into(),
-            "this server did not provide a specific rejection category; update the server to receive finding locations and explicit credential acceptance".into(),
-            "ask the hub admin to check the agent.push.rejected audit entries for what matched".into(),
-        ],
-        // 413 = over quota. git cannot reach the "used this much, the cap is this" line in the
-        // response body, so this at least gets the cause right — falling into the backstop gives
-        // "git's own words", and git's own words are one status code.
-        Some(413) => vec![
-            "storage quota exceeded (private agents have a hard cap; public ones don’t)".into(),
-            format!("check {owner}/{name}’s usage on the site, or make it public"),
-        ],
-        Some(409) => vec![
-            "the remote history is incompatible with what you’re writing (published refs can’t be rewritten or deleted)".into(),
-            format!("fetch first: agit clone {owner}/{name}, then commit"),
-        ],
-        Some(412) => vec![
-            "the remote identity no longer matches this checkout; the agent name may have been deleted and reused".into(),
-            format!("nothing was written — clone {owner}/{name} into a fresh checkout to inspect the current agent"),
-        ],
-        Some(428) => vec![
-            "the hub requires an immutable agent identity, but this checkout did not provide one".into(),
-            format!("re-clone it with this CLI: agit clone {owner}/{name}"),
-        ],
-        Some(401) => vec!["credentials expired: agit login".into()],
-        Some(403) => vec![format!("no write access: the owner of {owner}/{name} must add you as a write collaborator")],
-        Some(404) => vec![format!(
-            "can’t find {owner}/{name} — it may not exist, or you lack access (deliberately indistinguishable)"
-        )],
-        Some(s) if s >= 500 => vec![format!("backend error (HTTP {s}) — try again later")],
-        // No status code means a local or protocol-level failure, where git's own line is the
-        // most accurate.
-        _ if err.contains("fetch first") || err.contains("non-fast-forward") => vec![
-            format!("the remote moved ahead: `agit clone {owner}/{name}` to catch up, then continue"),
-        ],
-        // The transfer also writes the checkout (remote-tracking refs, the upstream of a first
-        // publication), so it can meet another git process's lock or a sandbox's refusal.
-        _ if !crate::domain::repo::checkout_write_hints(err).is_empty() => {
-            crate::domain::repo::checkout_write_hints(err)
-        }
-        _ => vec![
-            "git’s own words above are the best clue".into(),
-            "`agit doctor --check-backend` checks connectivity".into(),
-        ],
-    }
-}
-
-/// A known server rejection preserves its reason; an unclassified Git failure stays unclassified.
 pub(super) fn branch_failure_code(out: &crate::hub::git::Outcome) -> ExitCode {
     match out.http_status() {
         Some(401) => ExitCode::Auth,
@@ -976,84 +481,6 @@ pub(crate) fn is_read_only(me: &str, checkout_owner: &str, upstream: Option<&str
     checkout_owner != me && upstream.is_none()
 }
 
-/// What happened to a read-only checkout.
-enum Promotion {
-    /// This one is pushable as it stands.
-    Ready,
-    /// Just promoted to yours; the repo moved to a new location.
-    Promoted { repo: Repo, name: String },
-    /// The reason has already been said; exit with this code.
-    Refused(ExitCode),
-}
-
-/// In a read-only checkout, offer to promote it to a copy under your name.
-///
-/// The test is that **both** hold: the agent `origin` names is not yours, and there is no
-/// `upstream`. The second is not optional — a copy that was already promoted has its upstream
-/// pointing at somebody else's copy, and going by "does it hold somebody else's address" alone
-/// marks it read-only too.
-fn promote_if_read_only(
-    client: &crate::hub::Client,
-    owner: &str,
-    checkout: &super::clone::Checkout,
-    repo: &Repo,
-) -> crate::Result<Promotion> {
-    if !is_read_only(owner, &checkout.owner, repo.upstream_url().as_deref()) {
-        return Ok(Promotion::Ready);
-    }
-    // Somebody else's name: ask the hub's write-access gate (an organization owner, a team
-    // member granted access to this agent). Write access pushes straight through with no
-    // promoted copy; no answer is an error — treating a timeout as a refusal offers a copy.
-    if matches!(
-        super::writability(owner, &checkout.owner, &checkout.name)?,
-        super::Writability::Granted | super::Writability::Creatable
-    ) {
-        return Ok(Promotion::Ready);
-    }
-
-    let src = format!("{}/{}", checkout.owner, checkout.name);
-    let target = format!("{owner}/{}", checkout.name);
-    println!(
-        "{} belongs to {} — you can’t push to it.",
-        ui::bold(&src),
-        ui::bold(&checkout.owner)
-    );
-
-    match ui::prompt::confirm(
-        &format!("create {target} under your name and publish it?"),
-        true,
-    )? {
-        Some(true) => {}
-        Some(false) => {
-            println!(
-                "{}",
-                ui::dim("  nothing published; every local version is still here.")
-            );
-            ui::hint(&format!("when you mean it: agit clone {src} --mine"));
-            return Ok(Promotion::Refused(ExitCode::Ok));
-        }
-        // A non-interactive run touches nobody's namespace, not even your own — it hands over
-        // the command to run.
-        None => {
-            ui::error(&format!(
-                "can’t push to {src}, and there’s no TTY here to ask about making your own copy."
-            ));
-            ui::hint(&format!(
-                "agit clone {src} --mine   # make the copy, wire origin/upstream"
-            ));
-            ui::hint("then publish with `agit push`");
-            return Ok(Promotion::Refused(ExitCode::Interactive));
-        }
-    }
-
-    let source = super::remote_request(client.get_agent(&checkout.owner, &checkout.name))?;
-    let plan = super::clone::promote(client, &checkout.path, &source, None)?;
-    Ok(Promotion::Promoted {
-        repo: Repo::at(config::repo_dir(&plan.owner, &plan.name)?),
-        name: plan.name,
-    })
-}
-
 /// Where the remote agent lands.
 struct Remote {
     owner: String,
@@ -1062,12 +489,13 @@ struct Remote {
     identity: RemoteIdentity,
     /// Visibility as the server records it: `public` or `private`.
     visibility: String,
+    encryption_enabled: bool,
     /// A first-publication target is verified against the requested visibility before pinning.
     first_publish: bool,
 }
 
 #[derive(Debug)]
-struct FirstPublicationRefusal;
+pub(super) struct FirstPublicationRefusal;
 
 impl std::fmt::Display for FirstPublicationRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1077,32 +505,10 @@ impl std::fmt::Display for FirstPublicationRefusal {
 
 impl std::error::Error for FirstPublicationRefusal {}
 
-/// Make sure the remote has this agent.
-fn ensure_remote(
-    client: &crate::hub::Client,
-    owner: &str,
-    agent: &str,
-    want: Option<bool>,
-    snap: &meta::Meta,
-    repo: &Repo,
-) -> crate::Result<Remote> {
-    ensure_remote_with_options(
-        client,
-        owner,
-        agent,
-        want,
-        snap,
-        repo,
-        RemotePreparation {
-            pin_identity: true,
-            own_namespace: None,
-        },
-    )
-}
-
 struct RemotePreparation {
     pin_identity: bool,
     own_namespace: Option<bool>,
+    encryption_enabled: bool,
 }
 
 fn ensure_remote_with_options(
@@ -1117,6 +523,11 @@ fn ensure_remote_with_options(
     let expected = identity::expected_for_transport(repo, client.base())?;
     match super::remote_request(client.get_agent(owner, agent)) {
         Ok(remote) => {
+            let encryption_enabled = remote.require_encryption_enabled()?;
+            anyhow::ensure!(
+                encryption_enabled == preparation.encryption_enabled,
+                "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+            );
             let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
             identity::verify_transport_target(repo, &observed)?;
             return Ok(Remote {
@@ -1125,6 +536,7 @@ fn ensure_remote_with_options(
                 push_url: remote.clone_url,
                 identity: observed,
                 visibility: remote.visibility,
+                encryption_enabled,
                 first_publish: false,
             });
         }
@@ -1132,7 +544,7 @@ fn ensure_remote_with_options(
             if e.downcast_ref::<crate::hub::client::ApiError>()
                 .is_some_and(|api| api.status == 404) =>
         {
-            if expected.is_some() {
+            if expected.is_some() || (preparation.pin_identity && identity::read(repo)?.is_some()) {
                 return Err(
                     e.context("the RC remote is unavailable; refusing to create a replacement")
                 );
@@ -1168,10 +580,21 @@ fn ensure_remote_with_options(
         name: agent.to_string(),
         owner: (!mine).then(|| owner.to_string()),
         public,
+        encryption_enabled: preparation.encryption_enabled,
         repo_origins: origins,
     }))?;
     let remote_identity = RemoteIdentity::new(client.base(), &resp.agent_id)?;
     let observed = super::remote_request(client.get_agent(owner, agent))?;
+    let encryption_enabled = observed.require_encryption_enabled()?;
+    anyhow::ensure!(
+        encryption_enabled == preparation.encryption_enabled,
+        "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+    );
+    anyhow::ensure!(
+        resp.push_url == observed.clone_url
+            && observed.clone_url == format!("{}/{owner}/{agent}.git", remote_identity.hub),
+        "created repository URL differs from the confirmed destination"
+    );
     // A creation response may name a concurrently created repository. Its current audience and
     // immutable identity must agree with this publication before any identity pin or upload.
     if resp.owner != owner
@@ -1205,6 +628,7 @@ fn ensure_remote_with_options(
         push_url: observed.clone_url,
         identity: remote_identity,
         visibility: observed.visibility,
+        encryption_enabled,
         first_publish: true,
     })
 }
@@ -1213,27 +637,6 @@ fn ensure_remote_with_options(
 /// say) passes through unchanged rather than being guessed at.
 fn visibility_label(visibility: &str) -> &str {
     visibility
-}
-
-/// Branches with something new: the ones the remote does not have, or the ones local is ahead
-/// on.
-///
-/// The scope of `--all`. The difference between "every branch" and "every branch with something
-/// new" shows up on a re-run: the first reports a pile of up-to-date refs to the server every
-/// time, the second says only what is true.
-fn updated_branches(repo: &Repo, heads: &[String]) -> Vec<String> {
-    heads
-        .iter()
-        .filter(|b| {
-            if !repo.has_ref(&format!("refs/remotes/origin/{b}")) {
-                return true;
-            }
-            repo.git_opt(&["rev-list", "--count", &format!("origin/{b}..{b}")])
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .is_none_or(|n| n > 0)
-        })
-        .cloned()
-        .collect()
 }
 
 /// What to tell the user when this cannot go on.
@@ -1274,7 +677,6 @@ fn plan_branches(
     explicit: &[String],
     all: bool,
     ctx_branch: Option<&str>,
-    repo: &Repo,
     heads: &[String],
 ) -> std::result::Result<Vec<String>, Refusal> {
     if !explicit.is_empty() {
@@ -1299,16 +701,10 @@ fn plan_branches(
         return Ok(out);
     }
 
-    if all {
-        let updated = updated_branches(repo, heads);
-        if updated.is_empty() {
-            return Err(Refusal {
-                msg: "every branch is already on the hub — nothing to push.".into(),
-                hints: vec!["record new turns first: `agit commit`".into()],
-                code: ExitCode::Ok,
-            });
-        }
-        return Ok(updated);
+    // Source tracking refs describe a different graph; only the generated destination refs can
+    // establish that a privacy publication is already present.
+    if all && !heads.is_empty() {
+        return Ok(heads.to_vec());
     }
 
     if let Some(b) = ctx_branch {
@@ -1335,90 +731,15 @@ fn plan_branches(
             msg: "no explicit publish branch; name a branch or set AGIT_SESSION.".into(),
             hints: vec![
                 "agit push <owner>/<repo> -b <branch>".into(),
-                "or publish all updated branches: agit push <owner>/<repo> --all".into(),
+                "or publish all local branches: agit push <owner>/<repo> --all".into(),
             ],
             code: ExitCode::Ref,
         }),
     }
 }
 
-fn published_versions(repo: &Repo, branches: &[String]) -> Vec<(String, String)> {
-    branches
-        .iter()
-        .filter_map(|branch| {
-            repo.git_opt(&["rev-parse", "--verify", &format!("refs/heads/{branch}")])
-                .map(|sha| (branch.clone(), meta::id_from_sha(sha.trim())))
-        })
-        .collect()
-}
-
-/// Publish the main file line alongside the session branches. Bare repositories default HEAD to
-/// `main`; omitting it leaves an otherwise healthy clone with a misleading "remote HEAD refers to
-/// nonexistent ref" warning.
-fn refs_to_push(branches: &[String], has_main: bool) -> Vec<String> {
-    let mut refs: Vec<String> = Vec::new();
-    for b in branches {
-        if !refs.contains(b) {
-            refs.push(b.clone());
-        }
-    }
-    if has_main && !refs.iter().any(|b| b == "main") {
-        refs.push("main".to_string());
-    }
-    refs
-}
-
-/// Tags pointing at commits reachable from the pushed branches.
-///
-/// `git push --tags` sends up **every** tag in the repo, including the ones on branches that
-/// were not selected. A version ID is a name derived from the content, so pushing it announces
-/// that the content exists — a branch outside `--all` must not be exposed along the way.
-fn tags_to_push(repo: &Repo, branches: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for b in branches {
-        let Some(list) = repo.git_opt(&["tag", "--merged", b]) else {
-            continue;
-        };
-        for t in list.lines().map(str::trim).filter(|t| !t.is_empty()) {
-            if !out.iter().any(|x| x == t) {
-                out.push(t.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Only exact tag objects on the verified destination can be omitted. Peeling an annotated
-/// tag would hide a changed message, while an unavailable local ref must still reach Git.
-fn tags_missing_from_remote(
-    repo: &Repo,
-    tags: &[String],
-    advertised: &std::collections::BTreeMap<String, String>,
-) -> Vec<String> {
-    let Some(local) = repo.git_opt(&[
-        "for-each-ref",
-        "--format=%(refname)%09%(objectname)",
-        "refs/tags",
-    ]) else {
-        return tags.to_vec();
-    };
-    let local: std::collections::BTreeMap<_, _> = local
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .collect();
-    tags.iter()
-        .filter(|tag| {
-            let name = format!("refs/tags/{tag}");
-            match (local.get(name.as_str()), advertised.get(&name)) {
-                (Some(local), Some(remote)) => *local != remote,
-                _ => true,
-            }
-        })
-        .cloned()
-        .collect()
-}
-
 /// Local configuration cannot add tag refs or publish a nested repository implicitly.
+#[cfg(test)]
 fn publication_push_args(refs: &[String], set_upstream: bool) -> Vec<&str> {
     let mut args = vec!["push", "--no-follow-tags", "--recurse-submodules=no"];
     if set_upstream {
@@ -1429,12 +750,22 @@ fn publication_push_args(refs: &[String], set_upstream: bool) -> Vec<&str> {
     args
 }
 
-/// Point `origin` at the publish URL. An unchanged URL writes nothing.
-fn point_origin(repo: &Repo, slug: &str, url: &str) -> crate::Result<()> {
-    if repo.remote_is(crate::domain::repo::ORIGIN, url) {
+/// Bind the live checkout under the same guard as import and settlement configuration writes.
+fn bind_publication_origin(
+    repo: &Repo,
+    slug: &str,
+    destination: &identity::RemoteIdentity,
+    url: &str,
+) -> crate::Result<()> {
+    if identity::read(repo)?.as_ref() == Some(destination)
+        && repo.remote_is(crate::domain::repo::ORIGIN, url)
+    {
         return Ok(());
     }
-    write_checkout_config(slug, || repo.set_remote(url))
+    write_checkout_config(slug, || {
+        identity::pin(repo, destination)?;
+        repo.set_remote(url)
+    })
 }
 
 /// Write the checkout's own git configuration under the repository's exclusive guard, the lock
@@ -1457,6 +788,7 @@ fn write_checkout_config<T>(
 
 /// Push tags. Batched because an agent gets a version ID every turn, and a command line has a
 /// length limit.
+#[cfg(test)]
 fn push_tags(
     repo: &Repo,
     tags: &[String],
@@ -1520,101 +852,6 @@ fn where_column(h: &secrets::Hit) -> String {
             .unwrap_or_default(),
         _ => at.to_string(),
     }
-}
-
-/// The diagnostics and exit category describe the same publication decision.
-enum Gate {
-    /// The scan is clean or its reported content risk was explicitly allowed.
-    Pass,
-    /// Diagnostics have identified the refusal and its exit category.
-    Blocked(ExitCode),
-}
-
-/// Collection finishes and the spinner clears before result diagnostics are emitted.
-fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> crate::Result<Gate> {
-    let sp = ui::spinner("scanning for secrets…");
-    let scan = secrets::scan_agent_repo(repo, plan);
-    sp.finish_and_clear();
-    finish_secret_scan(scan, allow_secrets)
-}
-
-/// Preparation errors cannot be waived; incomplete coverage is reported alongside findings.
-fn finish_secret_scan(
-    scan: crate::Result<secrets::ScanReport>,
-    allow_secrets: bool,
-) -> crate::Result<Gate> {
-    let scan = match scan {
-        Ok(scan) => scan,
-        Err(error) => {
-            let code = match error.downcast_ref::<secrets::ScanPreparationFailure>() {
-                Some(secrets::ScanPreparationFailure::Configuration) => ExitCode::Usage,
-                Some(secrets::ScanPreparationFailure::LocalState) => ExitCode::Precondition,
-                None => ExitCode::Failure,
-            };
-            ui::error(&format!(
-                "cannot complete the secret scan: {}",
-                super::terminal_error_message(&error)
-            ));
-            return Ok(Gate::Blocked(code));
-        }
-    };
-
-    super::report_binary_carriers(scan.binary_carriers);
-    let hits = scan.hits;
-    let unscanned = scan.unscanned;
-    if hits.is_empty() && unscanned.is_empty() {
-        return Ok(Gate::Pass);
-    }
-    if !hits.is_empty() {
-        report_hits(&hits, scan.truncated);
-    }
-    if !unscanned.is_empty() {
-        super::report_unscanned(&unscanned);
-    }
-
-    if allow_secrets && unscanned.is_empty() {
-        ui::warning("--allow-secrets is set — accepting the credential findings shown above.");
-        return Ok(Gate::Pass);
-    }
-
-    if config::allow_secrets() {
-        // A content override must announce which risks the local gate is allowing.
-        if !hits.is_empty() {
-            ui::warning(&format!(
-                "AGIT_ALLOW_SECRETS is set — proceeding past {} suspected secrets.",
-                hits.len()
-            ));
-        }
-        if !unscanned.is_empty() {
-            ui::warning(
-                "AGIT_ALLOW_SECRETS is set — proceeding past content that was not scanned.",
-            );
-        }
-        // A local override cannot promise server acceptance or permission to publish history publicly.
-        ui::warning(
-            "AGIT_ALLOW_SECRETS affects only the local check; the server may still refuse this push. Use --allow-secrets to explicitly accept server credential findings.",
-        );
-        return Ok(Gate::Pass);
-    }
-
-    if hits.is_empty() {
-        // Missing coverage requires a coverage diagnosis even when the scan found no secrets.
-        ui::error("publish blocked: part of what would be sent was not scanned.");
-    } else {
-        ui::error(&format!(
-            "{} suspected secrets found — publish blocked.",
-            hits.len()
-        ));
-        ui::hint(
-            "· reviewed false positive? use `agit secrets allow <record-id> --repo <path> --reason <reason>`, or pipe its exact value to `agit secrets allow --stdin --repo <path>`; check the reported synchronization status",
-        );
-    }
-    if unscanned.is_empty() {
-        ui::hint("to accept these findings explicitly, repeat the push with --allow-secrets");
-    }
-    // Object findings need remedies for retained history, not only workspace lines.
-    super::hint_secret_hit_remedies(hits.iter());
-    Ok(Gate::Blocked(ExitCode::Policy))
 }
 
 /// Truncated results remain visibly incomplete so omitted findings are not mistaken for clean data.
@@ -1707,6 +944,9 @@ mod tests {
     #[test]
     fn visibility_flags_are_read_from_the_args() {
         let base = || Args {
+            separate: false,
+            encryption: None,
+            to: None,
             agent: None,
             branch: vec![],
             all: false,
@@ -1715,6 +955,7 @@ mod tests {
             allow_secrets: false,
             audit: false,
             dry_run: false,
+            show_preview: false,
         };
         let (_d, repo) = {
             let d = tempfile::tempdir().unwrap();
@@ -1785,15 +1026,6 @@ mod tests {
         assert_eq!(visibility_label("internal"), "internal");
     }
 
-    #[test]
-    fn first_session_push_also_publishes_the_main_file_line() {
-        assert_eq!(refs_to_push(&["e2e".into()], true), ["e2e", "main"]);
-        assert_eq!(refs_to_push(&["main".into()], true), ["main"]);
-        assert_eq!(refs_to_push(&["e2e".into()], false), ["e2e"]);
-        // The same branch written twice (`-b a -b a`) must not appear twice on the command line.
-        assert_eq!(refs_to_push(&["a".into(), "a".into()], false), ["a"]);
-    }
-
     /// The positional argument accepts the spelling its own ambiguity hint asks for.
     #[test]
     fn the_positional_takes_both_a_bare_name_and_owner_slash_name() {
@@ -1832,7 +1064,7 @@ mod tests {
         let (dir, repo) = fixture("ctx");
         assert_eq!(repo.current_branch().as_deref(), Some("ghost"));
         let heads = repo.local_branches();
-        let got = plan_branches(&[], false, Some("refund-fix"), &repo, &heads).unwrap();
+        let got = plan_branches(&[], false, Some("refund-fix"), &heads).unwrap();
         assert_eq!(got, ["refund-fix"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1842,7 +1074,7 @@ mod tests {
     fn several_branches_without_a_context_are_refused_not_guessed() {
         let (dir, repo) = fixture("ambig");
         let heads = repo.local_branches();
-        let err = plan_branches(&[], false, None, &repo, &heads).unwrap_err();
+        let err = plan_branches(&[], false, None, &heads).unwrap_err();
         assert_eq!(err.code, ExitCode::Ref);
         assert!(
             err.hints.iter().any(|h| h.contains("--all")),
@@ -1850,7 +1082,7 @@ mod tests {
             err.hints
         );
         let one = ["solo".to_string()];
-        assert!(plan_branches(&[], false, None, &repo, &one).is_err());
+        assert!(plan_branches(&[], false, None, &one).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1863,112 +1095,29 @@ mod tests {
             &["refund-fix".into(), "main".into()],
             false,
             Some("ghost"),
-            &repo,
             &heads,
         )
         .unwrap();
         assert_eq!(got, ["refund-fix", "main"]);
-        let err = plan_branches(&["nope".into()], false, None, &repo, &heads).unwrap_err();
+        let err = plan_branches(&["nope".into()], false, None, &heads).unwrap_err();
         assert_eq!(err.code, ExitCode::Ref);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The scope of `--all` is "branches with something new", not "every branch".
+    /// Source tracking refs cannot suppress generation after a privacy policy change.
     #[test]
-    fn all_covers_the_branches_with_something_new() {
+    fn all_projects_every_branch_despite_source_tracking_refs() {
         let (dir, repo) = fixture("all");
         let heads = repo.local_branches();
-        // No origin yet: all three are new.
-        let mut got = plan_branches(&[], true, None, &repo, &heads).unwrap();
+        let mut got = plan_branches(&[], true, None, &heads).unwrap();
         got.sort();
         assert_eq!(got, ["ghost", "main", "refund-fix"]);
-        // Mark main as "the remote already has it" — it drops out of the push scope.
         repo.git(&["update-ref", "refs/remotes/origin/main", "main"])
             .unwrap();
-        let mut got = plan_branches(&[], true, None, &repo, &heads).unwrap();
+        let mut got = plan_branches(&[], true, None, &heads).unwrap();
         got.sort();
-        assert_eq!(got, ["ghost", "refund-fix"]);
+        assert_eq!(got, ["ghost", "main", "refund-fix"]);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Only the tags reachable from the pushed branches go up.
-    ///
-    /// `--tags` sends up the version IDs of the `ghost` experiment line too, and a version ID is
-    /// a name derived from the content — pushing it announces that the content exists.
-    #[test]
-    fn only_tags_reachable_from_the_pushed_branches_go_up() {
-        let (dir, repo) = fixture("tags");
-        let got = tags_to_push(&repo, &["refund-fix".to_string()]);
-        assert!(got.contains(&"agit-refund-two".to_string()), "{got:?}");
-        assert!(
-            got.contains(&"agit-main-one".to_string()),
-            "an ancestor's version ID goes up too: {got:?}"
-        );
-        assert!(
-            !got.contains(&"agit-ghost-three".to_string()),
-            "another branch must not be broadcast along the way: {got:?}"
-        );
-        // Pushing main + ghost reverses it.
-        let got = tags_to_push(&repo, &["main".to_string(), "ghost".to_string()]);
-        assert!(got.contains(&"agit-ghost-three".to_string()), "{got:?}");
-        assert!(!got.contains(&"agit-refund-two".to_string()), "{got:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn published_version_follows_the_selected_branch_instead_of_checkout_head() {
-        let (dir, repo) = fixture("published-version");
-        repo.git(&["checkout", "main"]).unwrap();
-        let sha = repo.git(&["rev-parse", "refs/heads/refund-fix"]).unwrap();
-        let versions = published_versions(&repo, &["refund-fix".into()]);
-        assert_eq!(
-            versions,
-            vec![("refund-fix".into(), meta::id_from_sha(sha.trim()))]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn only_identical_advertised_tag_objects_are_skipped() {
-        let (dir, repo) = fixture("advertised-tags");
-        repo.git(&["tag", "-a", "release", "-m", "published message", "main"])
-            .unwrap();
-        let tag_oid = repo.git_opt(&["rev-parse", "refs/tags/release"]).unwrap();
-        let lightweight_oid = repo
-            .git_opt(&["rev-parse", "refs/tags/agit-main-one"])
-            .unwrap();
-        let advertised = std::collections::BTreeMap::from([
-            ("refs/tags/release".to_string(), tag_oid),
-            ("refs/tags/agit-main-one".to_string(), lightweight_oid),
-        ]);
-        let tags = tags_to_push(&repo, &["refund-fix".to_string()]);
-        assert_eq!(
-            tags_missing_from_remote(&repo, &tags, &advertised),
-            ["agit-refund-two"]
-        );
-        assert_eq!(
-            tags_missing_from_remote(&repo, &tags, &Default::default()),
-            tags
-        );
-        repo.git(&[
-            "tag",
-            "-f",
-            "-a",
-            "release",
-            "-m",
-            "changed message",
-            "main",
-        ])
-        .unwrap();
-        let mut missing = tags_missing_from_remote(&repo, &tags, &advertised);
-        missing.sort();
-        assert_eq!(missing, ["agit-refund-two", "release"]);
-        assert!(!missing.contains(&"agit-ghost-three".to_string()));
-        assert_eq!(
-            tags_missing_from_remote(&repo, &["gone".to_string()], &advertised),
-            ["gone"]
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2009,57 +1158,6 @@ mod tests {
         // upstream configured — either it was promoted, or the user wired the remote up
         // themselves, and in neither case does push create another one for them.
         assert!(!is_read_only("me", "alice", Some("http://h/bob/photo.git")));
-    }
-
-    #[test]
-    fn credential_acceptance_is_offered_only_for_server_findings() {
-        for (kind, offers_acceptance) in [
-            ("secrets_rejected", true),
-            ("secret_scan_incomplete", false),
-            ("provenance_rejected", false),
-        ] {
-            let out = crate::hub::git::Outcome {
-                code: 128,
-                stderr: format!("fatal: remote error: HTTP 422 {kind}: synthetic finding"),
-            };
-            let advice = diagnose(&out, "alice", "notes").join("\n");
-            assert_eq!(
-                advice.contains("agit push alice/notes@<branch> --allow-secrets"),
-                offers_acceptance
-            );
-            assert_eq!(branch_failure_code(&out), ExitCode::Policy);
-        }
-    }
-
-    /// Every 422 hint says "the server refused it" first, or the user goes looking locally.
-    #[test]
-    fn a_422_is_explained_as_a_server_side_rejection() {
-        let out = crate::hub::git::Outcome {
-            code: 128,
-            stderr: "error: RPC failed; HTTP 422 curl 22 The requested URL returned error: 422"
-                .into(),
-        };
-        let advice = diagnose(&out, "me", "photo").join("\n");
-        assert!(
-            advice.contains("the server rejected"),
-            "must say the server rejected it: {advice}"
-        );
-        assert!(
-            !advice.contains("the remote moved ahead"),
-            "must not point the wrong way: {advice}"
-        );
-    }
-
-    #[test]
-    fn a_stale_identity_is_not_diagnosed_as_non_fast_forward() {
-        let out = crate::hub::git::Outcome {
-            code: 128,
-            stderr: "fatal: unable to access remote: The requested URL returned error: 412".into(),
-        };
-        let advice = diagnose(&out, "me", "photo").join("\n");
-        assert!(advice.contains("identity"), "{advice}");
-        assert!(advice.contains("deleted and reused"), "{advice}");
-        assert!(!advice.contains("fetch first"), "{advice}");
     }
 
     #[test]

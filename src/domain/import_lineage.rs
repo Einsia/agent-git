@@ -1436,12 +1436,14 @@ mod tests {
                 .arg("--no-replace-objects")
                 .arg("-C")
                 .arg(fixture.repo.root())
-                .args(["rev-list", &head])
                 .env(key, path);
             if local_only {
                 ReadPolicy::LocalOnly.apply(&mut command);
             }
-            let output = command.output().unwrap();
+            let output = command.args(["rev-list", &head]).output().unwrap();
+            if local_only {
+                assert!(output.stderr.is_empty(), "{output:?}");
+            }
             assert!(
                 output.status.success(),
                 "{}",

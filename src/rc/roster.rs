@@ -187,6 +187,9 @@ pub enum StartClaim {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
+    /// Capture kind is independent of the current controller and survives native aliases.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) captures: BTreeMap<String, crate::rc::capture::RepositoryKind>,
     #[serde(default)]
     pub sessions: BTreeMap<String, Entry>,
     /// This machine's session history **has been lost** (the ledger failed to
@@ -337,6 +340,7 @@ pub(crate) fn fail_next_fallback_removals(count: usize) {
 impl Roster {
     fn unusable() -> Roster {
         Roster {
+            captures: BTreeMap::new(),
             sessions: BTreeMap::new(),
             history_lost: true,
             start_history_lost: true,
@@ -1377,6 +1381,7 @@ mod tests {
 
     fn start_info() -> crate::protocol::SessionInfo {
         crate::protocol::SessionInfo {
+            publication: None,
             session_id: "agit-started".into(),
             native_source: None,
             runtime_session_id: None,

@@ -99,6 +99,7 @@ mod unix {
     /// resulting SHA through `AGIT_RC_SUPERVISOR_COMMIT_RESULT`.
     #[test]
     fn strict_supervisor_commit_writes_the_real_new_head_to_its_result_file() {
+        use base64::Engine as _;
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("workspace");
         let agit_home = root.path().join("agit-home");
@@ -109,6 +110,7 @@ mod unix {
         let branch = "s/integration";
         let hub = "https://hub.test";
         let result_path = root.path().join("settled-sha");
+        let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
 
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -178,7 +180,7 @@ mod unix {
             "sessionId": session_id,
             "uuid": "cb71e9d8-a3d2-4c70-930d-98def38d9f54",
             "cwd": cwd,
-            "message": {"role": "user", "content": "settle this turn"},
+            "message": {"role": "user", "content": format!("settle this turn {secret}")},
         });
         let assistant = serde_json::json!({
             "type": "assistant",
@@ -188,12 +190,33 @@ mod unix {
             "cwd": cwd,
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": "done"}],
+                "content": [
+                    {"type": "text", "text": format!("Readable reply {session_id}")},
+                    {"type": "tool_use", "id": "shell-call", "name": "Bash", "input": {"command": format!("printf 'Readable command {secret}'")}},
+                ],
             },
         });
+        let result = serde_json::json!({
+            "type": "user", "sessionId": session_id,
+            "uuid": "81567b2e-195a-4ed3-a180-06eca3efc210",
+            "parentUuid": "88bfaf5e-4107-4cf2-9038-a2a891d171f1",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "shell-call", "content": format!("Readable output {secret}"), "is_error": false}
+            ]}
+        });
+        let completed = serde_json::json!({
+            "type": "assistant", "sessionId": session_id,
+            "uuid": "cf91e4b3-c951-42f6-98ce-9d4a9cedbaf3",
+            "parentUuid": "81567b2e-195a-4ed3-a180-06eca3efc210",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+        });
+        let originals = [user, assistant, result, completed];
         std::fs::write(
             transcript_dir.join(format!("{session_id}.jsonl")),
-            format!("{}\n{}\n", user, assistant),
+            originals
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
         )
         .unwrap();
 
@@ -221,5 +244,59 @@ mod unix {
         assert_eq!(reported.len(), 40, "the result must be a full commit SHA");
         assert_eq!(git(&["rev-list", "--count", "HEAD"]), "1");
         assert_eq!(git(&["branch", "--show-current"]), branch);
+
+        let (log, view) = agit::domain::storage::materialize_pair_at(&repo, "HEAD").unwrap();
+        assert!(!log.contains(secret));
+        let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(&repo).unwrap();
+        let restored_log = dictionary.hydrate_envelopes(&log).unwrap().text;
+        let restored_view = dictionary.hydrate_envelopes(&view).unwrap().text;
+        let restored: Vec<_> = agit::domain::storage::parse_envelopes(&restored_log)
+            .unwrap()
+            .into_iter()
+            .map(|envelope| envelope.content)
+            .collect();
+        assert_eq!(restored, originals);
+
+        let policy = agit::domain::privacy::PrivacyPolicy {
+            workspace: Some(cwd.clone()),
+            ..Default::default()
+        };
+        let key = crypto_box::SecretKey::from([29; 32]);
+        let redactor = agit::domain::redact::Redactor::new(Default::default())
+            .with_repository(&repo)
+            .unwrap();
+        let metadata = agit::domain::meta::read(&repo).unwrap();
+        let projection = agit::domain::privacy_publication::project_session(
+            &policy,
+            &mut Default::default(),
+            Some(branch),
+            &restored_log,
+            &restored_view,
+            &metadata,
+            &redactor,
+        )
+        .unwrap();
+        let recipient = agit::domain::privacy_envelope::ViewingRecipient::from_base64(
+            "fixture".into(),
+            &base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes()),
+        )
+        .unwrap();
+        let envelope = projection.seal(&recipient).unwrap();
+        let public = envelope.public_projection.to_string();
+        for marker in [
+            "settle this turn",
+            "Readable reply",
+            "Readable command",
+            "Readable output",
+            "done",
+        ] {
+            assert!(public.contains(marker));
+        }
+        assert!(!public.contains(secret));
+        assert!(!public.contains("content unavailable"));
+        let private = envelope.open_layer(&key).unwrap();
+        let (original_log, original_view) = private.session_bytes().unwrap();
+        assert_eq!(original_log.as_str(), restored_log);
+        assert_eq!(original_view.as_str(), restored_view);
     }
 }

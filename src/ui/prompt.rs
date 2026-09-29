@@ -93,6 +93,31 @@ pub fn password(prompt: &str) -> Result<Option<String>> {
     Ok(Some(Password::new().with_prompt(prompt).interact()?))
 }
 
+/// Keep repository passwords in zeroizing storage immediately after no-echo input.
+pub(crate) fn repository_password(
+    prompt: &str,
+    confirm: bool,
+) -> Result<zeroize::Zeroizing<String>> {
+    let password = password(prompt)?.map(zeroize::Zeroizing::new).ok_or_else(|| {
+        crate::commands::InteractionRequired("repository passwords require an interactive terminal; --yes cannot supply a password".into())
+    })?;
+    anyhow::ensure!(!password.is_empty(), "enter a repository viewing password");
+    if confirm {
+        let repeated = self::password("Confirm repository viewing password")?
+            .map(zeroize::Zeroizing::new)
+            .ok_or_else(|| {
+                crate::commands::InteractionRequired(
+                    "confirm the repository viewing password in an interactive terminal".into(),
+                )
+            })?;
+        anyhow::ensure!(
+            *password == *repeated,
+            "repository viewing passwords do not match"
+        );
+    }
+    Ok(password)
+}
+
 /// Pick one of several runtimes.
 ///
 /// A single candidate is not asked about — a question with only one answer wastes the user's

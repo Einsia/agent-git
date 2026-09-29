@@ -943,6 +943,7 @@ mod tests {
     fn remote(owner: &str, name: &str) -> crate::hub::RemoteAgent {
         crate::hub::RemoteAgent {
             agent_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            encryption_enabled: Some(true),
             owner: owner.into(),
             name: name.into(),
             clone_url: "https://example.test/unused.git".into(),

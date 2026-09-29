@@ -149,6 +149,8 @@ pub struct Report {
     pub collected: usize,
     /// Files not collected because of a suspected secret.
     pub refused: Vec<String>,
+    /// Memory files rejected before content scanning by the repository privacy policy.
+    pub privacy_excluded: Vec<String>,
     /// The commit that landed.
     pub commit: Option<String>,
     /// Collection is turned off by `memory.track = off`.
@@ -597,6 +599,7 @@ pub fn materialize_with(
         let collected = collect_with(primary, branch, slug, mem_dir, policy)?;
         report.warnings.extend(collected.warnings);
         report.refused.extend(collected.refused);
+        report.privacy_excluded.extend(collected.privacy_excluded);
     }
     let baseline = read_baseline(&checkout, mem_dir)?.unwrap_or_default();
     let mut files = branch_files(&checkout, &tree_ref(branch))?;
@@ -753,6 +756,7 @@ pub fn collect_with(
     let plan = plan_collect(baseline.as_ref(), &top, &mirror, &in_branch, policy.scope);
     let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
     let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary)?;
 
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     // Refused file names are tracked separately (the display string carries the rule name and is
@@ -760,6 +764,19 @@ pub fn collect_with(
     // collection and the next materialization both see them again.
     let mut refused_names: BTreeSet<String> = BTreeSet::new();
     for (name, bytes) in plan.top_changed.iter().chain(plan.mirror_changed.iter()) {
+        let privacy_decision = privacy.evaluate_memory(name, Some(branch));
+        if privacy_decision.action != crate::domain::privacy::CandidateAction::Allowed {
+            report.privacy_excluded.push(format!(
+                "{} ({})",
+                name,
+                privacy_decision
+                    .reason
+                    .as_deref()
+                    .unwrap_or("privacy policy excluded the candidate")
+            ));
+            refused_names.insert(name.clone());
+            continue;
+        }
         match protect_memory_bytes(&dictionary, bytes, &global)? {
             Ok(protected) => {
                 edits.insert(name.clone(), Some(protected));
@@ -802,6 +819,13 @@ pub fn collect_with(
                     }
                 }
             }
+        }
+    } else {
+        // A rejected candidate must stay outside the baseline when this is the first explicit
+        // collection. Otherwise changing the local policy later would never reconsider it.
+        for name in &refused_names {
+            next.files.remove(name);
+            next.mirror.remove(name);
         }
     }
     if let Err(error) = store_baseline(&checkout, &next) {
@@ -942,10 +966,21 @@ pub fn distill(
     let ours = branch_files(primary, &plan.branch_tip)?;
     let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
     let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary)?;
+    let source_branch = branch.lines().find(|name| *name != "main");
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     for item in chosen {
         match item {
             Pending::Carry(name) => {
+                let decision = privacy.evaluate_memory(name, source_branch);
+                anyhow::ensure!(
+                    decision.action == crate::domain::privacy::CandidateAction::Allowed,
+                    "memory/{name} is excluded by the repository privacy policy: {}",
+                    decision
+                        .reason
+                        .as_deref()
+                        .unwrap_or("candidate is not allowlisted")
+                );
                 let bytes = ours
                     .get(name)
                     .ok_or_else(|| anyhow::anyhow!("the plan has no memory/{name}"))?;
@@ -1427,6 +1462,11 @@ pub fn report_collect(report: &Report, branch: &str) {
             "memory/{refused}: suspected secret, not collected"
         ));
     }
+    for excluded in &report.privacy_excluded {
+        ui::warning(&format!(
+            "memory/{excluded}: not collected by the repository privacy policy"
+        ));
+    }
     for warning in &report.warnings {
         ui::warning(warning);
     }
@@ -1451,6 +1491,11 @@ pub fn report_materialize(report: &Report) {
     for refused in &report.refused {
         ui::warning(&format!(
             "memory/{refused}: suspected secret, not collected"
+        ));
+    }
+    for excluded in &report.privacy_excluded {
+        ui::warning(&format!(
+            "memory/{excluded}: not collected by the repository privacy policy"
         ));
     }
     for warning in &report.warnings {
@@ -1504,6 +1549,9 @@ mod tests {
         let c =
             super::super::plumbing::commit_tree(&repo, &tree, &[head.trim()], "session").unwrap();
         repo.git(&["update-ref", "refs/heads/s1", &c]).unwrap();
+        let mut privacy = crate::domain::privacy::PrivacyPolicy::default();
+        privacy.memory_allow.push("**/*.md".into());
+        privacy.save(&repo).unwrap();
         let mem = base.join("claude-memory");
         std::fs::create_dir_all(&mem).unwrap();
         (d, repo, mem)
@@ -1735,6 +1783,35 @@ mod tests {
         let r = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
         assert_eq!(r.collected, 1);
         assert!(file(&repo, "refs/heads/s1", "new.md").is_none());
+    }
+
+    #[test]
+    fn privacy_allowlist_rejects_memory_before_scanning_and_retries_after_update() {
+        let (_d, repo, mem) = fixture();
+        let mut privacy = crate::domain::privacy::PrivacyPolicy::load(&repo).unwrap();
+        privacy.memory_allow = vec!["team.md".into()];
+        privacy.save(&repo).unwrap();
+        materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
+
+        std::fs::write(mem.join("private.md"), "personal note\n").unwrap();
+        let rejected = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(rejected.collected, 0);
+        assert_eq!(rejected.privacy_excluded.len(), 1);
+        assert!(file(&repo, "refs/heads/s1", "private.md").is_none());
+
+        privacy.memory_allow.push("private.md".into());
+        privacy.save(&repo).unwrap();
+        let accepted = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(accepted.collected, 1);
+        assert_eq!(
+            file(&repo, "refs/heads/s1", "private.md").as_deref(),
+            Some("personal note\n")
+        );
+
+        privacy.memory_allow = vec!["team.md".into()];
+        privacy.save(&repo).unwrap();
+        let plan = distill_plan(&repo, "s1").unwrap();
+        assert!(distill(&repo, &plan, &plan.items).is_err());
     }
 
     /// With no baseline, settlement only records one and collects nothing; an explicit sync

@@ -182,6 +182,7 @@ pub fn authorize(
         "session.catalog.settings"
         | "session.history"
         | "session.goal.read"
+        | "session.publication.deliver"
         | "session.subscribe"
         | "session.watch"
         | "session.unwatch"

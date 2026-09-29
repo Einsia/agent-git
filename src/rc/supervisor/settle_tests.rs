@@ -15,13 +15,11 @@ fn exit(status: i32) -> std::process::Output {
         .unwrap()
 }
 
-/// The supervisor must distinguish a real new commit from the hook-style
-/// success/no-op convention, and it must not publish a settlement until
-/// the push itself returned success. A failed push leaves the exact new
-/// SHA pending so the next idempotent attempt can recover it.
+/// Successful no-ops and concurrent HEAD changes cannot establish settlement ownership.
+/// An unchanged HEAD is eligible only when that exact source commit is pending.
 #[cfg(unix)]
 #[test]
-fn strict_settlement_requires_a_new_commit_and_a_confirmed_push() {
+fn strict_settlement_requires_an_owned_commit_or_pending_retry() {
     let ok = exit(0);
     let failed = exit(7);
 
@@ -40,21 +38,11 @@ fn strict_settlement_requires_a_new_commit_and_a_confirmed_push() {
         .unwrap()
         .expect("a changed HEAD is the strict settlement candidate");
     assert_eq!(pending, "new");
-    assert_eq!(
-        confirmed_strict_push(&failed, &pending),
-        None,
-        "a failed push emits no commit.settled"
-    );
 
     let retry = strict_settlement_candidate("new", &ok, "new", None, Some(&pending))
         .unwrap()
         .expect("the next no-op retries the unconfirmed push");
     assert_eq!(retry, pending);
-    assert_eq!(
-        confirmed_strict_push(&ok, &retry),
-        Some("new".to_string()),
-        "a confirmed retry emits the pending SHA exactly once"
-    );
     assert!(
         strict_settlement_candidate("new", &ok, "new", None, None)
             .unwrap()
@@ -579,6 +567,55 @@ impl SettlementFixture {
         // step from there is the real shape of "the hub did not take it".
         git(&["-C", &repo_s, "push", "-q", "origin", &branch]);
 
+        let source = git(&["-C", &repo_s, "rev-parse", "HEAD"]);
+        let domain_repo = crate::domain::repo::Repo::at(&repo);
+        let mut publication = PublicationReceipt {
+            version: 1,
+            mode: Default::default(),
+            repository: "alice/photo".into(),
+            branch: branch.clone(),
+            source: source.clone(),
+            published: source,
+            projected_session_id: None,
+            destination: crate::hub::identity::RemoteIdentity::new(
+                &crate::infra::config::hub_url(),
+                "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+            )
+            .unwrap(),
+            url: bare_s,
+            policy_digest: Some(
+                crate::domain::privacy::PrivacyPolicy::default()
+                    .digest()
+                    .unwrap(),
+            ),
+            recipient: Some("synthetic-viewer".into()),
+        };
+        crate::hub::identity::pin(&domain_repo, &publication.destination).unwrap();
+        publication.save(&domain_repo).unwrap();
+        let publication_path = std::fs::read_dir(repo.join(".git/agit/privacy-published"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(&publication_path).unwrap();
+        publication.source = "__SOURCE__".into();
+        publication.published = "__PUBLISHED__".into();
+        let publication_json = serde_json::to_string(&publication).unwrap();
+        let push_body = format!(
+            "    test \"$AGIT_AUTO_PUSH\" = 1\n    test -z \"${{AGIT_YES+x}}\"\n    test \"$2\" = \"$AGIT_SESSION\"\n\
+             source=$(git {safe} -C {repo} rev-parse HEAD)\n    published=$source\n\
+             if [ -f {repo}/.git/publication-tip ]; then published=$(cat {repo}/.git/publication-tip); fi\n\
+             git {safe} -C {repo} push -q origin \"$published:refs/heads/{branch}\"\n\
+             receipt=$(printf '%s' '{publication_json}' | sed \"s/__SOURCE__/$source/g; s/__PUBLISHED__/$published/g\")\n\
+             printf '%s' \"$receipt\" > '{publication_path}'\n\
+             request=$(cat \"${result}\")\n    printf '{{\"request\":%s,\"publication\":%s}}' \"$request\" \"$receipt\" > \"${result}\"\n",
+            safe = crate::domain::meta::GIT_SAFE.join(" "),
+            repo = repo_s,
+            publication_path = publication_path.display(),
+            result = crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
+        );
+
         let exe = dir.path().join("settlement-child.sh");
         let commit_body = if new_turn {
             format!(
@@ -601,10 +638,8 @@ impl SettlementFixture {
                 "#!/bin/sh\nset -e\nexport GIT_CONFIG_NOSYSTEM=1\n\
                      export GIT_CONFIG_GLOBAL=/dev/null\nexport GIT_TERMINAL_PROMPT=0\n\
                      case \"$1\" in\ncommit)\n{commit_body}  ;;\n\
-                     push)\n    git {safe} -C {repo} push -q origin {branch}\n  ;;\n\
+                     push)\n{push_body}  ;;\n\
                      esac\nexit 0\n",
-                safe = crate::domain::meta::GIT_SAFE.join(" "),
-                repo = repo_s,
             ),
         )
         .unwrap();
@@ -798,6 +833,249 @@ fn only_settled_frame(frames: Vec<Frame>) -> CommitSettled {
     settled.into_iter().next().unwrap()
 }
 
+/// Saving locally must not publish a private commit ID or impersonate successful publication.
+#[cfg(unix)]
+#[tokio::test]
+async fn local_settlement_reports_persistence_without_a_private_sha() {
+    let fixture = SettlementFixture::new(true);
+    let before = fixture.head();
+    let (mut session, mut out, _notes, authority, _) = fixture.session();
+    authority.send_modify(|state| {
+        state.local_owner = true;
+        state.agent_identity_v1 = false;
+    });
+    let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+    let after = fixture.head();
+    assert_ne!(before, after);
+    assert_eq!(fixture.tracking(), before);
+    let notifications: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.method() == method::COMMIT_LOCAL_SETTLED)
+        .collect();
+    assert_eq!(notifications.len(), 1);
+    let local = notifications[0];
+    assert_eq!(
+        local.params.clone().unwrap(),
+        serde_json::json!({"session_id":session.info.session_id,"through_seq":0})
+    );
+    assert!(local.connection_delivery.is_none());
+    assert!(frames.iter().all(|frame| {
+        frame.method() != method::COMMIT_SETTLED && !frame.to_json().contains(&after)
+    }));
+}
+
+/// Local turns keep settling while published notifications remain unacknowledged on disk.
+#[cfg(unix)]
+#[test]
+fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::settle_tests::local_settlement_publishes_confirmed_target_and_retains_each_source",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path());
+    }
+    crate::rc::select_local_authority();
+    let mut fixture = SettlementFixture::new(true);
+    let selected = home.path().join("repos/desktop-fixture/project");
+    std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    std::fs::rename(&fixture.repo, &selected).unwrap();
+    let script = std::fs::read_to_string(&fixture.exe)
+        .unwrap()
+        .replace(fixture.repo.to_str().unwrap(), selected.to_str().unwrap());
+    std::fs::write(&fixture.exe, script).unwrap();
+    fixture.repo = selected;
+    crate::rc::with_agit_home(home.path(), || {
+        let local_id = "00000000-0000-0000-0000-000000000002";
+        let remote_id = "6f35cd22-85ae-4ed5-a106-2d9069d6b346";
+        let repo = crate::domain::repo::Repo::at(&fixture.repo);
+        let state = crate::rc::state_dir("desktop-rc").unwrap();
+        std::fs::write(
+            state.join("identity.json"),
+            serde_json::json!({
+                "machine_fingerprint":"fixture", "display_name":"Fixture", "created_at":"fixture"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        repo.git(&["config", "agit.desktopIdentity", local_id])
+            .unwrap();
+        repo.git(&["config", "agit.desktopAuthority", "local:fixture"])
+            .unwrap();
+        repo.git(&[
+            "config",
+            "agit.desktopPublication",
+            &serde_json::json!({
+                "version":1, "local_agent_id":local_id, "repository":"alice/photo",
+                "identity": crate::hub::identity::read(&repo).unwrap().unwrap(),
+            })
+            .to_string(),
+        ])
+        .unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        let script = std::fs::read_to_string(&fixture.exe).unwrap().replace("push)\n", &format!(
+            "push)\n    test \"$AGIT_EXPECTED_AGENT_ID\" = {remote_id}\n    test \"$AGIT_LOCAL_AGENT_ID\" = {local_id}\n    printf x >> {}/.git/push-calls\n",
+            fixture.repo.display(),
+        ));
+        std::fs::write(&fixture.exe, &script).unwrap();
+        let public = fixture_git(&[
+            "-C",
+            fixture.repo.to_str().unwrap(),
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            &fixture.head(),
+            "-m",
+            "public",
+        ]);
+        std::fs::write(fixture.repo.join(".git/publication-tip"), &public).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut session, mut out, _notes, authority, _) = fixture.session();
+            session.agit_session = Some(
+                crate::rc::lineage::AgitSession::new(
+                    "desktop-fixture/project",
+                    local_id,
+                    &fixture.branch,
+                )
+                .unwrap(),
+            );
+            authority.send_modify(|state| {
+                state.local_owner = true;
+                state.agent_identity_v1 = false;
+            });
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            let first_source = fixture.head();
+            let hints: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.method() == method::SESSION_PUBLICATION_CHANGED)
+                .collect();
+            assert_eq!(hints.len(), 2);
+            assert!(hints.iter().all(
+                |frame| frame.params.as_ref().unwrap()["session_id"] == session.info.session_id
+            ));
+            assert_eq!(
+                hints[0].params.as_ref().unwrap()["publication"]["progress"],
+                "publishing"
+            );
+            assert_eq!(
+                hints[1].params.as_ref().unwrap()["publication"]["progress"],
+                "awaiting_ack"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .position(|frame| frame.method() == method::COMMIT_LOCAL_SETTLED)
+                    .unwrap()
+                    < frames
+                        .iter()
+                        .position(|frame| frame.method() == method::SESSION_PUBLICATION_CHANGED)
+                        .unwrap()
+            );
+            assert_eq!(fixture.tracking(), public);
+            assert_ne!(first_source, public);
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame.method() == method::COMMIT_LOCAL_SETTLED)
+            );
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.method() != method::COMMIT_SETTLED
+                        && !frame.to_json().contains(&first_source))
+            );
+            settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert_ne!(fixture.head(), first_source);
+            let read_entries = || -> Vec<crate::domain::privacy_receipt::outbox::Entry> {
+                std::fs::read_dir(repo.common_dir().unwrap().join("agit/rc-publications"))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                    .map(|entry| {
+                        serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap()
+                    })
+                    .collect()
+            };
+            let entries = read_entries();
+            assert_eq!(entries.len(), 2);
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.publication.as_ref().unwrap().source == first_source)
+            );
+            assert!(session.pending_settlement.is_none());
+            assert_eq!(
+                std::fs::read(fixture.repo.join(".git/push-calls")).unwrap(),
+                b"xx"
+            );
+
+            std::fs::write(&fixture.exe, script.replace("push)\n", "push)\n exit 1\n")).unwrap();
+            let failed = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(
+                failed
+                    .iter()
+                    .filter(|frame| frame.method() == method::SESSION_PUBLICATION_CHANGED)
+                    .count(),
+                2
+            );
+            let pending = read_entries()
+                .into_iter()
+                .find(|entry| entry.publication.is_none())
+                .unwrap();
+            let commit_start = script.find("commit)\n").unwrap();
+            let push_start = script.find("push)\n").unwrap();
+            let retry_script = format!(
+                "{}commit)\n :\n ;;\n{}",
+                &script[..commit_start],
+                &script[push_start..]
+            );
+            std::fs::write(&fixture.exe, retry_script).unwrap();
+            drop(session);
+            let (mut resumed, mut out, _notes, authority, _) = fixture.session();
+            resumed.agit_session = Some(
+                crate::rc::lineage::AgitSession::new(
+                    "desktop-fixture/project",
+                    local_id,
+                    &fixture.branch,
+                )
+                .unwrap(),
+            );
+            authority.send_modify(|state| {
+                state.local_owner = true;
+                state.agent_identity_v1 = false;
+            });
+            let retry = settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(
+                retry
+                    .iter()
+                    .filter(|frame| frame.method() == method::SESSION_PUBLICATION_CHANGED)
+                    .count(),
+                2
+            );
+            let restored = read_entries()
+                .into_iter()
+                .find(|entry| entry.notification_id == pending.notification_id)
+                .unwrap();
+            assert_eq!(
+                restored.publication.as_ref().unwrap().source,
+                fixture.head()
+            );
+            assert_eq!(read_entries().len(), 3);
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(
+                std::fs::read(fixture.repo.join(".git/push-calls")).unwrap(),
+                b"xxx"
+            );
+        });
+    });
+}
+
 /// End to end (the settlement success path): the temporary result file under `.git` →
 /// `SUPERVISOR_RESULT_ENV` → the subprocess writes it back → `read_to_string` → the predicate →
 /// a real push → `commit.settled`.
@@ -827,6 +1105,114 @@ async fn a_real_settlement_pushes_and_reports_the_sha_its_child_wrote() {
         head,
         "the settlement never actually pushed the new commit"
     );
+}
+
+/// The remote commit can differ from the source; lost delivery retains a local source retry
+/// without disclosing that source ID or repeatedly publishing an acknowledged settlement.
+#[cfg(unix)]
+#[tokio::test]
+async fn projected_publication_reports_the_remote_commit_across_restarts() {
+    let fixture = SettlementFixture::new(false);
+    let root = fixture.repo.to_str().unwrap();
+    let base = fixture.head();
+    fixture_git(&[
+        "-C",
+        root,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "private source turn",
+    ]);
+    let source = fixture.head();
+    let tree = fixture_git(&["-C", root, "rev-parse", "HEAD^{tree}"]);
+    let published = fixture_git(&[
+        "-C",
+        root,
+        "commit-tree",
+        &tree,
+        "-p",
+        &base,
+        "-m",
+        "Projected session",
+    ]);
+    assert_ne!(source, published);
+    std::fs::write(fixture.repo.join(".git/publication-tip"), &published).unwrap();
+    let (mut first, mut out, _notes, _tx, _lease) = fixture.session();
+    let settled = only_settled_frame(
+        settle_with_link(
+            &mut first,
+            &mut out,
+            SettlementBoundary::Turn,
+            LinkAck::LostBeforeAck,
+        )
+        .await,
+    );
+    assert_eq!(settled.commit_sha, published);
+    assert_eq!(fixture.tracking(), published);
+    assert_eq!(first.pending_settlement.as_ref().unwrap().sha, source);
+    assert_eq!(
+        read_unacked_settlement(&fixture.receipt()).as_deref(),
+        Some(source.as_str())
+    );
+    drop(first);
+
+    let (mut second, mut out, _notes, _tx, _lease) = fixture.session();
+    let settled =
+        only_settled_frame(settle_draining(&mut second, &mut out, SettlementBoundary::Turn).await);
+    assert_eq!(settled.commit_sha, published);
+    assert!(!fixture.receipt().exists());
+    let (mut third, mut out, _notes, _tx, _lease) = fixture.session();
+    let frames = settle_draining(&mut third, &mut out, SettlementBoundary::Turn).await;
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.method.as_deref() == Some(method::COMMIT_SETTLED))
+    );
+    assert_eq!(fixture.head(), source);
+}
+
+/// Success exit status and even a well-formed receipt cannot acknowledge a different request.
+#[cfg(unix)]
+#[tokio::test]
+async fn unconfirmed_publication_keeps_the_source_pending_without_notification() {
+    for refusal in [
+        "missing-result",
+        "failed-process",
+        "wrong-source",
+        "stale-request",
+    ] {
+        let fixture = SettlementFixture::new(true);
+        let script = std::fs::read_to_string(&fixture.exe).unwrap();
+        let modified = match refusal {
+            "missing-result" => script.replace("push)\n", "push)\n    exit 0\n"),
+            "failed-process" => script.replace("esac\nexit 0", "esac\nif [ \"$1\" = push ]; then exit 7; fi\nexit 0"),
+            "wrong-source" => script.replace("\"source\":\"__SOURCE__\"", &format!("\"source\":\"{}\"", "f".repeat(40))),
+            "stale-request" => script.replace("    printf '{\"request\":%s", "    request=$(printf '%s' \"$request\" | sed 's/\"request_id\":\"[^\"]*\"/\"request_id\":\"00000000-0000-0000-0000-000000000000\"/')\n    printf '{\"request\":%s"),
+            _ => unreachable!(),
+        };
+        assert_ne!(
+            script, modified,
+            "refusal fixture was not changed: {refusal}"
+        );
+        std::fs::write(&fixture.exe, modified).unwrap();
+        let (mut session, mut out, _notes, _tx, _lease) = fixture.session();
+        let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.method.as_deref() == Some(method::COMMIT_SETTLED)),
+            "unconfirmed publication emitted a settlement: {refusal}"
+        );
+        assert_eq!(
+            session.pending_settlement.as_ref().unwrap().sha,
+            fixture.head()
+        );
+        assert_eq!(
+            read_unacked_settlement(&fixture.receipt()).as_deref(),
+            Some(fixture.head().as_str())
+        );
+    }
 }
 
 /// Regression (BACKLOG A2: a pending settlement is not durable): after a failed push the daemon
@@ -1140,9 +1526,16 @@ async fn a_settlement_whose_notification_was_never_acked_is_redelivered_after_a_
     };
     let (_probe_tx, mut probe_rx) = tokio::sync::watch::channel(lease);
     assert!(
-        unpushed_local_head(&mut probe_rx, lease, &repo_s, &turn)
-            .await
-            .is_none(),
+        unpushed_local_head(
+            &mut probe_rx,
+            lease,
+            &repo_s,
+            &turn,
+            &fixture.branch,
+            "6f35cd22-85ae-4ed5-a106-2d9069d6b346"
+        )
+        .await
+        .is_none(),
         "the premise of this regression is that git reachability no longer knows"
     );
 

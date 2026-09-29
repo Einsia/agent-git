@@ -486,6 +486,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
+                    publication: None,
                     session_id: "agit-danger-start".into(),
                     native_source: None,
                     runtime_session_id: None,
@@ -569,6 +570,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let mut state = daemon.lock().await;
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
+                    publication: None,
                     session_id: "agit-unjudged".into(),
                     native_source: None,
                     runtime_session_id: None,
@@ -634,6 +636,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 // it the one the next resume path picks up by hand; what it bypasses is the
                 // owner-only gate.
                 let info = SessionInfo {
+                    publication: None,
                     session_id: "agit-unauthorized".into(),
                     native_source: None,
                     runtime_session_id: None,
@@ -761,6 +764,7 @@ fn session_start_idempotency_is_an_explicit_per_socket_feature() {
 async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
+        publication: None,
         session_id: "agit-existing".into(),
         native_source: None,
         runtime_session_id: None,
@@ -1755,6 +1759,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         generation: 1,
         shared_executor: false,
         info: SessionInfo {
+            publication: None,
             session_id: "s-1".into(),
             native_source: None,
             runtime_session_id: None,
@@ -1976,6 +1981,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
 
     let mk = |last_active: u64| WatchLive {
         info: SessionInfo {
+            publication: None,
             session_id: "s".into(),
             native_source: None,
             runtime_session_id: None,
@@ -2523,6 +2529,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         .latest_session_generations
         .insert("session-a".into(), 1);
     let info = SessionInfo {
+        publication: None,
         session_id: "session-a".into(),
         native_source: None,
         runtime_session_id: None,
@@ -2625,6 +2632,54 @@ async fn delayed_publication_covers_only_its_captured_turn_boundary() {
     let commit = state.project_session_frame(commit).unwrap();
     assert_eq!(commit.params.unwrap()["through_seq"], 1);
     assert_eq!(commit.seq, Some(3));
+}
+
+#[tokio::test]
+async fn local_settlement_coverage_is_scoped_to_the_current_generation() {
+    let daemon = rpc_test_daemon(Default::default(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.opts.local_owner = true;
+    state
+        .settlement
+        .send_modify(|lease| lease.local_owner = true);
+    state
+        .latest_session_generations
+        .insert("session-a".into(), 2);
+    let boundary = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut completed = tagged_test_notification(
+        "session-a",
+        2,
+        method::TURN_COMPLETED,
+        serde_json::json!({}),
+    );
+    completed.settlement_boundary = Some(boundary.clone());
+    state.project_session_frame(completed).unwrap();
+    state
+        .project_session_frame(tagged_test_notification(
+            "session-a",
+            2,
+            method::ITEM_DELTA,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+    for generation in [1, 2] {
+        let mut saved = tagged_test_notification(
+            "session-a",
+            generation,
+            method::COMMIT_LOCAL_SETTLED,
+            serde_json::json!({"session_id":"session-a","through_seq":0}),
+        );
+        saved.settlement_boundary = Some(boundary.clone());
+        let projected = state.project_session_frame(saved);
+        if generation == 1 {
+            assert!(projected.is_none());
+        } else {
+            let saved = projected.unwrap();
+            assert_eq!(saved.params.as_ref().unwrap()["through_seq"], 1);
+            assert_eq!(saved.seq, Some(3));
+            assert!(saved.params.unwrap().get("commit_sha").is_none());
+        }
+    }
 }
 
 #[tokio::test]
@@ -2903,4 +2958,61 @@ fn resumed_launch_does_not_replay_the_initial_model() {
             assert_eq!(state.roster.starts["launch"].spec.model.as_deref(), Some("initial-model-a"));
         });
     });
+}
+
+/// Restart catalogs retain logical identity without starting another native writer.
+#[tokio::test]
+async fn dormant_capture_is_discoverable_with_its_native_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut roster = Roster::default();
+    roster
+        .record(
+            "logical",
+            serde_json::from_value(serde_json::json!({
+                "runtime":"claude-code", "thread_id":"native", "cwd":cwd,
+                "workspace_id":"ws-a", "project_id":"project", "agit_session":"alice/imported@work",
+                "expected_agent_id":"00000000-0000-0000-0000-000000000001",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), roster);
+    let mut state = daemon.lock().await;
+    state.opts.local_owner = true;
+    state.mirror.bind("ws-a", "project", &cwd).unwrap();
+    let frame = frame_with(
+        Some(claim("owner", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a"}),
+    );
+    let snapshot = state.prepare_session_list(&frame).unwrap();
+    let native = LocalSession {
+        runtime_session_id: "native".into(),
+        runtime: "claude-code".into(),
+        cwd: cwd.to_string_lossy().into(),
+        modified_at: "2026-09-26T00:00:00Z".into(),
+        gist: Some("History".into()),
+        title: None,
+        adopted: true,
+        agent: Some("alice/imported".into()),
+        likely_active: false,
+    };
+    let listed = state
+        .finish_session_list(&frame, &snapshot.roots, vec![native.clone()])
+        .unwrap();
+    assert_eq!(listed["sessions"][0]["session_id"], "logical");
+    assert_eq!(listed["sessions"][0]["runtime_session_id"], "native");
+    assert_eq!(listed["sessions"][0]["branch"], "work");
+    assert_eq!(listed["sessions"][0]["status"], "ended");
+    assert_eq!(
+        listed["sessions"][0]["publication"]["readiness"],
+        "checking"
+    );
+    assert!(state.sessions.is_empty());
+    let mut foreign = native;
+    foreign.cwd.push_str("/different");
+    let listed = state
+        .finish_session_list(&frame, &snapshot.roots, vec![foreign])
+        .unwrap();
+    assert!(listed["sessions"].as_array().unwrap().is_empty());
 }

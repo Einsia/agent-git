@@ -1,5 +1,8 @@
 //! Quiet remote commands retain data and authority while suppressing their own routine notices.
 
+#[path = "support/privacy_policy_sources.rs"]
+mod privacy_policy_sources;
+
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
@@ -55,6 +58,7 @@ impl Hub {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
+        let response_hub = base.clone();
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(120);
             let mut replies = VecDeque::from(replies);
@@ -88,6 +92,19 @@ impl Hub {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                     .unwrap();
+                    continue;
+                }
+                if !replies.front().is_some_and(|reply| {
+                    reply.method == request.method && reply.path == request.path
+                }) && let Some((status, body)) = privacy_policy_sources::route(
+                    &response_hub,
+                    "me",
+                    &request.method,
+                    &request.path,
+                    &request.body,
+                ) {
+                    let body = body.to_string();
+                    write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     continue;
                 }
                 let reply = replies.pop_front().expect("unexpected request or replay");
@@ -520,8 +537,8 @@ fn quiet_share_preserves_the_created_link_policy_data_and_revoke_hint() {
     for mode in ["ordinary", "flag", "", "1"] {
         let hub = Hub::new(vec![Reply::ok(
             "POST",
-            "/api/shares",
-            json!({"slug":"owned-share", "url":"https://example.invalid/s/owned-share"}),
+            "/api/shares/privacy",
+            json!({"format_version":2,"slug":"owned-share", "url":"https://example.invalid/s/owned-share"}),
         )]);
         let lab = Lab::new();
         let repo = lab.saved_share(&hub.base);
@@ -593,6 +610,14 @@ fn quiet_share_keeps_confirmation_refusal_without_a_request() {
             error.contains("requires confirmation") && error.contains("--yes"),
             "{error}"
         );
+        let preview = error
+            .find("Privacy preview:")
+            .expect("share preview must be available before confirmation");
+        let content = error
+            .find("SYNTHETIC-SHARE-CONTENT")
+            .expect("preview must show the outgoing content");
+        let refusal = error.find("requires confirmation").unwrap();
+        assert!(preview < content && content < refusal, "{error}");
         assert_eq!(lab.git(&repo, &["rev-parse", "HEAD"]), head);
     }
     assert!(hub.finish().is_empty());
@@ -601,7 +626,7 @@ fn quiet_share_keeps_confirmation_refusal_without_a_request() {
 #[test]
 fn quiet_share_json_keeps_the_complete_created_result() {
     for version in ["1", "2"] {
-        let hub = Hub::new((0..2).map(|_| Reply::ok("POST", "/api/shares", json!({"slug":"owned-share", "url":"https://example.invalid/s/owned-share"}))).collect());
+        let hub = Hub::new((0..2).map(|_| Reply::ok("POST", "/api/shares/privacy", json!({"format_version":2,"slug":"owned-share", "url":"https://example.invalid/s/owned-share"}))).collect());
         let lab = Lab::new();
         lab.saved_share(&hub.base);
         let mut outputs = Vec::new();

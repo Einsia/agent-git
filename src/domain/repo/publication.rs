@@ -43,6 +43,8 @@ impl FrozenRef {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PublicationPlan {
+    #[serde(skip)]
+    include_main: bool,
     heads: Vec<FrozenRef>,
     tags: Vec<FrozenRef>,
     commit_objects: Vec<String>,
@@ -50,7 +52,7 @@ pub struct PublicationPlan {
 }
 
 impl PublicationPlan {
-    /// Selected branch roots and the existing main file line, sorted by full ref name.
+    /// Frozen branch roots, sorted by full ref name.
     pub fn heads(&self) -> &[FrozenRef] {
         &self.heads
     }
@@ -73,6 +75,15 @@ impl PublicationPlan {
     /// Capture explicit branch names and their locally available publication metadata.
     /// Missing objects, malformed metadata and exhausted inspection budgets return an error.
     pub fn freeze(repo: &Repo, branches: &[String]) -> Result<Self> {
+        Self::freeze_roots(repo, branches, true)
+    }
+
+    /// Session publication must not add an independently advancing shared-file line.
+    pub fn freeze_selected(repo: &Repo, branches: &[String]) -> Result<Self> {
+        Self::freeze_roots(repo, branches, false)
+    }
+
+    fn freeze_roots(repo: &Repo, branches: &[String], include_main: bool) -> Result<Self> {
         ensure!(
             !branches.is_empty(),
             "audit needs a selected publication branch"
@@ -87,7 +98,7 @@ impl PublicationPlan {
             .iter()
             .map(|branch| format!("refs/heads/{branch}"))
             .collect();
-        if references.contains_key("refs/heads/main") {
+        if include_main && references.contains_key("refs/heads/main") {
             names.insert("refs/heads/main".into());
         }
         let heads: Vec<FrozenRef> = names
@@ -105,23 +116,12 @@ impl PublicationPlan {
 
         // Raw parent pointers define published history. Grafts, shallow boundaries, replacement
         // refs and commit-graph caches cannot remove an ancestor from this set.
-        let mut commits = BTreeSet::new();
-        let mut pending: Vec<String> = heads
-            .iter()
-            .map(|reference| reference.oid.clone())
-            .collect();
-        while let Some(oid) = pending.pop() {
-            if commits.contains(&oid) {
-                continue;
-            }
-            ensure!(
-                commits.len() < MAX_COMMITS,
-                "audit publication history limit exceeded"
-            );
-            let body = reader.object(&oid, "commit")?;
-            pending.extend(commit_parents(&body)?);
-            commits.insert(oid);
-        }
+        let commits = reader.ancestry(
+            heads
+                .iter()
+                .map(|reference| reference.oid.clone())
+                .collect(),
+        )?;
 
         let mut tags = Vec::new();
         let mut tag_objects = BTreeSet::new();
@@ -140,6 +140,7 @@ impl PublicationPlan {
             }
         }
         Ok(Self {
+            include_main,
             heads,
             tags,
             commit_objects: commits.into_iter().collect(),
@@ -151,11 +152,35 @@ impl PublicationPlan {
     /// Callers still publish literal object refspecs because this comparison does not lock refs.
     pub fn verify(&self, repo: &Repo, branches: &[String]) -> Result<()> {
         ensure!(
-            Self::freeze(repo, branches)? == *self,
+            Self::freeze_roots(repo, branches, self.include_main)? == *self,
             "publication refs changed during audit; rerun the audit before publishing"
         );
         Ok(())
     }
+
+    /// Implicit main remains part of the compared snapshot without consuming a selected slot.
+    pub(crate) fn verify_captured(&self, repo: &Repo) -> Result<()> {
+        let branches = self
+            .heads
+            .iter()
+            .filter(|reference| {
+                !(self.include_main && self.heads.len() > 1 && reference.name == "refs/heads/main")
+            })
+            .map(|reference| {
+                reference
+                    .name
+                    .strip_prefix("refs/heads/")
+                    .map(str::to_owned)
+                    .context("captured branch name is invalid")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.verify(repo, &branches)
+    }
+}
+
+/// Raw, identity-checked parent pointers ignore local topology overlays.
+pub(crate) fn raw_ancestors(repo: &Repo, root: &str) -> Result<BTreeSet<String>> {
+    Reader::new(repo).ancestry(vec![root.into()])
 }
 
 struct Reader {
@@ -180,6 +205,23 @@ impl Reader {
             bytes: 0,
             reads: 0,
         }
+    }
+
+    fn ancestry(&mut self, mut pending: Vec<String>) -> Result<BTreeSet<String>> {
+        let mut commits = BTreeSet::new();
+        while let Some(oid) = pending.pop() {
+            if commits.contains(&oid) {
+                continue;
+            }
+            ensure!(
+                commits.len() < MAX_COMMITS,
+                "audit publication history limit exceeded"
+            );
+            let body = self.object(&oid, "commit")?;
+            pending.extend(commit_parents(&body)?);
+            commits.insert(oid);
+        }
+        Ok(commits)
     }
 
     fn read(&mut self, args: &[&str], limit: usize) -> Result<Vec<u8>> {
@@ -306,7 +348,7 @@ fn header(body: &[u8]) -> Result<&str> {
     std::str::from_utf8(&body[..end]).context("audit publication object header is malformed")
 }
 
-fn commit_parents(body: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn commit_parents(body: &[u8]) -> Result<Vec<String>> {
     let header = header(body)?;
     let mut parents = Vec::new();
     let mut tree = None;
@@ -467,6 +509,9 @@ mod tests {
         git(root, &["tag", "unselected-version"]);
         let branches = vec!["selected".to_owned()];
         let plan = PublicationPlan::freeze(&repo, &branches).unwrap();
+        let selected = PublicationPlan::freeze_selected(&repo, &branches).unwrap();
+        assert_eq!(selected.heads.len(), 1);
+        assert_eq!(selected.heads[0].name(), "refs/heads/selected");
         assert_eq!(
             plan.heads
                 .iter()
@@ -484,6 +529,10 @@ mod tests {
         assert_eq!(plan.tags[0].refspec(), format!("{tag}:refs/tags/reviewed"));
         plan.verify(&repo, &branches).unwrap();
         let next = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["update-ref", "refs/heads/main", &next, &base]);
+        selected.verify(&repo, &branches).unwrap();
+        assert!(plan.verify(&repo, &branches).is_err());
+        git(root, &["update-ref", "refs/heads/main", &base, &next]);
         git(root, &["update-ref", "refs/heads/selected", &next, &base]);
         assert!(plan.verify(&repo, &branches).is_err());
         assert_eq!(

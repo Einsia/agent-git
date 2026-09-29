@@ -349,6 +349,7 @@ impl Controller {
                         | "session.catalog.list"
                         | "session.history"
                         | "session.goal.read"
+                        | "session.publication.deliver"
                         | "session.subscribe"
                         | "session.watch"
                         | "session.unwatch"

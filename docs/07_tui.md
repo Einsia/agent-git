@@ -388,6 +388,9 @@ selected assets and binds the directory.
 With no arguments, config opens all supported global keys in one editor. Each
 row names the source of its effective value: environment, stored, default or
 unset. The detail pane keeps the effective and stored values on separate lines.
+`privacy.encryption` selects the default for new Hub repositories and defaults
+to `true`; its description distinguishes that preference from an existing
+repository's fixed mode. Changing it does not enable automatic uploads.
 For `hub.url`, it also shows the current `AGIT_HUB_URL` value and explains when
 that environment variable masks the file.
 

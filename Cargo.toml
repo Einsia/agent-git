@@ -46,6 +46,10 @@ name = "startup_migration"
 harness = false
 required-features = ["cli"]
 
+[[example]]
+name = "privacy-envelope-fixture"
+required-features = ["secret-vault"]
+
 [lib]
 name = "agit"
 path = "src/lib.rs"
@@ -113,6 +117,10 @@ rc = [
 # agitd need this layer.
 secret-vault = [
     "dep:aes-gcm",
+    "dep:argon2",
+    "dep:crypto_secretbox",
+    "dep:x25519-dalek",
+    "dep:crypto_box",
     "dep:base64",
     "dep:keyring",
     "dep:security-framework",
@@ -209,6 +217,10 @@ rand = "0.8"
 # End-to-end encryption for `agit share`. AES-GCM because browsers support it
 # natively through WebCrypto: the viewer decrypts with zero dependencies.
 aes-gcm = { version = "0.10", optional = true }
+x25519-dalek = { version = "2", optional = true }
+crypto_box = { version = "0.9.1", default-features = false, features = ["seal", "salsa20", "std", "rand_core"], optional = true }
+argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"], optional = true }
+crypto_secretbox = { version = "0.1.1", default-features = false, features = ["salsa20", "alloc"], optional = true }
 base64 = { version = "0.22", optional = true }
 # native store: macOS Keychain / Windows Credential Manager / Unix Secret Service.
 # `v1` is this crate's narrow cross-platform API; the `cli` feature stays off,

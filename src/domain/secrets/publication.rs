@@ -4,6 +4,7 @@ use super::*;
 use crate::domain::lfs::{Pointer, inspection};
 use crate::domain::repo::{ObjectBody, Repo, publication::PublicationPlan};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::Read;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -21,9 +22,25 @@ pub enum InspectionFailure {
 pub(crate) struct CapturedPolicy {
     allowlist: HashSet<String>,
     registered: RegisteredMatcher,
+    pub(crate) privacy_views: BTreeMap<String, String>,
 }
 
 impl CapturedPolicy {
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn for_copy(
+        mut self,
+        git_dir: &Path,
+        identities: HashSet<String>,
+    ) -> crate::Result<Self> {
+        let dictionary =
+            crate::domain::secret_filter::RepositoryDictionary::open_at_git_dir(git_dir)?
+                .copy_matcher(&identities)?;
+        self.registered = load_registered_matcher()?
+            .merged(&dictionary)?
+            .with_repository_identities(identities);
+        Ok(self)
+    }
+
     pub(crate) fn capture(git_dir: &Path) -> Result<Self, InspectionFailure> {
         let home = crate::infra::config::agit_home().map_err(|_| InspectionFailure::LocalState)?;
         let allowlist = match std::fs::read_to_string(home.join(ALLOWLIST_FILE)) {
@@ -72,6 +89,7 @@ impl CapturedPolicy {
         Ok(Self {
             allowlist,
             registered,
+            privacy_views: BTreeMap::new(),
         })
     }
 }
@@ -155,6 +173,7 @@ impl<'a> Inspector<'a> {
             lfs_remaining: Cell::new(0),
             prepared_binary: Some(&binary),
             prepared_remaining: Some(&remaining),
+            privacy_views: Some(&self.policy.privacy_views),
         };
         let blobs = scan_publish_blobs(&context, history, &mut self.out, &mut self.unscanned);
         self.binary_git = binary.get();
@@ -452,6 +471,7 @@ mod tests {
     fn policy() -> CapturedPolicy {
         CapturedPolicy {
             allowlist: HashSet::new(),
+            privacy_views: BTreeMap::new(),
             #[cfg(feature = "secret-vault")]
             registered: RegisteredMatcher::for_test(&[]),
             #[cfg(not(feature = "secret-vault"))]
@@ -517,6 +537,7 @@ mod tests {
         let secret = "blue \"horse\" battery";
         let mut policy = CapturedPolicy {
             allowlist: HashSet::new(),
+            privacy_views: BTreeMap::new(),
             registered: RegisteredMatcher::for_test(&[("sec_owned", secret)]),
         };
         let text =

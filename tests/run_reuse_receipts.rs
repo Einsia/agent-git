@@ -200,6 +200,8 @@ impl Lab {
         identity::pin(&repo, &RemoteIdentity::new(hub, AGENT).unwrap()).unwrap();
         repo.git(&["remote", "add", "origin", &format!("{hub}/me/qa.git")])
             .unwrap();
+        repo.git(&["update-ref", "refs/remotes/origin/work", &commits[1]])
+            .unwrap();
         Self {
             temporary,
             home,

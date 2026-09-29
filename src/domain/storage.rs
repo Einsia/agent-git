@@ -35,7 +35,6 @@ fn read_limit(condition: bool, message: impl FnOnce() -> String) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "secret-vault")]
 fn immutable_local_oid(commit: &str) -> Result<()> {
     anyhow::ensure!(
         matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -731,10 +730,7 @@ pub(crate) fn identity_log_at(
     layout: LayoutVersion,
     maximum: usize,
 ) -> Result<String> {
-    anyhow::ensure!(
-        meta::is_event_id(commit),
-        "identity evidence requires an immutable commit"
-    );
+    immutable_local_oid(commit)?;
     let policy = ReadPolicy::LocalOnly;
     let bytes = git_blob_with_policy(
         repo_root,

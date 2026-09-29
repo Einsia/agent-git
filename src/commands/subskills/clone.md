@@ -47,6 +47,17 @@ agit clone alice/notes --no-bind
 
 `clone` fetches and optionally binds. Use `run` or `resume` to run a ref.
 
+For an encrypted clone, continuing from original private context requires recovery on the
+execution machine. Follow [privacy](privacy.md#guide-the-user-through-password-operations):
+explain what the repository viewing password means, who can provide it, and give the user
+the exact terminal unlock command. A successful clone alone does not decrypt the session.
+
+A normal clone retains the Hub repository identity and its fixed encryption mode.
+The user creation default does not change that mode. To publish available original
+history in another mode, select a new destination with `push SOURCE --to TARGET`.
+Encrypted history requires valid recovery access, and unlocking one snapshot does
+not supply every historical original for a complete ordinary copy. See `agit help push`.
+
 ## Automatic publishing preference
 
 An interactive repository creation asks whether to inherit the user preference, enable automatic pushing, or disable it for this repository. Use `--auto-push` or `--auto-push=false` to choose explicitly in scripts; omission inherits the user setting. Change or clear the override later with `agit config --repo <owner/repo> push.auto <true|false>` or `agit config --repo <owner/repo> --unset push.auto`.

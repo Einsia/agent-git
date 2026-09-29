@@ -14,7 +14,7 @@
 //! Fork/resume fork · new · resume
 //! Merging     merge · cherry-pick · revert
 //! Remotes     push · pull · fetch
-//! Find/share  search · share · pr
+//! Find/share  search · share · privacy · pr
 //! Export/ops  export · scan · setup · doctor
 //! ```
 
@@ -445,6 +445,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 
         Commands::Search(a) => commands::search::run(*a),
         Commands::Share(a) => commands::share::run(a),
+        Commands::Privacy(a) => commands::privacy::run(a),
         Commands::Pr(a) => commands::pr::run(a),
 
         Commands::Export(a) => commands::export::run(a),

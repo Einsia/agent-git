@@ -302,6 +302,13 @@ impl Client {
             .map(|cred| cred.username.clone())
     }
 
+    pub(crate) fn credential_account_id(&self) -> Option<String> {
+        self.cred
+            .borrow()
+            .as_ref()
+            .and_then(|cred| cred.account_id.clone())
+    }
+
     pub(crate) fn checked_access_token(&self) -> Result<Option<String>> {
         self.ensure_destination()?;
         Ok(self.token.borrow().clone())
@@ -331,8 +338,19 @@ impl Client {
     }
 
     pub(super) fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_expected(path, None)
+    }
+
+    pub(super) fn get_expected<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.get(self.url(path));
+            if let Some(id) = expected_agent_id {
+                req = req.header(super::identity::EXPECTED_AGENT_ID_HEADER, id);
+            }
             if !path.trim_start_matches('/').starts_with("api/auth/") {
                 req = req.header("Accept-Encoding", "gzip");
             }
@@ -343,7 +361,7 @@ impl Client {
         })
     }
 
-    fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    pub(super) fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -672,7 +690,7 @@ impl Client {
         })
     }
 
-    fn put<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    pub(super) fn put<B: serde::Serialize, T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -945,8 +963,8 @@ impl Client {
     /// It asks the first step of a push — `info/refs?service=git-receive-pack` — which already
     /// has to pass the hub's write gate (an org owner and a team member granted this agent both
     /// fall under that one decision). The CLI does not infer from "which orgs I am in": org
-    /// membership and "can write this agent" are different things. This GET reads a status code
-    /// and changes nothing.
+    /// membership and "can write this agent" are different things. Ordinary receive advertisement
+    /// can validate and durably register existing history before returning its status.
     ///
     /// Behind the write gate sits an identity fence: whoever can write must also carry
     /// Expected-Agent-Id — missing is 428, mismatched is 412. The probe asks "can I write", not
@@ -958,8 +976,20 @@ impl Client {
         name: &str,
         expected_agent_id: &str,
     ) -> Result<super::PushAccess> {
+        self.push_access_with_secret_acceptance(owner, name, expected_agent_id, false)
+    }
+
+    /// Existing ordinary history is reconciled under the same explicit acceptance as the push.
+    /// Callers must not inherit that acceptance for automatic publication or unrelated probes.
+    pub(crate) fn push_access_with_secret_acceptance(
+        &self,
+        owner: &str,
+        name: &str,
+        expected_agent_id: &str,
+        accept_secret_findings: bool,
+    ) -> Result<super::PushAccess> {
         let path = format!("{owner}/{name}.git/info/refs?service=git-receive-pack");
-        let status = self.status_of(&path, Some(expected_agent_id))?;
+        let status = self.status_of(&path, Some(expected_agent_id), accept_secret_findings)?;
         super::PushAccess::from_status(status).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} answered {status} to the push-access probe for {owner}/{name}",
@@ -976,7 +1006,12 @@ impl Client {
     /// The status code only. On a 401 it exchanges the token once and retries, like
     /// [`Self::with_retry`]; a second 401 is reported as expired credentials, not as "no
     /// permission".
-    fn status_of(&self, path: &str, expected_agent_id: Option<&str>) -> Result<u16> {
+    fn status_of(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+        accept_secret_findings: bool,
+    ) -> Result<u16> {
         self.ensure_destination()?;
         let send = |t: Option<&str>| {
             let mut req = self.agent.get(self.url(path));
@@ -985,6 +1020,9 @@ impl Client {
             }
             if let Some(id) = expected_agent_id {
                 req = req.header(super::identity::EXPECTED_AGENT_ID_HEADER, id);
+            }
+            if accept_secret_findings {
+                req = req.header("X-AgentGit-Accept-Secret-Findings", "true");
             }
             req.call()
         };
@@ -1075,7 +1113,16 @@ impl Client {
 
     /// Publish: create the agent and get the push address.
     pub fn publish(&self, req: &PublishRequest) -> Result<PublishResponse> {
-        self.post("api/agents", req)
+        let response: PublishResponse = self.post("api/agents", req)?;
+        anyhow::ensure!(
+            response.encryption_enabled.is_some(),
+            "the Hub did not return encryption_enabled for the created repository; upgrade the Hub and inspect the destination before retrying"
+        );
+        anyhow::ensure!(
+            response.encryption_enabled == Some(req.encryption_enabled),
+            "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+        );
+        Ok(response)
     }
 
     /// Copy an agent into your own namespace.
@@ -1096,7 +1143,7 @@ impl Client {
     }
 
     pub fn create_share(&self, req: &ShareRequest) -> Result<ShareResponse> {
-        self.post("api/shares", req)
+        self.post("api/shares/privacy", req)
     }
 
     pub fn list_shares(&self) -> Result<Vec<ShareResponse>> {
@@ -1902,7 +1949,7 @@ mod tests {
             assert!(!token.has_token());
             assert!(token.logout().is_err());
             assert!(token.delete("api/agents/alice/example").is_err());
-            assert!(token.status_of("api/health", None).is_err());
+            assert!(token.status_of("api/health", None, false).is_err());
         }
         assert_eq!(
             listener.accept().unwrap_err().kind(),

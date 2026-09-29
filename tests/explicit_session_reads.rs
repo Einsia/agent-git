@@ -1,5 +1,8 @@
 //! Reading and sharing an omitted target follows the explicitly selected branch, never recency.
 
+#[path = "support/privacy_policy_sources.rs"]
+mod privacy_policy_sources;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -137,6 +140,7 @@ fn share_payload(home: &Path, work: &Path) -> String {
     )
     .unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
+    let response_hub = hub.clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let mut stream = incoming.unwrap();
@@ -182,13 +186,21 @@ fn share_payload(home: &Path, work: &Path) -> String {
                     assert_eq!(&ending, b"\r\n");
                 }
             }
-            let shared = request_line.starts_with("POST /api/shares ");
+            let shared = request_line.starts_with("POST /api/shares/privacy ");
             let body = if shared {
                 sender
                     .send(serde_json::from_slice::<serde_json::Value>(&payload).unwrap())
                     .unwrap();
-                r#"{"slug":"synthetic-share","url":"http://localhost/s/synthetic-share"}"#
+                r#"{"format_version":2,"slug":"synthetic-share","url":"http://localhost/s/synthetic-share"}"#
                     .to_owned()
+            } else if let Some((_, response)) = privacy_policy_sources::route(
+                &response_hub,
+                "me",
+                request_line.split_whitespace().next().unwrap(),
+                request_line.split_whitespace().nth(1).unwrap(),
+                &payload,
+            ) {
+                response.to_string()
             } else {
                 serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"tag":"test"}).to_string()
             };

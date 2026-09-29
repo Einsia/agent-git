@@ -15,7 +15,37 @@ impl CompleteInspection {
     /// Only a complete deterministic inspection can reach publication.
     /// Accepting findings applies to this operation and does not constitute model approval.
     /// Native Git LFS retains its own User-Agent and server-directed transfer policy.
-    pub fn publish(mut self, acceptance: SecretFindingsAcceptance) -> PublicationReport {
+    pub fn publish(self, acceptance: SecretFindingsAcceptance) -> PublicationReport {
+        self.publish_confirmed(acceptance, None)
+    }
+
+    /// Call after reviewing the immutable public objects and confirming their destination.
+    /// The Hub must issue a matching receipt before any Git receive request is sent.
+    pub fn publish_with_privacy_receipts(
+        self,
+        policy_digest: &str,
+        recipient: &str,
+        visibility: &str,
+        content_policy_digest: &str,
+    ) -> Result<PublicationReport> {
+        ensure!(
+            !self.has_findings(),
+            "publication has unresolved secret findings"
+        );
+        let policy = self.prepared.publication.privacy_policy(
+            policy_digest,
+            recipient,
+            visibility,
+            content_policy_digest,
+        )?;
+        Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy)))
+    }
+
+    fn publish_confirmed(
+        mut self,
+        acceptance: SecretFindingsAcceptance,
+        policy: Option<crate::hub::privacy::publication::PublicationPolicy>,
+    ) -> PublicationReport {
         if self.has_findings() && acceptance == SecretFindingsAcceptance::Reject {
             return PublicationReport::refused(
                 "complete secret findings require explicit acceptance for this publication".into(),
@@ -32,7 +62,10 @@ impl CompleteInspection {
                 error: None,
             };
         }
-        let (heads, tags) = self.prepared.publication.push_refs();
+        let (heads, tags) = match policy.as_ref() {
+            Some(policy) => self.prepared.publication.push_refs_confirmed(Some(policy)),
+            None => self.prepared.publication.push_refs(),
+        };
         PublicationReport {
             lfs: Some(lfs),
             heads: Some(heads),

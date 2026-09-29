@@ -50,6 +50,7 @@ pub struct AgitSession {
     name: String,
     agent_id: String,
     branch: String,
+    pub(crate) capture: Option<crate::rc::capture::RepositoryKind>,
 }
 
 /// Whether this segment is safe to use as **one** path component.
@@ -150,6 +151,7 @@ impl AgitSession {
             name: name.to_string(),
             agent_id,
             branch: branch.to_string(),
+            capture: None,
         })
     }
 

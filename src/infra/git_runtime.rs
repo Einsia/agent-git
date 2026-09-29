@@ -36,6 +36,14 @@ pub fn command() -> Command {
     super::background::command("git")
 }
 
+/// Git for Windows maps `/dev/null` to its null device; an empty filename is not portable.
+/// Apply before the subcommand so the empty graft file's advice override is a global option.
+pub(crate) fn disable_grafts(command: &mut Command) {
+    command
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .args(["-c", "advice.graftFileDeprecated=false"]);
+}
+
 /// Reapply private executable lookup after a caller clears the subprocess environment.
 pub fn configure(command: &mut Command) {
     #[cfg(feature = "bundled-git")]

@@ -93,6 +93,12 @@ impl Landing {
             );
             if lease.local_owner {
                 command.env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV);
+                if let Some(kind) = &agit_session.capture {
+                    let Ok(kind) = serde_json::to_string(kind) else {
+                        return;
+                    };
+                    command.env(crate::rc::capture::CAPTURE_ENV, kind);
+                }
             }
             command
                 .env_remove(crate::commands::commit::archive::NATIVE_ENV)

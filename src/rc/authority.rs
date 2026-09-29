@@ -7,6 +7,10 @@ pub(crate) trait Authority: Send + Sync {
     /// Hold the authority's read lease while invoking the nonblocking acceptance step.
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool;
 
+    fn publication_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
+        None
+    }
+
     fn watch_owner(&self) -> Option<String> {
         None
     }
@@ -29,6 +33,24 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
+    pub fn publication_grant(&self) -> Result<agit_peer::cloud::ConnectionGrant, RpcError> {
+        let mut grant = None;
+        if self.admit(|| {
+            grant = self
+                .0
+                .as_ref()
+                .and_then(|authority| authority.publication_grant());
+            grant.is_some()
+        }) {
+            Ok(grant.expect("admitted publication grant"))
+        } else {
+            Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "publication delivery requires current session-controller authority",
+            ))
+        }
+    }
+
     pub fn new(authority: impl Authority + 'static) -> Self {
         Self(Some(Arc::new(authority)))
     }

@@ -39,6 +39,7 @@
 //! envelope sequence with an IR line number.
 
 pub mod display;
+pub(crate) mod recovery;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -29,6 +29,7 @@
 use super::CmdResult;
 use crate::domain::link::{self, Link};
 use crate::domain::meta;
+use crate::domain::privacy_recovery::RecoveredSnapshot;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
 use crate::domain::store::Store;
@@ -806,6 +807,10 @@ pub(crate) fn archive_launch_context(
     }
     .unwrap_or_else(|| fallback_cwd.to_owned());
     let cwd = std::path::absolute(cwd)?;
+    let cwd = cwd
+        .canonicalize()
+        .map(crate::infra::git_runtime::path_for_git)
+        .unwrap_or(cwd);
     let system_prompt = if file {
         None
     } else {
@@ -909,7 +914,26 @@ fn resume_branch_for(
     // The form comes from `meta.line`, never a guess. A missing meta and "this is the file line"
     // are two different things and must not read the same: the first is a broken checkout, the
     // second a branch that never carries a session.
-    let Some(snap) = meta::read_at_ref(repo, &head) else {
+    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let mut recovered = RecoveredSnapshot::load(repo, &head)?;
+    for claim in link::active_for_branch(&store, owner, agent, branch) {
+        if let Some(binding) = &claim.privacy_recovery {
+            claim.native_privacy_recovery()?;
+            let pinned = RecoveredSnapshot::load_bound(repo, binding, &head)?;
+            anyhow::ensure!(
+                recovered
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.binding() == pinned.binding()),
+                "active runtimes refer to different private recovery data"
+            );
+            recovered = Some(pinned);
+        }
+    }
+    let Some(snap) = recovered
+        .as_ref()
+        .map(|snapshot| snapshot.metadata.clone())
+        .or_else(|| meta::read_at_ref(repo, &head))
+    else {
         ui::error(&format!(
             "`{branch}` carries no {} — this checkout is incomplete.",
             meta::FILE
@@ -954,8 +978,17 @@ fn resume_branch_for(
                 .and_then(|l| l.cwd.clone())
                 .map(PathBuf::from)
         })
+        .or_else(|| {
+            recovered
+                .as_ref()
+                .map(|snapshot| PathBuf::from(&snapshot.metadata.cwd))
+        })
         .unwrap_or(std::env::current_dir()?);
     let cwd = std::path::absolute(cwd)?;
+    let cwd = cwd
+        .canonicalize()
+        .map(crate::infra::git_runtime::path_for_git)
+        .unwrap_or(cwd);
 
     // `cwd_state` is an observation, not a checkout instruction. Compare it before either
     // native reuse or VIEW materialization so both resume paths receive the same context.
@@ -991,8 +1024,10 @@ fn resume_branch_for(
     // VIEW is only a projection of the committed LOG. Validate the evidence carrier even when the
     // slow path will install only VIEW, so a missing/tampered event cannot be bypassed by changing
     // runtimes or by lacking a native-session link.
-    let committed_log = committed_log(repo, &head, &snap)?;
-    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let committed_log = match &recovered {
+        Some(snapshot) => snapshot.log.to_string(),
+        None => committed_log(repo, &head, &snap)?,
+    };
     let active = link::active_for_branch(&store, owner, agent, branch);
     if active.len() > 1 && !args.force {
         report_multiple_active(slug, branch, &active);
@@ -1006,12 +1041,19 @@ fn resume_branch_for(
         if !args.force
             && let [existing] = active
             && existing.materialized_from.as_deref() == Some(head.as_str())
+            && existing.privacy_recovery == recovered.as_ref().map(RecoveredSnapshot::binding)
+            && (existing.privacy_recovery.is_none()
+                || existing.native_privacy_recovery().unwrap_or(false))
             && requested_runtime.is_none_or(|runtime| existing.source == runtime)
-            && existing.cwd.as_deref() == Some(cwd.to_string_lossy().as_ref())
+            && existing.cwd.as_deref().is_some_and(|recorded| {
+                adapter::claude_code::canonical_cwd(Path::new(recorded)) == cwd
+            })
             && matches!(
                 link::materialization_activity(existing),
                 link::MaterializationActivity::Untouched | link::MaterializationActivity::Appended
             )
+            && claude_session_is_in_project(existing, &cwd)
+            && prepared_recovery_is_loadable(existing)
             && let Some(resumed) = prepared_resume(
                 &existing.source,
                 &existing.session_id,
@@ -1023,7 +1065,9 @@ fn resume_branch_for(
             )
         {
             report_environment_notice(&existing.source, system_prompt.as_deref());
-            materialize_memory(repo, branch, slug, &existing.source, &cwd);
+            if recovered.is_none() {
+                materialize_memory(repo, branch, slug, &existing.source, &cwd);
+            }
             println!(
                 "{}",
                 ui::dim(&format!(
@@ -1040,12 +1084,14 @@ fn resume_branch_for(
         return Ok(Some(resumed));
     }
 
-    if !switches_rt
+    if recovered.is_none()
+        && !switches_rt
         && args.cwd.is_none()
         && !args.force
         && !history_requires_view_materialization(repo, &head)?
         && let [lk] = active.as_slice()
         && lk.baseline_bytes.is_none()
+        && claude_session_is_in_project(lk, &cwd)
         && head_view_matches_log(repo, &head, &snap)?
     {
         // Native reuse requires both saved VIEW equality and a native LOG prefix. History
@@ -1158,7 +1204,14 @@ fn resume_branch_for(
             "the active runtime claim changed while preparing to resume; retry the command"
         );
     }
-    materialize_memory(repo, branch, slug, to_runtime, &cwd);
+    if let Some(snapshot) = &recovered {
+        snapshot.verify(repo)?;
+        ui::info(
+            "Restoring private history using ordinary resume rules and the original private VIEW.",
+        );
+    } else {
+        materialize_memory(repo, branch, slug, to_runtime, &cwd);
+    }
 
     // ── Slow path: materialize from the head VIEW, mint a new id ──
     materialize_and_resume(
@@ -1174,10 +1227,49 @@ fn resume_branch_for(
         prompt,
         system_prompt.as_deref(),
         &committed_log,
+        recovered.as_ref(),
         &store,
         supersede,
     )
     .map(Some)
+}
+
+fn claude_session_is_in_project(existing: &Link, cwd: &Path) -> bool {
+    if !matches!(existing.source.as_str(), "claude-code" | "claude-desktop") {
+        return true;
+    }
+    let Ok(expected) = adapter::claude_code::session_path(&existing.session_id, cwd) else {
+        return false;
+    };
+    existing
+        .resolve()
+        .is_some_and(|actual| same_file::is_same_file(actual, expected).unwrap_or(false))
+}
+
+fn prepared_recovery_is_loadable(existing: &Link) -> bool {
+    if !matches!(existing.source.as_str(), "claude-code" | "claude-desktop") {
+        return true;
+    }
+    let Some(cwd) = existing.cwd.as_deref() else {
+        return false;
+    };
+    let Ok(bytes) = existing.read_bytes() else {
+        return false;
+    };
+    let Some(baseline) = existing
+        .baseline_bytes
+        .and_then(|length| usize::try_from(length).ok())
+    else {
+        return false;
+    };
+    let Some(bytes) = bytes.get(..baseline) else {
+        return false;
+    };
+    let Ok(raw) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let cwd = adapter::claude_code::canonical_cwd(Path::new(cwd));
+    crate::domain::transcript::recovery::validate_claude(raw, &existing.session_id, &cwd).is_ok()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1855,6 +1947,7 @@ fn materialize_and_resume(
     prompt: Option<&str>,
     system_prompt: Option<&str>,
     committed_log: &str,
+    recovered: Option<&RecoveredSnapshot>,
     store: &Store,
     supersede: Vec<Link>,
 ) -> crate::Result<Resumed> {
@@ -1882,13 +1975,17 @@ fn materialize_and_resume(
 
     // The materialized content = the original lines unwrapped from the branch head's VIEW (not
     // the full log).
-    let view_env = crate::domain::storage::materialize_at(repo.root(), head, meta::VIEW_FILE)
+    let view_env = if let Some(snapshot) = recovered {
+        snapshot.view.to_string()
+    } else {
+        crate::domain::storage::materialize_at(repo.root(), head, meta::VIEW_FILE)
         .map_err(|_| {
             anyhow::anyhow!(
                 "{branch} has no {} yet — this session line hasn’t settled a turn (`agit commit` first), or the checkout is incomplete",
                 meta::VIEW_FILE
             )
-        })?;
+        })?
+    };
     let (text, skipped) = transcript::unwrap_lossy(&view_env);
     let raw_bytes = text.len();
     let mut saved: String = view_env
@@ -1902,9 +1999,13 @@ fn materialize_and_resume(
     // whole LOG for one bootstrap line; the identity keys are rewritten uniformly by the load
     // afterwards.
     let text = if transcript::needs_bootstrap(&text, from) {
-        match crate::domain::storage::materialize_head_at(repo.root(), head, meta::LOG_FILE) {
-            Ok(Some(head)) => transcript::restore_bootstrap(&text, &head, from),
-            _ => text,
+        if let Some(snapshot) = recovered {
+            transcript::restore_bootstrap(&text, &snapshot.log, from)
+        } else {
+            match crate::domain::storage::materialize_head_at(repo.root(), head, meta::LOG_FILE) {
+                Ok(Some(head)) => transcript::restore_bootstrap(&text, &head, from),
+                _ => text,
+            }
         }
     } else {
         text
@@ -1956,6 +2057,8 @@ fn materialize_and_resume(
     }
     lk.branch = Some(branch.to_string());
     lk.materialized_from = Some(head.to_string());
+    lk.privacy_recovery = recovered.map(RecoveredSnapshot::binding);
+    lk.privacy_recovery_format = recovered.map(|_| link::NATIVE_PRIVACY_RECOVERY_FORMAT.into());
     // The baseline must be taken down **the same path that later reads the live transcript**
     // (`lk.read_bytes` → resolve), never by reading the file `install` dropped: for a file-backed
     // runtime the two are the same bytes, for a library-backed one they are not — OpenCode is
@@ -2740,6 +2843,114 @@ mod tests {
         assert_eq!(current.branch.as_deref(), Some("recovery"));
         assert_eq!(current.baseline_bytes, None);
         assert!(current.superseded_by.is_none());
+    }
+
+    /// An append after replacement selection must survive the final installation recheck.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_replacement_rechecks_an_append_after_selection() {
+        if crate::rc::in_isolated_test(
+            "commands::resume::tests::recovery_replacement_rechecks_an_append_after_selection",
+        ) {
+            return;
+        }
+        use crate::adapter::Adapter;
+        use crate::domain::{storage, transcript::recovery};
+        use sha2::Digest as _;
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+        }
+        let cwd = root.path().canonicalize().unwrap();
+        let repo = Repo::init(&cwd.join("repo")).unwrap();
+        repo.git(&["config", "user.name", "Fixture"]).unwrap();
+        repo.git(&["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let legacy = format!(
+            "{}\n",
+            serde_json::json!({"agit":recovery::GENERATED_ORIGIN,
+            "type":"user","message":{"role":"user","content":format!("{}{}", recovery::EVIDENCE_PREFIX,
+                serde_json::json!({"runtime":"claude-code","session":"source","record":{"type":"system","content":"historical permission"}}))}})
+        );
+        let saved =
+            transcript::wrap_lines(&legacy, "claude-code", &format!("agit-{}", "a".repeat(40)));
+        let snap = meta::Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            "claude-code".into(),
+            cwd.to_string_lossy().into(),
+        );
+        storage::write_snapshot(repo.root(), &saved, &saved).unwrap();
+        meta::write(repo.root(), &snap).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Recovery fixture").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let installed = crate::adapter::claude_code::ClaudeCode
+            .install(&legacy, &id, &cwd)
+            .unwrap();
+        let store = Store::open_or_init().unwrap();
+        let mut claim = Link::new("claude-code", &id, Some(&cwd));
+        claim.owner = Some("alice".into());
+        claim.agent = Some("recovered".into());
+        claim.branch = Some("work".into());
+        claim.baseline_bytes = Some(legacy.len() as u64);
+        claim.baseline_hash = Some(hex::encode(sha2::Sha256::digest(legacy.as_bytes())));
+        claim.materialized_from = Some(head.clone());
+        link::write(&store, &claim).unwrap();
+        assert_eq!(
+            super::claim_activity(&repo, &saved, &claim).unwrap(),
+            super::ClaimActivity::Untouched
+        );
+        assert!(!super::prepared_recovery_is_loadable(&claim));
+        let selected = vec![claim.clone()];
+        let appended = format!(
+            "{legacy}{}\n",
+            serde_json::json!({"type":"user","message":{"role":"user","content":"new real turn"}})
+        );
+        std::fs::write(&installed.path, &appended).unwrap();
+        let result = super::materialize_and_resume(
+            &repo,
+            "alice/recovered",
+            "work",
+            &head,
+            &snap,
+            "claude-code",
+            "claude-code",
+            &super::Args {
+                no_launch: true,
+                ..Default::default()
+            },
+            &cwd,
+            None,
+            None,
+            &saved,
+            None,
+            &store,
+            selected,
+        );
+        let error = result
+            .err()
+            .expect("an appended turn must prevent replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("active runtime changed during materialization"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(installed.path).unwrap(), appended);
+        assert_eq!(
+            link::get(&store, "claude-code", &id)
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            claim.to_json().unwrap()
+        );
+        assert_eq!(
+            link::active_for_branch(&store, "alice", "recovered", "work").len(),
+            1
+        );
     }
 
     /// Lands one more commit on top of the current HEAD: changes the meta's kind (and line

@@ -4,6 +4,8 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
+pub(crate) mod publication;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Repository {
     pub slug: String,

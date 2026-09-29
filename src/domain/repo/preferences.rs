@@ -4,8 +4,50 @@ use super::Repo;
 use anyhow::{Result, bail};
 
 const AUTO_PUSH_KEY: &str = "agit.autoPush";
+const CREATION_ENCRYPTION_KEY: &str = "agit.creationEncryption";
 
 impl Repo {
+    /// Local creation intent never overrides a mode returned by the Hub.
+    pub fn creation_encryption(&self) -> Result<Option<bool>> {
+        let (status, output, error) = self.git_status(&[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            CREATION_ENCRYPTION_KEY,
+        ])?;
+        match status {
+            Some(0) => match output.trim() {
+                "true" => Ok(Some(true)),
+                "false" => Ok(Some(false)),
+                _ => bail!("invalid local repository encryption creation intent"),
+            },
+            Some(1) => Ok(None),
+            _ => bail!(
+                "could not read repository encryption creation intent: {}",
+                error.trim()
+            ),
+        }
+    }
+
+    pub fn set_creation_encryption(&self, enabled: bool) -> Result<()> {
+        self.git(&[
+            "config",
+            "--local",
+            "--replace-all",
+            CREATION_ENCRYPTION_KEY,
+            if enabled { "true" } else { "false" },
+        ])?;
+        Ok(())
+    }
+
+    pub fn encryption_for_creation(&self, explicit: Option<bool>) -> Result<bool> {
+        match explicit.or(self.creation_encryption()?) {
+            Some(value) => Ok(value),
+            None => crate::infra::config::encryption_default(),
+        }
+    }
+
     /// Only the repository's local config can override the user's automatic publishing choice.
     /// Includes and inherited Git configuration cannot grant upload consent.
     pub fn auto_push_override(&self) -> Result<Option<bool>> {

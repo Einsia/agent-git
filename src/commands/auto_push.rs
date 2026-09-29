@@ -5,6 +5,25 @@ use crate::ui;
 use std::path::Path;
 use std::process::Stdio;
 
+pub(super) const AUTOMATIC_ENV: &str = "AGIT_AUTO_PUSH";
+
+/// A background child may use saved consent, never a parent's interactive confirmation flag.
+pub(crate) fn configure(command: &mut std::process::Command) {
+    command.env(AUTOMATIC_ENV, "1").env_remove("AGIT_YES");
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn unattended_children_cannot_inherit_interactive_consent() {
+    let mut command = std::process::Command::new("sh");
+    command.env("AGIT_YES", "1").args([
+        "-c",
+        "test \"$AGIT_AUTO_PUSH\" = 1 && test -z \"${AGIT_YES+x}\"",
+    ]);
+    configure(&mut command);
+    assert!(command.status().unwrap().success());
+}
+
 pub(super) fn branch_tip(directory: &Path, branch: &str) -> Option<String> {
     let repo = Repo::open(directory)?;
     let branch_ref = format!("refs/heads/{branch}");
@@ -49,12 +68,13 @@ pub(super) fn after_settlement(
     // A child process isolates the noninteractive publish policy and its JSON output from the
     // settlement caller. It uses the ordinary identity, access, visibility and secret gates.
     let outcome = std::env::current_exe().and_then(|executable| {
-        crate::infra::background::command(executable)
+        let mut command = crate::infra::background::command(executable);
+        configure(&mut command);
+        command
             .args(["--json", "push", &target])
             .current_dir(directory)
             .env("AGIT_SESSION", &target)
             .env("AGIT_TUI", "0")
-            .env_remove("AGIT_YES")
             .stdin(Stdio::null())
             .output()
     });

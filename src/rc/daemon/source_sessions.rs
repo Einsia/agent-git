@@ -137,23 +137,6 @@ impl Daemon {
                 p.expected_agent_id.as_deref(),
                 p.branch.as_deref(),
             )?,
-            None if self.opts.local_owner
-                && p.agent.is_none()
-                && p.expected_agent_id.is_none()
-                && p.branch.is_none() =>
-            {
-                let repository =
-                    crate::rc::local_repository::ensure_repository(&project, &project_path)
-                        .map_err(unavailable)?;
-                Some(
-                    crate::rc::lineage::AgitSession::new(
-                        &repository.slug,
-                        &repository.agent_id,
-                        &format!("desktop-{key}"),
-                    )
-                    .map_err(unavailable)?,
-                )
-            }
             None => lineage_from_params(
                 self.settlement_feature(),
                 p.agent.as_deref(),
@@ -163,6 +146,7 @@ impl Daemon {
         };
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            publication: None,
             session_id: logical,
             native_source: Some(source),
             runtime_session_id: Some(native.into()),
@@ -239,6 +223,7 @@ mod tests {
             }
             let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
             let mut state = daemon.try_lock().unwrap();
+            state.opts.local_owner = true;
             state.mirror.bind("ws", "project", &project).unwrap();
             let (frames, _) = mpsc::channel(16);
             let claim = |role: &str| crate::protocol::CallerClaim {
@@ -272,6 +257,7 @@ mod tests {
                     panic!("source must attach");
                 };
                 assert_eq!(spawn.spec.resume_from.as_deref(), Some(native.as_str()));
+                assert!(spawn.spec.agit_session.is_none());
                 assert_eq!(
                     spawn.info.native_source.as_ref().unwrap().source_id,
                     source.source_id

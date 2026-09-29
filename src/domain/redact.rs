@@ -80,6 +80,19 @@ pub struct JsonReport {
     pub registered_ids: Vec<String>,
 }
 
+impl JsonReport {
+    fn withheld(error: &anyhow::Error) -> Self {
+        eprintln!("agit: JSON privacy protection failed; content withheld: {error:#}");
+        Self {
+            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
+            secrets: 0,
+            paths: 0,
+            ips: 0,
+            registered_ids: vec![],
+        }
+    }
+}
+
 #[cfg(feature = "rc")]
 pub(crate) struct NativeJson {
     pub value: serde_json::Value,
@@ -148,7 +161,7 @@ struct NativeProtection {
     source: Option<crate::protocol::NativeSourceRef>,
     runtime: String,
     session: String,
-    evidence: crate::domain::secrets::identity::Evidence,
+    evidence: Option<crate::domain::secrets::identity::Evidence>,
     seeded: bool,
 }
 
@@ -294,7 +307,40 @@ impl Redactor {
         Ok(self)
     }
 
-    /// Supervised sessions need a selected Agent repository to publish reversible mappings.
+    /// Only local cache state may retain this digest of persona and secret-rule dependencies.
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&(
+            &self.persona.username,
+            &self.persona.home,
+            &self.persona.hostname,
+            self.registered.snapshot().publication_fingerprint()?,
+            self.dictionary
+                .as_ref()
+                .map(|dictionary| dictionary.publication_fingerprint())
+                .transpose()?,
+        ))?);
+        Ok(crate::domain::privacy_envelope::digest_bytes(&bytes))
+    }
+
+    /// Encryption carries protection only for literals used in the original session, including
+    /// private records that never enter the public scanner.
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn publication_values_matching(
+        &self,
+        used: impl Fn(&str) -> bool,
+    ) -> crate::Result<std::collections::BTreeSet<String>> {
+        let mut values = self
+            .registered
+            .snapshot()
+            .publication_values_matching(&used);
+        if let Some(dictionary) = &self.dictionary {
+            values.extend(dictionary.publication_values_matching(used)?);
+        }
+        Ok(values)
+    }
+
+    /// Repository-bound sessions must persist reversible mappings before publishing secrets.
     #[cfg(feature = "rc")]
     pub(crate) fn require_repository(mut self) -> Self {
         self.require_repository = true;
@@ -313,10 +359,23 @@ impl Redactor {
             source: None,
             runtime: runtime.into(),
             session: session.into(),
-            evidence: crate::domain::secrets::identity::Evidence::new(
+            evidence: Some(crate::domain::secrets::identity::Evidence::new(
                 &crate::domain::repo::Repo::at(root),
                 cwd,
-            ),
+            )),
+            seeded: false,
+        })));
+        self
+    }
+
+    /// An unbound session has native schema identities but no repository publication authority.
+    #[cfg(feature = "rc")]
+    pub(crate) fn with_unbound_native_context(mut self, runtime: &str, session: &str) -> Self {
+        self.native = Some(Arc::new(std::sync::Mutex::new(NativeProtection {
+            source: None,
+            runtime: runtime.into(),
+            session: session.into(),
+            evidence: None,
             seeded: false,
         })));
         self
@@ -331,7 +390,9 @@ impl Redactor {
             && let Ok(mut native) = native.lock()
         {
             native.source = source;
-            native.evidence.reset();
+            if let Some(evidence) = &mut native.evidence {
+                evidence.reset();
+            }
             native.seeded = false;
         }
         self
@@ -343,7 +404,9 @@ impl Redactor {
             && let Ok(mut native) = native.lock()
             && native.session != session
         {
-            native.evidence.reset();
+            if let Some(evidence) = &mut native.evidence {
+                evidence.reset();
+            }
             native.seeded = false;
             native.session = session.to_owned();
         }
@@ -373,7 +436,7 @@ impl Redactor {
             return Vec::new();
         }
         let result = (|| -> crate::Result<Vec<NativeJson>> {
-            let (Some(native), Some(dictionary)) = (&self.native, &self.dictionary) else {
+            let Some(native) = &self.native else {
                 return Ok(records
                     .iter()
                     .map(|(value, pointers)| {
@@ -398,13 +461,20 @@ impl Redactor {
                     .as_ref()
                     .map(|source| source.session_ref(&session))
                     .unwrap_or_else(|| session.clone());
-                native.evidence.seed_native(&runtime, &instance)?;
+                if let Some(evidence) = &mut native.evidence {
+                    evidence.seed_native(&runtime, &instance)?;
+                }
                 native.seeded = true;
             }
             let masks: Vec<_> = records
                 .iter()
                 .map(|(value, pointers)| {
-                    let mut mask = native.evidence.record(&runtime, &session, value);
+                    let mut mask = match &mut native.evidence {
+                        Some(evidence) => evidence.record(&runtime, &session, value),
+                        None => crate::domain::secrets::identity::native_record_mask(
+                            &runtime, &session, value,
+                        ),
+                    };
                     for pointer in *pointers {
                         if let Some(text) =
                             value.pointer(pointer).and_then(serde_json::Value::as_str)
@@ -418,6 +488,29 @@ impl Redactor {
                     mask
                 })
                 .collect();
+            let Some(dictionary) = &self.dictionary else {
+                return Ok(records
+                    .iter()
+                    .zip(&masks)
+                    .map(|((value, _), mask)| {
+                        let pointers: Vec<_> = mask
+                            .0
+                            .iter()
+                            .filter_map(|(pointer, span)| {
+                                let text = value.pointer(pointer)?.as_str()?;
+                                (span == &(0..text.len())).then_some(pointer.as_str())
+                            })
+                            .collect();
+                        let report = self.scrub_json_with_verified_fields(value, &pointers);
+                        NativeJson {
+                            secret_projection: report.secrets > 0
+                                || report.value.get("protection_error").is_some(),
+                            value: report.value,
+                            registered_ids: report.registered_ids,
+                        }
+                    })
+                    .collect());
+            };
             let registered = self.registered.snapshot();
             let protect = |range: std::ops::Range<usize>| -> crate::Result<Vec<NativeJson>> {
                 let mut input = String::new();
@@ -564,9 +657,12 @@ impl Redactor {
 
     /// Redact one text. Deterministic: same input, same persona ⇒ same output.
     pub fn scrub(&self, text: &str) -> Report {
-        self.try_scrub(text).unwrap_or_else(|_| Report {
-            text: PROTECTION_ERROR_TEXT.into(),
-            ..empty_report()
+        self.try_scrub(text).unwrap_or_else(|error| {
+            eprintln!("agit: text privacy protection failed; content withheld: {error:#}");
+            Report {
+                text: PROTECTION_ERROR_TEXT.into(),
+                ..empty_report()
+            }
         })
     }
 
@@ -719,13 +815,8 @@ impl Redactor {
     /// only safe boundary for serialized runtime events: matching the wire text
     /// would miss `\"`, `\\` and `\n` inside a registered literal.
     pub fn scrub_json(&self, value: &serde_json::Value) -> JsonReport {
-        self.try_scrub_json(value).unwrap_or_else(|_| JsonReport {
-            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
-            secrets: 0,
-            paths: 0,
-            ips: 0,
-            registered_ids: vec![],
-        })
+        self.try_scrub_json(value)
+            .unwrap_or_else(|error| JsonReport::withheld(&error))
     }
 
     /// Pointers are supplied only after the caller validates schema-owned identities.
@@ -742,7 +833,7 @@ impl Redactor {
                 .and_then(|local| self.registered.snapshot().merged(&local))
             {
                 Ok(matcher) => matcher,
-                Err(_) => return self.scrub_json(value),
+                Err(error) => return JsonReport::withheld(&error),
             },
             None => self.registered.snapshot(),
         };
@@ -926,12 +1017,17 @@ impl StreamRedactor {
         #[cfg(feature = "rc")]
         if let Some(native) = &self.redactor.native {
             let mut native = native.lock().map_err(|_| StreamProtectionError)?;
-            if native.evidence.contains_object_identity(&ready) {
+            if native
+                .evidence
+                .as_mut()
+                .is_some_and(|evidence| evidence.contains_object_identity(&ready))
+            {
                 // The authoritative completed record carries the operation/result relationship.
                 return Ok(empty_report());
             }
         }
-        self.redactor.try_scrub(&ready).map_err(|_| {
+        self.redactor.try_scrub(&ready).map_err(|error| {
+            eprintln!("agit: stream privacy protection failed; content withheld: {error:#}");
             self.failed = true;
             StreamProtectionError
         })
@@ -1058,6 +1154,145 @@ mod tests {
         assert!(updated[0].secret_projection);
         assert!(!updated[0].value.to_string().contains(secret));
         assert_eq!(updated[2].value, clean);
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn unbound_native_identities_are_schema_scoped_and_explicit_rules_still_apply() {
+        use crate::domain::secret_filter::{Matcher, MatcherHandle};
+        let session = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
+        let record_id = "8d5c2a51-8af0-4e5f-9f9e-731acee20c17";
+        let call_id = "toolu_01Qz7mXv9LpZ4tNc8WjF3bHy";
+        let message_id = "msg_01Qz7mXv9LpZ4tNc8WjF3bHy";
+        let secret = "blue horse battery";
+        let matcher = MatcherHandle::new(Matcher::for_test(&[("secret", secret)]));
+        let redactor = Redactor::with_registered(Persona::default(), matcher)
+            .with_unbound_native_context("claude-code", session);
+        let raw = serde_json::json!({
+            "type":"assistant", "sessionId":session, "uuid":record_id, "parentUuid":session,
+            "message":{"type":"message", "id":message_id,"role":"assistant", "content":[
+                {"type":"text", "text":format!("Readable reply {session} {record_id} {secret} {message_id} {call_id}")},
+                {"type":"tool_use", "id":call_id,"name":"Bash","input":{"command":"pwd"}}
+            ]},
+            "nested":{"sessionId":session,"uuid":record_id}
+        });
+        let protected = redactor.scrub_native_json(&raw, &[]);
+        assert_eq!(protected.value["sessionId"], session);
+        assert_eq!(protected.value["uuid"], record_id);
+        assert_eq!(protected.value["parentUuid"], session);
+        assert_eq!(protected.value["message"]["id"], message_id);
+        assert_eq!(protected.value["message"]["content"][1]["id"], call_id);
+        let content = protected.value["message"]["content"][0].to_string();
+        assert!(content.contains("Readable reply"));
+        for original in [session, record_id, secret, message_id, call_id] {
+            assert!(!content.contains(original));
+            assert!(!protected.value["nested"].to_string().contains(original));
+        }
+        assert!(protected.secret_projection);
+        assert_eq!(protected.registered_ids, vec!["secret"]);
+        let mut clean = raw.clone();
+        clean.as_object_mut().unwrap().remove("nested");
+        clean["message"]["content"] = serde_json::json!("Readable ordinary reply");
+        let projected = redactor.scrub_native_json(&clean, &[]);
+        assert_eq!(projected.value, clean);
+        assert!(!projected.secret_projection);
+        let mut untrusted = raw.clone();
+        untrusted["message"]["role"] = serde_json::json!("user");
+        assert!(
+            !redactor
+                .scrub_native_json(&untrusted, &[])
+                .value
+                .to_string()
+                .contains(session)
+        );
+        let wrong_session =
+            Redactor::new(Persona::default()).with_unbound_native_context("claude-code", record_id);
+        assert_ne!(
+            wrong_session.scrub_native_json(&raw, &[]).value["uuid"],
+            record_id
+        );
+        let explicit = Redactor::with_registered(
+            Persona::default(),
+            MatcherHandle::new(Matcher::for_test(&[
+                ("identity", record_id),
+                ("call", call_id),
+            ])),
+        )
+        .with_unbound_native_context("claude-code", session);
+        assert_ne!(
+            explicit.scrub_native_json(&raw, &[]).value["uuid"],
+            record_id
+        );
+        assert_ne!(
+            explicit.scrub_native_json(&raw, &[]).value["message"]["content"][1]["id"],
+            call_id
+        );
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn dictionary_io_failures_withhold_content_and_log_the_cause() {
+        const CHILD: &str = "AGIT_REDACTOR_IO_TEST_CHILD";
+        const SECRET: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "domain::redact::tests::dictionary_io_failures_withhold_content_and_log_the_cause", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let logs = String::from_utf8_lossy(&output.stderr);
+            assert!(logs.contains("cannot read secret-filter vault"), "{logs}");
+            assert!(
+                logs.contains("cannot create") && logs.contains("keys"),
+                "{logs}"
+            );
+            for boundary in [
+                "text privacy protection failed",
+                "JSON privacy protection failed",
+                "native secret projection withheld",
+                "stream privacy protection failed",
+            ] {
+                assert!(logs.contains(boundary), "missing {boundary}: {logs}");
+            }
+            assert!(!logs.contains(SECRET));
+            assert!(!logs.contains("PRIVATE_RECORD_BODY"));
+            return;
+        }
+        for failing_read in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+            let redactor = Redactor::new(Persona::default())
+                .require_repository()
+                .with_repository(repo.root())
+                .unwrap()
+                .with_native_context("claude-code", "", repo.root(), repo.root());
+            let dictionary = repo.root().join(".git/agit/secret-dictionary");
+            std::fs::create_dir_all(&dictionary).unwrap();
+            if failing_read {
+                std::fs::create_dir(dictionary.join("vault.json")).unwrap();
+            } else {
+                std::fs::write(dictionary.join("keys"), "blocked directory").unwrap();
+            }
+            let text = format!("PRIVATE_RECORD_BODY {SECRET}");
+            let raw = serde_json::json!({"text": text});
+            assert_eq!(redactor.scrub(&text).text, PROTECTION_ERROR_TEXT);
+            assert_eq!(
+                redactor.scrub_json(&raw).value,
+                serde_json::json!({"protection_error":PROTECTION_ERROR_TEXT})
+            );
+            assert_eq!(
+                redactor.scrub_native_json(&raw, &[]).value,
+                serde_json::json!({"protection_error":PROTECTION_ERROR_TEXT})
+            );
+            let mut stream = redactor.stream();
+            assert!(stream.push(&text).unwrap().text.is_empty());
+            assert!(stream.flush().is_err());
+        }
     }
 
     #[cfg(feature = "rc")]

@@ -45,6 +45,7 @@ use crate::adapter::{EventKind, OpenCall, Session};
 use crate::domain::link::{self, Link};
 use crate::domain::mergetx;
 use crate::domain::meta::{self, Completeness, Kind, Meta};
+use crate::domain::privacy_recovery::RecoveredSnapshot;
 use crate::domain::repo::{self, Repo};
 use crate::domain::storage;
 use crate::domain::store::Store;
@@ -390,7 +391,7 @@ fn run_inner(args: Args) -> CmdResult {
                 );
                 crate::rc::select_local_authority();
                 let lineage = crate::rc::lineage::AgitSession::new(&slug, &expected, &branch)?;
-                crate::rc::local_repository::require(&lineage)?;
+                crate::rc::capture::from_environment(lineage)?;
             }
             if std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_some() {
                 let repo = Repo::open(&repo_dir).ok_or_else(|| {
@@ -554,7 +555,7 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
         crate::rc::select_local_authority();
         let route = std::env::var("AGIT_SESSION")?;
         let lineage = crate::rc::lineage::AgitSession::parse(&route, &expected)?;
-        crate::rc::local_repository::require(&lineage)?;
+        let lineage = crate::rc::capture::from_environment(lineage)?;
         return Ok(Some(lineage.owner().to_owned()));
     }
 
@@ -1914,7 +1915,27 @@ fn settle_bytes(
         }
         return Ok(ExitCode::Policy);
     }
-    let head_meta = if let Some(tip) = settlement_tip.as_deref() {
+    let recovered = lk
+        .privacy_recovery
+        .as_ref()
+        .map(|binding| {
+            lk.native_privacy_recovery()?;
+            anyhow::ensure!(
+                materialized_mode,
+                "private recovery requires a materialized runtime"
+            );
+            RecoveredSnapshot::load_bound(
+                repo,
+                binding,
+                settlement_tip
+                    .as_deref()
+                    .context("private recovery has no branch tip")?,
+            )
+        })
+        .transpose()?;
+    let head_meta = if let Some(snapshot) = recovered.as_ref() {
+        Some(snapshot.metadata.clone())
+    } else if let Some(tip) = settlement_tip.as_deref() {
         // Once a branch has a commit, absence and corruption are different states:
         // malformed/non-UTF-8/invalid meta must stop every mutating path instead of being
         // mistaken for an old v0 branch.
@@ -2223,12 +2244,20 @@ fn settle_bytes(
     if new_chunks.is_empty() {
         // No new turn. Two legal moves remain: a `-m` file commit, or a no-op.
         if let Some(msg) = &opts.message {
+            let public_meta = if recovered.is_some() {
+                meta::read_at_ref_result(
+                    repo,
+                    settlement_tip.as_deref().expect("recovery branch tip"),
+                )?
+            } else {
+                head_meta.clone()
+            };
             return file_commit(
                 repo,
                 slug,
                 branch,
                 settlement_tip.as_deref(),
-                &head_meta,
+                &public_meta,
                 msg,
                 &opts.paths,
                 quiet,
@@ -2277,10 +2306,26 @@ fn settle_bytes(
         let tip = settlement_tip
             .as_deref()
             .expect("materialized settlement requires a frozen branch tip");
-        let log = storage::materialize_at(repo.root(), tip, meta::LOG_FILE)
-            .map_err(|error| anyhow::anyhow!("cannot read committed LOG at {tip}: {error:#}"))?;
-        let view = storage::materialize_at(repo.root(), tip, meta::VIEW_FILE)
-            .map_err(|error| anyhow::anyhow!("cannot read committed VIEW at {tip}: {error:#}"))?;
+        let (log, view) = if let Some(snapshot) = recovered.as_ref() {
+            snapshot.verify(repo)?;
+            if lk.native_privacy_recovery()? {
+                (snapshot.log.to_string(), snapshot.view.to_string())
+            } else {
+                let view = snapshot.legacy_evidence_view()?.to_string();
+                let log = storage::make_view_reachable(&snapshot.log, &view)?;
+                (log, view)
+            }
+        } else {
+            let log =
+                storage::materialize_at(repo.root(), tip, meta::LOG_FILE).map_err(|error| {
+                    anyhow::anyhow!("cannot read committed LOG at {tip}: {error:#}")
+                })?;
+            let view =
+                storage::materialize_at(repo.root(), tip, meta::VIEW_FILE).map_err(|error| {
+                    anyhow::anyhow!("cannot read committed VIEW at {tip}: {error:#}")
+                })?;
+            (log, view)
+        };
         let log = if snapshot.layout == meta::LayoutVersion::V0 {
             storage::make_view_reachable(&log, &view)?
         } else {
@@ -2528,6 +2573,12 @@ fn settle_bytes(
             )?;
             super::plumbing::session_snapshot_tree(repo, base, &log, &view, &snap_text)?
         };
+        // An envelope authenticates its published snapshot, never a locally continued child.
+        let tree = super::plumbing::tree_apply_owned(
+            repo,
+            &tree,
+            vec![("privacy/envelope.json".into(), None)],
+        )?;
         let parents = pending_parent
             .iter()
             .map(String::as_str)
@@ -2589,6 +2640,8 @@ fn settle_bytes(
         lk.baseline_bytes = Some(new_baseline as u64);
         lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])));
         lk.materialized_from = Some(last_sha.clone());
+        lk.privacy_recovery = None;
+        lk.privacy_recovery_format = None;
     }
     // The same lock (`link::lock`) as import's claim/rollback critical section, plus a CAS:
     // write only while the disk still holds what it held when settlement started — a claim

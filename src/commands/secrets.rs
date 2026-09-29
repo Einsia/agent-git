@@ -509,63 +509,48 @@ pub(crate) fn has_policy_state(repo: &Repo) -> crate::Result<bool> {
     Ok(dictionary.exists() && dictionary.has_policy_state()?)
 }
 
-/// A missing first-publication destination is materialized by push only after local checks.
-pub(crate) fn synchronize_before_push(
-    repo: &Repo,
+pub(crate) fn copy_policy_identities(
     client: &crate::hub::Client,
     owner: &str,
     name: &str,
-    dry_run: bool,
-    allow_secrets: bool,
-) -> crate::Result<Option<ExitCode>> {
-    let has_policy_state = match has_policy_state(repo) {
-        Ok(state) => state,
-        Err(error) => {
-            ui::error(&format!(
-                "cannot inspect repository declaration state: {}",
-                super::terminal_error_message(&error)
-            ));
-            return Ok(Some(ExitCode::Precondition));
-        }
+    agent_id: &str,
+) -> crate::Result<std::collections::HashSet<String>> {
+    use crate::domain::secret_filter::RepositoryPolicyTransport;
+    let snapshot = match (HubPolicy {
+        client,
+        owner,
+        name,
+        agent_id,
+    })
+    .snapshot()
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.is::<PolicyUnavailable>() => return Ok(Default::default()),
+        Err(error) => return Err(error),
     };
-    let expected = crate::hub::identity::expected_for_transport(repo, client.base())?;
-    let result = match super::remote_request(client.get_agent(owner, name)) {
-        Ok(remote) => crate::hub::identity::RemoteIdentity::new(client.base(), &remote.agent_id)
-            .and_then(|identity| synchronize_target(repo, client, owner, name, &identity, dry_run)),
-        Err(error)
-            if error
-                .downcast_ref::<crate::hub::client::ApiError>()
-                .is_some_and(|api| api.status == 404) =>
-        {
-            if expected.is_some() {
-                return Err(
-                    error.context("the RC remote is unavailable; refusing to create a replacement")
-                );
-            }
-            if has_policy_state {
-                report_pending_declarations(repo)?;
-                ui::info(
-                    "Declarations require an immutable destination; synchronization is planned after first-publication repository creation.",
-                );
-            }
-            return Ok(None);
-        }
-        Err(error) => Err(error),
-    };
-    report_policy_discovery(result, has_policy_state, allow_secrets)
+    snapshot.validate(agent_id)?;
+    Ok(snapshot
+        .decisions
+        .into_iter()
+        .filter(|decision| {
+            decision.state == crate::domain::secrets::repository_policy::DecisionState::Active
+        })
+        .map(|decision| decision.value_identity)
+        .collect())
 }
 
-/// A prepared copy installs policy for its validated destination without resolving its name again.
+/// Publication synchronizes the validated destination without resolving its name again.
 pub(crate) fn synchronize_push_target(
     repo: &Repo,
     client: &crate::hub::Client,
     owner: &str,
     name: &str,
     identity: &crate::hub::identity::RemoteIdentity,
+    dry_run: bool,
     allow_secrets: bool,
 ) -> crate::Result<Option<ExitCode>> {
     let has_policy_state = has_policy_state(repo)?;
-    let result = synchronize_target(repo, client, owner, name, identity, false);
+    let result = synchronize_target(repo, client, owner, name, identity, dry_run);
     report_policy_discovery(result, has_policy_state, allow_secrets)
 }
 

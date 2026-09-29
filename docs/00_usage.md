@@ -599,8 +599,11 @@ agit share list           # which links are still alive
 agit share rm <slug>      # revoke one
 ```
 
-`--public` is an unencrypted, crawlable link; `--password` adds a passphrase. A session with a
-secret finding is refused outright.
+`--public` sends a structured public projection without private recovery data; `--password` adds
+a passphrase. Privacy rules rewrite or omit excluded content and secrets before publication.
+Default encrypted sharing requires your configured viewing key: the link opens the checked
+presentation, while your viewing password can additionally recover the selected original records.
+Creating links requires a Hub and viewer that support the versioned privacy share protocol.
 
 ### 4.2 Search for precedent
 

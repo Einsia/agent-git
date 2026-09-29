@@ -88,9 +88,11 @@ impl Lab {
         let home = dir.path().join("home");
         let store = dir.path().join("agit");
         let work = dir.path().join("work");
-        let project = home.join(".claude/projects/fixture");
-        fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&work).unwrap();
+        let project = home
+            .join(".claude/projects")
+            .join(agit::domain::store::slug_for(&work.canonicalize().unwrap()));
+        fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(store.join("credentials")).unwrap();
         fs::write(
             store.join("credentials/127.0.0.1_1.json"),

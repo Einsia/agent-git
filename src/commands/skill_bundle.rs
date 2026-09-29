@@ -59,6 +59,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "new",
     "run",
     "pr",
+    "privacy",
     "pull",
     "push",
     "rc",

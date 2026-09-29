@@ -131,6 +131,37 @@ impl Client {
         &self.origin
     }
 
+    pub async fn confirm_publication(
+        &self,
+        executor: &DeviceCredential,
+        grant: &ConnectionGrant,
+        delivery: &crate::publication::Delivery,
+    ) -> anyhow::Result<crate::publication::Acknowledgement> {
+        self.validate_executor_grant(executor, grant)?;
+        let now = || -> anyhow::Result<i64> {
+            Ok(SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?)
+        };
+        delivery.validate(grant, now()?)?;
+        let body = serde_json::to_value(delivery)?;
+        ensure!(
+            serde_json::to_vec(&body)?.len() <= crate::publication::MAX_NOTIFICATION_BYTES,
+            "publication delivery exceeds its size limit"
+        );
+        let response: crate::publication::Acknowledgement = self
+            .request(
+                Method::POST,
+                crate::publication::CONFIRM_PATH,
+                &executor.token,
+                Some(body),
+            )
+            .await?;
+        response.validate(delivery, grant, now()?)?;
+        Ok(response)
+    }
+
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -588,6 +619,73 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An authenticated HTTP response must still match the exact publication and delivery lease.
+    #[tokio::test]
+    async fn publication_http_ack_requires_bound_durable_receipt() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (notification, grant) = crate::publication::tests::fixture("https://hub.example");
+        let executor = DeviceCredential {
+            device: grant.target.clone(),
+            token: Secret::new("fixture-token".into()),
+        };
+        let delivery = crate::publication::Delivery::new(notification, &grant, 0).unwrap();
+        let expected = delivery.clone();
+        let server = tokio::spawn(async move {
+            for wrong in [false, true] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "POST /api/peer/publications/confirm HTTP/1.1\r\n");
+                let mut length = None;
+                let mut authenticated = false;
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                    authenticated |= lower.trim() == "authorization: bearer fixture-token";
+                }
+                assert!(authenticated);
+                let mut body = vec![0; length.unwrap()];
+                socket.read_exact(&mut body).await.unwrap();
+                let observed: crate::publication::Delivery = serde_json::from_slice(&body).unwrap();
+                assert_eq!(observed, expected);
+                let mut response = crate::publication::tests::ack(&observed);
+                if wrong {
+                    response.receipt.public_commit = "c".repeat(40);
+                }
+                let body = serde_json::to_string(&response).unwrap();
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new("https://hub.example")
+            .unwrap()
+            .with_trusted_transport_origin(&format!("http://{address}"))
+            .unwrap();
+        assert_eq!(
+            client
+                .confirm_publication(&executor, &grant, &delivery)
+                .await
+                .unwrap(),
+            crate::publication::tests::ack(&delivery)
+        );
+        assert!(
+            client
+                .confirm_publication(&executor, &grant, &delivery)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn presence_grant_retains_executor_binding_without_an_http_round_trip() {

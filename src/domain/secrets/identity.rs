@@ -106,12 +106,7 @@ impl Evidence {
     }
 
     pub(crate) fn record(&mut self, runtime: &str, native: &str, value: &Value) -> RecordMask {
-        let mut mask = RecordMask::default();
-        for pointer in native_session_pointers(runtime, native, value) {
-            if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
-                mask.0.push((pointer.into(), 0..text.len()));
-            }
-        }
+        let mut mask = native_record_mask(runtime, native, value);
         match runtime {
             "codex" if value["type"] == "response_item" => {
                 let item = &value["payload"];
@@ -511,9 +506,10 @@ pub(crate) fn native_session_pointers(
     native: &str,
     value: &Value,
 ) -> Vec<&'static str> {
-    let canonical_uuid =
-        uuid::Uuid::parse_str(native).is_ok_and(|uuid| uuid.hyphenated().to_string() == native);
-    if !canonical_uuid {
+    let canonical_uuid = |text: &str| {
+        uuid::Uuid::parse_str(text).is_ok_and(|uuid| uuid.hyphenated().to_string() == text)
+    };
+    if !canonical_uuid(native) {
         return Vec::new();
     }
     match runtime {
@@ -536,12 +532,83 @@ pub(crate) fn native_session_pointers(
                 && matches!(value["type"].as_str(), Some("user" | "assistant"))
                 && value.pointer("/message/role").and_then(Value::as_str)
                     == value["type"].as_str()
-                && value.pointer("/message/content").is_some() =>
+                && value
+                    .pointer("/message/content")
+                    .is_some_and(|content| content.is_string() || content.is_array()) =>
         {
-            vec!["/sessionId"]
+            let mut pointers = vec!["/sessionId"];
+            for pointer in ["/uuid", "/parentUuid"] {
+                if value
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .is_some_and(canonical_uuid)
+                {
+                    pointers.push(pointer);
+                }
+            }
+            pointers
         }
         _ => Vec::new(),
     }
+}
+
+/// Schema-owned identifiers are evidence only at their exact fields in the selected session.
+pub(crate) fn native_record_mask(runtime: &str, native: &str, value: &Value) -> RecordMask {
+    let pointers = native_session_pointers(runtime, native, value);
+    let mut mask = RecordMask::default();
+    if pointers.is_empty() {
+        return mask;
+    }
+    for pointer in pointers {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+            mask.0.push((pointer.into(), 0..text.len()));
+        }
+    }
+    let native_id = |value: &Value, prefix: &str| {
+        value.as_str().is_some_and(|text| {
+            text.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 128
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+        })
+    };
+    if runtime == "claude-code" {
+        if value["type"] == "assistant"
+            && value["message"]["type"] == "message"
+            && native_id(&value["message"]["id"], "msg_")
+        {
+            let text = value["message"]["id"].as_str().unwrap();
+            mask.0.push(("/message/id".into(), 0..text.len()));
+        }
+        if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) {
+            for (index, block) in blocks.iter().enumerate() {
+                let field = match (value["type"].as_str(), block["type"].as_str()) {
+                    (Some("assistant"), Some("tool_use"))
+                        if block["name"].as_str().is_some_and(|name| !name.is_empty())
+                            && block["input"].is_object() =>
+                    {
+                        "id"
+                    }
+                    (Some("user"), Some("tool_result"))
+                        if block["content"].is_string() || block["content"].is_array() =>
+                    {
+                        "tool_use_id"
+                    }
+                    _ => continue,
+                };
+                if native_id(&block[field], "toolu_") {
+                    let text = block[field].as_str().unwrap();
+                    mask.0
+                        .push((format!("/message/content/{index}/{field}"), 0..text.len()));
+                }
+            }
+        }
+    }
+    mask.0.sort_by(|a, b| a.0.cmp(&b.0));
+    mask
 }
 
 #[cfg(test)]

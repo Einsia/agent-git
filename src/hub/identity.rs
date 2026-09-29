@@ -251,6 +251,27 @@ pub fn verify_slug(
     Ok(remote)
 }
 
+/// A repository mode read retains a checkout's identity even outside supervised execution.
+pub fn repository_mode(
+    repo: &Repo,
+    client: &super::Client,
+    owner: &str,
+    name: &str,
+) -> crate::Result<(RemoteIdentity, bool)> {
+    let remote = if read(repo)?.is_some() {
+        verify_slug(repo, client, owner, name)?
+    } else {
+        client.get_agent(owner, name)?
+    };
+    anyhow::ensure!(
+        remote.owner == owner && remote.name == name,
+        "the Hub returned another repository for its encryption mode"
+    );
+    let identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
+    verify_transport_target(repo, &identity)?;
+    Ok((identity, remote.require_encryption_enabled()?))
+}
+
 fn write(repo: &Repo, identity: &RemoteIdentity) -> crate::Result<()> {
     let value = serde_json::to_string(identity)?;
     // One key carries the whole pair; git itself replaces the config file atomically through

@@ -50,7 +50,7 @@ pub mod rc;
 pub mod worktree;
 
 // Recording
-mod auto_push;
+pub(crate) mod auto_push;
 pub mod commit;
 pub mod file;
 pub mod memory;
@@ -79,6 +79,7 @@ pub mod push;
 
 // Discovery and sharing
 pub mod pr;
+pub mod privacy;
 pub mod search;
 pub mod share;
 
@@ -231,6 +232,8 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         ExitCode::Usage
     } else if error.is::<RemoteRequest>() {
         ExitCode::Network
+    } else if error.is::<push::FirstPublicationRefusal>() {
+        ExitCode::Precondition
     } else if error.is::<InteractionRequired>() {
         ExitCode::Interactive
     } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {
@@ -1455,6 +1458,8 @@ pub enum Commands {
     Search(Box<search::Args>),
     /// Create a read-only link to a conversation
     Share(share::Args),
+    /// Configure and preview the device-local privacy allowlist
+    Privacy(privacy::Args),
     /// Pull requests: create / list / show / fetch / merge
     Pr(pr::Args),
 
@@ -1518,6 +1523,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Pull(_) => "pull",
         Commands::Search(_) => "search",
         Commands::Share(_) => "share",
+        Commands::Privacy(_) => "privacy",
         Commands::Pr(_) => "pr",
         Commands::Export(_) => "export",
         Commands::Scan(_) => "scan",

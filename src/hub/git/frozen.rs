@@ -24,6 +24,8 @@ mod captured;
 mod http;
 #[path = "frozen_lfs_cache.rs"]
 mod lfs_cache;
+#[path = "frozen_lfs_download.rs"]
+mod lfs_download;
 pub use captured::CapturedPublication;
 #[path = "prepared_publication.rs"]
 mod prepared;
@@ -55,6 +57,47 @@ pub struct FrozenPublication {
 }
 
 impl FrozenPublication {
+    /// Query a destination with the selected repository identity without capturing or pushing
+    /// the public objects. Probes share publication's isolated routing and authentication.
+    /// An unavailable or malformed advertisement remains unknown.
+    pub fn advertised_refs_for(
+        repo: &Repo,
+        canonical_url: &str,
+        identity: &RemoteIdentity,
+    ) -> Option<RemoteRefs> {
+        let source = Source::new(repo).ok()?;
+        let (url, client) = Self::destination(&source, canonical_url, identity).ok()?;
+        let directory = captured::private_git_directory("sha1").ok()?;
+        let transport = Self::prepare_transport(
+            &source,
+            directory.path(),
+            &url,
+            identity,
+            Some(client),
+            "http:https",
+        )
+        .ok()?;
+        let args = super::remote_ref_args(&url, true);
+        let output = super::capture_transport(directory.path(), &args, Some(&transport))?;
+        super::parse_remote_refs(&output)
+    }
+
+    /// A true result means every generated public branch and tag has the exact advertised OID.
+    /// Extra remote refs do not affect the selected publication and are left untouched.
+    pub fn advertised_refs_match(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        canonical_url: &str,
+        identity: &RemoteIdentity,
+    ) -> Option<bool> {
+        let refs = Self::advertised_refs_for(repo, canonical_url, identity)?;
+        Some(plan.heads().iter().chain(plan.tags()).all(|reference| {
+            refs.refs
+                .get(reference.name())
+                .is_some_and(|oid| oid == reference.oid())
+        }))
+    }
+
     /// The URL must be the canonical clone URL selected alongside the immutable remote identity.
     /// Named remotes are deliberately absent because they can select multiple push destinations.
     /// Supported HTTP preferences are captured once; unsupported HTTP preferences fail explicitly.
@@ -150,7 +193,6 @@ impl FrozenPublication {
             plan,
             lfs_inventory,
         } = content;
-        let mut preferences = source.http_preferences(&url)?;
         let lfs_url = format!("{}/info/lfs", url.trim_end_matches('/'));
         let batch_url = format!("{lfs_url}/objects/batch");
         let lfs_preferences = source
@@ -161,44 +203,14 @@ impl FrozenPublication {
             .map_err(|error| *error)
             .and_then(|values| http::prepare(&batch_url, values, &source.environment))
             .map(|agent| (lfs_url, agent));
-        insert_execution_constraints(&mut preferences, directory.path())?;
-        let parameters = parameters(&preferences);
-        validate_prepared_parameters(&parameters)?;
-        let mut environment = source.process_environment();
-        for name in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-            ensure!(
-                !source.environment.contains_key(OsStr::new(name)),
-                "frozen publication cannot preserve backend-specific {name}; configure Git http.sslCAInfo or http.sslCAPath explicitly"
-            );
-        }
-        for (key, value) in [
-            ("HOME", directory.path().join("home").into_os_string()),
-            (
-                "USERPROFILE",
-                directory.path().join("home").into_os_string(),
-            ),
-            (
-                "XDG_CONFIG_HOME",
-                directory.path().join("home").into_os_string(),
-            ),
-            ("GIT_DIR", directory.path().as_os_str().to_owned()),
-            ("GIT_CONFIG_NOSYSTEM", "1".into()),
-            (
-                "GIT_CONFIG_SYSTEM",
-                directory.path().join("empty-config").into_os_string(),
-            ),
-            (
-                "GIT_CONFIG_GLOBAL",
-                directory.path().join("empty-config").into_os_string(),
-            ),
-            ("GIT_ALLOW_PROTOCOL", protocols.into()),
-            ("GIT_NO_LAZY_FETCH", "1".into()),
-            ("GIT_OPTIONAL_LOCKS", "0".into()),
-            ("GIT_ATTR_NOSYSTEM", "1".into()),
-            ("GIT_TERMINAL_PROMPT", "0".into()),
-        ] {
-            environment.insert(key.into(), value);
-        }
+        let transport = Self::prepare_transport(
+            &source,
+            directory.path(),
+            &url,
+            &identity,
+            client,
+            protocols,
+        )?;
         ensure!(
             !plan.heads().is_empty(),
             "frozen publication has no branch roots"
@@ -206,23 +218,6 @@ impl FrozenPublication {
         let oid_length = if format == "sha256" { 64 } else { 40 };
         let heads = batches(plan.heads(), &url, oid_length)?;
         let tags = batches(plan.tags(), &url, oid_length)?;
-        let urls = client
-            .as_ref()
-            .map(|_| vec![url.clone()])
-            .unwrap_or_default();
-        let transport = TransportIdentity {
-            client,
-            urls,
-            agent_id: Some(identity.agent_id.clone()),
-            accept_secret_findings: false,
-            lfs: None,
-            execution: Some(Execution {
-                root: directory.path().to_owned(),
-                environment,
-                parameters,
-            }),
-        };
-        transport.environment()?;
         Ok(Self {
             transport,
             directory,
@@ -237,6 +232,67 @@ impl FrozenPublication {
             heads,
             tags,
         })
+    }
+
+    fn prepare_transport(
+        source: &Source,
+        directory: &Path,
+        url: &str,
+        identity: &RemoteIdentity,
+        client: Option<crate::hub::Client>,
+        protocols: &str,
+    ) -> Result<TransportIdentity> {
+        let mut preferences = source.http_preferences(url)?;
+        insert_execution_constraints(&mut preferences, directory)?;
+        let parameters = parameters(&preferences);
+        validate_prepared_parameters(&parameters)?;
+        let mut environment = source.process_environment();
+        for name in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            ensure!(
+                !source.environment.contains_key(OsStr::new(name)),
+                "frozen publication cannot preserve backend-specific {name}; configure Git http.sslCAInfo or http.sslCAPath explicitly"
+            );
+        }
+        for (key, value) in [
+            ("HOME", directory.join("home").into_os_string()),
+            ("USERPROFILE", directory.join("home").into_os_string()),
+            ("XDG_CONFIG_HOME", directory.join("home").into_os_string()),
+            ("GIT_DIR", directory.as_os_str().to_owned()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            (
+                "GIT_CONFIG_SYSTEM",
+                directory.join("empty-config").into_os_string(),
+            ),
+            (
+                "GIT_CONFIG_GLOBAL",
+                directory.join("empty-config").into_os_string(),
+            ),
+            ("GIT_ALLOW_PROTOCOL", protocols.into()),
+            ("GIT_NO_LAZY_FETCH", "1".into()),
+            ("GIT_OPTIONAL_LOCKS", "0".into()),
+            ("GIT_ATTR_NOSYSTEM", "1".into()),
+            ("GIT_TERMINAL_PROMPT", "0".into()),
+        ] {
+            environment.insert(key.into(), value);
+        }
+        let urls = client
+            .as_ref()
+            .map(|_| vec![url.to_owned()])
+            .unwrap_or_default();
+        let transport = TransportIdentity {
+            client,
+            urls,
+            agent_id: Some(identity.agent_id.clone()),
+            accept_secret_findings: false,
+            lfs: None,
+            execution: Some(Execution {
+                root: directory.to_owned(),
+                environment,
+                parameters,
+            }),
+        };
+        transport.environment()?;
+        Ok(transport)
     }
 
     pub fn url(&self) -> &str {
@@ -280,9 +336,120 @@ impl FrozenPublication {
     /// Every attempt retains its observations, including effects preceding a failed retry.
     /// Tags are attempted only after all branch batches are affirmatively acknowledged.
     pub(super) fn push_refs(&self) -> (PublicationPhase, Option<PublicationPhase>) {
-        let heads = self.push_phase(&self.heads);
-        let tags = heads.ok().then(|| self.push_phase(&self.tags));
+        self.push_refs_confirmed(None)
+    }
+
+    pub(super) fn privacy_policy(
+        &self,
+        policy_digest: &str,
+        recipient: &str,
+        visibility: &str,
+        content_policy_digest: &str,
+    ) -> Result<crate::hub::privacy::publication::PublicationPolicy> {
+        ensure!(
+            self.lfs_inventory.is_empty(),
+            "session publication cannot carry LFS payloads"
+        );
+        self.verify_privacy_ref_updates()?;
+        let client = self
+            .transport
+            .client
+            .as_ref()
+            .context("publication needs a Hub account")?;
+        let repository = self
+            .url
+            .strip_prefix(&format!("{}/", self.identity.hub))
+            .and_then(|url| url.strip_suffix(".git"))
+            .context("publication destination is not a repository URL")?;
+        crate::hub::privacy::publication::PublicationPolicy::register(
+            client,
+            repository,
+            &self.identity.agent_id,
+            policy_digest,
+            recipient,
+            visibility,
+            content_policy_digest,
+        )
+    }
+
+    pub(super) fn push_refs_confirmed(
+        &self,
+        policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
+    ) -> (PublicationPhase, Option<PublicationPhase>) {
+        let heads = self.push_phase(&self.heads, policy);
+        let tags = heads.ok().then(|| self.push_phase(&self.tags, policy));
         (heads, tags)
+    }
+
+    fn receive_receipt(
+        &self,
+        policy: &crate::hub::privacy::publication::PublicationPolicy,
+        batch: &[FrozenRef],
+    ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
+        let before = self.privacy_remote_refs()?;
+        let mut after = before.clone();
+        for reference in batch {
+            after.insert(reference.name().into(), reference.oid().into());
+        }
+        policy.confirm(
+            self.transport
+                .client
+                .as_ref()
+                .context("publication needs a Hub account")?,
+            &before,
+            &after,
+        )
+    }
+
+    fn privacy_remote_refs(&self) -> Result<BTreeMap<String, String>> {
+        let output = super::capture_transport(
+            self.directory.path(),
+            &["ls-remote", "--refs", "--", &self.url],
+            Some(&self.transport),
+        )
+        .context("cannot read the complete publication destination refs")?;
+        crate::hub::privacy::publication::parse_refs(&output)
+    }
+
+    /// Divergent projections cannot replace the server strategy before an explicit migration.
+    fn verify_privacy_ref_updates(&self) -> Result<()> {
+        let before = self.privacy_remote_refs()?;
+        for reference in self.plan.heads() {
+            let Some(previous) = before.get(reference.name()) else {
+                continue;
+            };
+            if previous == reference.oid() {
+                continue;
+            }
+            let mut command = self
+                .transport
+                .execution
+                .as_ref()
+                .context("privacy publication has no captured Git context")?
+                .command();
+            command.env("GIT_ALLOW_PROTOCOL", "").args([
+                "merge-base",
+                "--is-ancestor",
+                previous,
+                reference.oid(),
+            ]);
+            let output = bounded_inspection_output(command, CONFIG_LIMIT)?;
+            ensure!(
+                output.status.success() && output.stderr.is_empty(),
+                "privacy publication cannot fast-forward {}; choose a new branch or destination, or explicitly migrate the published history",
+                reference.name()
+            );
+        }
+        for reference in self.plan.tags() {
+            ensure!(
+                before
+                    .get(reference.name())
+                    .is_none_or(|previous| previous == reference.oid()),
+                "privacy publication would replace published tag {}; explicit migration is required",
+                reference.name()
+            );
+        }
+        Ok(())
     }
 
     fn lfs_execution(&self, storage: &Path) -> Result<Execution> {
@@ -319,9 +486,24 @@ impl FrozenPublication {
         })
     }
 
-    fn push_phase(&self, batches: &[Vec<FrozenRef>]) -> PublicationPhase {
+    fn push_phase(
+        &self,
+        batches: &[Vec<FrozenRef>],
+        policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
+    ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         for (index, batch) in batches.iter().enumerate() {
+            let receipt = match policy
+                .map(|policy| self.receive_receipt(policy, batch))
+                .transpose()
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    phase.error = Some(format!("{error:#}"));
+                    phase.unattempted = batches[index..].iter().flatten().cloned().collect();
+                    break;
+                }
+            };
             let specs: Vec<_> = batch.iter().map(FrozenRef::refspec).collect();
             let mut args = vec![
                 "push",
@@ -332,8 +514,17 @@ impl FrozenPublication {
                 &self.url,
             ];
             args.extend(specs.iter().map(String::as_str));
-            let run =
-                super::execute_transport(None, &args, &self.transport, super::OutputMode::Captured);
+            if receipt.is_some() {
+                args.insert(1, "--atomic");
+            }
+            let run = super::execute_transport_receipt(
+                None,
+                &args,
+                &self.transport,
+                super::OutputMode::Captured,
+                None,
+                receipt.as_ref(),
+            );
             let attempted = !run.attempts.is_empty();
             phase.attempts.extend(
                 run.attempts

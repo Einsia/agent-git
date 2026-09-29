@@ -134,9 +134,9 @@ fn draw(frame: &mut Frame, target: &str, draft: &Draft, state: &mut ListState) {
     );
     if let Some(detail) = panes.detail {
         let visibility = if draft.public {
-            "Public: anyone with the link can read it. The service stores the readable conversation."
+            "Public: anyone with the link can read the sanitized session. Original records are not included."
         } else {
-            "Encrypted link: anyone with the complete link can read it. The service cannot decrypt the conversation."
+            "Encrypted link: anyone with the complete link can read the sanitized session. Original records require the source publication's repository password. Encrypted sharing needs an accepted saved publication."
         };
         frame.render_widget(Paragraph::new(format!(
             "{target}\n\n{visibility}\n\nThe link expires after {}.\n\nA passphrase, if enabled, is entered after this screen.\n\nContinue to review and confirm the share.", EXPIRIES[draft.expiry]

@@ -43,27 +43,7 @@ impl GitContent {
         } else {
             crate::domain::lfs::history::for_publication(&repo, plan)?
         };
-        let directory = tempfile::tempdir().context("cannot create frozen Git context")?;
-        for path in [
-            "objects/info",
-            "objects/pack",
-            "refs/heads",
-            "hooks",
-            "home",
-        ] {
-            std::fs::create_dir_all(directory.path().join(path))?;
-        }
-        std::fs::write(directory.path().join("empty-config"), b"")?;
-        std::fs::write(
-            directory.path().join("HEAD"),
-            b"ref: refs/heads/agit-frozen\n",
-        )?;
-        let config = if format == "sha256" {
-            "[core]\nrepositoryformatversion = 1\nbare = true\n[extensions]\nobjectformat = sha256\n"
-        } else {
-            "[core]\nrepositoryformatversion = 0\nbare = true\n"
-        };
-        std::fs::write(directory.path().join("config"), config)?;
+        let directory = private_git_directory(&format)?;
         write_alternate(directory.path(), &objects)?;
         Ok(Self {
             directory,
@@ -123,6 +103,31 @@ impl GitContent {
     }
 }
 
+pub(super) fn private_git_directory(format: &str) -> Result<tempfile::TempDir> {
+    let directory = tempfile::tempdir().context("cannot create frozen Git context")?;
+    for path in [
+        "objects/info",
+        "objects/pack",
+        "refs/heads",
+        "hooks",
+        "home",
+    ] {
+        std::fs::create_dir_all(directory.path().join(path))?;
+    }
+    std::fs::write(directory.path().join("empty-config"), b"")?;
+    std::fs::write(
+        directory.path().join("HEAD"),
+        b"ref: refs/heads/agit-frozen\n",
+    )?;
+    let config = if format == "sha256" {
+        "[core]\nrepositoryformatversion = 1\nbare = true\n[extensions]\nobjectformat = sha256\n"
+    } else {
+        "[core]\nrepositoryformatversion = 0\nbare = true\n"
+    };
+    std::fs::write(directory.path().join("config"), config)?;
+    Ok(directory)
+}
+
 fn write_alternate(directory: &Path, objects: &Path) -> Result<()> {
     let objects = path_text(objects)?;
     let alternate = format!(
@@ -143,9 +148,62 @@ pub struct CapturedPublication {
 }
 
 impl CapturedPublication {
+    /// Source allowances cannot authorize disclosure to a separately selected repository.
+    pub fn with_copy_policy(
+        mut self,
+        policy_repo: &Repo,
+        identities: std::collections::HashSet<String>,
+    ) -> Result<Self> {
+        self.git.inspection_policy = self.git.inspection_policy.and_then(|policy| {
+            policy
+                .for_copy(
+                    &policy_repo
+                        .common_dir()
+                        .map_err(|_| InspectionFailure::LocalState)?,
+                    identities,
+                )
+                .map_err(|_| InspectionFailure::LocalState)
+        });
+        Ok(self)
+    }
+
+    /// Projected objects retain the source repository's registered-secret inspection policy.
+    pub fn capture_projected(
+        projected: &crate::domain::privacy_git::ProjectedHistory,
+        byte_budget: u64,
+        policy_repo: &Repo,
+    ) -> Result<Self> {
+        let mut captured = Self::capture(projected.repo(), projected.plan(), byte_budget)?;
+        captured.git.inspection_policy =
+            CapturedPolicy::capture(&policy_repo.common_dir()?).map(|mut policy| {
+                policy.privacy_views = projected.inspection_views().clone();
+                policy
+            });
+        Ok(captured)
+    }
+
     /// Capture full selected history and stage every LFS pointer before contacting a destination.
     /// A remote-present payload needs the same verified local bytes as an absent payload.
     pub fn capture(repo: &Repo, plan: &PublicationPlan, byte_budget: u64) -> Result<Self> {
+        Self::capture_inner(repo, plan, byte_budget, false)
+    }
+
+    /// Missing historical payloads are read from the pinned source into private inspection storage.
+    /// Remote presence never substitutes for verified bytes or authorizes a new destination.
+    pub fn capture_with_lfs_recovery(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        byte_budget: u64,
+    ) -> Result<Self> {
+        Self::capture_inner(repo, plan, byte_budget, true)
+    }
+
+    fn capture_inner(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        byte_budget: u64,
+        recover_missing: bool,
+    ) -> Result<Self> {
         let source = Source::new(repo)?;
         let git = GitContent::capture(&source, plan)?;
         git.write_refs()?;
@@ -164,9 +222,41 @@ impl CapturedPublication {
                 .prefix("audit-lfs-")
                 .tempdir_in(git.directory.path())
                 .context("cannot create private audit payload storage")?;
+            let mut recovery = None;
+            let mut recovery_error = None;
+            let staged = StagedLfsPayloads::stage_with_recovery(
+                objects,
+                &git.lfs_inventory,
+                byte_budget,
+                directory,
+                |pointer| {
+                    use crate::hub::git::LfsStagingFailure;
+                    if !recover_missing {
+                        return Err(LfsStagingFailure::Source);
+                    }
+                    let result = (|| {
+                        if recovery.is_none() {
+                            let identity = crate::hub::identity::read(repo)?
+                                .context("missing LFS content has no pinned source repository; restore the original payload before pushing")?;
+                            let url = repo.remote_url()
+                                .context("missing LFS content has no source remote; restore the original payload before pushing")?;
+                            recovery =
+                                Some(FrozenPublication::prepare(repo, plan, &url, &identity)?);
+                        }
+                        recovery.as_ref().expect("recovery source is prepared")
+                            .download_lfs_payload(pointer)
+                            .with_context(|| format!("cannot recover historical LFS object {} from the pinned source; restore the payload or retry when the source is available", pointer.oid))
+                    })();
+                    result.map_err(|error| {
+                        recovery_error = Some(error);
+                        LfsStagingFailure::Source
+                    })
+                },
+            );
             Some(
-                StagedLfsPayloads::stage(objects, &git.lfs_inventory, byte_budget, directory)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?,
+                staged.map_err(|error| {
+                    recovery_error.unwrap_or_else(|| anyhow::anyhow!("{error}"))
+                })?,
             )
         };
         Ok(Self {
@@ -214,20 +304,7 @@ impl CapturedPublication {
     /// Call before any destination creation or promotion and again after a source relocation.
     /// This observation does not lock refs; publication still uses captured literal object IDs.
     pub fn verify_source(&self, repo: &Repo) -> Result<()> {
-        let heads = self.plan().heads();
-        // The plan adds main independently of the explicitly selected session branches.
-        let branches = heads
-            .iter()
-            .filter(|reference| heads.len() == 1 || reference.name() != "refs/heads/main")
-            .map(|reference| {
-                reference
-                    .name()
-                    .strip_prefix("refs/heads/")
-                    .map(str::to_owned)
-                    .context("captured branch name is invalid")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.plan().verify(repo, &branches)
+        self.plan().verify_captured(repo)
     }
 
     pub(super) fn refresh_policy(mut self, repo: &Repo) -> Result<Self> {

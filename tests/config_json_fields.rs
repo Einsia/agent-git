@@ -54,6 +54,33 @@ fn config_json_distinguishes_persisted_values_from_effective_defaults() {
 }
 
 #[test]
+fn encryption_creation_default_is_typed_and_independent_of_automatic_uploads() {
+    let root = tempfile::tempdir().unwrap();
+    let read = || run(root.path(), &["privacy.encryption"], &[])["setting"].clone();
+    assert_eq!(read()["effective"], true);
+    assert_eq!(read()["source"], "default");
+    assert_eq!(read()["scope"], "creation_default");
+    assert!(read()["stored"].is_null());
+    assert!(!root.path().join("agit/config.json").exists());
+
+    let changed = run(root.path(), &["privacy.encryption", "false"], &[]);
+    assert_eq!(changed["setting"]["effective"], false);
+    assert_eq!(changed["setting"]["stored"], false);
+    assert_eq!(changed["setting"]["source"], "stored");
+    assert_eq!(read(), changed["setting"]);
+    let listed = run(root.path(), &["--list"], &[]);
+    assert!(listed["settings"].as_array().unwrap().contains(&read()));
+    assert_eq!(
+        run(root.path(), &["push.auto"], &[])["setting"]["effective"],
+        "false"
+    );
+
+    let unset = run(root.path(), &["--unset", "privacy.encryption"], &[]);
+    assert_eq!(unset["setting"]["effective"], true);
+    assert!(unset["setting"]["stored"].is_null());
+}
+
+#[test]
 fn overridden_settings_report_both_the_saved_request_and_active_environment() {
     let root = tempfile::tempdir().unwrap();
     let value = run(

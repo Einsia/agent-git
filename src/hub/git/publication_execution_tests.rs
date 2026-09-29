@@ -80,11 +80,15 @@ fn native_lfs_object(
         request.header("Host").unwrap(),
         pointer.oid
     );
+    let headers = serde_json::json!({
+        "Authorization":request.header("Authorization").unwrap(),
+        "X-AgentGit-Expected-Agent-Id":AGENT_ID,
+    });
     serde_json::json!({
         "oid": pointer.oid,
         "size": pointer.size,
         "authenticated": true,
-        "actions": {"upload": {"href": url}, "verify": {"href": format!("{url}/verify")}}
+        "actions": {"upload": {"href": url,"header":headers}, "verify": {"href": format!("{url}/verify"),"header":headers}}
     })
 }
 
@@ -184,7 +188,7 @@ fn native_publication_consumes_owned_bytes_and_retains_refresh_into_refs() {
         );
         assert_eq!(
             request.header("X-AgentGit-Accept-Secret-Findings"),
-            Some("true")
+            None
         );
         if request.method == "PUT" {
             assert_eq!(request.body, payload);

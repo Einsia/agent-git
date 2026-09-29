@@ -755,6 +755,8 @@ pub struct Plan {
     pub identity: RemoteIdentity,
     /// `upstream`: the source. Only a copy has one — a read-only checkout's origin is the source.
     pub upstream: Option<String>,
+    /// The source identity fenced by the copy request, independently of the destination.
+    pub upstream_identity: Option<RemoteIdentity>,
     /// Whether this one can be pushed. A read-only checkout cannot.
     pub writable: bool,
     /// This run only promotes an existing read-only checkout to yours; no new content is fetched.
@@ -788,6 +790,29 @@ impl Plan {
         repo.set_remote(&self.origin)?;
         if let Some(u) = &self.upstream {
             repo.set_upstream(u)?;
+            let source = self
+                .upstream_identity
+                .as_ref()
+                .context("copy source identity is missing")?;
+            preserve_source_tracking(repo, false)?;
+            let result = crate::hub::git::run_for_remote(
+                repo,
+                &[
+                    "fetch",
+                    "--atomic",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--no-recurse-submodules",
+                    u,
+                    "+refs/heads/*:refs/remotes/upstream/*",
+                ],
+                source,
+            );
+            if !matches!(result, Ok(ref result) if result.ok()) {
+                ui::warning(
+                    "source publication evidence is unavailable; source reuse will not be reported",
+                );
+            }
         }
         Ok(())
     }
@@ -878,6 +903,7 @@ fn plan(
             origin: remote.clone_url,
             identity,
             upstream: None,
+            upstream_identity: None,
             writable: true,
             promoted_in_place: false,
         }));
@@ -900,6 +926,7 @@ fn plan(
             origin: source.clone_url,
             identity: source_identity,
             upstream: None,
+            upstream_identity: None,
             writable,
             promoted_in_place: false,
         }));
@@ -942,6 +969,7 @@ fn plan(
         origin: resp.push_url,
         identity: copy_identity,
         upstream: Some(source.clone_url),
+        upstream_identity: Some(source_identity),
         writable: true,
         promoted_in_place: false,
     }))
@@ -1071,6 +1099,7 @@ fn promote_with_progress(
         origin: resp.push_url,
         identity: copy_identity,
         upstream: Some(source.clone_url.clone()),
+        upstream_identity: Some(source_identity),
         writable: true,
         promoted_in_place: true,
     })
@@ -1114,6 +1143,7 @@ pub(crate) fn promote_to_prepared_destination(
         origin: destination.clone_url.clone(),
         identity: copy_identity,
         upstream: Some(source.clone_url.clone()),
+        upstream_identity: Some(source_identity),
         writable: true,
         promoted_in_place: true,
     })
@@ -1167,6 +1197,10 @@ fn relocate_promoted_checkout(
             repository_id: source_identity.agent_id.clone(),
         },
     )?;
+    preserve_source_tracking(
+        repo,
+        repo.remote_is(crate::domain::repo::ORIGIN, &source.clone_url),
+    )?;
     identity::rebind(repo, source_identity, copy_identity)?;
     repo.set_remote(push_url)?;
     repo.set_upstream(&source.clone_url)?;
@@ -1180,6 +1214,51 @@ fn relocate_promoted_checkout(
     }
     rename_links(&source.owner, &source.name, owner, name)?;
 
+    Ok(())
+}
+
+/// A copy retains only the source's exchanged refs as publication evidence. Local branch
+/// heads may contain unpublished turns and cannot establish source reuse.
+fn preserve_source_tracking(repo: &Repo, origin_is_source: bool) -> crate::Result<()> {
+    use std::io::{Seek, Write};
+    let refs = if origin_is_source {
+        repo.git(&[
+            "for-each-ref",
+            "--format=%(objectname) %(refname) %(symref)",
+            "refs/remotes/origin/",
+        ])?
+    } else {
+        String::new()
+    };
+    let mut retained = std::collections::BTreeMap::new();
+    for line in refs.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if let [oid, name] = fields.as_slice() {
+            let branch = name
+                .strip_prefix("refs/remotes/origin/")
+                .context("unexpected source tracking ref")?;
+            retained.insert(format!("refs/remotes/upstream/{branch}"), *oid);
+        }
+    }
+    let previous = repo.git(&[
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/remotes/upstream/",
+    ])?;
+    let mut input = tempfile::tempfile()?;
+    writeln!(input, "start")?;
+    for name in previous.lines() {
+        if !retained.contains_key(name) {
+            writeln!(input, "delete {name}")?;
+        }
+    }
+    for (name, oid) in retained {
+        writeln!(input, "update {name} {oid}")?;
+    }
+    writeln!(input, "prepare")?;
+    writeln!(input, "commit")?;
+    input.rewind()?;
+    repo.git_with_stdin_file(&["update-ref", "--no-deref", "--stdin"], input)?;
     Ok(())
 }
 
@@ -1481,6 +1560,210 @@ fn choose_for_recording(name: &str, found: &[Checkout]) -> crate::Result<Option<
 
 #[cfg(test)]
 mod tests {
+    /// Real clone refs must survive both copy setup and local promotion, without treating
+    /// unpublished local descendants as evidence for a source reuse notification.
+    #[test]
+    fn copied_history_retains_source_reuse_evidence() {
+        const CHILD: &str = "AGIT_COPY_EVIDENCE_FIXTURE";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::clone::tests::copied_history_retains_source_reuse_evidence",
+                    "--nocapture",
+                ])
+                .env(CHILD, root.path())
+                .env("AGIT_HOME", root.path().join("agit"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", root.path().join("empty-config"))
+                .env("GIT_AUTHOR_NAME", "Copy evidence fixture")
+                .env("GIT_AUTHOR_EMAIL", "copy@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Copy evidence fixture")
+                .env("GIT_COMMITTER_EMAIL", "copy@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let seed = crate::domain::repo::Repo::init(&root.join("seed")).unwrap();
+        seed.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        seed.git(&["checkout", "-b", "work"]).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        crate::domain::meta::write(
+            seed.root(),
+            &crate::domain::meta::Meta::new(session.clone(), "claude-code".into(), String::new()),
+        )
+        .unwrap();
+        seed.add_all().unwrap();
+        seed.commit("Published source session").unwrap();
+        let published = seed.git(&["rev-parse", "HEAD"]).unwrap();
+        let copy_path = root.join("remote-copy");
+        seed.git(&[
+            "clone",
+            seed.root().to_str().unwrap(),
+            copy_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let copy = crate::domain::repo::Repo::at(copy_path);
+        copy.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let copy_session = format!("agit-{}", "b".repeat(40));
+        crate::domain::meta::write(
+            copy.root(),
+            &crate::domain::meta::Meta::new(copy_session, "claude-code".into(), String::new()),
+        )
+        .unwrap();
+        copy.add_all().unwrap();
+        copy.commit("Published only in the independent copy")
+            .unwrap();
+        let copy_only = copy.git(&["rev-parse", "HEAD"]).unwrap();
+        let hub = "https://hub.example.test";
+        let source: crate::hub::RemoteAgent = serde_json::from_value(serde_json::json!({
+            "agent_id": "00000000-0000-0000-0000-000000000001",
+            "owner": "alice", "name": "notes",
+            "clone_url": format!("{hub}/alice/notes.git")
+        }))
+        .unwrap();
+        let destination: crate::hub::RemoteAgent = serde_json::from_value(serde_json::json!({
+            "agent_id": "00000000-0000-0000-0000-000000000002",
+            "owner": "bob", "name": "notes",
+            "clone_url": format!("{hub}/bob/notes.git")
+        }))
+        .unwrap();
+        for promote in [false, true] {
+            let path = if promote {
+                crate::infra::config::repo_dir("alice", "notes").unwrap()
+            } else {
+                root.join("fresh")
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            seed.git(&[
+                "clone",
+                if promote { seed.root() } else { copy.root() }
+                    .to_str()
+                    .unwrap(),
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            let repo = crate::domain::repo::Repo::at(&path);
+            assert!(!repo.has_ref("refs/remotes/upstream/work"));
+            repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+            std::fs::write(path.join("local.txt"), "Unpublished local work").unwrap();
+            repo.add_all().unwrap();
+            repo.commit("Local-only descendant").unwrap();
+            let local = repo.git(&["rev-parse", "HEAD"]).unwrap();
+            repo.git(&["update-ref", "refs/remotes/upstream/stale", &local])
+                .unwrap();
+            let repo = if promote {
+                repo.set_remote(&source.clone_url).unwrap();
+                identity::pin(&repo, &RemoteIdentity::new(hub, &source.agent_id).unwrap()).unwrap();
+                super::promote_to_prepared_destination(&path, &source, &destination, hub).unwrap();
+                crate::domain::repo::Repo::at(
+                    crate::infra::config::repo_dir("bob", "notes").unwrap(),
+                )
+            } else {
+                repo.git(&[
+                    "config",
+                    &format!("url.{}.insteadOf", seed.root().display()),
+                    &source.clone_url,
+                ])
+                .unwrap();
+                Plan {
+                    owner: destination.owner.clone(),
+                    name: destination.name.clone(),
+                    origin: destination.clone_url.clone(),
+                    identity: RemoteIdentity::new(hub, &destination.agent_id).unwrap(),
+                    upstream: Some(source.clone_url.clone()),
+                    upstream_identity: Some(RemoteIdentity::new(hub, &source.agent_id).unwrap()),
+                    writable: true,
+                    promoted_in_place: false,
+                }
+                .apply_remotes(&repo, false, None)
+                .unwrap();
+                repo.git(&[
+                    "config",
+                    "--unset",
+                    &format!("url.{}.insteadOf", seed.root().display()),
+                ])
+                .unwrap();
+                assert_eq!(
+                    repo.git(&["rev-parse", "refs/remotes/origin/work"])
+                        .unwrap(),
+                    copy_only
+                );
+                repo
+            };
+            let receipt = |point| {
+                crate::commands::run::reuse_receipt(
+                    &repo,
+                    hub,
+                    ("bob", "notes"),
+                    Some(("alice", "notes")),
+                    point,
+                    crate::hub::reuse::ReuseMode::Fork,
+                )
+            };
+            assert_eq!(
+                receipt(&published),
+                crate::hub::reuse::SessionReuse::new(
+                    "alice",
+                    "notes",
+                    &session,
+                    &published,
+                    crate::hub::reuse::ReuseMode::Fork,
+                )
+            );
+            assert_eq!(
+                receipt(&local),
+                None,
+                "local work cannot authorize source reuse"
+            );
+            if !promote {
+                assert_eq!(
+                    receipt(&copy_only),
+                    None,
+                    "copy-only sessions do not belong to the source"
+                );
+            }
+            assert!(!repo.has_ref("refs/remotes/upstream/stale"));
+            assert_eq!(
+                repo.git(&["rev-parse", "refs/remotes/upstream/work"])
+                    .unwrap(),
+                published
+            );
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), local);
+            if !promote {
+                let unavailable =
+                    format!("url.{}.insteadOf", root.join("missing-source").display());
+                repo.git(&["config", &unavailable, &source.clone_url])
+                    .unwrap();
+                Plan {
+                    owner: destination.owner.clone(),
+                    name: destination.name.clone(),
+                    origin: destination.clone_url.clone(),
+                    identity: RemoteIdentity::new(hub, &destination.agent_id).unwrap(),
+                    upstream: Some(source.clone_url.clone()),
+                    upstream_identity: Some(RemoteIdentity::new(hub, &source.agent_id).unwrap()),
+                    writable: true,
+                    promoted_in_place: false,
+                }
+                .apply_remotes(&repo, true, None)
+                .unwrap();
+                repo.git(&["config", "--unset", &unavailable]).unwrap();
+                assert!(!repo.has_ref("refs/remotes/upstream/work"));
+                assert_eq!(receipt(&published), None);
+                assert_eq!(receipt(&copy_only), None);
+                assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), local);
+                assert_eq!(
+                    repo.git(&["rev-parse", "refs/remotes/origin/work"])
+                        .unwrap(),
+                    copy_only
+                );
+            }
+        }
+    }
+
     #[test]
     fn pickup_network_diagnostics_do_not_infer_auth_from_paths_or_ports() {
         for detail in [
@@ -1688,6 +1971,7 @@ mod tests {
             origin: "https://hub.test/me/photo.git".into(),
             identity: current.clone(),
             upstream: None,
+            upstream_identity: None,
             writable: true,
             promoted_in_place: false,
         };
@@ -1743,6 +2027,7 @@ mod tests {
             )
             .unwrap(),
             upstream: None,
+            upstream_identity: None,
             writable: true,
             promoted_in_place: false,
         };
@@ -1759,6 +2044,7 @@ mod tests {
         let source = RemoteIdentity::new(hub, "00000000-0000-0000-0000-000000000001").unwrap();
         let response = |forked_from: Option<&str>, agent_id: &str| crate::hub::PublishResponse {
             agent_id: agent_id.into(),
+            encryption_enabled: Some(true),
             forked_from: forked_from.map(str::to_string),
             owner: "me".into(),
             name: "photo".into(),
@@ -2146,6 +2432,30 @@ mod tests {
                 user_bytes
             );
         }
+
+        let unborn = Repo::init(&tmp.path().join("unborn")).unwrap();
+        unborn
+            .git(&[
+                "fetch",
+                "--quiet",
+                repo.root().to_str().unwrap(),
+                "refs/remotes/origin/session:refs/remotes/origin/session",
+            ])
+            .unwrap();
+        std::fs::write(unborn.root().join(meta::LOG_FILE), user_bytes).unwrap();
+        let error = checkout_target(&unborn, "origin/session", Some("session")).unwrap_err();
+        assert!(error.to_string().contains("user data"), "{error:#}");
+        assert_eq!(
+            std::fs::read(unborn.root().join(meta::LOG_FILE)).unwrap(),
+            user_bytes
+        );
+        std::fs::remove_file(unborn.root().join(meta::LOG_FILE)).unwrap();
+        let main_ref = unborn.common_dir().unwrap().join("refs/heads/main");
+        std::fs::write(&main_ref, "broken ref\n").unwrap();
+        assert!(checkout_target(&unborn, "origin/session", Some("session")).is_err());
+        std::fs::remove_file(main_ref).unwrap();
+        checkout_target(&unborn, "origin/session", Some("session")).unwrap();
+        assert_eq!(unborn.git(&["rev-parse", "HEAD"]).unwrap(), target);
     }
 
     // ─────────── One name and two checkouts ───────────

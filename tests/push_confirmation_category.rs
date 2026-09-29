@@ -164,7 +164,7 @@ impl Lab {
         if let Some(version) = mode.strip_prefix("json") {
             command.args(["--json", "--json-version", version]);
         }
-        command.args(["push", "other/qa", "-b", "main"]);
+        command.args(["push", "other/qa", "-b", "main", "--encryption=false"]);
         if dry_run {
             command.arg("--dry-run");
         }
@@ -300,26 +300,19 @@ impl HttpWorker {
                     })
                 }));
                 let (status, body) = match requests.len() {
-                    0 | 2 => {
+                    0 => {
                         assert_eq!(first, "GET /api/agents/other/qa HTTP/1.1");
                         (
                             200,
                             serde_json::json!({
                                 "agent_id":"9f2c3b53-7fe0-412f-b62a-bf68a6845ce7",
-                                "owner":"other", "name":"qa", "visibility":"private",
+                                "owner":"other", "name":"qa", "visibility":"private", "encryption_enabled":false,
                                 "clone_url":format!("{base}/other/qa.git")
                             })
                             .to_string(),
                         )
                     }
                     1 => {
-                        assert_eq!(
-                            first,
-                            "GET /api/agents/other/qa/secret-allowances?expected_agent_id=9f2c3b53-7fe0-412f-b62a-bf68a6845ce7 HTTP/1.1"
-                        );
-                        (404, "{}".to_owned())
-                    }
-                    3 => {
                         assert_eq!(
                             first,
                             "GET /other/qa.git/info/refs?service=git-receive-pack HTTP/1.1"
@@ -332,6 +325,10 @@ impl HttpWorker {
                             })
                         }));
                         (403, "{}".to_owned())
+                    }
+                    2 => {
+                        assert_eq!(first, "GET /api/agents/alice/qa HTTP/1.1");
+                        (404, "{}".to_owned())
                     }
                     _ => panic!("confirmation refusal performed an additional request: {first}"),
                 };
@@ -381,13 +378,13 @@ impl Drop for HttpWorker {
 }
 
 fn assert_refusal(output: &Output, mode: &str) {
-    assert_eq!(output.status.code(), Some(8), "{mode}: {output:?}");
+    assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
     let text = if let Some(version) = mode.strip_prefix("json") {
         assert!(output.stderr.is_empty(), "{output:?}");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["schema_version"], version.parse::<u64>().unwrap());
         assert_eq!(value["command"], "push");
-        assert_eq!(value["exit_code"], 8);
+        assert_eq!(value["exit_code"], 1);
         assert_eq!(value["ok"], false);
         value["diagnostics"]["stderr"]
             .as_array()
@@ -399,23 +396,18 @@ fn assert_refusal(output: &Output, mode: &str) {
     } else {
         String::from_utf8(output.stderr.clone()).unwrap()
     };
-    assert!(text.contains("no TTY here to ask"), "{text}");
-    assert!(text.contains("agit clone other/qa --mine"), "{text}");
+    assert!(text.contains("separate destination"), "{text}");
+    assert!(text.contains("--to owner/new-repository"), "{text}");
     for stream in [&output.stdout, &output.stderr] {
         assert!(!String::from_utf8_lossy(stream).contains("synthetic-publication-token"));
     }
 }
 
 #[test]
-fn noninteractive_copy_confirmation_preserves_the_foreign_checkout() {
+fn ordinary_copy_refusal_preserves_the_foreign_checkout() {
     for mode in ["human", "quiet", "json1", "json2"] {
         let lab = Lab::new(mode);
         let repo = lab.seed("other", "qa", true);
-        // Initialize the ordinary local scan state before measuring the confirmation refusal.
-        let dry_run =
-            publication_http::with_missing_agent_probe(&lab.hub, || lab.push("human", true));
-        assert!(dry_run.status.success(), "{dry_run:?}");
-        lab.no_requests();
         eprintln!("publication mode={mode} stage=snapshot-before start");
         let before = lab.state();
         eprintln!("publication mode={mode} stage=snapshot-before done");
@@ -426,7 +418,7 @@ fn noninteractive_copy_confirmation_preserves_the_foreign_checkout() {
         assert_refusal(&output, mode);
         assert_eq!(
             requests.len(),
-            4,
+            3,
             "the read capability proof must precede confirmation"
         );
         eprintln!("publication mode={mode} stage=postconditions start");

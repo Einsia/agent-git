@@ -1107,7 +1107,7 @@ fn browser_url_wide(url: &str) -> Option<Vec<u16>> {
 
 /// Pass URLs directly to the system association API so query separators never reach a shell.
 #[cfg(windows)]
-fn open_browser(url: &str) -> bool {
+pub(crate) fn open_browser(url: &str) -> bool {
     use windows_sys::Win32::{
         System::Com::{
             COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -1140,7 +1140,7 @@ fn open_browser(url: &str) -> bool {
 
 /// Open a browser where possible; failing is not fatal because the link is already on screen.
 #[cfg(not(windows))]
-fn open_browser(url: &str) -> bool {
+pub(crate) fn open_browser(url: &str) -> bool {
     let cmd = if cfg!(target_os = "macos") {
         "open"
     } else {

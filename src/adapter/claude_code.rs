@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
+/// A generated assistant without a source model must not select a model on resume.
+pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
+
 /// Nested subagents are outside collect_dir; legacy agent files can be siblings.
 fn is_user_session(session: &SessionRef) -> bool {
     !session.id.starts_with("agent-")
@@ -65,11 +68,24 @@ pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
     })
 }
 
+/// Claude keys project storage by the physical cwd reported by its process.
+pub(crate) fn canonical_cwd(cwd: &Path) -> PathBuf {
+    cwd.canonicalize()
+        .map(crate::infra::git_runtime::path_for_git)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+}
+
 /// Map a cwd onto Claude Code's project directory name.
 ///
 /// Must match Claude Code's own algorithm, or it never finds the session installed into it.
 pub fn slug_for(cwd: &Path) -> String {
-    crate::domain::store::slug_for(cwd)
+    crate::domain::store::slug_for(&canonical_cwd(cwd))
+}
+
+pub(crate) fn session_path(session_id: &str, cwd: &Path) -> Result<PathBuf> {
+    Ok(projects_dir()?
+        .join(slug_for(cwd))
+        .join(format!("{session_id}.jsonl")))
 }
 
 impl Adapter for ClaudeCode {
@@ -120,12 +136,23 @@ impl Adapter for ClaudeCode {
     }
 
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
-        let dir = projects_dir()?.join(slug_for(repo));
-        if !dir.exists() {
-            // This project has never run under Claude Code — a normal state, not an error.
-            return Ok(vec![]);
+        let root = projects_dir()?;
+        let cwd = canonical_cwd(repo);
+        let dir = root.join(slug_for(&cwd));
+        let legacy = root.join(crate::domain::store::slug_for(repo));
+        let mut sessions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let directories = std::iter::once(&dir).chain((legacy != dir).then_some(&legacy));
+        for path in directories {
+            if path.is_dir() {
+                for session in collect_dir(path, Some(cwd.to_string_lossy().into_owned()))? {
+                    if seen.insert(session.id.clone()) {
+                        sessions.push(session);
+                    }
+                }
+            }
         }
-        collect_dir(&dir, Some(repo.to_string_lossy().to_string()))
+        Ok(sessions)
     }
 
     fn all_sessions(&self) -> Result<Vec<SessionRef>> {
@@ -166,23 +193,20 @@ impl Adapter for ClaudeCode {
     fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
         matches!(
             record["type"].as_str(),
-            Some("file-history-snapshot" | "custom-title" | "summary")
+            Some("file-history-snapshot" | "custom-title" | "agent-name" | "summary")
         )
     }
 
-    /// Reverse lookup: with a cwd, go straight there (0.14 ms); without one, or on a miss, glob
-    /// one level (2.2 ms).
-    ///
-    /// Going straight there works because the project directory name is the slug of the cwd (all
-    /// ten real samples agree). That is Claude Code's internal convention, not something we can
-    /// guarantee, so the fallback has to exist.
+    /// Prefer the physical project directory, retaining lexical and global lookup for old files.
     fn resolve(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf> {
         let root = projects_dir().ok()?;
 
         if let Some(c) = cwd {
-            let direct = root.join(slug_for(c)).join(format!("{session_id}.jsonl"));
-            if direct.is_file() {
-                return Some(direct);
+            for slug in [slug_for(c), crate::domain::store::slug_for(c)] {
+                let direct = root.join(slug).join(format!("{session_id}.jsonl"));
+                if direct.is_file() {
+                    return Some(direct);
+                }
             }
         }
 
@@ -240,6 +264,20 @@ impl Adapter for ClaudeCode {
 
             match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                 "user" => {
+                    // Public projections can retain user-shaped native records that were
+                    // inactive or runtime-generated.  Their marker applies before tool-result
+                    // extraction; otherwise an inactive result becomes a normal output event.
+                    if is_system_generated(&v, extract_text(content).as_deref().unwrap_or_default())
+                    {
+                        if let Some(text) = extract_text(content) {
+                            events.push(
+                                Event::text(EventKind::Other, text, ts.clone()).at_line(lineno),
+                            );
+                        } else {
+                            events.push(other_event(ts).at_line(lineno));
+                        }
+                        continue;
+                    }
                     // Tool output also arrives as `type: "user"` (all 2211 observed blocks do),
                     // but nobody typed it. Split it off first, or the `extract_text` below —
                     // which only knows `text` blocks — yields no event at all for the record:
@@ -274,6 +312,21 @@ impl Adapter for ClaudeCode {
                     }
                 }
                 "assistant" => {
+                    // The public schema keeps inactive assistant records as assistant-shaped
+                    // messages so their role and block order survive publication.  The marker
+                    // still makes the complete record internal, including tool blocks.
+                    if v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
+                        || v.get("promptSource").and_then(|x| x.as_str()) == Some("system")
+                    {
+                        if let Some(text) = extract_text(content) {
+                            events.push(
+                                Event::text(EventKind::Other, text, ts.clone()).at_line(lineno),
+                            );
+                        } else {
+                            events.push(other_event(ts).at_line(lineno));
+                        }
+                        continue;
+                    }
                     // content is an array of blocks and can carry text and tool calls at once;
                     // both are collected — a tool call is the main evidence of what the agent
                     // did.
@@ -287,8 +340,16 @@ impl Adapter for ClaudeCode {
                                         .filter(|t| !t.trim().is_empty())
                                     {
                                         events.push(
-                                            Event::text(EventKind::AssistantReply, t, ts.clone())
-                                                .at_line(lineno),
+                                            Event::text(
+                                                if is_compact_summary(&v) {
+                                                    EventKind::CompactSummary
+                                                } else {
+                                                    EventKind::AssistantReply
+                                                },
+                                                t,
+                                                ts.clone(),
+                                            )
+                                            .at_line(lineno),
                                         );
                                     }
                                 }
@@ -455,7 +516,7 @@ impl Adapter for ClaudeCode {
                     "isSidechain": false,
                     "message": { "content": [{
                         "type": "tool_use", "id": tid, "name": name, "input": input
-                    }], "role": "assistant" },
+                    }], "role": "assistant", "model": SYNTHETIC_MODEL },
                     "parentUuid": parent,
                     "sessionId": new_id,
                     "timestamp": ts,
@@ -557,12 +618,16 @@ impl Adapter for ClaudeCode {
             } else {
                 serde_json::Value::String(text)
             };
+            let mut message = serde_json::json!({ "content": content, "role": role });
+            if role == "assistant" {
+                message["model"] = SYNTHETIC_MODEL.into();
+            }
 
             out.push_str(&serde_json::to_string(&serde_json::json!({
                 "cwd": cwd_s,
                 "gitBranch": "",
                 "isSidechain": false,
-                "message": { "content": content, "role": role },
+                "message": message,
                 "parentUuid": parent,
                 "sessionId": new_id,
                 "timestamp": ts,
@@ -589,6 +654,12 @@ impl Adapter for ClaudeCode {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
+            if v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
+                || v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true)
+                || v.get("promptSource").and_then(|x| x.as_str()) == Some("system")
+            {
+                continue;
+            }
             let Some(blocks) = v
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -630,10 +701,10 @@ impl Adapter for ClaudeCode {
     }
 
     fn install(&self, content: &str, new_id: &str, cwd: &Path) -> Result<Installed> {
-        let dir = projects_dir()?.join(slug_for(cwd));
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
-        let path = dir.join(format!("{new_id}.jsonl"));
+        let cwd = canonical_cwd(cwd);
+        let path = session_path(new_id, &cwd)?;
+        let dir = path.parent().expect("session path has a project directory");
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         std::fs::write(&path, content)
             .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(Installed {
@@ -1044,6 +1115,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn message_classification_markers_apply_to_assistants_and_tool_records() {
+        let text = concat!(
+            r#"{"type":"assistant","isMeta":true,"message":{"role":"assistant","content":[{"type":"tool_use","id":"inactive","name":"Bash","input":{}}]},"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"inactive","content":"ignored"}]},"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","isCompactSummary":true,"message":{"role":"assistant","content":[{"type":"text","text":"compressed context"}]},"sessionId":"s"}"#,
+        );
+        let session = ClaudeCode.parse(text).unwrap();
+        assert_eq!(
+            session
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                EventKind::Other,
+                EventKind::Other,
+                EventKind::CompactSummary
+            ]
+        );
+        let counts = session.counts();
+        assert_eq!(counts.prompts, 0);
+        assert_eq!(counts.replies, 0);
+        assert_eq!(counts.tools, 0);
+        assert_eq!(counts.outputs, 0);
+        assert_eq!(counts.compactions, 1);
+        assert_eq!(counts.dropped, 2);
+        assert!(ClaudeCode.open_tool_calls(text).is_empty());
+    }
+
     /// The record is neither `UserPrompt` nor `Other` — it does not exist at all. Across 13123
     /// lines of real corpus there are 2211 such blocks, none of which reach the IR, and 40% of the
     /// distinct config-assignment shapes live only inside them.
@@ -1131,6 +1234,7 @@ mod tests {
             .iter()
             .find(|v| v["message"]["content"][0]["type"] == "tool_use")
             .expect("a tool_use block is emitted");
+        assert_eq!(call["message"]["model"], SYNTHETIC_MODEL);
         assert_eq!(
             call["message"]["content"][0]["input"]["command"],
             "cat lr.txt"
@@ -1799,6 +1903,71 @@ mod tests {
 #[cfg(test)]
 mod config_directory_tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "rc"))]
+    #[test]
+    fn symlinked_projects_install_and_discover_physical_sessions_before_legacy_files() {
+        if crate::rc::in_isolated_test(
+            "adapter::claude_code::config_directory_tests::symlinked_projects_install_and_discover_physical_sessions_before_legacy_files",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let config = root.path().join("claude");
+        // The subprocess isolates the runtime's process-wide configuration directory.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &config) };
+        let content = r#"{"type":"user","sessionId":"source","cwd":"/source","message":{"role":"user","content":"saved context"}}"#;
+        let (installed, _) =
+            crate::domain::install::install(content, "claude-code", "claude-code", &alias).unwrap();
+        let id = installed.path.file_stem().unwrap().to_str().unwrap();
+        let physical_dir = config
+            .join("projects")
+            .join(crate::domain::store::slug_for(&workspace));
+        assert_eq!(installed.path.parent(), Some(physical_dir.as_path()));
+        let native = std::fs::read_to_string(&installed.path).unwrap();
+        assert_eq!(
+            ClaudeCode.parse(&native).unwrap().cwd.as_deref(),
+            workspace.to_str()
+        );
+        assert_eq!(
+            ClaudeCode.resolve(id, Some(&alias)),
+            Some(installed.path.clone())
+        );
+        let sessions = ClaudeCode.sessions_for(&alias).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].path, installed.path);
+
+        let legacy_dir = config
+            .join("projects")
+            .join(crate::domain::store::slug_for(&alias));
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join(format!("{id}.jsonl"));
+        std::fs::write(&legacy, content).unwrap();
+        std::fs::write(legacy_dir.join("legacy-only.jsonl"), content).unwrap();
+        assert_eq!(
+            ClaudeCode.resolve(id, Some(&alias)),
+            Some(installed.path.clone())
+        );
+        let sessions = ClaudeCode.sessions_for(&alias).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap()
+                .path,
+            installed.path
+        );
+        std::fs::remove_file(&installed.path).unwrap();
+        assert_eq!(ClaudeCode.resolve(id, Some(&alias)), Some(legacy.clone()));
+        assert_eq!(ClaudeCode.resolve(id, Some(&workspace)), Some(legacy));
+    }
+
     #[test]
     fn configured_harness_directory_owns_transcript_discovery() {
         assert_eq!(

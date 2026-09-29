@@ -73,7 +73,9 @@ pub(super) fn harness_test_session_with_channels(
         tokio::sync::watch::channel(crate::rc::Confinement::default());
     let (_settlement_tx, settlement) = tokio::sync::watch::channel(SettlementState::default());
     let session = Session {
+        publication_incarnation: None,
         info: SessionInfo {
+            publication: None,
             session_id: "session-turn-test".into(),
             native_source: None,
             runtime_session_id: None,

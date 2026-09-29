@@ -86,7 +86,27 @@ impl StagedLfsPayloads {
         byte_budget: u64,
         directory: TempDir,
     ) -> Result<Self, LfsStagingError> {
-        match stage_into(source_objects, missing, byte_budget, directory.path()) {
+        Self::stage_with_recovery(source_objects, missing, byte_budget, directory, |_| {
+            Err(LfsStagingFailure::Source)
+        })
+    }
+
+    /// Recovery supplies bytes only for absent cache entries; local corruption remains an error.
+    /// Recovered bytes pass the same size and digest checks before becoming inspection input.
+    pub(super) fn stage_with_recovery(
+        source_objects: &Path,
+        missing: &[Pointer],
+        byte_budget: u64,
+        directory: TempDir,
+        mut recover: impl FnMut(&Pointer) -> Result<File, LfsStagingFailure>,
+    ) -> Result<Self, LfsStagingError> {
+        match stage_into(
+            source_objects,
+            missing,
+            byte_budget,
+            directory.path(),
+            &mut recover,
+        ) {
             Ok(pointers) => Ok(Self {
                 directory,
                 pointers,
@@ -123,6 +143,7 @@ fn stage_into(
     missing: &[Pointer],
     byte_budget: u64,
     directory: &Path,
+    recover: &mut impl FnMut(&Pointer) -> Result<File, LfsStagingFailure>,
 ) -> Result<Vec<Pointer>, LfsStagingFailure> {
     let pointers = selected_pointers(missing, byte_budget)?;
     let destination = directory
@@ -144,10 +165,7 @@ fn stage_into(
     {
         return Err(LfsStagingFailure::Destination);
     }
-    let (source, exists) = source_outside_directory(source_objects, &destination)?;
-    if !exists && pointers.iter().any(|pointer| pointer.size != 0) {
-        return Err(LfsStagingFailure::Source);
-    }
+    let (source, _) = source_outside_directory(source_objects, &destination)?;
     let storage = destination.join("storage");
     create_private_directory(&storage)?;
     let objects = storage.join("objects");
@@ -168,7 +186,11 @@ fn stage_into(
             // Git LFS can represent the empty object without a physical cache entry.
             copy_verified(&mut std::io::empty(), &mut output, pointer)?;
         } else {
-            let mut input = open_source(&object_path(&source, pointer))?;
+            let path = object_path(&source, pointer);
+            let mut input = match path.symlink_metadata() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => recover(pointer)?,
+                _ => open_source(&path)?,
+            };
             copy_verified(&mut input, &mut output, pointer)?;
         }
     }

@@ -66,6 +66,7 @@
 mod admission;
 pub(crate) mod authority;
 pub mod build_identity;
+pub(crate) mod capture;
 pub mod cloud;
 pub(crate) mod codex_history;
 #[cfg(unix)]
@@ -125,6 +126,16 @@ pub fn select_local_authority() {
 
 /// The selected daemon namespace.
 pub fn rc_dir() -> crate::Result<PathBuf> {
+    state_dir(
+        if LOCAL_AUTHORITY.load(std::sync::atomic::Ordering::Acquire) {
+            "desktop-rc"
+        } else {
+            "rc"
+        },
+    )
+}
+
+pub(crate) fn state_dir(namespace: &str) -> crate::Result<PathBuf> {
     #[cfg(test)]
     let home = test_agit_home_override()
         .map(Ok)
@@ -133,13 +144,7 @@ pub fn rc_dir() -> crate::Result<PathBuf> {
     let home = crate::infra::config::agit_home()?;
     #[cfg(windows)]
     windows_security::validate_path(&home, true, false)?;
-    let d = home.join(
-        if LOCAL_AUTHORITY.load(std::sync::atomic::Ordering::Acquire) {
-            "desktop-rc"
-        } else {
-            "rc"
-        },
-    );
+    let d = home.join(namespace);
     #[cfg(windows)]
     windows_security::private_directory(&d)?;
     #[cfg(not(windows))]

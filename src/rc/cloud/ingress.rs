@@ -109,6 +109,7 @@ impl Registry {
     pub fn client(&self, principal: Principal, expires_at_ms: i64) -> Client {
         Client {
             principal,
+            grant: None,
             controller: None,
             lease: Lease(Arc::new(RwLock::new(LeaseState::new(expires_at_ms)))),
             state: self.state.clone(),
@@ -153,6 +154,7 @@ impl Registry {
                 delegation::validate_resources(&grant, &state.resources)?;
             }
             client.controller = owners.accept(&grant).await?;
+            client.grant = Some(grant);
             if let Some(controller) = client.controller.as_mut() {
                 controller.resource_pin = resource_pin;
             }
@@ -230,6 +232,7 @@ impl Lease {
 #[derive(Clone)]
 pub struct Client {
     pub principal: Principal,
+    grant: Option<agit_peer::cloud::ConnectionGrant>,
     controller: Option<delegation::Controller>,
     lease: Lease,
     state: Arc<RwLock<State>>,
@@ -254,6 +257,7 @@ impl Drop for Client {
 }
 
 struct ExecutionAuthority {
+    grant: Option<agit_peer::cloud::ConnectionGrant>,
     controller: Option<delegation::Controller>,
     lease: Lease,
     principal: Principal,
@@ -266,6 +270,16 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn publication_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
+        if self.permit.method != crate::protocol::method::SESSION_PUBLICATION_DELIVER {
+            return None;
+        }
+        let mut grant = self.grant.clone()?;
+        grant.session_controller.as_ref()?;
+        grant.expires_at_ms = self.lease.expires_at_ms();
+        Some(grant)
+    }
+
     fn watch_owner(&self) -> Option<String> {
         self.controller
             .as_ref()
@@ -407,6 +421,7 @@ impl Client {
             self.session_events.store(enabled, Ordering::Relaxed);
         }
         frame.authority = crate::rc::authority::Guard::new(ExecutionAuthority {
+            grant: self.grant.clone(),
             controller: self.controller.clone(),
             principal: self.principal.clone(),
             lease: self.lease.clone(),
@@ -424,6 +439,13 @@ impl Client {
                 observed: false,
             }),
         );
+        drop(state);
+        if frame.method() == crate::protocol::method::SESSION_PUBLICATION_DELIVER {
+            frame
+                .authority
+                .publication_grant()
+                .map_err(Rejection::Reply)?;
+        }
         Ok(frame)
     }
 
@@ -538,6 +560,111 @@ mod tests {
     use super::*;
     use agit_peer::access::{Access, Resource, Rule};
     use serde_json::json;
+
+    /// Only an admitted current controller can provide authority for a publication receipt.
+    #[test]
+    fn publication_grant_follows_live_controller_policy_and_generation() {
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                use agit_peer::cloud::{ConnectionGrant, Device, SessionController};
+                let policy = || {
+                    Policy::new(
+                        1,
+                        vec![Rule {
+                            principal: principal(),
+                            resource: Resource::Session("native".into()),
+                            access: Access::Control,
+                        }],
+                    )
+                    .unwrap()
+                };
+                let registry = Registry::fixed(policy());
+                registry.state.write().unwrap().resources.observe(
+                    "session.list",
+                    &json!({"sessions":[{
+                        "session_id":"logical", "runtime_session_id":"native", "runtime":"codex",
+                        "workspace_id":"local-owner", "cwd":"/trusted"
+                    }]}),
+                );
+                let device = Device {
+                    id: "executor".into(),
+                    owner: principal(),
+                    machine_id: "machine".into(),
+                    display_name: "Fixture".into(),
+                    credential_epoch: 1,
+                    certificate: agit_peer::Identity::generate()
+                        .unwrap()
+                        .certificate()
+                        .clone(),
+                };
+                let now = chrono::Utc::now().timestamp_millis();
+                let mut grant = ConnectionGrant {
+                    id: "grant".into(),
+                    caller: principal(),
+                    source: Device {
+                        id: "controller".into(),
+                        ..device.clone()
+                    },
+                    target: device,
+                    expires_at_ms: now + 60_000,
+                    project_controller: None,
+                    session_controller: Some(SessionController {
+                        session_id: "native".into(),
+                        runtime: "codex".into(),
+                        generation: 1,
+                        access: Access::Control,
+                    }),
+                };
+                let request = || {
+                    Frame::request(
+                        crate::protocol::method::SESSION_PUBLICATION_DELIVER,
+                        json!({"session_id":"logical", "grant_id":"forged"}),
+                    )
+                };
+                assert!(
+                    crate::rc::authority::Guard::default()
+                        .publication_grant()
+                        .is_err()
+                );
+                let ordinary = registry.client(principal(), now + 60_000);
+                assert!(ordinary.authorize(request()).is_err());
+                let client = registry.admitted(grant.clone()).await.unwrap();
+                let frame = client.authorize(request()).unwrap();
+                assert_eq!(frame.authority.publication_grant().unwrap().id, "grant");
+                client.lease().renew(now + 120_000).unwrap();
+                assert_eq!(
+                    frame.authority.publication_grant().unwrap().expires_at_ms,
+                    now + 120_000
+                );
+                registry.state.write().unwrap().policy = Policy::default();
+                assert!(frame.authority.publication_grant().is_err());
+                registry.state.write().unwrap().policy = policy();
+                grant.id = "replacement".into();
+                grant.session_controller.as_mut().unwrap().generation += 1;
+                let replacement = registry.admitted(grant).await.unwrap();
+                assert!(frame.authority.publication_grant().is_err());
+                let fresh = replacement.authorize(request()).unwrap();
+                assert_eq!(
+                    fresh.authority.publication_grant().unwrap().id,
+                    "replacement"
+                );
+                let history = replacement
+                    .authorize(Frame::request(
+                        "session.history",
+                        json!({"session_id":"logical"}),
+                    ))
+                    .unwrap();
+                assert!(history.authority.publication_grant().is_err());
+                drop(replacement);
+                assert!(fresh.authority.publication_grant().is_err());
+            });
+        });
+    }
 
     fn principal() -> Principal {
         Principal {

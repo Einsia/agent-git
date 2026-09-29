@@ -24,6 +24,10 @@ pub(super) enum SessionOpening {
 }
 
 pub(super) struct PreparedSpawn {
+    pub(super) local_owner: bool,
+    pub(super) prior_entry: Option<roster::Entry>,
+    pub(super) prior_capture: Option<crate::rc::capture::RepositoryKind>,
+    pub(super) incarnation: String,
     pub(super) authority: crate::rc::authority::Guard,
     pub(super) epoch: u64,
     #[cfg(test)]
@@ -59,8 +63,18 @@ impl SessionOpening {
     ) -> Result<serde_json::Value, RpcError> {
         match self {
             Self::Ready(value) => Ok(value),
-            Self::Launch(spawn, reply) => {
-                let result = spawn.execute().await;
+            Self::Launch(mut spawn, reply) => {
+                let result = async {
+                    spawn
+                        .resolve_capture()
+                        .await
+                        .map_err(SpawnFailure::before_launch)?;
+                    daemon
+                        .persist_capture(&spawn)
+                        .map_err(SpawnFailure::before_launch)?;
+                    spawn.execute().await
+                }
+                .await;
                 let result = daemon.finish_spawn(*spawn, result);
                 reply.finish(daemon, result)
             }
@@ -76,7 +90,7 @@ impl SessionOpening {
     ) {
         let result = match self {
             Self::Ready(value) => Ok(value),
-            Self::Launch(spawn, reply) => {
+            Self::Launch(mut spawn, reply) => {
                 // Cancellation or panic cannot prove that the OS spawn boundary was not crossed.
                 // Keep the reservation until recovery instead of admitting another writer.
                 let result = if *stop.borrow() {
@@ -85,7 +99,20 @@ impl SessionOpening {
                         "the daemon is stopping; nothing was launched",
                     )))
                 } else {
-                    let launch = AssertUnwindSafe(spawn.execute()).catch_unwind();
+                    let launch = AssertUnwindSafe(async {
+                        spawn
+                            .resolve_capture()
+                            .await
+                            .map_err(SpawnFailure::before_launch)?;
+                        {
+                            let mut state = daemon.lock().await;
+                            state
+                                .persist_capture(&spawn)
+                                .map_err(SpawnFailure::before_launch)?;
+                        }
+                        spawn.execute().await
+                    })
+                    .catch_unwind();
                     tokio::select! {
                         biased;
                         _ = stop.changed() => Err(unknown_launch("the daemon stopped during launch")),
@@ -144,6 +171,83 @@ impl OpeningReply {
 }
 
 impl PreparedSpawn {
+    async fn resolve_capture(&mut self) -> Result<(), RpcError> {
+        if !self.local_owner {
+            return Ok(());
+        }
+        let Some(native) = self.spec.resume_from.clone() else {
+            return Ok(());
+        };
+        let native = self
+            .info
+            .native_source
+            .as_ref()
+            .map(|source| source.session_ref(&native))
+            .unwrap_or(native);
+        let runtime = self.info.runtime.clone();
+        let cwd = self.spec.cwd.clone();
+        let entry = self.prior_entry.clone();
+        let saved = self.prior_capture.clone();
+        let wire = self.spec.agit_session.clone();
+        let lineage = tokio::task::spawn_blocking(move || -> crate::Result<_> {
+            let prior = match entry.as_ref() {
+                Some(entry)
+                    if entry.agit_session.is_some() || entry.expected_agent_id.is_some() =>
+                {
+                    Some(crate::rc::lineage::AgitSession::parse(
+                        entry
+                            .agit_session
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("incomplete capture route"))?,
+                        entry
+                            .expected_agent_id
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("incomplete capture identity"))?,
+                    )?)
+                }
+                _ => None,
+            };
+            let resolved = crate::rc::capture::resolve(
+                &runtime,
+                &native,
+                &cwd,
+                prior.as_ref(),
+                saved.as_ref(),
+            )?;
+            if let Some(wire) = wire {
+                anyhow::ensure!(
+                    resolved
+                        .as_ref()
+                        .is_some_and(|local| local.to_string() == wire.to_string()
+                            && local.agent_id() == wire.agent_id()),
+                    "requested capture conflicts with the local native claim"
+                );
+            }
+            Ok(resolved)
+        })
+        .await
+        .map_err(|_| RpcError::new(ErrorCode::Internal, "capture inspection failed"))?
+        .map_err(|_| {
+            let mut error = RpcError::new(
+                ErrorCode::Forbidden,
+                "native capture binding is invalid or conflicting",
+            );
+            error.data = Some(
+                serde_json::json!({"publication":crate::protocol::SessionPublicationStatus {
+                    readiness: crate::protocol::PublicationReadiness::SetupRequired,
+                    progress: crate::protocol::PublicationProgress::Idle,
+                    stage: Some(crate::protocol::PublicationStage::Capture),
+                    reason: Some(crate::protocol::PublicationReason::BindingInvalid),
+                }}),
+            );
+            error
+        })?;
+        self.info.agent = lineage.as_ref().map(|lineage| lineage.slug());
+        self.info.branch = lineage.as_ref().map(|lineage| lineage.branch().into());
+        self.spec.agit_session = lineage;
+        Ok(())
+    }
+
     pub(super) async fn execute(&self) -> Result<Spawned, SpawnFailure> {
         #[cfg(test)]
         if let Some(pause) = &self.launch_pause {
@@ -168,7 +272,40 @@ impl PreparedSpawn {
         self.authority
             .check()
             .map_err(SpawnFailure::before_launch)?;
-        let session = Session::launch(
+        if self.local_owner
+            && let Some(lineage) = self.spec.agit_session.clone()
+        {
+            let runtime = self.info.runtime.clone();
+            let native = self.spec.resume_from.clone();
+            let cwd = self.spec.cwd.clone();
+            tokio::task::spawn_blocking(move || -> crate::Result<()> {
+                crate::rc::capture::require(&lineage)?;
+                if let Some(native) = native {
+                    crate::rc::capture::resolve(
+                        &runtime,
+                        &native,
+                        &cwd,
+                        Some(&lineage),
+                        lineage.capture.as_ref(),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                SpawnFailure::before_launch(RpcError::new(
+                    ErrorCode::Internal,
+                    "capture revalidation failed",
+                ))
+            })?
+            .map_err(|_| {
+                SpawnFailure::before_launch(RpcError::new(
+                    ErrorCode::Forbidden,
+                    "capture binding changed before launch",
+                ))
+            })?;
+        }
+        let mut session = Session::launch(
             self.info.clone(), self.spec.clone(), out, self.notes.clone(),
             self.confinement.clone(), self.settlement.clone(), self.generation,
             self.secret_filter.clone(),
@@ -192,11 +329,101 @@ impl PreparedSpawn {
                 ))
             }
         })?;
+        session.publication_incarnation = Some(self.incarnation.clone());
         Ok(Spawned { session, frames })
     }
 }
 
 impl Daemon {
+    fn persist_capture(&mut self, spawn: &PreparedSpawn) -> Result<(), RpcError> {
+        if !spawn.local_owner {
+            return Ok(());
+        }
+        spawn.authority.check()?;
+        if self.settlement.borrow().epoch != spawn.epoch
+            || self
+                .opening_sessions
+                .get(&spawn.info.session_id)
+                .is_none_or(|reservation| reservation.generation != spawn.generation)
+        {
+            return Err(RpcError::new(
+                ErrorCode::SessionBusy,
+                "capture launch authority changed",
+            ));
+        }
+        let id = &spawn.info.session_id;
+        let coordinates = |entry: &roster::Entry| {
+            (
+                entry.runtime.clone(),
+                entry.thread_id.clone(),
+                entry.native_source.clone(),
+                entry.cwd.clone(),
+                entry.workspace_id.clone(),
+                entry.agit_session.clone(),
+                entry.expected_agent_id.clone(),
+            )
+        };
+        if self.roster.get(id).map(coordinates) != spawn.prior_entry.as_ref().map(coordinates)
+            || self.roster.captures.get(id) != spawn.prior_capture.as_ref()
+        {
+            return Err(RpcError::new(
+                ErrorCode::SessionBusy,
+                "capture association changed during inspection",
+            ));
+        }
+        let previous = self.roster.clone();
+        if let Some(lineage) = &spawn.spec.agit_session
+            && let Some(kind) = &lineage.capture
+        {
+            if self
+                .roster
+                .captures
+                .get(id)
+                .is_some_and(|current| current != kind)
+            {
+                return Err(RpcError::new(
+                    ErrorCode::Forbidden,
+                    "capture repository identity changed",
+                ));
+            }
+            self.roster.captures.insert(id.clone(), kind.clone());
+        }
+        let prior = self.roster.get(id);
+        let entry = roster::Entry {
+            native_source: spawn.info.native_source.clone(),
+            runtime: spawn.info.runtime.clone(),
+            thread_id: spawn.spec.resume_from.clone().unwrap_or_default(),
+            cwd: spawn.spec.cwd.to_string_lossy().into_owned(),
+            workspace_id: spawn.info.workspace_id.clone(),
+            project_id: spawn.info.project_id.clone(),
+            agit_session: spawn.spec.agit_session.as_ref().map(ToString::to_string),
+            expected_agent_id: spawn
+                .spec
+                .agit_session
+                .as_ref()
+                .map(|lineage| lineage.agent_id().into()),
+            permission_mode: spawn.info.permission_mode,
+            guard_attempts: prior
+                .map(|entry| entry.guard_attempts.clone())
+                .unwrap_or_default(),
+            prior_threads: prior
+                .map(|entry| entry.prior_threads.clone())
+                .unwrap_or_default(),
+            ever_dangerous: spawn.info.dangerous,
+        };
+        if let Err(error) = self.roster.record(id, entry) {
+            self.roster = previous;
+            return Err(RpcError::new(ErrorCode::Forbidden, error.to_string()));
+        }
+        if self.roster.save().is_err() {
+            self.roster = previous;
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                "capture binding could not be persisted; nothing was launched",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn prepare_opening(
         &mut self,
         frame: &Frame,
@@ -436,6 +663,7 @@ mod tests {
         let mut state = daemon.lock().await;
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
+            publication: None,
             session_id: "agit-opening".into(),
             native_source: None,
             runtime_session_id: None,
@@ -474,6 +702,147 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}", error.error.message));
         drop(state);
         (dir, daemon, spawn)
+    }
+
+    /// An unbound roster can acquire exact local capture only after its durable save succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn imported_capture_upgrades_an_unbound_roster_before_launch() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::opening::tests::imported_capture_upgrades_an_unbound_roster_before_launch",
+        ) {
+            return;
+        }
+        use crate::{
+            domain::{link, repo::Repo, store::Store},
+            rc::lineage::AgitSession,
+        };
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let (_root, daemon, mut spawn) = fixture().await;
+        let native = uuid::Uuid::now_v7().to_string();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir(&codex_home).unwrap();
+        let transcript = codex_home.join(format!("rollout-{native}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":spawn.spec.cwd}})),
+        ).unwrap();
+        let db = rusqlite::Connection::open(codex_home.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER)").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1,?2,?3,0,'question','cli',1)",
+            rusqlite::params![native, transcript.to_str(), spawn.spec.cwd.to_str()],
+        )
+        .unwrap();
+        let source = crate::rc::runtime_sources::Registry::open()
+            .unwrap()
+            .register(&codex_home, None, None, None)
+            .unwrap();
+        let binding = link::NativeBinding {
+            source: crate::protocol::NativeSourceRef {
+                source_id: source.source_id,
+                generation: source.generation,
+            },
+            thread_id: native.clone(),
+        };
+        let store = Store::open_or_init().unwrap();
+        let mut claim = link::Link::from_native(binding.clone(), &spawn.spec.cwd).unwrap();
+        claim.owner = Some("alice".into());
+        claim.agent = Some("imported".into());
+        claim.branch = Some("work".into());
+        link::write(&store, &claim).unwrap();
+        let lineage = AgitSession::new(
+            "alice/imported",
+            "00000000-0000-0000-0000-000000000001",
+            "work",
+        )
+        .unwrap();
+        let repo = Repo::init(&lineage.repo_dir().unwrap()).unwrap();
+        repo.git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ])
+        .unwrap();
+        repo.git(&["branch", "work"]).unwrap();
+        crate::hub::identity::pin(
+            &repo,
+            &crate::hub::identity::RemoteIdentity::new("https://hub.invalid", lineage.agent_id())
+                .unwrap(),
+        )
+        .unwrap();
+        let row: roster::Entry = serde_json::from_value(serde_json::json!({
+            "runtime":"codex", "thread_id":native, "cwd":spawn.spec.cwd,
+            "native_source":binding.source,
+            "workspace_id":"ws", "project_id":"project"
+        }))
+        .unwrap();
+        spawn.local_owner = true;
+        spawn.info.runtime = "codex".into();
+        spawn.info.native_source = Some(binding.source.clone());
+        spawn.spec.resume_from = Some(native);
+        spawn.prior_entry = Some(row.clone());
+        daemon
+            .lock()
+            .await
+            .roster
+            .record(&spawn.info.session_id, row)
+            .unwrap();
+        spawn.resolve_capture().await.unwrap();
+        assert_eq!(spawn.info.agent.as_deref(), Some("alice/imported"));
+        assert_eq!(spawn.info.branch.as_deref(), Some("work"));
+        let mut state = daemon.lock().await;
+        roster::fail_next_saves(1, 0);
+        assert!(state.persist_capture(&spawn).is_err());
+        assert!(state.roster.captures.is_empty());
+        assert!(
+            state
+                .roster
+                .get(&spawn.info.session_id)
+                .unwrap()
+                .agit_session
+                .is_none()
+        );
+        assert!(state.sessions.is_empty());
+        state.persist_capture(&spawn).unwrap();
+        let restarted = Roster::try_load().unwrap();
+        assert_eq!(
+            restarted.get(&spawn.info.session_id).unwrap().native_source,
+            Some(binding.source.clone())
+        );
+        assert_eq!(
+            restarted
+                .get(&spawn.info.session_id)
+                .unwrap()
+                .agit_session
+                .as_deref(),
+            Some("alice/imported@work")
+        );
+        assert_eq!(
+            restarted.captures.get(&spawn.info.session_id),
+            spawn.spec.agit_session.as_ref().unwrap().capture.as_ref()
+        );
+        assert!(
+            state.persist_capture(&spawn).is_err(),
+            "an obsolete inspection cannot overwrite the association"
+        );
+        assert_eq!(
+            link::get_checked(&store, "codex", &claim.session_id)
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            claim.to_json().unwrap()
+        );
     }
 
     /// An unresolved opening excludes native aliases across workspace boundaries.

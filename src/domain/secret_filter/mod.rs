@@ -260,14 +260,18 @@ impl OsKeyStore {
         vault_id: &str,
         operation: impl FnOnce(keyring::Entry) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        let access = || {
+        Self::with_access(|| {
             // Store initialization belongs inside the access policy too: a platform provider
             // can contact the credential service while creating an entry.
             let entry = keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|error| {
                 Self::failure("cannot open the operating-system credential store", error)
             })?;
             operation(entry)
-        };
+        })
+    }
+
+    /// All credential services share the process-wide platform dialog policy.
+    pub(crate) fn with_access<T>(access: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
         #[cfg(target_os = "macos")]
         return os_keychain::with_access(access);
         #[cfg(not(target_os = "macos"))]
@@ -1152,6 +1156,25 @@ impl Matcher {
         self.inner.generation
     }
 
+    /// Cache dependencies identify effective rules, not a generation shared by unrelated vaults.
+    pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
+        let bytes = Zeroizing::new(serde_json::to_vec(&(
+            &self.inner.ids,
+            &self.inner.explicit,
+            self.inner
+                .patterns
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            self.inner
+                .allowlist
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+        ))?);
+        Ok(crate::domain::privacy_envelope::digest_bytes(&bytes))
+    }
+
     pub fn rules(&self) -> usize {
         self.inner.ids.len()
     }
@@ -1170,6 +1193,16 @@ impl Matcher {
 
     pub(crate) fn allowed_values(&self) -> impl Iterator<Item = &str> {
         self.inner.allowlist.iter().map(|value| value.as_str())
+    }
+
+    pub(crate) fn publication_values_matching(
+        &self,
+        used: impl Fn(&str) -> bool,
+    ) -> std::collections::BTreeSet<String> {
+        self.patterns()
+            .filter(|(_, value)| used(value))
+            .map(|(_, value)| value.to_owned())
+            .collect()
     }
 
     pub(crate) fn repository_identities(&self) -> &HashSet<String> {

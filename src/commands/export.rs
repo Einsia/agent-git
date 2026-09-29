@@ -30,7 +30,7 @@ pub struct Args {
     /// Output format.
     #[arg(
         long,
-        value_name = "jsonl|ir|markdown|RUNTIME",
+        value_name = "jsonl|ir|markdown|privacy-envelope|RUNTIME",
         default_value = "jsonl"
     )]
     pub format: String,
@@ -40,6 +40,13 @@ pub struct Args {
     /// Redact secrets on export.
     #[arg(long)]
     pub redact: bool,
+    /// Apply the repository privacy policy before rendering public content.
+    #[arg(long)]
+    pub privacy: bool,
+    /// Standard Base64 X25519 viewing public key; otherwise use the signed-in Hub account.
+    /// Remote-bound repositories still require authenticated privacy rules.
+    #[arg(long, value_name = "BASE64")]
+    pub viewing_public_key: Option<String>,
     /// Output path (default or `-`: stdout).
     #[arg(short = 'o', long, value_name = "path")]
     pub out: Option<String>,
@@ -104,12 +111,40 @@ pub fn run(args: Args) -> CmdResult {
     };
     let sha = resolved.sha.clone();
 
+    let encrypted = args.format == "privacy-envelope";
+    if encrypted && (args.view_only || spec.tail != refs::Tail::None) {
+        ui::error(
+            "privacy-envelope exports require a complete snapshot; use a branch, tag, or commit without --view-only or a turn selector",
+        );
+        return Ok(ExitCode::Usage);
+    }
+    if args.viewing_public_key.is_some() && !encrypted {
+        ui::error("--viewing-public-key requires --format privacy-envelope");
+        return Ok(ExitCode::Usage);
+    }
+
     let which = if args.view_only {
         meta::VIEW_FILE
     } else {
         meta::LOG_FILE
     };
-    let env_text = match required_sequence(&repo, &sha, which) {
+    let frozen = if args.privacy || encrypted {
+        Some(crate::domain::privacy_publication::read_snapshot(
+            &repo, &sha,
+        )?)
+    } else {
+        None
+    };
+    let env_text = match frozen.as_ref().map_or_else(
+        || required_sequence(&repo, &sha, which),
+        |(_, log, view)| {
+            Ok(if args.view_only {
+                view.clone()
+            } else {
+                log.clone()
+            })
+        },
+    ) {
         Ok(text) => text,
         Err(error) => {
             // `--view-only` is a security/selection boundary: a broken or missing VIEW must
@@ -125,15 +160,84 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         env_text
     };
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let selected = dictionary.protect_envelopes(&selected, &registered)?;
-    anyhow::ensure!(
-        selected.intact == 0,
-        "export exceeds the reversible protection limit; no output was written"
-    );
-    let selected = selected.text;
+    let account = if encrypted && args.viewing_public_key.is_none() {
+        Some(super::require_login()?)
+    } else {
+        None
+    };
+    let sources = frozen
+        .as_ref()
+        .map(|_| super::privacy::sources::Sources::resolve(Some((&repo, &slug)), account.as_ref()))
+        .transpose()?;
+    let additional = sources
+        .as_ref()
+        .map(|sources| sources.additional_rules())
+        .transpose()?
+        .unwrap_or_default();
+    let viewing = if encrypted && args.viewing_public_key.is_none() {
+        Some(super::privacy::publication_key::PublicationKey::resolve(
+            &repo,
+            resolved.branch.as_deref(),
+            &sha,
+        )?)
+    } else {
+        None
+    };
+    let projection = if let Some((metadata, log, view)) = frozen {
+        Some(
+            crate::domain::privacy_publication::project_frozen_with_sources(
+                Some(&repo),
+                resolved.branch.as_deref(),
+                &log,
+                &view,
+                &metadata,
+                &additional,
+            )?,
+        )
+    } else {
+        None
+    };
+    let selected = if let Some(projection) = &projection {
+        ui::privacy_preview::write_report(
+            &mut std::io::stderr().lock(),
+            projection.report(),
+            if encrypted {
+                ui::privacy_preview::Recovery::FullSession
+            } else {
+                ui::privacy_preview::Recovery::PublicOnly
+            },
+        )?;
+        projection.select(&selected)?
+    } else {
+        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+        let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+        let selected = dictionary.protect_envelopes(&selected, &registered)?;
+        anyhow::ensure!(
+            selected.intact == 0,
+            "export exceeds the reversible protection limit; no output was written"
+        );
+        selected.text
+    };
     let result = match args.format.as_str() {
+        "privacy-envelope" => {
+            let public_key = match args.viewing_public_key.as_deref() {
+                Some(key) => key.to_owned(),
+                None => viewing
+                    .as_ref()
+                    .expect("repository export has a viewing key")
+                    .public_key
+                    .clone(),
+            };
+            let id = crate::domain::privacy_envelope::digest_bytes(public_key.as_bytes())
+                .replace(':', "-");
+            let recipient =
+                crate::domain::privacy_envelope::ViewingRecipient::from_base64(id, &public_key)?;
+            let envelope = projection
+                .as_ref()
+                .expect("encrypted export has a projection")
+                .seal(&recipient)?;
+            Ok(format!("{}\n", serde_json::to_string(&envelope)?))
+        }
         "jsonl" => Ok(transcript::unwrap_lossy(&selected).0),
         "ir" => to_ir(&selected),
         "markdown" => to_markdown(&selected),
@@ -141,7 +245,7 @@ pub fn run(args: Args) -> CmdResult {
         other => {
             ui::error(&format!("unknown format `{other}`."));
             ui::hint(&format!(
-                "jsonl | ir | markdown | {}",
+                "jsonl | ir | markdown | privacy-envelope | {}",
                 adapter::RUNTIMES.join(" | ")
             ));
             return Ok(ExitCode::Usage);
@@ -155,7 +259,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    if args.redact {
+    if args.redact && projection.is_none() {
         // Secret projection precedes rendering; this optional pass anonymizes the local persona.
         let rep = crate::domain::redact::Redactor::try_this_machine()?.scrub_persona(&out);
         out = rep.text;
@@ -168,6 +272,14 @@ pub fn run(args: Args) -> CmdResult {
                 rep.secrets, rep.paths, rep.ips
             ))
         );
+    }
+
+    if let Some(viewing) = viewing.as_ref() {
+        viewing.verify(&repo)?;
+        eprintln!("Repository key source: {}", viewing.source());
+    }
+    if let Some(sources) = sources.as_ref() {
+        sources.verify()?;
     }
 
     match &args.out {

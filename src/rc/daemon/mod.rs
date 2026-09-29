@@ -67,6 +67,7 @@ mod guard;
 mod opening;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 mod projection;
+mod publication;
 mod pump;
 mod restart;
 mod session_metadata;
@@ -1603,6 +1604,7 @@ fn min_role(method_name: &str) -> Role {
         | method::APPROVAL_DECIDE
         | method::SESSION_SET_MODEL
         | method::SESSION_SET_PERMISSION_MODE
+        | method::SESSION_PUBLICATION_DELIVER
         | method::FS_READ_FILE => Role::Operator,
         // Codex's native queue is an independently authorized persisted inbox. It does not
         // acquire the writer lock or start a turn, so an operator may enqueue text while the

@@ -27,6 +27,7 @@ pub mod git;
 /// The repo-local, immutable pin of the remote identity.
 pub mod identity;
 mod json_response;
+pub mod privacy;
 /// Session reuse receipts that `agit run` sends when it starts from a session.
 pub mod reuse;
 pub(crate) mod transport;
@@ -99,6 +100,9 @@ pub struct RemoteAgent {
     /// The remote identity, unchanged by a rename or by a delete and a rebuild under the same
     /// name.
     pub agent_id: String,
+    /// Only an explicit Hub value establishes mode; an omitted field is an unsupported server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_enabled: Option<bool>,
     pub owner: String,
     pub name: String,
     /// The git clone URL.
@@ -115,6 +119,13 @@ pub struct RemoteAgent {
 }
 
 impl RemoteAgent {
+    pub fn require_encryption_enabled(&self) -> crate::Result<bool> {
+        self.encryption_enabled.ok_or_else(|| anyhow::anyhow!(
+            "the Hub did not return encryption_enabled for {}; upgrade the Hub before configuring or publishing this repository",
+            self.slug()
+        ))
+    }
+
     /// The `<owner>/<name>` form.
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.name)
@@ -209,6 +220,8 @@ pub struct PublishRequest {
     pub owner: Option<String>,
     /// Visibility is sent explicitly so server defaults cannot widen the audience chosen locally.
     pub public: bool,
+    /// Creation always sends its selected mode, independent of visibility.
+    pub encryption_enabled: bool,
     /// The code repo origins these sessions touch, for the server to build its reverse-lookup
     /// index on.
     #[serde(default)]
@@ -219,6 +232,8 @@ pub struct PublishRequest {
 pub struct PublishResponse {
     /// The immutable remote identity of the new copy.
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_enabled: Option<bool>,
     /// Immutable source identity for copy responses. A fresh publish has no
     /// source; copy callers must require this to match what they fenced.
     #[serde(default)]
@@ -233,9 +248,9 @@ pub struct PublishResponse {
 /// Share a session.
 #[derive(Debug, Serialize)]
 pub struct ShareRequest {
-    /// The content, **already encrypted locally** — the hub never sees plaintext.
-    /// The decryption key lives only in the sharing link's fragment (`#k=`) and never reaches the
-    /// server.
+    pub format_version: u32,
+    /// A public share projection, or a privacy envelope encrypted with a key in the link
+    /// fragment. The envelope's private layer requires the owner's viewing key.
     pub payload: String,
     #[serde(default)]
     pub encrypted: bool,
@@ -249,6 +264,8 @@ pub struct ShareRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ShareResponse {
+    #[serde(default)]
+    pub format_version: Option<u32>,
     pub slug: String,
     pub url: String,
     #[serde(default)]
@@ -575,6 +592,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agent.agent_id, "00000000-0000-0000-0000-000000000001");
+        assert!(agent.require_encryption_enabled().is_err());
         assert!(
             serde_json::from_str::<RemoteAgent>(
                 r#"{"owner":"me","name":"photo","clone_url":"https://hub/me/photo.git"}"#
@@ -598,6 +616,30 @@ mod tests {
             copy.forked_from.as_deref(),
             Some("00000000-0000-0000-0000-000000000001")
         );
+    }
+
+    #[test]
+    fn authoritative_mode_requires_a_boolean_and_never_defaults_on_read() {
+        let mut wire = serde_json::json!({
+            "agent_id":"00000000-0000-0000-0000-000000000001", "owner":"me",
+            "name":"photo", "clone_url":"https://hub/me/photo.git"
+        });
+        for mode in [
+            serde_json::Value::Null,
+            serde_json::json!("false"),
+            serde_json::json!(0),
+        ] {
+            wire["encryption_enabled"] = mode;
+            assert!(
+                serde_json::from_value::<RemoteAgent>(wire.clone())
+                    .map_or(true, |remote| remote.require_encryption_enabled().is_err())
+            );
+        }
+        for enabled in [false, true] {
+            wire["encryption_enabled"] = enabled.into();
+            let remote: RemoteAgent = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(remote.require_encryption_enabled().unwrap(), enabled);
+        }
     }
 }
 

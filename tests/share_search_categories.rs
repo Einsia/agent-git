@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "support/privacy_policy_sources.rs"]
+mod privacy_policy_sources;
+
 const ACCESS: &str = "SYNTHETIC-category-access";
 const REFRESH: &str = "SYNTHETIC-category-refresh";
 const CONTENT: &str = "SYNTHETIC-SAVED-SHARE-CONTENT";
@@ -26,6 +29,7 @@ enum Reply {
     Status(u16),
     TruncatedHeaders,
     EmptyList,
+    Share,
 }
 
 #[derive(Debug)]
@@ -49,6 +53,7 @@ impl Hub {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
+        let policy_hub = base.clone();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(180);
             let mut requests = Vec::new();
@@ -69,7 +74,20 @@ impl Hub {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
-                requests.push(read_request(&mut stream));
+                let request = read_request(&mut stream);
+                if let Some((status, body)) = privacy_policy_sources::route(
+                    &policy_hub,
+                    "me",
+                    &request.method,
+                    &request.target,
+                    &request.body,
+                ) {
+                    assert_eq!(request.authorization, format!("Bearer {ACCESS}"));
+                    let body = body.to_string();
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                requests.push(request);
                 assert!(requests.len() <= 16, "unexpected request replay");
                 match reply {
                     Reply::Status(status) => {
@@ -91,6 +109,10 @@ impl Hub {
                     }
                     Reply::EmptyList => {
                         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").unwrap();
+                    }
+                    Reply::Share => {
+                        let body = json!({"format_version":2,"slug":"checked","url":"https://example.invalid/s/checked"}).to_string();
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
                 }
                 stream.flush().unwrap();
@@ -392,10 +414,10 @@ fn assert_failure(output: &Output, mode: &str, code: i32, lab: &Lab, base: &str,
     assert_eq!(output.status.code(), Some(code), "{mode}: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    for secret in [ACCESS, REFRESH, CONTENT] {
+    for secret in [ACCESS, REFRESH] {
         assert!(
             !stdout.contains(secret) && !stderr.contains(secret),
-            "private content in output"
+            "private credential in output: stdout={stdout} stderr={stderr}"
         );
     }
     assert!(!stdout.contains("share created") && !stdout.contains("revoked "));
@@ -525,7 +547,7 @@ fn share_http_and_transport_failures_preserve_auth_without_replaying_writes() {
         (
             &["--yes", "share", "me/qa@chosen", "--public"],
             "POST",
-            "/api/shares",
+            "/api/shares/privacy",
         ),
     ]);
 }
@@ -610,58 +632,52 @@ fn an_empty_share_list_is_still_successful_and_keeps_credentials() {
 }
 
 #[test]
-fn secret_shares_refuse_with_policy_in_all_modes_without_contacting_the_hub() {
+fn secret_shares_publish_checked_projections_in_all_modes() {
     for secret in [BUILTIN_SECRET, REGISTERED_SECRET] {
-        let hub = Hub::new(Reply::EmptyList);
+        let hub = Hub::new(Reply::Share);
         let lab = Lab::new(&hub.base);
         lab.write_saved(secret);
         if secret == REGISTERED_SECRET {
             lab.register_secret(&hub.base);
         }
-        let before = lab.state();
+        let before = lab.git(&["rev-parse", "HEAD"]);
         for (mode, mut flags) in modes() {
             flags.extend(["--yes", "share", "me/qa@chosen", "--public"]);
             let mut command = lab.command(&hub.base, &flags);
             command.env("AGIT_ALLOW_SECRETS", "1");
-            let output = run_bounded(command);
-            assert_eq!(output.status.code(), Some(7), "{mode}: {output:?}");
+            let output = success(run_bounded(command));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let text = format!("{stdout}{stderr}");
             for private in [secret, REGISTERED_LABEL, ACCESS, REFRESH] {
-                assert!(
-                    !text.contains(private),
-                    "share refusal leaked private content"
-                );
+                assert!(!text.contains(private), "public preview disclosed a secret");
             }
-            assert!(text.contains("refusing to share"), "{output:?}");
-            assert!(!text.contains("share created"), "{output:?}");
-            assert!(!text.contains("log in with `agit login --hub"));
-            assert!(!text.contains("log in from PowerShell with"));
-            if secret == REGISTERED_SECRET {
-                assert!(text.contains("[redacted:registered-secret]"), "{output:?}");
-            } else {
-                assert!(text.contains("aws-access-token"), "{output:?}");
-            }
+            assert!(text.contains("https://example.invalid/s/checked"));
             if let Some(version) = mode.strip_prefix("json") {
                 assert!(stderr.is_empty(), "{output:?}");
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(value["schema"], "cli-output");
                 assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
-                assert_eq!(value["exit_code"], 7);
-                assert_eq!(value["ok"], false);
-                assert_eq!(value["result"]["format"], "text");
-                if version == "1" {
-                    assert!(value.get("fix").is_none());
-                } else {
-                    assert_eq!(value["fix"], json!([]));
-                }
-            } else {
-                assert!(stderr.contains("refusing to share"), "{output:?}");
+                assert_eq!(value["exit_code"], 0);
+                assert_eq!(value["ok"], true);
             }
-            assert_eq!(lab.state(), before, "{mode}: refusal changed local data");
+            assert_eq!(lab.git(&["rev-parse", "HEAD"]), before);
         }
-        assert!(hub.finish().is_empty());
+        let requests = hub.finish();
+        assert_eq!(requests.len(), modes().len());
+        for request in requests {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/api/shares/privacy");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let public: Value = serde_json::from_str(body["payload"].as_str().unwrap()).unwrap();
+            assert_eq!(public["kind"], "share");
+            assert!(public.get("private_payload").is_none());
+            for private in [secret, REGISTERED_LABEL, ACCESS, REFRESH] {
+                assert!(
+                    !public.to_string().contains(private),
+                    "public share disclosed a secret"
+                );
+            }
+        }
     }
 }
 

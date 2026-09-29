@@ -496,14 +496,41 @@ fn land(args: LandArgs) -> CmdResult {
 fn land_local(args: LandArgs) -> CmdResult {
     crate::rc::select_local_authority();
     let lineage = crate::rc::lineage::AgitSession::new(&args.slug, &args.agent_id, &args.branch)?;
-    let repo = crate::rc::local_repository::require(&lineage)?;
+    let lineage = crate::rc::capture::from_environment(lineage)?;
+    let repo = crate::rc::capture::require(&lineage)?;
     let history_update = super::migration::begin_startup_recovery_for_path(
         &lineage.repo_dir()?,
         "local-land-history",
     )?;
     let store = crate::domain::store::Store::open_or_init()?;
     let _branch_guard = crate::domain::link::lock_branch(&store, &args.slug, &args.branch)?;
-    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.link_key()?)?;
+    let key = args.link_key()?;
+    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &key)?;
+    if matches!(
+        lineage.capture,
+        Some(crate::rc::capture::RepositoryKind::HubLinked { .. })
+    ) {
+        anyhow::ensure!(
+            repo.has_ref(&format!("refs/heads/{}", args.branch)),
+            "imported capture branch is missing"
+        );
+        if let Some(existing) = crate::domain::link::get_checked(&store, &args.runtime, &key)? {
+            anyhow::ensure!(
+                existing.is_active()
+                    && existing.owner.as_deref() == Some(lineage.owner())
+                    && existing.agent.as_deref() == Some(lineage.name())
+                    && existing.branch.as_deref() == Some(lineage.branch())
+                    && existing
+                        .cwd
+                        .as_deref()
+                        .map(std::path::Path::new)
+                        .map(std::fs::canonicalize)
+                        .transpose()?
+                        == Some(std::fs::canonicalize(&args.cwd)?),
+                "imported capture claim changed before landing"
+            );
+        }
+    }
     let link = landed_link(&store, &args, lineage.name())?;
     anyhow::ensure!(
         link.merge_archive.is_none(),
@@ -576,7 +603,7 @@ fn landed_link(
         crate::domain::link::read_archive_link_snapshot(store, &args.runtime, &key)?
             .map(|snapshot| snapshot.link)
     } else {
-        crate::domain::link::get(store, &args.runtime, &key)
+        crate::domain::link::get_checked(store, &args.runtime, &key)?
     };
     let mut lk =
         existing.unwrap_or_else(|| crate::domain::link::Link::new(&args.runtime, &key, None));

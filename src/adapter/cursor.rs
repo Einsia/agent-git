@@ -111,6 +111,10 @@ impl Adapter for Cursor {
         "cursor"
     }
 
+    fn native_files_root(&self) -> Result<PathBuf> {
+        projects_dir()
+    }
+
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         let dir = projects_dir()?.join(slug_for(repo)).join(TRANSCRIPTS);
         if !dir.is_dir() {

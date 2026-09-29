@@ -312,13 +312,14 @@ impl ReadPolicy {
         }
     }
 
+    /// Apply environment and global options before adding the Git subcommand.
     pub(crate) fn apply(self, command: &mut Command) {
         if !matches!(self, Self::AllowTransport) {
             command
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .env("GIT_ALLOW_PROTOCOL", "")
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .env("GIT_GRAFT_FILE", "");
+                .env("GIT_OPTIONAL_LOCKS", "0");
+            crate::infra::git_runtime::disable_grafts(command);
             for key in [
                 "GIT_DIR",
                 "GIT_WORK_TREE",
@@ -1340,6 +1341,7 @@ impl Repo {
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .args(["-c", "core.fsmonitor=false"]);
+            crate::infra::git_runtime::disable_grafts(&mut cmd);
             for name in [
                 "GIT_DIR",
                 "GIT_WORK_TREE",
@@ -1349,7 +1351,6 @@ impl Repo {
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                 "GIT_NAMESPACE",
                 "GIT_SHALLOW_FILE",
-                "GIT_GRAFT_FILE",
                 "GIT_PREFIX",
                 "GIT_CONFIG_PARAMETERS",
                 "GIT_CONFIG_COUNT",
@@ -2537,25 +2538,53 @@ impl Repo {
 
     /// Strict raw blob read with a real `None` only when the exact path is absent.
     pub fn show_raw_result(&self, git_ref: &str, path: &str) -> Result<Option<String>> {
+        let immutable = matches!(git_ref.len(), 40 | 64)
+            && git_ref.bytes().all(|byte| byte.is_ascii_hexdigit());
         #[cfg(feature = "cli")]
         if !self.local_objects_only
             && path == crate::domain::meta::FILE
-            && matches!(git_ref.len(), 40 | 64)
-            && git_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && immutable
             && let Ok(text) = self.pinned_metadata(git_ref)
         {
             return Ok(text);
         }
+        // A complete object ID names the object even when a ref has the same spelling. Disable
+        // only that ambiguity warning; other inspection diagnostics still fail the read.
+        let immutable_snapshot = self.local_objects_only && immutable;
+        let options: &[&str] = if immutable_snapshot {
+            &["-c", "core.warnAmbiguousRefs=false"]
+        } else {
+            &[]
+        };
         let commit = self
-            .git(&["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")])?
+            .git(
+                &[
+                    options,
+                    &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
+                ]
+                .concat(),
+            )?
             .trim()
             .to_owned();
-        let entry =
-            self.git_bytes_result(&["ls-tree", "-z", "--full-name", &commit, "--", path])?;
+        if immutable_snapshot {
+            anyhow::ensure!(
+                commit.eq_ignore_ascii_case(git_ref),
+                "immutable snapshot does not name a commit object"
+            );
+        }
+        let entry = self.git_bytes_result(
+            &[
+                options,
+                &["ls-tree", "-z", "--full-name", &commit, "--", path],
+            ]
+            .concat(),
+        )?;
         if entry.is_empty() {
             return Ok(None);
         }
-        let bytes = self.git_bytes_result(&["cat-file", "blob", &format!("{commit}:{path}")])?;
+        let bytes = self.git_bytes_result(
+            &[options, &["cat-file", "blob", &format!("{commit}:{path}")]].concat(),
+        )?;
         String::from_utf8(bytes)
             .with_context(|| format!("{git_ref}:{path} is not UTF-8"))
             .map(Some)
@@ -3214,6 +3243,43 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
                 .unwrap(),
             repo.root().join(".git").canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn local_inspection_reads_stored_parents_despite_repository_grafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        for content in ["root", "tip"] {
+            std::fs::write(repo.root().join("fixture"), content).unwrap();
+            repo.add_all().unwrap();
+            repo.commit(content).unwrap();
+        }
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let history = repo.git(&["rev-list", "--first-parent", &head]).unwrap();
+        assert!(history.lines().count() > 1);
+        assert_eq!(
+            repo.clone()
+                .local_objects_only()
+                .git(&["rev-list", "--first-parent", &head])
+                .unwrap(),
+            history
+        );
+        let graft = repo.git_path("info/grafts").unwrap();
+        std::fs::create_dir_all(graft.parent().unwrap()).unwrap();
+        let graft_content = format!("{head}\n");
+        std::fs::write(&graft, &graft_content).unwrap();
+        assert_eq!(
+            repo.git(&["rev-list", "--first-parent", &head]).unwrap(),
+            head
+        );
+
+        assert_eq!(
+            repo.local_objects_only()
+                .git(&["rev-list", "--first-parent", &head])
+                .unwrap(),
+            history
+        );
+        assert_eq!(std::fs::read_to_string(graft).unwrap(), graft_content);
     }
 
     #[test]

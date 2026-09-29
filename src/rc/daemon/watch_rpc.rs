@@ -323,6 +323,7 @@ impl Daemon {
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            publication: None,
             session_id: watch_id.clone(),
             native_source: enrolled.as_ref().map(|watch| watch.identity()),
             runtime_session_id: Some(
@@ -405,11 +406,16 @@ impl Daemon {
         // freezes a snapshot on this stream, which keeps allowing by the old
         // rules after `agit rc secrets reload`.
         let secret_filter = self.secret_filter.clone();
+        let native_id = enrolled
+            .as_ref()
+            .map(|watch| watch.native_id.as_str())
+            .unwrap_or(&request.session_id);
         let mut redactor = crate::domain::redact::Redactor::with_registered(
             crate::domain::redact::Persona::this_machine(),
             secret_filter,
         )
-        .for_device_control();
+        .for_device_control()
+        .with_unbound_native_context(&runtime, native_id);
         if let Some(root) = &protection_repo {
             redactor = redactor.with_repository(root).map_err(|_| {
                 RpcError::new(
@@ -417,10 +423,6 @@ impl Daemon {
                     "session protection context is unavailable",
                 )
             })?;
-            let native_id = enrolled
-                .as_ref()
-                .map(|watch| watch.native_id.as_str())
-                .unwrap_or(&request.session_id);
             redactor = redactor.with_native_context(&runtime, native_id, &cwd, root);
             redactor = redactor.with_native_source(enrolled.as_ref().map(|watch| watch.identity()));
         }

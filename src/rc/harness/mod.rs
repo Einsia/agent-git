@@ -195,6 +195,14 @@ fn lineage_env(lineage: Option<&crate::rc::lineage::AgitSession>) -> Vec<(String
     let mut env = vec![(SUPERVISED_HOOK_ENV.into(), "1".into())];
     if let Some(lineage) = lineage {
         env.push(("AGIT_SESSION".into(), lineage.to_string()));
+        if let Some(kind) = &lineage.capture {
+            env.push((
+                crate::rc::capture::CAPTURE_ENV.into(),
+                serde_json::to_string(kind).expect("capture kind serializes"),
+            ));
+            env.push(("AGIT_LOCAL_AGENT_ID".into(), lineage.agent_id().into()));
+            return env;
+        }
         env.push((
             crate::hub::identity::EXPECTED_AGENT_ID_ENV.into(),
             lineage.agent_id().into(),

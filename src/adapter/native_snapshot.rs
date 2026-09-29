@@ -203,6 +203,14 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
             .is_some_and(|extension| extension == "jsonl")
             && match runtime {
                 "codex" => super::codex::id_from_filename(path).as_deref() == Some(id),
+                "cursor" => {
+                    path.file_stem().is_some_and(|stem| stem == id)
+                        && path.strip_prefix(root).is_ok_and(|relative| {
+                            relative
+                                .components()
+                                .any(|part| part.as_os_str() == "agent-transcripts")
+                        })
+                }
                 _ => path.file_stem().is_some_and(|stem| stem == id),
             };
         if matches {

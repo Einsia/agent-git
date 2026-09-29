@@ -5,6 +5,14 @@ description: Start and manage owner-authorized remote agent sessions.
 
 # Remote control
 
+When the user wants to continue an encrypted cloned session through Workspaces, first follow
+[privacy](privacy.md#guide-the-user-through-password-operations) for any required recovery.
+Explain that the owner supplies the repository viewing password and that the user enters it
+with the provided CLI unlock command on the RC execution machine. Then prepare the selected
+session under its normal resume/run rules before attaching through RC. Starting the daemon
+alone needs no viewing password and does not decrypt a cloned session; recovered originals
+remain subject to RC output protection.
+
 Run this on the machine where your code and agent runtime are installed:
 
 ```sh

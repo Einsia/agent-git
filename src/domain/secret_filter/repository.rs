@@ -14,7 +14,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -179,6 +179,32 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         self.store.path.exists()
     }
 
+    /// Reuse requires an authenticated dictionary even when no source token needs expansion.
+    pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
+        self.store.with_lock(|| {
+            let (unlocked, records) = match std::fs::symlink_metadata(&self.store.path) {
+                Ok(_) => {
+                    let unlocked = self
+                        .store
+                        .unlock_file(super::read_vault(&self.store.path)?, true)?;
+                    let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
+                    (Some(unlocked), records)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, vec![]),
+                Err(error) => return Err(error.into()),
+            };
+            let allowed = local_allowlist(&records, &Matcher::empty(), unlocked.as_ref())?;
+            let values = allowed.values.into_iter().collect::<BTreeSet<_>>();
+            let identities = allowed.identities.into_iter().collect::<BTreeSet<_>>();
+            let bytes = Zeroizing::new(serde_json::to_vec(&(
+                unlocked.as_ref().map(|value| &value.file),
+                values,
+                identities,
+            ))?);
+            Ok(crate::domain::privacy_envelope::digest_bytes(&bytes))
+        })
+    }
+
     /// Protect a JSONL transcript on decoded JSON strings, not on its escaped
     /// wire representation. Malformed/truncated lines fall back to literal text
     /// so the transformation remains fail-closed for readable bytes.
@@ -281,7 +307,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         instance: &str,
         cwd: &Path,
     ) -> crate::Result<ProtectionReport> {
-        use crate::domain::secrets::identity::{Evidence, RecordMask, native_session_pointers};
+        use crate::domain::secrets::identity::{Evidence, native_record_mask};
         let repo = self.repo_root.as_ref().map(crate::domain::repo::Repo::at);
         let mut evidence = repo.as_ref().map(|repo| Evidence::new(repo, cwd));
         if let Some(evidence) = &mut evidence {
@@ -291,17 +317,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             if let Some(evidence) = &mut evidence {
                 evidence.record(runtime, native, value)
             } else {
-                RecordMask(
-                    native_session_pointers(runtime, native, value)
-                        .into_iter()
-                        .filter_map(|pointer| {
-                            Some((
-                                pointer.to_owned(),
-                                0..value.pointer(pointer)?.as_str()?.len(),
-                            ))
-                        })
-                        .collect(),
-                )
+                native_record_mask(runtime, native, value)
             }
         })
     }
@@ -489,8 +505,103 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         committed: &str,
         live: &str,
     ) -> crate::Result<(HydrationReport, HydrationReport)> {
-        self.with_readonly_hydrator(&[committed, live], None, None, |hydrate| {
+        self.with_readonly_hydrator(&[committed, live], None, None, None, |hydrate| {
             Ok((hydrate(committed)?, hydrate(live)?))
+        })
+    }
+
+    /// Only resolved values from these inputs accompany an encrypted publication. Exporting
+    /// unrelated dictionary entries would disclose secrets outside the selected session.
+    pub(crate) fn hydrate_publication_inputs(
+        &self,
+        inputs: &[&str],
+    ) -> crate::Result<(Vec<HydrationReport>, BTreeSet<String>)> {
+        let mut values = BTreeSet::new();
+        let reports = self.with_readonly_hydrator(
+            inputs,
+            Some(32 * 1024 * 1024),
+            None,
+            Some(&mut values),
+            |hydrate| inputs.iter().copied().map(hydrate).collect(),
+        )?;
+        Ok((reports, values))
+    }
+
+    pub(crate) fn hydrate_publication_snapshot(
+        &self,
+        native: &str,
+        metadata: &mut crate::domain::meta::Meta,
+    ) -> crate::Result<(HydrationReport, BTreeSet<String>)> {
+        let fields = observation_fields(metadata);
+        let input = serde_json::to_string(&fields)?;
+        let (mut reports, values) = self.hydrate_publication_inputs(&[native, &input])?;
+        let observations = reports.pop().expect("metadata hydration report");
+        anyhow::ensure!(
+            observations.unresolved == 0,
+            "publication metadata has unresolved secret placeholders; restore the source dictionary or unlock the original publication"
+        );
+        let hydrated: Vec<String> = serde_json::from_str(&observations.text)?;
+        for (field, value) in fields.into_iter().zip(hydrated) {
+            *field = value;
+        }
+        Ok((reports.remove(0), values))
+    }
+
+    pub(crate) fn publication_values_matching(
+        &self,
+        used: impl Fn(&str) -> bool,
+    ) -> crate::Result<BTreeSet<String>> {
+        Ok(self.active_matcher()?.publication_values_matching(used))
+    }
+
+    /// Imported values only add local protection; source rule names and allowances carry no
+    /// authority on this device. Persist the complete set before recovered text is made usable.
+    pub(crate) fn import_publication_values(&self, values: &BTreeSet<String>) -> crate::Result<()> {
+        anyhow::ensure!(
+            values
+                .iter()
+                .all(|value| !value.is_empty() && value.len() <= MAX_REPOSITORY_SECRET_BYTES),
+            "invalid recovered protection value"
+        );
+        if values.is_empty() {
+            return Ok(());
+        }
+        self.store.with_lock(|| {
+            let created = !self.store.path.exists();
+            let mut unlocked = if created {
+                self.store.create_unlocked()?
+            } else {
+                self.store.unlock_existing()?
+            };
+            let mut records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
+            let now = chrono::Utc::now().to_rfc3339();
+            for value in values {
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.secret.as_str() == value)
+                {
+                    if !record.origins.contains(&RecordOrigin::Explicit) {
+                        record.origins.push(RecordOrigin::Explicit);
+                    }
+                    record.explicit_block = true;
+                    record.updated_at = now.clone();
+                    reseal_record(&mut unlocked, record)?;
+                } else {
+                    let record = DecryptedRecord {
+                        id: format!("sec_{}", uuid::Uuid::now_v7().simple()),
+                        name: "Recovered session secret".into(),
+                        secret: Zeroizing::new(value.clone()),
+                        origins: vec![RecordOrigin::Explicit],
+                        heuristic_disposition: super::HeuristicDisposition::Protect,
+                        explicit_block: true,
+                        declaration: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+                    append_record(&mut unlocked, &record)?;
+                }
+            }
+            bump_and_write(&self.store, &mut unlocked, created)
         })
     }
 
@@ -516,6 +627,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             inputs,
             Some(max_output_bytes),
             dictionary_limits,
+            None,
             |hydrate| Ok(inputs.iter().copied().map(hydrate).collect()),
         )
     }
@@ -525,6 +637,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         inputs: &[&str],
         max_output_bytes: Option<usize>,
         dictionary_limits: Option<ReadonlyDictionaryLimits>,
+        mut recovered_values: Option<&mut BTreeSet<String>>,
         consume: impl FnOnce(&mut dyn FnMut(&str) -> crate::Result<HydrationReport>) -> crate::Result<T>,
     ) -> crate::Result<T> {
         let mut budget = max_output_bytes.map(HydrationBudget::new);
@@ -585,10 +698,15 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                     .count();
                 Ok(match &matcher {
                     Some(matcher) => {
-                        if let Some(budget) = &mut budget {
+                        if budget.is_some() || recovered_values.is_some() {
                             for found in matcher.find_iter(value.as_bytes()) {
-                                budget
-                                    .reserve_escaped(secrets[found.pattern().as_usize()].len())?;
+                                let secret = secrets[found.pattern().as_usize()];
+                                if let Some(budget) = &mut budget {
+                                    budget.reserve_escaped(secret.len())?;
+                                }
+                                if let Some(values) = &mut recovered_values {
+                                    values.insert(secret.to_owned());
+                                }
                             }
                         }
                         replace_known_tokens(value, matcher, &secrets)
@@ -703,23 +821,46 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     }
 
     pub(crate) fn active_matcher(&self) -> crate::Result<Matcher> {
-        self.matcher_for(false)
+        self.matcher_for(false, None)
     }
 
     pub(crate) fn registered_matcher(&self) -> crate::Result<Matcher> {
-        self.matcher_for(true)
+        self.matcher_for(true, None)
     }
 
-    fn matcher_for(&self, registered_only: bool) -> crate::Result<Matcher> {
+    pub(crate) fn copy_matcher(&self, identities: &HashSet<String>) -> crate::Result<Matcher> {
+        self.matcher_for(false, Some(identities))
+    }
+
+    fn matcher_for(
+        &self,
+        registered_only: bool,
+        copy_identities: Option<&HashSet<String>>,
+    ) -> crate::Result<Matcher> {
         self.store.with_lock(|| {
             if !self.store.path.exists() {
                 return Ok(Matcher::empty()
-                    .with_allowlist(local_allowlist(&[], &Matcher::empty(), None)?.values));
+                    .with_allowlist(local_allowlist(&[], &Matcher::empty(), None)?.values)
+                    .with_repository_identities(copy_identities.cloned().unwrap_or_default()));
             }
             let unlocked = self.store.unlock_existing()?;
             let generation = unlocked.file.generation;
-            let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
-            let allowlist = local_allowlist(&records, &Matcher::empty(), Some(&unlocked))?;
+            let mut records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
+            let allowlist = if let Some(identities) = copy_identities {
+                for record in &mut records {
+                    if record.declaration.is_some()
+                        || record.heuristic_disposition == super::HeuristicDisposition::Allow
+                    {
+                        record.heuristic_disposition = super::HeuristicDisposition::Protect;
+                        record.origins.push(RecordOrigin::Heuristic);
+                    }
+                }
+                let mut allowlist = local_allowlist(&[], &Matcher::empty(), None)?;
+                allowlist.identities = identities.clone();
+                allowlist
+            } else {
+                local_allowlist(&records, &Matcher::empty(), Some(&unlocked))?
+            };
             let records = records
                 .into_iter()
                 .filter(|record| {

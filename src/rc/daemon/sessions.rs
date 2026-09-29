@@ -83,6 +83,55 @@ impl Daemon {
                 }
             }
         }
+        // Dormant roster identities must remain discoverable after a daemon restart.
+        // Native rows stay available for read-only history and explicit resume.
+        let mut dormant = Vec::new();
+        for (id, entry) in &self.roster.sessions {
+            if self.sessions.contains_key(id)
+                || entry.workspace_id != caller.workspace_id
+                || entry.native_source.is_some()
+            {
+                continue;
+            }
+            let Some(row) = native.get(&(entry.runtime.as_str(), entry.thread_id.as_str())) else {
+                continue;
+            };
+            if row.cwd != entry.cwd || policy::require_within(Path::new(&entry.cwd), roots).is_err()
+            {
+                continue;
+            }
+            let lineage = entry
+                .agit_session
+                .as_deref()
+                .zip(entry.expected_agent_id.as_deref())
+                .and_then(|(route, identity)| {
+                    crate::rc::lineage::AgitSession::parse(route, identity).ok()
+                });
+            dormant.push(self.stamped(SessionInfo {
+                publication: None,
+                native_source: None,
+                session_id: id.clone(),
+                runtime_session_id: Some(entry.thread_id.clone()),
+                workspace_id: entry.workspace_id.clone(),
+                project_id: entry.project_id.clone(),
+                runtime: entry.runtime.clone(),
+                agent: lineage.as_ref().map(|lineage| lineage.slug()),
+                branch: lineage.as_ref().map(|lineage| lineage.branch().into()),
+                status: SessionStatus::Ended,
+                last_seq: 0,
+                title: row.title.clone(),
+                gist: row.gist.clone(),
+                dangerous: self.roster.transcript_ever_dangerous(
+                    &entry.runtime,
+                    &entry.thread_id,
+                    &entry.workspace_id,
+                    &entry.cwd,
+                ),
+                permission_mode: entry.restart_permission_mode(),
+                created_at: row.modified_at.clone(),
+                updated_at: row.modified_at.clone(),
+            }));
+        }
         let snapshot = self.local_session_scan(&caller.workspace_id);
         let local = local
             .into_iter()
@@ -93,6 +142,7 @@ impl Daemon {
             .values()
             .filter(|session| session.info.workspace_id == caller.workspace_id)
             .map(|session| self.stamped(session.info.clone()))
+            .chain(dormant)
             .collect();
         Ok(serde_json::to_value(SessionListResult { sessions, local }).unwrap())
     }
@@ -266,6 +316,7 @@ impl Daemon {
             };
             let now = chrono::Utc::now().to_rfc3339();
             let info = SessionInfo {
+                publication: None,
                 session_id: p.session_id.clone(),
                 native_source: None,
                 runtime_session_id: None,
@@ -401,9 +452,8 @@ impl Daemon {
             .roster
             .logical_for_thread(&runtime, &p.session_id, &p.workspace_id)
             .unwrap_or_else(crate::domain::meta::mint_session_id);
-        // The hub fills in lineage (only it knows which repo this project maps to). Without it,
-        // a session taken over from a terminal runs to the end and still **settles no commit** —
-        // `agit commit --from-hook` cannot resolve which branch to record on.
+        // Local-owner capture resolves the exact native claim before launch; delegated
+        // controllers retain negotiated lineage and cannot select a different local claim.
         let prior = self.roster.get(&logical).cloned();
         // A roster row that already names a repository is this conversation's
         // first local identity claim. It wins over current wire params. In
@@ -466,6 +516,7 @@ impl Daemon {
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            publication: None,
             session_id: logical,
             native_source: None,
             runtime_session_id: None,
@@ -809,6 +860,7 @@ impl Daemon {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            publication: None,
             session_id: session_id.clone(),
             native_source: if p.runtime == "codex" {
                 crate::rc::runtime_sources::Registry::open()
@@ -968,7 +1020,7 @@ impl Daemon {
     pub(super) fn prepare_spawn(
         &mut self,
         mut info: SessionInfo,
-        spec: LaunchSpec,
+        mut spec: LaunchSpec,
         danger: danger::TranscriptDanger,
         frames: &mpsc::Sender<Frame>,
         prompt: Option<String>,
@@ -990,15 +1042,22 @@ impl Daemon {
                 "this launch resumes a harness transcript that was never cleared for this caller",
             )));
         }
-        if self.opts.local_owner
-            && let Some(lineage) = &spec.agit_session
-        {
-            crate::rc::local_repository::require(lineage).map_err(|e| {
-                SpawnFailure::before_launch(RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))
-            })?;
-        }
         self.require_launch_slot(&info, &spec)?;
         danger::stamp(&mut info, danger);
+        if self.opts.local_owner
+            && spec.resume_from.is_none()
+            && let Some(lineage) = &mut spec.agit_session
+        {
+            crate::rc::local_repository::require(lineage).map_err(|error| {
+                SpawnFailure::before_launch(RpcError::new(
+                    ErrorCode::PathNotAllowed,
+                    error.to_string(),
+                ))
+            })?;
+            lineage.capture = Some(crate::rc::capture::RepositoryKind::DeviceLocal {
+                agent_id: lineage.agent_id().into(),
+            });
+        }
         let session_id = info.session_id.clone();
         // Capture only ambiguity inherited by this new harness generation.
         // A same-generation turn can arm another token after spawn; Ready must
@@ -1133,6 +1192,9 @@ impl Daemon {
         );
         let confinement = self.confinement_for(&info.workspace_id);
         Ok(PreparedSpawn {
+            prior_entry: self.roster.get(&info.session_id).cloned(),
+            prior_capture: self.roster.captures.get(&info.session_id).cloned(),
+            incarnation: self.identity.instance_id.clone(),
             authority: Default::default(),
             epoch: self.settlement.borrow().epoch,
             #[cfg(test)]
@@ -1147,6 +1209,7 @@ impl Daemon {
             confinement,
             settlement: self.settlement.subscribe(),
             secret_filter: self.secret_filter.clone(),
+            local_owner: self.opts.local_owner,
             prompt,
             attribution,
         })

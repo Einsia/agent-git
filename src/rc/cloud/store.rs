@@ -132,7 +132,7 @@ pub fn load(hub: &str) -> crate::Result<Option<Enrollment>> {
     load_in(&super::super::rc_dir()?, hub)
 }
 
-fn load_in(directory: &Path, hub: &str) -> crate::Result<Option<Enrollment>> {
+pub(in crate::rc) fn load_in(directory: &Path, hub: &str) -> crate::Result<Option<Enrollment>> {
     let Some(stored) = read::<Stored>(&directory.join(filename(hub)?), MAX_RECORD)? else {
         return Ok(None);
     };

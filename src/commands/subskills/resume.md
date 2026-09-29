@@ -37,6 +37,17 @@ This grouping offers candidates; it does not select a session target.
 
 Preparing the same branch tip, runtime, and directory again reuses the existing runtime session when its recorded baseline remains valid. Without `--force`, a materialized instance whose branch advanced is superseded only when its recorded baseline proves that no new content exists; otherwise resume refuses before creating another writer.
 
+After `privacy unlock`, resume installs the original private VIEW through the ordinary runtime
+installer. Same-runtime history retains native roles, models, tool records and other native fields;
+cross-runtime conversion uses the usual loss warnings. Uncontinued legacy quoted recoveries are
+rebuilt from the verified cache, preserving the old transcript and recording its replacement.
+Legacy recoveries with new conversation must be committed before automatic replacement.
+
+If an encrypted snapshot needs recovery, follow the user handoff in
+[privacy](privacy.md#guide-the-user-through-password-operations). Explain the viewing password
+and provide the exact unlock command for the execution machine; wait for recovery before
+preparing continuation from original context.
+
 Instance ownership is scoped to the selected local AgentGit store (`AGIT_HOME`, default `~/.agit`). New claims in `store/<runtime>/<native-id>.json` bind the native session to its owner/repository and branch; materialized claims also record the baseline used to detect unsettled content. Resume rechecks active claims and the selected branch head under local locks. Separate stores have separate claims, even on the same machine. A serialized `runtime_instances` field is retained for compatibility, but is not populated as an active registry or consulted for ownership.
 
 Resume can prepare locally available history offline and does not acquire a Hub branch lease. It cannot establish whether another machine is still running the same branch. If machines advance independently, reconcile the histories explicitly with merge or fork. `--force` deliberately replaces local active claims even when their transcripts cannot be proven settled; it leaves those transcripts available for recovery. It cannot revoke an instance on another machine, and the selected branch and tracking-history checks still apply. Remote Control operates through the connected machine's daemon and does not turn this local claim mechanism into a global branch lease.

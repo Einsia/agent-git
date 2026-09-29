@@ -21,6 +21,7 @@ pub struct Picked {
     pub name: String,
     pub bind: bool,
     pub auto_push: Option<bool>,
+    pub encryption: Option<bool>,
     /// `None` means seed was not requested. `Some` is the exact set confirmed in the asset screen.
     pub seed_assets: Option<Vec<(PathBuf, PathBuf)>>,
 }
@@ -32,6 +33,8 @@ struct Form {
     seed: bool,
     auto_push: Option<bool>,
     user_auto_push: bool,
+    encryption: Option<bool>,
+    user_encryption: bool,
     field: Field,
     editing: bool,
     notice: Option<String>,
@@ -45,6 +48,8 @@ impl Default for Form {
             seed: false,
             auto_push: None,
             user_auto_push: false,
+            encryption: None,
+            user_encryption: true,
             field: Field::Name,
             editing: false,
             notice: None,
@@ -58,6 +63,7 @@ enum Field {
     Bind,
     Seed,
     AutoPush,
+    Encryption,
     Create,
 }
 
@@ -67,7 +73,8 @@ impl Field {
             Field::Name => Field::Bind,
             Field::Bind => Field::Seed,
             Field::Seed => Field::AutoPush,
-            Field::AutoPush => Field::Create,
+            Field::AutoPush => Field::Encryption,
+            Field::Encryption => Field::Create,
             Field::Create => Field::Name,
         }
     }
@@ -77,7 +84,8 @@ impl Field {
             Field::Name => Field::Create,
             Field::Bind => Field::Name,
             Field::Seed => Field::Bind,
-            Field::Create => Field::AutoPush,
+            Field::Create => Field::Encryption,
+            Field::Encryption => Field::AutoPush,
             Field::AutoPush => Field::Seed,
         }
     }
@@ -88,7 +96,8 @@ impl Field {
             Field::Bind => 1,
             Field::Seed => 2,
             Field::AutoPush => 3,
-            Field::Create => 4,
+            Field::Encryption => 4,
+            Field::Create => 5,
         }
     }
 }
@@ -120,6 +129,7 @@ fn pick_telemetry_inner(cwd: &Path) -> crate::Result<Option<Picked>> {
     let assets = crate::commands::init::find_seed_assets(cwd);
     let mut form = Form {
         user_auto_push: crate::infra::config::auto_push_default()?,
+        user_encryption: crate::infra::config::encryption_default()?,
         ..Default::default()
     };
     let mut selected = vec![false; assets.len()];
@@ -145,6 +155,7 @@ fn pick_telemetry_inner(cwd: &Path) -> crate::Result<Option<Picked>> {
                                 name: form.name.trim().to_string(),
                                 bind: form.bind,
                                 auto_push: form.auto_push,
+                                encryption: form.encryption,
                                 seed_assets: Some(picked),
                             });
                         }
@@ -157,6 +168,7 @@ fn pick_telemetry_inner(cwd: &Path) -> crate::Result<Option<Picked>> {
                         name: form.name.trim().to_string(),
                         bind: form.bind,
                         auto_push: form.auto_push,
+                        encryption: form.encryption,
                         seed_assets: form.seed.then(Vec::new),
                     });
                 }
@@ -224,6 +236,7 @@ fn form_loop(
                 Field::Bind => form.bind = !form.bind,
                 Field::Seed => toggle_file_import(form, asset_count),
                 Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
+                Field::Encryption => form.encryption = cycle_auto_push(form.encryption),
                 _ => {}
             },
             KeyCode::Enter => match form.field {
@@ -231,6 +244,7 @@ fn form_loop(
                 Field::Bind => form.bind = !form.bind,
                 Field::Seed => toggle_file_import(form, asset_count),
                 Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
+                Field::Encryption => form.encryption = cycle_auto_push(form.encryption),
                 Field::Create => match validate_name(&form.name) {
                     Ok(()) => return Ok(FormOutcome::Submit),
                     Err(error) => {
@@ -382,6 +396,15 @@ fn draw_form(
                 None => "off [-] user preference",
             }
         )),
+        ListItem::new(format!(
+            "encryption       {}",
+            match form.encryption {
+                Some(true) => "on  [x] new Hub repository",
+                Some(false) => "off [ ] new Hub repository",
+                None if form.user_encryption => "on  [-] creation default",
+                None => "off [-] creation default",
+            }
+        )),
         ListItem::new(
             if owner == "local" && form.auto_push.unwrap_or(form.user_auto_push) {
                 "create repo      sign in, then create"
@@ -461,6 +484,7 @@ fn field_detail(form: &Form, asset_count: usize) -> String {
         Field::Seed if form.seed => "After Create, review the found instructions and skills one by one. Only the files you select will be copied into the Agent repo.".into(),
         Field::Seed => "Enable this to review instructions and skills from this folder before copying selected files into the Agent repo.".into(),
         Field::AutoPush => "Choose whether settled turns are pushed automatically or kept local. Inherit uses your user preference. Automatic push requires signing in and still checks content before publishing.".into(),
+        Field::Encryption => "Choose encryption for a new Hub repository. Inherit uses privacy.encryption at creation. An existing Hub repository keeps its fixed mode. This does not enable automatic uploads.".into(),
         Field::Create => "Creates the Agent repo and its main line of shared instructions and skills using the choices above. This does not start an agent session.".into(),
     }
 }

@@ -277,6 +277,47 @@ fn later_object_failure_keeps_partial_copies_owned_until_cleanup() {
 }
 
 #[test]
+fn recovery_checks_budget_and_integrity_without_overriding_local_corruption() {
+    let (source, pointer) = cache(b"payload");
+    let path = object_path(source.path(), &pointer);
+    std::fs::write(&path, b"corrupt").unwrap();
+    let error = StagedLfsPayloads::stage_with_recovery(
+        source.path(),
+        std::slice::from_ref(&pointer),
+        pointer.size,
+        tempfile::tempdir().unwrap(),
+        |_| panic!("local corruption must not trigger recovery"),
+    )
+    .unwrap_err();
+    assert_eq!(error.failure(), LfsStagingFailure::Integrity);
+    std::fs::remove_file(&path).unwrap();
+    let error = StagedLfsPayloads::stage_with_recovery(
+        source.path(),
+        std::slice::from_ref(&pointer),
+        pointer.size - 1,
+        tempfile::tempdir().unwrap(),
+        |_| panic!("over-budget content must not trigger recovery"),
+    )
+    .unwrap_err();
+    assert_eq!(error.failure(), LfsStagingFailure::Budget);
+    let error = StagedLfsPayloads::stage_with_recovery(
+        source.path(),
+        std::slice::from_ref(&pointer),
+        pointer.size,
+        tempfile::tempdir().unwrap(),
+        |_| {
+            let mut input = tempfile::tempfile().unwrap();
+            std::io::Write::write_all(&mut input, b"corrupt").unwrap();
+            input.rewind().unwrap();
+            Ok(input)
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.failure(), LfsStagingFailure::Integrity);
+    assert!(!path.exists());
+}
+
+#[test]
 fn an_open_source_handle_does_not_follow_a_replaced_cache_path() {
     let (source, pointer) = cache(b"original");
     let path = object_path(source.path(), &pointer);

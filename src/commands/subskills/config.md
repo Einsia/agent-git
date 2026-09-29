@@ -54,9 +54,27 @@ JSON reads and successful writes distinguish `effective`, `stored`, and `source`
 (`environment`, `stored`, `default`, or `unset`). When an environment override is
 active, a successful write still reports that override as effective alongside
 the newly stored value. `operation` identifies `list`, `get`, `set`, or `unset`.
-Values retain the configuration's string representation, including booleans.
+Existing settings retain their string representation, including booleans.
+`privacy.encryption` returns JSON booleans for `effective` and `stored` (or null
+when unset), with `scope: "creation_default"`.
 An unset `commit.auto` has the effective default `true`; displaying it never
 writes that default to disk.
+
+## Encryption creation default
+
+`privacy.encryption` accepts `true` or `false` and defaults to `true`. It selects
+encryption when creating a new Hub repository. An existing repository's mode is
+fixed at creation and does not follow later preference changes. Visibility and
+automatic uploading are independent settings.
+
+```bash
+agit config privacy.encryption false
+agit config privacy.encryption --json
+agit config --unset privacy.encryption
+```
+
+Unsetting the preference restores the default of `true`. The global config
+editor shows the effective value, stored value and source separately.
 
 ## Automatic publishing
 
@@ -70,6 +88,27 @@ agit config --repo alice/project --unset push.auto
 agit config --repo alice/project --list --json
 ```
 
-Only `push.auto` currently supports `--repo`. Repository JSON results distinguish `repository` from `inherited` values. This changes the Agent repo preference, not the project code repository.
+`push.auto` supports a repository override. `privacy.encryption` is read-only at
+repository scope: an established repository returns the authoritative Hub mode,
+`source: "hub"`, `scope: "repository_mode"`, `fixed: true` and its immutable
+`agent_id`. A purely local repository reports `scope: "creation_intent"` and
+`fixed: false`; that intent applies only when creating a new destination.
+A device-local RC repository reads the mode of its confirmed Hub destination;
+`publication_repository` names that destination separately from the local repository.
+Repository set/unset of `privacy.encryption` is refused. Mode lookup errors or
+an unsupported Hub response are errors, never a disabled-mode default.
 
-When enabled, a successful session settlement publishes its selected branch after releasing local locks. Installed Stop hooks use the same behavior. Empty settlements send nothing. Automatic pushes retain the normal identity, access, visibility and secret checks, and never accept a read-only clone promotion prompt. A failed upload leaves the local commit intact; run `agit push <owner/repo>@<branch>` to inspect and retry. The RC supervisor retains control of its own publication flow.
+Repository `push.auto` JSON results distinguish `repository` from `inherited`
+values. This changes the Agent repo preference, not the project code repository.
+
+After enabling, run `agit push <owner/repo>@<branch>` to inspect and confirm the
+destination and mode. Successful publication stores local authorization bound to
+the account, immutable repository, URL, visibility and mode. Encrypted consent also
+binds the privacy policy and current recipient; ordinary consent requires neither.
+A successful settlement then publishes its selected branch after releasing local
+locks. Installed Stop hooks use the same behavior; empty settlements send nothing.
+Automatic push retains inspection and authority checks. Changed consent inputs
+require another explicit push, and `--yes` cannot substitute for saved consent.
+Automatic publication cannot create or promote a destination. A failed upload
+leaves the local commit intact; run an explicit push to inspect and retry. RC uses
+the same authoritative mode and requires a durable backend acknowledgement.

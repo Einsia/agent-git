@@ -151,7 +151,7 @@ impl Lab {
         if supervised {
             command.env(agit::rc::harness::SUPERVISED_HOOK_ENV, "1");
         }
-        command.args(["push", target, "--all", "--dry-run"]);
+        command.args(["push", target, "--all", "--dry-run", "--encryption=false"]);
         command
     }
 
@@ -244,7 +244,7 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
                 _ => {}
             }
             let output = lab.push_output(&mut command);
-            assert_output(&output, mode, 4, "is malformed");
+            assert_output(&output, mode, 4, "inspection local policy is unavailable");
             assert_eq!(lab.state(), blocked);
             assert_eq!(lab.git(&repo, &["show-ref"]), refs);
             lab.no_requests();
@@ -256,7 +256,12 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
                 command.arg("--allow-secrets");
             }
             let invalid_config = lab.push_output(&mut command);
-            assert_output(&invalid_config, mode, 2, "takes `os` or `file`");
+            assert_output(
+                &invalid_config,
+                mode,
+                2,
+                "inspection configuration is invalid",
+            );
             assert_eq!(lab.state(), blocked);
             lab.no_requests();
         }
@@ -269,9 +274,17 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
         lab.no_requests();
 
         fs::write(repo.join("AGENTS.md"), format!("Secret: {SECRET}\n")).unwrap();
+        lab.git(&repo, &["add", "."]);
+        lab.git(&repo, &["commit", "-m", "Record protected content"]);
+        let refs = lab.git(&repo, &["show-ref"]);
         let policy_state = lab.state();
         let policy = lab.push("alice/qa", mode, false);
-        assert_output(&policy, mode, 7, "publish blocked");
+        assert_output(
+            &policy,
+            mode,
+            7,
+            "ordinary publication contains secret findings",
+        );
         assert!(!String::from_utf8_lossy(&policy.stdout).contains(SECRET));
         assert!(!String::from_utf8_lossy(&policy.stderr).contains(SECRET));
         assert_eq!(lab.state(), policy_state);
@@ -356,11 +369,13 @@ fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
         &["commit", "-m", "Remove sensitive pointer from tip"],
     );
     let refs = lab.git(&repo, &["show-ref"]);
-    let output = lab.push_output(
-        lab.command(env!("CARGO_BIN_EXE_agit"))
-            .args(["push", "alice/qa", "--all"]),
-    );
-    assert_output(&output, "human", 1, "cannot complete the secret scan");
+    let output = lab.push_output(lab.command(env!("CARGO_BIN_EXE_agit")).args([
+        "push",
+        "alice/qa",
+        "--all",
+        "--encryption=false",
+    ]));
+    assert_output(&output, "human", 1, "unsupported Git LFS pointer version");
     assert_eq!(lab.git(&repo, &["show-ref"]), refs);
     lab.no_requests();
 }

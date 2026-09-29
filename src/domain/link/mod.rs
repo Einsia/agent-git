@@ -65,6 +65,15 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Local recovery evidence must stay pinned until settlement retains it in branch history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyRecovery {
+    pub commit: String,
+    pub manifest_digest: String,
+}
+
+pub const NATIVE_PRIVACY_RECOVERY_FORMAT: &str = "native-v1";
+
 /// One session link in the store.
 ///
 /// `source` / `session_id` come from the file path and are never persisted (see the module
@@ -103,6 +112,10 @@ pub struct Link {
     /// idempotent repeat from a branch that advanced and needs a fresh materialization. A
     /// successful settlement advances this tip together with the byte baseline.
     pub materialized_from: Option<String>,
+    /// The private snapshot used to render the baseline; absence never substitutes public bytes.
+    pub privacy_recovery: Option<PrivacyRecovery>,
+    /// Absent on a bound recovery means the baseline contains legacy quoted history.
+    pub privacy_recovery_format: Option<String>,
     /// The runtime instance that replaced this claim, in `<runtime>/<session-id>` form.
     ///
     /// The transcript remains in the runtime for recovery, but a superseded link is no longer a
@@ -135,6 +148,10 @@ struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     materialized_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    privacy_recovery: Option<PrivacyRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    privacy_recovery_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     merge_archive: Option<MergeArchiveRole>,
@@ -159,6 +176,8 @@ impl Link {
             baseline_bytes: None,
             baseline_hash: None,
             materialized_from: None,
+            privacy_recovery: None,
+            privacy_recovery_format: None,
             superseded_by: None,
             merge_archive: None,
             naming_ignored: false,
@@ -188,6 +207,8 @@ impl Link {
             baseline_bytes: self.baseline_bytes,
             baseline_hash: self.baseline_hash.clone(),
             materialized_from: self.materialized_from.clone(),
+            privacy_recovery: self.privacy_recovery.clone(),
+            privacy_recovery_format: self.privacy_recovery_format.clone(),
             superseded_by: self.superseded_by.clone(),
             merge_archive: self.merge_archive.clone(),
             naming_ignored: self.naming_ignored,
@@ -197,6 +218,14 @@ impl Link {
     /// `<runtime>/<session-id>`, the machine-local identity used in supersession records.
     pub fn instance(&self) -> String {
         format!("{}/{}", self.source, self.session_id)
+    }
+
+    pub fn native_privacy_recovery(&self) -> Result<bool> {
+        match self.privacy_recovery_format.as_deref() {
+            None => Ok(false),
+            Some(NATIVE_PRIVACY_RECOVERY_FORMAT) => Ok(true),
+            Some(format) => bail!("unsupported private recovery format: {format}"),
+        }
     }
 
     /// Only active links may resolve implicit context or advance their claimed branch.
@@ -520,6 +549,8 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         baseline_bytes: body.baseline_bytes,
         baseline_hash: body.baseline_hash,
         materialized_from: body.materialized_from,
+        privacy_recovery: body.privacy_recovery,
+        privacy_recovery_format: body.privacy_recovery_format,
         superseded_by: body.superseded_by,
         merge_archive: body.merge_archive,
         naming_ignored: body.naming_ignored,
@@ -1109,6 +1140,29 @@ pub fn latest(store: &Store) -> Option<Link> {
 /// making a new one. This is the one that cannot be filled in after the fact.
 pub fn get(store: &Store, source: &str, session_id: &str) -> Option<Link> {
     read(&link_path(store, source, session_id))
+}
+
+/// A malformed claim is not an unbound session and cannot authorize a new destination.
+#[cfg(feature = "cli")]
+pub fn get_checked(store: &Store, source: &str, session_id: &str) -> Result<Option<Link>> {
+    crate::domain::merge_archive::RuntimeLinkKey {
+        runtime: source.into(),
+        session_id: session_id.into(),
+    }
+    .validate()?;
+    let path = link_path(store, source, session_id);
+    let bytes = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "session link is not a regular file"
+            );
+            crate::domain::storage::read_bytes_capped(&path, 64 * 1024)?
+        }
+    };
+    Link::from_json(source, session_id, &bytes).map(Some)
 }
 
 /// Keep an unclaimed session out of the naming inbox.

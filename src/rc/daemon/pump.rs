@@ -555,6 +555,14 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
+                            if frame.method() == method::SESSION_PUBLICATION_DELIVER =>
+                        {
+                            super::publication::dispatch(
+                                d.clone(), &frame, epoch, out_tx.clone(),
+                                &mut session_rpc_tasks, session_rpc_stop_tx.subscribe(),
+                            ).await;
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_ENQUEUE && {
                                 let state = d.lock().await;
                                 frame.params.as_ref().and_then(|params| params["session_id"].as_str())

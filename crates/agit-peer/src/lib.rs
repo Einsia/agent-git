@@ -6,6 +6,7 @@ pub mod client;
 pub mod cloud;
 pub mod identity;
 pub mod protocol;
+pub mod publication;
 #[cfg(feature = "tunnel")]
 pub mod transport;
 

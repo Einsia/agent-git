@@ -53,6 +53,22 @@ pub fn agit_home() -> Result<PathBuf> {
     Ok(home.join(".agit"))
 }
 
+/// Mandatory policies are discovered outside repository content; the manifest adds sources
+/// without replacing the administrator's system-wide policy.
+pub(crate) fn privacy_policy_sources() -> Result<(PathBuf, PathBuf)> {
+    #[cfg(target_os = "macos")]
+    let system = PathBuf::from("/Library/Application Support/AgentGit/privacy-policy.json");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let system = PathBuf::from("/etc/agit/privacy-policy.json");
+    #[cfg(windows)]
+    let system = std::env::var_os("PROGRAMDATA")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("AgentGit/privacy-policy.json");
+    Ok((system, agit_home()?.join("privacy-policy-sources.json")))
+}
+
 #[cfg(unix)]
 pub(crate) fn state_ancestors(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut ancestors = std::collections::BTreeSet::new();
@@ -353,6 +369,17 @@ pub fn auto_push_default() -> Result<bool> {
         Some("true") => Ok(true),
         Some(_) => anyhow::bail!(
             "invalid user push.auto preference; set it to true or false with agit config"
+        ),
+    }
+}
+
+/// This preference selects a new Hub identity's mode; existing identities use Hub authority.
+pub fn encryption_default() -> Result<bool> {
+    match get_global("privacy.encryption")?.as_deref() {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => anyhow::bail!(
+            "invalid user privacy.encryption preference; set it to true or false with agit config"
         ),
     }
 }

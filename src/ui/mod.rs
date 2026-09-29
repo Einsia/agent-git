@@ -9,6 +9,7 @@
 //!
 //! This degradation is not polish — it decides whether agit can be consumed by a script.
 
+pub(crate) mod privacy_preview;
 pub mod prompt;
 pub mod semantic_prefix;
 pub mod session;

@@ -10,6 +10,17 @@ pub struct Identity {
     pub created_at: String,
 }
 
+/// Ordinary commands verify desktop ownership without switching their own daemon namespace or
+/// inventing a new machine identity when the owner's state is unavailable.
+pub(crate) fn desktop_identity() -> crate::Result<Identity> {
+    let path = super::state_dir("desktop-rc")?.join("identity.json");
+    #[cfg(windows)]
+    super::windows_security::validate_path(&path, false, true)?;
+    Ok(serde_json::from_slice(
+        &crate::domain::storage::read_bytes_capped(&path, 8192)?,
+    )?)
+}
+
 fn identity_path() -> crate::Result<PathBuf> {
     let path = super::rc_dir()?.join("identity.json");
     #[cfg(windows)]

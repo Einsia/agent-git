@@ -1,12 +1,67 @@
 //! Publication options constrain real receivers even when local Git defaults broaden a push.
 
-use super::{RemoteIdentity, Repo, publication_push_args, push_tags};
+use super::{RemoteIdentity, Repo, bind_publication_origin, publication_push_args, push_tags};
+use crate::hub::identity;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CHILD_ROOT: &str = "AGIT_PUSH_PUBLICATION_TEST_ROOT";
 const COMPLETE: &str = "publication receiver fixture verified";
+
+/// A publication waits for settlement before touching Git config, while unchanged bindings
+/// need no write. Holding Git's config lock makes an unguarded publisher fail visibly.
+#[test]
+fn publication_origin_waits_for_settlement() {
+    let Some(root) = isolated("publication_origin_waits_for_settlement") else {
+        return;
+    };
+    let repo = Repo::init(&root.join("repo")).unwrap();
+    let store = crate::domain::store::Store::open_or_init().unwrap();
+    let destination = RemoteIdentity::new(
+        "https://hub.invalid",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    .unwrap();
+    let old_url = "https://hub.invalid/alice/old.git";
+    let new_url = "https://hub.invalid/alice/app.git";
+    identity::pin(&repo, &destination).unwrap();
+    repo.set_remote(old_url).unwrap();
+    let guard = crate::domain::link::lock_branch(&store, "alice/app", "work").unwrap();
+    let config_lock = repo.root().join(".git/config.lock");
+    std::fs::write(&config_lock, b"").unwrap();
+    bind_publication_origin(&repo, "alice/app", &destination, old_url).unwrap();
+    let (started, starting) = std::sync::mpsc::channel();
+    let (sent, received) = std::sync::mpsc::channel();
+    let publishing = repo.clone();
+    let worker = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        sent.send(bind_publication_origin(
+            &publishing,
+            "alice/app",
+            &destination,
+            new_url,
+        ))
+        .unwrap();
+    });
+    starting
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(matches!(
+        received.recv_timeout(std::time::Duration::from_millis(200)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(repo.remote_url().as_deref(), Some(old_url));
+    std::fs::remove_file(config_lock).unwrap();
+    drop(guard);
+    received
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(repo.remote_url().as_deref(), Some(new_url));
+    println!("{COMPLETE}");
+}
 
 fn isolated(name: &str) -> Option<PathBuf> {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
@@ -266,92 +321,6 @@ fn inherited_submodule_recursion_cannot_change_publication_targets() {
         assert_eq!(refs(&sub_remote).get("refs/heads/main"), Some(&sub_tip));
         let expected = if mode == "only" { &base } else { &tip };
         assert_eq!(refs(&control).get("refs/heads/main"), Some(expected));
-    }
-    println!("{COMPLETE}");
-}
-
-/// Explicit credential acceptance requires successful preparation and complete scan coverage.
-#[test]
-fn explicit_acceptance_requires_prepared_complete_scan() {
-    use super::{ExitCode, Gate, finish_secret_scan, secrets};
-
-    let Some(_root) = isolated("explicit_acceptance_requires_prepared_complete_scan") else {
-        return;
-    };
-    let hits = || {
-        vec![secrets::Hit {
-            rule: "registered-secret".into(),
-            file: Some("AGENTS.md".into()),
-            source: secrets::Source::File,
-            line: 1,
-            redacted: "synthetic redacted finding".into(),
-            fingerprint: 1,
-        }]
-    };
-    for accepted in [false, true] {
-        let clean = secrets::ScanReport {
-            binary_carriers: 0,
-            hits: Vec::new(),
-            truncated: false,
-            unscanned: Default::default(),
-        };
-        assert!(matches!(
-            finish_secret_scan(Ok(clean), accepted).unwrap(),
-            Gate::Pass
-        ));
-        for (error, expected) in [
-            (
-                anyhow::Error::from(secrets::ScanPreparationFailure::Configuration),
-                ExitCode::Usage,
-            ),
-            (
-                anyhow::Error::from(secrets::ScanPreparationFailure::LocalState),
-                ExitCode::Precondition,
-            ),
-            (
-                anyhow::anyhow!("synthetic preparation failure"),
-                ExitCode::Failure,
-            ),
-        ] {
-            assert!(
-                matches!(finish_secret_scan(Err(error), accepted).unwrap(), Gate::Blocked(code) if code == expected)
-            );
-        }
-        for unscanned in [
-            secrets::Unscanned {
-                over_budget: Some((2, 1)),
-                ..Default::default()
-            },
-            secrets::Unscanned {
-                oversized: vec![("aaaaaaaa".into(), 2)],
-                ..Default::default()
-            },
-            secrets::Unscanned {
-                oversized_files: vec![("AGENTS.md".into(), 2)],
-                ..Default::default()
-            },
-        ] {
-            for findings in [Vec::new(), hits()] {
-                let report = secrets::ScanReport {
-                    binary_carriers: 0,
-                    hits: findings,
-                    truncated: false,
-                    unscanned: unscanned.clone(),
-                };
-                assert!(matches!(
-                    finish_secret_scan(Ok(report), accepted).unwrap(),
-                    Gate::Blocked(ExitCode::Policy)
-                ));
-            }
-        }
-        let report = secrets::ScanReport {
-            binary_carriers: 0,
-            hits: hits(),
-            truncated: false,
-            unscanned: Default::default(),
-        };
-        let verdict = finish_secret_scan(Ok(report), accepted).unwrap();
-        assert_eq!(matches!(verdict, Gate::Pass), accepted);
     }
     println!("{COMPLETE}");
 }

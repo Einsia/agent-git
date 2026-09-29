@@ -44,6 +44,6 @@ pub(crate) fn for_native(
         Some(root) => Ok(redactor
             .with_repository(&root)?
             .with_native_context(runtime, native, cwd, &root)),
-        None => Ok(redactor),
+        None => Ok(redactor.with_unbound_native_context(runtime, native)),
     }
 }

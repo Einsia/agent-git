@@ -1,0 +1,24 @@
+{
+  "description": "Synthetic libsodium key record for accepted-publication share/export fixtures.",
+  "password": "synthetic-repository-password",
+  "private_key": "Hx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8=",
+  "record": {
+    "recipient": "sha256-f6ca182965e96387cb9b17547221dc79e1ea06b7b635f95c45fffd9dd6cb4bb0",
+    "current": true,
+    "updated_at": "2026-09-26T00:00:00Z",
+    "public_key_algorithm": "x25519",
+    "public_key": "K9OVBGEgLiQvK66DwHcRnVukrjAFg9frt5I7Im2FM0M=",
+    "encrypted_private_key": {
+      "version": 2,
+      "algorithm": "xsalsa20-poly1305",
+      "nonce": "LCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
+      "ciphertext": "FNJ8x/O98fo5RhUoEjyB7nxxmIEGHjKIUuv1EmqY3XhDEeqdJ4SYC5njOtX+1jdr"
+    },
+    "kdf": {
+      "algorithm": "argon2id13",
+      "salt": "KysrKysrKysrKysrKysrKw==",
+      "opslimit": 1,
+      "memlimit": 8388608
+    }
+  }
+}

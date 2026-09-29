@@ -2384,6 +2384,10 @@ fn protocol_blob_view(
     text: &str,
     labels: &HashMap<String, String>,
 ) -> Option<String> {
+    #[cfg(feature = "cli")]
+    if let Some(view) = context.privacy_views.and_then(|views| views.get(oid)) {
+        return Some(view.clone());
+    }
     let path = labels.get(oid)?;
     let view = protocol_payload_view(context.repo, text, path, context.trusted_identities)?;
     let finder = format!("--find-object={oid}");
@@ -4270,6 +4274,8 @@ fn scan_publish_objects(
         prepared_binary: None,
         #[cfg(feature = "cli")]
         prepared_remaining: None,
+        #[cfg(feature = "cli")]
+        privacy_views: None,
     };
     scan_publish_blobs(&blobs, history, out, unscanned)?;
     scan_commit_messages(
@@ -4682,6 +4688,8 @@ struct BlobScanContext<'a> {
     prepared_binary: Option<&'a std::cell::Cell<u64>>,
     #[cfg(feature = "cli")]
     prepared_remaining: Option<&'a std::cell::Cell<u64>>,
+    #[cfg(feature = "cli")]
+    privacy_views: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// Read a batch of objects and scan the blobs among them. `batch` and `label` are cleared once

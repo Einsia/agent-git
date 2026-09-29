@@ -7,7 +7,8 @@
 //! and decryption happens in the browser.
 //!
 //! AES-GCM and not XChaCha20 because browsers support the former natively through WebCrypto — the
-//! viewer decrypts with zero dependencies and no wasm to bundle.
+//! viewer decrypts the outer transport with WebCrypto. The inner privacy envelope retains
+//! selected original records encrypted to the accepted source publication's repository viewing key.
 
 use super::{CmdResult, require_login};
 use crate::domain::link;
@@ -20,7 +21,8 @@ use crate::domain::store::Store;
 use crate::domain::transcript;
 use crate::hub::ShareRequest;
 use crate::infra::config;
-use crate::{ExitCode, adapter, ui};
+use crate::{ExitCode, ui};
+use anyhow::Context;
 use clap::{Args as ClapArgs, Subcommand};
 
 #[derive(ClapArgs)]
@@ -108,8 +110,16 @@ pub fn run(mut args: Args) -> CmdResult {
         )],
     );
 
-    let readable = protected_readable(&source)?;
-
+    let repo = source
+        .protection_repo
+        .as_ref()
+        .map(|root| Repo::open(root).context("the source repository is unavailable"))
+        .transpose()?;
+    let sources = super::privacy::sources::Sources::resolve(
+        repo.as_ref().zip(source.repository.as_deref()),
+        Some(&client),
+    )?;
+    let prepared = protected_readable(&source, &sources.additional_rules()?)?;
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
     // Passphrase: hashed locally; the plaintext is never uploaded.
@@ -129,12 +139,72 @@ pub fn run(mut args: Args) -> CmdResult {
         None
     };
 
-    let (payload, key) = if args.public {
-        (readable, None)
+    let viewing = if args.public {
+        None
     } else {
-        let (ct, k) = encrypt(readable.as_bytes())?;
+        let repo = repo.as_ref().context("standalone encrypted sharing requires verified accepted repository context; no share was uploaded")?;
+        let commit = source.snapshot.as_deref().context("encrypted live sharing requires a saved accepted publication; save and push this snapshot first")?;
+        Some(super::privacy::publication_key::PublicationKey::resolve(
+            repo,
+            source.branch.as_deref(),
+            commit,
+        )?)
+    };
+
+    let (payload, key) = if args.public {
+        (
+            serde_json::to_string(
+                &prepared
+                    .projection
+                    .share_public_value(&prepared.protected, &prepared.text),
+            )?,
+            None,
+        )
+    } else {
+        let viewing = viewing
+            .as_ref()
+            .context("encrypted share has no viewing key")?;
+        let recipient = viewing.recipient()?;
+        let envelope = prepared.projection.seal_share(
+            &prepared.original,
+            &prepared.protected,
+            &prepared.text,
+            &recipient,
+        )?;
+        let envelope = serde_json::to_string(&envelope)?;
+        let (ct, k) = encrypt(envelope.as_bytes())?;
         (ct, Some(k))
     };
+    anyhow::ensure!(
+        payload.len() <= crate::domain::privacy_envelope::MAX_ENVELOPE_BYTES,
+        "share exceeds the upload budget; no content was sent"
+    );
+
+    {
+        use std::io::Write;
+        use ui::privacy_preview::{self, Recovery};
+        let mut output = std::io::stderr().lock();
+        privacy_preview::write_report(
+            &mut output,
+            &prepared.report,
+            if args.public {
+                Recovery::PublicOnly
+            } else {
+                Recovery::SelectedRecords
+            },
+        )?;
+        writeln!(output, "Public metadata:")?;
+        privacy_preview::write_value(
+            &mut output,
+            &prepared
+                .projection
+                .share_public_value(&prepared.protected, &prepared.text)["metadata"],
+            2,
+        )?;
+        writeln!(output, "Complete selected public records:")?;
+        privacy_preview::write_session(&mut output, &prepared.protected)?;
+        output.flush()?;
+    }
 
     let visibility = if args.public {
         "public and unencrypted"
@@ -176,7 +246,16 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     }
 
+    if let Some(viewing) = viewing.as_ref() {
+        viewing.verify(repo.as_ref().expect("repository key has a source"))?;
+    }
+    anyhow::ensure!(
+        source.policy_digest()? == prepared.policy_digest,
+        "privacy policy changed after the share preview; review a fresh preview before sharing"
+    );
+    sources.verify()?;
     let resp = match client.create_share(&ShareRequest {
+        format_version: 2,
         payload,
         encrypted: !args.public,
         expire_seconds: expire_secs,
@@ -186,8 +265,16 @@ pub fn run(mut args: Args) -> CmdResult {
         Ok(response) => response,
         Err(error) => return failed(error),
     };
+    anyhow::ensure!(
+        resp.format_version == Some(2),
+        "the Hub did not acknowledge the privacy share format; inspect or revoke share {} before retrying",
+        resp.slug
+    );
 
     ui::success("share created");
+    if let Some(viewing) = &viewing {
+        println!("Repository key source: {}", viewing.source());
+    }
 
     // When encrypted, the key is appended to the fragment — it is never sent to the server.
     let link = match &key {
@@ -259,60 +346,114 @@ struct ShareSource {
     label: String,
     selection_source: super::echo::Source,
     protection_repo: Option<std::path::PathBuf>,
-    native_context: Option<(String, std::path::PathBuf)>,
+    repository: Option<String>,
+    projection_log: Option<String>,
+    metadata: meta::Meta,
+    branch: Option<String>,
+    snapshot: Option<String>,
+}
+
+impl ShareSource {
+    fn policy_digest(&self) -> crate::Result<String> {
+        match self.protection_repo.as_ref() {
+            Some(root) => {
+                let repo = Repo::open(root)
+                    .ok_or_else(|| anyhow::anyhow!("the source repository is unavailable"))?;
+                crate::domain::privacy::PrivacyPolicy::load(&repo)?.digest()
+            }
+            None => crate::domain::privacy::PrivacyPolicy::load_default()?.digest(),
+        }
+    }
+}
+
+struct PreparedShare {
+    text: String,
+    original: String,
+    protected: String,
+    projection: crate::domain::privacy_publication::SessionProjection,
+    report: crate::domain::privacy_publication::ProjectionReport,
+    policy_digest: String,
 }
 
 /// Project native content before rendering so truncation cannot hide discovery context.
-fn protected_readable(source: &ShareSource) -> crate::Result<String> {
-    let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    if let Some(root) = &source.protection_repo {
-        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(root)?;
-        let protected = match source.envelope.as_deref() {
-            Some(envelope) => dictionary.protect_envelopes(envelope, &registered)?,
-            None => match &source.native_context {
-                Some((native, cwd)) => dictionary.protect_session_jsonl(
-                    &source.raw,
-                    &registered,
-                    &source.runtime,
-                    native,
-                    cwd,
-                )?,
-                None => dictionary.protect_jsonl(&source.raw, &registered)?,
-            },
-        };
+fn protected_readable(
+    source: &ShareSource,
+    additional: &[crate::domain::privacy::mandatory::MandatoryPolicy],
+) -> crate::Result<PreparedShare> {
+    let policy_digest = source.policy_digest()?;
+    let repo = source
+        .protection_repo
+        .as_ref()
+        .map(|root| {
+            Repo::open(root).ok_or_else(|| {
+                anyhow::anyhow!("the source repository is unavailable; no share was created")
+            })
+        })
+        .transpose()?;
+    let selected = match &source.envelope {
+        Some(envelope) => envelope.clone(),
+        None => crate::domain::privacy_publication::wrap_native(
+            &source.raw,
+            &source.runtime,
+            &source.metadata.session,
+        )?,
+    };
+    let log = source.projection_log.as_deref().unwrap_or(&selected);
+    let projection = crate::domain::privacy_publication::project_frozen_with_sources(
+        repo.as_ref(),
+        source.branch.as_deref(),
+        log,
+        &selected,
+        &source.metadata,
+        additional,
+    )?;
+    let original = selected;
+    let selected = projection.select(&original)?;
+    let (selected, secret_matches) = if let Some(repo) = repo.as_ref() {
+        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+        let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
+        let protected = dictionary.protect_envelopes(&selected, &registered)?;
         anyhow::ensure!(
             protected.intact == 0,
             "share exceeds the reversible protection limit; no content was sent"
         );
-        let parsed = if source.envelope.is_some() {
-            transcript::display::parse(&protected.text)?
-        } else {
-            adapter::get(&source.runtime)?.parse(&protected.text)?
-        };
-        return Ok(ui::transcript::render_transcript(&parsed, 20000));
-    }
-    let parsed = match source.envelope.as_deref() {
-        Some(envelope) => transcript::display::parse(envelope)?,
-        None => {
-            let runtime = adapter::infer_runtime(&source.raw).unwrap_or(source.runtime.as_str());
-            adapter::get(runtime)?.parse(&source.raw)?
-        }
+        (protected.text, protected.replacements)
+    } else {
+        let parsed = transcript::display::parse(&selected)?;
+        let hits = secrets::scan_text_registered_with(
+            &serde_json::to_string(&parsed)?,
+            &std::collections::HashSet::new(),
+            &crate::domain::secret_filter::VaultStore::open_default()?.matcher()?,
+        );
+        anyhow::ensure!(
+            hits.is_empty(),
+            "this unclaimed native session needs an Agent repository for reversible protection; no content was sent"
+        );
+        (selected, 0)
     };
-    let hits = secrets::scan_text_registered_with(
-        &serde_json::to_string(&parsed)?,
-        &std::collections::HashSet::new(),
-        &registered,
-    );
+    let parsed = transcript::display::parse(&selected)?;
     anyhow::ensure!(
-        hits.is_empty(),
-        "this unclaimed native session needs an Agent repository for reversible protection; no content was sent"
+        source.policy_digest()? == policy_digest,
+        "privacy policy changed while preparing the share"
     );
-    Ok(ui::transcript::render_transcript(&parsed, 20000))
+    Ok(PreparedShare {
+        text: ui::transcript::render_transcript(&parsed, usize::MAX),
+        report: {
+            let mut report = projection.report().clone();
+            report.secret_matches += secret_matches;
+            report
+        },
+        policy_digest,
+        original,
+        protected: selected,
+        projection,
+    })
 }
 
 struct SharePoint {
     repo: Repo,
     sha: String,
+    branch: Option<String>,
     slug: String,
     selection_source: super::echo::Source,
 }
@@ -397,8 +538,30 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         }
         _ => None,
     };
+    let runtime = if native.source == "claude-desktop" {
+        "claude-code"
+    } else {
+        &native.source
+    };
+    let adapter = crate::adapter::get(runtime)?;
+    let limits = crate::adapter::native_snapshot::Limits {
+        bytes: crate::domain::privacy_publication::MAX_INPUT_BYTES,
+        working_bytes: crate::domain::privacy_publication::MAX_INPUT_BYTES * 2,
+        ..Default::default()
+    };
+    let source = adapter.lookup_native_readonly(&native.session_id, limits)?;
+    let snapshot = adapter
+        .snapshot_native_readonly(&source, limits)
+        .context("cannot read native session within the privacy preparation input budget")?;
+    let raw = String::from_utf8(snapshot.bytes).context("native session is not UTF-8")?;
+    let cwd = native.cwd.clone().unwrap_or_default();
+    let metadata = meta::Meta::new(
+        meta::session_hash(&cwd, raw.as_bytes()),
+        native.source.clone(),
+        cwd,
+    );
     Ok(ShareSource {
-        raw: native.read()?,
+        raw,
         envelope: None,
         runtime: native.source.clone(),
         label: format!(
@@ -408,10 +571,15 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         ),
         selection_source: super::echo::Source::Explicit,
         protection_repo,
-        native_context: native
-            .cwd
+        repository: native
+            .owner
             .as_ref()
-            .map(|cwd| (native.session_id.clone(), std::path::PathBuf::from(cwd))),
+            .zip(native.agent.as_ref())
+            .map(|(owner, name)| format!("{owner}/{name}")),
+        projection_log: None,
+        metadata,
+        branch: native.branch.clone(),
+        snapshot: None,
     })
 }
 
@@ -467,10 +635,11 @@ fn resolve_point(
         None if native_available && matches!(spec.repo, refs::RepoSel::Context) => return Ok(None),
         None => anyhow::bail!("{slug} has no local AgentGit repo; clone it before sharing"),
     };
-    let sha = refs::resolve(&repo, &spec)?.sha;
+    let resolved = refs::resolve(&repo, &spec)?;
     Ok(Some(SharePoint {
         repo,
-        sha,
+        sha: resolved.sha,
+        branch: resolved.branch,
         slug,
         selection_source,
     }))
@@ -478,8 +647,7 @@ fn resolve_point(
 
 /// Metadata, content and confirmation describe the same immutable saved point.
 fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource> {
-    let snapshot = meta::read_at_ref_result(&point.repo, &point.sha)?
-        .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
+    let snapshot = storage::metadata_local(point.repo.root(), &point.sha)?;
     if !snapshot.is_session_line() || snapshot.session.is_empty() {
         anyhow::bail!(
             "this point is not a settled session; select a session branch or recorded version"
@@ -490,15 +658,14 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
     } else {
         meta::VIEW_FILE
     };
-    let envelope = point
-        .repo
-        .show_result(&point.sha, sequence)?
-        .ok_or_else(|| anyhow::anyhow!("this point has no {sequence}; no share was created"))?;
+    let limit = crate::domain::privacy_publication::MAX_INPUT_BYTES;
+    let (log, envelope) = if full_log {
+        let log = storage::identity_log_at(point.repo.root(), &point.sha, snapshot.layout, limit)?;
+        (log.clone(), log)
+    } else {
+        storage::materialize_pair_local(point.repo.root(), &point.sha, limit, limit)?
+    };
     if !full_log && snapshot.layout == meta::LayoutVersion::V0 {
-        let log = point
-            .repo
-            .show_result(&point.sha, meta::LOG_FILE)?
-            .ok_or_else(|| anyhow::anyhow!("this point has no LOG to validate its VIEW"))?;
         let reachable: std::collections::HashSet<_> = log
             .split_inclusive('\n')
             .map(storage::event_id)
@@ -518,6 +685,16 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
             "this point's VIEW contains misplaced or mismatched markers; no share was created"
         );
     }
+    let projection_log = if full_log {
+        log
+    } else {
+        if snapshot.layout == meta::LayoutVersion::V0 {
+            storage::make_view_reachable(&log, &envelope)?
+        } else {
+            log
+        }
+    };
+    crate::domain::privacy_publication::check_input(&projection_log, &envelope)?;
     let (raw, skipped) = transcript::unwrap_lossy(&envelope);
     if skipped > 0 {
         anyhow::bail!(
@@ -527,7 +704,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
     Ok(ShareSource {
         raw,
         envelope: Some(envelope),
-        runtime: snapshot.runtime,
+        runtime: snapshot.runtime.clone(),
         label: format!(
             "{sequence} of {}@{}",
             point.slug,
@@ -535,7 +712,11 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         ),
         selection_source: point.selection_source,
         protection_repo: Some(point.repo.root().to_path_buf()),
-        native_context: None,
+        repository: Some(point.slug),
+        projection_log: Some(projection_log),
+        metadata: snapshot,
+        branch: point.branch,
+        snapshot: Some(point.sha),
     })
 }
 
@@ -742,27 +923,21 @@ mod tests {
             label: "fixture".into(),
             selection_source: super::super::echo::Source::Explicit,
             protection_repo: Some(repo.root().to_path_buf()),
-            native_context: None,
+            repository: Some("owner/repo".into()),
+            projection_log: None,
+            metadata: meta::Meta::new(claim(), "claude-code".into(), String::new()),
+            branch: None,
+            snapshot: None,
         };
-        let sent = protected_readable(&source).unwrap();
+        let sent = protected_readable(&source, &[]).unwrap().text;
         assert!(!sent.contains(secret));
-        assert!(sent.contains("{{AGIT_SECRET_V1:"));
-        let dictionary =
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-        assert!(
-            dictionary
-                .hydrate_text(&sent)
-                .unwrap()
-                .text
-                .contains(secret)
-        );
         assert_eq!(source.raw, raw);
         assert!(
             transcript::unwrap_strict(source.envelope.as_ref().unwrap())
                 .unwrap()
                 .contains(secret)
         );
-        assert_eq!(protected_readable(&source).unwrap(), sent);
+        assert_eq!(protected_readable(&source, &[]).unwrap().text, sent);
     }
 
     #[test]
@@ -809,6 +984,7 @@ mod tests {
         let point = SharePoint {
             repo: Repo::open(repo.root()).unwrap(),
             sha: repo.git(&["rev-parse", "refs/heads/session-a"]).unwrap(),
+            branch: Some("session-a".into()),
             slug: "me/paper".into(),
             selection_source: crate::commands::echo::Source::Explicit,
         };

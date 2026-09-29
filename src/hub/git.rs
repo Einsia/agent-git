@@ -319,32 +319,61 @@ impl TransportIdentity {
     }
 
     fn environment(&self) -> Result<Vec<(String, OsString)>> {
-        self.environment_in(self.execution.as_ref())
+        self.environment_in(self.execution.as_ref(), self.lfs.is_some())
     }
 
     fn environment_in(
         &self,
         execution: Option<&frozen::Execution>,
+        lfs: bool,
     ) -> Result<Vec<(String, OsString)>> {
-        if let Some(execution) = execution {
-            let environment = transport_env_after(
+        // LFS action headers carry transfer authority. Injecting the batch identity at the
+        // repository prefix duplicates the receiver fence on upload and verification requests.
+        let lfs_urls;
+        let urls = if lfs {
+            lfs_urls = self
+                .urls
+                .iter()
+                .flat_map(|url| {
+                    ["info/lfs/objects/batch", "info/refs", "git-upload-pack"]
+                        .map(|path| format!("{}/{path}", url.trim_end_matches('/')))
+                })
+                .collect::<Vec<_>>();
+            &lfs_urls
+        } else {
+            &self.urls
+        };
+        let mut environment = if let Some(execution) = execution {
+            transport_env_after(
                 Some(&execution.parameters),
                 self.token()?.as_deref(),
                 self.agent_id.as_deref(),
-                &self.urls,
+                urls,
                 self.accept_secret_findings,
-            );
-            execution.validate_parameters(&environment[0].1)?;
-            return Ok(environment);
+            )
+        } else {
+            transport_env(
+                self.token()?.as_deref(),
+                self.agent_id.as_deref(),
+                urls,
+                self.accept_secret_findings,
+            )
+        };
+        if lfs {
+            let parameters = &mut environment[0].1;
+            for url in &self.urls {
+                parameters.push(" ");
+                parameters.push(quote_git_parameter(&format!("http.{url}.extraHeader")));
+                parameters.push("=''");
+            }
         }
-        let mut environment = transport_env(
-            self.token()?.as_deref(),
-            self.agent_id.as_deref(),
-            &self.urls,
-            self.accept_secret_findings,
-        );
-        if let Some((remote, endpoint)) = &self.lfs {
+        if execution.is_none()
+            && let Some((remote, endpoint)) = &self.lfs
+        {
             constrain_lfs_environment(&mut environment, remote, endpoint);
+        }
+        if let Some(execution) = execution {
+            execution.validate_parameters(&environment[0].1)?;
         }
         Ok(environment)
     }
@@ -785,9 +814,20 @@ fn execute_transport_in(
     mode: OutputMode,
     execution: Option<&frozen::Execution>,
 ) -> TransportRun {
+    execute_transport_receipt(dir, args, transport, mode, execution, None)
+}
+
+fn execute_transport_receipt(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: &TransportIdentity,
+    mode: OutputMode,
+    execution: Option<&frozen::Execution>,
+    receipt: Option<&super::privacy::publication::ReceiveReceipt>,
+) -> TransportRun {
     crate::telemetry::allow_uploads();
     let started = std::time::Instant::now();
-    let result = execute_transport_inner(dir, args, transport, mode, execution);
+    let result = execute_transport_inner(dir, args, transport, mode, execution, receipt);
     crate::telemetry::operation(
         crate::telemetry::Operation::GitTransport,
         result.error.is_none()
@@ -807,6 +847,7 @@ fn execute_transport_inner(
     transport: &TransportIdentity,
     mode: OutputMode,
     execution: Option<&frozen::Execution>,
+    receipt: Option<&super::privacy::publication::ReceiveReceipt>,
 ) -> TransportRun {
     let execution = execution.or(transport.execution.as_ref());
     let mut run = TransportRun {
@@ -824,7 +865,7 @@ fn execute_transport_inner(
     }
 
     for retry in [false, true] {
-        match spawn(dir, args, transport, mode, execution) {
+        match spawn(dir, args, transport, mode, execution, receipt) {
             Ok(attempt) => {
                 let refresh = !retry
                     && attempt.outcome.code != 0
@@ -856,6 +897,9 @@ fn execute_transport_inner(
 pub struct RemoteRefs {
     pub heads: Vec<String>,
     pub tags: std::collections::BTreeMap<String, String>,
+    /// The complete advertised branch and tag namespace is needed when a publication
+    /// decides whether its generated refs already exist remotely.
+    pub refs: std::collections::BTreeMap<String, String>,
 }
 
 /// An unavailable or malformed advertisement is unknown and cannot justify skipping content.
@@ -896,6 +940,13 @@ fn parse_remote_refs(out: &str) -> Option<RemoteRefs> {
                 return None;
             }
         } else {
+            return None;
+        }
+        if refs
+            .refs
+            .insert(name.to_string(), oid.to_string())
+            .is_some()
+        {
             return None;
         }
     }
@@ -1193,6 +1244,7 @@ fn spawn(
     transport: &TransportIdentity,
     mode: OutputMode,
     execution: Option<&frozen::Execution>,
+    receipt: Option<&super::privacy::publication::ReceiveReceipt>,
 ) -> Result<ProcessOutput> {
     let mut cmd = transport.command_in(dir, execution);
     let full = match mode {
@@ -1208,7 +1260,23 @@ fn spawn(
     // immediately and let us see the authentication marker, instead of hanging on input in a
     // non-interactive environment.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    for (k, v) in transport.environment_in(execution)? {
+    let mut environment = transport.environment_in(execution, args.first() == Some(&"lfs"))?;
+    if let Some(receipt) = receipt {
+        anyhow::ensure!(
+            transport.urls.len() == 1 && execution.is_some(),
+            "privacy receipt requires one frozen Hub transport"
+        );
+        let parameters = &mut environment[0].1;
+        let key = format!("http.{}.extraHeader", transport.urls[0]);
+        for (name, value) in receipt.headers() {
+            parameters.push(" ");
+            parameters.push(quote_git_parameter(&key));
+            parameters.push("=");
+            parameters.push(quote_git_parameter(&format!("{name}: {value}")));
+        }
+        execution.unwrap().validate_parameters(parameters)?;
+    }
+    for (k, v) in environment {
         cmd.env(k, v);
     }
 
@@ -2226,15 +2294,15 @@ mod git_credential_lifecycle_tests {
         for corrupt in [false, true] {
             let expected_oid = oid.clone();
             let hub = FakeHub::new(move |request| {
-                assert_eq!(
-                    request.header("Authorization"),
-                    Some("Bearer fake-alice-access")
-                );
-                assert_eq!(
-                    request.header("X-AgentGit-Expected-Agent-Id"),
-                    Some(AGENT_ID)
-                );
                 if request.path.ends_with("/objects/batch") {
+                    assert_eq!(
+                        request.header("Authorization"),
+                        Some("Bearer fake-alice-access")
+                    );
+                    assert_eq!(
+                        request.header("X-AgentGit-Expected-Agent-Id"),
+                        Some(AGENT_ID)
+                    );
                     assert_eq!(request.method, "POST");
                     let batch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                     assert_eq!(batch["objects"][0]["oid"], expected_oid);
@@ -2251,6 +2319,8 @@ mod git_credential_lifecycle_tests {
                     }
                 } else {
                     assert_eq!(request.method, "GET");
+                    assert_eq!(request.header("Authorization"), None);
+                    assert_eq!(request.header("X-AgentGit-Expected-Agent-Id"), None);
                     assert_eq!(
                         request.header("X-Agit-Lfs-Grant"),
                         Some("synthetic-file-grant")
@@ -2395,9 +2465,10 @@ mod git_credential_lifecycle_tests {
                     assert_eq!(batch["operation"], "upload");
                     assert_eq!(batch["objects"].as_array().unwrap().len(), 1);
                     assert_eq!(batch["objects"][0]["oid"], expected);
+                    let action_headers = serde_json::json!({"Authorization":"Bearer fake-alice-access", "X-AgentGit-Expected-Agent-Id":AGENT_ID});
                     serde_json::to_vec(&serde_json::json!({"transfer":"basic", "objects":[{
                         "oid":expected,"size":expected_payload.len(),"authenticated":true,
-                        "actions":{"upload":{"href":base},"verify":{"href":format!("{base}/verify")}}
+                        "actions":{"upload":{"href":base,"header":action_headers},"verify":{"href":format!("{base}/verify"),"header":action_headers}}
                     }]}))
                     .unwrap()
                 } else if request.method == "PUT" {

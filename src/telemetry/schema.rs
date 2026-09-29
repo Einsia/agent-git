@@ -387,6 +387,35 @@ mod tests {
             vec!["agit", "config", "hub.url", "https://private-canary"],
             vec![
                 "agit",
+                "export",
+                "private-owner/repo@branch",
+                "--format",
+                "privacy-envelope",
+                "--privacy",
+                "--viewing-public-key",
+                "private-canary-key",
+            ],
+            vec![
+                "agit",
+                "push",
+                "private-owner/repo@branch",
+                "--to",
+                "private-canary/repo",
+                "--separate",
+                "--encryption=false",
+            ],
+            vec![
+                "agit",
+                "privacy",
+                "policy",
+                "replace",
+                "private-canary-pattern",
+                "private-canary-replacement",
+                "--repo",
+                "private-owner/repo",
+            ],
+            vec![
+                "agit",
                 "doctor",
                 "--repair-permissions",
                 "/private-canary/state",
@@ -423,6 +452,46 @@ mod tests {
             capture(&["agit", "doctor"])["arg_repair_permissions"],
             false
         );
+    }
+
+    #[test]
+    fn privacy_telemetry_summarizes_inputs_without_capturing_content() {
+        let value = capture(&[
+            "agit",
+            "privacy",
+            "policy",
+            "add-external",
+            "private-canary",
+            "/private-canary/root",
+            "--repo",
+            "private-canary/repo",
+            "--include",
+            "private-canary/src/**",
+            "--include",
+            "private-canary/docs/**",
+            "--exclude",
+            "private-canary/secret/**",
+        ]);
+        assert_eq!(value["command_path"], "privacy policy add-external");
+        for field in ["arg_label", "arg_path", "arg_repo"] {
+            assert_eq!(value[field], true);
+        }
+        assert_eq!(value["arg_include"], "2-5");
+        assert_eq!(value["arg_exclude"], "1");
+        assert!(!value.to_string().contains("private-canary"));
+
+        let value = capture(&["agit", "privacy", "init", "private-canary/repo"]);
+        assert_eq!(value["command_path"], "privacy init");
+        assert!(value.get("arg_encryption").is_none());
+        let value = capture(&[
+            "agit",
+            "privacy",
+            "init",
+            "private-canary/repo",
+            "--encryption=false",
+        ]);
+        assert_eq!(value["arg_encryption"], "false");
+        assert!(!value.to_string().contains("private-canary"));
     }
 
     #[test]

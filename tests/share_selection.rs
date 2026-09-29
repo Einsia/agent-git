@@ -2,22 +2,34 @@
 
 #![cfg(unix)]
 
+use agit::domain::privacy_envelope::PrivacyEnvelope;
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
+use crypto_box::SecretKey;
 use serde_json::{Value, json};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+
+#[path = "support/privacy_policy_sources.rs"]
+mod privacy_policy_sources;
+#[path = "support/publication_text.rs"]
+mod publication_text;
 
 struct Hub {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    rotate_key: Arc<AtomicBool>,
+    legacy: Arc<AtomicBool>,
+    hub_rules: Arc<Mutex<Vec<Value>>>,
+    policy_drift: Arc<AtomicUsize>,
+    policy_reads: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Hub {
@@ -29,7 +41,19 @@ impl Hub {
         let captured = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let rotate_key = Arc::new(AtomicBool::new(false));
+        let rotation = rotate_key.clone();
+        let legacy = Arc::new(AtomicBool::new(false));
+        let old_protocol = legacy.clone();
+        let hub_rules = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let rules = hub_rules.clone();
+        let policy_drift = Arc::new(AtomicUsize::new(0));
+        let drift = policy_drift.clone();
+        let policy_reads = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let reads = policy_reads.clone();
+        let policy_hub = url.clone();
         let worker = std::thread::spawn(move || {
+            let key_reads = AtomicUsize::new(0);
             while !stopping.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -64,7 +88,73 @@ impl Hub {
                             })
                             .unwrap_or(0);
                         if bytes.len() >= end + 4 + length {
-                            assert!(header.starts_with("POST /api/shares "));
+                            let mut request_line =
+                                header.lines().next().unwrap().split_whitespace();
+                            let method = request_line.next().unwrap();
+                            let target = request_line.next().unwrap();
+                            if let Some((status, mut body)) = privacy_policy_sources::route(
+                                &policy_hub,
+                                "me",
+                                method,
+                                target,
+                                &bytes[end + 4..end + 4 + length],
+                            ) {
+                                if target == "/api/privacy/policy-sources/resolve" {
+                                    let request: Value =
+                                        serde_json::from_slice(&bytes[end + 4..end + 4 + length])
+                                            .unwrap();
+                                    let mut reads = reads.lock().unwrap();
+                                    let scope = if request["repository"].is_null() {
+                                        1
+                                    } else {
+                                        2
+                                    };
+                                    if drift.load(Ordering::SeqCst) == scope
+                                        && reads
+                                            .iter()
+                                            .any(|read| read["repository"] == request["repository"])
+                                    {
+                                        body["revision"] = json!("revision-2");
+                                    }
+                                    reads.push(request);
+                                    body["sources"] = json!(*rules.lock().unwrap());
+                                }
+                                let body = body.to_string();
+                                write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                                break None;
+                            }
+                            if target.starts_with("/api/agents/me/paper/privacy/keys/") {
+                                let (recipient, commit) = target
+                                    .strip_prefix("/api/agents/me/paper/privacy/keys/")
+                                    .unwrap()
+                                    .split_once("?ref=")
+                                    .unwrap();
+                                let fixture: Value = serde_json::from_str(include_str!(
+                                    "fixtures/privacy-web-key.json"
+                                ))
+                                .unwrap();
+                                let mut record = fixture["record"].clone();
+                                use base64::Engine;
+                                let public = base64::engine::general_purpose::STANDARD
+                                    .encode(SecretKey::from([31; 32]).public_key().as_bytes());
+                                record["public_key"] = json!(public);
+                                record["recipient"] =
+                                    json!(agit::domain::privacy_key::recipient_id(&public));
+                                assert_eq!(recipient, record["recipient"].as_str().unwrap());
+                                if key_reads.fetch_add(1, Ordering::SeqCst) > 0
+                                    && rotation.load(Ordering::SeqCst)
+                                {
+                                    record["recipient"] = json!("changed-recipient");
+                                }
+                                let body = json!({"agent_id":"00000000-0000-0000-0000-000000000001","commit":commit,"session_id":format!("agit-{}","b".repeat(40)),"key":record}).to_string();
+                                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                                break None;
+                            }
+                            assert!(header.starts_with("POST /api/shares/privacy "));
+                            if old_protocol.load(Ordering::SeqCst) {
+                                write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                break None;
+                            }
                             break Some(
                                 serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
                             );
@@ -84,7 +174,7 @@ impl Hub {
                 };
                 if let Some(request) = request {
                     captured.lock().unwrap().push(request);
-                    let body = r#"{"slug":"fixture","url":"http://127.0.0.1/share/fixture"}"#;
+                    let body = r#"{"format_version":2,"slug":"fixture","url":"http://127.0.0.1/share/fixture"}"#;
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
             }
@@ -94,6 +184,11 @@ impl Hub {
             requests,
             stop,
             worker: Some(worker),
+            rotate_key,
+            legacy,
+            hub_rules,
+            policy_drift,
+            policy_reads,
         }
     }
 
@@ -124,8 +219,101 @@ fn envelope(text: &str) -> String {
     transcript::wrap_lines(&raw, "claude-code", &format!("agit-{}", "b".repeat(40)))
 }
 
+#[path = "support/privacy_input_budget.rs"]
+mod privacy_input_budget;
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
+
+#[test]
+fn shared_text_fixture_preserves_public_text_and_recovers_selected_originals() {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+    use agit::domain::privacy::PrivacyPolicy;
+    use base64::Engine;
+
+    let f = Fixture::new("unselected");
+    std::fs::create_dir_all(f.home().join("src")).unwrap();
+    let raw = publication_text::records(f.home())
+        .into_iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    let log = transcript::wrap_lines(&raw, "claude-code", &format!("agit-{}", "b".repeat(40)));
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    storage::write_snapshot(f.repo.root(), &log, &log).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo
+        .commit("Session with textual and attachment records")
+        .unwrap();
+    PrivacyPolicy {
+        workspace: Some(f.home().into()),
+        replacements: vec![publication_text::replacement()],
+        ..Default::default()
+    }
+    .save(&f.repo)
+    .unwrap();
+
+    f.success(&["me/paper@chosen", "--public"], None);
+    let request = f.hub.payloads().pop().unwrap();
+    let public: Value = serde_json::from_str(request["payload"].as_str().unwrap()).unwrap();
+    publication_text::assert_public(&public, f.home());
+
+    f.accept_current();
+    let output = f.success(&["me/paper@chosen"], None);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("attachment body is excluded from public content")
+            .count()
+            >= 4
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let key = stdout
+        .split("#k=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let request = f.hub.payloads().pop().unwrap();
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let blob = engine.decode(request["payload"].as_str().unwrap()).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&engine.decode(key).unwrap()).unwrap();
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
+        .unwrap();
+    let envelope = PrivacyEnvelope::parse(&plaintext).unwrap();
+    assert_eq!(envelope.public_projection, public);
+    let recovered = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
+    let (original_log, original_view) = recovered.session_bytes().unwrap();
+    assert_eq!(original_log.as_str(), log);
+    assert_eq!(original_view.as_str(), log);
+}
+
+#[test]
+fn oversized_saved_and_live_sources_fail_before_upload() {
+    let f = Fixture::new("unselected");
+    f.repo.git(&["checkout", "-b", "oversized"]).unwrap();
+    privacy_input_budget::commit_oversized_event(&f.repo);
+    let result = f.run(&["me/paper@oversized", "--public"], None);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("limit"),
+        "{result:?}"
+    );
+    assert!(f.hub.payloads().is_empty());
+    let native = f.native("oversized-native");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(native)
+        .unwrap()
+        .set_len(agit::domain::privacy_publication::MAX_INPUT_BYTES as u64 + 1)
+        .unwrap();
+    let result = f.run(&["oversized-native", "--public"], None);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("budget"),
+        "{result:?}"
+    );
+    assert!(f.hub.payloads().is_empty());
+}
 
 impl Fixture {
     fn new(excluded: &str) -> Self {
@@ -182,16 +370,71 @@ impl Fixture {
         }
     }
 
+    fn accept_current(&self) {
+        use base64::Engine;
+        let branch = self.repo.current_branch().unwrap();
+        let log = storage::materialize_at(self.repo.root(), "HEAD", meta::LOG_FILE).unwrap();
+        let view = storage::materialize_at(self.repo.root(), "HEAD", meta::VIEW_FILE).unwrap();
+        let metadata = meta::read(self.repo.root()).unwrap();
+        let key = SecretKey::from([31; 32]);
+        let public = base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes());
+        let layer = agit::domain::privacy_layer::PrivateLayer::new(
+            &log,
+            &view,
+            serde_json::to_value(&metadata).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let envelope = PrivacyEnvelope::seal_layer(
+            agit::domain::privacy_envelope::digest_bytes(b"policy"),
+            agit::domain::privacy_envelope::digest_bytes(b"snapshot"),
+            json!({"metadata":{"session":metadata.session}}),
+            &layer,
+            &agit::domain::privacy_envelope::ViewingRecipient::from_base64(
+                agit::domain::privacy_key::recipient_id(&public),
+                &public,
+            )
+            .unwrap(),
+            vec![],
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.repo.root().join("privacy")).unwrap();
+        std::fs::write(
+            self.repo.root().join("privacy/envelope.json"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        self.repo.add_all().unwrap();
+        self.repo.commit("Accepted publication fixture").unwrap();
+        self.repo
+            .set_remote(&format!("{}/me/paper.git", self.hub.url))
+            .unwrap();
+        agit::hub::identity::pin(
+            &self.repo,
+            &agit::hub::identity::RemoteIdentity::new(
+                &self.hub.url,
+                "00000000-0000-0000-0000-000000000001",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(self.repo.current_branch().unwrap(), branch);
+    }
+
     fn home(&self) -> &Path {
         self.temporary.path()
     }
 
     fn run(&self, args: &[&str], session: Option<&str>) -> Output {
+        self.run_command("share", args, session)
+    }
+
+    fn run_command(&self, subcommand: &str, args: &[&str], session: Option<&str>) -> Output {
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .args(["-y", "share"])
+            .args(["-y", subcommand])
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -217,7 +460,7 @@ impl Fixture {
             if Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("share subprocess exceeded its deadline");
+                panic!("{subcommand} subprocess exceeded its deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -249,7 +492,7 @@ impl Fixture {
         let result = self.run(args, session);
         assert!(
             !result.status.success(),
-            "unexpected share: {}",
+            "unexpected share for {args:?}: {}",
             String::from_utf8_lossy(&result.stdout)
         );
         assert_eq!(self.hub.payloads().len(), before);
@@ -308,7 +551,13 @@ fn refs_and_injected_branch_share_view_while_full_log_is_explicit() {
 fn selected_secret_scope_and_invalid_selectors_never_widen_the_upload() {
     let f = Fixture::new("ghp_7Kd2mQ9xR4vB1nT8sW3zY6cL5jH0gF2aE4pU");
     f.success(&["me/paper@chosen", "--public"], None);
-    f.refuse_without_upload(&["me/paper@chosen", "--public", "--full-log"], None);
+    f.success(&["me/paper@chosen", "--public", "--full-log"], None);
+    assert!(
+        !f.hub.payloads().last().unwrap()["payload"]
+            .as_str()
+            .unwrap()
+            .contains("ghp_7Kd2mQ9xR4vB1nT8sW3zY6cL5jH0gF2aE4pU")
+    );
     for target in [
         "me/paper@chosen#1.1",
         "me/paper@chosen#1..#1",
@@ -355,6 +604,36 @@ fn native_ids_remain_live_and_local_ref_ambiguities_are_rejected() {
     assert!(other.root().is_dir());
     f.refuse_without_upload(&["paper@chosen", "--public"], None);
     assert_eq!(std::fs::read(path).unwrap(), before);
+
+    let root = f.home().join(".cursor/projects/fixture");
+    let cursor = root.join("agent-transcripts/cursor-fixture/cursor-fixture.jsonl");
+    std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cursor,
+        format!(
+            "{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"LIVE-CURSOR"}]}})
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("cursor-fixture.jsonl"), "UNRELATED-FILE").unwrap();
+    link::write(
+        &Store::at(f.home().join("store")),
+        &link::Link::new("cursor", "cursor-fixture", Some(f.home())),
+    )
+    .unwrap();
+    let output = f.success(&["cursor-fixture", "--public"], None);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("1 records checked"));
+    assert!(
+        f.hub.payloads().last().unwrap()["payload"]
+            .as_str()
+            .unwrap()
+            .contains("LIVE-CURSOR")
+    );
+    let duplicate = root.join("agent-transcripts/duplicate/cursor-fixture.jsonl");
+    std::fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    std::fs::copy(cursor, duplicate).unwrap();
+    f.refuse_without_upload(&["cursor-fixture", "--public"], None);
 }
 
 #[test]
@@ -365,9 +644,14 @@ fn encrypted_shares_keep_the_key_out_of_the_request_and_preserve_limits() {
     };
     use base64::Engine;
     let f = Fixture::new("EXCLUDED-LOG");
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    f.accept_current();
     let output = f.success(
         &["me/paper@chosen", "--expire", "24h", "--views", "3"],
         None,
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("recover the selected original records")
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let key = stdout
@@ -392,9 +676,388 @@ fn encrypted_shares_keep_the_key_out_of_the_request_and_preserve_limits() {
             .unwrap(),
     )
     .unwrap();
+    assert_eq!(request["format_version"], 2);
+    let envelope = PrivacyEnvelope::parse(plaintext.as_bytes()).unwrap();
+    assert_eq!(envelope.public_projection["kind"], "share");
+    let visible = f
+        .repo
+        .show_result(&f.sha, meta::VIEW_FILE)
+        .unwrap()
+        .unwrap();
+    let recovered = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
+    let (private_log, private_view) = recovered.session_bytes().unwrap();
+    assert_eq!(private_log.as_str(), visible);
+    assert_eq!(private_view.as_str(), visible);
+    assert!(
+        !serde_json::to_string(&recovered)
+            .unwrap()
+            .contains("EXCLUDED-LOG")
+    );
+    assert!(envelope.open_layer(&SecretKey::from([32; 32])).is_err());
     assert!(plaintext.contains("VISIBLE-SAVED"));
     assert!(!plaintext.contains("EXCLUDED-LOG"));
+    let mut tampered = envelope;
+    tampered.public_projection["presentation"] = json!("changed presentation");
+    assert!(tampered.open_layer(&SecretKey::from([31; 32])).is_err());
     assert!(stdout.contains("VIEW of me/paper@"));
+}
+
+#[test]
+fn privacy_shares_refuse_recipient_drift_and_do_not_fall_back_to_legacy_writes() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    f.accept_current();
+    let exported = f.run_command(
+        "export",
+        &["me/paper@chosen", "--format", "privacy-envelope"],
+        None,
+    );
+    assert!(exported.status.success(), "{exported:?}");
+    let exported = PrivacyEnvelope::parse(&exported.stdout).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/privacy-repository-key.json")).unwrap();
+    let record: agit::domain::privacy_key::KeyRecord =
+        serde_json::from_value(fixture["record"].clone()).unwrap();
+    let private = record
+        .unlock(&zeroize::Zeroizing::new(
+            fixture["password"].as_str().unwrap().into(),
+        ))
+        .unwrap();
+    assert!(
+        exported
+            .open_layer(&SecretKey::from_slice(private.as_ref()).unwrap())
+            .is_ok()
+    );
+    let f = Fixture::new("EXCLUDED-LOG");
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    f.accept_current();
+    f.hub.rotate_key.store(true, Ordering::SeqCst);
+    let output = f.run(&["me/paper@chosen"], None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not match the selected publication")
+    );
+    assert!(f.hub.payloads().is_empty());
+    let f = Fixture::new("EXCLUDED-LOG");
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    f.accept_current();
+    f.hub.legacy.store(true, Ordering::SeqCst);
+    f.refuse_without_upload(&["me/paper@chosen"], None);
+}
+
+#[test]
+fn unbound_live_encrypted_shares_refuse_before_upload() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    f.native("unbound-native");
+    let output = f.run(&["unbound-native"], None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("standalone encrypted sharing"),
+        "{output:?}"
+    );
+    assert!(f.hub.payloads().is_empty());
+}
+
+#[test]
+fn shares_refresh_account_and_repository_rules_before_upload() {
+    for (target, scope) in [("unbound-native", 1), ("me/paper@chosen", 2)] {
+        let f = Fixture::new("EXCLUDED-LOG");
+        f.native("unbound-native");
+        f.hub.policy_drift.store(scope, Ordering::SeqCst);
+        let output = f.run(&[target, "--public"], None);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("mandatory Hub privacy rules changed"),
+            "{output:?}"
+        );
+        assert!(f.hub.payloads().is_empty());
+        let reads = f.hub.policy_reads.lock().unwrap();
+        assert!(reads.iter().any(|read| read["repository"].is_null()));
+        if scope == 2 {
+            assert!(reads.iter().any(|read| read["repository"] == "me/paper"));
+        }
+    }
+}
+
+#[test]
+fn privacy_exports_refresh_source_rules_and_recipient_before_releasing_output() {
+    use agit::domain::privacy::PrivacyPolicy;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let f = Fixture::new("EXCLUDED-LOG");
+    f.repo
+        .set_remote_named("origin", &format!("{}/me/paper.git", f.hub.url))
+        .unwrap();
+    let path = f.home().join("managed.txt");
+    std::fs::write(&path, "LOCAL_FILE_BODY").unwrap();
+    let raw = [
+        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"managed","name":"Read","input":{"file_path":path}}]}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"managed","content":"MANAGED_CAPTURED_TEXT"}]}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":"Visible export reply"}}),
+    ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
+    let log = transcript::wrap_lines(&raw, "claude-code", &format!("agit-{}", "b".repeat(40)));
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    storage::write_snapshot(f.repo.root(), &log, &log).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo.commit("Session with managed tool text").unwrap();
+    PrivacyPolicy {
+        workspace: Some(f.home().to_path_buf()),
+        ..Default::default()
+    }
+    .save(&f.repo)
+    .unwrap();
+    *f.hub.hub_rules.lock().unwrap() =
+        vec![json!({"version":1,"id":"organization","revision":"r1","exclude":["managed.txt"]})];
+    let output_path = f.home().join("export.json");
+    let output_path = output_path.to_str().unwrap();
+    let key = STANDARD.encode(SecretKey::from([31; 32]).public_key().as_bytes());
+    let args = [
+        "me/paper@chosen",
+        "--format",
+        "privacy-envelope",
+        "--viewing-public-key",
+        key.as_str(),
+        "--out",
+        output_path,
+    ];
+
+    let result = f.run_command(
+        "export",
+        &["me/paper@chosen", "--privacy", "--out", output_path],
+        None,
+    );
+    assert!(result.status.success(), "{result:?}");
+    let public = std::fs::read_to_string(output_path).unwrap();
+    assert!(public.contains("Visible export reply"));
+    assert!(!public.contains("MANAGED_CAPTURED_TEXT"));
+
+    let result = f.run_command("export", &args, None);
+    assert!(result.status.success(), "{result:?}");
+    let envelope = PrivacyEnvelope::parse(&std::fs::read(output_path).unwrap()).unwrap();
+    assert!(
+        !envelope
+            .public_projection
+            .to_string()
+            .contains("MANAGED_CAPTURED_TEXT")
+    );
+    let private = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
+    let (original, _) = private.session_bytes().unwrap();
+    assert!(original.contains("MANAGED_CAPTURED_TEXT"));
+    assert!(!original.contains("LOCAL_FILE_BODY"));
+    assert!(
+        f.hub
+            .policy_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|read| read["repository"] == "me/paper")
+    );
+
+    std::fs::write(output_path, "UNCHANGED_OUTPUT").unwrap();
+    f.hub.policy_reads.lock().unwrap().clear();
+    f.hub.policy_drift.store(2, Ordering::SeqCst);
+    let result = f.run_command("export", &args, None);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("mandatory Hub privacy rules changed"),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_path).unwrap(),
+        "UNCHANGED_OUTPUT"
+    );
+    f.hub.policy_drift.store(0, Ordering::SeqCst);
+
+    f.accept_current();
+    f.hub.rotate_key.store(true, Ordering::SeqCst);
+    let result = f.run_command(
+        "export",
+        &[
+            "me/paper@chosen",
+            "--format",
+            "privacy-envelope",
+            "--out",
+            output_path,
+        ],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("does not match the selected publication"),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_path).unwrap(),
+        "UNCHANGED_OUTPUT"
+    );
+    assert!(
+        f.hub
+            .policy_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|read| read["repository"].is_null())
+    );
+    assert!(f.hub.payloads().is_empty());
+}
+
+#[test]
+fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
+    use agit::domain::privacy::{BranchRestriction, PrivacyPolicy, ReplacementRule};
+
+    let f = Fixture::new("EXCLUDED-LOG");
+    let source_hub = Hub::start();
+    let credential_path = |url: &str| {
+        f.home().join("credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(url).unwrap()
+        ))
+    };
+    let mut credential = agit::infra::credentials::load_at(&credential_path(&f.hub.url)).unwrap();
+    credential.hub = Some(source_hub.url.clone());
+    agit::infra::credentials::save_at(&credential_path(&source_hub.url), &credential).unwrap();
+    f.repo
+        .set_remote_named("origin", &format!("{}/me/paper.git", source_hub.url))
+        .unwrap();
+    agit::hub::identity::pin(
+        &f.repo,
+        &agit::hub::identity::RemoteIdentity::new(
+            &source_hub.url,
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    *source_hub.hub_rules.lock().unwrap() = vec![
+        json!({"version":1,"id":"source-organization","revision":"r1","exclude":["src/managed.rs"]}),
+    ];
+    let private_file = f.home().join("src/private.rs");
+    let managed_file = f.home().join("src/managed.rs");
+    let public_file = f.home().join("src/main.rs");
+    std::fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+    std::fs::write(&public_file, "public source\n").unwrap();
+    std::fs::write(&private_file, "private source\n").unwrap();
+    std::fs::write(&managed_file, "managed source\n").unwrap();
+    let allowed_output = format!(
+        "{}\nALLOWED_TOOL_TAIL\u{1b}[2J",
+        "Allowed output ".repeat(30)
+    );
+    let raw = [
+        json!({"type":"user","sessionId":"native-fixture","cwd":f.home(),"message":{"role":"user","content":format!("PRIVATE_LABEL Read {} and {}", public_file.display(), private_file.display())}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-private","name":"Read","input":{"file_path":private_file}}]}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-private","content":"PRIVATE_SOURCE_OUTPUT"}]}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-managed","name":"Read","input":{"file_path":managed_file}}]}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-managed","content":"MANAGED_SOURCE_OUTPUT"}]}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"read-public","name":"Read","input":{"file_path":public_file}}]}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-public","content":allowed_output}]}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":"VISIBLE-SAVED"}}),
+    ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
+    let claim = format!("agit-{}", "b".repeat(40));
+    let view = transcript::wrap_lines(&raw, "claude-code", &claim);
+    f.repo.git(&["checkout", "chosen"]).unwrap();
+    storage::write_snapshot(f.repo.root(), &(envelope("HIDDEN_HISTORY") + &view), &view).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo
+        .commit("Session with source-bound tool output")
+        .unwrap();
+    f.repo.git(&["tag", "privacy-saved"]).unwrap();
+    f.repo.git(&["checkout", "main"]).unwrap();
+    let policy = PrivacyPolicy {
+        workspace: Some(f.home().to_path_buf()),
+        replacements: vec![ReplacementRule {
+            pattern: "PRIVATE_LABEL".into(),
+            replacement: "Public label".into(),
+            regex: false,
+        }],
+        branches: [(
+            "chosen".into(),
+            BranchRestriction {
+                exclude: vec!["src/private.rs".into()],
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    policy.save(&f.repo).unwrap();
+    let path = f.native("native-fixture");
+    std::fs::write(&path, &raw).unwrap();
+    let store = Store::at(f.home().join("store"));
+    let mut native = link::get(&store, "claude-code", "native-fixture").unwrap();
+    native.owner = Some("me".into());
+    native.agent = Some("paper".into());
+    native.branch = Some("chosen".into());
+    link::write(&store, &native).unwrap();
+
+    for target in [
+        "me/paper@chosen",
+        "me/paper@privacy-saved",
+        "native-fixture",
+    ] {
+        let output = f.success(&[target, "--public"], None);
+        let request = f.hub.payloads().pop().unwrap();
+        let text = request["payload"].as_str().unwrap();
+        let public: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(public["kind"], "share");
+        assert!(public["session"]["log"].is_string());
+        assert!(
+            public["presentation"]
+                .as_str()
+                .unwrap()
+                .contains("VISIBLE-SAVED")
+        );
+        assert!(text.contains("Public label"));
+        assert!(text.contains("<workspace>/src/main.rs"), "{text}");
+        assert!(text.contains("<private-file-1>"));
+        for excluded in [
+            "PRIVATE_LABEL",
+            "PRIVATE_SOURCE_OUTPUT",
+            "MANAGED_SOURCE_OUTPUT",
+            "src/managed.rs",
+            "src/private.rs",
+            "HIDDEN_HISTORY",
+            f.home().to_str().unwrap(),
+        ] {
+            assert!(!text.contains(excluded), "{text}");
+        }
+        let preview = String::from_utf8_lossy(&output.stderr);
+        assert!(preview.contains("Privacy preview"));
+        assert!(preview.contains("Source LOG record"));
+        assert!(preview.contains("tool source is excluded, ambiguous, or unknown"));
+        assert!(preview.contains("original records are not included"));
+        assert!(preview.contains("ALLOWED_TOOL_TAIL\\u{1b}[2J"));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(!preview.contains("PRIVATE_SOURCE_OUTPUT"));
+        assert!(!preview.contains("HIDDEN_HISTORY"));
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    assert!(
+        source_hub
+            .policy_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|read| read["repository"] == "me/paper")
+    );
+    assert!(
+        f.hub
+            .policy_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|read| read["repository"].is_null())
+    );
+    source_hub.policy_drift.store(2, Ordering::SeqCst);
+    // Each operation starts a new review; the mutation must happen between its two resolutions.
+    source_hub.policy_reads.lock().unwrap().clear();
+    let before = f.hub.payloads().len();
+    let output = f.run(&["me/paper@chosen", "--public"], None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mandatory Hub privacy rules changed"),
+        "{output:?}"
+    );
+    assert_eq!(f.hub.payloads().len(), before);
 }
 
 #[test]

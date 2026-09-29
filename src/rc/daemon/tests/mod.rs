@@ -1,5 +1,7 @@
 mod guards;
 mod metadata;
+#[cfg(unix)]
+mod publication;
 mod sessions;
 mod stopping;
 mod turns;
@@ -13,6 +15,7 @@ pub(super) fn rpc_test_live(
     Live {
         generation,
         info: SessionInfo {
+            publication: None,
             session_id: session_id.into(),
             native_source: None,
             runtime_session_id: None,

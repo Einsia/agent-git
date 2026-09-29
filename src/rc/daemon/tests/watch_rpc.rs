@@ -216,6 +216,177 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
         .unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() {
+    const CHILD: &str = "AGIT_TEST_CLAUDE_HISTORY_IDENTITY";
+    let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rc::daemon::watch_rpc::tests::unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing", "--nocapture"])
+            .env(CHILD, directory.path())
+            .env("AGIT_HOME", directory.path().join("agit"))
+            .env("CLAUDE_CONFIG_DIR", directory.path().join("claude"))
+            .env("AGIT_SECRETS_KEYSTORE", "file")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let cwd = root.canonicalize().unwrap();
+    let native = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
+    let call = "toolu_01Qz7mXv9LpZ4tNc8WjF3bHy";
+    let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let record = |role: &str, content: serde_json::Value| {
+        serde_json::json!({
+            "type":role, "sessionId":native, "uuid":uuid::Uuid::new_v4().to_string(),
+            "message":{"role":role,"content":content}
+        })
+    };
+    let mut records = vec![record(
+        "assistant",
+        serde_json::json!([
+            {"type":"tool_use", "id":call, "name":"Bash", "input":{"command":format!("printf '{secret} {call}'")}}
+        ]),
+    )];
+    records.extend((0..65).map(|_| {
+        record(
+            "assistant",
+            serde_json::json!([
+                {"type":"text","text":"Repeated answer"}
+            ]),
+        )
+    }));
+    records.push(record("user", serde_json::json!([
+        {"type":"tool_result","tool_use_id":call,"content":format!("Visible result {secret} {native}"),"is_error":false}
+    ])));
+    let project = crate::adapter::claude_code::projects_dir()
+        .unwrap()
+        .join(crate::adapter::claude_code::slug_for(&cwd));
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{native}.jsonl"));
+    let original = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    std::fs::write(&path, &original).unwrap();
+    let daemon = fixture(&cwd).await;
+    let (frames, mut received) = mpsc::channel(128);
+    {
+        let mut state = daemon.lock().await;
+        state.secret_filter = crate::domain::secret_filter::MatcherHandle::load_default().unwrap();
+        let request = request(method::SESSION_WATCH, "ws", native);
+        let mut scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd.clone());
+        scan.runtime = "claude-code".into();
+        scan.total_lines = records.len() as u64;
+        scan.source = WatchSource::File {
+            path: path.clone(),
+            offset: 0,
+            handle: None,
+        };
+        state.finish_watch_scan(&request, scan, &frames).unwrap();
+    }
+    let watched = ready(async {
+        let mut items = Vec::new();
+        loop {
+            let frame = received.recv().await.unwrap();
+            if frame.method() == method::ITEM_COMPLETED {
+                items.push(frame.params.unwrap());
+            } else if frame.method() == "session.history.status"
+                && frame.params.as_ref().unwrap()["status"] == "complete"
+            {
+                break items;
+            }
+        }
+    })
+    .await;
+    daemon
+        .lock()
+        .await
+        .dispatch(&request(method::SESSION_UNWATCH, "ws", native), &frames)
+        .await
+        .unwrap();
+    let mut params = serde_json::json!({"runtime":"claude-code","session_id":native,"cwd":cwd});
+    let mut pages = Vec::new();
+    loop {
+        let page = crate::rc::local_history::read(params.clone()).unwrap();
+        assert_eq!(
+            page,
+            crate::rc::local_history::read({
+                let mut retry = params.clone();
+                retry["snapshot"] = page["snapshot"].clone();
+                retry
+            })
+            .unwrap()
+        );
+        let more = page["has_more"] == true;
+        params["snapshot"] = page["snapshot"].clone();
+        params["before"] = page["before"].clone();
+        pages.push(page);
+        if !more {
+            break;
+        }
+        assert!(pages.len() < records.len());
+    }
+    assert!(pages.len() > 1);
+    let tool_ids = |page: &serde_json::Value, field: &str| {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| {
+                item["raw"]["message"]["content"][0][field]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tool_ids(pages.first().unwrap(), "tool_use_id"), vec![call]);
+    assert_eq!(tool_ids(pages.last().unwrap(), "id"), vec![call]);
+    let history: Vec<_> = pages
+        .iter()
+        .rev()
+        .flat_map(|page| page["items"].as_array().unwrap())
+        .collect();
+    assert_eq!(history.len(), watched.len());
+    let mut merged = std::collections::BTreeMap::new();
+    for (paged, live) in history.iter().zip(&watched) {
+        assert_eq!(paged["source_id"], live["source_id"]);
+        assert_ne!(paged["item_id"], live["item_id"]);
+        assert_eq!(paged["raw"], live["raw"]);
+        let mut event = live["event"].clone();
+        event.as_object_mut().unwrap().remove("line");
+        assert_eq!(paged["event"], event);
+        merged.insert(paged["source_id"].as_str().unwrap(), *paged);
+    }
+    assert_eq!(merged.len(), records.len());
+    for live in &watched {
+        merged.insert(live["source_id"].as_str().unwrap(), live);
+    }
+    assert_eq!(merged.len(), records.len());
+    assert_eq!(
+        merged
+            .values()
+            .filter(|item| item["event"]["text"] == "Repeated answer")
+            .count(),
+        65
+    );
+    assert!(!serde_json::to_string(&pages).unwrap().contains(secret));
+    assert!(!serde_json::to_string(&watched).unwrap().contains(secret));
+    if let Some(output) = std::env::var_os("AGIT_RC_HISTORY_FIXTURE") {
+        std::fs::write(
+            output,
+            serde_json::to_vec(&serde_json::json!({"pages":pages,"watch":watched})).unwrap(),
+        )
+        .unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+}
+
 #[tokio::test]
 async fn cancelled_intermediate_request_keeps_stream_order_and_admission() {
     let mut queue = WatchRpcQueue::default();

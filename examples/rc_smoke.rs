@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     let now = chrono::Utc::now().to_rfc3339();
     let info = SessionInfo {
+        publication: None,
         session_id: "agit-smoke".into(),
         workspace_id: "ws-smoke".into(),
         project_id: Some("p1".into()),

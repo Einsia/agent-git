@@ -19,7 +19,7 @@ agit repo <subcommand>
 
 | Subcommand | Purpose | Main options |
 |---|---|---|
-| `create <name>` | Create a remote repo on the Hub | `--private` |
+| `create <name>` | Create a remote repo on the Hub | `--private`, `--encryption=true\|false` |
 | `list` | List local repos | `--remote` lists visible Hub repos |
 | `info [repo]` | Show repo details | An omitted repo requires `AGIT_SESSION` |
 | `visibility <repo> <public|private>` | Change visibility | Making private public triggers a server scan |
@@ -35,6 +35,7 @@ agit repo <subcommand>
 
 ```bash
 agit repo create notes --private
+agit repo create ordinary-notes --private --encryption=false
 agit repo list --remote
 agit repo info szh/p1
 agit repo path szh/p1
@@ -45,6 +46,19 @@ agit repo invite szh/p1                        # anyone with the link joins as r
 agit repo invite szh/p1@refund-fix --role write # lands on that branch's session after accepting
 agit repo delete szh/p1 --local
 ```
+
+## Fixed encryption mode
+
+Encryption is fixed when a Hub repository is created. `--encryption=true|false`
+overrides the user's `privacy.encryption` creation default (built-in `true`).
+Visibility remains independent. An encrypted repository requires explicit viewing
+password setup with `agit privacy init <owner/repo>` before encrypted publication.
+An ordinary repository requires no viewing password.
+
+If the name already exists, creation reports its unchanged mode and directs you
+to `agit clone` to retain its identity and history. A conflicting explicit mode
+is refused even when the repository is empty. Choose a new name for another mode.
+`repo info` displays the authoritative mode; a missing mode field requires a Hub upgrade.
 
 ## Invite links
 

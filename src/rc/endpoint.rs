@@ -319,6 +319,29 @@ pub async fn serve(
     .await
 }
 
+#[cfg(all(test, unix))]
+pub(in crate::rc) async fn serve_test_cloud(
+    listener: Listener,
+    outbound: super::outbound::OutboundRx,
+    events: mpsc::Sender<super::link::LinkEvent>,
+    incoming: mpsc::Receiver<super::cloud::host::Authenticated>,
+    registry: super::cloud::ingress::Registry,
+) -> crate::Result<()> {
+    let identity = super::build_identity::DaemonIdentity::current()?;
+    serve_described(
+        listener,
+        outbound,
+        events,
+        serde_json::json!({"workspace_id":WORKSPACE,"rpc_features":identity.rpc_features}),
+        super::peers::controller()?,
+        None,
+        Some(cloud::Ingress::fixed(incoming, registry)),
+        Admission::default(),
+        None,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_described(
     #[allow(unused_mut)] mut listener: Listener,

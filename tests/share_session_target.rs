@@ -65,13 +65,12 @@ fn sharing_follows_the_selected_branch_instead_of_repo_recency() {
         }
         let output = command.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(8), "{target:?}: {stderr}");
+        assert_eq!(output.status.code(), Some(6), "{target:?}: {stderr}");
+        assert!(stderr.contains("cannot reach hub"), "{target:?}: {stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains(&format!(
-                "share for VIEW of me/paper@{} requires",
-                &selected[..12]
-            )),
-            "{target:?}: {stderr}"
+            stdout.contains(&format!("VIEW of me/paper@{}", &selected[..12])),
+            "{target:?}: {stdout}"
         );
     }
 }

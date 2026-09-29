@@ -40,6 +40,9 @@ pub struct Args {
     /// Override automatic publishing for this repository; omission inherits user preferences.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub auto_push: Option<bool>,
+    /// Encryption intent for a new Hub repository; an existing Hub mode is fixed.
+    #[arg(long, require_equals = true, value_name = "true|false")]
+    pub encryption: Option<bool>,
 
     /// Asset choices made by the TUI. `None` means use the ordinary `--seed` policy; `Some`
     /// carries the exact item-by-item confirmation and must not ask a second time.
@@ -63,6 +66,7 @@ pub fn run(args: Args) -> CmdResult {
                 args.seed = picked.seed_assets.is_some();
                 args.seed_assets = picked.seed_assets;
                 args.auto_push = picked.auto_push;
+                args.encryption = picked.encryption;
                 preference_chosen = true;
             }
             crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
@@ -166,6 +170,21 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Precondition);
     }
     let dir = crate::infra::config::repo_dir(&owner, &name)?;
+    if let Some(enabled) = args.encryption
+        && let Some(existing) = Repo::open(&dir)
+        && (crate::hub::identity::read(&existing)?.is_some() || existing.remote_url().is_some())
+    {
+        let (_, actual) = crate::hub::identity::repository_mode(
+            &existing,
+            &crate::hub::Client::from_env(),
+            &owner,
+            &name,
+        )?;
+        anyhow::ensure!(
+            enabled == actual,
+            "repository encryption mode is fixed at creation; create a different repository for the requested mode"
+        );
+    }
     let repo = match Repo::open(&dir).map(|r| (checkout_state(&r), r)) {
         Some((CheckoutState::Empty, existing)) => {
             // The shape `agit repo create` + `agit clone` leaves behind: the remote identity
@@ -205,6 +224,13 @@ pub fn run(args: Args) -> CmdResult {
         None => Repo::init(&dir)?,
     };
     preference.apply(&repo, &format!("{owner}/{name}"))?;
+    if let Some(enabled) = args.encryption
+        && crate::hub::identity::read(&repo)?.is_none()
+        && repo.remote_url().is_none()
+    {
+        repo.set_creation_encryption(enabled)?;
+    }
+
     scaffold(repo.root())?;
 
     let seeded = if let Some(picked) = args.seed_assets.as_deref() {
@@ -274,6 +300,7 @@ fn wants_tui(args: &Args) -> bool {
         && !args.no_bind
         && !args.rebind
         && args.auto_push.is_none()
+        && args.encryption.is_none()
         && args.seed_assets.is_none()
 }
 
@@ -493,6 +520,7 @@ mod tests {
             vec!["x", "--private"],
             vec!["x", "--no-bind"],
             vec!["x", "--rebind"],
+            vec!["x", "--encryption=false"],
         ] {
             assert!(!wants_tui(&W::try_parse_from(argv).unwrap().args));
         }

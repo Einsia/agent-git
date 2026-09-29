@@ -39,9 +39,11 @@
 
 mod background;
 mod landing;
+mod local_publication;
 pub(crate) mod native_records;
 mod settlement_io;
 
+use crate::domain::privacy_receipt::{PublicationReceipt, SupervisorPushRequest};
 use crate::domain::{redact, transcript};
 use crate::protocol::{
     ApprovalResponse, CommitSettled, Delivery, Frame, ItemCompleted, ItemDelta, ItemStarted,
@@ -149,18 +151,19 @@ async fn publish_settlement(
     mut state: tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
     command: tokio::process::Command,
-    sha: String,
+    request: SupervisorPushRequest,
+    result_file: tempfile::NamedTempFile,
     mut notification: Frame,
     out: mpsc::Sender<Frame>,
 ) -> Option<Arc<crate::protocol::ConnectionDelivery>> {
     let push = guarded_output(&mut state, lease, command).await?;
-    if confirmed_strict_push(&push, &sha).is_none() {
+    let Some(published) = confirmed_strict_push(&push, &request, result_file.path()) else {
         tracing_note(&format!(
-            "RC push failed; the pending commit will retry next turn: {}",
+            "RC publication has no matching successful receipt; the pending commit will retry next turn: {}",
             String::from_utf8_lossy(&push.stderr).trim()
         ));
         return None;
-    }
+    };
     if !settlement_lease_is_current(&state, lease) {
         return None;
     }
@@ -168,6 +171,7 @@ async fn publish_settlement(
         lease.epoch,
         crate::protocol::ConnectionFeature::AgentIdentityV1,
     );
+    notification.params.as_mut()?["commit_sha"] = serde_json::Value::String(published);
     notification.connection_delivery = Some(delivery.clone());
     if out.send(notification).await.is_err() {
         delivery.invalidate();
@@ -178,38 +182,12 @@ async fn publish_settlement(
     Some(delivery)
 }
 
-/// The settlement whose `commit.settled` the hub has not confirmed — a watermark on disk.
+/// Notification delivery has its own durable source watermark: publication acknowledgement
+/// cannot prove that `commit.settled` arrived. Write it before publication and remove it only
+/// on confirmed delivery so a restart can retry either unfinished step.
 ///
-/// # Why git reachability cannot be this watermark
-///
-/// [`unpushed_local_head`] derives whether the git side at the hub took this commit, reading the
-/// remote-tracking ref `git push` maintains itself. **Whether the notification arrived is a
-/// second watermark**: the remote ref advances as soon as the push succeeds, while
-/// `commit.settled` is still queued outbound and may reach the hub much later — or never.
-///
-/// Keeping the two watermarks apart bites on an ordinary shutdown, no power loss required: the
-/// daemon's shutdown path runs `link_task.abort()` (the transport is gone) **before**
-/// `shutdown()` → exit settlement. Exit settlement then commits and pushes successfully with no
-/// consumer left to deliver the notification; `wait_for_connection_delivery_within` returns
-/// Pending/Stale and `pending_settlement` holds the sha in memory — then the process exits and
-/// memory is gone. The session that comes back has that field `None`, and asking git also
-/// answers `None` because HEAD is already remotely reachable: the settlement event is lost for
-/// good, the local repo plainly holds that turn, and the session is missing a stretch on the hub.
-///
-/// So the notification side keeps its own receipt: written **before the push**, deleted only on
-/// `DeliveryStatus::Delivered`. Better to resend than not to send — the hub converges by sha, a
-/// duplicate `commit.settled` pointing at the same commit is idempotent, and nobody can recover
-/// the one that was dropped.
-///
-/// It lives under `<repo>/.git/`: settlement already creates its temporary result file there
-/// (`.git` is always a directory and shares this repo's lifetime), so deleting the repo takes
-/// the receipts with it instead of leaving orphans in `$AGIT_HOME` pointing at commits that do
-/// not exist.
-///
-/// The file name is a digest of the branch name rather than the name itself: a branch name may
-/// carry `/`, and characters that are illegal on Windows (`git check-ref-format` accepts them,
-/// NTFS does not). Several sessions run concurrently under one repo directory; one receipt per
-/// branch, none overwriting another.
+/// Branch names are hashed to support path separators and platform-specific filename rules.
+/// Each repository retains these receipts locally, independently of the published Git tree.
 fn unacked_settlement_path(repo_dir: &std::path::Path, branch: &str) -> PathBuf {
     use sha2::Digest as _;
     let key = hex::encode(sha2::Sha256::digest(branch.as_bytes()));
@@ -458,52 +436,57 @@ fn strict_settlement_candidate(
     }
 }
 
-fn confirmed_strict_push(push: &std::process::Output, sha: &str) -> Option<String> {
-    push.status.success().then(|| sha.to_string())
+fn confirmed_strict_push(
+    push: &std::process::Output,
+    request: &SupervisorPushRequest,
+    path: &std::path::Path,
+) -> Option<String> {
+    push.status
+        .success()
+        .then(|| request.read_result(path).ok())
+        .flatten()
+        .map(|receipt| receipt.published)
 }
 
-/// A local commit the hub has not confirmed taking — **derived** from git's own bookkeeping
-/// rather than recalled from memory.
-///
-/// `pending_settlement` lives only in `Session`: after a failed push (an unreachable network is
-/// the most common cause) the daemon crashes, is SIGKILLed or loses power, and the session
-/// `resume_from` brings back has that field `None`; if no new turn follows,
-/// `strict_settlement_candidate` returns straight out of `None => Ok(None)` — nobody ever pushes
-/// that commit and `commit.settled` never names it: the local repo plainly holds that turn, and
-/// the session is missing a stretch on the hub.
-///
-/// So the test reads the remote-tracking ref `git push` maintains itself: it advances only on a
-/// successful push. Derived rather than persisted, because any write-on-exit scheme misses a
-/// hard kill and a power loss — exactly the occasions that leave a pending commit behind.
-///
-/// What it asks is **reachability** (`HEAD --not --remotes=origin`), not whether this equals the
-/// tip of `origin/<branch>`. The difference bites in a real case: a session that just finished
-/// landing ends before running a single turn, so the branch exists but was never pushed and HEAD
-/// still sits on the main baseline that came down with the clone. Comparing tips calls that
-/// baseline commit pending, so the supervisor creates the branch, pushes it, and sends a
-/// `commit.settled` naming a commit this session never produced — a turn on the hub out of
-/// nowhere. Asked by reachability, `origin/main` containing it means "already taken" and nothing
-/// happens.
-///
-/// Excluding the remote refs is not enough; the local main file line has to be excluded too:
-/// when the agent repo on the hub is empty (a new project binding for the first time), `rc land`
-/// clones back a repo with no commits at all and then builds the main baseline locally through
-/// `create_main_file_line`, with not one `origin/*` ref. A session that ends without running a
-/// turn leaves HEAD on that purely local main baseline — asked by origin reachability alone it
-/// counts as never pushed, so a `commit.settled` naming a scaffold commit goes out anyway, which
-/// is the "turn out of nowhere" the paragraph above avoids. The main line is not this session's
-/// output and settlement must never report it.
-///
-/// `--glob=refs/heads/main*` rather than `^refs/heads/main`: with no main, the latter makes the
-/// whole rev-list fatal (the derivation degenerates into always `None`), while a `--glob` that
-/// matches nothing counts as unwritten. Widening to `main-...` only makes the test more
-/// conservative — it can skip a push, never invent one.
+/// A matching local publication receipt accounts for a private source commit even when
+/// the remote contains only its generated public counterpart. Without that evidence,
+/// reachability excludes remote history and untouched local main baselines from retries.
+/// The glob also works when no main ref exists; an identity or receipt error prevents
+/// deriving a settlement for an unverified destination.
 async fn unpushed_local_head(
     state: &mut tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
     repo_dir: &str,
     head: &str,
+    branch: &str,
+    expected_agent_id: &str,
 ) -> Option<String> {
+    if !settlement_lease_is_current(state, lease) {
+        return None;
+    }
+    if !lease.local_owner {
+        let repo = crate::domain::repo::Repo::at(std::path::Path::new(repo_dir));
+        let confirmed = (|| -> crate::Result<bool> {
+            let identity =
+                crate::hub::identity::require_current(&repo, &crate::infra::config::hub_url())?;
+            anyhow::ensure!(
+                identity.agent_id == expected_agent_id,
+                "RC publication destination changed"
+            );
+            PublicationReceipt::load(&repo, branch)?
+                .map(|receipt| receipt.matches(&repo, branch, head, &identity))
+                .transpose()
+                .map(|value| value.unwrap_or(false))
+        })();
+        match confirmed {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(error) => {
+                tracing_note(&format!("cannot verify RC publication history: {error:#}"));
+                return None;
+            }
+        }
+    }
     let remotes = format!("--remotes={}", crate::domain::repo::ORIGIN);
     let mut rev = crate::infra::git_runtime::async_command();
     rev.args(crate::domain::meta::GIT_SAFE)
@@ -740,6 +723,7 @@ pub struct Session {
     /// Which generation of the same logical id this session is. Reported back with `Ended` on
     /// exit so the daemon removes only its own generation.
     generation: u64,
+    pub(crate) publication_incarnation: Option<String>,
     /// This workspace's allowlist **as it stands now**, plus the command names the owner
     /// granted.
     ///
@@ -1190,12 +1174,16 @@ impl Session {
         let mut redactor =
             redact::Redactor::with_registered(redact::Persona::this_machine(), secret_filter)
                 .for_device_control()
-                .require_repository();
+                .with_unbound_native_context(
+                    &info.runtime,
+                    spec.resume_from.as_deref().unwrap_or(""),
+                );
         if let Some(session) = &agit_session {
             let repo = session
                 .repo_dir()
                 .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
             redactor = redactor
+                .require_repository()
                 .with_repository(&repo)
                 .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
             redactor = redactor
@@ -1320,6 +1308,7 @@ impl Session {
             delta_streams: Default::default(),
             alerted_registered: Default::default(),
             generation,
+            publication_incarnation: None,
             resuming,
         };
         // Announce only during launch. Native binding is repeated after the daemon
@@ -3205,6 +3194,12 @@ impl Session {
                 command
                     .env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV)
                     .env("AGIT_LOCAL_AGENT_ID", &expected_agent_id);
+                if let Some(kind) = &agit_session.capture {
+                    command.env(
+                        crate::rc::capture::CAPTURE_ENV,
+                        serde_json::to_string(kind).expect("capture kind serializes"),
+                    );
+                }
             }
             command
         };
@@ -3256,7 +3251,8 @@ impl Session {
             result_file,
             prepared_file,
         };
-        let push = command(&["push", &agit_session.slug()]);
+        let mut push = command(&["push", &agit_session_env]);
+        crate::commands::auto_push::configure(push.as_std_mut());
         let context = settlement_io::LocalSettlementContext {
             lease,
             receipt_path,
@@ -3285,7 +3281,7 @@ impl Session {
             branch,
             expected_agent_id,
             journal_boundary,
-            push,
+            mut push,
         } = context;
         if !settlement_lease_is_current(&self.settlement, lease) {
             return;
@@ -3302,13 +3298,8 @@ impl Session {
             .map(|pending| pending.sha.clone())
         {
             Some(sha) => Some(sha),
-            // With nothing remembered, read the receipt first and then ask git. Neither
-            // watermark can be dropped: the receipt covers whether the notification arrived,
-            // `unpushed_local_head` covers whether the commit was pushed — after a crash
-            // following a successful push only the receipt can speak, and after a crash before
-            // the receipt was persisted only git can. Asked only when this turn produced no new
-            // commit: on the other branches `pending` is never read, and the subprocess would
-            // be started for nothing.
+            // A no-op can retry an undelivered notification or an unpublished source commit.
+            // Publication and notification receipts establish different completion boundaries.
             None if reported.is_none() && after == before => {
                 // The receipt counts only while it points at the current HEAD: a HEAD that has
                 // moved on means a later settlement followed, whose `commit.settled` covers
@@ -3317,7 +3308,15 @@ impl Session {
                 match read_unacked_settlement(&receipt_path).filter(|sha| *sha == after) {
                     Some(sha) => Some(sha),
                     None => {
-                        unpushed_local_head(&mut self.settlement, lease, &repo_dir_s, &after).await
+                        unpushed_local_head(
+                            &mut self.settlement,
+                            lease,
+                            &repo_dir_s,
+                            &after,
+                            &branch,
+                            &expected_agent_id,
+                        )
+                        .await
                     }
                 }
             }
@@ -3350,13 +3349,31 @@ impl Session {
         let Some(sha) = candidate else {
             return; // strict commit succeeded but produced no new turn
         };
-        // The receipt is written **before the push**: a crash after a successful push but
-        // before the notification arrives is this hole's most common shape (the daemon's
-        // shutdown path tears down the transport before running exit settlement, see
-        // [`unacked_settlement_path`]). Written after the push it would leave a window between
-        // "pushed" and "receipt written", which is exactly the window to close. A receipt left
-        // behind by a failed push causes no false positive: it is accepted only while it points
-        // at the current HEAD, and that turn is due for a re-push anyway.
+        if lease.local_owner {
+            let mut notification = Frame::notification(
+                method::COMMIT_LOCAL_SETTLED,
+                crate::protocol::CommitLocalSettled {
+                    session_id: self.info.session_id.clone(),
+                    through_seq: 0,
+                },
+            );
+            notification.settlement_boundary = journal_boundary.clone();
+            self.pending_settlement = None;
+            let _ = self.out.send(notification).await;
+            self.publish_local_source(
+                lease,
+                &repo_dir_s,
+                &branch,
+                &expected_agent_id,
+                &sha,
+                push,
+                journal_boundary,
+            )
+            .await;
+            return;
+        }
+        // Persist the source before publication so a crash cannot lose its notification retry.
+        // The remote notification receives the generated public SHA only after a matching result.
         if !lease.local_owner {
             record_unacked_settlement(&receipt_path, &sha, &branch);
             self.pending_settlement = Some(PendingSettlement {
@@ -3370,9 +3387,9 @@ impl Session {
             method::COMMIT_SETTLED,
             CommitSettled {
                 session_id: self.info.session_id.clone(),
-                agent: Some(slug),
+                agent: Some(slug.clone()),
                 expected_agent_id: Some(expected_agent_id.clone()),
-                branch: Some(branch),
+                branch: Some(branch.clone()),
                 commit_sha: sha.clone(),
                 // The daemon resolves the captured boundary in its own journal coordinates.
                 through_seq: 0,
@@ -3380,17 +3397,46 @@ impl Session {
             },
         );
         notification.settlement_boundary = journal_boundary.clone();
-        if lease.local_owner {
-            self.pending_settlement = None;
-            // Local Git is authoritative; a disconnected viewer can rediscover HEAD.
-            let _ = self.out.send(notification).await;
-            return;
-        }
+        let publication = (|| -> crate::Result<_> {
+            use std::io::Write;
+            let repo = crate::domain::repo::Repo::at(std::path::Path::new(&repo_dir_s));
+            let destination =
+                crate::hub::identity::require_current(&repo, &crate::infra::config::hub_url())?;
+            anyhow::ensure!(
+                destination.agent_id == expected_agent_id,
+                "RC publication destination changed"
+            );
+            let request = SupervisorPushRequest {
+                version: 1,
+                request_id: uuid::Uuid::now_v7().to_string(),
+                repository: slug,
+                branch,
+                source: sha,
+                destination,
+                notification_id: None,
+            };
+            request.validate()?;
+            let mut file = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
+            file.write_all(&serde_json::to_vec(&request)?)?;
+            Ok((request, file))
+        })();
+        let (request, result_file) = match publication {
+            Ok(value) => value,
+            Err(error) => {
+                tracing_note(&format!("cannot prepare RC publication: {error:#}"));
+                return;
+            }
+        };
+        push.env(
+            crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
+            result_file.path(),
+        );
         let publish = publish_settlement(
             self.settlement.clone(),
             lease,
             push,
-            sha,
+            request,
+            result_file,
             notification,
             self.out.clone(),
         );
@@ -3697,6 +3743,9 @@ fn trace_phase(session_id: &str, phase: &str, started: std::time::Instant) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod privacy_tests;
 
 #[cfg(test)]
 mod settle_tests;

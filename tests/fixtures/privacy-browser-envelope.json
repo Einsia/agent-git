@@ -1,0 +1,35 @@
+{
+  "aad_base64": "YWdpdC1wcml2YWN5LWVudmVsb3BlLXYxAHNoYTI1NjoxMWRhNmQyMzYwYmIwODcwYjQ1NzY4YTk4ZGYzNzIwYmUwZDYyNWQwNmE1MTRlNDNkNzczMWVkZWY3NWEzOGNm",
+  "envelope": {
+    "attachments": [],
+    "format_version": 1,
+    "policy_digest": "sha256:585be8baf92682c15da67e8c328a4eb8ddc8eec2f5555311539adc31c18e458c",
+    "private_payload": {
+      "algorithm": "aes-256-gcm",
+      "ciphertext": "kS6Nfho3YG336bNEH6TabrKYrHAct9TDe493G0Xil42q/e5B4bZ/1Eir75xx7lw4z6dXAQSmpqyWSClGalD2hBvmk31FyoMBdQ==",
+      "nonce": "L4i//ulLA3ws7WMP",
+      "wrapped_keys": [
+        {
+          "algorithm": "x25519-sealed-box",
+          "ciphertext": "iPkjbycy4BREHWI2bMNyyNrcM899q6cTpWN+e4me6ld3byzvB3Sw6ayb/1YGTRsoRI67n7gNN8gLniyp8qlz+YBWMm3wLkDT9jR16plFQTU=",
+          "recipient": "test-viewer"
+        }
+      ]
+    },
+    "public_projection": {
+      "canonical_order": {
+        "2": "two",
+        "10": "ten",
+        "": "bmp",
+        "😀": "astral"
+      },
+      "content": "safe synthetic session",
+      "logical_path": "<workspace>/src/main.rs",
+      "runtime": "codex"
+    },
+    "snapshot_digest": "sha256:5b77343bd881a4f425bde1ec9979946ec1add11de02010d4c63159977bac4de8"
+  },
+  "private_payload_base64": "c3ludGhldGljIG9yaWdpbmFsIHNlc3Npb24sIG1ldGFkYXRhIGFuZCBhdHRhY2htZW50IGJ5dGVz",
+  "test_only_viewing_private_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "viewing_public_key": "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ+xnTzf3/pe20="
+}

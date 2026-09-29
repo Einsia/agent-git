@@ -43,5 +43,9 @@ agit memory sync --into szh/p1@refund-fix
 
 - Only Claude Code keeps a per-project memory directory; for other runtimes `sync` is a no-op while `status`/`distill` still work on the branch.
 - Files that hit the secret scanner are never collected or distilled; clean them first.
+- The repository privacy policy is checked before the secret scanner. Memory is private by default;
+  add an explicit pattern with `agit privacy policy allow-memory <pattern> --repo <owner/repo>`
+  before a file can enter a branch. A branch restriction can narrow that allowlist, and rejected
+  candidates remain eligible for a later retry after the policy changes.
 - `memory.track = off` (`agit config`) turns collection off for this machine, on every path including `sync`.
 - A session not started through agit has no baseline: `commit` only records one; `memory sync` collects every top-level file.

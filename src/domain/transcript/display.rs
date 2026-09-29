@@ -140,15 +140,26 @@ pub fn render_native(
     let mut keys = std::collections::BTreeSet::new();
     let mut raw = String::new();
     let mut synthetic = false;
+    let mut recovery = false;
+    let mut follows_evidence = false;
+    let mut claude_sources = true;
+    let mut records = Vec::new();
     for line in envelopes.split_inclusive('\n') {
         let envelope = storage::parse_envelope_line(line)?;
         synthetic |= envelope.content["agit"] == "merge_summary";
+        follows_evidence = super::recovery::generated(&envelope.content, follows_evidence);
+        recovery |= follows_evidence;
+        claude_sources &= adapter::get(&envelope.source)?.format() == "claude-code";
         keys.insert(source_key(&envelope));
         raw.push_str(&serde_json::to_string(&envelope.content)?);
         raw.push('\n');
+        records.push(envelope.content);
     }
     anyhow::ensure!(!keys.is_empty(), "empty saved transcript");
-    if !synthetic && keys.len() == 1 {
+    if recovery && claude_sources && !synthetic && dst.format() == "claude-code" {
+        return Ok((super::recovery::render_claude(&records, id, cwd)?, false));
+    }
+    if !synthetic && !recovery && keys.len() == 1 {
         let src = adapter::get(&keys.first().unwrap().source)?;
         if src.format() == dst.format() {
             src.parse(&raw)?;
