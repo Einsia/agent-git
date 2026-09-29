@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-09-30
+
 ### Changed
 
 - **Installations that skip install scripts are counted.** An installation whose
@@ -38,6 +40,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   [Session reuse and invitations](docs/telemetry.md#session-reuse-and-invitations).
 
 ### Fixed
+
+- Remote Control can return a fresh, bounded native history page with watch
+  admission, avoiding a separate network round trip when opening a conversation.
+  Native history transfers negotiate compression, preserving complete tool
+  results and compatibility with older clients and servers. Optional history
+  reads do not block the daemon or prevent a successful live subscription.
+- Device name changes synchronize to Cloud without enrolling another device.
+- Failed session publication retries while the conversation is idle, so a
+  transient upload failure does not require another user message to recover.
 
 - `agit login` checks that it can save credentials under `AGIT_HOME` before it
   asks the Hub for anything. An agent sandbox that refuses writes there no
