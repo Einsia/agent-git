@@ -276,20 +276,47 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
     std::fs::write(&path, &original).unwrap();
     let daemon = fixture(&cwd).await;
     let (frames, mut received) = mpsc::channel(128);
-    {
-        let mut state = daemon.lock().await;
-        state.secret_filter = crate::domain::secret_filter::MatcherHandle::load_default().unwrap();
-        let request = request(method::SESSION_WATCH, "ws", native);
-        let mut scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd.clone());
-        scan.runtime = "claude-code".into();
-        scan.total_lines = records.len() as u64;
-        scan.source = WatchSource::File {
-            path: path.clone(),
-            offset: 0,
-            handle: None,
-        };
-        state.finish_watch_scan(&request, scan, &frames).unwrap();
-    }
+    daemon.lock().await.secret_filter =
+        crate::domain::secret_filter::MatcherHandle::load_default().unwrap();
+    let mut watch_request = request(method::SESSION_WATCH, "ws", native);
+    let params = watch_request.params.as_mut().unwrap();
+    params["include_history"] = serde_json::json!(true);
+    params["cwd"] = serde_json::json!("/outside-workspace");
+    params["runtime"] = serde_json::json!("untrusted-runtime");
+    let (outbound, mut replies) = crate::rc::outbound::channel();
+    let (_stop, stopping) = tokio::sync::watch::channel(false);
+    let transcript = path.clone();
+    let directory = cwd.clone();
+    let lines = records.len() as u64;
+    WatchRpcQueue::default()
+        .reserve(&watch_request)
+        .unwrap()
+        .serve_with(
+            daemon.clone(),
+            outbound,
+            frames.clone(),
+            (watch_request, 0),
+            stopping,
+            move |scan| {
+                let mut scan = prepared(scan, directory);
+                scan.runtime = "claude-code".into();
+                scan.total_lines = lines;
+                scan.source = WatchSource::File {
+                    path: transcript,
+                    offset: 0,
+                    handle: None,
+                };
+                Ok(scan)
+            },
+        )
+        .await;
+    let reply = response(&mut replies).await;
+    assert!(reply.error.is_none(), "{reply:?}");
+    let page = &reply.result.as_ref().unwrap()["history_page"];
+    assert!(page["items"].is_array(), "{page}");
+    assert!(page.to_string().contains("Visible result"));
+    assert!(!page.to_string().contains(secret));
+    assert!(!daemon.lock().await.watches.is_empty());
     let watched = ready(async {
         let mut items = Vec::new();
         loop {
@@ -441,7 +468,8 @@ async fn slow_scan_releases_daemon_and_unwatch_cannot_overtake_it() {
     let (_stop, stopping) = tokio::sync::watch::channel(false);
     let (started, scanning) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
-    let watch = request(method::SESSION_WATCH, "ws", "native");
+    let mut watch = request(method::SESSION_WATCH, "ws", "native");
+    watch.params.as_mut().unwrap()["include_history"] = serde_json::json!(true);
     let unwatch = request(method::SESSION_UNWATCH, "ws", "native");
     let opener = tokio::spawn(queue.reserve(&watch).unwrap().serve_with(
         daemon.clone(),
@@ -476,6 +504,14 @@ async fn slow_scan_releases_daemon_and_unwatch_cannot_overtake_it() {
     let opened = response(&mut replies).await;
     assert_eq!(opened.id, watch.id);
     assert!(opened.error.is_none(), "{opened:?}");
+    assert!(
+        opened
+            .result
+            .as_ref()
+            .unwrap()
+            .get("history_page")
+            .is_none()
+    );
     let closed = response(&mut replies).await;
     assert_eq!(closed.id, unwatch.id);
     assert!(closed.error.is_none());

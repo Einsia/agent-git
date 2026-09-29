@@ -50,6 +50,34 @@ enum WatchSource {
     },
 }
 
+impl PreparedWatch {
+    fn initial_history(&self, frame: &Frame) -> Option<serde_json::Value> {
+        let params = frame.params.as_ref()?;
+        if params["include_history"] != true {
+            return None;
+        }
+        // The scan supplies the runtime and directory; client coordinates cannot widen a read.
+        let mut history = serde_json::json!({
+            "workspace_id":self.request.workspace_id,
+            "session_id":self.request.session_id,
+            "runtime":self.runtime,
+            "cwd":self.cwd,
+            "view":"conversation",
+        });
+        if let Some(watch) = &self.enrolled {
+            let source = watch.identity();
+            history["source_id"] = serde_json::json!(source.source_id);
+            history["source_generation"] = serde_json::json!(source.generation);
+            history["native_session_id"] = serde_json::json!(watch.native_id);
+            history["expected_cwd"] = serde_json::json!(watch.cwd);
+        }
+        if let Some(encoding) = params.get("response_encoding") {
+            history["response_encoding"] = encoding.clone();
+        }
+        Some(history)
+    }
+}
+
 impl WatchScan {
     pub(super) fn run(self) -> Result<PreparedWatch, RpcError> {
         let Self { request, snapshot } = self;
@@ -828,7 +856,7 @@ impl WatchRpcTicket {
             Err(error) => Err(error),
             Ok(prepared) => {
                 let permit = tokio::select! {
-                    permit = scans.acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return },
+                    permit = scans.clone().acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return },
                     _ = stopping(&mut stop) => return,
                 };
                 {
@@ -857,11 +885,45 @@ impl WatchRpcTicket {
                 {
                     prepared.native_inbox = Some("codex_queue".into());
                 }
-                let mut state = daemon.lock().await;
-                if *stop.borrow() || !connection_epoch_is_current(&state.settlement, epoch) {
-                    return;
+                let history = scanned
+                    .as_ref()
+                    .ok()
+                    .and_then(|prepared| prepared.initial_history(&frame));
+                let mut result = {
+                    let mut state = daemon.lock().await;
+                    if *stop.borrow() || !connection_epoch_is_current(&state.settlement, epoch) {
+                        return;
+                    }
+                    scanned.and_then(|prepared| state.finish_watch_scan(&frame, prepared, &frames))
+                };
+                if let Ok(value) = &mut result
+                    && value["read_only"] == true
+                    && let Some(params) = history
+                    && let Ok(permit) = scans.clone().try_acquire_owned()
+                {
+                    // The tail and replay journal exist before history is read outside the daemon lock.
+                    let authority = frame.authority.clone();
+                    let reading = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        authority
+                            .check()
+                            .map_err(|error| anyhow::anyhow!(error.message))?;
+                        crate::rc::local_history::read(params)
+                    });
+                    let page = tokio::select! {
+                        page = tokio::time::timeout(std::time::Duration::from_secs(1), reading) => page,
+                        _ = stopping(&mut stop) => return,
+                    };
+                    if let Ok(Ok(Ok(page))) = page {
+                        value["history_page"] = page;
+                        if serde_json::to_vec(value)
+                            .map_or(true, |bytes| bytes.len() > agit_peer::MAX_FRAME_BYTES / 2)
+                        {
+                            value.as_object_mut().unwrap().remove("history_page");
+                        }
+                    }
                 }
-                scanned.and_then(|prepared| state.finish_watch_scan(&frame, prepared, &frames))
+                result
             }
         };
         let state = daemon.lock().await;
