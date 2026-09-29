@@ -50,6 +50,7 @@ impl Fixture {
             "AGIT_TELEMETRY_PARENT_ID",
             "AGIT_INSTALL_CHANNEL",
             "AGIT_INSTALLER_ONBOARDING_HANDLED",
+            "AGIT_INSTALLER_YES",
             "AGIT_ACQUISITION_ID",
             "AGIT_CAMPAIGN_URL",
             "AGIT_YES",
@@ -1439,5 +1440,109 @@ fn required_official_policy_does_not_enable_an_optional_hub_after_switching() {
             );
             assert!(!f.path("pending-install.json").exists());
         }
+    }
+}
+
+/// A new installation without an installer receipt reports once from its first user command,
+/// never from the setup an installer runs before recording its own receipt, and never for state
+/// that predates the creation time or is first written into an older AGIT_HOME. Counting
+/// installer invocations would drop create-agit's receipt and its acquisition key as a
+/// duplicate; admitting legacy state would count every upgraded installation as new. The first
+/// command runs with a false deferral switch, so treating the variable's presence as deferral
+/// moves the receipt to the second command and fails the first count.
+#[test]
+fn first_user_command_reports_a_missing_receipt_once_and_installer_runs_do_not() {
+    let receipts = |f: &Fixture| {
+        f.events()
+            .into_iter()
+            .filter(|event| event["event"] == "cli_install_succeeded")
+            .collect::<Vec<_>>()
+    };
+    let mut f = Fixture::new();
+    f.hub = "https://agent-git.com".into();
+    for run in 0..2 {
+        let output = f
+            .command()
+            .args(["status", "--json"])
+            .env("AGIT_INSTALL_CHANNEL", "npm_global")
+            .env("AGIT_TELEMETRY_DEFER", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(receipts(&f).len(), 1, "after run {run}");
+    }
+    let found = receipts(&f);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let properties = &found[0]["properties"];
+    assert_eq!(properties["receipt_origin"], "first_command");
+    assert_eq!(properties["installation_verified"], true);
+    assert_eq!(properties["channel"], "npm_global");
+    let prefs: Value =
+        serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(properties["installation_id"], prefs["device_id"]);
+
+    // An automatic push whose settling parent had no statistics context carries no parent ID;
+    // its own marker must still keep it from counting, while the same agent-shaped call counts.
+    let mut auto = Fixture::new();
+    auto.hub = f.hub.clone();
+    for (marker, expected) in [(true, 0), (false, 1)] {
+        let mut command = auto.command();
+        command
+            .args(["status", "--json"])
+            .env("AGIT_SESSION", "einsia/qa@work");
+        if marker {
+            command.env("AGIT_AUTO_PUSH", "1");
+        }
+        command.output().unwrap();
+        assert_eq!(receipts(&auto).len(), expected, "marker={marker}");
+    }
+
+    let mut installer = Fixture::new();
+    installer.hub = f.hub.clone();
+    for args in [
+        vec!["--version"],
+        vec!["setup", "--skill", "--runtime", "codex", "--quiet"],
+    ] {
+        installer
+            .command()
+            .args(&args)
+            .env("AGIT_TELEMETRY_DEFER", "1")
+            .env("AGIT_INSTALL_CHANNEL", "npm_global")
+            .output()
+            .unwrap();
+    }
+    assert!(installer.path("preferences.json").exists());
+    assert!(receipts(&installer).is_empty());
+    let acquisition = uuid::Uuid::new_v4().to_string();
+    installer
+        .command()
+        .args(["--internal-install-completed", "--defer-notice"])
+        .env("AGIT_INSTALL_CHANNEL", "create_agit")
+        .env("AGIT_ACQUISITION_ID", &acquisition)
+        .output()
+        .unwrap();
+    let found = receipts(&installer);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["properties"]["receipt_origin"], "installer");
+    assert_eq!(found[0]["properties"]["acquisition_id"], acquisition);
+
+    let legacy = Fixture::new();
+    legacy.enable();
+    let mut upgraded = Fixture::new();
+    upgraded.hub = f.hub.clone();
+    let old_state = upgraded.home.path().join("agit/legacy-state");
+    std::fs::create_dir_all(old_state.parent().unwrap()).unwrap();
+    std::fs::File::create(&old_state)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400))
+        .unwrap();
+    for fixture in [&legacy, &upgraded] {
+        assert!(fixture.run(&["status", "--json"]).status.success());
+        assert!(!fixture.events().is_empty());
+        assert!(receipts(fixture).is_empty());
+        let prefs: Value =
+            serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap())
+                .unwrap();
+        assert_eq!(prefs["first_command_checked"], true);
     }
 }

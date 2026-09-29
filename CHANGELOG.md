@@ -10,6 +10,17 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Changed
 
+- **Installations that skip install scripts are counted.** An installation whose
+  installer recorded no install receipt, such as one run through `npx`, with
+  npm `--ignore-scripts`, or by a package manager that skips install scripts,
+  now records one from its first user command, marked
+  `receipt_origin=first_command`; installer receipts are marked
+  `receipt_origin=installer`. Setup, hooks, MCP, RC, background processes and
+  commands an installer runs never record it, so a create-agit receipt keeps its
+  acquisition key. Installations whose statistics state predates this release,
+  or whose `AGIT_HOME` already held older state, are never reported this way. See
+  [First-command receipt](docs/telemetry.md#acquisition-funnel-contract).
+
 - **Session reuse and invitation counts on the Hub.** When `agit run` continues
   a session line or forks from a point on one, it sends the Hub one receipt
   naming the repository, the source session ID and commit, whether the run

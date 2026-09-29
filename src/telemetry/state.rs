@@ -9,6 +9,10 @@ use std::{
 };
 
 pub const NOTICE_VERSION: u32 = 2;
+/// How long after it was verified a pending receipt, or after its state was created an
+/// installation's first-command receipt, may still be recorded. Outside it, an installation is
+/// not new, so a receipt would count an old installation as a fresh one.
+pub(crate) const RECEIPT_WINDOW_MS: i64 = 86_400_000;
 pub const REQUIRED_NOTICE: &str = "Usage statistics are required when using agent-git.com and are linked to your account when signed in.";
 pub const ENABLED_NOTICE: &str =
     "Usage statistics are enabled and linked to your account when signed in.";
@@ -63,6 +67,14 @@ pub struct Preferences {
     pub acquisition_completed: bool,
     pub first_acquisition_account: Option<AcquisitionAccount>,
     pub acquisition_reported: bool,
+    /// When this state was first written into an AGIT_HOME that held nothing older than the
+    /// receipt window. Identity rotation keeps it. State that lacks it belongs to an installation
+    /// that existed before it, so it can never send a first-command receipt.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set before a first-command receipt is queued, and set by identity rotation when the old
+    /// identity was reported: an installation that was reported or considered in any generation
+    /// never sends a first-command receipt, so a re-enable does not count as a new installation.
+    pub first_command_checked: bool,
 }
 
 impl Preferences {
@@ -167,12 +179,38 @@ pub fn override_reason(hub: &str) -> Option<&'static str> {
         "AGIT_TELEMETRY_DEFER",
     ]
     .into_iter()
-    .find(|name| {
-        std::env::var_os(name).is_some_and(|v| {
-            !matches!(
-                v.to_str().map(str::to_ascii_lowercase).as_deref(),
-                Some("0" | "false" | "")
-            )
+    .find(|name| asserted(name))
+}
+
+/// A switch variable is on unless it is unset, empty, `0` or `false`.
+pub(crate) fn asserted(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| {
+        !matches!(
+            v.to_str().map(str::to_ascii_lowercase).as_deref(),
+            Some("0" | "false" | "")
+        )
+    })
+}
+
+/// Whether AGIT_HOME holds an entry created or last modified before the receipt window. Such an
+/// installation is not new even when its statistics state is missing: releases before usage
+/// statistics never wrote it, and an upgrade that runs no installer receipt path creates it on
+/// the next command. Without this check that command would report an old installation as new.
+fn home_predates_window(dir: &Path) -> bool {
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_millis(RECEIPT_WINDOW_MS as u64))
+    else {
+        return false;
+    };
+    let Some(Ok(entries)) = dir.parent().map(std::fs::read_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.metadata().is_ok_and(|metadata| {
+            [metadata.created(), metadata.modified()]
+                .into_iter()
+                .flatten()
+                .any(|time| time < cutoff)
         })
     })
 }
@@ -197,11 +235,16 @@ fn choose_at(
     only_unset: bool,
 ) -> Result<Preferences> {
     let _guard = gate(dir, true)?;
-    let mut current = match read_at(dir) {
-        Ok(current) => current,
-        Err(_) if preference == Preference::Disabled => Preferences::default(),
+    let (mut current, fresh) = match read_json::<Preferences>(&dir.join("preferences.json"), 65536)
+    {
+        Ok(Some(current)) => (current, false),
+        Ok(None) => (Preferences::default(), true),
+        Err(_) if preference == Preference::Disabled => (Preferences::default(), false),
         Err(error) => return Err(error),
     };
+    if fresh && !home_predates_window(dir) {
+        current.created_at = Some(chrono::Utc::now());
+    }
     let required = matches!(source, DecisionSource::HostedHub);
     let previous = if required {
         current.preference
@@ -235,6 +278,7 @@ fn choose_at(
     current.campaign_first = None;
     current.campaign_latest = None;
     current.acquisition_route = None;
+    current.first_command_checked |= current.install_reported;
     current.install_reported = false;
     current.acquisition_completed = false;
     current.first_acquisition_account = None;

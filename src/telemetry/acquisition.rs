@@ -3,6 +3,15 @@
 use super::{Destination, Event, EventName, state, transport};
 use serde_json::{Map, Value, json};
 
+use state::RECEIPT_WINDOW_MS;
+
+/// Which process recorded an installation's single receipt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Installer,
+    FirstCommand,
+}
+
 pub(crate) fn extend_properties(preferences: &state::Preferences, props: &mut Map<String, Value>) {
     if let Some(id) = preferences.device_id {
         props.insert("installation_id".into(), json!(id));
@@ -82,7 +91,12 @@ pub fn installed(defer_notice: bool) -> anyhow::Result<()> {
         state::onboarding()?;
     }
     resume_pending(&hub)?;
-    record_install(&destination, &fact, state::read()?.generation)?;
+    record_install(
+        &destination,
+        &fact,
+        state::read()?.generation,
+        Origin::Installer,
+    )?;
     transport::spawn_worker(&hub);
     Ok(())
 }
@@ -105,15 +119,27 @@ pub(crate) fn resume_pending(hub: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let age = (chrono::Utc::now() - fact.verified_at).num_milliseconds();
-    if (0..=86_400_000).contains(&age) {
-        record_install(&destination, &fact, preferences.generation)?;
+    if (0..=RECEIPT_WINDOW_MS).contains(&age) {
+        record_install(
+            &destination,
+            &fact,
+            preferences.generation,
+            Origin::Installer,
+        )?;
     }
     let _guard = state::gate(&dir, true)?;
-    let current = state::read_at(&dir)?;
+    let mut current = state::read_at(&dir)?;
     if current.generation != preferences.generation {
         return Ok(());
     }
-    if current.install_reported || !(0..=86_400_000).contains(&age) {
+    let expired = !(0..=RECEIPT_WINDOW_MS).contains(&age);
+    // An expired pending receipt proves the installation is not new; once it is gone, only the
+    // marker keeps a first command from reporting the installation with a fresh timestamp.
+    if expired && !current.install_reported && !current.first_command_checked {
+        current.first_command_checked = true;
+        state::write_json(&dir.join("preferences.json"), &current)?;
+    }
+    if current.install_reported || expired {
         match std::fs::remove_file(dir.join("pending-install.json")) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -123,15 +149,79 @@ pub(crate) fn resume_pending(hub: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An installation whose installers recorded no receipt, such as `npx`, skipped install scripts
+/// or a package manager that does not run them, reports it once from its first user command.
+/// The caller admits only user-initiated invocations. Pending admission runs first and wins, so
+/// an installer's timestamp and acquisition key survive. The marker is saved before the receipt
+/// is queued, under the same gate hold, so state that cannot be written sends nothing and a
+/// concurrent sender cannot take the gate between the two. The gate is never waited for: a
+/// command that finds it busy leaves the marker unset and the next command tries again.
+pub(crate) fn first_command(hub: &str, generation: u64) -> anyhow::Result<()> {
+    let unchecked = |preferences: &state::Preferences| {
+        state::enabled(preferences, hub)
+            && preferences.generation == generation
+            && preferences.device_id.is_some()
+            && !preferences.install_reported
+            && !preferences.first_command_checked
+    };
+    // Every later command returns here without taking the gate.
+    if !unchecked(&state::read()?) {
+        return Ok(());
+    }
+    let Some(destination) = Destination::for_hub(hub) else {
+        return Ok(());
+    };
+    let dir = state::directory()?;
+    let now = chrono::Utc::now();
+    let _guard = state::gate(&dir, false)?;
+    let mut preferences = state::read_at(&dir)?;
+    if !unchecked(&preferences)
+        || std::fs::symlink_metadata(dir.join("pending-install.json")).is_ok()
+    {
+        return Ok(());
+    }
+    // A debug run only previews, so the marker stays unset for the run that queues the receipt.
+    if !state::debug(hub) {
+        preferences.first_command_checked = true;
+        state::write_json(&dir.join("preferences.json"), &preferences)?;
+    }
+    let recent = preferences.created_at.is_some_and(|created| {
+        (0..=RECEIPT_WINDOW_MS).contains(&(now - created).num_milliseconds())
+    });
+    if !recent {
+        return Ok(());
+    }
+    let mut fact = VerifiedInstall::current(&destination);
+    fact.verified_at = now;
+    fact.acquisition_id = None;
+    fact.campaign = None;
+    if fact.channel == "unknown" {
+        fact.channel = preferences.channel;
+    }
+    record_locked(&dir, &destination, &fact, generation, Origin::FirstCommand)
+}
+
 fn record_install(
     destination: &Destination,
     fact: &VerifiedInstall,
     generation: u64,
+    origin: Origin,
 ) -> anyhow::Result<()> {
     let dir = state::directory()?;
+    let _guard = state::gate(&dir, true)?;
+    record_locked(&dir, destination, fact, generation, origin)
+}
+
+/// The caller holds the state gate.
+fn record_locked(
+    dir: &std::path::Path,
+    destination: &Destination,
+    fact: &VerifiedInstall,
+    generation: u64,
+    origin: Origin,
+) -> anyhow::Result<()> {
     let preferences = {
-        let _guard = state::gate(&dir, true)?;
-        let mut preferences = state::read_at(&dir)?;
+        let mut preferences = state::read_at(dir)?;
         if !state::enabled(&preferences, &destination.hub) || preferences.generation != generation {
             return Ok(());
         }
@@ -166,6 +256,7 @@ fn record_install(
         "source": "installer", "ci": fact.ci,
         "channel": preferences.channel, "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH, "installation_verified": true,
+        "receipt_origin": match origin {Origin::Installer => "installer", Origin::FirstCommand => "first_command"},
         "app_env": if destination.environment == "production" {"production"} else {"development"},
         "deployment_env": destination.environment, "event_id": id,
         "event_ts": fact.verified_at.timestamp_millis(), "$process_person_profile": false, "$geoip_disable": true
@@ -181,7 +272,7 @@ fn record_install(
     if state::debug(&destination.hub) {
         eprintln!("{}", json!({"telemetry_preview": event}));
     } else {
-        transport::enqueue(event.clone(), preferences.generation, destination)?;
+        transport::enqueue_locked(dir, event.clone(), preferences.generation, destination)?;
         if preferences.acquisition_id.is_some() && !preferences.acquisition_reported {
             let mut attributed = event;
             attributed.event = EventName::InstallAttributed;
@@ -189,7 +280,7 @@ fn record_install(
             attributed
                 .properties
                 .insert("event_id".into(), json!(attributed.uuid));
-            transport::enqueue(attributed, preferences.generation, destination)?;
+            transport::enqueue_locked(dir, attributed, preferences.generation, destination)?;
         }
     }
     Ok(())

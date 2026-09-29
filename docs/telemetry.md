@@ -105,7 +105,7 @@ been persisted when the daemon exits may be lost.
 | `cli_onboarding_completed` | Setup established an enabled preference |
 | `cli_session_started` | Foreground telemetry activity started a new session |
 | `cli_install_stage` | Visible create-agit attempt start, durable copy, binary verification, integration setup and completion |
-| `cli_install_succeeded` | An installer copied the binary and verified it runs; once per installation generation |
+| `cli_install_succeeded` | An installer verified the binary runs, or a new installation without an installer receipt ran its first user command; once per installation generation |
 | `cli_install_attributed` | A tagged installer associates an installation with an anonymous website acquisition |
 | `cli_acquisition_linked` | The first successful CLI login saved an authoritative account ID |
 
@@ -253,6 +253,38 @@ optional preference and deferred receipt behavior: visible setup can admit a
 pending receipt with its original timestamp. Local-only commands do not start a
 sender, and pending receipts expire after a day.
 
+**First-command receipt.** Some installations never run an installer that records
+a receipt: `npx` leaves it to create-agit, npm `--ignore-scripts` and package
+managers that skip install scripts never run it, and an unwritable telemetry
+directory cannot keep it. Such an installation records one receipt from its first
+user command instead. Receipts carry `receipt_origin`: `installer` for installer
+and pending receipts, `first_command` for this one. It has the installer
+receipt's properties, `installation_verified=true` because the binary is running,
+the command time as its timestamp, and the channel the npm launcher or the saved
+installation reports. It carries no acquisition key or campaign; a later tagged
+installer can still attribute it with `cli_install_attributed`.
+
+Only a command a person or their agent runs qualifies. `agit setup`, hooks, MCP,
+RC and other background processes, child processes another `agit` invocation
+starts (such as an automatic push after a hook settles a session), help,
+version, parse errors, completions, and any invocation with a true
+`AGIT_TELEMETRY_DEFER` or the create-agit installer environment do not, because
+installers run them before recording their own receipt or the user did not run
+them. A recorded receipt or a pending receipt for the installation suppresses it,
+pending admission runs first, and a pending receipt that expires unsent marks the
+installation as considered. Only installations whose telemetry state was created
+within the pending-receipt window, in an `AGIT_HOME` holding nothing older than
+that window, qualify. Older state, state saved by releases that did not record
+its creation time, and state first created in an older `AGIT_HOME` (for example
+an installation from before usage statistics that later upgrades) are marked as
+considered without sending. The marker is saved under the same state lock hold
+that queues the event, before it is queued, so an installation that cannot save
+it sends nothing. The command never waits for that lock; if a sender holds it,
+the next command tries again. With `AGIT_TELEMETRY_DEBUG=1` the receipt is
+previewed and the marker is left unset. The event is queued like any other: a
+local-only command does not start a sender, so it waits for the next online
+operation and can expire unsent.
+
 The first `agit login` handoff URL also carries `installation_id`. The browser
 stores it through registration, so a direct npm installation can be associated
 with a website visit when the browser authorization page is opened. The CLI emits
@@ -277,9 +309,11 @@ activity or merge subsequent accounts sharing a machine.
 
 Untagged installs that never open browser authorization cannot be connected to an
 earlier website visit. Where the installation receipt was eligible for delivery, they still appear in
-the installation-without-observed-registration cohort. Manual archive copies, builds outside the installers, `--no-verify`, npm
-`--ignore-scripts`, nonproduction opt-outs, offline delivery expiry, and older CLI releases have
-no verified install receipt. Exclude those from claims of complete coverage. Data
+the installation-without-observed-registration cohort. Manual archive copies, builds outside the
+installers, `--no-verify`, `npx`, and npm `--ignore-scripts` installs are counted only by a
+first-command receipt, so an installation that never runs a user command has none.
+Nonproduction opt-outs, offline delivery expiry, and older CLI releases have no verified install
+receipt. Exclude those from claims of complete coverage. Data
 is prospective; deploying the website and releasing the CLI are both required.
 
 ## Local campaign attribution

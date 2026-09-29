@@ -43,6 +43,7 @@ struct Seed {
     background: bool,
     hook: bool,
     protocol: bool,
+    first_command: bool,
 }
 #[derive(Clone)]
 struct Context {
@@ -205,6 +206,7 @@ fn seed(argv: &[OsString]) -> Seed {
         background,
         hook,
         protocol,
+        first_command: false,
     }
 }
 
@@ -408,6 +410,7 @@ pub fn begin(argv: &[OsString], restart: Option<&str>) {
     if state::required(&seed.hub) && (!parse_ok || lightweight) {
         return;
     }
+    seed.first_command = user_initiated(&seed, parse_ok && !lightweight);
     if let Ok(mut run) = RUN.lock() {
         *run = Some(Run {
             seed,
@@ -452,12 +455,47 @@ pub fn activate(onboarding: bool) {
     if !seed.hook && !started_event {
         emit(&context, EventName::Started, Map::new());
     }
+    if seed.first_command {
+        let _ = acquisition::first_command(&seed.hub, context.generation);
+    }
     if let Ok(mut run) = RUN.lock()
         && let Some(run) = run.as_mut()
     {
         run.context = Some(context);
         run.started_event = !seed.hook;
     }
+}
+
+/// Only a command a person or their agent ran may stand in for a missing install receipt. An
+/// installer's own invocations run before the installer records its receipt, so if they counted,
+/// the installer's receipt and its acquisition key would be dropped as a duplicate. Background,
+/// hook, protocol and RC processes run without the user, and help, version, parse errors and
+/// completions never initialize statistics. A child that another invocation started carries
+/// its parent's ID and never counts: a user-run parent already had the chance, and a hook's
+/// child would otherwise count on the hook's behalf. An automatic push is also excluded by its
+/// own marker, because the parent ID exists only when the settling invocation had a statistics
+/// context, and a hook that could not take the state lock has none. The create-agit variables
+/// count when present because create-agit always sets them; the deferral switch follows the same
+/// rule as everywhere else, so `AGIT_TELEMETRY_DEFER=0` does not defer.
+fn user_initiated(seed: &Seed, admitted: bool) -> bool {
+    let property = |name: &str| seed.properties.get(name).and_then(Value::as_str);
+    let installer = state::asserted("AGIT_TELEMETRY_DEFER")
+        || present("AGIT_INSTALLER_YES")
+        || present("AGIT_INSTALLER_ONBOARDING_HANDLED");
+    admitted
+        && !installer
+        && !seed.properties.contains_key("parent_invocation_id")
+        && !state::asserted("AGIT_AUTO_PUSH")
+        && !seed.background
+        && !seed.hook
+        && !seed.protocol
+        && matches!(property("source"), Some("direct" | "agent"))
+        && match property("command") {
+            None | Some("unparsed" | "completions" | "setup") => false,
+            // Without a terminal a bare `agit` prints help instead of opening the TUI.
+            Some("bare") => seed.properties.get("prompt_capable") == Some(&json!(true)),
+            Some(_) => true,
+        }
 }
 
 /// A replacement process continues the invocation; it must not emit another start or lose prompts.

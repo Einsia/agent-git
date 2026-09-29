@@ -75,8 +75,12 @@ pub(super) fn after_settlement(
             .current_dir(directory)
             .env("AGIT_SESSION", &target)
             .env("AGIT_TUI", "0")
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::null());
+        // Statistics attribute the push to the settling invocation, which may be a hook.
+        if let Some(parent) = crate::telemetry::parent_invocation_id() {
+            command.env("AGIT_TELEMETRY_PARENT_ID", parent);
+        }
+        command.output()
     });
     match outcome {
         Ok(output) if output.status.success() => {

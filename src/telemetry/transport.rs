@@ -160,10 +160,6 @@ fn prune(queue: &mut Queue, generation: u64, now: i64) {
 }
 
 pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) -> Result<()> {
-    ensure!(
-        serde_json::to_vec(&event)?.len() <= MAX_EVENT_BYTES,
-        "telemetry event exceeds its limit"
-    );
     let dir = state::directory()?;
     let _guard = state::gate(
         &dir,
@@ -172,7 +168,21 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
             EventName::InstallSucceeded | EventName::InstallAttributed | EventName::InstallStage
         ),
     )?;
-    let mut preferences = state::read_at(&dir)?;
+    enqueue_locked(&dir, event, generation, destination)
+}
+
+/// The caller holds the state gate.
+pub(crate) fn enqueue_locked(
+    dir: &Path,
+    event: Event,
+    generation: u64,
+    destination: &Destination,
+) -> Result<()> {
+    ensure!(
+        serde_json::to_vec(&event)?.len() <= MAX_EVENT_BYTES,
+        "telemetry event exceeds its limit"
+    );
+    let mut preferences = state::read_at(dir)?;
     if !state::enabled(&preferences, &destination.hub) || preferences.generation != generation {
         return Ok(());
     }
@@ -182,7 +192,7 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
     {
         return Ok(());
     }
-    let mut queue = load(&dir)?;
+    let mut queue = load(dir)?;
     let now = chrono::Utc::now().timestamp_millis();
     prune(&mut queue, generation, now);
     if event.event == EventName::Integration {
