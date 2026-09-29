@@ -171,3 +171,65 @@ fn init_refuses_to_scaffold_over_untracked_user_content() {
         "agit: init (main file line)"
     );
 }
+
+/// File commits preserve code symbols and artifact references in the canonical Git tree.
+#[test]
+fn file_commit_preserves_code_and_artifact_references() {
+    let lab = Lab::new();
+    lab.ok(&["init", "project", "--no-bind"]);
+    let repo = lab.repo_dir("project");
+    let files = [
+        (
+            "README.md",
+            "# Project\n[Guide](artifacts/03-guide-A4-fold.pdf)\n[Report](output/pdf/central-park-2024-reading.pdf)",
+        ),
+        (
+            "server.py",
+            "from http.server import SimpleHTTPRequestHandler",
+        ),
+        ("client.js", "export class SimpleHTTPRequestHandler {}"),
+        ("lib.rs", "pub struct SimpleHTTPRequestHandler;"),
+        (
+            "guide.md",
+            "[Data](datasets/regional-2026-observations.csv)\n[Chart](figures/regional-2026-observations.svg)",
+        ),
+        (
+            "datasets/regional-2026-observations.csv",
+            "region,value\nNorth,3",
+        ),
+        (
+            "figures/regional-2026-observations.svg",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+        ),
+    ];
+    for (path, content) in files {
+        let source = lab.work.join(path);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, content).unwrap();
+        let source = source.canonicalize().unwrap();
+        lab.ok(&[
+            "file",
+            "add",
+            "--into",
+            "me/project@main",
+            "--to",
+            path,
+            source.to_str().unwrap(),
+        ]);
+    }
+    lab.ok(&[
+        "file",
+        "commit",
+        "--into",
+        "me/project@main",
+        "-m",
+        "Add project files",
+    ]);
+    for (path, content) in files {
+        assert_eq!(
+            git(&repo, &["show", &format!("refs/heads/main:{path}")]),
+            content,
+            "{path}"
+        );
+    }
+}

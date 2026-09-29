@@ -48,6 +48,7 @@ pub(crate) mod placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
 pub mod rules;
+mod syntax;
 
 use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
@@ -1016,9 +1017,12 @@ fn raw_hits_capped(
     raw_hits_capped_in(&view_of(text), cap, &entropy_exempt_regions(text), keep)
 }
 
+/// Context is read before escape normalization so literal contents cannot become code.
+/// These spans affect only bare entropy; credential fields and explicit detectors remain independent.
 fn entropy_exempt_regions(text: &str) -> Vec<(usize, usize)> {
     let mut regions = media::regions(text);
     regions.extend(paths::regions(text));
+    regions.extend(syntax::identifier_regions(text));
     merge_regions(regions)
 }
 
@@ -1516,7 +1520,7 @@ pub fn scan_text_capped_with_repository_policy(
         offset += chunk.len();
     }
     let mut semantic_regions = json_regions.clone();
-    semantic_regions.extend(paths::regions(text));
+    semantic_regions.extend(entropy_exempt_regions(text));
     let semantic_regions = merge_regions(semantic_regions);
     let (raw, truncated) = raw_hits_capped_in(&view, cap, &semantic_regions, |found, start| {
         if (!repository_identities.is_empty() || (policy.allowlist && !allowlist.is_empty()))
@@ -1609,7 +1613,7 @@ fn scan_semantic_strings(
                     {
                         vec![(0, view.len())]
                     } else {
-                        paths::regions(&decoded)
+                        entropy_exempt_regions(&decoded)
                     };
                     let (mut raw, mut truncated) =
                         raw_hits_capped_in(&view, remaining.saturating_add(1), &media, &mut record);
@@ -5535,6 +5539,122 @@ mod tests {
 
     fn none() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// Prose annotations and ambiguous apostrophes must not turn opaque values into code symbols.
+    #[test]
+    fn ambiguous_syntax_keeps_opaque_values_sensitive() {
+        let secret = "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        for text in [
+            format!("Use {secret} (production)"),
+            format!("Use {secret}(production)"),
+            format!("{secret} (production)"),
+            format!("{secret}(production"),
+            format!("{secret}(production use)"),
+            format!("{secret}([production)"),
+            format!("{secret}() for production"),
+            format!("let value: &'static str = \"it's class {secret} {{}}\";"),
+            format!("'outer: loop {{ let value = \"it's class {secret} {{}}\"; }}"),
+        ] {
+            let report = scan_text_with(&text, &none(), Policy::STRICT);
+            assert!(
+                report
+                    .iter()
+                    .any(|hit| hit.fingerprint == fingerprint(secret)),
+                "{text}"
+            );
+            let (redacted, count) = scrub(&text);
+            assert!(count > 0 && !redacted.contains(secret), "{text}");
+            let json = serde_json::json!({"text": text}).to_string();
+            assert!(
+                scan_text_with(&json, &none(), Policy::STRICT)
+                    .iter()
+                    .any(|hit| hit.fingerprint == fingerprint(secret)),
+                "{json}"
+            );
+            #[cfg(feature = "secret-vault")]
+            assert!(
+                secret_candidates_jsonl(&json, |_| true)
+                    .values
+                    .iter()
+                    .any(|value| value.as_str() == secret),
+                "{json}"
+            );
+        }
+    }
+
+    /// Syntax identifies symbols without waiving opaque values or independently evidenced secrets.
+    #[test]
+    fn code_symbols_preserve_source_without_waiving_credentials() {
+        let source = "from http.server import SimpleHTTPRequestHandler\n";
+        for code in [
+            source,
+            "import SimpleHTTPRequestHandler as handler",
+            "from http.server import HTTPServer, SimpleHTTPRequestHandler # server",
+            "class SimpleHTTPRequestHandler {}",
+            "class LocalServer(SimpleHTTPRequestHandler): pass",
+            "fn SimpleHTTPRequestHandler() {}",
+            "const SimpleHTTPRequestHandler = 1;",
+            "handler.SimpleHTTPRequestHandler();",
+            "handler.SimpleHTTPRequestHandler(42, 'value', argument);",
+            "from http.server import SimpleHTTPRequestHandler\nprint('server is running')",
+            "use network::SimpleHTTPRequestHandler;",
+            "import { SimpleHTTPRequestHandler } from 'network';",
+        ] {
+            for symbol in [
+                "SimpleHTTPRequestHandler",
+                "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+            ] {
+                assert!(!scan_text(symbol, &none()).is_empty());
+                let code = code.replace("SimpleHTTPRequestHandler", symbol);
+                assert!(
+                    scan_text_with(&code, &none(), Policy::STRICT).is_empty(),
+                    "{code}"
+                );
+                assert_eq!(scrub(&code), (code.clone(), 0));
+                let transcript = serde_json::json!({"text": code}).to_string();
+                assert!(scan_text(&transcript, &none()).is_empty(), "{transcript}");
+                #[cfg(feature = "secret-vault")]
+                assert!(
+                    secret_candidates_jsonl(&transcript, |_| true)
+                        .values
+                        .is_empty()
+                );
+            }
+        }
+        for text in [
+            "SimpleHTTPRequestHandler",
+            "password = \"SimpleHTTPRequestHandler\"",
+            "from http.server import safe; password = SimpleHTTPRequestHandler",
+            "from http.server import safe # SimpleHTTPRequestHandler",
+            "from http.server import AKIA4X7QZ2M5RT6VW3JH",
+            "const handler = \"SimpleHTTPRequestHandler\";",
+            "handler(\"SimpleHTTPRequestHandler\");",
+            "// SimpleHTTPRequestHandler();",
+            "value = \"SimpleHTTPRequestHandler();\"",
+            "value = \"prefix\\\"; SimpleHTTPRequestHandler();\"",
+        ] {
+            assert!(!scan_text(text, &none()).is_empty(), "{text}");
+        }
+        let credential = serde_json::json!({"password": source}).to_string();
+        assert!(!scan_text(&credential, &none()).is_empty());
+        let value = "eXhMRMpsLYICuvLwBGGclKDR";
+        let mixed = format!("const SimpleHTTPRequestHandler = \"{value}\";");
+        let hits = scan_text(&mixed, &none());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fingerprint, fingerprint(value));
+        let (scrubbed, count) = scrub(&mixed);
+        assert_eq!(count, 1);
+        assert!(scrubbed.contains("SimpleHTTPRequestHandler"));
+        assert!(!scrubbed.contains(value));
+        #[cfg(feature = "secret-vault")]
+        {
+            let matcher = crate::domain::secret_filter::Matcher::for_test(&[(
+                "explicit",
+                "SimpleHTTPRequestHandler",
+            )]);
+            assert!(!scan_text_registered_with(source, &none(), &matcher).is_empty());
+        }
     }
 
     /// Plain identifiers need stronger evidence, while credential fields retain discovery.
