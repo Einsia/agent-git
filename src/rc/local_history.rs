@@ -1,5 +1,6 @@
 //! Read-only pages addressed by native transcript byte boundaries.
 mod snapshot;
+mod transfer;
 
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
@@ -25,7 +26,13 @@ pub fn read(params: Value) -> crate::Result<Value> {
 
 pub(crate) fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> {
     let roster = timings.measure("roster_ms", super::roster::Roster::try_load)?;
-    read_with_roster(params, &roster, timings)
+    let compressed = params["response_encoding"] == transfer::ENCODING;
+    let page = read_with_roster(params, &roster, timings)?;
+    if compressed {
+        timings.measure("encode_ms", || transfer::encode(page))
+    } else {
+        Ok(page)
+    }
 }
 
 fn read_with_roster(

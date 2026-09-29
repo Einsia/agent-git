@@ -87,7 +87,6 @@ cli = [
     "dep:owo-colors",
     "dep:dialoguer",
     "dep:ureq",
-    "dep:flate2",
     "dep:self-replace",
     "dep:sha1",
 ]
@@ -99,6 +98,7 @@ cli = [
 # The protocol *types* (`crate::protocol`) are deliberately NOT gated — the hub
 # compiles against them.
 rc = [
+    "dep:flate2",
     "dep:agit-peer",
     "dep:agit-controller",
     "dep:agit-tunnel",
