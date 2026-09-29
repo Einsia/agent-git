@@ -69,7 +69,14 @@ impl Service {
                         .into_iter()
                         .map(|hub| {
                             let pending = store::inbound_pending(&hub)?;
-                            Ok((hub, pending))
+                            let renamed = store::load(&hub)?.is_some_and(|enrollment| {
+                                enrollment.inbound_enabled
+                                    && super::super::identity::identity().is_ok_and(|identity| {
+                                        identity.display_name
+                                            != enrollment.credential.device.display_name
+                                    })
+                            });
+                            Ok((hub, pending || renamed))
                         })
                         .collect::<crate::Result<Vec<_>>>()
                 })

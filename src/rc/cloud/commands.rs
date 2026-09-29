@@ -127,6 +127,21 @@ pub(super) async fn enroll_pending(hub: &str) -> crate::Result<bool> {
     let api = Client::new(hub)?;
     let _lock = store::enrollment_lock(api.origin())?;
     if !store::inbound_pending(api.origin())? {
+        if let Some(mut enrollment) = store::load(api.origin())?
+            && enrollment.inbound_enabled
+        {
+            let name = super::super::identity::identity()?.display_name;
+            if name != enrollment.credential.device.display_name {
+                let owner = enrollment.credential.device.owner.clone();
+                tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner))
+                    .await??;
+                let token = super::account_token(api.origin(), false).await?;
+                api.rename_device(&token, &enrollment.credential.device, &name)
+                    .await?;
+                enrollment.credential.device.display_name = name;
+                store::save(&enrollment)?;
+            }
+        }
         return Ok(false);
     }
     let (mut enrollment, changed) = register(&api, None, Registration::Validate).await?;
@@ -171,7 +186,7 @@ async fn register(
     name: Option<String>,
     mode: Registration,
 ) -> crate::Result<(store::Enrollment, bool)> {
-    let saved = store::load(api.origin())?;
+    let mut saved = store::load(api.origin())?;
     if let Some(enrollment) = &saved {
         let owner = enrollment.credential.device.owner.clone();
         tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner)).await??;
@@ -180,25 +195,27 @@ async fn register(
         }
     }
     let token = super::account_token(api.origin(), false).await?;
-    if let Some(enrollment) = &saved
+    let machine = super::super::identity::identity()?;
+    let display_name = name.unwrap_or(machine.display_name);
+    if let Some(enrollment) = &mut saved
         && registered(api, &token, &enrollment.credential.device).await?
     {
+        if enrollment.credential.device.display_name != display_name {
+            api.rename_device(&token, &enrollment.credential.device, &display_name)
+                .await?;
+            enrollment.credential.device.display_name = display_name;
+            store::save(enrollment)?;
+        }
         return Ok((saved.unwrap(), false));
     }
-    let (machine_id, display_name) = match &saved {
-        Some(enrollment) => {
-            let device = &enrollment.credential.device;
-            (device.machine_id.clone(), device.display_name.clone())
-        }
-        None => {
-            let machine = super::super::identity::identity()?;
-            (machine.machine_fingerprint, machine.display_name)
-        }
-    };
+    let machine_id = saved
+        .as_ref()
+        .map(|enrollment| enrollment.credential.device.machine_id.clone())
+        .unwrap_or(machine.machine_fingerprint);
     let identity = agit_peer::Identity::generate()?;
     let request = Enrollment {
         machine_id,
-        display_name: name.unwrap_or(display_name),
+        display_name,
         certificate: identity.certificate().clone(),
     };
     let credential = api.enroll(&token, &request).await?;

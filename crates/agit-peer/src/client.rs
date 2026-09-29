@@ -218,6 +218,22 @@ impl Client {
             .await
     }
 
+    pub async fn rename_device(
+        &self,
+        account: &Secret,
+        device: &Device,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        self.request::<serde_json::Value>(
+            Method::PATCH,
+            &format!("/api/peer/devices/{}", device.id),
+            account,
+            Some(serde_json::json!({"display_name": name})),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn register_controller(
         &self,
         account: &Secret,

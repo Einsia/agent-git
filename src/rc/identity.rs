@@ -48,6 +48,10 @@ pub fn identity() -> crate::Result<Identity> {
 }
 
 pub fn set_display_name(name: &str) -> crate::Result<Identity> {
+    anyhow::ensure!(
+        !name.trim().is_empty() && name.len() <= 256 && !name.chars().any(char::is_control),
+        "invalid device display name"
+    );
     let mut id = identity()?;
     id.display_name = name.to_string();
     write_private(&identity_path()?, &serde_json::to_string_pretty(&id)?)?;

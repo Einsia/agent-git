@@ -38,6 +38,20 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
         assert_eq!(first.identity.certificate(), healthy.identity.certificate());
         assert!(!store::inbound_pending(&hub).unwrap());
 
+        super::super::super::identity::set_display_name("office-machine").unwrap();
+        assert!(!enroll_pending(&hub).await.unwrap());
+        let renamed = store::load(&hub).unwrap().unwrap();
+        assert_eq!(renamed.credential.device.display_name, "office-machine");
+        assert_eq!(
+            renamed.credential.token.expose(),
+            first.credential.token.expose()
+        );
+        assert_eq!(
+            renamed.credential.device.credential_epoch,
+            first.credential.device.credential_epoch
+        );
+        assert_eq!(renamed.identity.certificate(), first.identity.certificate());
+
         api.revoke(
             &Secret::new("fixture-account".into()),
             &first.credential.device,
@@ -80,7 +94,7 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
     let server = tokio::spawn(async move {
         let mut device = Value::Null;
         let mut revoked = false;
-        let (mut registrations, mut pages) = (0, 0);
+        let (mut registrations, mut pages, mut renames) = (0, 0, 0);
         loop {
             let socket = tokio::select! {
                 _ = &mut stopped => break,
@@ -113,6 +127,11 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
                     "certificate":body["certificate"], "credential_epoch":registrations});
                 revoked = false;
                 json!({"device":device, "token":format!("fixture-device-{registrations}")})
+            } else if request.starts_with("PATCH /api/peer/devices/executor ") {
+                renames += 1;
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                device["display_name"] = body["display_name"].clone();
+                json!({"ok":true})
             } else if request.starts_with("DELETE /api/peer/devices/executor ") {
                 revoked = true;
                 json!({"ok":true})
@@ -139,7 +158,7 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
                 .unwrap();
             socket.write_all(&body).await.unwrap();
         }
-        (registrations, pages)
+        (registrations, pages, renames)
     });
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "rc::cloud::commands::tests::explicit_inbound_recovers_revocation_without_rotating_healthy_credentials", "--nocapture"])
@@ -155,7 +174,7 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
     );
     assert_eq!(
         server.await.unwrap(),
-        (2, 4),
+        (2, 4, 1),
         "only explicit recovery may register again; discovery must follow pagination"
     );
 }
