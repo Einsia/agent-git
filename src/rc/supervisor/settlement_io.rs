@@ -221,6 +221,7 @@ impl Session {
             Ok(None) => {}
             Err(error) => tracing_note(&format!("local settlement worker failed: {error}")),
         }
+        self.retry_unfinished_publication();
     }
 
     pub(super) async fn local_commit_with_reads(

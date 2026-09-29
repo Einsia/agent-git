@@ -114,8 +114,12 @@ impl Session {
         }
         let (repo, request, result) = match prepared {
             Ok(Some(prepared)) => prepared,
-            Ok(None) => return,
+            Ok(None) => {
+                self.finish_publication_outcome(PublicationOutcome::Complete(None));
+                return;
+            }
             Err(error) => {
+                self.publication_retry.failed();
                 tracing_note(&format!("RC publication remains pending: {error:#}"));
                 status.progress = Progress::LocalSaved;
                 status.stage = Some(Stage::Capture);
@@ -172,12 +176,16 @@ impl Session {
                 ))
                 .await;
             // A verified Git result remains in the outbox until a durable receiver accepts it.
-            None
+            if status.progress == Progress::Failed {
+                PublicationOutcome::Retry
+            } else {
+                PublicationOutcome::Complete(None)
+            }
         };
         if boundary.is_some() {
             self.publication = Some(Publication(tokio::spawn(publish)));
         } else {
-            publish.await;
+            self.finish_publication_outcome(publish.await);
         }
     }
 }

@@ -2050,3 +2050,123 @@ async fn repository_preparation_does_not_block_native_input_or_ready() {
     assert_ne!(fixture.head(), head);
     session.driver.shutdown().await.unwrap();
 }
+
+/// A failed background push must become eligible without a subsequent user turn.
+/// Repeated failures back off, and confirmed completion removes the retry deadline.
+#[tokio::test(start_paused = true)]
+async fn idle_publication_retries_after_failure_without_another_turn() {
+    let driver = AnyDriver::Codex(Box::new(
+        crate::rc::harness::codex::CodexDriver::test_responder(Some("retry-native"), &[]),
+    ));
+    let (mut session, _out, _notes) =
+        super::tests::harness_test_session_with_channels(driver, "codex", SessionStatus::Idle);
+    session.publication = Some(Publication(tokio::spawn(async {
+        PublicationOutcome::Retry
+    })));
+    session.finish_publication(true).await;
+    assert!(!session.settlement_due);
+    assert!(!session.publication_retry.due());
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(session.publication_retry.due());
+    session.finish_publication_outcome(PublicationOutcome::Retry);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(!session.publication_retry.due());
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(session.publication_retry.due());
+    let delivery = crate::protocol::ConnectionDelivery::new(
+        1,
+        crate::protocol::ConnectionFeature::AgentIdentityV1,
+    );
+    session.finish_publication_outcome(PublicationOutcome::Complete(Some(delivery.clone())));
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    assert!(!session.publication_retry.due());
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    assert!(session.publication_retry.due());
+    delivery.mark_delivered();
+    session.finish_publication_outcome(PublicationOutcome::Complete(Some(delivery)));
+    tokio::time::advance(std::time::Duration::from_secs(600)).await;
+    assert!(!session.publication_retry.due());
+    assert_eq!(session.publication_retry.failures, 0);
+}
+
+/// A failed push must reach the remote after recovery without creating another turn commit.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_publication_retry_pushes_the_pending_source_and_respects_live_authority() {
+    let fixture = SettlementFixture::new(true);
+    let script = std::fs::read_to_string(&fixture.exe).unwrap();
+    std::fs::write(
+        &fixture.exe,
+        script.replace("push)\n", "push)\n    exit 7\n"),
+    )
+    .unwrap();
+    let (mut session, mut out, _notes, authority, lease) = fixture.session();
+    let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.method() != method::COMMIT_SETTLED)
+    );
+    let source = fixture.head();
+    assert_ne!(fixture.tracking(), source);
+    assert!(!session.idle_settlement_ready());
+    tokio::time::sleep_until(session.publication_retry.next.unwrap()).await;
+    assert!(session.idle_settlement_ready());
+    session.info.status = SessionStatus::Running;
+    assert!(!session.idle_settlement_ready());
+    session.info.status = SessionStatus::Idle;
+    authority.send_modify(|state| state.agent_identity_v1 = false);
+    assert!(!session.idle_settlement_ready());
+    authority.send_replace(lease);
+    assert!(session.idle_settlement_ready());
+    std::fs::write(
+        &fixture.exe,
+        script.replace(
+            "commit)\n",
+            "commit)\nprintf 'prepared\\n' > \"$AGIT_RC_SUPERVISOR_PREPARED\"\nsleep 30\n",
+        ),
+    )
+    .unwrap();
+    let (_commands, mut receiver) = mpsc::channel(1);
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.settle_until_command(&mut receiver),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(session.local_settlement.is_some());
+    assert!(session.publication_retry.next.is_none());
+    authority.send_modify(|state| state.agent_identity_v1 = false);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.finish_local_settlement(true),
+    )
+    .await
+    .unwrap();
+    assert!(!session.settlement_due);
+    assert!(session.local_settlement.is_none());
+    let retry = session
+        .publication_retry
+        .next
+        .expect("interrupted background settlement retains publication retry");
+    tokio::time::sleep_until(retry).await;
+    assert!(!session.idle_settlement_ready());
+    authority.send_replace(lease);
+    assert!(session.idle_settlement_ready());
+    std::fs::write(
+        &fixture.exe,
+        script.replace("commit)\n", "commit)\n    exit 0\n"),
+    )
+    .unwrap();
+    let settled =
+        only_settled_frame(settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await);
+    assert_eq!(settled.commit_sha, source);
+    assert_eq!(fixture.head(), source);
+    assert_eq!(fixture.tracking(), source);
+    assert!(!session.idle_settlement_ready());
+    assert!(!fixture.receipt().exists());
+}

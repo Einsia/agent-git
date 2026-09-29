@@ -139,7 +139,31 @@ struct PendingSettlement {
     receipt: Option<PathBuf>,
 }
 
-struct Publication(tokio::task::JoinHandle<Option<Arc<crate::protocol::ConnectionDelivery>>>);
+enum PublicationOutcome {
+    Complete(Option<Arc<crate::protocol::ConnectionDelivery>>),
+    Retry,
+}
+
+struct Publication(tokio::task::JoinHandle<PublicationOutcome>);
+
+#[derive(Default)]
+struct PublicationRetry {
+    failures: u32,
+    next: Option<tokio::time::Instant>,
+}
+
+impl PublicationRetry {
+    fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        let seconds = 2_u64.saturating_pow(self.failures.min(9)).min(300);
+        self.next = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(seconds));
+    }
+
+    fn due(&self) -> bool {
+        self.next
+            .is_some_and(|next| tokio::time::Instant::now() >= next)
+    }
+}
 
 impl Drop for Publication {
     fn drop(&mut self) {
@@ -159,7 +183,7 @@ async fn publish_settlement(
     let push = guarded_output(&mut state, lease, command).await?;
     let Some(published) = confirmed_strict_push(&push, &request, result_file.path()) else {
         tracing_note(&format!(
-            "RC publication has no matching successful receipt; the pending commit will retry next turn: {}",
+            "RC publication has no matching successful receipt; the pending commit remains eligible for retry: {}",
             String::from_utf8_lossy(&push.stderr).trim()
         ));
         return None;
@@ -735,12 +759,12 @@ pub struct Session {
     /// Live feature ACK. This is a lease, not a startup snapshot: disconnect or
     /// renegotiation invalidates an in-flight settlement immediately.
     settlement: tokio::sync::watch::Receiver<SettlementState>,
-    /// A local commit that exists but has not received a successful push
-    /// result yet. A later turn retries the idempotent push even when strict
-    /// commit reports no new transcript content.
+    /// An unconfirmed source remains eligible for idempotent publication even when
+    /// strict commit reports no new transcript content.
     pending_settlement: Option<PendingSettlement>,
     /// Publication owns the repository writer until its process tree has finished.
     publication: Option<Publication>,
+    publication_retry: PublicationRetry,
     local_settlement: Option<settlement_io::LocalSettlement>,
     settlement_due: bool,
     completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -1297,6 +1321,7 @@ impl Session {
             settlement,
             pending_settlement: None,
             publication: None,
+            publication_retry: PublicationRetry::default(),
             local_settlement: None,
             settlement_due: false,
             completed_boundary: None,
@@ -2526,12 +2551,7 @@ impl Session {
                 _ = ticker.tick() => {
                     self.finish_local_settlement(false).await;
                     self.finish_publication(false).await;
-                    if self.settlement_due
-                        && self.local_settlement.is_none()
-                        && self.publication.is_none()
-                        && self.info.status == SessionStatus::Idle
-                        && self.pending_turn_command.is_none()
-                    {
+                    if self.idle_settlement_ready() {
                         deferred_command = self.settle_until_command(commands).await;
                     }
                     // **The mode is a value to poll, not a series of events each call site
@@ -2977,6 +2997,15 @@ impl Session {
         deferred_command
     }
 
+    fn idle_settlement_ready(&self) -> bool {
+        (self.settlement_due || self.publication_retry.due())
+            && self.local_settlement.is_none()
+            && self.publication.is_none()
+            && self.info.status == SessionStatus::Idle
+            && self.pending_turn_command.is_none()
+            && settlement_lease(&self.settlement).is_some()
+    }
+
     /// Ordinary controls leave repository transactions intact; publication cannot block them.
     async fn settle_until_command(
         &mut self,
@@ -2989,9 +3018,25 @@ impl Session {
             return None;
         }
         self.settlement_due = false;
+        let retrying = self.publication_retry.next.take().is_some();
         let boundary = self.completed_boundary.clone();
-        self.settle_and_push_inner(SettlementBoundary::Turn, boundary, Some(commands))
-            .await
+        let deferred = self
+            .settle_and_push_inner(SettlementBoundary::Turn, boundary, Some(commands))
+            .await;
+        if retrying {
+            self.retry_unfinished_publication();
+        }
+        deferred
+    }
+
+    fn retry_unfinished_publication(&mut self) {
+        if self.publication.is_none()
+            && self.local_settlement.is_none()
+            && self.publication_retry.failures > 0
+            && self.publication_retry.next.is_none()
+        {
+            self.publication_retry.failed();
+        }
     }
 
     async fn finish_publication(&mut self, wait: bool) {
@@ -3003,8 +3048,28 @@ impl Session {
             return;
         }
         let mut task = self.publication.take().expect("publication is present");
-        if let Ok(Some(delivery)) = (&mut task.0).await {
-            self.apply_publication_delivery(delivery);
+        match (&mut task.0).await {
+            Ok(outcome) => self.finish_publication_outcome(outcome),
+            Err(_) => self.publication_retry.failed(),
+        }
+    }
+
+    fn finish_publication_outcome(&mut self, outcome: PublicationOutcome) {
+        match outcome {
+            PublicationOutcome::Complete(delivery) => {
+                let acknowledged = delivery.as_ref().is_none_or(|delivery| {
+                    delivery.status() == crate::protocol::DeliveryStatus::Delivered
+                });
+                if let Some(delivery) = delivery {
+                    self.apply_publication_delivery(delivery);
+                }
+                if acknowledged {
+                    self.publication_retry = PublicationRetry::default();
+                } else {
+                    self.publication_retry.failed();
+                }
+            }
+            PublicationOutcome::Retry => self.publication_retry.failed(),
         }
     }
 
@@ -3347,6 +3412,7 @@ impl Session {
             }
         };
         let Some(sha) = candidate else {
+            self.publication_retry = PublicationRetry::default();
             return; // strict commit succeeded but produced no new turn
         };
         if lease.local_owner {
@@ -3441,9 +3507,18 @@ impl Session {
             self.out.clone(),
         );
         if journal_boundary.is_some() {
-            self.publication = Some(Publication(tokio::spawn(publish)));
-        } else if let Some(delivery) = publish.await {
-            self.apply_publication_delivery(delivery);
+            self.publication = Some(Publication(tokio::spawn(async move {
+                match publish.await {
+                    Some(delivery) => PublicationOutcome::Complete(Some(delivery)),
+                    None => PublicationOutcome::Retry,
+                }
+            })));
+        } else {
+            let outcome = match publish.await {
+                Some(delivery) => PublicationOutcome::Complete(Some(delivery)),
+                None => PublicationOutcome::Retry,
+            };
+            self.finish_publication_outcome(outcome);
         }
     }
 
