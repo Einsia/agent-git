@@ -141,6 +141,7 @@ pub fn run(args: Args) -> CmdResult {
             with_token: false,
             device: false,
             complete: None,
+            wait: None,
         })?;
         if result != ExitCode::Ok {
             ui::hint(&format!(

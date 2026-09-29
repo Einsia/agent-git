@@ -82,14 +82,25 @@ impl Destination {
         repo::valid_name(&owner)?;
         repo::valid_name(&name)?;
         crate::commands::canonical_owner(&owner)?;
+        let spelled_in_target = target.base.is_some();
         let branch = target
             .base
             .or_else(|| args.branch.clone())
             .context("lineage inspection requires an explicit destination branch")?;
         repo::valid_branch_name(&branch)?;
         ensure!(
-            branch != "@" && branch != "main",
+            branch != "@",
             "the destination must name an explicit session branch"
+        );
+        ensure!(
+            branch != "main",
+            "cannot import a session onto `main`: {}; choose a session branch instead, e.g. `{}`",
+            super::MAIN_BRANCH_REASON,
+            if spelled_in_target {
+                format!("--into {slug}@<session-branch>")
+            } else {
+                "-b <session-branch>".to_owned()
+            }
         );
         Ok((slug, owner, name, branch))
     }

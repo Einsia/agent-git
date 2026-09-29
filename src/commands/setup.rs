@@ -3,15 +3,20 @@
 //!
 //! * `--hooks`: settle automatically at the end of a turn (silent; a failure never blocks) +
 //!   `AGIT_SESSION` injection + registering a newly opened unadopted session inside a bound
-//!   workspace as pending adoption. Discovery answers only "which ones exist". Claude Code and
-//!   hook-capable Codex installations receive the integration; other runtimes keep using the
-//!   instruction-injected `agit commit` discipline.
+//!   workspace as pending adoption. Discovery answers only "which ones exist". Claude Code,
+//!   hook-capable Codex and WorkBuddy receive `agit hooks` commands in their hook settings, one
+//!   entry per hook whatever path agit runs from; Hermes and OpenClaw receive their native
+//!   lifecycle integration. Other runtimes keep using the instruction-injected `agit commit`
+//!   discipline.
 //! * `--skill`: install one entrypoint plus command references read on demand into each runtime's
 //!   native Skill directory:
 //!   - claude-code → `~/.claude/skills/agit/`
 //!   - codex → `$CODEX_HOME/skills/agit/` (default `~/.codex/skills/agit/`)
 //!   - opencode → `~/.config/opencode/skills/agit/`
 //!   - cursor → `~/.cursor/skills/agit/`
+//!   - hermes → `$HERMES_HOME/skills/agit/` (default `~/.hermes/skills/agit/`)
+//!   - openclaw → `$OPENCLAW_STATE_DIR/skills/agit/` (default `~/.openclaw/skills/agit/`)
+//!   - workbuddy → `skills/agit/` under its config directory (default `~/.workbuddy-ai/`)
 //!     Every directory holds `SKILL.md`, `VERSION` and `references/commands/`; `--skill` does not
 //!     expand the full manual into `AGENTS.md`. Use `--agents-md` for the short adoption rule.
 //! * `--mcp`: register `agit mcp` (stdio MCP server: search/show/view/status/commit) into each
@@ -20,6 +25,8 @@
 //!   - codex → `[mcp_servers.agit]` in `~/.codex/config.toml`
 //!   - opencode → `mcp.agit` in `~/.config/opencode/opencode.json`
 //!   - cursor → `mcpServers.agit` in `~/.cursor/mcp.json`
+//!   - workbuddy → `mcpServers.agit` in its MCP file under the config directory
+//!   - hermes → its native MCP configuration; OpenClaw needs none beside its lifecycle plugin
 //! * `--agents-md`: append a marked, idempotent section to the project AGENTS.md.
 //! * `--completions <shell>`: shell completions.
 
@@ -231,15 +238,21 @@ const RETIRED_HOOKS: &[(&str, &str)] = &[("Stop", "commit --from-hook")];
 /// `command` to a shell, so this stays a bare join. Quoting is a separate concern — adding it
 /// here changes the semantics.
 fn hook_command(exe: &str, argv: &[&str], runtime: Option<&str>) -> String {
-    let mut command = format!("{exe} {}", argv.join(" "));
-    if let Some(runtime) = runtime {
-        command.push_str(&format!(" --runtime {runtime}"));
-    }
-    command
+    format!("{exe} {}", hook_arguments(argv, runtime))
 }
 
-/// Runtime hook configuration. Each runtime-owned file is merged idempotently, so the same
-/// command is never written twice.
+/// What identifies one agit hook regardless of where the executable lives: the argument string
+/// after the executable.
+fn hook_arguments(argv: &[&str], runtime: Option<&str>) -> String {
+    let mut arguments = argv.join(" ");
+    if let Some(runtime) = runtime {
+        arguments.push_str(&format!(" --runtime {runtime}"));
+    }
+    arguments
+}
+
+/// Runtime hook configuration. Each runtime-owned file is merged idempotently, so one hook is
+/// never written twice, including when agit now runs from another executable path.
 fn install_hooks(runtime: Option<&str>) -> SetupReport {
     let mut report = SetupReport::default();
     let exe = exe_str();
@@ -411,7 +424,12 @@ fn install_hook_file(
         added += retire_hook(hooks, event, argv);
     }
     for (event, argv) in HOOKS {
-        added += upsert_hook(hooks, event, &hook_command(exe, argv, runtime_flag));
+        added += upsert_hook(
+            hooks,
+            event,
+            &hook_command(exe, argv, runtime_flag),
+            &hook_arguments(argv, runtime_flag),
+        );
     }
     if added > 0 {
         if write_json(path, &doc).is_err() {
@@ -519,32 +537,91 @@ fn retire_hook(hooks: &mut serde_json::Value, event: &str, argv: &str) -> usize 
     removed
 }
 
-/// A command already present under the same hook event is left untouched.
-fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str) -> usize {
+/// Install one agit hook under an event, keeping exactly one entry for it. Returns how many
+/// entries were added, rewritten or removed.
+///
+/// An entry is agit's own when it is this exact command, or when [`is_our_hook`] recognizes it
+/// as an `agit` executable followed by `arguments`. Installs from different executable paths
+/// (npm's global bin, `setup.sh`'s `~/.local/bin`, a package-runner cache) therefore land on the
+/// same entry: the first one found is pointed at the current executable and the others are
+/// removed. Keeping them would run the same hook once per stale path, concurrently, on every
+/// event. Other entries, including ones that merely mention the arguments, are left untouched.
+fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments: &str) -> usize {
     let arr = hooks
         .as_object_mut()
         .expect("hooks must be an object")
         .entry(event)
         .or_insert_with(|| serde_json::json!([]));
     let arr = arr.as_array_mut().expect("hook event must be an array");
-    for group in arr.iter() {
-        if group
-            .get("hooks")
-            .and_then(|value| value.as_array())
-            .is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.get("type").and_then(|value| value.as_str()) == Some("command")
-                        && entry.get("command").and_then(|value| value.as_str()) == Some(cmd)
-                })
-            })
-        {
-            return 0;
+    let ours = |entry: &serde_json::Value| {
+        entry.get("type").and_then(|value| value.as_str()) == Some("command")
+            && entry
+                .get("command")
+                .and_then(|value| value.as_str())
+                .is_some_and(|command| command == cmd || is_our_hook(command, arguments))
+    };
+    let exact = |entry: &serde_json::Value| {
+        entry.get("command").and_then(|value| value.as_str()) == Some(cmd)
+    };
+    // Prefer an entry that already carries the current command, so a settled file stays as is.
+    let keep = arr
+        .iter()
+        .enumerate()
+        .flat_map(|(group, value)| {
+            value
+                .get("hooks")
+                .and_then(|entries| entries.as_array())
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, entry)| ours(entry))
+                .map(move |(index, entry)| (group, index, exact(entry)))
+        })
+        .min_by_key(|(_, _, exact)| !exact)
+        .map(|(group, index, _)| (group, index));
+    let Some((keep_group, keep_index)) = keep else {
+        arr.push(serde_json::json!({
+            "hooks": [{"type": "command", "command": cmd}]
+        }));
+        return 1;
+    };
+    let mut changed = 0;
+    let mut emptied = Vec::new();
+    for (group_index, group) in arr.iter_mut().enumerate() {
+        let Some(entries) = group
+            .get_mut("hooks")
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        let before = entries.len();
+        let mut index = 0;
+        entries.retain(|entry| {
+            let kept = (group_index, index) == (keep_group, keep_index) || !ours(entry);
+            index += 1;
+            kept
+        });
+        changed += before - entries.len();
+        if before > 0 && entries.is_empty() {
+            emptied.push(group_index);
         }
     }
-    arr.push(serde_json::json!({
-        "hooks": [{"type": "command", "command": cmd}]
-    }));
-    1
+    let kept = arr[keep_group]["hooks"]
+        .as_array_mut()
+        .and_then(|entries| entries.iter_mut().find(|entry| ours(entry)))
+        .expect("the kept hook entry remains in its group");
+    if !exact(kept) {
+        kept["command"] = serde_json::Value::String(cmd.to_owned());
+        changed += 1;
+    }
+    // Only groups this call emptied go away; every other group stays as it was.
+    let mut group_index = 0;
+    arr.retain(|_| {
+        let kept = !emptied.contains(&group_index);
+        group_index += 1;
+        kept
+    });
+    changed
 }
 
 // ── skill / instruction install ───────────────────────────────────────
@@ -1301,12 +1378,18 @@ mod tests {
                 {"hooks": [{"type": "command", "command": format!("{command} --extra")}]}
             ]);
             let mut hooks = serde_json::json!({"SessionStart": original.clone()});
-            assert_eq!(upsert_hook(&mut hooks, "SessionStart", command), 1);
+            assert_eq!(
+                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest"),
+                1
+            );
             let groups = hooks["SessionStart"].as_array().unwrap();
             assert_eq!(&groups[..3], original.as_array().unwrap());
             assert_eq!(groups[3]["hooks"][0]["command"], command);
             let installed = hooks.clone();
-            assert_eq!(upsert_hook(&mut hooks, "SessionStart", command), 0);
+            assert_eq!(
+                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest"),
+                0
+            );
             assert_eq!(hooks, installed);
         }
     }
@@ -1373,6 +1456,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json\n");
     }
 
+    /// Installs from different executable paths keep one entry per hook: the stale path is
+    /// replaced and extra copies are removed, while a user's hook sharing the group stays. Matching
+    /// on the whole command string instead adds one more concurrent hook per install location.
+    #[test]
+    fn hooks_installed_from_another_path_are_replaced_instead_of_stacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [
+                            {"type": "command", "command": "/usr/bin/user-hook"},
+                            {"type": "command", "command": "/usr/local/bin/agit hooks ingest --runtime workbuddy"}
+                        ]},
+                        {"hooks": [{"type": "command", "command": "/tmp/npx-cache/agit hooks ingest --runtime workbuddy"}]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let exe = "/home/me/.local/bin/agit";
+        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy")).succeeded());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let commands = |event: &str| -> Vec<String> {
+            doc["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap().iter())
+                .map(|entry| entry["command"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            commands("SessionStart"),
+            [
+                "/usr/bin/user-hook",
+                "/home/me/.local/bin/agit hooks ingest --runtime workbuddy"
+            ]
+        );
+        assert_eq!(
+            commands("Stop"),
+            ["/home/me/.local/bin/agit hooks settle --runtime workbuddy"]
+        );
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy")).succeeded());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+    }
+
     /// **The command written out must parse as an agit invocation.**
     ///
     /// This is the root-cause guard for B1: a hook whose subcommand takes no positional argument
@@ -1411,7 +1547,12 @@ mod tests {
         let mut hooks = serde_json::json!({});
         for (event, argv) in HOOKS {
             assert_eq!(
-                upsert_hook(&mut hooks, event, &hook_command("agit", argv, None)),
+                upsert_hook(
+                    &mut hooks,
+                    event,
+                    &hook_command("agit", argv, None),
+                    &hook_arguments(argv, None)
+                ),
                 1
             );
         }
@@ -1421,7 +1562,12 @@ mod tests {
         // Idempotent: the same command is never written twice.
         for (event, argv) in HOOKS {
             assert_eq!(
-                upsert_hook(&mut hooks, event, &hook_command("agit", argv, None)),
+                upsert_hook(
+                    &mut hooks,
+                    event,
+                    &hook_command("agit", argv, None),
+                    &hook_arguments(argv, None)
+                ),
                 0
             );
         }
@@ -1449,7 +1595,12 @@ mod tests {
             );
         }
         for (event, argv) in HOOKS {
-            upsert_hook(&mut hooks, event, &hook_command("agit", argv, None));
+            upsert_hook(
+                &mut hooks,
+                event,
+                &hook_command("agit", argv, None),
+                &hook_arguments(argv, None),
+            );
         }
         let text = hooks.to_string();
         assert!(

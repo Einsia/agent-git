@@ -285,9 +285,21 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // `--mine` **creates an agent under your namespace on the hub**, so signing in is a hard
     // precondition. A read-only pickup deliberately does not require it — a public agent is
     // readable by anyone, and "just take a look" is the route that has to stay open.
+    let client = if args.mine {
+        super::with_approved_sign_in(client)
+    } else {
+        client
+    };
     if args.mine && !client.has_token() {
         ui::error(&format!("not signed in to {}.", client.base()));
-        ui::hint("`--mine` creates a copy under your name — sign in first with `agit login`");
+        if super::login::is_waiting(client.base()) {
+            ui::hint(&format!(
+                "`--mine` creates a copy under your name — {}",
+                super::login::complete_hint(client.base())
+            ));
+        } else {
+            ui::hint("`--mine` creates a copy under your name — sign in first with `agit login`");
+        }
         return Ok(ExitCode::Auth);
     }
 

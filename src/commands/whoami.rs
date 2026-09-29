@@ -2,7 +2,8 @@
 //!
 //! **Zero network** by default (PRD): the credentials are local, and Expiry is readable straight
 //! off them. Only `--check` verifies the token (one call to the hub). Not signed in exits 5
-//! (Auth) and names the next command.
+//! (Auth) and names the next command; `--check` first claims a sign-in the human has approved
+//! since `agit login` recorded its request.
 //!
 //! `--check` calls an endpoint that **requires authentication**: the public health endpoint
 //! answers 200 to a forged or revoked token just the same and cannot tell a live credential from
@@ -22,12 +23,27 @@ pub struct Args {
 
 pub fn run(args: Args, json: bool) -> CmdResult {
     let hub = config::hub_url();
-    let Some(cred) = credentials::load(&hub) else {
+    // `--check` goes online anyway, so without credentials it first claims a sign-in the human
+    // approved after `agit login` recorded it; plain `whoami` stays offline and only says so.
+    let cred = credentials::load(&hub).or_else(|| {
+        (args.check
+            && matches!(
+                super::login::claim_recorded(&hub),
+                super::login::PendingSignIn::SignedIn
+            ))
+        .then(|| credentials::load(&hub))
+        .flatten()
+    });
+    let Some(cred) = cred else {
         ui::error(&format!(
             "not signed in to {}.",
             crate::infra::hub_authority::safe_label(&hub)
         ));
-        ui::hint("next: `agit login`");
+        if super::login::is_waiting(&hub) {
+            ui::hint(&super::login::complete_hint(&hub));
+        } else {
+            ui::hint("next: `agit login`");
+        }
         return Ok(ExitCode::Auth);
     };
     let client = crate::hub::Client::for_credential(&hub, &cred);
@@ -107,6 +123,15 @@ fn verify_online(hub: &str, client: &crate::hub::Client, human: bool) -> (Check,
         }
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
+            // Renewing the access token reads and writes local lock and credential files before
+            // any request; a failure there says nothing about the Hub.
+            if crate::infra::local_state::find(&e).is_some() {
+                ui::error(&format!("cannot use the local credentials: {e:#}"));
+                for hint in crate::infra::local_state::hints(&e) {
+                    ui::hint(&hint);
+                }
+                return (Check::default(), ExitCode::Precondition);
+            }
             match e.downcast_ref::<crate::hub::client::ApiError>() {
                 Some(api) if api.status == 401 || api.status == 403 => {
                     ui::error(&format!("{hub} rejects the credentials: {}", api.detail));

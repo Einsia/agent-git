@@ -435,9 +435,22 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     }
 
     // ── 4. Adoption: write the link ──
-    let lk = match &accepted {
-        Some(selected) => selected.link(),
-        None => attach(&store, &found, existing)?,
+    let destination_label = prepared
+        .as_ref()
+        .zip(agent.as_deref())
+        .map(|(target, agent)| format!("{}/{agent}@{}", target.namespace, target.branch));
+    let (lk, attached) = match &accepted {
+        Some(selected) => (selected.link(), None),
+        None => {
+            let (lk, attached) = attach(&store, &found, existing, destination_label.as_deref())?;
+            (lk, Some(attached))
+        }
+    };
+    // A failed import leaves the session link as it found it, including absent.
+    let restore_attached = || {
+        if let Some(attached) = &attached {
+            attached.restore(&store);
+        }
     };
 
     if args.link_only {
@@ -465,9 +478,16 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         &owner,
         &prepared,
         accepted.as_ref(),
-    )? {
-        Placed::Ready(l) => *l,
-        Placed::Refused(code) => return Ok(code),
+    ) {
+        Ok(Placed::Ready(l)) => *l,
+        Ok(Placed::Refused(code)) => {
+            restore_attached();
+            return Ok(code);
+        }
+        Err(error) => {
+            restore_attached();
+            return Err(error);
+        }
     };
     println!();
     // Settlement that did not succeed = this import did not happen: put the ref that was created
@@ -488,6 +508,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     })();
     if !matches!(outcome, Ok(ExitCode::Ok)) {
         landing.rollback();
+        restore_attached();
     }
     outcome
 }
@@ -750,6 +771,18 @@ enum TargetSelection {
     Refused(ExitCode),
 }
 
+/// Why no session is placed on `main`, stated wherever a session targets it.
+pub(super) const MAIN_BRANCH_REASON: &str =
+    "`main` holds the repository's shared files, and each session lives on its own branch";
+
+/// Refuse a session on `main`. `example` is a working replacement in the caller's own syntax.
+pub(super) fn refuse_main_branch(action: &str, example: &str) {
+    ui::error(&format!("cannot {action} `main`: {MAIN_BRANCH_REASON}."));
+    ui::hint(&format!(
+        "choose a session branch instead, e.g. `{example}`"
+    ));
+}
+
 fn prepare_target(
     lk: &Link,
     agent: &str,
@@ -890,6 +923,16 @@ fn prepare_target(
         Some(branch) => Some(branch.to_owned()),
     });
     let branch = match target_branch.as_ref().or(args.branch.as_ref()) {
+        Some(branch) if branch == "main" => {
+            let suggested = format!("{}-{}", agent, link::short(&lk.session_id));
+            let example = if target_branch.is_some() {
+                format!("--into {namespace}/{agent}@{suggested}")
+            } else {
+                format!("-b {suggested}")
+            };
+            refuse_main_branch("import a session onto", &example);
+            return Ok(TargetSelection::Refused(ExitCode::Usage));
+        }
         Some(branch) => branch.clone(),
         None if onto_commit.is_none() && cur_is_session => cur.unwrap(),
         None => {
@@ -974,8 +1017,7 @@ pub(super) fn place_legacy_commit_branch(
     branch: String,
 ) -> crate::Result<Placed> {
     if branch == "main" {
-        ui::error("cannot settle session turns onto `main` — it is the shared file line");
-        ui::hint("choose a session branch with `-b <branch>`; sessions must never land on main");
+        refuse_main_branch("settle session turns onto", "-b <session-branch>");
         return Ok(Placed::Refused(ExitCode::Precondition));
     }
     let preference = if !repo_dir.join(".git").exists() {
@@ -1334,20 +1376,23 @@ fn recorded_owner(lk: &Link) -> Option<&str> {
     lk.owner.as_deref().filter(|owner| !owner.is_empty())
 }
 
+/// `<owner>/<repo>@<branch>` of a link that claims a branch. Unknown ownership is displayed as
+/// unknown rather than borrowed from the current account.
+fn claim_label(lk: &Link) -> Option<String> {
+    let branch = lk.branch.as_deref()?;
+    Some(format!(
+        "{}/{}@{branch}",
+        recorded_owner(lk).unwrap_or("<unknown-owner>"),
+        lk.agent.as_deref().unwrap_or("<unknown-repo>")
+    ))
+}
+
 /// A recorded branch claim may be reused without confirmation only at its complete identity.
-/// Unknown ownership is displayed as unknown rather than borrowed from the current account.
 fn claimed_elsewhere(lk: &Link, owner: &str, agent: &str, branch: &str) -> Option<String> {
-    let prev_branch = lk.branch.as_deref()?;
     let same = recorded_owner(lk) == Some(owner)
         && lk.agent.as_deref() == Some(agent)
-        && prev_branch == branch;
-    (!same).then(|| {
-        format!(
-            "{}/{}@{prev_branch}",
-            recorded_owner(lk).unwrap_or("<unknown-owner>"),
-            lk.agent.as_deref().unwrap_or("<unknown-repo>")
-        )
-    })
+        && lk.branch.as_deref() == Some(branch);
+    if same { None } else { claim_label(lk) }
 }
 
 /// Persist the routing fields as soon as import claims a branch.
@@ -1846,17 +1891,39 @@ pub(super) fn selection_arg(value: &str) -> String {
 /// A bare `Link::new` overwrites the `agent` on an already-adopted link back to None. Once
 /// written, that agent may already have been used by several commits, and erasing it makes the
 /// next commit ask for the name again.
-fn attach(store: &Store, found: &Found, existing: Option<Link>) -> crate::Result<Link> {
+///
+/// # What an existing link means
+///
+/// A link that exists is either a registration without a saved destination (written by a
+/// SessionStart hook or `--link-only`) or a claim on a saved branch. The status line says which,
+/// and what happens next: a registration is saved by this import, a claim on `destination` gets
+/// its new turns recorded, and a claim elsewhere is moved only with confirmation. The link file
+/// itself is never offered as something to act on; deleting it loses the claim.
+fn attach(
+    store: &Store,
+    found: &Found,
+    existing: Option<Link>,
+    destination: Option<&str>,
+) -> crate::Result<(Link, AttachedLink)> {
     let _guard = link::lock(store, found.runtime, &found.session_id)?;
     let path = link::link_path(store, found.runtime, &found.session_id);
-    let current = match std::fs::symlink_metadata(&path) {
-        Ok(_) => Some(link::read(&path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot read the existing session link at {}",
-                path.display()
-            )
-        })?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let (current, previous) = match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let bytes = std::fs::read(&path).with_context(|| {
+                format!(
+                    "cannot read the existing session link at {}",
+                    path.display()
+                )
+            })?;
+            let current = link::read(&path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot read the existing session link at {}",
+                    path.display()
+                )
+            })?;
+            (Some(current), Some(bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(error) => return Err(error.into()),
     };
     // Destination selection can wait on remote permissions. Its link snapshot cannot replace a
@@ -1869,6 +1936,10 @@ fn attach(store: &Store, found: &Found, existing: Option<Link>) -> crate::Result
         );
     }
     let s = ui::theme::symbols();
+    // A claim is keyed on its branch, the same way placement decides whether moving it needs
+    // confirmation; a claim with unknown parts is described with them marked unknown.
+    let saved_at = current.as_ref().and_then(claim_label);
+    let complete = current.as_ref().and_then(saved_destination);
     let was_tracked = current.is_some();
 
     let mut lk = current.unwrap_or_else(|| Link::new(found.runtime, &found.session_id, None));
@@ -1880,37 +1951,113 @@ fn attach(store: &Store, found: &Found, existing: Option<Link>) -> crate::Result
     // temporarily incomplete.
     lk.naming_ignored = false;
     link::write(store, &lk)?;
+    let attached = AttachedLink {
+        source: lk.source.clone(),
+        session_id: lk.session_id.clone(),
+        written: std::fs::read(&path).unwrap_or_default(),
+        path,
+        previous,
+    };
 
-    if was_tracked {
-        println!(
-            "{} {} {} was already adopted",
-            ui::dim(s.idle),
-            found.runtime,
-            ui::bold(&link::short(&found.session_id))
-        );
-    } else {
-        println!(
-            "{} adopted {} {}",
-            ui::ok(s.check),
-            found.runtime,
-            ui::bold(&link::short(&found.session_id))
-        );
+    let session = format!(
+        "{} {}",
+        found.runtime,
+        ui::bold(&link::short(&found.session_id))
+    );
+    match (&saved_at, destination) {
+        (None, _) if !was_tracked => {
+            println!("{} adopted {session}", ui::ok(s.check));
+        }
+        (None, Some(destination)) => println!(
+            "{} {session} was registered but not saved yet; this import saves it to {destination}",
+            ui::dim(s.idle)
+        ),
+        (None, None) => println!(
+            "{} {session} was already registered and is not saved to a repository yet",
+            ui::dim(s.idle)
+        ),
+        (Some(saved), Some(destination)) if saved == destination => {
+            println!(
+                "{} {session} is already saved at {saved}; this import records its new turns there",
+                ui::dim(s.idle)
+            );
+            ui::hint(&format!("later turns: `agit commit {saved}`"));
+        }
+        (Some(saved), Some(destination)) => {
+            println!("{} {session} is already saved at {saved}", ui::dim(s.idle));
+            ui::hint(&format!(
+                "importing into {destination} moves its future turns there; confirm when asked, or pass `-y` to move it without a prompt"
+            ));
+        }
+        (Some(saved), None) => {
+            println!("{} {session} is already saved at {saved}", ui::dim(s.idle));
+            match &complete {
+                Some(saved) => ui::hint(&format!("later turns: `agit commit {saved}`")),
+                None => ui::hint(&format!(
+                    "its claim does not name its repository completely; import it again with `agit import {} --from {} --into <owner>/<repo>@<branch>`",
+                    ui::session::shell_arg(&found.session_id),
+                    ui::session::shell_arg(found.runtime)
+                )),
+            }
+        }
     }
 
-    let mut kv: Vec<(&str, String)> = vec![];
-    match &lk.cwd {
-        Some(c) => kv.push(("working dir", ui::tilde(Path::new(c)))),
-        None => kv.push((
-            "working dir",
-            ui::dim("unknown (filled in when a version is recorded)").to_string(),
-        )),
+    let working_dir = match &lk.cwd {
+        Some(c) => ui::tilde(Path::new(c)),
+        None => ui::dim("unknown (filled in when a version is recorded)").to_string(),
+    };
+    print!("{}", ui::table::key_values(&[("working dir", working_dir)]));
+    Ok((lk, attached))
+}
+
+/// `<owner>/<repo>@<branch>` for a link whose claim names all three.
+fn saved_destination(lk: &Link) -> Option<String> {
+    Some(format!(
+        "{}/{}@{}",
+        recorded_owner(lk)?,
+        lk.agent.as_deref()?,
+        lk.branch.as_deref()?
+    ))
+}
+
+/// The session link as [`attach`] found it and as it left it.
+#[derive(Debug)]
+struct AttachedLink {
+    source: String,
+    session_id: String,
+    path: PathBuf,
+    /// The file's bytes before the import; `None` when there was no link.
+    previous: Option<Vec<u8>>,
+    written: Vec<u8>,
+}
+
+impl AttachedLink {
+    /// Put the link back as it was before the import, including absent. A link that changed
+    /// since this import wrote it belongs to a later writer (a settlement advancing its
+    /// watermark, a concurrent import) and is left in place.
+    fn restore(&self, store: &Store) {
+        let _guard = match link::lock(store, &self.source, &self.session_id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                ui::warning(&format!(
+                    "could not lock the session link to undo this import: {error:#}"
+                ));
+                return;
+            }
+        };
+        if !std::fs::read(&self.path).is_ok_and(|current| current == self.written) {
+            return;
+        }
+        let restored = match &self.previous {
+            Some(bytes) => std::fs::write(&self.path, bytes),
+            None => std::fs::remove_file(&self.path),
+        };
+        if let Err(error) = restored {
+            ui::warning(&format!(
+                "could not restore the session link this import changed: {error}"
+            ));
+        }
     }
-    kv.push((
-        "link",
-        ui::tilde(&link::link_path(store, &lk.source, &lk.session_id)),
-    ));
-    print!("{}", ui::table::key_values(&kv));
-    Ok(lk)
 }
 
 /// The suggested agent name for the hint.
@@ -2379,7 +2526,7 @@ mod tests {
             cwd: Some("/repo/one".into()),
         };
 
-        let attached = attach(&store, &found, Some(existing)).unwrap();
+        let (attached, _) = attach(&store, &found, Some(existing), None).unwrap();
 
         assert!(!attached.naming_ignored);
         assert!(!link::get(&store, "codex", "AB").unwrap().naming_ignored);
@@ -2409,7 +2556,7 @@ mod tests {
                 session_id: "AB".into(),
                 cwd: Some("/repo/one".into()),
             };
-            let error = attach(&store, &found, expected).unwrap_err();
+            let error = attach(&store, &found, expected, None).unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -2431,7 +2578,7 @@ mod tests {
             session_id: "AB".into(),
             cwd: None,
         };
-        assert!(attach(&store, &found, None).is_err());
+        assert!(attach(&store, &found, None, None).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{incomplete");
     }
 
@@ -2479,7 +2626,7 @@ mod tests {
                 session_id: "AB".into(),
                 cwd: None,
             };
-            let mut lk = attach(&store, &found, None).unwrap();
+            let (mut lk, _) = attach(&store, &found, None, None).unwrap();
             let path = link::link_path(&store, found.runtime, &found.session_id);
             let evidence = b"{\"superseded_by\":\"replacement\",";
             if malformed {
@@ -2588,7 +2735,7 @@ mod tests {
                 repo.git(&["update-ref", "refs/heads/base", &advanced])
                     .unwrap();
                 selected.verify().unwrap();
-                lk = attach(&store, &found, None).unwrap();
+                lk = attach(&store, &found, None, None).unwrap().0;
                 let placed =
                     place_on_branch(&mut lk, &store, shape, "alice", &selected, None).unwrap();
                 assert!(matches!(placed, Placed::Ready(_)));
@@ -2600,7 +2747,7 @@ mod tests {
                 );
                 continue;
             }
-            lk = attach(&store, &found, None).unwrap();
+            lk = attach(&store, &found, None, None).unwrap().0;
             let guard = link::lock(&store, found.runtime, &found.session_id).unwrap();
             let worker_store = store.clone();
             let worker = std::thread::spawn(move || {

@@ -26,6 +26,57 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   names. See
   [Session reuse and invitations](docs/telemetry.md#session-reuse-and-invitations).
 
+### Fixed
+
+- `agit login` checks that it can save credentials under `AGIT_HOME` before it
+  asks the Hub for anything. An agent sandbox that refuses writes there no
+  longer uses up the human's approval: login stops with the directory to allow
+  and says no login request was created, and `agit login --complete` leaves the
+  approved sign-in unclaimed so the same command finishes it later. If saving
+  still fails after sign-in, the new Hub session is signed out again.
+- Signing in from an agent no longer fails when the agent runtime stops the
+  waiting `agit login`. Every browser and device-code request is recorded
+  privately under `AGIT_HOME` when the Hub creates it, and
+  `agit login --complete` without a value finishes it from any later process,
+  including an interrupted `agit login --device`. `--complete` now waits for
+  the approval for up to 90 seconds (`--wait <seconds>`, `0` checks once)
+  instead of checking once, keeps waiting through a failed poll, keeps the
+  request when the wait runs out, and forgets it when the Hub says it expired
+  or was already used. Running the printed `--complete` command again after
+  the sign-in finished reports success instead of "no longer valid". A new
+  `agit login` finishes a request the human already approved instead of
+  replacing it. `agit whoami --check`, `agit commit` and commands that stop
+  with "not logged in" first claim an approved request once, and otherwise
+  point to `agit login --complete` instead of a new login. Signing out cancels
+  a sign-in still being claimed: a session approved after `agit logout` is
+  signed out again instead of saved, and a session a concurrent sign-in saved
+  while `agit logout` ran is revoked with the credentials it removes. A second
+  `agit login --complete` or a new `agit login` started while another process
+  claims the same sign-in waits for it and reports success instead of "no
+  longer valid" or a new login link.
+- Local state problems read as local problems. `agit whoami --check` reports
+  an unwritable home or a held credential lock instead of "can't reach" the
+  Hub, `agit doctor` checks that `AGIT_HOME` is writable, and every command
+  that meets one exits with the precondition code. Messages name the agit lock
+  another process holds and say that agit's lock files are released when their
+  process exits and must not be deleted; credential locks give up after a
+  bounded wait, and session locks say what they are waiting for.
+- Re-importing a session describes its claim: a registration is saved by the
+  import, a saved session says where and how to record later turns, and a
+  session saved elsewhere says how to move it. The link file path is no longer
+  offered as a next step, and a failed import restores the session's previous
+  link, including none.
+- A session targeted at `main` is refused before anything is adopted or
+  created, with the reason and an example branch in the caller's syntax.
+- `agit push` leaves an `origin` that already points at the destination alone
+  and writes a changed one under the repository lock, so a manual push and a
+  hook's auto-push no longer collide on `.git/config`. Git failures on a held
+  lock say not to delete it while a git process runs; a refused write says the
+  checkout is not writable instead.
+- `agit setup` recognizes its own hooks by their arguments, so installing from
+  another executable path replaces the old entry instead of adding a second
+  one.
+
 ## [0.2.12] - 2026-09-28
 
 ### Fixed

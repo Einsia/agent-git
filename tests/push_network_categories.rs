@@ -193,6 +193,16 @@ impl Lab {
         command
     }
 
+    /// Create the repository lock a publish takes to change `origin`; returns the store root,
+    /// which the fixture does not otherwise have.
+    fn repository_lock(&self, slug: &str) -> PathBuf {
+        let root = self.home.join("store");
+        assert!(!root.exists());
+        agit::domain::link::lock_repository_for_write(&agit::domain::store::Store::at(&root), slug)
+            .unwrap();
+        root
+    }
+
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         walkdir::WalkDir::new(self.root.path())
             .into_iter()
@@ -693,8 +703,10 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
                     &format!("{}/team/qa.git", lab.base),
                 ],
             );
+            let store = lab.repository_lock("team/qa");
             let expected = lab.state();
             fs::write(config, original).unwrap();
+            fs::remove_dir_all(store).unwrap();
             assert_eq!(lab.state(), before);
             expected
         } else {
@@ -840,10 +852,13 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
         let refs = lab.git(&path, &["show-ref"]);
         let url = format!("{}/alice/qa.git", lab.base);
         // A successful identity lookup records origin before the transport runs; only that
-        // known config change belongs in the failed publication's expected inventory.
+        // known config change, and the repository lock taken to write it, belong in the failed
+        // publication's expected inventory.
         lab.git(&path, &["remote", "add", "origin", &url]);
+        let store = lab.repository_lock("alice/qa");
         let expected = lab.state();
         lab.git(&path, &["remote", "remove", "origin"]);
+        fs::remove_dir_all(store).unwrap();
         assert_eq!(lab.state(), before);
         let server = Server::start(
             &lab,

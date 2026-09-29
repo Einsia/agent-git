@@ -236,7 +236,7 @@ The root canonical `command` remains the actual top-level command.
 
 | Command and all nested operations | Additional safe dimensions and results |
 | --- | --- |
-| `login` | Method `browser|device|pat|unknown`, requested Hub class, handoff/wait/complete action and authorization outcome; `--complete` presence only; never PAT, authorization state, browser code, email, or URL |
+| `login` | Method `browser|device|pat|unknown`, requested Hub class, handoff/wait/complete action and authorization outcome; `--complete` presence only and a `--wait` bucket; never PAT, authorization state, browser code, email, or URL |
 | `logout` | Current/all Hub scope; count bucket of revoked sign-ins, without Hub names |
 | `whoami` | Offline/check mode; known authenticated/reachable result |
 | `config` | Action list/read/set/unset; user/repository scope; known key enum; validate runtime, visibility, auto-push, auto-commit, memory tracking, keystore enums; `hub.url` becomes only destination class |

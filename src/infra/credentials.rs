@@ -12,10 +12,13 @@
 //! "hand over / delete just one hub's credentials" with no way to express it.
 
 use super::hub_authority::HubAuthority;
+use super::local_state;
 use crate::Result;
 use anyhow::{Context, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub mod pending;
 
 /// One hub's credentials. The whole file is this single object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +178,14 @@ pub fn load_at(path: &Path) -> Option<HubCredential> {
 
 /// Saving cannot transfer a credential between authorities.
 pub fn save(hub: &str, cred: &HubCredential) -> Result<()> {
+    let (path, cred) = bound_for_saving(hub, cred)?;
+    let _guard = mutation_guard(path.parent().context("credential directory is missing")?)?;
+    save_at(&path, &cred)
+}
+
+/// `cred` bound to `hub`, and the path it is saved at; a credential bound to another authority
+/// is refused.
+fn bound_for_saving(hub: &str, cred: &HubCredential) -> Result<(PathBuf, HubCredential)> {
     let authority = HubAuthority::parse(hub)?;
     ensure!(
         cred.hub.is_none() || bound_to(cred, &authority),
@@ -184,9 +195,7 @@ pub fn save(hub: &str, cred: &HubCredential) -> Result<()> {
         hub: Some(hub.trim().trim_end_matches('/').to_string()),
         ..cred.clone()
     };
-    let path = crate::infra::config::credentials_path(hub)?;
-    let _guard = mutation_guard(path.parent().context("credential directory is missing")?)?;
-    save_at(&path, &cred)
+    Ok((crate::infra::config::credentials_path(hub)?, cred))
 }
 
 /// Refresh results cannot replace a concurrent login or resurrect a signed-out credential.
@@ -276,8 +285,8 @@ fn save_refreshed_at(
     Ok(Some(fresh))
 }
 
-fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
-    super::config::create_state_dir(dir).context("cannot create credential directory")?;
+/// Open a credential lock file the way every credential writer does.
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -285,71 +294,151 @@ fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
-        .open(dir.with_extension("lock"))
-        .context("cannot open credential mutation lock")?;
-    fs2::FileExt::lock_exclusive(&file).context("cannot lock credential mutations")?;
+    options.open(path)
+}
+
+fn create_credential_dir(dir: &Path) -> Result<()> {
+    super::config::create_state_dir(dir)
+        .map_err(|error| local_state::io_failure("cannot create credential directory", dir, error))
+}
+
+fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
+    create_credential_dir(dir)?;
+    let path = dir.with_extension("lock");
+    let file = open_lock(&path).map_err(|error| {
+        local_state::io_failure("cannot open credential mutation lock", &path, error)
+    })?;
+    local_state::lock_exclusive(&file, &path, "the credential mutation lock")?;
     Ok(file)
+}
+
+/// Prove that [`save`] can persist a credential before a caller spends a one-time Hub
+/// authorization on obtaining one.
+///
+/// It performs the filesystem steps saving performs: creating the credential directory, opening
+/// the mutation lock for writing, creating a temporary file beside the credentials and renaming
+/// it over another. A missing lock file is not created; creating a temporary file in its
+/// directory proves the same permission, so a failed check leaves no file behind. A lock another
+/// process holds is not a failure here, because saving waits for it. A refused write is reported
+/// as [`local_state::LocalStateError::NotWritable`].
+pub fn preflight_writable() -> Result<()> {
+    let dir = crate::infra::config::credentials_dir()?;
+    create_credential_dir(&dir)?;
+    let temporary = |dir: &Path| {
+        tempfile::NamedTempFile::new_in(dir).map_err(|error| {
+            local_state::io_failure("cannot create a temporary file in", dir, error)
+        })
+    };
+    let lock_path = dir.with_extension("lock");
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(error) if local_state::is_contended(&error) => {}
+            Err(error) => {
+                return Err(local_state::io_failure(
+                    "cannot lock credential mutations",
+                    &lock_path,
+                    error,
+                ));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            drop(temporary(lock_path.parent().unwrap_or(&dir))?);
+        }
+        Err(error) => {
+            return Err(local_state::io_failure(
+                "cannot open credential mutation lock",
+                &lock_path,
+                error,
+            ));
+        }
+    }
+    let probe = temporary(&dir)?;
+    #[cfg(not(windows))]
+    {
+        // Saving replaces the credential file by rename; the replaced path is removed when
+        // `target` drops, so the probe leaves nothing behind.
+        let target = temporary(&dir)?.into_temp_path();
+        probe.persist(&target).map_err(|error| {
+            local_state::io_failure("cannot rename a temporary file to", &target, error.error)
+        })?;
+    }
+    #[cfg(windows)]
+    drop(probe);
+    Ok(())
+}
+
+/// [`preflight_writable`] for a diagnostic, which creates no state: while the credential
+/// directory does not exist yet, its nearest existing ancestor must accept a new file, since
+/// saving creates the directory there. Returns whether the credential directory exists.
+#[cfg(feature = "cli")]
+pub fn probe_writable() -> Result<bool> {
+    let dir = crate::infra::config::credentials_dir()?;
+    if dir.is_dir() {
+        return preflight_writable().map(|()| true);
+    }
+    let existing = dir
+        .ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .context("no ancestor of the credential directory exists")?;
+    tempfile::NamedTempFile::new_in(existing).map_err(|error| {
+        local_state::io_failure("cannot create a temporary file in", existing, error)
+    })?;
+    Ok(false)
 }
 
 /// Serialize renewal through persistence without preventing a concurrent login or logout.
 /// The separate mutation lock still fences the final write against an identity change.
 #[cfg(feature = "cli")]
 pub(crate) fn refresh_guard(hub: &str) -> Result<std::fs::File> {
-    use std::time::{Duration, Instant};
-
     let authority = HubAuthority::parse(hub)?;
     let dir = crate::infra::config::credentials_dir()?;
-    super::config::create_state_dir(&dir).context("cannot create credential directory")?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(dir.join(format!("{}.refresh.lock", authority.storage_key())))
-        .context("cannot open Hub credential refresh lock")?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(file),
-            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-                ensure!(
-                    Instant::now() < deadline,
-                    "another process is still refreshing Hub credentials; retry this command"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => return Err(error).context("cannot lock Hub credential refresh"),
-        }
-    }
+    create_credential_dir(&dir)?;
+    let path = dir.join(format!("{}.refresh.lock", authority.storage_key()));
+    let file = open_lock(&path).map_err(|error| {
+        local_state::io_failure("cannot open Hub credential refresh lock", &path, error)
+    })?;
+    local_state::lock_exclusive(&file, &path, "the Hub credential refresh lock")?;
+    Ok(file)
 }
 
 pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {
+    let body = format!("{}\n", serde_json::to_string_pretty(cred)?);
+    write_private(path, body.as_bytes(), "saved Hub credentials")?;
+    // File metadata invalidates the tokenless sidecar if another writer replaces the credential.
+    #[cfg(feature = "cli")]
+    let _ = save_account_cache(path, cred.account_id.as_deref());
+    Ok(())
+}
+
+/// Replace `path` with `body`, readable by this user only. A reader sees the previous file or
+/// the new one, never a partial write, because the body is complete in a private temporary file
+/// before it takes the name.
+fn write_private(path: &Path, body: &[u8], what: &str) -> Result<()> {
     if let Some(d) = path.parent() {
         super::config::create_state_dir(d)?;
     }
-    let body = format!("{}\n", serde_json::to_string_pretty(cred)?);
     #[cfg(windows)]
-    super::windows_security::write_private_file(path, body.as_bytes())
-        .with_context(|| format!("cannot write private credentials to {}", path.display()))?;
+    super::windows_security::write_private_file(path, body)
+        .with_context(|| format!("cannot write {what} to {}", path.display()))?;
     #[cfg(not(windows))]
     {
         use std::io::Write as _;
         let directory = path.parent().context("credential directory is missing")?;
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(|error| {
+            local_state::io_failure("cannot create a temporary file in", directory, error)
+        })?;
         set_private(temporary.path())?;
-        temporary.write_all(body.as_bytes())?;
+        temporary.write_all(body)?;
         temporary.as_file().sync_all()?;
         temporary
             .persist(path)
-            .map_err(|_| anyhow!("cannot persist saved Hub credentials"))?;
+            .map_err(|_| anyhow!("cannot persist {what}"))?;
     }
-    // File metadata invalidates the tokenless sidecar if another writer replaces the credential.
-    #[cfg(feature = "cli")]
-    let _ = save_account_cache(path, cred.account_id.as_deref());
     Ok(())
 }
 
@@ -427,30 +516,75 @@ fn analytics_account_at(path: &Path) -> (Option<String>, &'static str) {
     (account_id, state)
 }
 
-/// Signing out clears the selected slot and all positively bound compatibility records.
-pub fn remove(hub: &str) -> Result<bool> {
+/// What a sign-out removed.
+#[derive(Default)]
+pub struct Removed {
+    /// How many credential records were removed.
+    pub records: usize,
+    /// The removed credentials bound to a Hub. A sign-out reads and revokes credentials before it
+    /// removes them, so a sign-in that saves in between leaves a session only these name; the
+    /// sign-out revokes it with them.
+    pub bound: Vec<HubCredential>,
+}
+
+/// Forget the Hub's sign-in request waiting for approval, and its claim marker, as a sign-out
+/// does before it reads the credentials it revokes. A claim of that request in flight commits
+/// under the same lock (see [`pending::commit`]), so it either committed already, and the
+/// sign-out reads and revokes its credentials, or it finds the request forgotten and saves
+/// nothing.
+pub fn forget_request(hub: &str) -> Result<()> {
+    let authority = HubAuthority::parse(hub)?;
+    let dir = crate::infra::config::credentials_dir()?;
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let _guard = mutation_guard(&dir)?;
+    pending::discard(&dir, &authority);
+    Ok(())
+}
+
+/// Signing out clears the selected slot and all positively bound compatibility records, and
+/// forgets the Hub's sign-in request waiting for approval, which could otherwise sign the
+/// account back in when a later command claims it. The credentials are read under the lock
+/// every save takes, so the ones returned include any a sign-in saved after the caller read
+/// them.
+pub fn remove(hub: &str) -> Result<Removed> {
     let authority = HubAuthority::parse(hub)?;
     let dir = crate::infra::config::credentials_dir()?;
     let _guard = mutation_guard(&dir)?;
+    pending::discard(&dir, &authority);
     remove_from(&dir, &authority)
 }
 
-fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<bool> {
+fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<Removed> {
     let canonical = dir.join(format!("{}.json", authority.storage_key()));
     let paths = record_paths(dir)?;
+    let mut removed = Removed::default();
     let _ = std::fs::remove_file(canonical.with_extension("identity"));
-    let mut removed = match std::fs::remove_file(&canonical) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => return Err(anyhow!("cannot remove saved Hub credentials")),
-    };
-    for path in paths {
-        if !recognized_record(&path, true).is_some_and(|cred| bound_to(&cred, authority)) {
-            continue;
+    let saved = std::fs::symlink_metadata(&canonical)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| load_at(&canonical))
+        .flatten()
+        .filter(|cred| bound_to(cred, authority));
+    match std::fs::remove_file(&canonical) {
+        Ok(()) => {
+            removed.records += 1;
+            removed.bound.extend(saved);
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(anyhow!("cannot remove saved Hub credentials")),
+    }
+    for path in paths {
+        let Some(cred) = recognized_record(&path, true).filter(|cred| bound_to(cred, authority))
+        else {
+            continue;
+        };
         let _ = std::fs::remove_file(path.with_extension("identity"));
         match std::fs::remove_file(&path) {
-            Ok(()) => removed = true,
+            Ok(()) => {
+                removed.records += 1;
+                removed.bound.push(cred);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(anyhow!("cannot remove saved Hub credentials")),
         }
@@ -490,15 +624,35 @@ pub fn all_checked() -> Result<Vec<(String, Option<HubCredential>)>> {
         .collect())
 }
 
-/// Explicit global logout clears every local credential record, including unbound records.
-pub fn remove_all() -> Result<usize> {
+/// Forget every sign-in request waiting for approval, and every claim marker, as a global
+/// sign-out does before it reads the credentials it revokes (see [`forget_request`]); a leftover
+/// approved request would otherwise sign an account back in when a later command claims it.
+/// Returns whether a request was forgotten.
+pub fn forget_pending() -> Result<bool> {
     let dir = crate::infra::config::credentials_dir()?;
+    if !dir.is_dir() {
+        return Ok(false);
+    }
     let _guard = mutation_guard(&dir)?;
-    let mut removed = 0;
+    Ok(pending::discard_all(&dir) > 0)
+}
+
+/// Explicit global logout clears every local credential record, including unbound records, and
+/// returns what it removed as [`remove`] does.
+pub fn remove_all() -> Result<Removed> {
+    let dir = crate::infra::config::credentials_dir()?;
+    if !dir.is_dir() {
+        return Ok(Removed::default());
+    }
+    let _guard = mutation_guard(&dir)?;
+    pending::discard_all(&dir);
+    let mut removed = Removed::default();
     for path in record_paths(&dir)? {
+        let cred = recognized_record(&path, false);
         let _ = std::fs::remove_file(path.with_extension("identity"));
         std::fs::remove_file(&path).map_err(|_| anyhow!("cannot remove saved Hub credentials"))?;
-        removed += 1;
+        removed.records += 1;
+        removed.bound.extend(cred);
     }
     Ok(removed)
 }
@@ -777,6 +931,9 @@ mod tests {
         assert!(load_from(dir.path(), &authority).unwrap().is_none());
     }
 
+    /// A selected sign-out removes only the records bound to its Hub and returns exactly those,
+    /// because it revokes every returned session at that session's Hub; returning a foreign
+    /// record would sign out an account the sign-out never selected.
     #[test]
     fn selected_logout_preserves_colliding_foreign_legacy_credentials() {
         let dir = tempfile::tempdir().unwrap();
@@ -788,11 +945,14 @@ mod tests {
         let own_path = legacy(dir.path(), &own);
         let canonical = dir.path().join(format!("{}.json", authority.storage_key()));
         save_at(&canonical, &own).unwrap();
-        assert!(remove_from(dir.path(), &authority).unwrap());
+        let removed = remove_from(dir.path(), &authority).unwrap();
         assert!(!own_path.exists());
         assert!(!canonical.exists());
         assert_eq!(std::fs::read(foreign_path).unwrap(), foreign_bytes);
-        assert!(!remove_from(dir.path(), &authority).unwrap());
+        assert_eq!(removed.records, 2);
+        assert_eq!(removed.bound.len(), removed.records);
+        assert!(removed.bound.iter().all(|cred| cred.hub == own.hub));
+        assert_eq!(remove_from(dir.path(), &authority).unwrap().records, 0);
     }
 
     #[test]
@@ -874,11 +1034,11 @@ mod tests {
         save_at(&original, &alias).unwrap();
         if expected.exists() {
             assert!(load_from(dir.path(), &authority).unwrap().is_some());
-            assert!(remove_from(dir.path(), &authority).unwrap());
+            assert!(remove_from(dir.path(), &authority).unwrap().records > 0);
             assert!(!original.exists());
         } else {
             assert!(load_from(dir.path(), &authority).unwrap().is_none());
-            assert!(!remove_from(dir.path(), &authority).unwrap());
+            assert_eq!(remove_from(dir.path(), &authority).unwrap().records, 0);
             assert!(original.exists());
         }
     }

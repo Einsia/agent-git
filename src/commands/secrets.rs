@@ -466,10 +466,7 @@ fn synchronize_selected(repo: &Repo) -> crate::Result<()> {
         )?;
     }
     if !client.has_token() {
-        return Err(super::LoginRequired {
-            hub: client.base().to_owned(),
-        }
-        .into());
+        return Err(super::LoginRequired::new(client.base()).into());
     }
     let (owner, name) = selected_route(repo, client.base())?;
     let remote = super::remote_request(client.get_agent(&owner, &name))?;

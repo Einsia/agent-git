@@ -123,30 +123,81 @@ pub(crate) fn remote_request<T>(result: Result<T>) -> Result<T> {
 
 /// Require sign-in, otherwise give an actionable next step.
 ///
-/// Several commands need this precondition, so the wording lives in one place.
+/// Several commands need this precondition, so the wording lives in one place. Without
+/// credentials it first claims a sign-in the human approved after `agit login` recorded it (see
+/// [`with_approved_sign_in`]), so a login whose waiting process was stopped still signs in.
 pub fn require_login() -> Result<crate::hub::Client> {
     let c = crate::hub::Client::from_env();
-    if c.checked_access_token()?.is_none() {
-        return Err(anyhow::Error::new(LoginRequired {
-            hub: c.base().to_owned(),
-        }));
+    if c.checked_access_token()?.is_some() {
+        return Ok(c);
     }
-    Ok(c)
+    let c = with_approved_sign_in(c);
+    if c.checked_access_token()?.is_some() {
+        return Ok(c);
+    }
+    Err(anyhow::Error::new(LoginRequired::new(c.base())))
+}
+
+/// [`require_login`] for a command that promises to make no Hub request: it only reads the saved
+/// credentials and the local sign-in record, and claims nothing.
+pub fn require_saved_login() -> Result<crate::hub::Client> {
+    let c = crate::hub::Client::from_env();
+    if c.checked_access_token()?.is_some() {
+        return Ok(c);
+    }
+    Err(anyhow::Error::new(LoginRequired::new(c.base())))
+}
+
+/// `client`, or, when it has no credentials, a client for the same Hub holding the credentials of
+/// a sign-in the human approved after `agit login` recorded its request. The claim is one poll
+/// that never waits for the human (see [`login::claim_recorded`]).
+pub(crate) fn with_approved_sign_in(client: crate::hub::Client) -> crate::hub::Client {
+    if client.has_token() {
+        return client;
+    }
+    match login::claim_recorded(client.base()) {
+        login::PendingSignIn::SignedIn => crate::hub::Client::for_stored_hub(client.base()),
+        login::PendingSignIn::Waiting | login::PendingSignIn::Absent => client,
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct LoginRequired {
     pub(crate) hub: String,
+    /// A sign-in request for the Hub waits for the human's approval, so the next step is to
+    /// finish it rather than to start another one.
+    pub(crate) pending: bool,
+}
+
+impl LoginRequired {
+    /// The failure for a command that found no credentials for `hub`. It reads the local sign-in
+    /// record only and claims nothing.
+    pub(crate) fn new(hub: &str) -> Self {
+        Self {
+            hub: hub.to_owned(),
+            pending: login::is_waiting(hub),
+        }
+    }
+
+    /// The command that signs in. A waiting sign-in is finished, not replaced: a new login needs
+    /// a new approval.
+    pub(crate) fn fix(&self) -> Option<fix::FixCommand> {
+        let mut args = vec!["login", "--hub", &self.hub];
+        if self.pending {
+            args.push("--complete");
+        }
+        fix::FixCommand::at_hub(&args, &self.hub, true)
+    }
 }
 
 impl std::fmt::Display for LoginRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "not logged in to {} yet.\n  {}",
-            self.hub,
+        let next = if self.pending {
+            login::complete_hint(&self.hub)
+        } else {
             crate::ui::login_hint(&self.hub)
-        )
+        };
+        write!(f, "not logged in to {} yet.\n  {next}", self.hub)
     }
 }
 
@@ -172,6 +223,10 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
                 .is_some_and(|api| api.status == 401)
     }) {
         ExitCode::Auth
+    } else if crate::infra::local_state::find(error).is_some() {
+        // Unwritable or held local state is a local precondition, even when it surfaced while a
+        // Hub request was being prepared.
+        ExitCode::Precondition
     } else if error.is::<crate::hub::client::RequestConfiguration>() {
         ExitCode::Usage
     } else if error.is::<RemoteRequest>() {
@@ -246,6 +301,12 @@ pub fn writability(me: &str, owner: &str, name: &str) -> Result<Writability> {
     }
     let client = crate::hub::Client::from_env();
     if !client.has_token() {
+        if login::is_waiting(client.base()) {
+            anyhow::bail!(
+                "{owner}/{name} is not your namespace — {}",
+                login::complete_hint(client.base())
+            );
+        }
         anyhow::bail!(
             "{owner}/{name} is not your namespace — sign in (`agit login`) so the hub can say whether you may write to it"
         );
@@ -1652,6 +1713,7 @@ mod terminal_error_tests {
             (
                 anyhow::Error::new(LoginRequired {
                     hub: "https://hub.example.test".into(),
+                    pending: false,
                 }),
                 ExitCode::Auth,
             ),
@@ -1682,6 +1744,7 @@ mod terminal_error_tests {
         assert!(!configuration.is::<super::RemoteRequest>());
         let auth = anyhow::Error::new(LoginRequired {
             hub: "https://hub.example.test".into(),
+            pending: false,
         })
         .context(crate::hub::client::RequestConfiguration);
         assert_eq!(
@@ -1707,6 +1770,7 @@ mod terminal_error_tests {
     fn remote_request_context_preserves_authentication_and_does_not_classify_by_words() {
         let error = super::remote_request::<()>(Err(anyhow::Error::new(LoginRequired {
             hub: "https://hub.example.test".into(),
+            pending: false,
         })))
         .unwrap_err();
         assert_eq!(terminal_error_code(&error, ExitCode::Usage), ExitCode::Auth);
@@ -1753,6 +1817,7 @@ mod terminal_error_tests {
     fn authentication_takes_precedence_over_a_reference_context() {
         let error = anyhow::Error::new(LoginRequired {
             hub: "https://hub.example.test".into(),
+            pending: false,
         })
         .context(NotFound("absent".into()))
         .context("selecting a tag target");

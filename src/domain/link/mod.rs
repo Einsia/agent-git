@@ -311,21 +311,26 @@ pub fn link_path(store: &Store, source: &str, session_id: &str) -> PathBuf {
 /// with the returned handle. The lock file is the link's name plus a `.lock` suffix and its
 /// contents mean nothing; [`list`] accepts only `.json`, so it never takes it for a link.
 pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::File> {
-    use fs2::FileExt as _;
     let dir = store.root().join(source);
-    crate::infra::config::create_state_dir(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = dir.join(format!("{session_id}.json.lock"));
-    let f = crate::infra::config::state_file_options()
+    let f = open_lock_file(&dir, &lp)?;
+    crate::infra::local_state::lock_patiently(&f, &lp, "the session link lock", true)?;
+    Ok(f)
+}
+
+/// Create and open one of the link, branch or repository lock files. A refused write is reported
+/// as agit's home not being writable rather than as a problem with the lock itself.
+fn open_lock_file(dir: &Path, path: &Path) -> Result<std::fs::File> {
+    use crate::infra::local_state::io_failure;
+    crate::infra::config::create_state_dir(dir)
+        .map_err(|error| io_failure("cannot create", dir, error))?;
+    crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&lp)
-        .with_context(|| format!("cannot open {}", lp.display()))?;
-    f.lock_exclusive()
-        .with_context(|| format!("cannot lock {}", lp.display()))?;
-    Ok(f)
+        .open(path)
+        .map_err(|error| io_failure("cannot open", path, error))
 }
 
 pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
@@ -950,7 +955,6 @@ impl BranchLock {
 }
 
 pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock> {
-    use fs2::FileExt as _;
     use sha2::Digest as _;
 
     let repository = lock_repository(store, slug, false)?;
@@ -959,18 +963,9 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
     digest.update([0]);
     digest.update(branch.as_bytes());
     let dir = store.root().join(".locks").join("branches");
-    crate::infra::config::create_state_dir(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
-    let file = crate::infra::config::state_file_options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    file.lock_exclusive()
-        .with_context(|| format!("cannot lock {}", path.display()))?;
+    let file = open_lock_file(&dir, &path)?;
+    crate::infra::local_state::lock_patiently(&file, &path, "the branch lock", true)?;
     Ok(BranchLock {
         _branch: file,
         _repository: repository,
@@ -982,26 +977,29 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
 /// Repository moves exclude every branch writer, including branches created during promotion.
 /// Shared repository guards let ordinary writes to independent branches proceed concurrently.
 fn lock_repository(store: &Store, slug: &str, exclusive: bool) -> Result<std::fs::File> {
-    use fs2::FileExt as _;
+    let (path, file) = open_repository_lock(store, slug)?;
+    crate::infra::local_state::lock_patiently(&file, &path, "the repository lock", exclusive)?;
+    Ok(file)
+}
+
+fn open_repository_lock(store: &Store, slug: &str) -> Result<(PathBuf, std::fs::File)> {
     use sha2::Digest as _;
 
     let dir = store.root().join(".locks").join("repositories");
-    crate::infra::config::create_state_dir(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(sha2::Sha256::digest(slug))));
-    let file = crate::infra::config::state_file_options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    if exclusive {
-        file.lock_exclusive()
-    } else {
-        fs2::FileExt::lock_shared(&file)
-    }
-    .with_context(|| format!("cannot lock {}", path.display()))?;
+    let file = open_lock_file(&dir, &path)?;
+    Ok((path, file))
+}
+
+/// Exclude every import and settlement of one repository for a short local write to its
+/// checkout, such as a publish updating the remote URL in `.git/config`.
+///
+/// The wait is bounded: a shared holder can be an import that is waiting for input, and a
+/// publish must then fail with the holder named instead of hanging.
+#[cfg(feature = "cli")]
+pub fn lock_repository_for_write(store: &Store, slug: &str) -> Result<std::fs::File> {
+    let (path, file) = open_repository_lock(store, slug)?;
+    crate::infra::local_state::lock_exclusive(&file, &path, "the repository lock")?;
     Ok(file)
 }
 

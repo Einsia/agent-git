@@ -296,6 +296,29 @@ pub fn run(args: Args) -> CmdResult {
         },
     ));
 
+    // ── Local state ──
+    // The probe `agit login` runs before it asks the Hub for anything, minus creating the
+    // credential directory. A home that refuses writes (commonly an agent sandbox) fails every
+    // sign-in, settlement and import.
+    checks.push((
+        "agit home".into(),
+        match credentials::probe_writable() {
+            Ok(true) => Check::Ok(format!("{} is writable", ui::tilde(&config::agit_home()?))),
+            Ok(false) => Check::Ok(format!(
+                "writable; {} is created at the first sign-in",
+                ui::tilde(&config::credentials_dir()?)
+            )),
+            Err(error) => {
+                fatal = true;
+                let mut detail = first_line(&format!("{error:#}"));
+                for hint in crate::infra::local_state::hints(&error) {
+                    detail.push_str(&format!("; {hint}"));
+                }
+                Check::Err(detail)
+            }
+        },
+    ));
+
     // ── Secret keystore ──
     // Probed the way a commit uses it. A store that opens but refuses writes, or a vault whose
     // key the configured store does not hold, fails the first commit that finds a secret — on

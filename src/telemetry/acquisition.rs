@@ -260,6 +260,21 @@ pub fn save_login(
     hub: &str,
     credential: &crate::infra::credentials::HubCredential,
 ) -> anyhow::Result<()> {
+    save_login_with(hub, credential, || {
+        crate::infra::credentials::save(hub, credential).map(|()| true)
+    })
+    .map(drop)
+}
+
+/// [`save_login`] with `save` in place of saving the credentials outright. `save` returns whether
+/// it saved them, and only a login it saved counts as the installation's first. It can run while
+/// this process holds the telemetry state lock, so it must not wait for any lock whose holder
+/// can wait for that one.
+pub fn save_login_with(
+    hub: &str,
+    credential: &crate::infra::credentials::HubCredential,
+    save: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
     let eligible = || -> anyhow::Result<_> {
         let destination =
             Destination::for_hub(hub).ok_or_else(|| anyhow::anyhow!("no analytics destination"))?;
@@ -288,7 +303,9 @@ pub fn save_login(
     } else {
         None
     };
-    crate::infra::credentials::save(hub, credential)?;
+    if !save()? {
+        return Ok(false);
+    }
     if let Some((dir, guard, mut preferences, destination)) = state {
         if preferences.first_acquisition_account.is_none() && !preferences.acquisition_completed {
             let account_id = credential.account_id.clone().filter(|id| {
@@ -313,7 +330,7 @@ pub fn save_login(
         let _ = enqueue_pending_link(hub);
         transport::spawn_worker(hub);
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn enqueue_pending_link(hub: &str) -> anyhow::Result<()> {

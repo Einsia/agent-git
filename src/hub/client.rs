@@ -263,7 +263,12 @@ impl Client {
 
     /// A named hub with no credentials (the constructor for the browser / device login flow).
     pub fn for_hub(hub: &str) -> Client {
-        Self::new(hub.to_string(), None, Duration::from_secs(30))
+        Self::for_hub_with_timeout(hub, Duration::from_secs(30))
+    }
+
+    /// [`Self::for_hub`] with an explicit request timeout.
+    pub(crate) fn for_hub_with_timeout(hub: &str, timeout: Duration) -> Client {
+        Self::new(hub.to_string(), None, timeout)
     }
 
     /// A named hub plus a ready-made token (the constructor for `login --with-token`).
@@ -2063,7 +2068,7 @@ mod tests {
         let (base, hub) = fake_hub(2, |request| {
             if request.starts_with("POST /api/auth/refresh ") {
                 let base = request_hub(request);
-                assert!(credentials::remove(&base).unwrap());
+                assert!(credentials::remove(&base).unwrap().records > 0);
                 return (
                     200,
                     serde_json::to_string(&new_pair(&base, "alice")).unwrap(),

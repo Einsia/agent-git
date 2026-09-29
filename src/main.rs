@@ -462,6 +462,11 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Err(e) => {
             commands::fix::register_terminal_error(&e);
             agit::ui::error(&commands::terminal_error_message(&e));
+            // An unwritable home or a held lock carries its own next steps, including that a
+            // lock file must not be deleted while its holder runs.
+            for hint in agit::infra::local_state::hints(&e) {
+                agit::ui::hint(&hint);
+            }
             commands::terminal_error_code(&e, agit::ExitCode::Failure).as_i32()
         }
     }

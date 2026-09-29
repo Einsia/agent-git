@@ -168,6 +168,8 @@ pub mod infra {
     pub mod hub_authority;
     #[cfg(feature = "cli")]
     pub(crate) mod local_git;
+    /// Local state failures (an unwritable home, a held lock), told apart from Hub failures.
+    pub mod local_state;
     /// Where each runtime's project memory directory is.
     pub mod runtime_memory;
     /// Discovery of the runtime session the current process belongs to (no CLI output here).

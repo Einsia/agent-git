@@ -131,9 +131,10 @@ pub(crate) fn gate(dir: &Path, wait: bool) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(dir.join("gate.lock"))?;
+    let path = dir.join("gate.lock");
+    let file = options.open(&path)?;
     if wait {
-        fs2::FileExt::lock_exclusive(&file)?;
+        crate::infra::local_state::lock_exclusive(&file, &path, "the telemetry state lock")?;
     } else {
         fs2::FileExt::try_lock_exclusive(&file)?;
     }

@@ -232,7 +232,12 @@ pub fn run(mut args: Args) -> CmdResult {
     } else {
         None
     };
-    let client = require_login()?;
+    // Local search promises no Hub request, so it only reads the saved sign-in.
+    let client = if local_queries.is_some() {
+        super::require_saved_login()?
+    } else {
+        require_login()?
+    };
     if let Some(parsed) = local_queries {
         let results = local::execute(&args, &queries, &parsed)?;
         if results.len() > 1 {

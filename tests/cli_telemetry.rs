@@ -777,10 +777,14 @@ fn first_browser_handoff_and_completed_login_join_the_install_without_linking_an
             .iter()
             .any(|e| e["event"] == "cli_acquisition_linked")
     );
-    for account in ["account-alice", "account-bob"] {
+    // The Hub hands out one session per request, so each account completes its own request.
+    for (account, state) in [
+        ("account-alice", "private-state-canary"),
+        ("account-bob", "private-state-canary-second"),
+    ] {
         let mut child = f
             .command()
-            .args(["login", "--complete", "private-state-canary"])
+            .args(["login", "--complete", state])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -856,10 +860,14 @@ fn the_first_saved_account_survives_a_busy_collector_and_a_broken_queue() {
     fs2::FileExt::lock_exclusive(&gate).unwrap();
     std::fs::write(f.path("queue.json"), b"invalid queue").unwrap();
     let mut first = None;
-    for account in ["account-alice", "account-bob"] {
+    // The Hub hands out one session per request, so each account completes its own request.
+    for (account, state) in [
+        ("account-alice", "private-state-canary"),
+        ("account-bob", "private-state-canary-second"),
+    ] {
         let mut child = f
             .command()
-            .args(["login", "--complete", "private-state-canary"])
+            .args(["login", "--complete", state])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -499,7 +499,7 @@ pub fn run(mut args: Args) -> CmdResult {
             return Ok(code);
         }
     }
-    repo.set_remote(&push_url)?;
+    point_origin(&repo, &format!("{namespace}/{agent}"), &push_url)?;
 
     // ── 6b. Did the destination change after the scan ──
     //
@@ -894,6 +894,11 @@ fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<Stri
         _ if err.contains("fetch first") || err.contains("non-fast-forward") => vec![
             format!("the remote moved ahead: `agit clone {owner}/{name}` to catch up, then continue"),
         ],
+        // The transfer also writes the checkout (remote-tracking refs, the upstream of a first
+        // publication), so it can meet another git process's lock or a sandbox's refusal.
+        _ if !crate::domain::repo::checkout_write_hints(err).is_empty() => {
+            crate::domain::repo::checkout_write_hints(err)
+        }
         _ => vec![
             "git’s own words above are the best clue".into(),
             "`agit doctor --check-backend` checks connectivity".into(),
@@ -1190,7 +1195,9 @@ fn ensure_remote_with_options(
     }
     // Retained pins belong to supervised work and cannot be rewritten by an ordinary push.
     if preparation.pin_identity && matches!(identity::read(repo), Ok(None)) {
-        identity::pin(repo, &remote_identity)?;
+        write_checkout_config(&format!("{owner}/{agent}"), || {
+            identity::pin(repo, &remote_identity)
+        })?;
     }
     Ok(Remote {
         owner: observed.owner,
@@ -1420,6 +1427,32 @@ fn publication_push_args(refs: &[String], set_upstream: bool) -> Vec<&str> {
     args.push("origin");
     args.extend(refs.iter().map(String::as_str));
     args
+}
+
+/// Point `origin` at the publish URL. An unchanged URL writes nothing.
+fn point_origin(repo: &Repo, slug: &str, url: &str) -> crate::Result<()> {
+    if repo.remote_is(crate::domain::repo::ORIGIN, url) {
+        return Ok(());
+    }
+    write_checkout_config(slug, || repo.set_remote(url))
+}
+
+/// Write the checkout's own git configuration under the repository's exclusive guard, the lock
+/// import and settlement hold shared while they write this checkout, so agit processes do not race
+/// for git's lock on `.git/config`. The guard covers only the local write: held across the
+/// network transfer, it would stall every settlement of the repository for as long as the push
+/// takes.
+///
+/// The upstream `git push -u` records on a first publication is written outside the guard. Git
+/// does not fail a push whose upstream it cannot record, and the next push records it again,
+/// because a branch without an upstream is pushed with `-u`.
+fn write_checkout_config<T>(
+    slug: &str,
+    write: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let store = crate::domain::store::Store::open_or_init()?;
+    let _guard = crate::domain::link::lock_repository_for_write(&store, slug)?;
+    write()
 }
 
 /// Push tags. Batched because an agent gets a version ID every turn, and a command line has a

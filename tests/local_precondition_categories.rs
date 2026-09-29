@@ -327,7 +327,7 @@ fn lineage_arguments_keep_usage_and_git_failures_keep_their_unclassified_cause()
                 "alice/qa@main",
                 "claude-code",
                 ID,
-                "explicit session branch",
+                "`main` holds the repository's shared files",
             ),
             ("alice/qa@work#1", "claude-code", ID, "historic selector"),
             ("Alice/qa@work", "claude-code", ID, "lowercase"),

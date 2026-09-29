@@ -190,6 +190,78 @@ impl std::fmt::Display for GitRecordBudgetExceeded {
 
 impl std::error::Error for GitRecordBudgetExceeded {}
 
+/// A failed git command, with its stderr and what that stderr says about the checkout itself
+/// (see [`checkout_write_hints`]).
+fn git_failure(args: &[&str], stderr: &[u8]) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    let mut message = format!("git {} failed: {stderr}", args.join(" "));
+    for hint in checkout_write_hints(stderr) {
+        message.push_str("\n  ");
+        message.push_str(&hint);
+    }
+    anyhow::anyhow!(message)
+}
+
+/// Next steps for a git failure that could not write the checkout, one per line; none for any
+/// other failure.
+///
+/// A held lock and a refused write need opposite advice. Git words a lock held by a live process
+/// and one left by a crashed process the same way, and deleting a live holder's lock lets two
+/// writers change the same file, so a held lock says to check for running git processes first.
+/// A refused write (an agent sandbox, a read-only file system) has no lock to remove at all, and
+/// advice about locks there invites deleting unrelated files.
+pub(crate) fn checkout_write_hints(stderr: &str) -> Vec<String> {
+    if reports_held_lock(stderr) {
+        vec![
+            "another git process, possibly one started by another agit command, may be writing this repository; do not delete its `.lock` file while one is running".into(),
+            format!(
+                "{} lists running git processes; remove the lock file only once none remains",
+                if cfg!(windows) {
+                    "`tasklist /fi \"imagename eq git.exe\"`"
+                } else {
+                    "`pgrep -lx git`"
+                }
+            ),
+        ]
+    } else if reports_refused_write(stderr) {
+        let home = crate::infra::config::agit_home()
+            .map(|home| home.display().to_string())
+            .unwrap_or_else(|_| "AGIT_HOME".into());
+        vec![
+            "the operating system refused a write to this repository; this commonly happens when agit runs inside an agent sandbox that only allows writes to the workspace".into(),
+            format!("allow writes to {home}, or run this agit command outside the sandbox"),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Git creates every lock file with `O_EXCL`, so a held lock surfaces as the `EEXIST` text "File
+/// exists", in a line git itself may have translated but that still names the lock or the config
+/// file. Other errno values on the same lines (a refused write) are not a held lock.
+fn reports_held_lock(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.contains("File exists") && (line.contains(".lock") || line.contains("config"))
+    })
+}
+
+/// Git reports a failed local write as `<what>: <strerror>` at the end of a line. A transport
+/// refusal such as ssh's `Permission denied (publickey).` continues past the errno text and is
+/// not a local write.
+fn reports_refused_write(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim_end().trim_end_matches('.');
+        [
+            ": Permission denied",
+            ": Operation not permitted",
+            ": Read-only file system",
+        ]
+        .iter()
+        .any(|errno| line.ends_with(errno))
+    })
+}
+
 #[derive(Debug)]
 struct GitStreamFailure {
     command: String,
@@ -1327,11 +1399,7 @@ impl Repo {
             .output()
             .with_context(|| format!("failed to run git {}", args.join(" ")))?;
         if !out.status.success() {
-            bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            return Err(git_failure(args, &out.stderr));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     }
@@ -1345,11 +1413,7 @@ impl Repo {
             .output()
             .with_context(|| format!("failed to run git {}", args.join(" ")))?;
         if !out.status.success() {
-            bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            return Err(git_failure(args, &out.stderr));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     }
@@ -1923,11 +1987,7 @@ impl Repo {
             .output()
             .with_context(|| format!("git {} failed to start", args.join(" ")))?;
         if !out.status.success() {
-            anyhow::bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            return Err(git_failure(args, &out.stderr));
         }
         Ok(out.stdout)
     }
@@ -2050,11 +2110,31 @@ impl Repo {
         self.remote(UPSTREAM)
     }
 
+    /// Whether this checkout's own configuration gives the remote exactly one URL, `url`.
+    /// Rewrite rules such as `insteadOf` are not applied: this compares what `set_remote_named`
+    /// would write.
+    pub fn remote_is(&self, name: &str, url: &str) -> bool {
+        self.git_opt(&[
+            "config",
+            "--local",
+            "--get-all",
+            &format!("remote.{name}.url"),
+        ])
+        .is_some_and(|urls| urls == url)
+    }
+
     /// Set a remote (add it when absent, update it when present).
     ///
     /// The URL changes: switching hub, or a read-only clone being promoted into your own copy (at
     /// which point origin moves from their copy to yours). So "already exists" is not an error.
+    ///
+    /// A remote that already carries exactly this URL is left alone. Every rewrite takes git's
+    /// lock on `.git/config`; rewriting an unchanged URL on each publish makes overlapping pushes
+    /// of one repository fail on that lock.
     pub fn set_remote_named(&self, name: &str, url: &str) -> Result<()> {
+        if self.remote_is(name, url) {
+            return Ok(());
+        }
         if self.remote(name).is_some() {
             self.git(&["remote", "set-url", name, url])?;
         } else {
@@ -3718,6 +3798,44 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         // The URL changes after switching hub, so an existing origin must not make this fail.
         r.set_remote("http://other/a.git").unwrap();
         assert_eq!(r.remote_url().as_deref(), Some("http://other/a.git"));
+    }
+
+    /// Another writer holding git's config lock must not fail a publish whose remote URL is
+    /// already current, and a real change that meets the lock must say not to delete it. A
+    /// checkout that refuses writes has no lock to delete and must not be told about one. An
+    /// implementation that rewrites the URL unconditionally fails the first assertion; one that
+    /// reads every "could not lock" line as a held lock fails the last.
+    #[test]
+    fn unchanged_remote_is_not_rewritten_and_a_held_config_lock_is_explained() {
+        let d = tempfile::tempdir().unwrap();
+        let r = Repo::init(&d.path().join("a")).unwrap();
+        r.set_remote("http://h/a.git").unwrap();
+        let lock = r.root().join(".git/config.lock");
+        std::fs::write(&lock, b"").unwrap();
+        r.set_remote("http://h/a.git").unwrap();
+        let error = r.set_remote("http://other/a.git").unwrap_err().to_string();
+        assert!(error.contains("do not delete"), "{error}");
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(r.remote_url().as_deref(), Some("http://h/a.git"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let git_dir = r.root().join(".git");
+            let set_mode = |mode| {
+                std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(mode)).unwrap()
+            };
+            set_mode(0o555);
+            // A privileged runner ignores permission bits; there is nothing to observe then.
+            let refused = tempfile::tempfile_in(&git_dir)
+                .is_err()
+                .then(|| r.set_remote("http://other/a.git").unwrap_err().to_string());
+            set_mode(0o755);
+            if let Some(error) = refused {
+                assert!(!error.contains("do not delete"), "{error}");
+                assert!(error.contains("refused a write"), "{error}");
+            }
+        }
     }
 
     /// The two remotes are independent, and both must be settable when a read-only clone is

@@ -259,7 +259,7 @@ pub fn register(make_action: impl FnOnce() -> Option<FixCommand>) {
 /// Register only when this error determines the command's final failure, after recovery ends.
 pub fn register_terminal_error(error: &anyhow::Error) {
     if let Some(required) = error.downcast_ref::<super::LoginRequired>() {
-        register(|| FixCommand::at_hub(&["login", "--hub", &required.hub], &required.hub, true));
+        register(|| required.fix());
     }
     register_terminal_api_error(error);
 }

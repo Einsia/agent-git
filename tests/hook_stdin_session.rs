@@ -751,6 +751,113 @@ fn assert_offline_adoption_hint(from_commit: bool) {
     assert_eq!(turn_subjects(&log), vec!["preserve offline work"]);
 }
 
+/// Re-importing a session describes its claim: a registration is about to be saved, a saved
+/// claim names its destination and how to settle later turns. The link file path is never
+/// offered as a next step. A message keyed only on "a link file exists" says "already adopted"
+/// for a registration nothing has saved.
+///
+/// A refused import restores the link it wrote, including removing it. The restore compares the
+/// link against the bytes the import wrote, so a rollback that rewrites them differently leaves
+/// a placeholder behind, which the last assertions catch.
+#[test]
+fn reimport_wording_follows_the_claim_state() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "keep this", "kept"));
+    lab.run(&["import", A, "--from", "claude-code", "--link-only"]);
+    let link_path = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{A}.json"));
+    let import = [
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@saved",
+        "--independent",
+    ];
+
+    let registered = lab.agit(&import).output().unwrap();
+    assert!(registered.status.success(), "{registered:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&registered.stdout),
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    assert!(
+        text.contains("was registered but not saved yet; this import saves it to me/qa@saved"),
+        "{text}"
+    );
+    assert!(!text.contains("already adopted"), "{text}");
+    assert!(!text.contains(&*link_path.to_string_lossy()), "{text}");
+
+    lab.append(A, &lab.turn(A, 2, "keep more", "kept more"));
+    let saved = lab.agit(&import).output().unwrap();
+    assert!(saved.status.success(), "{saved:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    assert!(text.contains("is already saved at me/qa@saved"), "{text}");
+    assert!(text.contains("`agit commit me/qa@saved`"), "{text}");
+    assert!(!text.contains(&*link_path.to_string_lossy()), "{text}");
+
+    // An import that cannot claim the branch leaves the other session's link as it found it:
+    // absent when there was none, byte for byte when a registration existed.
+    lab.append(B, &lab.turn(B, 1, "someone else", "refused"));
+    let other_link = link_path.with_file_name(format!("{B}.json"));
+    let onto_claimed = [
+        "import",
+        B,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@saved",
+        "--independent",
+        "-y",
+    ];
+    let refused = lab.agit(&onto_claimed).output().unwrap();
+    assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+    assert!(!other_link.exists());
+    lab.run(&["import", B, "--from", "claude-code", "--link-only"]);
+    let registration = std::fs::read(&other_link).unwrap();
+    let refused = lab.agit(&onto_claimed).output().unwrap();
+    assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+    assert_eq!(std::fs::read(&other_link).unwrap(), registration);
+}
+
+/// A session aimed at `main` is refused before anything is adopted or created, with the reason
+/// and a replacement in the caller's own `--into` spelling. Refusing only at settlement leaves a
+/// new repository and a session link behind.
+#[test]
+fn main_branch_target_is_refused_before_adoption() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "not for main", "ok"));
+    let before = lab.local_state();
+    let output = lab
+        .agit(&[
+            "import",
+            A,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@main",
+            "--independent",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("shared files"), "{stderr}");
+    assert!(stderr.contains("`--into me/qa@"), "{stderr}");
+    assert!(!stderr.contains("-b <"), "{stderr}");
+    assert!(!lab.agit_home.join("repos/me/qa").exists());
+    assert!(!lab.agit_home.join("store/claude-code").exists());
+    assert_eq!(lab.local_state(), before);
+}
+
 /// Inherited supervisor routing cannot make a runtime helper own the parent branch.
 #[test]
 fn supervised_start_hooks_leave_native_registration_to_the_supervisor() {

@@ -559,6 +559,12 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
     }
 
     let c = crate::hub::Client::from_env();
+    // A hook stays offline; a command run by hand first claims a sign-in the human approved.
+    let c = if quiet {
+        c
+    } else {
+        super::with_approved_sign_in(c)
+    };
     if !c.has_token() {
         if !quiet {
             ui::error(&format!(
@@ -568,9 +574,13 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
             ui::hint(
                 "a version names its author and repo paths need the account name — neither can be backfilled",
             );
-            ui::hint_with_fix("`agit login`", || {
-                super::fix::FixCommand::at_hub(&["login", "--hub", c.base()], c.base(), true)
-            });
+            let required = super::LoginRequired::new(c.base());
+            let next = if required.pending {
+                super::login::complete_hint(c.base())
+            } else {
+                "`agit login`".to_owned()
+            };
+            ui::hint_with_fix(&next, || required.fix());
         }
         return Ok(None);
     }
@@ -1428,11 +1438,15 @@ fn settle_local_telemetry_inner(
     let quiet = opts.quiet;
     if branch == "main" {
         if !quiet {
-            ui::error(&format!(
-                "cannot settle session turns onto `{branch}` — it is the shared file line"
-            ));
-            ui::hint(
-                "choose a session branch with `-b <branch>`; sessions must never land on main",
+            // `commit` has no destination flag; a claim moves to a session branch by importing
+            // the session there again.
+            super::import::refuse_main_branch(
+                "settle session turns onto",
+                &format!(
+                    "agit import {} --from {} --into {slug}@<session-branch> -y",
+                    ui::session::shell_arg(&lk.session_id),
+                    ui::session::shell_arg(&lk.source)
+                ),
             );
         }
         return Ok(ExitCode::Precondition);

@@ -547,7 +547,7 @@ impl Intent {
         };
         self.verify_remote(&remote)?;
         self.verify_write_access(client, &remote.identity.agent_id)?;
-        repo.set_remote(&remote.push_url)?;
+        super::point_origin(&repo, &checkout.slug(), &remote.push_url)?;
         Ok((repo, remote))
     }
 
