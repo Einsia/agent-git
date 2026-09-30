@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-09-30
+
 ### Added
 
 - `agit project bind` enrolls a selected directory and its unbound subdirectories
@@ -24,6 +26,22 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   keys, or protection rules invalidate the corresponding cached state.
 - Release builds optimize for runtime speed to reduce history projection and
   secret scanning latency.
+- Remote Control retries failed local session saves while idle, without requiring
+  another user turn to resume archiving.
+- Push uses authenticated remote history to avoid rescanning already-published
+  objects, while continuing to inspect new objects and their selected LFS payloads.
+  Use `--audit` when a complete history review is needed.
+- Native history reads take authenticated, bounded dictionary snapshots without
+  waiting for a dictionary writer. Conservative pattern filtering avoids scanning
+  history for secret patterns that cannot occur while preserving redaction rules.
+- Compatible Cloud servers can read native history through a scoped project
+  controller without opening a separate session controller. Project controllers
+  remain read-only and cannot subscribe to or change a conversation.
+- Completed RC turns retain durable archive jobs until protected publication has
+  a receipt. A daemon restart retries pending jobs without starting the model or
+  requiring a viewer to open the conversation.
+- Settlement subprocesses retry temporary executable-busy failures within a
+  bounded window while retaining the current authority lease.
 
 ## [0.2.13] - 2026-09-30
 
