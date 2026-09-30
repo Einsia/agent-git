@@ -267,6 +267,15 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     ) -> crate::Result<ProtectionReport> {
         let allowlist = local_allowlist(&records, global, unlocked.as_ref())?;
         let started = std::time::Instant::now();
+        let presence = view_only
+            .then(|| PatternPresence::from_jsonl(text))
+            .transpose()?
+            .flatten();
+        record_timing(
+            "dictionary_presence_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let started = std::time::Instant::now();
         // A finding larger than a reversible record cannot become a
         // placeholder, but that is a fact about *that* finding — it says
         // nothing about the registered secret three lines above it. Only
@@ -281,7 +290,12 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         let candidates = {
             let existing: HashSet<&str> = records
                 .iter()
-                .filter(|record| effective_protect(record))
+                .filter(|record| {
+                    presence
+                        .as_ref()
+                        .is_none_or(|presence| presence.may_contain(&record.secret))
+                        && effective_protect(record)
+                })
                 .map(|record| record.secret.as_str())
                 .collect();
             crate::domain::secrets::secret_candidates_jsonl(text, |candidate| {
@@ -311,6 +325,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             records,
             allowlist,
             record_timing,
+            presence.as_ref(),
         )?;
         state.view_only = view_only;
         record_timing(
@@ -569,12 +584,20 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     ) -> crate::Result<ProtectionReport> {
         let allowed = local_allowlist(&records, &Matcher::empty(), unlocked.as_ref())?;
         let generation = unlocked.as_ref().map_or(0, |value| value.file.generation);
+        let presence = if view_only {
+            PatternPresence::from_jsonl(text)?
+        } else {
+            None
+        };
         let registered = Matcher::build(
             generation,
             records
                 .iter()
                 .filter(|record| {
-                    registered_protect(record)
+                    presence
+                        .as_ref()
+                        .is_none_or(|presence| presence.may_contain(&record.secret))
+                        && registered_protect(record)
                         && !allowed.contains(record.secret.as_str())
                         && !crate::domain::secrets::rules::preset_allows(&record.secret)
                 })
@@ -1637,6 +1660,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             records,
             allowlist,
             &mut |_, _| {},
+            None,
         )
     }
 
@@ -1650,11 +1674,15 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         records: Vec<DecryptedRecord>,
         allowlist: LocalAllowlist,
         record_timing: &mut dyn FnMut(&'static str, f64),
+        presence: Option<&PatternPresence>,
     ) -> crate::Result<Self> {
         let started = std::time::Instant::now();
         let mut specs: Vec<PatternSpec> =
             Vec::with_capacity(records.len() + global.rules() + candidates.len());
         for record in &records {
+            if presence.is_some_and(|presence| !presence.may_contain(&record.secret)) {
+                continue;
+            }
             specs.push(PatternSpec {
                 secret: record.secret.as_str(),
                 record_id: Some(record.id.clone()),
@@ -1704,6 +1732,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         let mut sources = Vec::new();
         for spec in specs.into_iter().filter(|spec| {
             spec.active
+                && presence.is_none_or(|presence| presence.may_contain(spec.secret))
                 && !allowlist.contains(spec.secret)
                 && !crate::domain::secrets::rules::preset_allows(spec.secret)
         }) {
@@ -2538,6 +2567,54 @@ fn observation_fields(metadata: &mut crate::domain::meta::Meta) -> Vec<&mut Stri
         fields.extend(state.branch.iter_mut());
     }
     fields
+}
+
+struct PatternPresence {
+    windows: Vec<u8>,
+}
+
+impl PatternPresence {
+    const WINDOW_BITS: usize = 1 << 22;
+
+    fn window_bit(window: &[u8]) -> usize {
+        let value = u64::from_le_bytes(
+            window
+                .try_into()
+                .expect("a presence window has fixed width"),
+        );
+        ((value.wrapping_mul(0x9e3779b97f4a7c15) ^ value.rotate_left(17)) >> 42) as usize
+    }
+
+    fn from_jsonl(text: &str) -> crate::Result<Option<Self>> {
+        const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
+        if text.len() > MAX_INPUT_BYTES {
+            return Ok(None);
+        }
+        let mut windows = vec![0u8; Self::WINDOW_BITS / 8];
+        // Inspect the decoded keys and values that protection transforms, including raw chunks.
+        // A budget miss retains every pattern; it never treats an uninspected value as absent.
+        transform_jsonl_in(text, |value, _, _| {
+            for window in value.as_bytes().windows(8) {
+                let bit = Self::window_bit(window);
+                windows[bit / 8] |= 1 << (bit % 8);
+            }
+            Ok((value.to_owned(), 0))
+        })?;
+        Ok(Some(Self { windows }))
+    }
+
+    fn may_contain(&self, pattern: &str) -> bool {
+        // Missing windows prove absence; positives retain the complete pattern for exact matching.
+        if pattern.len() >= 8 {
+            for start in [0, pattern.len() / 2 - 4, pattern.len() - 8] {
+                let bit = Self::window_bit(&pattern.as_bytes()[start..start + 8]);
+                if self.windows[bit / 8] & (1 << (bit % 8)) == 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 fn transform_jsonl(
@@ -4360,6 +4437,53 @@ mod tests {
         assert_eq!(
             dictionary.hydrate_jsonl(&protected.text).unwrap().text,
             input
+        );
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn native_pattern_presence_preserves_decoded_keys_overlaps_and_budget_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let escaped = "quoted\"value\nwith-newline";
+        // Unicode is transcript data exercising decoded substring boundaries.
+        let overlapping = "prefixΩsuffix";
+        let global = Matcher::for_test(&[
+            ("escaped", escaped),
+            ("left", "prefixΩ"),
+            ("right", "Ωsuffix"),
+        ]);
+        let input = format!(
+            "{}\nraw observation {overlapping}\n",
+            serde_json::json!({escaped: [overlapping, {"value":escaped}]})
+        );
+        let expected = dictionary.protect_jsonl(&input, &global).unwrap().text;
+        let before = std::fs::read(&dictionary.store.path).unwrap();
+        let observed = dictionary
+            .protect_with_masks_snapshot_profiled(
+                &input,
+                &Matcher::empty(),
+                &[Default::default()],
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(observed.text, expected);
+        assert_eq!(std::fs::read(&dictionary.store.path).unwrap(), before);
+        let mut presence = PatternPresence::from_jsonl(&input).unwrap().unwrap();
+        assert!(presence.may_contain(escaped));
+        assert!(presence.may_contain("Ωsuffix"));
+        assert!(!presence.may_contain("absent-secret"));
+        presence.windows.fill(u8::MAX);
+        assert!(presence.may_contain("absent-secret"));
+        let oversized = serde_json::json!({"value":"x".repeat(4 * 1024 * 1024)}).to_string();
+        assert!(PatternPresence::from_jsonl(&oversized).unwrap().is_none());
+        let fields = serde_json::json!(vec!["field"; 4097]).to_string();
+        assert!(
+            PatternPresence::from_jsonl(&fields)
+                .unwrap()
+                .unwrap()
+                .may_contain("field")
         );
     }
 
