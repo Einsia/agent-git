@@ -300,7 +300,7 @@ tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "
 tempfile = "3"
 
 [profile.release]
-opt-level = "z"
+opt-level = 2
 lto = true
 strip = true
 

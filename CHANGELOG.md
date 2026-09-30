@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- Repeated Remote Control history reads reuse bounded, authenticated secret
+  dictionary records and compiled protection patterns. Changed ciphertext,
+  keys, or protection rules invalidate the corresponding cached state.
+- Release builds optimize for runtime speed to reduce history projection and
+  secret scanning latency.
+
 ## [0.2.13] - 2026-09-30
 
 ### Changed
