@@ -37,6 +37,7 @@
 //! advertised identity: keeping the original hash would hand the hub an offline
 //! oracle for guessing a low-entropy value. See [`projected_object_hash`].
 
+pub(crate) mod archive_recovery;
 mod background;
 mod landing;
 mod local_publication;
@@ -332,12 +333,7 @@ async fn guarded_output(
     let job = crate::rc::windows_job::Job::new().ok()?;
     #[cfg(windows)]
     crate::rc::windows_job::Job::configure(&mut command);
-    let child = command
-        .spawn()
-        .inspect_err(|error| {
-            tracing_note(&format!("could not start settlement subprocess: {error}"))
-        })
-        .ok()?;
+    let child = guarded_spawn(state, lease, &mut command).await?;
 
     #[cfg(windows)]
     let child = {
@@ -426,6 +422,51 @@ async fn guarded_output(
                     }
                 }
                 return settlement_lease_is_current(state, lease).then_some(output);
+            }
+        }
+    }
+}
+
+fn executable_is_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// An executable held open for writing has not started when exec rejects it.
+/// Retrying that refusal is bounded and requires the same current authority lease.
+async fn guarded_spawn(
+    state: &mut tokio::sync::watch::Receiver<SettlementState>,
+    lease: SettlementState,
+    command: &mut tokio::process::Command,
+) -> Option<tokio::process::Child> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if !settlement_lease_is_current(state, lease) {
+            return None;
+        }
+        match command.spawn() {
+            Ok(child) => return Some(child),
+            Err(error) if executable_is_busy(&error) && tokio::time::Instant::now() < deadline => {
+                tokio::select! {
+                    biased;
+                    changed = state.changed() => {
+                        if changed.is_err() || !settlement_lease_is_current(state, lease) {
+                            return None;
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                }
+            }
+            Err(error) => {
+                tracing_note(&format!("could not start settlement subprocess: {error}"));
+                return None;
             }
         }
     }
@@ -2838,6 +2879,18 @@ impl Session {
                 // consecutive polls bring no new line, or until the cap (waiting forever is not
                 // allowed — the harness may already be dead).
                 self.settle_transcript().await;
+                if self.settlement.borrow().local_owner
+                    && let Err(error) = self.retain_completed_archive(&turn_id)
+                {
+                    self.publication_retry.failed();
+                    tracing_note(&format!(
+                        "completed turn archive remains unrecorded: {error:#}"
+                    ));
+                    self.emit("commit.failed", serde_json::json!({
+                        "session_id": self.info.session_id,
+                        "error": "The completed turn could not be queued for archiving. Its native history remains on this device."
+                    })).await;
+                }
                 self.set_status(SessionStatus::Idle).await;
                 let error = match error {
                     Some(message) => {

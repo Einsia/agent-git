@@ -1137,6 +1137,15 @@ pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<boo
     Ok(in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some())
 }
 
+#[cfg(feature = "rc")]
+pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Result<Option<u64>> {
+    let adapter = crate::adapter::get(runtime)?;
+    let session = adapter.parse(text)?;
+    Ok(turn_chunks(text, &session, &adapter.open_tool_calls(text))
+        .last()
+        .map(|chunk| chunk.end_byte as u64))
+}
+
 /// Tell the user why the trailing turn is not in this settlement and when it will be.
 ///
 /// Saying so is required: `agit status` reports `in sync` and `agit push` publishes without

@@ -322,6 +322,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     sessions: [("session-1".to_string(), live)].into_iter().collect(),
                     latest_session_generations: HashMap::new(),
                     opening_sessions: HashMap::new(),
+                    archive_recovering: HashMap::new(),
                     watches: HashMap::new(),
                     terminals: HashMap::new(),
                     terminal_delivery_blockers: blockers,

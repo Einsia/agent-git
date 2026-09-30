@@ -72,6 +72,7 @@ pub(super) fn rpc_test_daemon(
         sessions,
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        archive_recovering: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),
         terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

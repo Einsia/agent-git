@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
+mod archive_recovery;
 /// The monotonic danger bit's tests plus its credential. **Every path that hands a harness
 /// transcript over has to collect a slip from here.**
 ///
@@ -1089,6 +1090,7 @@ pub struct Daemon {
     latest_session_generations: HashMap<String, u64>,
     /// Reserved logical and native identities remain exclusive while a harness opens.
     opening_sessions: HashMap<String, LaunchReservation>,
+    archive_recovering: HashMap<String, crate::rc::archive_jobs::Job>,
     /// Read-only watch (`session.watch`) tail tasks, registered by watch stream id.
     /// `info` is kept so `session.subscribe` can subscribe to a watch stream too (replaying its
     /// ring).

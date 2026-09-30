@@ -467,6 +467,10 @@ impl Daemon {
         };
         if self.sessions.contains_key(&info.session_id)
             || self.opening_sessions.contains_key(&info.session_id)
+            || self.archive_recovering.contains_key(&info.session_id)
+            || self.archive_recovering.values().any(|job| {
+                native_conflict(&job.runtime, job.native_source.as_ref(), Some(&job.native))
+            })
             || self.sessions.values().any(|live| {
                 native_conflict(
                     &live.info.runtime,

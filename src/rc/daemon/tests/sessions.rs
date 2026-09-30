@@ -2070,6 +2070,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         sessions: HashMap::new(),
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        archive_recovering: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),
         terminal_delivery_blockers: Default::default(),

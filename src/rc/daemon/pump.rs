@@ -45,6 +45,7 @@ impl Daemon {
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
             opening_sessions: HashMap::new(),
+            archive_recovering: HashMap::new(),
             watches: HashMap::new(),
             terminals: HashMap::new(),
             terminal_delivery_blockers: terminal_delivery_blockers.clone(),
@@ -261,6 +262,11 @@ impl Daemon {
         // worker may outlive the state coordinator it needs for finalization.
         let mut session_rpc_tasks = tokio::task::JoinSet::new();
         let (session_rpc_stop_tx, _) = tokio::sync::watch::channel(false);
+        let _archive_recovery = archive_recovery::start(
+            d.clone(),
+            admission.clone(),
+            session_rpc_stop_tx.subscribe(),
+        );
         let mut watch_rpc_queue = watch_rpc::WatchRpcQueue::default();
         let mut stopping = false;
         let mut shutdown_projection_tail: Option<ShutdownProjectionTail> = None;

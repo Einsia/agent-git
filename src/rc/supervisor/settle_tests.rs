@@ -15,6 +15,60 @@ fn exit(status: i32) -> std::process::Output {
         .unwrap()
 }
 
+/// Exec refusal while a writer holds the executable can recover without admitting
+/// a subprocess after its connection-scoped settlement authority has ended.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn busy_settlement_executable_retries_only_under_its_current_lease() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("settlement-child.sh");
+    let marker = dir.path().join("started");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\nprintf 'settled\\n'\nif [ -n \"$AGIT_BUSY_TEST_MARKER\" ]; then touch \"$AGIT_BUSY_TEST_MARKER\"; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+    let refused = tokio::process::Command::new(&exe).spawn().unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::ETXTBSY));
+    let lease = SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    };
+    let (state_tx, mut state) = tokio::sync::watch::channel(lease);
+    let mut command = tokio::process::Command::new(&exe);
+    command.env_remove("AGIT_BUSY_TEST_MARKER");
+    let mut running = Box::pin(guarded_output(&mut state, lease, command));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut running)
+            .await
+            .is_err(),
+        "a busy executable must remain eligible for a guarded startup retry"
+    );
+    drop(writer);
+    let output = running.await.expect("the executable became available");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"settled\n");
+
+    let writer = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+    let mut command = tokio::process::Command::new(&exe);
+    command.env("AGIT_BUSY_TEST_MARKER", &marker);
+    let mut running = Box::pin(guarded_output(&mut state, lease, command));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut running)
+            .await
+            .is_err()
+    );
+    state_tx.send_modify(|state| state.epoch += 1);
+    assert!(running.await.is_none());
+    drop(writer);
+    assert!(!marker.exists(), "revoked authority must prevent startup");
+}
+
 /// Successful no-ops and concurrent HEAD changes cannot establish settlement ownership.
 /// An unchanged HEAD is eligible only when that exact source commit is pending.
 #[cfg(unix)]

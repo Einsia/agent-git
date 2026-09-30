@@ -64,6 +64,7 @@
 //! *detected*, not silently lost. Controllers reconcile replay gaps against executor history.
 
 mod admission;
+pub(crate) mod archive_jobs;
 pub(crate) mod authority;
 pub mod build_identity;
 pub(crate) mod capture;

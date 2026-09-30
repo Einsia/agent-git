@@ -190,12 +190,18 @@ impl Session {
     }
 }
 
-fn result_receipt(
+pub(super) fn result_receipt(
     repo: &Repo,
     request: &SupervisorPushRequest,
     path: &std::path::Path,
 ) -> crate::Result<()> {
     let (selected, receipt) = request.read_managed_result(repo, path)?;
     // The durable record must agree with the verified child reply.
-    Entry::complete(repo, &selected, &receipt)
+    Entry::complete(repo, &selected, &receipt)?;
+    if let Err(error) = crate::rc::archive_jobs::publication_confirmed(repo, &selected) {
+        tracing_note(&format!(
+            "published archive cleanup remains pending: {error:#}"
+        ));
+    }
+    Ok(())
 }
