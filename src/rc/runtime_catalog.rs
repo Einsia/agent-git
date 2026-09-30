@@ -188,6 +188,7 @@ impl Catalog {
     }
 
     fn reconcile_at(&self, roots: &CanonicalRoots, now: i64) -> crate::Result<()> {
+        self.registry.retire_missing_temporary()?;
         let enrolled = self.registry.list()?;
         let mut connection = self.connection()?;
         let scope = serde_json::to_string(&**roots)?;
@@ -822,6 +823,49 @@ mod tests {
             125,
             "removal takes effect before the next background scan"
         );
+    }
+
+    #[test]
+    fn expired_temporary_sources_leave_healthy_conversations_complete_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = Registry::at(directory.path().join("registry")).unwrap();
+        let healthy_home = directory.path().join("healthy");
+        let _db = native_store(&healthy_home, &project, "model");
+        let healthy = registry.register(&healthy_home, None, None, None).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home/.codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let expired = registry.enroll_observed(&home, None).unwrap();
+        drop(temporary);
+        let path = directory.path().join("catalog");
+        let roots = CanonicalRoots::from_untrusted([project]);
+        let catalog = Catalog::at(registry.clone(), path.clone()).unwrap();
+        for now in 0..3 {
+            catalog.reconcile_at(&roots, now).unwrap();
+        }
+        drop(catalog);
+        let restarted = Catalog::at(registry.clone(), path).unwrap();
+        let page = restarted.list(&roots, &request(None)).unwrap();
+        assert!(page.complete);
+        assert_eq!(page.coverage.len(), 1);
+        assert_eq!(page.coverage[0].source_id, healthy.source_id);
+        assert_eq!(page.coverage[0].status, "ready");
+        assert!(!page.rows.is_empty());
+        assert!(
+            page.rows
+                .iter()
+                .all(|row| row.source_id == healthy.source_id)
+        );
+        let retired = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|source| source.source_id == expired.source_id)
+            .unwrap();
+        assert!(!retired.enabled);
+        assert!(healthy_home.join("state_1.sqlite").exists());
     }
 
     #[test]

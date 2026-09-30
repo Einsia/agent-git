@@ -10,6 +10,13 @@ const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
 const REGISTRY_FILE: &str = "sources.json";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Enrollment {
+    Automatic,
+    Explicit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
     volume: u64,
     file: u64,
@@ -42,9 +49,45 @@ pub struct RuntimeSource {
     pub socket: Option<PathBuf>,
     pub generation: u64,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrollment: Option<Enrollment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disabled_reason: Option<String>,
 }
 
 impl RuntimeSource {
+    fn is_missing_temporary(&self, principal: &str, temporary_roots: &[PathBuf]) -> bool {
+        if !self.enabled || self.runtime != "codex" || self.principal != principal {
+            return false;
+        }
+        let legacy = self.enrollment.is_none()
+            && self.socket.is_none()
+            && self
+                .home
+                .file_name()
+                .is_some_and(|name| name == self.name.as_str())
+            && matches!(
+                self.executable_origin.as_deref(),
+                Some("path" | "observed" | "launch")
+            );
+        if self.enrollment != Some(Enrollment::Automatic) && !legacy {
+            return false;
+        }
+        let temporary = temporary_roots.iter().any(|root| {
+            let Ok(relative) = self.home.strip_prefix(root) else {
+                return false;
+            };
+            let Some(first) = relative.components().next() else {
+                return false;
+            };
+            // Unknown provenance only expires a recognizable temporary-directory allocation.
+            !legacy || first.as_os_str().to_string_lossy().starts_with(".tmp")
+        });
+        temporary
+            && std::fs::metadata(&self.home)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }
+
     /// A copied store or replaced directory cannot inherit an existing control identity.
     pub fn validate(&self) -> crate::Result<()> {
         ensure!(self.enabled, "runtime source is disabled");
@@ -144,6 +187,53 @@ impl Registry {
         let mut state = self.read()?;
         state.discovery = Some(report);
         self.save(&state)
+    }
+
+    /// Retirement revokes discovery coordinates without deleting transcripts or stopping tasks.
+    pub(crate) fn retire_missing_temporary(&self) -> crate::Result<usize> {
+        let principal = principal()?;
+        let temporary_roots = vec![
+            std::env::temp_dir(),
+            #[cfg(unix)]
+            PathBuf::from("/tmp"),
+            #[cfg(unix)]
+            PathBuf::from("/var/tmp"),
+        ];
+        let temporary_roots = temporary_roots
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect::<Vec<_>>();
+        let candidates = self
+            .read()?
+            .sources
+            .into_iter()
+            .filter(|source| source.is_missing_temporary(&principal, &temporary_roots))
+            .map(|source| source.source_id)
+            .collect::<std::collections::HashSet<_>>();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let mut retired = 0;
+        for source in &mut state.sources {
+            // Recheck under the registry lock so explicit re-enrollment wins a discovery race.
+            if candidates.contains(&source.source_id)
+                && source.is_missing_temporary(&principal, &temporary_roots)
+            {
+                source.generation = source
+                    .generation
+                    .checked_add(1)
+                    .context("runtime source generation exhausted")?;
+                source.enabled = false;
+                source.disabled_reason = Some("missing_temporary_home".into());
+                retired += 1;
+            }
+        }
+        if retired > 0 {
+            self.save(&state)?;
+        }
+        Ok(retired)
     }
 
     pub(crate) fn enroll_observed(
@@ -310,6 +400,7 @@ impl Registry {
                     .checked_add(1)
                     .context("runtime source generation exhausted")?;
                 source.enabled = true;
+                source.disabled_reason = None;
                 if rename_requested {
                     source.name = name;
                 }
@@ -321,8 +412,10 @@ impl Registry {
                     source.socket = socket.map(Path::to_path_buf);
                 }
             }
+            let enrollment_changed = source.enrollment != Some(Enrollment::Explicit);
+            source.enrollment = Some(Enrollment::Explicit);
             let source = source.clone();
-            if changed {
+            if changed || enrollment_changed {
                 self.save(&state)?;
             }
             return Ok(source);
@@ -360,6 +453,12 @@ impl Registry {
             socket: socket.map(Path::to_path_buf),
             generation: 1,
             enabled: true,
+            enrollment: Some(if automatic {
+                Enrollment::Automatic
+            } else {
+                Enrollment::Explicit
+            }),
+            disabled_reason: None,
         };
         state.sources.push(source.clone());
         self.save(&state)?;
@@ -376,6 +475,7 @@ impl Registry {
             .context("unknown runtime source")?;
         if source.enabled {
             source.enabled = false;
+            source.disabled_reason = None;
             source.generation = source
                 .generation
                 .checked_add(1)
@@ -534,6 +634,61 @@ fn file_identity(path: &Path) -> crate::Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_retirement_preserves_explicit_sources_and_rejects_reused_coordinates() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::at(root.path().join("registry")).unwrap();
+        let allocated = tempfile::tempdir().unwrap();
+        let home = allocated.path().join("home/.codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let automatic = registry.enroll_observed(&home, None).unwrap();
+        let explicit_home = root.path().join("registered-home");
+        std::fs::create_dir(&explicit_home).unwrap();
+        let explicit = registry.register(&explicit_home, None, None, None).unwrap();
+        let legacy_home = allocated.path().join("legacy/.codex");
+        std::fs::create_dir_all(&legacy_home).unwrap();
+        let legacy = registry.enroll_observed(&legacy_home, None).unwrap();
+        let mut state = registry.read().unwrap();
+        state
+            .sources
+            .iter_mut()
+            .find(|row| row.source_id == legacy.source_id)
+            .unwrap()
+            .enrollment = None;
+        registry.save(&state).unwrap();
+        std::fs::rename(&explicit_home, root.path().join("offline-home")).unwrap();
+        drop(allocated);
+        assert_eq!(registry.retire_missing_temporary().unwrap(), 2);
+        assert_eq!(registry.retire_missing_temporary().unwrap(), 0);
+        let retired = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.source_id == automatic.source_id)
+            .unwrap();
+        assert!(!retired.enabled);
+        assert_eq!(retired.generation, automatic.generation + 1);
+        assert_eq!(
+            retired.disabled_reason.as_deref(),
+            Some("missing_temporary_home")
+        );
+        let retained = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.source_id == explicit.source_id)
+            .unwrap();
+        assert!(retained.enabled);
+        assert_eq!(retained.generation, explicit.generation);
+        std::fs::rename(root.path().join("offline-home"), &explicit_home).unwrap();
+        registry.resolve(&explicit.source_id).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(!registry.enroll_observed(&home, None).unwrap().enabled);
+        assert!(registry.resolve(&automatic.source_id).is_err());
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(home.parent().unwrap().parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn creation_time_availability_preserves_registered_source_identity() {

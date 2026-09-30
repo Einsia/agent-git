@@ -82,8 +82,23 @@ The worker also checks native processes every 15 seconds on Linux and macOS.
 Only processes owned by the executor's OS account are eligible. Inspection keeps
 the executable path and `CODEX_HOME` (or `HOME/.codex`), rechecks process identity,
 and discards other environment values and arguments. A discovered home remains
-registered after its process exits. Native startup hooks also enroll their home,
+registered after its process exits while the directory exists. Native startup hooks also enroll their home,
 including homes outside the profile and project directories.
+
+Before catalog reconciliation, the worker retires an automatically enrolled home
+under the operating system's temporary directory if filesystem metadata reports
+that the home no longer exists. Its registration remains visible in `sources list`
+with `enabled: false` and `disabled_reason: missing_temporary_home`; its source
+generation advances so stale controls cannot attach to reused coordinates. No
+native history is deleted and no running task is stopped. Registrations without
+enrollment provenance are eligible only when their unnamed, unpinned coordinates
+identify a recognizable `.tmp` allocation under a system temporary root.
+
+Explicit registrations, persistent directories and permission failures do not
+expire automatically. Unavailable persistent sources retain their registrations
+and retry in the background. Healthy sources remain usable independently. A
+manually removed or retired source stays disabled during automatic discovery;
+explicit re-registration is required before it can become active again.
 
 Profile discovery checks the OS user's home and bound project directories, plus
 their immediate children. A candidate must contain `sessions` and a native

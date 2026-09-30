@@ -22,9 +22,14 @@ pub(crate) fn discover(registry: &Registry, roots: &CanonicalRoots) -> crate::Re
     let mut process_status = process_complete;
     let mut homes = std::collections::HashSet::new();
     for coordinates in processes {
-        let Ok(home) = coordinates.home.canonicalize() else {
-            process_status = false;
-            continue;
+        let home = match coordinates.home.canonicalize() {
+            Ok(home) => home,
+            // Exited processes and deleted temporary stores are not inspection failures.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                process_status = false;
+                continue;
+            }
         };
         if homes.insert(home.clone())
             && registry
