@@ -218,8 +218,11 @@ impl Session {
             .expect("local settlement is present");
         match (&mut task.0).await {
             Ok(Some(result)) => self.finish_local_commit(context, result).await,
-            Ok(None) => {}
-            Err(error) => tracing_note(&format!("local settlement worker failed: {error}")),
+            Ok(None) => self.publication_retry.failed(),
+            Err(error) => {
+                self.publication_retry.failed();
+                tracing_note(&format!("local settlement worker failed: {error}"));
+            }
         }
         self.retry_unfinished_publication();
     }

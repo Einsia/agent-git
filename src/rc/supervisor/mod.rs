@@ -3215,6 +3215,9 @@ impl Session {
         if self.landed_thread.as_deref() != Some(thread_id.as_str())
             || !settlement_lease_is_current(&self.settlement, lease)
         {
+            if self.agit_session.is_some() {
+                self.publication_retry.failed();
+            }
             return deferred_command;
         }
         let Some(agit_session) = self.agit_session.clone() else {
@@ -3396,6 +3399,7 @@ impl Session {
         ) {
             Ok(candidate) => candidate,
             Err(reason) => {
+                self.publication_retry.failed();
                 if lease.local_owner {
                     let detail = format!(
                         "{reason}: {}",

@@ -2170,3 +2170,38 @@ async fn idle_publication_retry_pushes_the_pending_source_and_respects_live_auth
     assert!(!session.idle_settlement_ready());
     assert!(!fixture.receipt().exists());
 }
+
+/// A failed local archive must retry while idle without requiring another user turn.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_settlement_retries_a_failed_archive_before_publishing() {
+    let fixture = SettlementFixture::new(true);
+    let script = std::fs::read_to_string(&fixture.exe).unwrap();
+    std::fs::write(
+        &fixture.exe,
+        script.replace("commit)\n", "commit)\n    exit 7\n"),
+    )
+    .unwrap();
+    let (mut session, mut out, _notes, _authority, _lease) = fixture.session();
+    let before = fixture.head();
+    let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+    assert_eq!(fixture.head(), before);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.method() != method::COMMIT_SETTLED)
+    );
+    let retry = session
+        .publication_retry
+        .next
+        .expect("failed archival must retain an idle retry");
+    assert!(!session.idle_settlement_ready());
+    tokio::time::sleep_until(retry).await;
+    assert!(session.idle_settlement_ready());
+    std::fs::write(&fixture.exe, script).unwrap();
+    let settled =
+        only_settled_frame(settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await);
+    assert_ne!(settled.commit_sha, before);
+    assert_eq!(fixture.tracking(), settled.commit_sha);
+    assert!(!session.idle_settlement_ready());
+}
