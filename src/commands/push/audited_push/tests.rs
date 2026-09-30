@@ -548,3 +548,43 @@ fn prepared_copy_relocates_only_local_content_and_exact_source_claims() {
     );
     println!("{COMPLETE}");
 }
+
+#[test]
+fn audit_and_new_destinations_require_full_inspection() {
+    let mut destination = intent();
+    for (flags, incremental) in [
+        (vec![], true),
+        (vec!["--dry-run"], true),
+        (vec!["--audit"], false),
+        (vec!["--audit", "--dry-run"], false),
+    ] {
+        let mut argv = vec!["agit", "push", "me/qa@work"];
+        argv.extend(flags);
+        let cli = crate::commands::Cli::try_parse_from(argv).unwrap();
+        let crate::commands::Commands::Push(args) = cli.command.unwrap() else {
+            panic!("push command");
+        };
+        assert_eq!(
+            inspection_destination(&args, &destination)
+                .unwrap()
+                .is_some(),
+            incremental
+        );
+    }
+    let cli = crate::commands::Cli::try_parse_from(["agit", "push", "me/qa@work"]).unwrap();
+    let crate::commands::Commands::Push(args) = cli.command.unwrap() else {
+        panic!("push command");
+    };
+    destination.action = Action::Create;
+    assert!(
+        inspection_destination(&args, &destination)
+            .unwrap()
+            .is_none()
+    );
+    destination.action = Action::Copy(remote());
+    assert!(
+        inspection_destination(&args, &destination)
+            .unwrap()
+            .is_none()
+    );
+}

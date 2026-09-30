@@ -117,8 +117,15 @@ pub(super) fn run(
 
     let limits = secrets::ScanLimits::DEFAULT;
     let spinner = ui::spinner("inspecting ordinary outgoing history…");
-    let captured =
-        CapturedPublication::capture_with_lfs_recovery(&repo, &plan, limits.budget_bytes)?;
+    let baseline = inspection_destination(args, &intent)?;
+    let captured = CapturedPublication::capture_for_destination(
+        &repo,
+        &plan,
+        limits.budget_bytes,
+        baseline
+            .as_ref()
+            .map(|identity| (intent.url.as_str(), identity)),
+    )?;
     let inspected = apply_copy_policy(captured, &repo, &client, &intent)?.inspect(limits);
     spinner.finish_and_clear();
     emit_push_target(&checkout, branches, selection_source);

@@ -81,12 +81,26 @@ The CLI prints the destination, mode and selected refs, then requires confirmati
 Successful publication updates ordinary branch tracking and saves session receipts.
 No viewing key, generated projection or privacy strategy is requested.
 
-If a historical LFS payload is absent locally, push downloads it from the source
+For pointers in the inspection scope, if an LFS payload is absent locally, push downloads it from the source
 repository's pinned Hub identity into private inspection storage. Its size and
 hash are verified and its content is scanned even when the current version has
 deleted the file or the destination already stores it. Unavailable or corrupt
 content blocks publication; restore the original payload or retry when the source
 is available. This also applies to dry runs and separate destinations.
+
+Ordinary and encrypted pushes inspect objects absent from the destination's live
+advertised Git history. Encrypted pushes compute this scope after projection, using
+published object IDs. Local tracking refs and previous push receipts do not define
+this baseline. New commits, blobs and annotated tags are inspected, including files
+added and deleted between published tips. New pointer objects require verified LFS
+payloads even if the destination reports that it already has those payloads.
+
+First publication, an empty destination, a failed advertisement or an unverifiable
+baseline uses full inspection. Advertised objects unavailable locally cannot narrow
+the scope. Manual push, automatic push and dry runs share these rules. Use
+--audit for complete history and payload review. Incremental push does not recheck
+remote history when scanner rules change. No scan-result cache is kept across pushes;
+the Hub's receive policy remains authoritative.
 
 An unchanged ordinary push still performs authenticated receive advertisement.
 The Hub validates and registers existing native history that lacks committed

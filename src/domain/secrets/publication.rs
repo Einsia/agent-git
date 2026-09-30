@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::domain::lfs::{Pointer, inspection};
-use crate::domain::repo::{ObjectBody, Repo, publication::PublicationPlan};
+use crate::domain::repo::{ObjectBody, Repo};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -117,12 +117,12 @@ impl<'a> Inspector<'a> {
         }
     }
 
-    pub(crate) fn git(
+    pub(crate) fn git_scoped(
         &mut self,
         repo: &Repo,
-        plan: &PublicationPlan,
+        scope: &crate::domain::repo::publication::InspectionScope,
     ) -> Result<(), InspectionFailure> {
-        match self.git_inner(repo, plan) {
+        match self.git_inner(repo, scope) {
             Ok(()) => self.require_complete(),
             Err(error) if error.downcast_ref::<BudgetSpent>().is_some() => {
                 self.unscanned.over_budget = Some((
@@ -135,13 +135,19 @@ impl<'a> Inspector<'a> {
         }
     }
 
-    fn git_inner(&mut self, repo: &Repo, plan: &PublicationPlan) -> crate::Result<()> {
-        let commits = plan.commit_objects();
-        let tags = plan.tag_objects();
-        anyhow::ensure!(!commits.is_empty(), "prepared commit inventory is empty");
+    fn git_inner(
+        &mut self,
+        repo: &Repo,
+        scope: &crate::domain::repo::publication::InspectionScope,
+    ) -> crate::Result<()> {
+        let commits = &scope.commits;
+        let tags = &scope.tags;
+        if commits.is_empty() && tags.is_empty() {
+            return Ok(());
+        }
         checked_objects(repo, commits, Some("commit"))?;
         checked_objects(repo, tags, Some("tag"))?;
-        let history = HistorySelection::Snapshots(commits);
+        let history = HistorySelection::Incremental(commits, &scope.excluded);
         let reserved = self.remaining.min(TRUSTED_PROVENANCE_MAX_BYTES);
         let mut provenance = ProvenanceReadBudget {
             remaining: reserved,

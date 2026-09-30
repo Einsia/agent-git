@@ -5,7 +5,7 @@ mod execution;
 
 use super::{PreparedPayloadAvailability, PreparedPublication};
 use crate::domain::lfs::Pointer;
-use crate::domain::repo::{Repo, publication::PublicationPlan};
+use crate::domain::repo::{Repo, publication::InspectionScope};
 use crate::domain::secrets::publication::{CapturedPolicy, InspectionFailure, Inspector};
 use crate::domain::secrets::{ScanLimits, ScanReport, Unscanned};
 use crate::hub::git::frozen::CapturedPublication;
@@ -117,7 +117,7 @@ impl PreparedPublication {
         let (report, reason) = inspect_content(
             &self.publication.inspection_policy,
             &repo,
-            self.plan(),
+            &self.publication.scope,
             self.pointers(),
             limits,
             |pointer| match self.availability(pointer)? {
@@ -166,7 +166,7 @@ impl CapturedPublication {
         let (report, reason) = inspect_content(
             &self.git.inspection_policy,
             &repo,
-            self.plan(),
+            &self.git.scope,
             self.pointers(),
             limits,
             |pointer| {
@@ -266,7 +266,7 @@ impl BlockedContentInspection {
 fn inspect_content<R: Read>(
     policy: &Result<CapturedPolicy, InspectionFailure>,
     repo: &Repo,
-    plan: &PublicationPlan,
+    scope: &InspectionScope,
     pointers: &[Pointer],
     limits: ScanLimits,
     mut payload: impl FnMut(&Pointer) -> anyhow::Result<Option<R>>,
@@ -294,7 +294,7 @@ fn inspect_content<R: Read>(
     let mut binary_lfs = Vec::new();
     let mut remote_present = Vec::new();
     let result = (|| {
-        inspector.git(repo, plan)?;
+        inspector.git_scoped(repo, scope)?;
         for pointer in pointers {
             match payload(pointer).map_err(|_| InspectionFailure::Content)? {
                 None => remote_present.push(pointer.clone()),

@@ -2,7 +2,7 @@
 //!
 //! Selected session branches retain their ancestry. Generated commits and version tags live
 //! in isolated storage so native Git metadata and source objects cannot enter the outgoing pack.
-//! Ordinary and audited publication inspect the same frozen objects before confirmation.
+//! Ordinary publication inspects new objects; audit inspects the complete frozen history.
 
 mod audit;
 mod audit_report;

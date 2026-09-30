@@ -275,6 +275,20 @@ impl Step {
         }
     }
 
+    /// An empty live advertisement keeps inspection complete without publishing any refs.
+    fn inspection_refs(repository: &str, agent_id: &'static str) -> Self {
+        let service = "# service=git-upload-pack\n";
+        let mut step = Self::new(
+            &format!("GET /{repository}.git/info/refs?service=git-upload-pack"),
+            Reply::Git(
+                "application/x-git-upload-pack-advertisement",
+                format!("{:04x}{service}00000000", service.len() + 4),
+            ),
+        );
+        step.agent_id = agent_id;
+        step
+    }
+
     fn with_body(mut self, body: Value) -> Self {
         self.body = Some(body);
         self
@@ -476,6 +490,7 @@ fn dry_run_reads_destination_mode_without_pinning_or_publishing() {
                 Reply::Json(remote(&lab, "alice", AGENT_ID)),
             ),
             Step::new(&policy_get(), Reply::Status(404)),
+            Step::inspection_refs("alice/qa", AGENT_ID),
         ],
     );
     let output = lab.push("alice/qa", "human", true);
@@ -824,6 +839,7 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
                     Reply::Json(remote(&lab, "alice", AGENT_ID)),
                 ),
                 Step::new(&policy_get(), Reply::Status(404)),
+                Step::inspection_refs("alice/qa", AGENT_ID),
                 Step::new(
                     "GET /api/agents/alice/qa",
                     Reply::Json(remote(&lab, "alice", AGENT_ID)),
@@ -969,6 +985,7 @@ fn remote_declarations_enable_push_without_local_policy_state() {
                     &policy_get(),
                     Reply::Json(policy_view(1, vec![policy_decision(value, "active", 1)])),
                 ),
+                Step::inspection_refs("alice/qa", AGENT_ID),
                 Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
                 Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
                 Step::new(
@@ -1012,6 +1029,7 @@ fn old_hub_accepts_push_without_local_policy_state() {
         vec![
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new(&policy_get(), Reply::Status(404)),
+            Step::inspection_refs("alice/qa", AGENT_ID),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new(
@@ -1082,6 +1100,7 @@ fn separate_push_does_not_inherit_source_allowances() {
             &lab,
             vec![
                 Step::new("GET /api/agents/alice/copy", Reply::Json(destination)),
+                Step::inspection_refs("alice/copy", OTHER_ID),
                 Step::new(
                     &format!(
                         "GET /api/agents/alice/copy/secret-allowances?expected_agent_id={OTHER_ID}"
@@ -1160,6 +1179,7 @@ fn exact_declaration_sync_enables_ordinary_branch_and_tag_push_but_not_another_v
         vec![
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new(&policy_get(), Reply::Json(snapshot.clone())),
+            Step::inspection_refs("alice/qa", AGENT_ID),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new("GET /alice/qa.git/info/refs?service=git-receive-pack", Reply::Status(200)),
@@ -1196,6 +1216,7 @@ fn exact_declaration_sync_enables_ordinary_branch_and_tag_push_but_not_another_v
         vec![
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote)),
             Step::new(&policy_get(), Reply::Json(snapshot)),
+            Step::inspection_refs("alice/qa", AGENT_ID),
         ],
     );
     let output = lab.push("alice/qa", "json2", false);
@@ -1318,6 +1339,7 @@ fn exact_declaration_old_hub_requires_explicit_acceptance_each_time() {
         vec![
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new(&policy_get(), Reply::Status(404)),
+            Step::inspection_refs("alice/qa", AGENT_ID),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             Step::new("GET /api/agents/alice/qa", Reply::Json(remote.clone())),
             accepted_probe(),

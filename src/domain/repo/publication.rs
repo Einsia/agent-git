@@ -51,6 +51,90 @@ pub struct PublicationPlan {
     tag_objects: Vec<String>,
 }
 
+/// Inspection selection is independent of the complete publication and verification plan.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InspectionScope {
+    pub(crate) commits: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) excluded: BTreeSet<String>,
+}
+
+impl InspectionScope {
+    pub(crate) fn full(plan: &PublicationPlan) -> Self {
+        Self {
+            commits: plan.commit_objects.clone(),
+            tags: plan.tag_objects.clone(),
+            excluded: BTreeSet::new(),
+        }
+    }
+
+    /// Live advertised IDs are resolved in isolated storage so topology overlays cannot
+    /// define exclusions. Unavailable roots contribute no exclusions.
+    pub(crate) fn incremental(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        advertised: impl Iterator<Item = String>,
+    ) -> Result<Self> {
+        use std::io::{Seek, Write};
+        let advertised: BTreeSet<_> = advertised.collect();
+        ensure!(
+            advertised.len() <= MAX_REFS,
+            "advertised ref limit exceeded"
+        );
+        ensure!(
+            advertised.iter().all(|oid| valid_oid(oid)),
+            "invalid advertised object identity"
+        );
+        let mut roots = BTreeSet::new();
+        repo.git_cat_file_batch_check(advertised.iter().cloned().collect(), |oid, kind, _| {
+            ensure!(
+                advertised.contains(oid),
+                "unexpected baseline object identity"
+            );
+            if matches!(kind, "commit" | "tag") {
+                roots.insert(oid.to_owned());
+            }
+            Ok(())
+        })?;
+        if roots.is_empty() {
+            return Ok(Self::full(plan));
+        }
+        let mut input = tempfile::tempfile()?;
+        for root in roots {
+            writeln!(input, "{root}")?;
+        }
+        input.rewind()?;
+        let mut excluded = BTreeSet::new();
+        repo.git_stream_split_stdin_file(
+            &["rev-list", "--objects", "--no-object-names", "--stdin"],
+            input,
+            b'\n',
+            |record| {
+                let oid = std::str::from_utf8(record)?;
+                ensure!(valid_oid(oid), "invalid baseline object identity");
+                ensure!(excluded.len() < 1_000_000, "baseline object limit exceeded");
+                excluded.insert(oid.to_owned());
+                Ok(())
+            },
+        )?;
+        Ok(Self {
+            commits: plan
+                .commit_objects
+                .iter()
+                .filter(|oid| !excluded.contains(*oid))
+                .cloned()
+                .collect(),
+            tags: plan
+                .tag_objects
+                .iter()
+                .filter(|oid| !excluded.contains(*oid))
+                .cloned()
+                .collect(),
+            excluded,
+        })
+    }
+}
+
 impl PublicationPlan {
     /// Frozen branch roots, sorted by full ref name.
     pub fn heads(&self) -> &[FrozenRef] {

@@ -35,18 +35,6 @@ pub fn for_publication(
     frozen_commits(repo, plan.commit_objects())
 }
 
-/// The publication source has already validated the exact bare carrier.
-#[cfg(feature = "cli")]
-pub(crate) fn for_bare_publication(
-    repo: &Repo,
-    plan: &crate::domain::repo::publication::PublicationPlan,
-) -> Result<Vec<super::Pointer>> {
-    frozen_commits_in(
-        &repo.clone().exact_bare_root_inspection(),
-        plan.commit_objects(),
-    )
-}
-
 #[cfg(feature = "cli")]
 fn frozen_commits(repo: &Repo, commits: &[String]) -> Result<Vec<super::Pointer>> {
     frozen_commits_in(&repo.clone().exact_root_inspection(), commits)
@@ -105,10 +93,48 @@ fn frozen_commits_in(repo: &Repo, commits: &[String]) -> Result<Vec<super::Point
     )
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn for_inspection(
+    repo: &Repo,
+    scope: &crate::domain::repo::publication::InspectionScope,
+) -> Result<Vec<super::Pointer>> {
+    use std::io::{Seek, Write};
+    if scope.commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = tempfile::tempfile()?;
+    for commit in &scope.commits {
+        writeln!(input, "{commit}")?;
+    }
+    input.rewind()?;
+    read_pointers_excluding(
+        repo,
+        &[
+            "rev-list",
+            "--no-walk",
+            "--objects",
+            "--no-object-names",
+            "--filter=blob:limit=1024",
+            "--stdin",
+        ],
+        Some(input),
+        &scope.excluded,
+    )
+}
+
 fn read_pointers(
     repo: &Repo,
     args: &[&str],
     input: Option<std::fs::File>,
+) -> Result<Vec<super::Pointer>> {
+    read_pointers_excluding(repo, args, input, &Default::default())
+}
+
+fn read_pointers_excluding(
+    repo: &Repo,
+    args: &[&str],
+    input: Option<std::fs::File>,
+    excluded: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<super::Pointer>> {
     let mut pointers = std::collections::BTreeMap::new();
     let mut batch = Vec::new();
@@ -153,6 +179,9 @@ fn read_pointers(
             matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "invalid Git object identity during LFS inspection"
         );
+        if excluded.contains(oid) {
+            return Ok(());
+        }
         batch.push(oid.to_owned());
         if batch.len() == 256 {
             read(&mut batch, &mut pointers)?;

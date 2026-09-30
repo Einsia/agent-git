@@ -643,8 +643,6 @@ impl SettlementFixture {
             ),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         SettlementFixture {
             _dir: dir,
@@ -1196,6 +1194,11 @@ async fn unconfirmed_publication_keeps_the_source_pending_without_notification()
             "refusal fixture was not changed: {refusal}"
         );
         std::fs::write(&fixture.exe, modified).unwrap();
+        // A writable script handle must not turn a publication refusal into a spawn failure.
+        let _script_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.exe)
+            .unwrap();
         let (mut session, mut out, _notes, _tx, _lease) = fixture.session();
         let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
         assert!(

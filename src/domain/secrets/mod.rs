@@ -5065,18 +5065,43 @@ enum HistorySelection<'a> {
     Frozen(&'a [String]),
     #[cfg(feature = "cli")]
     Snapshots(&'a [String]),
+    #[cfg(feature = "cli")]
+    Incremental(&'a [String], &'a std::collections::BTreeSet<String>),
 }
 
 impl HistorySelection<'_> {
     fn is_snapshot(self) -> bool {
         #[cfg(feature = "cli")]
-        if matches!(self, Self::Snapshots(_)) {
+        if matches!(self, Self::Snapshots(_) | Self::Incremental(_, _)) {
             return true;
         }
         false
     }
 
     fn stream(
+        self,
+        repo: &crate::domain::repo::Repo,
+        arguments: &[&str],
+        on_record: impl FnMut(&[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        #[cfg(feature = "cli")]
+        if let Self::Incremental(roots, excluded) = self {
+            if roots.is_empty() {
+                return Ok(());
+            }
+            let mut on_record = on_record;
+            return Self::Snapshots(roots).stream_inner(repo, arguments, |record| {
+                let oid = record.split(|byte| *byte == b' ').next().unwrap_or(record);
+                if !excluded.contains(std::str::from_utf8(oid)?) {
+                    on_record(record)?;
+                }
+                Ok(())
+            });
+        }
+        self.stream_inner(repo, arguments, on_record)
+    }
+
+    fn stream_inner(
         self,
         repo: &crate::domain::repo::Repo,
         arguments: &[&str],
@@ -5098,7 +5123,9 @@ impl HistorySelection<'_> {
                 repo.git_stream_split(&arguments, b'\n', on_record)
             }
             #[cfg(feature = "cli")]
-            Self::Snapshots(_) => unreachable!("snapshots are normalized before streaming"),
+            Self::Snapshots(_) | Self::Incremental(_, _) => {
+                unreachable!("snapshots are normalized before streaming")
+            }
             Self::Frozen(roots) => {
                 use std::io::{Seek, Write};
 
@@ -5336,7 +5363,8 @@ fn scan_messages(
                     HistorySelection::Revisions(revisions) => revisions.join(" "),
                     HistorySelection::Frozen(_) => "frozen publication roots".into(),
                     #[cfg(feature = "cli")]
-                    HistorySelection::Snapshots(_) => "captured publication snapshots".into(),
+                    HistorySelection::Snapshots(_) | HistorySelection::Incremental(_, _) =>
+                        "captured publication snapshots".into(),
                 }
             )
         })?;
@@ -5416,7 +5444,7 @@ fn scan_messages(
                 HistorySelection::Revisions(revisions) => revisions.join(" "),
                 HistorySelection::Frozen(_) => "frozen publication roots".into(),
                     #[cfg(feature = "cli")]
-                    HistorySelection::Snapshots(_) => "captured publication snapshots".into(),
+                    HistorySelection::Snapshots(_) | HistorySelection::Incremental(_, _) => "captured publication snapshots".into(),
             }
         )
     })

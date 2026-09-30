@@ -282,7 +282,15 @@ pub(super) fn run(
     projected.verify_accepted_policy()?;
     let limits = secrets::ScanLimits::DEFAULT;
     let spinner = ui::spinner("inspecting privacy-projected outgoing history…");
-    let captured = CapturedPublication::capture_projected(&projected, limits.budget_bytes, &repo)?;
+    let baseline = inspection_destination(args, &intent)?;
+    let captured = CapturedPublication::capture_projected_for(
+        &projected,
+        limits.budget_bytes,
+        &repo,
+        baseline
+            .as_ref()
+            .map(|identity| (intent.url.as_str(), identity)),
+    )?;
     let captured = apply_copy_policy(captured, &repo, &client, &intent)?;
     let inspected = captured.inspect(limits);
     spinner.finish_and_clear();
@@ -574,6 +582,16 @@ fn apply_copy_policy(
         Action::Copy(_) => anyhow::bail!("a separate publication cannot promote its source"),
     };
     captured.with_copy_policy(repo, identities)
+}
+
+fn inspection_destination(args: &Args, intent: &Intent) -> Result<Option<RemoteIdentity>> {
+    if args.audit {
+        return Ok(None);
+    }
+    match &intent.action {
+        Action::Existing(remote) => Ok(Some(RemoteIdentity::new(&intent.hub, &remote.agent_id)?)),
+        Action::Create | Action::Copy(_) => Ok(None),
+    }
 }
 
 fn synchronize_declarations(

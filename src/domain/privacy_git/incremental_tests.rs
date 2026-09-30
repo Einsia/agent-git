@@ -64,11 +64,34 @@ fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index()
             &redactor,
         )
     };
+    let started = std::time::Instant::now();
     let initial = prepare().unwrap();
+    println!("initial projection preparation={:?}", started.elapsed());
     assert_eq!(initial.preparations, 1);
     let cache_root = initial.repo.root().to_path_buf();
+    let published = initial.plan.heads()[0].oid().to_owned();
+    let original = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let scope = crate::domain::repo::publication::InspectionScope::incremental(
+        &initial.repo.clone().exact_root_inspection(),
+        &initial.plan,
+        [original].into_iter(),
+    )
+    .unwrap();
+    assert_eq!(scope.commits, initial.plan.commit_objects());
+    let scope = crate::domain::repo::publication::InspectionScope::incremental(
+        &initial.repo.clone().exact_root_inspection(),
+        &initial.plan,
+        [published.clone()].into_iter(),
+    )
+    .unwrap();
+    assert!(scope.commits.is_empty());
     drop(initial);
-    assert_eq!(prepare().unwrap().preparations, 0);
+    let started = std::time::Instant::now();
+    let reused = prepare().unwrap();
+    println!("reused projection preparation={:?}", started.elapsed());
+    assert_eq!(reused.preparations, 0);
+    assert_eq!(reused.plan.heads()[0].oid(), published);
+    drop(reused);
 
     fs::write(&path, "CHANGED_FILE_BODY_NOT_COLLECTED").unwrap();
     assert_eq!(
@@ -99,6 +122,13 @@ fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index()
     registered.replace(new_rules);
     let changed = prepare().unwrap();
     assert_eq!(changed.preparations, 1);
+    let scope = crate::domain::repo::publication::InspectionScope::incremental(
+        &changed.repo.clone().exact_root_inspection(),
+        &changed.plan,
+        [published].into_iter(),
+    )
+    .unwrap();
+    assert_eq!(scope.commits, changed.plan.commit_objects());
     assert!(
         !changed
             .inspection_views
@@ -125,6 +155,33 @@ fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index()
             .any(|text| text.contains("SYNTHETIC_TOOL_BODY"))
     );
     drop(denied);
+
+    let previous = prepare().unwrap();
+    let published = previous.plan.heads()[0].oid().to_owned();
+    drop(previous);
+    let rotated_key = SecretKey::from([25; 32]);
+    let rotated_recipient = ViewingRecipient::from_base64(
+        "rotated-viewer".into(),
+        &STANDARD.encode(rotated_key.public_key().as_bytes()),
+    )
+    .unwrap();
+    let rotated = ProjectedHistory::prepare_with_redactor(
+        &source,
+        &["work".into()],
+        &rotated_recipient,
+        "https://hub.invalid/alice/cache",
+        &redactor,
+    )
+    .unwrap();
+    let scope = crate::domain::repo::publication::InspectionScope::incremental(
+        &rotated.repo.clone().exact_root_inspection(),
+        &rotated.plan,
+        [published].into_iter(),
+    )
+    .unwrap();
+    assert_eq!(scope.commits, rotated.plan.commit_objects());
+    drop(rotated);
+    drop(prepare().unwrap());
 
     let cache = cache_root.join(".git/privacy-preparation/index.enc");
     let mut bytes = fs::read(&cache).unwrap();

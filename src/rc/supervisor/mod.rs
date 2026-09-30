@@ -263,6 +263,27 @@ struct SettlementChild {
     repo_dir: PathBuf,
 }
 
+#[derive(Clone)]
+struct SettlementProgram {
+    exe: PathBuf,
+    #[cfg(all(test, unix))]
+    script: bool,
+}
+
+impl SettlementProgram {
+    fn command(&self) -> tokio::process::Command {
+        // Fixture scripts are input to the interpreter: writable script handles must not
+        // prevent settlement or landing from starting under concurrent test execution.
+        #[cfg(all(test, unix))]
+        if self.script {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg(&self.exe);
+            return command;
+        }
+        tokio::process::Command::new(&self.exe)
+    }
+}
+
 /// Which boundary this settlement runs on.
 ///
 /// The only difference is whether there is a next time after a failure: yielding is right on a
@@ -1377,8 +1398,8 @@ impl Session {
     }
 
     /// The executable for settlement and landing subprocesses. See [`SettlementChild`].
-    fn settlement_exe(&self) -> Option<PathBuf> {
-        match &self.settlement_child {
+    fn settlement_exe(&self) -> Option<SettlementProgram> {
+        let exe = match &self.settlement_child {
             Some(child) => Some(child.exe.clone()),
             None => {
                 // Pin subprocesses to the running daemon's executable inode.
@@ -1392,7 +1413,12 @@ impl Session {
                     std::env::current_exe().ok()
                 }
             }
-        }
+        }?;
+        Some(SettlementProgram {
+            exe,
+            #[cfg(all(test, unix))]
+            script: self.settlement_child.is_some(),
+        })
     }
 
     /// This session's repo directory on this machine. See [`SettlementChild`].
@@ -3242,7 +3268,7 @@ impl Session {
         let cwd = self.cwd.clone();
         let agit_session_env = agit_session.to_string();
         let command = |args: &[&str]| {
-            let mut command = tokio::process::Command::new(&exe);
+            let mut command = exe.command();
             command
                 .args(args)
                 .current_dir(&cwd)

@@ -540,3 +540,88 @@ fn supplied_client_never_adopts_a_login_changed_during_audit_for_availability_re
     assert_eq!(hub.finish().len(), 1);
     println!("{COMPLETE}");
 }
+
+/// Only the destination's live object graph can waive payload reads or content inspection.
+#[test]
+fn incremental_capture_uses_live_refs_and_keeps_new_pointer_validation() {
+    if !isolated("incremental_capture_uses_live_refs_and_keeps_new_pointer_validation") {
+        return;
+    }
+    use crate::hub::git::CapturedPublication;
+    use std::sync::{Arc, Mutex};
+    let home = IsolatedHome::new();
+    let advertised = Arc::new(Mutex::new(FAKE_OID.to_owned()));
+    let response = advertised.clone();
+    let hub = FakeHub::new(move |request| {
+        assert!(request.path.contains("service=git-upload-pack"));
+        let mut reply = advertisement();
+        reply.body = String::from_utf8(reply.body).unwrap()
+            .replace(FAKE_OID, &response.lock().unwrap()).into_bytes();
+        reply
+    });
+    let (repo, _, url, identity) = captured_source(&home, &hub.base);
+    let payload = b"historical payload for incremental publication";
+    let pointer = prepared_pointer(payload);
+    record_prepared_pointer(&repo, "payload.lfs", &pointer);
+    let cache = prepared_cache(&repo, &pointer, payload);
+    let plan = prepared_plan(&repo);
+    let target = Some((url.as_str(), &identity));
+    let started = std::time::Instant::now();
+    let first = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &plan, pointer.size, target).unwrap());
+    assert_eq!(first.captured().pointers(), std::slice::from_ref(&pointer));
+    println!("first capture and scan: {:?}, selected payload bytes: {}", started.elapsed(), pointer.size);
+    *advertised.lock().unwrap() = plan.heads()[0].oid().to_owned();
+    std::fs::remove_file(&cache).unwrap();
+    let started = std::time::Instant::now();
+    let repeated = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &plan, 0, target).unwrap());
+    assert!(repeated.captured().pointers().is_empty());
+    assert!(!repeated.has_findings());
+    println!("repeat capture and scan: {:?}, selected payload bytes: 0", started.elapsed());
+    assert!(CapturedPublication::capture(&repo, &plan, pointer.size).is_err());
+    let other_identity = RemoteIdentity::new(&identity.hub, "00000000-0000-0000-0000-000000000099").unwrap();
+    assert!(repeated.bind_destination(&repo, &url, &other_identity).is_err());
+
+    let secret = "AKIA4X7QZ2M5RT6VW3JH";
+    std::fs::write(repo.root().join("removed.txt"), secret).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Add unpublished content").unwrap();
+    repo.git(&["rm", "removed.txt"]).unwrap();
+    repo.commit("Remove unpublished content").unwrap();
+    let appended = prepared_plan(&repo);
+    let started = std::time::Instant::now();
+    let complete = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &appended, 0, target).unwrap());
+    assert!(complete.has_findings());
+    assert!(complete.captured().pointers().is_empty());
+    println!("append capture and scan: {:?}, selected payload bytes: 0", started.elapsed());
+
+    let old = plan.heads()[0].oid();
+    repo.git(&["tag", "-a", "new-tag", old, "-m", secret]).unwrap();
+    let tagged = prepared_plan(&repo);
+    let complete = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &tagged, 0, target).unwrap());
+    assert!(complete.report().scan().hits.iter().any(|hit| hit.source == crate::domain::secrets::Source::TagObject));
+    repo.git(&["tag", "-f", "-a", "new-tag", old, "-m", &format!("changed {secret}")]).unwrap();
+    let changed = prepared_plan(&repo);
+    assert!(complete.verify_source(&repo).is_err());
+    let changed = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &changed, 0, target).unwrap());
+    assert!(changed.report().scan().hits.iter().any(|hit| hit.source == crate::domain::secrets::Source::TagObject));
+
+    let text = std::fs::read_to_string(repo.root().join("payload.lfs")).unwrap();
+    std::fs::write(repo.root().join("new-pointer.lfs"), text.replace("git-lfs.github.com", "hawser.github.com")).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Reference an existing payload with a new pointer object").unwrap();
+    let new_pointer = prepared_plan(&repo);
+    assert!(CapturedPublication::capture_for_destination(&repo, &new_pointer, pointer.size, target).is_err());
+    prepared_cache(&repo, &pointer, b"corrupt payload");
+    assert!(CapturedPublication::capture_for_destination(&repo, &new_pointer, pointer.size, target).is_err());
+    prepared_cache(&repo, &pointer, payload);
+    let complete = captured_inspected(CapturedPublication::capture_for_destination(
+        &repo, &new_pointer, pointer.size, target).unwrap());
+    assert_eq!(complete.captured().pointers(), std::slice::from_ref(&pointer));
+    assert!(!hub.finish().is_empty());
+    println!("{COMPLETE}");
+}

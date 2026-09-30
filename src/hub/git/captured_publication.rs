@@ -1,8 +1,11 @@
-//! Content capture is independent of remote creation, transport binding and publication consent.
+//! Content capture precedes remote mutation and can use a bound live advertisement for inspection.
 
 use super::{FrozenPublication, PreparedPublication, Source, absolute_path, path_text};
 use crate::domain::lfs::Pointer;
-use crate::domain::repo::{Repo, publication::PublicationPlan};
+use crate::domain::repo::{
+    Repo,
+    publication::{InspectionScope, PublicationPlan},
+};
 use crate::domain::secrets::publication::{CapturedPolicy, InspectionFailure};
 use crate::hub::git::StagedLfsPayloads;
 use crate::hub::identity::RemoteIdentity;
@@ -16,11 +19,44 @@ pub(super) struct GitContent {
     pub(super) lfs_objects: std::result::Result<PathBuf, super::lfs_cache::Failure>,
     pub(super) inspection_policy: std::result::Result<CapturedPolicy, InspectionFailure>,
     pub(super) plan: PublicationPlan,
+    pub(super) scope: InspectionScope,
+    pub(super) baseline: Option<(String, RemoteIdentity)>,
     pub(super) lfs_inventory: Vec<Pointer>,
+}
+
+struct AdvertisedBaseline {
+    url: String,
+    identity: RemoteIdentity,
+    refs: crate::hub::git::RemoteRefs,
 }
 
 impl GitContent {
     pub(super) fn capture(source: &Source, plan: &PublicationPlan) -> Result<Self> {
+        Self::capture_for(source, plan, None)
+    }
+
+    fn capture_for(
+        source: &Source,
+        plan: &PublicationPlan,
+        target: Option<(&str, &RemoteIdentity)>,
+    ) -> Result<Self> {
+        let advertised = target.and_then(|(url, identity)| {
+            let refs =
+                FrozenPublication::advertised_refs_for(&Repo::at(&source.root), url, identity)?;
+            Some(AdvertisedBaseline {
+                url: url.into(),
+                identity: identity.clone(),
+                refs,
+            })
+        });
+        Self::capture_advertised(source, plan, advertised)
+    }
+
+    fn capture_advertised(
+        source: &Source,
+        plan: &PublicationPlan,
+        advertised: Option<AdvertisedBaseline>,
+    ) -> Result<Self> {
         let format = source.text(&["rev-parse", "--show-object-format"])?;
         ensure!(
             matches!(format.as_str(), "sha1" | "sha256"),
@@ -36,21 +72,32 @@ impl GitContent {
             "publication object store is not a directory"
         );
         let lfs_objects = super::lfs_cache::capture(source);
-        let repo = Repo::at(&source.root);
         let inspection_policy = Self::capture_policy(source);
-        let lfs_inventory = if source.gitdir == "." {
-            crate::domain::lfs::history::for_bare_publication(&repo, plan)?
-        } else {
-            crate::domain::lfs::history::for_publication(&repo, plan)?
-        };
         let directory = private_git_directory(&format)?;
         write_alternate(directory.path(), &objects)?;
+        let isolated = Repo::at(directory.path()).exact_bare_root_inspection();
+        let mut baseline = None;
+        let scope = advertised
+            .and_then(|advertised| {
+                let scope = InspectionScope::incremental(
+                    &isolated,
+                    plan,
+                    advertised.refs.refs.into_values(),
+                )
+                .ok()?;
+                baseline = Some((advertised.url, advertised.identity));
+                Some(scope)
+            })
+            .unwrap_or_else(|| InspectionScope::full(plan));
+        let lfs_inventory = crate::domain::lfs::history::for_inspection(&isolated, &scope)?;
         Ok(Self {
             directory,
             format,
             lfs_objects,
             inspection_policy,
             plan: plan.clone(),
+            scope,
+            baseline,
             lfs_inventory,
         })
     }
@@ -173,7 +220,22 @@ impl CapturedPublication {
         byte_budget: u64,
         policy_repo: &Repo,
     ) -> Result<Self> {
-        let mut captured = Self::capture(projected.repo(), projected.plan(), byte_budget)?;
+        Self::capture_projected_for(projected, byte_budget, policy_repo, None)
+    }
+
+    pub fn capture_projected_for(
+        projected: &crate::domain::privacy_git::ProjectedHistory,
+        byte_budget: u64,
+        policy_repo: &Repo,
+        target: Option<(&str, &RemoteIdentity)>,
+    ) -> Result<Self> {
+        let mut captured = Self::capture_inner(
+            projected.repo(),
+            projected.plan(),
+            byte_budget,
+            false,
+            target,
+        )?;
         captured.git.inspection_policy =
             CapturedPolicy::capture(&policy_repo.common_dir()?).map(|mut policy| {
                 policy.privacy_views = projected.inspection_views().clone();
@@ -185,7 +247,7 @@ impl CapturedPublication {
     /// Capture full selected history and stage every LFS pointer before contacting a destination.
     /// A remote-present payload needs the same verified local bytes as an absent payload.
     pub fn capture(repo: &Repo, plan: &PublicationPlan, byte_budget: u64) -> Result<Self> {
-        Self::capture_inner(repo, plan, byte_budget, false)
+        Self::capture_inner(repo, plan, byte_budget, false, None)
     }
 
     /// Missing historical payloads are read from the pinned source into private inspection storage.
@@ -195,7 +257,17 @@ impl CapturedPublication {
         plan: &PublicationPlan,
         byte_budget: u64,
     ) -> Result<Self> {
-        Self::capture_inner(repo, plan, byte_budget, true)
+        Self::capture_inner(repo, plan, byte_budget, true, None)
+    }
+
+    /// A verified existing destination permits incremental inspection; no target means full review.
+    pub fn capture_for_destination(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        byte_budget: u64,
+        target: Option<(&str, &RemoteIdentity)>,
+    ) -> Result<Self> {
+        Self::capture_inner(repo, plan, byte_budget, true, target)
     }
 
     fn capture_inner(
@@ -203,9 +275,21 @@ impl CapturedPublication {
         plan: &PublicationPlan,
         byte_budget: u64,
         recover_missing: bool,
+        target: Option<(&str, &RemoteIdentity)>,
     ) -> Result<Self> {
         let source = Source::new(repo)?;
-        let git = GitContent::capture(&source, plan)?;
+        let git = GitContent::capture_for(&source, plan, target)?;
+        Self::stage(repo, plan, byte_budget, recover_missing, source, git)
+    }
+
+    fn stage(
+        repo: &Repo,
+        plan: &PublicationPlan,
+        byte_budget: u64,
+        recover_missing: bool,
+        source: Source,
+        git: GitContent,
+    ) -> Result<Self> {
         git.write_refs()?;
         let staged = if git.lfs_inventory.is_empty() {
             None
@@ -342,6 +426,12 @@ impl CapturedPublication {
         client: Option<crate::hub::Client>,
     ) -> Result<PreparedPublication> {
         self.verify_source(repo)?;
+        if let Some((url, expected)) = &self.git.baseline {
+            ensure!(
+                url == canonical_url && expected == identity,
+                "inspection destination changed; inspect again before publishing"
+            );
+        }
         let Self {
             staged,
             git,
@@ -374,3 +464,7 @@ impl CapturedPublication {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "incremental_capture_tests.rs"]
+mod incremental_tests;

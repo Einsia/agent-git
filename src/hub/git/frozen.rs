@@ -51,6 +51,7 @@ pub struct FrozenPublication {
         crate::domain::secrets::publication::InspectionFailure,
     >,
     plan: PublicationPlan,
+    scope: crate::domain::repo::publication::InspectionScope,
     lfs_inventory: Vec<crate::domain::lfs::Pointer>,
     heads: Vec<Vec<FrozenRef>>,
     tags: Vec<Vec<FrozenRef>>,
@@ -192,6 +193,8 @@ impl FrozenPublication {
             inspection_policy,
             plan,
             lfs_inventory,
+            scope,
+            baseline: _,
         } = content;
         let lfs_url = format!("{}/info/lfs", url.trim_end_matches('/'));
         let batch_url = format!("{lfs_url}/objects/batch");
@@ -229,6 +232,7 @@ impl FrozenPublication {
             inspection_policy,
             plan,
             lfs_inventory,
+            scope,
             heads,
             tags,
         })

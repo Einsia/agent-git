@@ -20,7 +20,7 @@ pub(super) struct Landing {
     runtime: String,
     session_id: String,
     cwd: PathBuf,
-    exe: Option<PathBuf>,
+    exe: Option<SettlementProgram>,
 }
 
 impl Landing {
@@ -86,7 +86,7 @@ impl Landing {
             args.push("--local-owner".into());
         }
         let out = if let Some(exe) = self.exe.clone() {
-            let mut command = tokio::process::Command::new(exe);
+            let mut command = exe.command();
             command.args(&args).env(
                 crate::hub::identity::EXPECTED_AGENT_ID_ENV,
                 agit_session.agent_id(),

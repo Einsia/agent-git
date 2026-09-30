@@ -348,12 +348,29 @@ Push resolves the Hub identity and explicit mode before selecting a pipeline. A
 missing mode field is an unsupported backend, never an ordinary-mode fallback.
 An existing mode ignores creation defaults and cannot be changed by push flags.
 
-For an ordinary repository, push captures and inspects raw source ancestry, selected
+For an ordinary repository, push captures raw source ancestry, selected
 branches, `main`, reachable tags and LFS. Commit IDs and session identities remain
 unchanged. The command confirms the destination, sends the captured objects using
 ordinary Git/LFS receive, and retains ordinary receipts. It requests no viewing key
 or privacy strategy. An explicit first push can create this destination using
 `--encryption=false`; automatic publication requires an already confirmed destination.
+
+Default inspection excludes Git objects reachable from the actual destination's live
+advertised refs, using only roots available in the isolated local object store. It
+checks new commit and tag bodies, new blobs throughout unpublished history, and the
+verified bytes behind new LFS pointer objects. Remote LFS availability alone cannot
+waive payload inspection. The complete frozen plan still controls source verification
+and upload refs. The baseline is bound to the destination URL and immutable repository
+identity; a changed destination or source invalidates the inspection.
+
+First publication, empty or unavailable advertisements, and unverifiable baselines
+fall back to full inspection. Encrypted scope is computed after projection from the
+public object graph, so changed policy or key material that creates new objects is
+included. Manual, automatic and dry-run push share this behavior. --audit always
+reviews complete selected history and payloads. Default incremental push does not
+retroactively apply updated scanner rules to remote content, and retains no scan
+results across pushes. Server-side scanning policy is unchanged. See
+[incremental inspection](push-incremental-inspection.md) for scope details and local measurements.
 
 The following projection and key requirements apply to encrypted repositories.
 
@@ -364,7 +381,7 @@ share the same authoritative mode and destination as explicit push. Encrypted co
 additionally binds the policy and recipient; ordinary consent needs neither.
 
 Encrypted `agit push OWNER/REPO@BRANCH` and `push --audit` prepare this projected history and
-fetch the destination repository's current viewing public key. They inspect the complete generated object graph using
+fetch the destination repository's current viewing public key. They inspect the selected generated objects using
 the source repository's registered-secret rules. Ciphertext and generated identities are excluded
 from heuristic inspection only through generator-owned object IDs; public messages and metadata remain scanned. Existing cache entries must reproduce the generated tree,
 parents, authorship and message before reuse.
