@@ -730,8 +730,19 @@ pub(crate) fn identity_log_at(
     layout: LayoutVersion,
     maximum: usize,
 ) -> Result<String> {
+    identity_log_at_profiled(repo_root, commit, layout, maximum, &mut |_, _| {})
+}
+
+pub(crate) fn identity_log_at_profiled(
+    repo_root: &Path,
+    commit: &str,
+    layout: LayoutVersion,
+    maximum: usize,
+    record_timing: &mut dyn FnMut(&'static str, f64),
+) -> Result<String> {
     immutable_local_oid(commit)?;
     let policy = ReadPolicy::LocalOnly;
+    let started = std::time::Instant::now();
     let bytes = git_blob_with_policy(
         repo_root,
         commit,
@@ -740,6 +751,10 @@ pub(crate) fn identity_log_at(
         policy,
     )?;
     let text = String::from_utf8(bytes).context("identity evidence LOG is not UTF-8")?;
+    record_timing(
+        "identity_seed_sequence_ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
     if layout == LayoutVersion::V0 {
         let canonical = canonical_v0(&text)?;
         anyhow::ensure!(
@@ -751,7 +766,7 @@ pub(crate) fn identity_log_at(
     let ids = parse_sequence(&text)?;
     #[cfg(feature = "cli")]
     if let Some(snapshot) = native::Snapshot::open(repo_root, commit)
-        && let Ok(text) = snapshot.materialize_bounded(&ids, maximum)
+        && let Ok(text) = snapshot.materialize_bounded_profiled(&ids, maximum, record_timing)
     {
         return Ok(text);
     }
@@ -769,6 +784,33 @@ pub(crate) fn identity_log_at(
         },
     )
     .map(|(log, _)| log)
+}
+
+/// Native visitors validate the full sequence before their caller accepts any provisional evidence.
+#[cfg(feature = "cli")]
+pub(crate) fn visit_native_identity_log_at(
+    repo_root: &Path,
+    commit: &str,
+    layout: LayoutVersion,
+    maximum: usize,
+    visit: impl FnMut(&Envelope) -> Result<()>,
+    record_timing: &mut dyn FnMut(&'static str, f64),
+) -> Option<Result<usize>> {
+    if layout != LayoutVersion::V1 {
+        return None;
+    }
+    let snapshot = native::Snapshot::open(repo_root, commit)?;
+    Some((|| {
+        immutable_local_oid(commit)?;
+        let started = std::time::Instant::now();
+        let sequence = snapshot.blob(meta::LOG_FILE, maximum)?;
+        let ids = parse_sequence(std::str::from_utf8(&sequence)?)?;
+        record_timing(
+            "identity_seed_sequence_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        snapshot.visit_envelopes_bounded(&ids, maximum, visit, record_timing)
+    })())
 }
 
 /// Read saved history from a validated immutable snapshot without consulting VIEW or fetching.
@@ -3479,6 +3521,39 @@ mod tests {
                 log
             );
             assert!(identity_log_at(&linked, &commit, LayoutVersion::V1, log.len() - 1).is_err());
+            let mut visited = String::new();
+            let bytes = visit_native_identity_log_at(
+                &linked,
+                &commit,
+                LayoutVersion::V1,
+                log.len(),
+                |envelope| {
+                    visited.push_str(&envelope_line(envelope));
+                    Ok(())
+                },
+                &mut |_, _| {},
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(bytes, log.len());
+            assert_eq!(visited, log);
+            let mut visits = 0;
+            assert!(
+                visit_native_identity_log_at(
+                    &linked,
+                    &commit,
+                    LayoutVersion::V1,
+                    log.len() - 1,
+                    |_| {
+                        visits += 1;
+                        Ok(())
+                    },
+                    &mut |_, _| {},
+                )
+                .unwrap()
+                .is_err()
+            );
+            assert_eq!(visits, 0);
             assert_eq!(
                 materialize_at(&linked, &commit, meta::LOG_FILE).unwrap(),
                 log
@@ -3505,6 +3580,18 @@ mod tests {
             );
             assert!(materialize_at(dir.path(), &corrupt, meta::LOG_FILE).is_err());
             assert!(identity_log_at(dir.path(), &corrupt, LayoutVersion::V1, log.len()).is_err());
+            assert!(
+                visit_native_identity_log_at(
+                    dir.path(),
+                    &corrupt,
+                    LayoutVersion::V1,
+                    log.len(),
+                    |_| Ok(()),
+                    &mut |_, _| {},
+                )
+                .unwrap()
+                .is_err()
+            );
         }
     }
 

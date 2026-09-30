@@ -2541,11 +2541,13 @@ pub(crate) fn seed_native_evidence(
     runtime: &str,
     native: &str,
     evidence: &mut identity::Evidence,
+    record_timing: &mut dyn FnMut(&'static str, f64),
 ) -> crate::Result<()> {
     if native.is_empty() {
         return Ok(());
     }
     let mut roots = Vec::new();
+    let started = std::time::Instant::now();
     repo.git_stream_split(
         &["for-each-ref", "--format=%(objectname)", "refs/heads"],
         b'\n',
@@ -2558,11 +2560,16 @@ pub(crate) fn seed_native_evidence(
             Ok(())
         },
     )?;
+    record_timing(
+        "identity_seed_refs_ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
     let specs: Vec<_> = roots
         .iter()
         .map(|root| format!("{root}:{}", crate::domain::meta::FILE))
         .collect();
     let mut budget = ProvenanceReadBudget::new();
+    let started = std::time::Instant::now();
     let mut matching: Vec<_> = roots
         .into_iter()
         .zip(read_trusted_meta_batch(repo, &specs, &mut budget))
@@ -2573,6 +2580,10 @@ pub(crate) fn seed_native_evidence(
             .map(|meta| (root, meta))
         })
         .collect();
+    record_timing(
+        "identity_seed_metadata_ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
     matching.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.turn));
     let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
     let mut sessions = HashSet::new();
@@ -2582,6 +2593,7 @@ pub(crate) fn seed_native_evidence(
             continue;
         }
         let alias = meta.cwd.clone();
+        let started = std::time::Instant::now();
         dictionary.hydrate_metadata_readonly(&mut meta)?;
         if meta.cwd_is_agent_repository
             || Path::new(&meta.cwd)
@@ -2592,22 +2604,68 @@ pub(crate) fn seed_native_evidence(
         {
             evidence.add_cwd_alias(&alias);
         }
+        record_timing(
+            "identity_seed_cwd_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         let maximum = remaining.min(budget.remaining as usize);
-        let Ok(saved) =
-            crate::domain::storage::identity_log_at(repo.root(), &root, meta.layout, maximum)
-        else {
+        let started = std::time::Instant::now();
+        #[cfg(feature = "cli")]
+        {
+            let mut provisional = evidence.clone();
+            if let Some(Ok(bytes)) = crate::domain::storage::visit_native_identity_log_at(
+                repo.root(),
+                &root,
+                meta.layout,
+                maximum,
+                |envelope| {
+                    if envelope.session_id == meta.session && envelope.source == runtime {
+                        provisional.record(runtime, native, &envelope.content);
+                    }
+                    Ok(())
+                },
+                record_timing,
+            ) {
+                record_timing(
+                    "identity_seed_log_ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                remaining = remaining.saturating_sub(bytes);
+                if !budget.reserve(bytes as u64) {
+                    break;
+                }
+                *evidence = provisional;
+                continue;
+            }
+        }
+        let Ok(saved) = crate::domain::storage::identity_log_at_profiled(
+            repo.root(),
+            &root,
+            meta.layout,
+            maximum,
+            record_timing,
+        ) else {
             continue;
         };
+        record_timing(
+            "identity_seed_log_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         remaining = remaining.saturating_sub(saved.len());
         if !budget.reserve(saved.len() as u64) {
             break;
         }
+        let started = std::time::Instant::now();
         for line in saved.split_inclusive('\n') {
             let envelope = crate::domain::storage::parse_envelope_line(line)?;
             if envelope.session_id == meta.session && envelope.source == runtime {
                 evidence.record(runtime, native, &envelope.content);
             }
         }
+        record_timing(
+            "identity_seed_records_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
     }
     Ok(())
 }

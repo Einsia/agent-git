@@ -44,6 +44,7 @@ struct Operation {
 }
 
 /// Evidence is replayable from saved native records; it is never a global value allowlist.
+#[derive(Clone)]
 pub(crate) struct Evidence {
     agent: Repo,
     cwd: PathBuf,
@@ -87,9 +88,19 @@ impl Evidence {
 
     #[cfg(feature = "secret-vault")]
     pub(crate) fn seed_native(&mut self, runtime: &str, native: &str) -> crate::Result<()> {
+        self.seed_native_profiled(runtime, native, &mut |_, _| {})
+    }
+
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn seed_native_profiled(
+        &mut self,
+        runtime: &str,
+        native: &str,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> crate::Result<()> {
         let repo = Repo::at(self.agent.root()).local_objects_only();
         let cwd = self.cwd.clone();
-        super::seed_native_evidence(&repo, &cwd, runtime, native, self)
+        super::seed_native_evidence(&repo, &cwd, runtime, native, self, record_timing)
     }
 
     /// A text delta has no typed result field. Delay possible object identities until its native record.
@@ -740,5 +751,64 @@ mod tests {
             line,
             &candidates(line).next().unwrap()
         ));
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn corrupt_saved_events_cannot_leave_partial_native_identity_proofs() {
+        use crate::domain::{
+            storage,
+            transcript::{self, Envelope},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "identity object"])
+            .unwrap();
+        let oid = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let session = "agit-1111111111111111111111111111111111111111";
+        let native = "d30bc5c5-8532-49f2-8505-b155dd31a139";
+        let command = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call", "name":"exec_command", "call_id":"identity-call",
+            "arguments":serde_json::json!({"cmd":"git rev-parse HEAD"}).to_string()}});
+        let output = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call_output", "call_id":"identity-call", "output":oid}});
+        let tail = serde_json::json!({"type":"event_msg", "payload":{"type":"turn_complete"}});
+        let line = |content: Value| {
+            storage::envelope_line(&Envelope {
+                session_id: session.into(),
+                source: "codex".into(),
+                object_hash: transcript::object_hash(&content),
+                content,
+            })
+        };
+        let tail = line(tail);
+        let log = format!("{}{}{tail}", line(command), line(output));
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        let mut metadata = meta::Meta::new(
+            session.into(),
+            "codex".into(),
+            repo.root().display().to_string(),
+        );
+        metadata.runtime_instances.push(native.into());
+        meta::write(repo.root(), &metadata).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("saved identity evidence").unwrap();
+        let narrative = serde_json::json!({"type":"response_item", "payload":{
+            "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":format!("Commit {oid}")}]}});
+        let mut valid = Evidence::new(&repo, repo.root());
+        valid.seed_native("codex", native).unwrap();
+        assert!(!valid.record("codex", native, &narrative).0.is_empty());
+
+        let event = meta::event_path(&storage::event_id(&tail).unwrap()).unwrap();
+        std::fs::write(
+            repo.root().join(event),
+            line(serde_json::json!({"changed":true})),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("invalid saved event").unwrap();
+        let mut rejected = Evidence::new(&repo, repo.root());
+        rejected.seed_native("codex", native).unwrap();
+        assert!(rejected.record("codex", native, &narrative).0.is_empty());
     }
 }

@@ -154,6 +154,8 @@ pub struct Redactor {
     dictionary: Option<Arc<crate::domain::secret_filter::RepositoryDictionary>>,
     #[cfg(feature = "rc")]
     native: Option<Arc<std::sync::Mutex<NativeProtection>>>,
+    #[cfg(feature = "rc")]
+    readonly_history: bool,
 }
 
 #[cfg(feature = "rc")]
@@ -276,6 +278,8 @@ impl Redactor {
             dictionary: None,
             #[cfg(feature = "rc")]
             native: None,
+            #[cfg(feature = "rc")]
+            readonly_history: false,
         }
     }
 
@@ -283,6 +287,13 @@ impl Redactor {
     #[cfg(feature = "rc")]
     pub(crate) fn for_device_control(mut self) -> Self {
         self.preserve_device_identity = true;
+        self
+    }
+
+    /// A history page cannot wait for dictionary writes performed by a running session.
+    #[cfg(feature = "rc")]
+    pub(crate) fn for_readonly_history(mut self) -> Self {
+        self.readonly_history = true;
         self
     }
 
@@ -474,7 +485,7 @@ impl Redactor {
                     .map(|source| source.session_ref(&session))
                     .unwrap_or_else(|| session.clone());
                 if let Some(evidence) = &mut native.evidence {
-                    evidence.seed_native(&runtime, &instance)?;
+                    evidence.seed_native_profiled(&runtime, &instance, record_timing)?;
                 }
                 native.seeded = true;
             }
@@ -536,17 +547,26 @@ impl Redactor {
                     input.push_str(&serde_json::to_string(value)?);
                     input.push('\n');
                 }
-                let mut index = range.start;
-                let protected = dictionary.protect_with_masks_profiled(
-                    &input,
-                    &registered,
-                    |_| {
-                        let mask = masks[index].clone();
-                        index += 1;
-                        mask
-                    },
-                    record_timing,
-                )?;
+                let protected = if self.readonly_history {
+                    dictionary.protect_with_masks_snapshot_profiled(
+                        &input,
+                        &registered,
+                        &masks[range.clone()],
+                        record_timing,
+                    )?
+                } else {
+                    let mut mask_index = range.start;
+                    dictionary.protect_with_masks_profiled(
+                        &input,
+                        &registered,
+                        |_| {
+                            let mask = masks[mask_index].clone();
+                            mask_index += 1;
+                            mask
+                        },
+                        record_timing,
+                    )?
+                };
                 anyhow::ensure!(
                     protected.intact == 0,
                     "native page exceeds its reversible protection limit"
@@ -557,7 +577,7 @@ impl Redactor {
                     .map(serde_json::from_str)
                     .collect::<Result<_, _>>()?;
                 anyhow::ensure!(
-                    index == range.end && values.len() == range.len(),
+                    values.len() == range.len(),
                     "native protection changed record boundaries"
                 );
                 values
@@ -581,6 +601,14 @@ impl Redactor {
             let protected = protect(0..records.len());
             let result = match protected {
                 Ok(values) => Ok(values),
+                Err(error)
+                    if self.readonly_history
+                        && error
+                            .is::<crate::domain::secret_filter::NativeHistoryPolicyUnavailable>(
+                            ) =>
+                {
+                    Err(error)
+                }
                 Err(batch_error) => {
                     let mut values = Vec::with_capacity(records.len());
                     let mut first_failure = None;

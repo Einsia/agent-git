@@ -28,6 +28,8 @@ mod decoded_records;
 mod os_keychain;
 mod protection_matcher;
 mod repository;
+#[cfg(feature = "rc")]
+pub(crate) use repository::NativeHistoryPolicyUnavailable;
 mod repository_sync;
 pub use repository_sync::{PolicySyncConflict, RepositoryPolicyTransport};
 mod repository_keys;

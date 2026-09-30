@@ -54,12 +54,24 @@ impl Snapshot {
     }
 
     pub(super) fn materialize_bounded(&self, ids: &[String], maximum: usize) -> Result<String> {
+        self.materialize_bounded_profiled(ids, maximum, &mut |_, _| {})
+    }
+
+    pub(super) fn materialize_bounded_profiled(
+        &self,
+        ids: &[String],
+        maximum: usize,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> Result<String> {
         let objects = RefCell::new(Vec::new());
-        materialize_ids_with_limits(
+        let timings = RefCell::new(record_timing);
+        let started = std::time::Instant::now();
+        let result = materialize_ids_with_limits(
             ids,
             MAX_EVENT_BYTES.min(maximum),
             maximum,
             |unique| {
+                let started = std::time::Instant::now();
                 let mut sizes = Vec::with_capacity(unique.len());
                 let mut objects = objects.borrow_mut();
                 for id in unique {
@@ -67,9 +79,14 @@ impl Snapshot {
                     objects.push(object);
                     sizes.push(size);
                 }
+                timings.borrow_mut()(
+                    "identity_seed_native_headers_ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 Ok(sizes)
             },
             |_, sizes, offsets, output| {
+                let started = std::time::Instant::now();
                 for ((object, size), offset) in objects.borrow().iter().zip(sizes).zip(offsets) {
                     let blob = self.objects.find_blob(*object)?;
                     anyhow::ensure!(blob.data.len() == *size, "snapshot event size mismatch");
@@ -81,8 +98,65 @@ impl Snapshot {
                         .context("event output range is out of bounds")?
                         .copy_from_slice(&blob.data);
                 }
+                timings.borrow_mut()(
+                    "identity_seed_native_read_ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 Ok(())
             },
-        )
+        );
+        timings.borrow_mut()(
+            "identity_seed_native_materialize_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
+    }
+
+    /// The visitor's effects are provisional until every event validates successfully.
+    pub(super) fn visit_envelopes_bounded(
+        &self,
+        ids: &[String],
+        maximum: usize,
+        mut visit: impl FnMut(&super::Envelope) -> Result<()>,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let (unique, indexes) = super::index_unique_ids(ids)?;
+        let mut objects = Vec::with_capacity(unique.len());
+        let mut sizes = Vec::with_capacity(unique.len());
+        for id in &unique {
+            let (object, size) = self.blob_header(&meta::event_path(id)?)?;
+            objects.push(object);
+            sizes.push(size);
+        }
+        super::validate_event_sizes(&unique, &sizes, maximum.min(MAX_EVENT_BYTES))?;
+        let bytes = super::expanded_sequence_size(ids, &indexes, &sizes, maximum)?;
+        record_timing(
+            "identity_seed_native_headers_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let started = std::time::Instant::now();
+        for id in ids {
+            let index = indexes[id.as_str()];
+            let blob = self.objects.find_blob(objects[index])?;
+            anyhow::ensure!(
+                blob.data.len() == sizes[index],
+                "snapshot event size mismatch"
+            );
+            let line = std::str::from_utf8(&blob.data).context("identity event is not UTF-8")?;
+            let envelope = super::parse_envelope_line(line)?;
+            use sha2::{Digest, Sha256};
+            let actual = hex::encode(Sha256::digest(line.as_bytes()));
+            anyhow::ensure!(
+                &actual[..meta::EVENT_ID_HEX_LEN] == id,
+                "identity event id mismatch"
+            );
+            visit(&envelope)?;
+        }
+        record_timing(
+            "identity_seed_native_visit_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(bytes)
     }
 }

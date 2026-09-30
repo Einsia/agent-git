@@ -38,6 +38,25 @@ Archive storage uses the existing standard layout: `session/meta.json`, `LOG`,
 before standard envelope construction. Display items, truncated tool previews,
 and conversation-only history cannot reconstruct a resumable archive.
 
+## Native history privacy projection
+
+Reading a Codex or Claude native history page does not acquire the dictionary's
+writer lock or register new values. The reader authenticates a bounded dictionary
+snapshot and rechecks current key access and complete ciphertext before returning
+the page. Concurrent dictionary changes require a bounded retry; unavailable
+policy withholds content rather than repeatedly inspecting individual records.
+
+Existing reversible mappings retain their standard Agit placeholders. A newly
+discovered sensitive value receives a display-only "[redacted:secret]" marker.
+These markers are not capture input, repository records, or a separate cache.
+Standard settlement still registers durable reversible mappings before archive
+publication. Native identities remain occurrence-scoped, and current explicit
+protection rules override native identity evidence.
+
+Compiled matchers reuse only identical ordered pattern prefixes after the current
+policy has selected active values. Overlaps across matcher segments retain current
+pattern indices and the ordering required by connected-region projection.
+
 ## Durable turn boundaries
 
 The executor records a pending capture before acknowledging a completed turn.

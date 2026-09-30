@@ -144,6 +144,17 @@ pub struct RepositoryDictionary<K: KeyStore = RepositoryKeyStore> {
     repo_root: Option<PathBuf>,
 }
 
+#[cfg(feature = "rc")]
+enum SnapshotProtection {
+    Ready(ProtectionReport),
+    Changed,
+}
+
+#[cfg(feature = "rc")]
+#[derive(Debug, thiserror::Error)]
+#[error("native history protection policy is unavailable: {0}")]
+pub(crate) struct NativeHistoryPolicyUnavailable(#[source] anyhow::Error);
+
 impl RepositoryDictionary<RepositoryKeyStore> {
     /// A validated Git carrier selects its dictionary without rediscovering a worktree.
     #[cfg(feature = "cli")]
@@ -242,6 +253,18 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         records: Vec<DecryptedRecord>,
         record_timing: &mut dyn FnMut(&'static str, f64),
     ) -> crate::Result<ProtectionReport> {
+        self.prepare_protected_records(text, global, unlocked, records, record_timing, false)
+    }
+
+    fn prepare_protected_records(
+        &self,
+        text: &str,
+        global: &Matcher,
+        unlocked: Option<Unlocked>,
+        records: Vec<DecryptedRecord>,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+        view_only: bool,
+    ) -> crate::Result<ProtectionReport> {
         let allowlist = local_allowlist(&records, global, unlocked.as_ref())?;
         let started = std::time::Instant::now();
         // A finding larger than a reversible record cannot become a
@@ -277,6 +300,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 crate::domain::secrets::MAX_NEW_CANDIDATE_BYTES / (1024 * 1024)
             );
         }
+        record_timing("dictionary_new_candidates", candidates.values.len() as f64);
         let started = std::time::Instant::now();
         let mut state = ProtectionState::from_records_profiled(
             &self.store,
@@ -288,6 +312,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             allowlist,
             record_timing,
         )?;
+        state.view_only = view_only;
         record_timing(
             "dictionary_matcher_ms",
             started.elapsed().as_secs_f64() * 1000.0,
@@ -390,7 +415,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         record_timing: &mut dyn FnMut(&'static str, f64),
     ) -> crate::Result<ProtectionReport> {
         let started = std::time::Instant::now();
-        // Identity masking and secret projection must observe the same dictionary policy.
+        // Identity masking and secret projection observe the same authenticated dictionary.
         self.store.with_lock(|| {
             record_timing(
                 "dictionary_lock_ms",
@@ -402,81 +427,226 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 "dictionary_read_ms",
                 started.elapsed().as_secs_f64() * 1000.0,
             );
-            let allowed = local_allowlist(&records, &Matcher::empty(), unlocked.as_ref())?;
-            let generation = unlocked.as_ref().map_or(0, |value| value.file.generation);
-            let registered = Matcher::build(
-                generation,
-                records
-                    .iter()
-                    .filter(|record| {
-                        registered_protect(record)
-                            && !allowed.contains(record.secret.as_str())
-                            && !crate::domain::secrets::rules::preset_allows(&record.secret)
-                    })
-                    .cloned()
-                    .collect(),
-            )?
-            .with_allowlist(allowed.values)
-            .with_repository_identities(allowed.identities);
-            let registered = global.merged(&registered)?;
-            let mut hidden = std::collections::HashMap::<String, String>::new();
-            let mut aliases = std::collections::HashMap::<String, String>::new();
-            let mut input = String::new();
-            for (chunk, value) in crate::domain::secrets::jsonl_chunks(text) {
-                if let Some(mut value) = value {
-                    let mut mask = mask_for(&value);
-                    mask.0.retain(|(pointer, span)| {
-                        value
-                            .pointer(pointer)
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| {
-                                !registered
-                                    .find(text)
-                                    .iter()
-                                    .any(|hit| hit.start < span.end && span.start < hit.end)
-                            })
-                    });
-                    mask.apply(&mut value, |identity| {
-                        if let Some(token) = aliases.get(identity) {
-                            return token.clone();
-                        }
-                        let token = format!(
-                            "{{{{AGIT_SECRET_V1:{}:sec_{}}}}}",
-                            uuid::Uuid::new_v4(),
-                            uuid::Uuid::new_v4().simple()
-                        );
-                        hidden.insert(token.clone(), identity.to_owned());
-                        aliases.insert(identity.to_owned(), token.clone());
-                        token
-                    });
-                    input.push_str(&serde_json::to_string(&value)?);
-                    if chunk.ends_with('\n') {
-                        input.push('\n');
-                    }
-                } else {
-                    input.push_str(chunk);
-                }
-            }
-            let mut report =
-                self.protect_records(&input, global, unlocked, records, record_timing)?;
-            if !hidden.is_empty() {
-                report.text = transform_jsonl(&report.text, |text| {
-                    let mut restored = String::with_capacity(text.len());
-                    let mut cursor = 0;
-                    for (start, end, token) in token_segments(text) {
-                        if let Some(identity) = hidden.get(token) {
-                            restored.push_str(&text[cursor..start]);
-                            restored.push_str(identity);
-                            cursor = end;
-                        }
-                    }
-                    restored.push_str(&text[cursor..]);
-                    Ok((restored, 0))
-                })?
-                .0;
-            }
-            Ok(report)
+            self.prepare_masked_records(
+                text,
+                global,
+                &mut mask_for,
+                unlocked,
+                records,
+                record_timing,
+                false,
+            )
         })
+    }
+
+    /// History views never learn mappings; unknown values receive display-only redaction.
+    #[cfg(feature = "rc")]
+    pub(crate) fn protect_with_masks_snapshot_profiled(
+        &self,
+        text: &str,
+        global: &Matcher,
+        masks: &[crate::domain::secrets::identity::RecordMask],
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> crate::Result<ProtectionReport> {
+        for _ in 0..2 {
+            match self.try_masked_snapshot(text, global, masks, record_timing)? {
+                SnapshotProtection::Ready(report) => return Ok(report),
+                SnapshotProtection::Changed => continue,
+            }
+        }
+        Err(NativeHistoryPolicyUnavailable(anyhow::anyhow!(
+            "the repository secret policy changed during history projection; retry the read"
+        ))
+        .into())
+    }
+
+    #[cfg(feature = "rc")]
+    fn try_masked_snapshot(
+        &self,
+        text: &str,
+        global: &Matcher,
+        masks: &[crate::domain::secrets::identity::RecordMask],
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> crate::Result<SnapshotProtection> {
+        use crate::adapter::native_snapshot::{Limits, Unavailable, read_file_bytes};
+        let limits = Limits {
+            bytes: 128 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let read = || {
+            match std::fs::symlink_metadata(&self.store.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(Unavailable::Read),
+                Ok(_) => {}
+            }
+            read_file_bytes(&self.store.path, limits).map(Some)
+        };
+        let started = std::time::Instant::now();
+        let bytes = match read() {
+            Ok(bytes) => bytes,
+            Err(Unavailable::Changed) => return Ok(SnapshotProtection::Changed),
+            Err(error) => return Err(NativeHistoryPolicyUnavailable(error.into()).into()),
+        };
+        let file: Option<super::VaultFile> = bytes
+            .as_ref()
+            .map(|bytes| serde_json::from_slice(bytes))
+            .transpose()
+            .context("the repository secret dictionary is malformed")
+            .map_err(NativeHistoryPolicyUnavailable)?;
+        let key_context = file.as_ref().map(|file| super::VaultFile {
+            version: file.version,
+            key_version: file.key_version,
+            key_storage: file.key_storage.clone(),
+            schema_version: file.schema_version,
+            projection_version: file.projection_version,
+            vault_id: file.vault_id.clone(),
+            generation: file.generation,
+            wrapped_dek: file.wrapped_dek.clone(),
+            records: Vec::new(),
+            repository_policy: None,
+        });
+        let unlocked = file
+            .map(|file| self.store.unlock_file(file, true))
+            .transpose()
+            .map_err(NativeHistoryPolicyUnavailable)?;
+        let records = unlocked
+            .as_ref()
+            .map(|unlocked| super::decrypt_records(&unlocked.file, &unlocked.dek))
+            .transpose()
+            .map_err(NativeHistoryPolicyUnavailable)?
+            .unwrap_or_default();
+        record_timing(
+            "dictionary_read_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let mut index = 0;
+        let report = self.prepare_masked_records(
+            text,
+            global,
+            |_| {
+                let mask = masks.get(index).cloned().unwrap_or_default();
+                index += 1;
+                mask
+            },
+            unlocked,
+            records,
+            record_timing,
+            true,
+        )?;
+        anyhow::ensure!(index == masks.len(), "native protection mask count changed");
+        let started = std::time::Instant::now();
+        // Current key access and complete ciphertext equality fence concurrent policy changes.
+        if let Some(key_context) = key_context {
+            self.store
+                .unlock_file(key_context, true)
+                .map_err(NativeHistoryPolicyUnavailable)?;
+        }
+        let current = match read() {
+            Ok(bytes) => bytes,
+            Err(Unavailable::Changed) => return Ok(SnapshotProtection::Changed),
+            Err(error) => return Err(NativeHistoryPolicyUnavailable(error.into()).into()),
+        };
+        record_timing(
+            "dictionary_snapshot_validate_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        if current != bytes {
+            return Ok(SnapshotProtection::Changed);
+        }
+        Ok(SnapshotProtection::Ready(report))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_masked_records(
+        &self,
+        text: &str,
+        global: &Matcher,
+        mut mask_for: impl FnMut(&Value) -> crate::domain::secrets::identity::RecordMask,
+        unlocked: Option<Unlocked>,
+        records: Vec<DecryptedRecord>,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+        view_only: bool,
+    ) -> crate::Result<ProtectionReport> {
+        let allowed = local_allowlist(&records, &Matcher::empty(), unlocked.as_ref())?;
+        let generation = unlocked.as_ref().map_or(0, |value| value.file.generation);
+        let registered = Matcher::build(
+            generation,
+            records
+                .iter()
+                .filter(|record| {
+                    registered_protect(record)
+                        && !allowed.contains(record.secret.as_str())
+                        && !crate::domain::secrets::rules::preset_allows(&record.secret)
+                })
+                .cloned()
+                .collect(),
+        )?
+        .with_allowlist(allowed.values)
+        .with_repository_identities(allowed.identities);
+        let registered = global.merged(&registered)?;
+        let mut hidden = std::collections::HashMap::<String, String>::new();
+        let mut aliases = std::collections::HashMap::<String, String>::new();
+        let mut input = String::new();
+        for (chunk, value) in crate::domain::secrets::jsonl_chunks(text) {
+            if let Some(mut value) = value {
+                let mut mask = mask_for(&value);
+                mask.0.retain(|(pointer, span)| {
+                    value
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            !registered
+                                .find(text)
+                                .iter()
+                                .any(|hit| hit.start < span.end && span.start < hit.end)
+                        })
+                });
+                mask.apply(&mut value, |identity| {
+                    if let Some(token) = aliases.get(identity) {
+                        return token.clone();
+                    }
+                    let token = format!(
+                        "{{{{AGIT_SECRET_V1:{}:sec_{}}}}}",
+                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    hidden.insert(token.clone(), identity.to_owned());
+                    aliases.insert(identity.to_owned(), token.clone());
+                    token
+                });
+                input.push_str(&serde_json::to_string(&value)?);
+                if chunk.ends_with('\n') {
+                    input.push('\n');
+                }
+            } else {
+                input.push_str(chunk);
+            }
+        }
+        let mut report = self.prepare_protected_records(
+            &input,
+            global,
+            unlocked,
+            records,
+            record_timing,
+            view_only,
+        )?;
+        if !hidden.is_empty() {
+            report.text = transform_jsonl(&report.text, |text| {
+                let mut restored = String::with_capacity(text.len());
+                let mut cursor = 0;
+                for (start, end, token) in token_segments(text) {
+                    if let Some(identity) = hidden.get(token) {
+                        restored.push_str(&text[cursor..start]);
+                        restored.push_str(identity);
+                        cursor = end;
+                    }
+                }
+                restored.push_str(&text[cursor..]);
+                Ok((restored, 0))
+            })?
+            .0;
+        }
+        Ok(report)
     }
 
     /// Protect user-controlled observations without rewriting metadata schema or identity fields.
@@ -1399,7 +1569,7 @@ struct ProtectionState<'a, K: KeyStore> {
     store: &'a VaultStore<K>,
     unlocked: Option<Unlocked>,
     records: Vec<DecryptedRecord>,
-    ac: Option<Arc<AhoCorasick>>,
+    ac: Option<Arc<super::protection_matcher::Compiled>>,
     sources: Vec<PatternSource>,
     allowlist: LocalAllowlist,
     dirty: bool,
@@ -1407,6 +1577,8 @@ struct ProtectionState<'a, K: KeyStore> {
     new_records: usize,
     new_heuristic_records: usize,
     intact_hits: usize,
+    view_only: bool,
+    transient_ids: HashSet<String>,
     /// Set only by the settlement path. `None` skips the extra scan entirely,
     /// which is what every continuity view wants.
     oversized_threshold: Option<usize>,
@@ -1551,7 +1723,14 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         let ac = if patterns.is_empty() {
             None
         } else {
-            Some(super::protection_matcher::compile(&patterns)?)
+            let stable_prefix = sources
+                .iter()
+                .take_while(|source| source.record_id.is_some())
+                .count();
+            Some(super::protection_matcher::compile(
+                &patterns,
+                stable_prefix,
+            )?)
         };
         record_timing(
             "dictionary_automaton_ms",
@@ -1570,6 +1749,8 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             new_records: 0,
             new_heuristic_records: 0,
             intact_hits: 0,
+            view_only: false,
+            transient_ids: HashSet::new(),
             oversized_threshold: None,
         })
     }
@@ -1640,7 +1821,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     fn protect_between(
         &mut self,
         text: &str,
-        ac: &AhoCorasick,
+        ac: &super::protection_matcher::Compiled,
         image: bool,
         opaque: impl Iterator<Item = (usize, usize)>,
     ) -> crate::Result<(String, usize)> {
@@ -1701,7 +1882,7 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     fn protect_segment(
         &mut self,
         text: &str,
-        ac: &AhoCorasick,
+        ac: &super::protection_matcher::Compiled,
         image: bool,
     ) -> crate::Result<(String, usize)> {
         let mut projection = ProjectionBuffer {
@@ -1859,6 +2040,12 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             .push_str(&text[projection.cursor..region_start]);
         let replaced = id.is_some();
         if let Some(id) = id {
+            if self.transient_ids.contains(&id) {
+                projection.out.push_str("[redacted:secret]");
+                projection.cursor = region_end;
+                projection.replacements = projection.replacements.saturating_add(1);
+                return Ok(());
+            }
             let vault_id = &self
                 .unlocked
                 .as_ref()
@@ -1887,6 +2074,9 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             .find(|record| record.secret.as_str() == secret)
         {
             let id = record.id.clone();
+            if self.view_only {
+                return Ok(id);
+            }
             let index = self
                 .records
                 .iter()
@@ -1928,6 +2118,9 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             }
             return Ok(id);
         }
+        if self.view_only {
+            return Ok(self.transient_record(secret, sources));
+        }
         if self.unlocked.is_none() {
             self.unlocked = Some(self.store.create_unlocked()?);
             self.created = true;
@@ -1963,6 +2156,9 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
     fn ensure_record(&mut self, pattern: usize, secret: &str) -> crate::Result<String> {
         let source = self.sources[pattern].clone();
         if let Some(id) = &source.record_id {
+            if self.view_only {
+                return Ok(id.clone());
+            }
             let index = self
                 .records
                 .iter()
@@ -2002,6 +2198,19 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             return Ok(id);
         }
 
+        if self.view_only {
+            let id = self.transient_record(
+                secret,
+                &MergedSources {
+                    explicit_block: source.from_global,
+                    global: source.from_global,
+                    heuristic: source.from_heuristic,
+                    ..Default::default()
+                },
+            );
+            self.sources[pattern].record_id = Some(id.clone());
+            return Ok(id);
+        }
         if self.unlocked.is_none() {
             self.unlocked = Some(self.store.create_unlocked()?);
             self.created = true;
@@ -2037,8 +2246,32 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         Ok(id)
     }
 
+    fn transient_record(&mut self, secret: &str, sources: &MergedSources) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.transient_ids.insert(id.clone());
+        self.records.push(DecryptedRecord {
+            id: id.clone(),
+            name: String::new(),
+            secret: Zeroizing::new(secret.to_owned()),
+            origins: [
+                sources.heuristic.then_some(RecordOrigin::Heuristic),
+                sources.global.then_some(RecordOrigin::Global),
+                sources.explicit.then_some(RecordOrigin::Explicit),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            heuristic_disposition: super::HeuristicDisposition::Protect,
+            explicit_block: sources.explicit_block,
+            declaration: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        });
+        id
+    }
+
     fn persist(&mut self) -> crate::Result<()> {
-        if !self.dirty {
+        if self.view_only || !self.dirty {
             return Ok(());
         }
         let unlocked = self
@@ -4128,6 +4361,124 @@ mod tests {
             dictionary.hydrate_jsonl(&protected.text).unwrap().text,
             input
         );
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn immutable_native_projection_does_not_wait_for_a_dictionary_writer() {
+        use fs2::FileExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Arc::new(RepositoryDictionary::new(
+            dir.path().join("vault.json"),
+            MemoryKeys::default(),
+        ));
+        let value = "registered-history-value";
+        let known = serde_json::json!({"text":value}).to_string();
+        let expected: Value = serde_json::from_str(
+            &dictionary
+                .protect_jsonl(&known, &Matcher::for_test(&[("history", value)]))
+                .unwrap()
+                .text,
+        )
+        .unwrap();
+        let heuristic = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let registered = "new-registered-history-value";
+        let input = serde_json::json!({"text":value,"heuristic":heuristic,"registered":registered})
+            .to_string();
+        let before = std::fs::read(&dictionary.store.path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("vault.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let reader = dictionary.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(reader.protect_with_masks_snapshot_profiled(
+                &input,
+                &Matcher::for_test(&[("new", registered)]),
+                &[Default::default()],
+                &mut |_, _| {},
+            ))
+            .unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        fs2::FileExt::unlock(&lock).unwrap();
+        worker.join().unwrap();
+        let result: Value = serde_json::from_str(
+            &result
+                .expect("read-only projection waits for a writer")
+                .unwrap()
+                .text,
+        )
+        .unwrap();
+        assert_eq!(result["text"], expected["text"]);
+        assert_eq!(result["heuristic"], "[redacted:secret]");
+        assert_eq!(result["registered"], "[redacted:secret]");
+        assert_eq!(std::fs::read(&dictionary.store.path).unwrap(), before);
+        let empty =
+            RepositoryDictionary::new(dir.path().join("empty/vault.json"), MemoryKeys::default());
+        let input = serde_json::json!({"text":heuristic}).to_string();
+        let projected = empty
+            .protect_with_masks_snapshot_profiled(
+                &input,
+                &Matcher::empty(),
+                &[Default::default()],
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(!projected.text.contains(heuristic));
+        assert!(!empty.store.path.exists());
+        assert!(empty.store.keys.0.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn native_snapshot_rechecks_changed_identity_policy_and_revoked_keys() {
+        use crate::domain::secrets::identity::RecordMask;
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        dictionary
+            .protect_jsonl(
+                "{\"text\":\"existing-value\"}",
+                &Matcher::for_test(&[("existing", "existing-value")]),
+            )
+            .unwrap();
+        let native = "d30bc5c5-8532-49f2-8505-b155dd31a139";
+        let input = serde_json::json!({"sessionId":native}).to_string();
+        let masks = [RecordMask(vec![("/sessionId".into(), 0..native.len())])];
+        let mut changed = false;
+        let result = dictionary
+            .protect_with_masks_snapshot_profiled(
+                &input,
+                &Matcher::empty(),
+                &masks,
+                &mut |phase, _| {
+                    if phase == "dictionary_transform_ms" && !changed {
+                        changed = true;
+                        dictionary
+                            .protect_jsonl(&input, &Matcher::for_test(&[("identity", native)]))
+                            .unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        assert!(changed);
+        assert!(!result.text.contains(native));
+        assert_eq!(dictionary.hydrate_jsonl(&result.text).unwrap().text, input);
+        let rejected = dictionary.protect_with_masks_snapshot_profiled(
+            &input,
+            &Matcher::empty(),
+            &masks,
+            &mut |phase, _| {
+                if phase == "dictionary_transform_ms" {
+                    dictionary.store.keys.0.lock().unwrap().clear();
+                }
+            },
+        );
+        assert!(rejected.unwrap_err().is::<NativeHistoryPolicyUnavailable>());
     }
 
     #[test]

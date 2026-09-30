@@ -12,10 +12,16 @@ fn main() -> anyhow::Result<()> {
             &mut timings,
         )?;
         let items = &result["items"];
+        let withheld = items
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["raw"].get("protection_error").is_some())
+            .count();
         println!(
             "{}",
             serde_json::json!({"sample": sample, "elapsed_ms": started.elapsed().as_secs_f64()*1000.0,
-            "phases": timings, "items": items.as_array().map(Vec::len),
+            "phases": timings, "items": items.as_array().map(Vec::len), "withheld_items": withheld,
             "digest": format!("{:x}", Sha256::digest(serde_json::to_vec(items)?))})
         );
     }
