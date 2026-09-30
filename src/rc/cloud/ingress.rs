@@ -523,6 +523,7 @@ impl Client {
                 result["controller_delegation"] = serde_json::json!([
                     "session-v1",
                     "project-v1",
+                    "project-history-v1",
                     "watch-v1",
                     "session-events-v1"
                 ]);
@@ -898,7 +899,13 @@ mod tests {
         assert_eq!(result["authority"], "cloud-principal");
         assert_eq!(
             result["controller_delegation"],
-            json!(["session-v1", "project-v1", "watch-v1", "session-events-v1"])
+            json!([
+                "session-v1",
+                "project-v1",
+                "project-history-v1",
+                "watch-v1",
+                "session-events-v1"
+            ])
         );
         assert!(result.get("diagnostic_log").is_none());
         assert!(client.project(&response.to_json()).unwrap().is_none());

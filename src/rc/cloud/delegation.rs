@@ -328,6 +328,7 @@ impl Controller {
                         | "workspace.list"
                         | "session.list"
                         | "session.catalog.list"
+                        | "session.history"
                         | "runtime.models"
                         | "session.start"
                 ),
@@ -525,6 +526,33 @@ mod tests {
         )
         .unwrap();
         assert!(controller.actor(&mut subscribe, &principal).is_err());
+        let (mut history, _) = access::authorize(
+            Frame::request("session.history", json!({"session_id":"visible"})),
+            &principal,
+            &policy,
+            &mut resources,
+        )
+        .unwrap();
+        controller.actor(&mut history, &principal).unwrap();
+        for id in ["hidden", "other"] {
+            assert!(
+                access::authorize(
+                    Frame::request("session.history", json!({"session_id":id})),
+                    &principal,
+                    &policy,
+                    &mut resources,
+                )
+                .is_err()
+            );
+        }
+        let (mut mutation, _) = access::authorize(
+            Frame::request("turn.start", json!({"session_id":"visible"})),
+            &principal,
+            &policy,
+            &mut resources,
+        )
+        .unwrap();
+        assert!(controller.actor(&mut mutation, &principal).is_err());
         assert!(!controller.has_session_stream());
         assert!(
             access::authorize(
