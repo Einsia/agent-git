@@ -286,34 +286,50 @@ pub(super) fn read(
             (page, start)
         }
     } else {
-        let (lines, next, mode, context) = timings.measure("page_ms", || -> crate::Result<_> {
-            let (mut lines, next, mode) = page_segments(&mut entry.parts, before)?;
-            validate_records(runtime, &lines)?;
-            let context = select_view(&mut lines, runtime, params);
-            Ok((lines, next, mode, context))
-        })?;
         let redactor = timings.measure("protection_context_ms", || target.redactor())?;
-        let items: Vec<Value> = timings.measure("projection_ms", || {
-            let (items, _) = super::super::supervisor::items_from_lines_with_mode(
-                runtime, &redactor, &lines, mode,
-            );
-            items
-                .into_iter()
-                .map(|mut item| {
-                    if *runtime == "codex" && params["view"] == "conversation" {
-                        project_context(&mut item, &context);
-                    }
-                    item.event.line = None;
-                    json!({
-                        "item_id": format!("history:{}", item.item_id),
-                        "source_id": item.source_id,
-                        "event": item.event,
-                        "raw": item.raw,
+        let mut cursor = before;
+        let mut skipped = 0;
+        // Metadata-only tails must not cost another network round trip. Bound the scan
+        // so transcripts without presentable records cannot monopolize the history worker.
+        loop {
+            let (lines, next, mode, context) =
+                timings.measure("page_ms", || -> crate::Result<_> {
+                    let (mut lines, next, mode) = page_segments(&mut entry.parts, cursor)?;
+                    validate_records(runtime, &lines)?;
+                    let context = select_view(&mut lines, runtime, params);
+                    Ok((lines, next, mode, context))
+                })?;
+            let items: Vec<Value> = timings.measure("projection_ms", || {
+                let (items, _) = super::super::supervisor::items_from_lines_with_mode(
+                    runtime, &redactor, &lines, mode,
+                );
+                items
+                    .into_iter()
+                    .map(|mut item| {
+                        if *runtime == "codex" && params["view"] == "conversation" {
+                            project_context(&mut item, &context);
+                        }
+                        item.event.line = None;
+                        json!({
+                            "item_id": format!("history:{}", item.item_id),
+                            "source_id": item.source_id,
+                            "event": item.event,
+                            "raw": item.raw,
+                        })
                     })
-                })
-                .collect()
-        });
-        (items, next)
+                    .collect()
+            });
+
+            if !items.is_empty() || next == 0 || skipped == 7 {
+                break (items, next);
+            }
+            ensure!(
+                cursor.is_none_or(|before| next < before),
+                Failure::InvalidCursor
+            );
+            cursor = Some(next);
+            skipped += 1;
+        }
     };
     let result =
         json!({"items":items,"before":next,"has_more":next>0,"snapshot":token,"status":"complete"});

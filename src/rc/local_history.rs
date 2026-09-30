@@ -14,8 +14,7 @@ impl Timings {
     fn measure<T>(&mut self, phase: &'static str, operation: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
         let result = operation();
-        self.0
-            .insert(phase, started.elapsed().as_secs_f64() * 1000.0);
+        *self.0.entry(phase).or_default() += started.elapsed().as_secs_f64() * 1000.0;
         result
     }
 }
@@ -617,6 +616,7 @@ mod tests {
             let mut roster = super::super::roster::Roster::default();
             let parent = "00000000-0000-0000-0000-000000000001";
             let native = "00000000-0000-0000-0000-000000000002";
+            let empty = "00000000-0000-0000-0000-000000000003";
             let mut sources = Vec::new();
             for name in ["alpha", "beta"] {
                 let home = directory.path().join(name);
@@ -649,7 +649,14 @@ mod tests {
                 std::fs::write(&path, text).unwrap();
                 let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
                 db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER)").unwrap();
-                for (id, path) in [(parent, parent_path), (native, path)] {
+                let empty_path = home.join("empty-child.jsonl");
+                std::fs::write(&empty_path, format!("{}\n", json!({
+                    "type":"session_meta", "payload":{
+                        "id":empty,"cwd":project,"history_mode":"paginated",
+                        "history_base":{"thread_id":parent,"end_byte_offset":parent_text.len(),"end_ordinal_exclusive":2}
+                    }
+                }))).unwrap();
+                for (id, path) in [(parent, parent_path), (native, path), (empty, empty_path)] {
                     db.execute(
                         "INSERT INTO threads VALUES (?1,?2,?3,0,'question','cli',1)",
                         rusqlite::params![id, path.to_str(), project.to_str()],
@@ -660,6 +667,10 @@ mod tests {
                 roster.record(name, serde_json::from_value(json!({
                     "native_source":{"source_id":source.source_id,"generation":source.generation},
                     "runtime":"codex","thread_id":native,"cwd":project,"workspace_id":"local-owner"
+                })).unwrap()).unwrap();
+                roster.record(&format!("{name}-empty"), serde_json::from_value(json!({
+                    "native_source":{"source_id":source.source_id,"generation":source.generation},
+                    "runtime":"codex","thread_id":empty,"cwd":project,"workspace_id":"local-owner"
                 })).unwrap()).unwrap();
                 sources.push(source);
             }
@@ -677,6 +688,15 @@ mod tests {
             assert!(direct.to_string().contains("alpha-child"));
             assert!(!direct.to_string().contains("beta-child"));
             assert!(read_with_roster(json!({"session_id":sources[1].session_ref(native),"snapshot":direct["snapshot"],"before":direct["before"]}), &Default::default(), &mut Timings::default()).is_err());
+            let inherited = read_with_roster(
+                json!({"session_id":"alpha-empty", "view":"conversation"}),
+                &roster,
+                &mut Timings::default(),
+            )
+            .unwrap();
+            assert!(inherited.to_string().contains("alpha-parent"));
+            assert!(!inherited.to_string().contains("beta-parent"));
+            assert_eq!(inherited["has_more"], false);
             let first = read_with_roster(
                 json!({"session_id":"alpha"}),
                 &roster,
