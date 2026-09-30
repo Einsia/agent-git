@@ -1125,6 +1125,60 @@ fn separate_push_does_not_inherit_source_allowances() {
     }
 }
 
+/// Without `--encryption` or a stored preference, a separate destination created from a source
+/// bound to an encrypted Hub repository is encrypted too, so an unattended `--to` takes the
+/// encrypted path, which refuses this file line before creating anything. Applying the ordinary
+/// creation default here would create an ordinary repository and publish the source's original
+/// history in plaintext.
+#[test]
+fn separate_destination_of_an_encrypted_source_stays_encrypted_by_default() {
+    let lab = Lab::new();
+    let path = lab.seed("alice", "qa", true);
+    identity::pin(
+        &Repo::at(&path),
+        &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    let mut encrypted = remote(&lab, "alice", AGENT_ID);
+    encrypted["encryption_enabled"] = json!(true);
+    let mut unreported = remote(&lab, "alice", AGENT_ID);
+    unreported
+        .as_object_mut()
+        .unwrap()
+        .remove("encryption_enabled");
+    // An encrypted source keeps the destination encrypted; a source the Hub cannot show, or
+    // shows without a mode, refuses rather than being read as ordinary.
+    for (source, code, message) in [
+        (Reply::Json(encrypted), 4, "encrypted session publication"),
+        (Reply::Status(404), 1, "encryption mode is unknown"),
+        (
+            Reply::Json(unreported),
+            1,
+            "did not return encryption_enabled",
+        ),
+    ] {
+        let before = lab.state();
+        let server = Server::start(
+            &lab,
+            vec![
+                Step::new("GET /api/agents/alice/copy", Reply::Status(404)),
+                Step::new("GET /api/agents/alice/qa", source),
+            ],
+        );
+        let output = lab
+            .command(env!("CARGO_BIN_EXE_agit"))
+            .args(["--json", "--json-version", "2", "push", "alice/qa"])
+            .args(["-b", "main", "--private", "--to", "alice/copy"])
+            .output()
+            .unwrap();
+        server.finish();
+        let text = assert_failure(&output, "json2", code);
+        assert!(text.contains(message), "{output:?}");
+        assert_eq!(lab.state(), before);
+        lab.no_requests();
+    }
+}
+
 #[test]
 fn exact_declaration_sync_enables_ordinary_branch_and_tag_push_but_not_another_value() {
     use sha2::Digest as _;

@@ -48,6 +48,14 @@ impl Repo {
         }
     }
 
+    /// The explicit, local or user choice of a new identity's mode; `None` when nobody chose.
+    pub fn encryption_preference(&self, explicit: Option<bool>) -> Result<Option<bool>> {
+        match explicit.or(self.creation_encryption()?) {
+            Some(value) => Ok(Some(value)),
+            None => crate::infra::config::encryption_preference(),
+        }
+    }
+
     /// Only the repository's local config can override the user's automatic publishing choice.
     /// Includes and inherited Git configuration cannot grant upload consent.
     pub fn auto_push_override(&self) -> Result<Option<bool>> {

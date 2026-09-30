@@ -27,7 +27,7 @@ pub const KEYS: [(&str, &str); 8] = [
     ),
     (
         "privacy.encryption",
-        "encryption default for new Hub repositories: true | false (default true; existing repository modes are fixed)",
+        "encryption default for new Hub repositories: true | false (default false; existing repository modes are fixed)",
     ),
     ("commit.auto", "hooks auto-settlement switch: true | false"),
     (
@@ -503,7 +503,7 @@ fn default_value(key: &str) -> Option<&'static str> {
         "push.visibility" => Some("ask"),
         "commit.auto" => Some("true"),
         "push.auto" => Some("false"),
-        "privacy.encryption" => Some("true"),
+        "privacy.encryption" => Some("false"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
         _ => None,

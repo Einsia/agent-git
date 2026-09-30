@@ -56,7 +56,9 @@ selectors are not supported. A local `repo@ref` requires a unique matching local
 
 An explicitly named native session ID or prefix preserves live transcript sharing, including
 unsettled content, with explicit `--public`. Encrypted sharing requires a saved, verified accepted
-publication; standalone encrypted sharing refuses before upload. The confirmation and result label this source as a live runtime transcript.
+publication of an encrypted repository; standalone encrypted sharing refuses before upload.
+Ordinary repositories, the default for new repositories, have no viewing key, so a share of
+their history needs `--public` (anyone with the URL can fetch it) and is refused without it. The confirmation and result label this source as a live runtime transcript.
 It is separate from a saved VIEW; use an AgentGit ref with `--full-log` for saved LOG content.
 A name that matches both a ref and a native session is refused rather than choosing for you.
 The command sends the versioned privacy share request to `/api/shares/privacy`. Public shares

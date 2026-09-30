@@ -6,8 +6,9 @@ Backend integration must pass against these routes before this feature is consid
 
 ## Fixed repository mode
 
-Hub creation accepts `encryption_enabled`; omission selects `true` for a new
-identity and preserves an existing identity's mode on retry. An explicit
+Hub creation accepts `encryption_enabled` and preserves an existing identity's
+mode on retry. The CLI always sends the field explicitly, so a CLI-created
+repository never depends on the Hub's choice for an omitted field. An explicit
 conflicting selection returns HTTP 409 and directs the caller to create another
 repository. Create and authoritative read responses return the immutable
 `agent_id` and an explicit effective boolean. Legacy repositories without mode
@@ -15,8 +16,11 @@ configuration return `false`; existing encrypted publications retain enabled mod
 
 The CLI requires that explicit response field before using a mode. Missing,
 malformed or failed responses never select ordinary publication. The user
-`privacy.encryption` preference defaults to `true` and supplies only creation
-intent; `--encryption=true|false` overrides it when creating a new identity.
+`privacy.encryption` preference defaults to `false`, so new repositories use
+ordinary publication unless encryption is chosen; it supplies only creation
+intent, and `--encryption=true|false` overrides it when creating a new identity.
+`privacy init` creates a missing repository encrypted unless a flag, local intent
+or stored preference selects `false`.
 Repository config reads are authoritative and mode writes are refused, including
 for empty repositories. Visibility and `push.auto` are independent.
 

@@ -8,6 +8,51 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-01
+
+### Changed
+
+- **New repositories use ordinary publication by default again.** Without
+  `--encryption` or a `privacy.encryption` preference, `agit push`, `agit init`,
+  `agit repo create` and the init wizard create repositories that publish original
+  history and need no viewing password. Encryption is an explicit opt-in chosen at
+  creation with `--encryption=true` or `agit config privacy.encryption true`, after
+  which `agit privacy init` sets the viewing password. `agit privacy init` still
+  creates a missing repository encrypted unless `false` is chosen, and existing
+  repositories keep the mode they were created with. A separate `agit push --to`
+  destination created from an encrypted repository stays encrypted unless
+  `--encryption=false` or a `privacy.encryption` preference chooses otherwise.
+- Local repositories set up by 0.2.13 or 0.2.14 without an explicit `--encryption`
+  choice follow the new default. If `push.auto` is on and the repository does not
+  exist on the Hub yet, the next automatic push creates it as an ordinary repository,
+  private unless `push.visibility` says otherwise. To keep such a repository
+  encrypted, run `agit privacy init OWNER/REPO` first, or set
+  `agit config --global privacy.encryption true`.
+- A checkout initialized with `agit init --encryption=true` refuses its first push
+  to an existing repository that uses ordinary publication, instead of silently
+  publishing original history there; pass `--encryption=false` to publish anyway,
+  or push to a new repository name to create an encrypted one.
+- Encrypted `agit share` links require an encrypted repository. Sharing from an
+  ordinary repository needs `--public`; without it the command now says so and
+  uploads nothing, instead of asking for a publication that cannot exist. Encrypted
+  links for ordinary repositories are not available in this release.
+
+### Fixed
+
+- Ordinary pushes from scripts, CI and agent sessions no longer require `--yes`;
+  a person at a terminal is still asked to confirm the destination, and declining
+  or cancelling that prompt publishes nothing. Secret findings still block
+  publication unless `--allow-secrets` is given, and encrypted publication keeps
+  its confirmation.
+- Automatic ordinary pushes after settlement, and Remote Control publication to an
+  ordinary repository, no longer need a prior explicit push. `push.auto` authorizes
+  them and they pass the same identity, access and secret checks as a manual push.
+  Outside Remote Control, a missing repository is created with the visibility a
+  non-interactive first push uses. Encrypted repositories still require an explicit
+  push to confirm their policy and viewing recipient before automatic publication.
+- Remote Control retires temporary runtime sources automatically once their
+  directories disappear.
+
 ## [0.2.14] - 2026-09-30
 
 ### Added

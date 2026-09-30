@@ -62,18 +62,20 @@ writes that default to disk.
 
 ## Encryption creation default
 
-`privacy.encryption` accepts `true` or `false` and defaults to `true`. It selects
-encryption when creating a new Hub repository. An existing repository's mode is
-fixed at creation and does not follow later preference changes. Visibility and
-automatic uploading are independent settings.
+`privacy.encryption` accepts `true` or `false` and defaults to `false`: new Hub
+repositories use ordinary publication, which needs no viewing password. Set it to
+`true` to opt into encryption for every repository created afterward, or choose per
+repository with `--encryption=true`. An existing repository's mode is fixed at
+creation and does not follow later preference changes. Visibility and automatic
+uploading are independent settings.
 
 ```bash
-agit config privacy.encryption false
+agit config privacy.encryption true
 agit config privacy.encryption --json
 agit config --unset privacy.encryption
 ```
 
-Unsetting the preference restores the default of `true`. The global config
+Unsetting the preference restores the default of `false`. The global config
 editor shows the effective value, stored value and source separately.
 
 ## Automatic publishing
@@ -101,14 +103,17 @@ an unsupported Hub response are errors, never a disabled-mode default.
 Repository `push.auto` JSON results distinguish `repository` from `inherited`
 values. This changes the Agent repo preference, not the project code repository.
 
-After enabling, run `agit push <owner/repo>@<branch>` to inspect and confirm the
-destination and mode. Successful publication stores local authorization bound to
-the account, immutable repository, URL, visibility and mode. Encrypted consent also
-binds the privacy policy and current recipient; ordinary consent requires neither.
-A successful settlement then publishes its selected branch after releasing local
-locks. Installed Stop hooks use the same behavior; empty settlements send nothing.
-Automatic push retains inspection and authority checks. Changed consent inputs
-require another explicit push, and `--yes` cannot substitute for saved consent.
-Automatic publication cannot create or promote a destination. A failed upload
-leaves the local commit intact; run an explicit push to inspect and retry. RC uses
-the same authoritative mode and requires a durable backend acknowledgement.
+Once enabled, a successful settlement publishes its selected branch after releasing
+local locks. Installed Stop hooks use the same behavior; empty settlements send nothing.
+For an ordinary repository nothing else is required: automatic push needs no earlier
+explicit push, passes the same inspection, identity and write-access checks as a manual
+push, never accepts secret findings, and creates a missing destination with the
+non-interactive visibility default. For an encrypted repository, first run
+`agit push <owner/repo>@<branch>` to inspect and confirm the destination and mode; that
+successful publication stores local authorization bound to the account, immutable
+repository, URL, visibility, mode, privacy policy and current recipient. Changed consent
+inputs require another explicit push, `--yes` cannot substitute for saved consent, and
+automatic encrypted publication cannot create a destination. No automatic push promotes
+a read-only checkout. A failed upload leaves the local commit intact; run an explicit push
+to inspect and retry. RC uses the same authoritative mode and requires a durable backend
+acknowledgement.

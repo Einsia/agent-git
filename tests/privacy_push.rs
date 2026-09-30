@@ -768,7 +768,17 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
             false,
         )
     };
-    let missing = run(true, &target);
+    // Encryption is opted into at creation; without the flag a first push creates an ordinary
+    // repository instead of reaching the viewing-key gate.
+    let missing = command_with_destination(
+        true,
+        &target,
+        (local_rc || separate).then_some("alice/app"),
+        false,
+    )
+    .arg("--encryption=true")
+    .output()
+    .unwrap();
     assert!(!missing.status.success());
     if copying && !separate {
         assert!(

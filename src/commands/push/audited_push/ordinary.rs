@@ -58,34 +58,16 @@ pub(super) fn run(
         !automatic || !args.audit,
         "automatic publication cannot replace an interactive audit decision"
     );
-    let auto_enabled = intent.separate_target.is_none() && repo.auto_push_enabled()?;
-    let prepare_consent = |agent_id: &str| -> Result<AutoConsent> {
-        let credential = credentials::load_checked(&intent.hub)?
-            .context("the selected account is no longer signed in")?;
-        Ok(consent(
-            &intent.hub,
-            &credential,
-            agent_id,
-            &intent.url,
-            &intent.visibility,
-        ))
-    };
-    let automatic_consent = if automatic {
-        let Action::Existing(remote) = &intent.action else {
-            return Err(crate::commands::InteractionRequired(
-                "automatic publication requires an existing confirmed destination; run an explicit push first".into(),
-            ).into());
-        };
-        let expected = prepare_consent(&remote.agent_id)?;
-        if !auto_enabled || !expected.matches(&repo)? {
-            return Err(crate::commands::InteractionRequired(
-                "automatic publication requires renewed confirmation of the destination, mode and audience; run an explicit push first".into(),
-            ).into());
-        }
-        Some(expected)
-    } else {
-        None
-    };
+    // Automatic ordinary publication needs only the repository's push.auto choice. It passes the
+    // same identity, write-access and secret gates as an explicit push, and a missing destination
+    // is created with the non-interactive visibility default. Encrypted publication keeps its
+    // saved-consent requirement.
+    if automatic && !repo.auto_push_enabled()? {
+        return Err(crate::commands::InteractionRequired(
+            "automatic publication is disabled for this repository; enable push.auto or run an explicit push".into(),
+        )
+        .into());
+    }
 
     let plan = PublicationPlan::freeze(&repo, branches)?;
     require_original_history(&repo, &plan)?;
@@ -148,15 +130,9 @@ pub(super) fn run(
     if complete.has_findings() {
         ui::warning("Secret findings are explicitly accepted for this ordinary publication.");
     }
-    let mut displayed = intent.json();
-    displayed["authorize_automatic_publication"] = json!(auto_enabled && !automatic);
+    let displayed = intent.json();
     println!("Publication destination: {displayed}");
     println!("Publication refs: {}", serde_json::to_string(&plan)?);
-    if auto_enabled && !automatic {
-        ui::info(
-            "Confirmation also authorizes future automatic pushes to this destination in ordinary mode.",
-        );
-    }
     if args.show_preview {
         show_preview(complete.captured())?;
     }
@@ -172,17 +148,17 @@ pub(super) fn run(
         reviewed.as_ref().is_none_or(|review| review.complete()),
         args.dry_run,
         || {
-            if automatic_consent.is_some()
-                || (!args.audit && std::env::var_os("AGIT_YES").is_some())
+            // A person at a terminal confirms the destination, and cancelling that prompt
+            // declines. With nobody to ask, an ordinary push proceeds the way `git push` does;
+            // the choice is made before prompting, so an unanswered prompt never publishes.
+            // An audit always waits for its reviewer.
+            if automatic
+                || (!args.audit
+                    && (std::env::var_os("AGIT_YES").is_some() || !ui::prompt::can_ask()))
             {
                 return Ok(Some(true));
             }
             let answer = ui::prompt::confirm(&intent.confirmation(), false)?;
-            if answer.is_none() && !args.audit {
-                return Err(crate::commands::InteractionRequired(
-                "ordinary publication requires destination confirmation; use --yes or an interactive terminal".into(),
-            ).into());
-            }
             Ok(answer)
         },
     )? {
@@ -207,14 +183,12 @@ pub(super) fn run(
     if let Some(selection) = &local_target {
         selection.verify(&repo)?;
     }
-    if let Some(expected) = &automatic_consent {
-        ensure!(
-            repo.auto_push_enabled()?
-                && expected.matches(&repo)?
-                && prepare_consent(&expected.agent_id)? == *expected,
-            "automatic publication consent changed after inspection"
-        );
-    }
+    // Turning automatic publication off while inspection runs stops the push before any remote
+    // write.
+    ensure!(
+        !automatic || repo.auto_push_enabled()?,
+        "automatic publication was disabled during inspection"
+    );
     let (repo, remote) = intent.materialize(&client, &checkout, repo)?;
     intent.verify_remote(&remote)?;
     let observed = lookup(&client, &intent.owner, &intent.name)?
@@ -250,7 +224,6 @@ pub(super) fn run(
         selection.bind(&repo, &remote.identity)?;
     }
     intent.verify_source_binding(&repo)?;
-    let accepted = prepare_consent(&remote.identity.agent_id)?;
     let receipts = receipts(&repo, &plan, &intent, &remote.identity)?;
     let selected = supervisor
         .as_ref()
@@ -286,9 +259,6 @@ pub(super) fn run(
     }
     if let (Some(reply), Some(candidate)) = (supervisor, selected) {
         reply.complete(&repo, candidate)?;
-    }
-    if auto_enabled && !automatic {
-        accepted.save(&repo)?;
     }
     if intent.separate_target.is_some() {
         intent.verify_source_binding(&repo)?;

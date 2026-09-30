@@ -155,7 +155,7 @@ pub(super) fn run(
     let target_id = match &intent.action {
         Action::Existing(remote) => Some(remote.agent_id.clone()),
         Action::Create => anyhow::bail!(
-            "repository viewing key is not configured; run `agit privacy init {target}` before publication"
+            "repository viewing key is not configured; run `agit privacy init {target}` before encrypted publication, or push with --encryption=false to create an ordinary repository"
         ),
         Action::Copy(_) => anyhow::bail!(
             "encrypted repository promotion requires a supported historical-key delivery contract; publish available original history with --to owner/new-repository while retaining the source identity"
@@ -967,19 +967,35 @@ impl Intent {
                     args.encryption.is_none_or(|selected| selected == enabled),
                     "repository encryption mode is fixed at creation; create a different repository for the requested mode"
                 );
-                if separate_target.is_none()
-                    && let Some(pinned) = identity::read(repo)?
-                {
+                let pinned = match &separate_target {
+                    Some(_) => None,
+                    None => identity::read(repo)?,
+                };
+                if let Some(pinned) = &pinned {
                     ensure!(
-                        pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
+                        *pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
                         "the publication destination differs from the pinned repository identity"
                     );
                 }
+                // A checkout initialized for encryption never sends original history to an
+                // ordinary repository on its first publication unless the command line says so:
+                // the Hub's mode may come from a default the owner never chose.
+                ensure!(
+                    enabled
+                        || args.encryption.is_some()
+                        || separate_target.is_some()
+                        || pinned.is_some()
+                        || expected.is_some()
+                        || repo.creation_encryption()? != Some(true),
+                    "this checkout was initialized for an encrypted repository, but {}/{} uses ordinary publication; pass --encryption=false to publish ordinary history there, or push to a new repository name to create an encrypted one",
+                    checkout.owner,
+                    checkout.name
+                );
                 enabled
             }
             Action::Create | Action::Copy(_) => {
                 if let Some(selected) = &separate_target {
-                    selected.encryption_for_creation(repo, args.encryption)?
+                    selected.encryption_for_creation(repo, client, args.encryption)?
                 } else {
                     repo.encryption_for_creation(args.encryption)?
                 }
@@ -1296,6 +1312,8 @@ fn verify_agent_location(hub: &str, owner: &str, name: &str, remote: &RemoteAgen
 }
 
 /// Readiness uses the same account, recipient, policy and endpoint inputs as protected push.
+/// An ordinary destination is ready once its identity and write access check out, because
+/// automatic ordinary publication needs no saved consent; an encrypted one also needs its consent.
 pub(crate) fn automatic_publication_consent(
     repo: &Repo,
     repository: &str,
@@ -1304,7 +1322,11 @@ pub(crate) fn automatic_publication_consent(
     if !repo.auto_push_enabled()? {
         return Ok(false);
     }
-    publication_consent(repo, repository, expected)?.matches(repo)
+    let current = publication_consent(repo, repository, expected)?;
+    if !current.mode.is_encrypted() {
+        return Ok(true);
+    }
+    current.matches(repo)
 }
 
 /// Explicit project enrollment reviews the same policy that unattended push later rechecks.

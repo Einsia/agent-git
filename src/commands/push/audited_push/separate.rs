@@ -57,6 +57,7 @@ struct Binding {
 pub(super) struct Selection {
     hub: String,
     pub repository: String,
+    source_repository: String,
     path: PathBuf,
     previous: Option<Binding>,
     source: SourceBinding,
@@ -100,6 +101,7 @@ impl Selection {
         Ok(Self {
             hub,
             repository: requested.into(),
+            source_repository: source_slug.into(),
             path,
             previous,
             source: SourceBinding::read(repo)?,
@@ -115,19 +117,42 @@ impl Selection {
         })
     }
 
+    /// A bound source's own creation intent describes the source, not this destination. Without
+    /// an explicit flag or a stored preference, the destination takes the source repository's
+    /// Hub mode: original history of an encrypted repository is never published in plaintext
+    /// unless ordinary publication is chosen. A source the Hub cannot show, or shows without a
+    /// mode, refuses instead of inheriting, because an unknown mode is not an ordinary one.
     pub(super) fn encryption_for_creation(
         &self,
         repo: &Repo,
+        client: &Client,
         explicit: Option<bool>,
     ) -> Result<bool> {
         if self.source.identity.is_none() && self.source.origin.is_none() {
-            repo.encryption_for_creation(explicit)
-        } else {
-            match explicit {
-                Some(enabled) => Ok(enabled),
-                None => config::encryption_default(),
-            }
+            return repo.encryption_for_creation(explicit);
         }
+        match explicit.or(config::encryption_preference()?) {
+            Some(enabled) => Ok(enabled),
+            None => self.source_encrypted(client),
+        }
+    }
+
+    fn source_encrypted(&self, client: &Client) -> Result<bool> {
+        let repository = self
+            .source
+            .local_publication
+            .as_ref()
+            .map_or(self.source_repository.as_str(), |bound| {
+                bound.repository.as_str()
+            });
+        let (owner, name) = crate::commands::parse_slug(repository)?;
+        lookup(client, &owner, &name)?
+            .with_context(|| {
+                format!(
+                    "the source repository {repository} is unavailable, so its encryption mode is unknown; pass --encryption=true or --encryption=false to choose the destination mode"
+                )
+            })?
+            .require_encryption_enabled()
     }
 
     pub(super) fn verify_lookup(&self, remote: Option<&RemoteAgent>) -> Result<()> {

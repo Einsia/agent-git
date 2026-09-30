@@ -32,7 +32,7 @@ agit init [<name>] [--seed] [--private] [--encryption=true|false] [--no-bind | -
 | `<name>` | Agent repo name; omitted means a prompt when agit may ask (see below), with the directory name only a suggestion |
 | `--seed` | Confirm and copy project `AGENTS.md`, `CLAUDE.md`, `.claude/skills/`, and similar assets into `main` |
 | `--private` | Record in the repo that the first `agit push` publishes private (`--public` at push time overrides) |
-| `--encryption=true\|false` | Record local creation intent for a new Hub identity; an existing Hub mode is fixed |
+| `--encryption=true\|false` | Record local creation intent for a new Hub identity (omitted: `privacy.encryption`, default `false`); an existing Hub mode is fixed |
 | `--no-bind` | Create the repo without binding the current directory |
 | `--rebind` | Bind this directory even if it is already bound to another repo (refused otherwise) |
 | `--auto-push[=<true\|false>]` | Set this repository's automatic publishing; the value needs `=`. Omitted: inherit the user preference |
@@ -60,7 +60,9 @@ If `szh/p1` already exists, do not run `init` again. Use `new` for a new session
 
 Encryption intent stays in local Git config and is separate from the Hub's mode.
 Omitting `--encryption` uses the user creation default when a new remote identity
-is created. An empty clone already has a fixed Hub mode; a conflicting selection
+is created; without a `privacy.encryption` preference that is ordinary publication,
+which needs no viewing password. Encryption is an explicit opt-in:
+`--encryption=true` records it. An empty clone already has a fixed Hub mode; a conflicting selection
 is refused before writing the scaffold. The init wizard offers an explicit choice
 or inheritance from `privacy.encryption`. This choice does not enable uploads.
 
@@ -74,7 +76,9 @@ Enabling automatic pushing while signed out enters the login flow before creatin
 
 ## Browser password onboarding
 
-For initial agent-assisted setup, use `--auto-push=false` while login, import, and viewing
+This applies only to a repository created with encryption enabled; an ordinary repository
+has no viewing password and needs no setup before its first push. For initial agent-assisted
+setup of an encrypted repository, use `--auto-push=false` while login, import, and viewing
 password setup are in progress. Follow `agit privacy init OWNER/REPO --browser --json --yes`
 in the privacy subskill: show the setup link, wait for the user, rerun with the same explicit
 Hub and repository, and push only after API-confirmed readiness. Enable repository `push.auto`

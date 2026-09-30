@@ -515,7 +515,7 @@ fn bind(
     );
     if automatic {
         println!(
-            "Automatic upload uses the existing repository-wide push.auto preference. Other managed sessions in this local repository inherit that preference. Uploads retain all identity, privacy and consent checks."
+            "Automatic upload uses the existing repository-wide push.auto preference. Other managed sessions in this local repository inherit that preference. Uploads retain all identity and privacy checks, and an encrypted repository's consent checks."
         );
     }
     confirm(
@@ -533,14 +533,21 @@ fn bind(
             super::config::get("commit.auto").as_deref() != Some("false"),
             "commit.auto is disabled; enable it explicitly before automatic project capture"
         );
+        // Only encrypted automatic publication reads saved consent; an ordinary repository's
+        // automatic uploads follow push.auto alone, so no policy is shown or saved for it.
         let consent = super::push::publication_consent(&repo, repository, &project.identity)?;
-        println!(
-            "Automatic publication policy: {}",
-            serde_json::to_string(&consent)?
-        );
-        confirm(
-            "Authorize future publication under this exact repository policy and enable repository-wide automatic push?",
-        )?;
+        let encrypted = consent.mode.is_encrypted();
+        if encrypted {
+            println!(
+                "Automatic publication policy: {}",
+                serde_json::to_string(&consent)?
+            );
+            confirm(
+                "Authorize future publication under this exact repository policy and enable repository-wide automatic push?",
+            )?;
+        } else {
+            confirm("Enable repository-wide automatic push to this ordinary repository?")?;
+        }
         for runtime in ["claude-code", "codex"] {
             if adapter::get(runtime)?.available() {
                 child(
@@ -555,7 +562,9 @@ fn bind(
                 )?;
             }
         }
-        consent.save(&repo)?;
+        if encrypted {
+            consent.save(&repo)?;
+        }
         repo.set_auto_push(Some(true))?;
     }
     workspace::bind(&root, repository, false)?;

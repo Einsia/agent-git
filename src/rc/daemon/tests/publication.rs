@@ -379,18 +379,21 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
         .common_dir()
         .unwrap()
         .join("agit/privacy-auto-consent.json");
-    let consent = std::fs::read(&consent_path).unwrap();
-    let mut changed: serde_json::Value = serde_json::from_slice(&consent).unwrap();
-    changed["account_id"] = json!("another-account");
-    std::fs::write(&consent_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-    let required = connection.call(request()).await.unwrap();
-    assert_eq!(
-        required["publication"]["reason"], "consent_required",
-        "{required}"
-    );
-    assert_ne!(required["publication"]["stage"], "receiver");
-    std::fs::write(&consent_path, &consent).unwrap();
+    // An ordinary destination delivers without any saved consent; an encrypted one requires
+    // consent matching its current account, policy and recipient.
+    assert_eq!(consent_path.exists(), encryption_enabled);
     if encryption_enabled {
+        let consent = std::fs::read(&consent_path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&consent).unwrap();
+        changed["account_id"] = json!("another-account");
+        std::fs::write(&consent_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let required = connection.call(request()).await.unwrap();
+        assert_eq!(
+            required["publication"]["reason"], "consent_required",
+            "{required}"
+        );
+        assert_ne!(required["publication"]["stage"], "receiver");
+        std::fs::write(&consent_path, &consent).unwrap();
         current_key.store(24, std::sync::atomic::Ordering::Release);
         let rotated = connection.call(request()).await.unwrap();
         assert_eq!(rotated["publication"]["reason"], "consent_required");

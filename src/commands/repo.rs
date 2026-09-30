@@ -24,7 +24,8 @@ pub enum Cmd {
         name: String,
         #[arg(long)]
         private: bool,
-        /// Fixed encryption mode for the new repository; omission uses privacy.encryption.
+        /// Fixed encryption mode for the new repository; omission uses privacy.encryption
+        /// (default false: ordinary publication).
         #[arg(long, require_equals = true, value_name = "true|false")]
         encryption: Option<bool>,
     },

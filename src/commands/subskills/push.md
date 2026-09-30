@@ -27,7 +27,7 @@ agit push [owner/repo@branch] [options]
 | `-b, --branch <branch>` | Branches to publish; repeatable |
 | `--all` | Publish all settled branches; encrypted mode skips repository file lines |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
-| `--encryption=true\|false` | Select a new repository's fixed mode; omission uses local creation intent or `privacy.encryption` |
+| `--encryption=true\|false` | Select a new repository's fixed mode; omission uses local creation intent or `privacy.encryption` (default `false`, ordinary) |
 | `--to <owner/repo>` | Publish original history to another repository; for device-local RC, select its retained primary target |
 | `--separate` | With `--to`, publish a separate copy from local RC while retaining its primary target |
 | `--allow-secrets` | Explicitly accept deterministic findings in ordinary mode; encrypted publication still requires clean processed content |
@@ -41,13 +41,20 @@ creation-preference changes. A conflicting flag is refused with guidance to crea
 another repository. Missing mode fields, malformed replies and failed lookups are
 errors; they never authorize ordinary publication.
 
-New repositories default to encryption enabled. Configure their viewing key with
-`agit privacy init OWNER/REPO` before encrypted push or dry run. For agent-assisted setup, use
-`agit privacy init OWNER/REPO --browser --json --yes`, show its setup link, wait for the user's reply,
-and rerun against the same explicit Hub/repository until the API reports `ready`. See the privacy
-subskill for the output and onboarding contract. An ordinary
-destination requires no viewing password and can be created by its first confirmed
-push with `--encryption=false`. Automatic publication requires an existing destination.
+New repositories use ordinary publication by default: the first push creates the
+repository and needs no viewing password. Encryption is an explicit opt-in chosen at
+creation with `--encryption=true` (or `agit init --encryption=true`, or the
+`privacy.encryption` preference). An encrypted destination needs its viewing key
+configured with `agit privacy init OWNER/REPO` before encrypted push or dry run. For
+agent-assisted setup, use `agit privacy init OWNER/REPO --browser --json --yes`, show its
+setup link, wait for the user's reply, and rerun against the same explicit Hub/repository
+until the API reports `ready`. See the privacy subskill for the output and onboarding
+contract.
+
+Automatic ordinary publication follows `push.auto` alone; it needs no earlier explicit
+push and may create a missing destination with the non-interactive visibility default.
+Automatic encrypted publication requires an existing destination whose policy, recipient
+and audience an explicit push has confirmed.
 
 Visibility is settled once, at first publish. Without `--private` / `--public`, push takes the repo preference recorded by `agit init --private`, then the global `push.visibility` (`public` or `private`; `ask` means ask), and otherwise asks a person at a terminal (non-interactive runs and agent sessions default to private). `--dry-run` prints which of these applies.
 
@@ -76,8 +83,10 @@ Use exact `allow` decisions for routine false positives. When publication is alr
 With encryption disabled, push freezes and inspects source commits, their ancestors,
 tags and LFS bytes. Selected file-line branches are supported, and an existing local
 `main` is included. Historical object IDs and original session identities are retained.
-The CLI prints the destination, mode and selected refs, then requires confirmation.
-`--yes` supplies that confirmation and retains inspection, identity and access checks.
+The CLI prints the destination, mode and selected refs. A person at a terminal is asked
+to confirm, and declining or cancelling publishes nothing; without one (scripts, CI,
+agent sessions) ordinary publication proceeds without `--yes`. `--yes` skips the
+question and retains inspection, secret-finding, identity and access checks.
 Successful publication updates ordinary branch tracking and saves session receipts.
 No viewing key, generated projection or privacy strategy is requested.
 
@@ -133,6 +142,9 @@ The target gets its own immutable identity, fixed mode and publication state.
 Encrypted copies use the target's current key and both source and target restrictions.
 A missing target's creation mode uses `--encryption` first. An unpublished local
 source then uses its recorded `init` intent; otherwise the user creation default applies.
+A published source uses the `privacy.encryption` preference, and without one the
+target takes the source repository's Hub mode, so a copy of an encrypted repository
+stays encrypted unless `--encryption=false` is given.
 An existing target always uses its authoritative mode. Reusing a confirmed target
 name for another identity is refused.
 

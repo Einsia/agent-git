@@ -62,7 +62,8 @@ pub struct Args {
     #[arg(long)]
     pub public: bool,
 
-    /// Encryption for a new destination; an existing repository's mode is fixed.
+    /// Encryption for a new destination (omitted: ordinary publication unless a creation
+    /// preference selects encryption); an existing repository's mode is fixed.
     #[arg(long, require_equals = true, value_name = "true|false")]
     pub encryption: Option<bool>,
 

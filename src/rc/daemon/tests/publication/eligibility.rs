@@ -20,15 +20,12 @@ pub(super) fn configure(repo: &Repo, hub: &str, published: &PublicationReceipt) 
     )
     .unwrap();
     repo.set_auto_push(Some(true)).unwrap();
-    let directory = repo.common_dir().unwrap().join("agit");
-    std::fs::create_dir_all(&directory).unwrap();
+    // Ordinary automatic publication needs no saved consent, so only encrypted fixtures write one.
     if !published.mode.is_encrypted() {
-        std::fs::write(directory.join("privacy-auto-consent.json"), serde_json::to_vec(&json!({
-            "version":2, "mode":"ordinary", "hub":hub, "account":"owner", "account_id":"account-1",
-            "agent_id":published.destination.agent_id, "url":published.url, "visibility":"private",
-        })).unwrap()).unwrap();
         return;
     }
+    let directory = repo.common_dir().unwrap().join("agit");
+    std::fs::create_dir_all(&directory).unwrap();
     let mut policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap();
     policy
         .mandatory

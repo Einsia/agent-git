@@ -389,7 +389,7 @@ With no arguments, config opens all supported global keys in one editor. Each
 row names the source of its effective value: environment, stored, default or
 unset. The detail pane keeps the effective and stored values on separate lines.
 `privacy.encryption` selects the default for new Hub repositories and defaults
-to `true`; its description distinguishes that preference from an existing
+to `false` (ordinary publication); its description distinguishes that preference from an existing
 repository's fixed mode. Changing it does not enable automatic uploads.
 For `hub.url`, it also shows the current `AGIT_HUB_URL` value and explains when
 that environment variable masks the file.
@@ -419,7 +419,9 @@ before creating the link. Esc or `q` cancels without publishing.
 The defaults are an encrypted link expiring after seven days. Both encrypted
 and public links can be read by anyone who has the complete link; only the
 encrypted form keeps the service from reading its content. The screen states
-that distinction beside the visibility setting.
+that distinction beside the visibility setting. Encrypted links require an
+encrypted repository; a session from an ordinary repository needs the public
+setting, and the command refuses an encrypted link for it before uploading.
 
 Explicit forms such as `agit share me/repo@work --expire 24h` retain their CLI
 behavior. Saved points share their VIEW by default; `--full-log` deliberately

@@ -49,7 +49,7 @@ impl Default for Form {
             auto_push: None,
             user_auto_push: false,
             encryption: None,
-            user_encryption: true,
+            user_encryption: false,
             field: Field::Name,
             editing: false,
             notice: None,

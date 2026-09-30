@@ -350,10 +350,13 @@ An existing mode ignores creation defaults and cannot be changed by push flags.
 
 For an ordinary repository, push captures raw source ancestry, selected
 branches, `main`, reachable tags and LFS. Commit IDs and session identities remain
-unchanged. The command confirms the destination, sends the captured objects using
+unchanged. The command shows the destination, asks a person at a terminal to confirm
+it (without a terminal it proceeds, as `--yes` does), sends the captured objects using
 ordinary Git/LFS receive, and retains ordinary receipts. It requests no viewing key
-or privacy strategy. An explicit first push can create this destination using
-`--encryption=false`; automatic publication requires an already confirmed destination.
+or privacy strategy. New repositories use this mode unless encryption is chosen at
+creation, so a first push creates the destination without extra flags. Automatic
+ordinary publication follows `push.auto` without saved consent; outside RC it may
+create a missing destination with the non-interactive visibility default.
 
 Default inspection excludes Git objects reachable from the actual destination's live
 advertised refs, using only roots available in the isolated local object store. It
@@ -377,8 +380,9 @@ The following projection and key requirements apply to encrypted repositories.
 `agit commit` settles original session records locally. When automatic publication is enabled,
 its post-settlement child invokes `push` for the explicit session branch after releasing
 settlement locks. RC settlement uses the same unattended publication configuration. These paths
-share the same authoritative mode and destination as explicit push. Encrypted consent
-additionally binds the policy and recipient; ordinary consent needs neither.
+share the same authoritative mode and destination as explicit push. Automatic encrypted
+publication needs saved consent bound to the destination, policy and recipient; automatic
+ordinary publication needs no saved consent.
 
 Encrypted `agit push OWNER/REPO@BRANCH` and `push --audit` prepare this projected history and
 fetch the destination repository's current viewing public key. They inspect the selected generated objects using
@@ -768,22 +772,25 @@ confirmation apply to that exact destination. The local checkout and desktop ide
 place; `agit.desktopPublication` records the confirmed repository slug and immutable Hub identity
 in local Git configuration. Later pushes of the local target reuse that binding. `--to` cannot
 replace it or redirect an ordinary Hub checkout. Privacy source rules resolve against the bound
-Hub repository, and automatic publication still requires enabled `push.auto` and explicit consent.
+Hub repository, and automatic publication still requires enabled `push.auto`, plus explicit
+consent for an encrypted destination.
 
-Enable `push.auto`, then run an explicit push to review the current repository policy and outgoing
-content. Its confirmation also authorizes future automatic publication with that policy. A
-successful publication stores a device-local receipt under
+For an encrypted destination, enable `push.auto`, then run an explicit push to review the current
+repository policy and outgoing content. Its confirmation also authorizes future automatic
+publication with that policy. A successful publication stores a device-local receipt under
 `<git-common-dir>/agit/privacy-auto-consent.json`, bound to the Hub, account, destination ID/URL,
 audience, policy digest, recipient fingerprint and consent format. The receipt contains no key or
 original session content and is never part of the published tree.
 
 Stop-hook and RC supervisor publication children set `AGIT_AUTO_PUSH=1` and remove inherited
-`AGIT_YES`. That mode requires
-both the enabled local preference and an exact current receipt; setting the environment marker or
-passing `--yes` alone grants nothing. It cannot create or promote a destination. Each automatic
-push generates a fresh preview, processes new content under the policy, verifies captured objects
-and repeats destination/key checks. Missing or changed authorization keeps the saved turn local
-and directs the user to an explicit push. Current preparation reinspects complete ancestry;
+`AGIT_YES`. For an encrypted destination that mode requires both the enabled local preference and
+an exact current receipt; setting the environment marker or passing `--yes` alone grants nothing.
+It cannot create or promote a destination. For an ordinary destination the enabled preference
+suffices: the child passes the same identity, access and secret gates as an explicit push, never
+accepts secret findings and never promotes a read-only checkout. Each automatic encrypted push
+generates a fresh preview, processes new content under the policy, verifies captured objects and
+repeats destination/key checks. Missing or changed authorization keeps the saved turn local and
+directs the user to an explicit push. Current preparation reinspects complete ancestry;
 unchanged generated objects and ciphertext are reused.
 
 Policy, recipient or destination changes invalidate consent. Reconfirming does not authorize a

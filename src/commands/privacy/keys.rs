@@ -54,13 +54,16 @@ pub(super) fn run(
                     "the pinned repository is unavailable; refusing to initialize a replacement under the same name"
                 );
             }
+            // Initializing a viewing password is itself a request for encryption, so only an
+            // explicit, local or user choice of ordinary publication declines it here.
             let enabled = match &local {
-                Some(repo) => repo.encryption_for_creation(encryption)?,
+                Some(repo) => repo.encryption_preference(encryption)?,
                 None => match encryption {
-                    Some(value) => value,
-                    None => config::encryption_default()?,
+                    Some(value) => Some(value),
+                    None => config::encryption_preference()?,
                 },
-            };
+            }
+            .unwrap_or(true);
             ensure!(
                 enabled,
                 "viewing passwords require encryption enabled at creation; use `agit repo create {name} --encryption=false` for an ordinary repository or `agit privacy init {repository} --encryption=true` for an encrypted repository"

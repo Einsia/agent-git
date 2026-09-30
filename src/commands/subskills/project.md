@@ -40,9 +40,11 @@ never request the viewing password in chat. Codex hooks must be supported, enabl
 trusted in the installed runtime. Unsupported hook setup is an error, not success.
 
 The Stop hook imports/saves the completed conversation through the ordinary import path,
-then publishes through existing identity, privacy and consent gates. Upload is synchronous;
+then publishes through existing identity and privacy gates, plus consent for an encrypted
+repository. Upload is synchronous;
 there is no resident retry queue. A failed push keeps local history. Retry with `project sync`.
-Policy, account, recipient or destination changes require review and renewed binding consent.
+For an encrypted repository, policy, account, recipient or destination changes require review
+and renewed binding consent; an ordinary repository's automatic uploads follow `push.auto` alone.
 RC-owned sessions keep their supervisor lifecycle and are not taken over by this command.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is

@@ -40,7 +40,8 @@ pub struct Args {
     /// Override automatic publishing for this repository; omission inherits user preferences.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub auto_push: Option<bool>,
-    /// Encryption intent for a new Hub repository; an existing Hub mode is fixed.
+    /// Encryption intent for a new Hub repository (omitted: privacy.encryption, default false);
+    /// an existing Hub mode is fixed.
     #[arg(long, require_equals = true, value_name = "true|false")]
     pub encryption: Option<bool>,
 

@@ -40,7 +40,8 @@ pub enum Action {
         /// Create a missing repository privately (the default).
         #[arg(long)]
         private: bool,
-        /// Creation-time encryption selection; password setup requires true.
+        /// Creation-time encryption selection; password setup requires true. Without this flag or
+        /// a stored preference, a repository this command creates is encrypted.
         #[arg(long, require_equals = true, value_name = "true|false")]
         encryption: Option<bool>,
     },

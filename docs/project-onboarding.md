@@ -85,7 +85,9 @@ successful pushes and failures; a push does not prove that Hub search indexing h
 Uploads use existing privacy and identity gates. A failed upload retains the local imported
 history. There is no resident retry service in this minimal version: fix access, connectivity
 or privacy setup and rerun sync. Hooks can wait for scanning/upload; this is not token streaming.
-An account, repository identity, policy or recipient change requires renewed explicit consent.
+For an encrypted repository, an account, repository identity, policy or recipient change
+requires renewed explicit consent; an ordinary repository's automatic uploads follow `push.auto`
+alone.
 
 Unbind stops this project's hook capture and automatic pushing, without deleting existing
 history or resetting repository preferences. Explicit manual push is still possible. Nested

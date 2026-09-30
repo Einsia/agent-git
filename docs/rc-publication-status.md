@@ -44,8 +44,9 @@ Executors advertise `session-publication-status-v1` in `rpc_features`. `SessionI
 Readiness and progress are independent. Start/resume/list/watch snapshots invalidate cached
 authorization to `checking` for a bound session, or report `unbound`; they retain available
 progress. Publication hints update progress under the existing stream/generation fences.
-Delivery checks the current canonical Hub, immutable destination, URL, account, write access,
-visibility, effective privacy policy and viewing recipient against explicit push consent.
+Delivery checks the current canonical Hub, immutable destination, URL, account and write access.
+An encrypted destination also checks visibility, effective privacy policy and viewing recipient
+against explicit push consent; an ordinary destination needs no saved consent.
 Readiness is never persisted as authorization.
 
 An unbound delivery keeps RPC `201` with `error.data.publication`. Capture admission errors

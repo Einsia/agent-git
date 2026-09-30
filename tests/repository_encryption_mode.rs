@@ -357,7 +357,7 @@ fn ordinary_source(root: &Path) -> (Repo, String, String) {
 }
 
 #[test]
-fn ordinary_history_continues_with_original_ids_file_lines_tags_lfs_and_automatic_consent() {
+fn ordinary_history_continues_with_original_ids_file_lines_tags_lfs_and_automatic_publication() {
     use agit::domain::{
         meta,
         privacy_receipt::{PublicationMode, PublicationReceipt},
@@ -415,14 +415,14 @@ fn ordinary_history_continues_with_original_ids_file_lines_tags_lfs_and_automati
     repo.commit("Append ordinary turn and attachment").unwrap();
     repo.tag(&format!("{session}/1.2")).unwrap();
     let head = repo.git(&["rev-parse", "work"]).unwrap();
-    repo.set_auto_push(Some(true)).unwrap();
     let automatic = || {
         hub.command(root.path(), &["push", "alice/demo@work"])
             .env("AGIT_AUTO_PUSH", "1")
             .output()
             .unwrap()
     };
-    refused(automatic(), "renewed confirmation");
+    refused(automatic(), "automatic publication is disabled");
+    repo.set_auto_push(Some(true)).unwrap();
     let before = ordinary_git_receiver::git(&remote, &["for-each-ref"]);
     let preview = hub.run(
         root.path(),
@@ -616,10 +616,6 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     };
     let pending = serde_json::to_vec(&request).unwrap();
     let result = root.path().join("supervisor-result.json");
-    let consent = repo
-        .common_dir()
-        .unwrap()
-        .join("agit/privacy-auto-consent.json");
     let push = |accept_findings| {
         std::fs::write(&result, &pending).unwrap();
         let mut command = hub.command(root.path(), &["--yes", "push", "alice/demo@work"]);
@@ -636,21 +632,18 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     refused(push(false), "answered 503 to the push-access probe");
     assert!(PublicationReceipt::load(&repo, "work").unwrap().is_none());
     assert_eq!(std::fs::read(&result).unwrap(), pending);
-    assert!(!consent.exists());
 
     hub.reject_advertisement.store(false, Ordering::Release);
     hub.require_secret_acceptance.store(true, Ordering::Release);
     refused(push(false), "answered 422 to the push-access probe");
     assert!(PublicationReceipt::load(&repo, "work").unwrap().is_none());
     assert_eq!(std::fs::read(&result).unwrap(), pending);
-    assert!(!consent.exists());
     let accepted = push(true);
     assert!(accepted.status.success(), "{accepted:?}");
     assert!(String::from_utf8_lossy(&accepted.stdout).contains("up to date"));
     let receipt = PublicationReceipt::load(&repo, "work").unwrap().unwrap();
     assert_eq!(receipt.published, head);
     assert_eq!(request.read_result(&result).unwrap(), receipt);
-    let authorized = std::fs::read(&consent).unwrap();
     let automatic = hub
         .command(
             root.path(),
@@ -670,7 +663,6 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
         receipt
     );
     assert_eq!(std::fs::read(&result).unwrap(), pending);
-    assert_eq!(std::fs::read(&consent).unwrap(), authorized);
     assert_eq!(ordinary_git_receiver::git(&remote, &["for-each-ref"]), refs);
     let requests = hub.requests.lock().unwrap();
     assert!(
@@ -752,6 +744,113 @@ fn initial_ordinary_push_creates_without_a_viewing_password_and_never_uses_a_fai
         requests
             .iter()
             .all(|(request, _)| !request.contains("/privacy/"))
+    );
+}
+
+/// Without a creation preference, `--yes` or a terminal, a first push creates an ordinary
+/// repository, and an automatic push later continues it with only push.auto enabled, while
+/// push.auto off refuses it without publishing. An encrypted default stops at the viewing-key
+/// gate, a confirmation requirement refuses before creation, a saved-consent requirement refuses
+/// the automatic push because nothing here saves one, and ignoring push.auto publishes the
+/// refused turn.
+#[test]
+fn default_publication_is_ordinary_unattended_and_continues_automatically() {
+    let root = tempfile::tempdir().unwrap();
+    let remote_root = root.path().join("remote");
+    std::fs::create_dir_all(&remote_root).unwrap();
+    let hub = Hub::start_git(Some(remote_root.clone()));
+    hub.authenticate(root.path());
+    let (repo, _, _) = ordinary_source(root.path());
+    let remote = remote_root.join("alice/demo.git");
+    hub.missing_until_create.store(true, Ordering::Release);
+    let first = hub.run(root.path(), &["push", "alice/demo@work"]);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(
+        ordinary_git_receiver::git(&remote, &["rev-parse", "work"]),
+        repo.git(&["rev-parse", "work"]).unwrap()
+    );
+    let requests = hub.requests.lock().unwrap();
+    let (_, creation) = requests
+        .iter()
+        .find(|(request, _)| request.starts_with("POST /api/agents "))
+        .unwrap();
+    assert_eq!(creation["encryption_enabled"], false);
+    assert!(
+        requests
+            .iter()
+            .all(|(request, _)| !request.contains("/privacy/"))
+    );
+    drop(requests);
+
+    std::fs::write(repo.root().join("continuation.txt"), "Automatic turn.\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Automatic ordinary continuation").unwrap();
+    let published = ordinary_git_receiver::git(&remote, &["rev-parse", "work"]);
+    let automatic = || {
+        hub.command(root.path(), &["--json", "push", "alice/demo@work"])
+            .env("AGIT_AUTO_PUSH", "1")
+            .output()
+            .unwrap()
+    };
+    repo.set_auto_push(Some(false)).unwrap();
+    refused(automatic(), "automatic publication is disabled");
+    assert_eq!(
+        ordinary_git_receiver::git(&remote, &["rev-parse", "work"]),
+        published
+    );
+    repo.set_auto_push(Some(true)).unwrap();
+    let automatic = automatic();
+    assert!(automatic.status.success(), "{automatic:?}");
+    assert_eq!(
+        ordinary_git_receiver::git(&remote, &["rev-parse", "work"]),
+        repo.git(&["rev-parse", "work"]).unwrap()
+    );
+    assert!(
+        !repo
+            .common_dir()
+            .unwrap()
+            .join("agit/privacy-auto-consent.json")
+            .exists()
+    );
+}
+
+/// A checkout initialized for encryption refuses its first publication to an existing ordinary
+/// repository, before any Git transport, until the command line selects ordinary publication.
+/// Following the Hub's mode silently would send original history in plaintext to a repository
+/// whose mode came from a default rather than the owner's choice.
+#[test]
+fn encrypted_creation_intent_refuses_first_ordinary_publication_without_explicit_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let remote_root = root.path().join("remote");
+    std::fs::create_dir_all(&remote_root).unwrap();
+    let hub = Hub::start_git(Some(remote_root.clone()));
+    hub.authenticate(root.path());
+    let (repo, _, _) = ordinary_source(root.path());
+    repo.set_creation_encryption(true).unwrap();
+    let remote = remote_root.join("alice/demo.git");
+    ordinary_git_receiver::initialize(&remote);
+
+    refused(
+        hub.run(root.path(), &["push", "alice/demo@work"]),
+        "initialized for an encrypted repository",
+    );
+    assert!(
+        hub.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(request, _)| !request.contains("git-receive-pack")
+                && !request.starts_with("POST "))
+    );
+
+    let explicit = hub.run(
+        root.path(),
+        &["push", "alice/demo@work", "--encryption=false"],
+    );
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert_eq!(
+        ordinary_git_receiver::git(&remote, &["rev-parse", "work"]),
+        repo.git(&["rev-parse", "work"]).unwrap()
     );
 }
 
@@ -1002,7 +1101,7 @@ fn empty_hub_repository_mode_is_fixed_and_never_inherits_local_defaults() {
     hub.authenticate(root.path());
     let repo = Repo::init(&root.path().join("agit/repos/alice/demo")).unwrap();
     let local = hub.setting(root.path());
-    assert_eq!(local["effective"], true);
+    assert_eq!(local["effective"], false);
     assert_eq!(local["scope"], "creation_intent");
     repo.set_creation_encryption(true).unwrap();
     identity::pin(&repo, &RemoteIdentity::new(&hub.base, ID).unwrap()).unwrap();
@@ -1202,10 +1301,10 @@ fn creation_sends_selected_mode_and_rechecks_it_before_installing_local_identity
         })
     };
     for (name, enabled, flags) in [
-        ("encrypted", true, vec![]),
-        ("ordinary", false, vec!["--encryption=false"]),
-        ("preferred", false, vec![]),
-        ("override", true, vec!["--encryption=true"]),
+        ("ordinary", false, vec![]),
+        ("encrypted", true, vec!["--encryption=true"]),
+        ("preferred", true, vec![]),
+        ("override", false, vec!["--encryption=false"]),
     ] {
         *hub.response.lock().unwrap() = (200, response(name, enabled));
         hub.missing_until_create.store(true, Ordering::Release);
@@ -1225,9 +1324,9 @@ fn creation_sends_selected_mode_and_rechecks_it_before_installing_local_identity
         let repo = Repo::open(root.path().join(format!("agit/repos/alice/{name}"))).unwrap();
         assert_eq!(identity::read(&repo).unwrap().unwrap().agent_id, ID);
         assert_eq!(repo.auto_push_override().unwrap(), None);
-        if name == "ordinary" {
+        if name == "encrypted" {
             assert!(
-                hub.run(root.path(), &["config", "privacy.encryption", "false"])
+                hub.run(root.path(), &["config", "privacy.encryption", "true"])
                     .status
                     .success()
             );
@@ -1276,6 +1375,8 @@ fn creation_sends_selected_mode_and_rechecks_it_before_installing_local_identity
     assert!(!root.path().join("agit/repos/alice/unsupported").exists());
 }
 
+/// Password setup for a missing repository creates it encrypted although no flag or preference
+/// selects encryption; inheriting the ordinary creation default would refuse before creation.
 #[test]
 fn browser_password_setup_creates_privately_and_checks_current_key_without_mutation() {
     let hub = Hub::start();

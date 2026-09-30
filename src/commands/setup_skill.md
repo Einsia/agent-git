@@ -63,7 +63,10 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   (or `=true`). The `=` is required; `--auto-push false` is refused. Automatic
   pushing needs an account: signed out, `--auto-push=true` prints a login link
   for the human and stops before creating anything. A first `agit push` without
-  `--public` or `--private` publishes private when nobody can be asked.
+  `--public` or `--private` publishes private when nobody can be asked. New
+  repositories use ordinary publication, with no viewing password and no `--yes`
+  needed off a terminal; encryption is an explicit opt-in at creation
+  (`--encryption=true`), after which `agit privacy init` sets its viewing password.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
   two writers in at once. `was already adopted` is informational; the import

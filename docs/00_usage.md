@@ -486,8 +486,14 @@ remote      none yet (a real push would create it)
 visibility  asked at first publish; unchanged after that
 ```
 
-Three things worth knowing:
+Four things worth knowing:
 
+- **New repositories are ordinary by default.** The first push creates the repository and
+  publishes original history with no viewing password; off a terminal it needs no `--yes`.
+  Encryption is an explicit opt-in chosen at creation (`--encryption=true` on `push`, `init` or
+  `repo create`, or `agit config privacy.encryption true`); set an encrypted repository's viewing
+  password with `agit privacy init alice/payments` before its first push. A repository's mode is
+  fixed once it exists.
 - **Visibility is decided at the first push only.** On a TTY it asks; non-interactive defaults to
   private. Change it afterwards with `agit repo visibility alice/payments public`; `agit push`
   never touches it.
@@ -601,8 +607,10 @@ agit share rm <slug>      # revoke one
 
 `--public` sends a structured public projection without private recovery data; `--password` adds
 a passphrase. Privacy rules rewrite or omit excluded content and secrets before publication.
-Default encrypted sharing requires your configured viewing key: the link opens the checked
-presentation, while your viewing password can additionally recover the selected original records.
+Default encrypted sharing applies to encrypted repositories and requires your configured viewing
+key: the link opens the checked presentation, while your viewing password can additionally
+recover the selected original records. An ordinary repository has no viewing key; share its
+history with `--public`, since without it the command refuses before uploading.
 Creating links requires a Hub and viewer that support the versioned privacy share protocol.
 
 ### 4.2 Search for precedent
@@ -893,6 +901,9 @@ answers).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.
+`privacy.encryption` (default `false`) selects encryption for repositories created afterward;
+`--encryption=true|false` overrides it per repository, and an existing repository keeps the mode
+it was created with.
 Automatic settlement is enabled by default: `commit.auto = true`. Setting it to `false` disables
 hook and supervisor settlement; explicit `agit commit` remains available. Unsetting the key
 restores the enabled default. The config list and editor show this effective default separately

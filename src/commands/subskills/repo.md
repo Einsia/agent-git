@@ -49,11 +49,12 @@ agit repo delete szh/p1 --local
 
 ## Fixed encryption mode
 
-Encryption is fixed when a Hub repository is created. `--encryption=true|false`
-overrides the user's `privacy.encryption` creation default (built-in `true`).
-Visibility remains independent. An encrypted repository requires explicit viewing
-password setup with `agit privacy init <owner/repo>` before encrypted publication.
-An ordinary repository requires no viewing password.
+Encryption is fixed when a Hub repository is created. New repositories use ordinary
+publication unless encryption is chosen: `--encryption=true|false` overrides the
+user's `privacy.encryption` creation default (built-in `false`). Visibility remains
+independent. An encrypted repository requires explicit viewing password setup with
+`agit privacy init <owner/repo>` before encrypted publication. An ordinary repository
+requires no viewing password.
 
 If the name already exists, creation reports its unchanged mode and directs you
 to `agit clone` to retain its identity and history. A conflicting explicit mode

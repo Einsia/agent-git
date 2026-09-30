@@ -48,10 +48,16 @@ After recovery, follow the selected session's resume/run rules and writer checks
 unlock does not itself start or attach a runtime. RC still protects outgoing content, so local
 recovery does not promise an unredacted original in the web Workspace.
 
-For agent-assisted onboarding, let the user set the viewing password in the browser:
+Viewing passwords exist only for encrypted repositories. New repositories use ordinary
+publication by default and need no password before their first push; skip this onboarding
+unless the user chose encryption.
 
-1. Complete login and local initialization/import. Use `agit init NAME --auto-push=false`
-   for initial setup; keep automatic publication disabled until setup is complete.
+For agent-assisted onboarding of an encrypted repository, let the user set the viewing
+password in the browser:
+
+1. Complete login and local initialization/import. Use
+   `agit init NAME --encryption=true --auto-push=false` for initial setup; keep automatic
+   publication disabled until setup is complete.
 2. Run the following command, retaining this explicit Hub and repository on every retry:
 
    ```sh
@@ -101,10 +107,11 @@ retains historical key records. Initialization configures the repository before 
 Password operations require an encrypted repository. `privacy init` cannot change
 an existing ordinary repository's mode, including an empty one; create a different
 repository for encrypted publication. When creating a missing repository, init
-uses its local creation intent or the global `privacy.encryption` default. Use
-`--encryption=true` to select an encrypted new repository explicitly. A disabled
-selection is refused before creation; use `agit repo create --encryption=false`
-to create an ordinary repository without a viewing password.
+uses `--encryption`, then the local creation intent, then a stored
+`privacy.encryption` preference; when none is set it creates an encrypted
+repository, because a viewing password implies encryption. A disabled selection is
+refused before creation; use `agit repo create --encryption=false` to create an
+ordinary repository without a viewing password.
 
 `agit privacy` manages the policy used before a session, export, share, or push enters the
 publication pipeline. The policy is stored below the local AgentGit repository's Git common

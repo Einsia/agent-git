@@ -115,6 +115,23 @@ pub fn run(mut args: Args) -> CmdResult {
         .as_ref()
         .map(|root| Repo::open(root).context("the source repository is unavailable"))
         .transpose()?;
+    // An encrypted link seals selected records to the viewing key of an encrypted repository's
+    // accepted publication. Ordinary history has no such key, so the default refuses before
+    // any prompt instead of asking for a publication that can never exist.
+    if !args.public
+        && let (Some(repo), Some(branch)) = (repo.as_ref(), source.branch.as_deref())
+        && crate::domain::privacy_receipt::PublicationReceipt::load(repo, branch)?
+            .is_some_and(|receipt| !receipt.mode.is_encrypted())
+    {
+        ui::error(&format!(
+            "{} uses ordinary publication; encrypted links require an encrypted repository, so no share was uploaded",
+            source.label
+        ));
+        ui::hint(
+            "rerun with --public for an unencrypted link anyone with the URL can fetch, or give readers access to the repository on the Hub",
+        );
+        return Ok(ExitCode::Precondition);
+    }
     let sources = super::privacy::sources::Sources::resolve(
         repo.as_ref().zip(source.repository.as_deref()),
         Some(&client),
