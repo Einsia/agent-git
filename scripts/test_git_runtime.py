@@ -1,7 +1,9 @@
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
+import ssl
 import tarfile
 import tempfile
 import unittest
@@ -13,6 +15,16 @@ spec.loader.exec_module(runtime)
 
 
 class RuntimeArchiveTests(unittest.TestCase):
+    def test_linux_certificate_store_is_pinned_and_available_without_network(self):
+        lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            runtime.urllib.request, "urlopen", side_effect=AssertionError("network unavailable")
+        ):
+            body = runtime.download(lock["linux_ca_bundle"], Path(temporary))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cadata=body.decode())
+        self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+
     def test_vendored_license_checkout_line_endings_cannot_change_pinned_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "license.txt"

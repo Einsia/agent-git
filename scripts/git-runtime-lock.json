@@ -36,14 +36,6 @@
         "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/138a6bf9dea5974644e48fef4826b7c474f2f7d8/main/c-ares"
       },
       {
-        "name": "ca-certificates-bundle",
-        "version": "20260611-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ca-certificates-bundle-20260611-r0.apk",
-        "sha256": "cd7752154d0fa628a5f7360218e9e8e83edf31f7fa26f58ee42d26b507bd0372",
-        "license": "MPL-2.0 AND MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e41cbd2ae991adfe8df298ba8e8e777e90bd0e03/main/ca-certificates"
-      },
-      {
         "name": "git",
         "version": "2.54.0-r0",
         "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/git-2.54.0-r0.apk",
@@ -172,14 +164,6 @@
         "sha256": "689603d300dc56f0b99e313506e4d7b3a3ffb87cec536324f8a306bc218afe67",
         "license": "MIT",
         "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/138a6bf9dea5974644e48fef4826b7c474f2f7d8/main/c-ares"
-      },
-      {
-        "name": "ca-certificates-bundle",
-        "version": "20260611-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/ca-certificates-bundle-20260611-r0.apk",
-        "sha256": "bc5d3ae0b602748852e0bc601a4348cabc4f654f12f27578919cbf3c810f1c1e",
-        "license": "MPL-2.0 AND MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e41cbd2ae991adfe8df298ba8e8e777e90bd0e03/main/ca-certificates"
       },
       {
         "name": "git",
@@ -368,5 +352,23 @@
       "sha256": "272d1239bdcef73bb98bac206168ca1040bd4a31296755fadfb7515bcea18df3",
       "path": "git-runtime-licenses/curl.txt"
     }
+  },
+  "linux_ca_bundle": {
+    "version": "20260611-r0",
+    "path": "git-runtime-data/ca-certificates.pem.gz",
+    "sha256": "b8d837841b88bfaa1a0fa827cbca8e2576418dd47c9fc4bb7f1f9d89c83111b9",
+    "license": "MPL-2.0 AND MIT",
+    "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e41cbd2ae991adfe8df298ba8e8e777e90bd0e03/main/ca-certificates",
+    "source_archives": [
+      {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ca-certificates-bundle-20260611-r0.apk",
+        "sha256": "cd7752154d0fa628a5f7360218e9e8e83edf31f7fa26f58ee42d26b507bd0372"
+      },
+      {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/ca-certificates-bundle-20260611-r0.apk",
+        "sha256": "bc5d3ae0b602748852e0bc601a4348cabc4f654f12f27578919cbf3c810f1c1e"
+      }
+    ],
+    "compression": "gzip"
   }
 }

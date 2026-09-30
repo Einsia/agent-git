@@ -22,8 +22,12 @@ import zipfile
 
 def download(pin, cache):
     if "path" in pin:
-        # Git checkout filters can change text line endings; the pin verifies canonical upstream bytes.
-        body = Path(__file__).parent.joinpath(pin["path"]).read_bytes().replace(b"\r\n", b"\n")
+        body = Path(__file__).parent.joinpath(pin["path"]).read_bytes()
+        if pin.get("compression") == "gzip":
+            body = gzip.decompress(body)
+        else:
+            # Git checkout filters can change text line endings; pins verify canonical payloads.
+            body = body.replace(b"\r\n", b"\n")
         if hashlib.sha256(body).hexdigest() != pin["sha256"]:
             raise ValueError("vendored checksum mismatch: " + pin["path"])
         return body
@@ -155,6 +159,7 @@ def assemble(lock, target, cache):
         arch = "aarch64" if target.startswith("aarch64-") else "x86_64"
         git = lock["linux"][arch]
         files = linux_runtime(git, cache, arch)
+        files["ssl/cert.pem"] = (download(lock["linux_ca_bundle"], cache), 0o644)
         lfs_key = "linux-arm64" if arch == "aarch64" else "linux-amd64"
     elif windows:
         git = lock["windows"]
@@ -195,6 +200,8 @@ def assemble(lock, target, cache):
         if "linux" in target or name in ("GPL-2.0-only", "MIT"):
             files["licenses/" + name + ".txt"] = (download(pin, cache), 0o644)
     manifest = {"target": target, "git": git, "lfs": lfs}
+    if "linux" in target:
+        manifest["ca_bundle"] = lock["linux_ca_bundle"]
     files["runtime-manifest.json"] = (json.dumps(manifest, indent=2).encode() + b"\n", 0o644)
     files["THIRD-PARTY-NOTICES.txt"] = (
         b"Git and Git LFS run as separate programs and retain their upstream licenses.\n"
