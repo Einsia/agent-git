@@ -6,14 +6,13 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
 };
-use zeroize::Zeroizing;
 
 const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 4;
 type Entry = ([u8; 32], Arc<AhoCorasick>);
 static CACHE: OnceLock<Mutex<VecDeque<Entry>>> = OnceLock::new();
 
-pub(super) fn compile(patterns: &[Zeroizing<String>]) -> crate::Result<Arc<AhoCorasick>> {
+pub(super) fn compile(patterns: &[&str]) -> crate::Result<Arc<AhoCorasick>> {
     // Order and boundaries determine pattern IDs, which select each replacement's source.
     let mut digest = Sha256::new();
     digest.update(b"agit-secret-protector-standard-v1");
@@ -64,19 +63,12 @@ pub(super) fn compile(patterns: &[Zeroizing<String>]) -> crate::Result<Arc<AhoCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn patterns(values: &[&str]) -> Vec<Zeroizing<String>> {
-        values
-            .iter()
-            .map(|value| Zeroizing::new((*value).to_owned()))
-            .collect()
-    }
-
     #[test]
     fn policy_changes_and_pattern_order_cannot_reuse_stale_match_ids() {
-        let first = compile(&patterns(&["cache-policy-alpha", "cache-policy-beta"])).unwrap();
-        let same = compile(&patterns(&["cache-policy-alpha", "cache-policy-beta"])).unwrap();
+        let first = compile(&["cache-policy-alpha", "cache-policy-beta"]).unwrap();
+        let same = compile(&["cache-policy-alpha", "cache-policy-beta"]).unwrap();
         assert!(Arc::ptr_eq(&first, &same));
-        let reversed = compile(&patterns(&["cache-policy-beta", "cache-policy-alpha"])).unwrap();
+        let reversed = compile(&["cache-policy-beta", "cache-policy-alpha"]).unwrap();
         assert_eq!(
             reversed
                 .find("cache-policy-alpha")
@@ -85,9 +77,9 @@ mod tests {
                 .as_usize(),
             1
         );
-        let removed = compile(&patterns(&["cache-policy-alpha"])).unwrap();
+        let removed = compile(&["cache-policy-alpha"]).unwrap();
         assert!(removed.find("cache-policy-beta").is_none());
-        let boundary = compile(&patterns(&["cache-policy-al", "phacache-policy-beta"])).unwrap();
+        let boundary = compile(&["cache-policy-al", "phacache-policy-beta"]).unwrap();
         assert!(boundary.find("cache-policy-alpha").is_some());
         assert!(boundary.find("cache-policy-beta").is_none());
     }
