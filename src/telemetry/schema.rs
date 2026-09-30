@@ -495,6 +495,35 @@ mod tests {
     }
 
     #[test]
+    fn project_telemetry_excludes_directory_and_repository_values() {
+        let value = capture(&[
+            "agit",
+            "project",
+            "bind",
+            "/private-canary/project",
+            "--repo",
+            "private-canary/repo",
+            "--history",
+            "none",
+            "--auto-upload",
+            "--dry-run",
+        ]);
+        assert_eq!(value["command_path"], "project bind");
+        assert_eq!(value["arg_history"], "none");
+        for field in ["arg_path", "arg_repo", "arg_auto_upload", "arg_dry_run"] {
+            assert_eq!(value[field], true);
+        }
+        assert!(!value.to_string().contains("private-canary"));
+
+        for action in ["sync", "status", "unbind"] {
+            let value = capture(&["agit", "project", action, "/private-canary/project"]);
+            assert_eq!(value["command_path"], format!("project {action}"));
+            assert_eq!(value["arg_path"], true);
+            assert!(!value.to_string().contains("private-canary"));
+        }
+    }
+
+    #[test]
     fn local_reconciliation_captures_flags_without_arbitrary_feature_or_target_values() {
         let bridge = capture(&[
             "agit",

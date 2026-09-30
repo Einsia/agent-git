@@ -311,6 +311,7 @@ fn startup_for(command: &Commands) -> Startup {
             Startup::ToolDispatcher
         }
         Commands::Status(_) => Startup::Inspect,
+        Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
         Commands::Mcp(_) => Startup::ToolDispatcher,
@@ -417,6 +418,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Repo(a) => commands::repo::run(a),
 
         Commands::Import(a) => commands::import::run_with_output(a, json),
+        Commands::Project(a) => commands::project::run(a),
         Commands::Status(a) => commands::status::run(a),
         Commands::Memory(a) => commands::memory::run(a),
         Commands::Distill(a) => commands::memory::run_distill(a),

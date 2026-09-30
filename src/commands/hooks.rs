@@ -277,7 +277,9 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     let env_session = super::context::from_session_env();
 
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
-    let bound = dir.map(|d| workspace::read(d).is_some()).unwrap_or(false);
+    let bound = dir
+        .map(|d| workspace::read(d).is_some() || super::project::registration_scope(d))
+        .unwrap_or(false);
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
     if rt == "codex" && ev.source != Source::Compact {
         let _ = crate::rc::runtime_sources::Registry::open()
@@ -553,6 +555,9 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
     };
+    if !archive_required && super::project::capture(rt, &ev.session_id, ev.cwd.as_deref())? {
+        return Ok(());
+    }
     let Some(lk) = super::commit::archive::native_link(
         &store,
         &crate::domain::merge_archive::RuntimeLinkKey {

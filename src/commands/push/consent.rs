@@ -8,7 +8,7 @@ use std::{fs, io::Write};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct AutoConsent {
+pub(crate) struct AutoConsent {
     pub version: u32,
     #[serde(default, skip_serializing_if = "PublicationMode::is_encrypted")]
     pub mode: PublicationMode,

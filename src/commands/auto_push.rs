@@ -44,6 +44,7 @@ pub(super) fn after_settlement(
 ) {
     if std::env::var_os(super::commit::SUPERVISOR_RESULT_ENV).is_some()
         || crate::rc::harness::settlement_is_delegated()
+        || std::env::var_os(AUTOMATIC_ENV).is_some()
     {
         return;
     }
@@ -60,6 +61,16 @@ pub(super) fn after_settlement(
         Err(error) => {
             ui::warning(&format!(
                 "saved locally; automatic pushing is disabled: {error:#}"
+            ));
+            return;
+        }
+    }
+    match super::project::blocks_auto_push(&repo, slug, branch) {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(error) => {
+            ui::warning(&format!(
+                "saved locally; project policy could not be verified: {error:#}"
             ));
             return;
         }

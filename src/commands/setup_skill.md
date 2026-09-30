@@ -234,6 +234,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | Command | Meaning |
 |---|---|
 | `import` | Adopt an existing runtime transcript into a repo/branch |
+| `project` | Explicitly enroll a project directory, sync its history, inspect status, or pause hook capture |
 | `status` | Show identity, adopted sessions, bindings, and sync state |
 | `branch` | List, rename, remove, or seal existing branches; it does not create them |
 

@@ -350,6 +350,22 @@ fn codex_hooks_capability() -> Option<CodexHooksCapability> {
     parse_codex_hooks_capability(&String::from_utf8_lossy(&output.stdout))
 }
 
+pub(super) fn require_project_hooks() -> crate::Result<()> {
+    let claude = crate::adapter::get("claude-code")?.available();
+    let codex = crate::adapter::get("codex")?.available();
+    anyhow::ensure!(
+        claude || codex,
+        "install Claude Code or Codex before enabling project hooks"
+    );
+    if codex {
+        anyhow::ensure!(
+            codex_hooks_capability().is_some_and(|c| c.enabled),
+            "Codex must report an enabled hooks feature before automatic project capture; use manual project sync otherwise"
+        );
+    }
+    Ok(())
+}
+
 fn parse_codex_hooks_capability(output: &str) -> Option<CodexHooksCapability> {
     output.lines().find_map(|line| {
         let mut fields = line.split_whitespace();

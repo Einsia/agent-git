@@ -9,7 +9,7 @@ mod audit_report;
 mod audit_workspace;
 mod audited_push;
 mod consent;
-pub(crate) use audited_push::automatic_publication_consent;
+pub(crate) use audited_push::{automatic_publication_consent, publication_consent};
 mod preview;
 
 use super::{CmdResult, require_login};

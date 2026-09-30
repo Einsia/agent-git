@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- `agit project bind` enrolls a selected directory and its unbound subdirectories
+  in an existing repository, with explicit history import and automatic upload
+  choices. `project sync` retries synchronization, `project status` reports local
+  results, and `project unbind` pauses project capture. Codex and Claude Code hooks
+  preserve existing session claims and enforce the current project policy before
+  publishing.
+
 ### Fixed
 
 - Repeated Remote Control history reads reuse bounded, authenticated secret

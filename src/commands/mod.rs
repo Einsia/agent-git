@@ -40,6 +40,7 @@ pub mod echo;
 pub mod fix;
 pub mod import;
 pub mod json;
+pub mod project;
 pub mod status;
 pub mod target;
 pub mod upgrade;
@@ -1402,6 +1403,8 @@ pub enum Commands {
     // ── Adoption and status ─────────────────────────────────────────
     /// Adopt a running session; import settles immediately (cursor picker; --link-only works offline)
     Import(import::Args),
+    /// Bind project directories, sync their sessions, or pause automatic capture
+    Project(project::Args),
     /// Who am I, adopted sessions, sync state (instant, offline)
     Status(status::Args),
     /// List, rename, remove, or seal session branches
@@ -1501,6 +1504,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Run(_) => "run",
         Commands::Repo(_) => "repo",
         Commands::Import(_) => "import",
+        Commands::Project(_) => "project",
         Commands::Status(_) => "status",
         Commands::Branch(_) => "branch",
         Commands::Commit(_) => "commit",

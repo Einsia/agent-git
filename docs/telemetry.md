@@ -40,6 +40,10 @@ It covers canonical top-level commands, nested subcommands, aliases, MCP tools a
 inputs, and RC protocol methods. Tests reject unclassified additions. Aliases are
 reported under their canonical command name.
 
+Project commands report the selected `history` enum and boolean options. Directory
+paths and destination repositories are presence-only; their values are never
+included in telemetry.
+
 | Field category | Representation |
 | --- | --- |
 | Commands | Fixed command and subcommand names |

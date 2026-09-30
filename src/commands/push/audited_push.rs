@@ -1286,6 +1286,15 @@ pub(crate) fn automatic_publication_consent(
     if !repo.auto_push_enabled()? {
         return Ok(false);
     }
+    publication_consent(repo, repository, expected)?.matches(repo)
+}
+
+/// Explicit project enrollment reviews the same policy that unattended push later rechecks.
+pub(crate) fn publication_consent(
+    repo: &Repo,
+    repository: &str,
+    expected: &RemoteIdentity,
+) -> Result<AutoConsent> {
     let client = Client::from_env_with_timeout(std::time::Duration::from_secs(5));
     ensure!(
         identity::normalize_hub(client.base())? == expected.hub,
@@ -1308,14 +1317,13 @@ pub(crate) fn automatic_publication_consent(
     let credential =
         credentials::load_checked(&expected.hub)?.context("publication account is unavailable")?;
     if !remote.require_encryption_enabled()? {
-        return ordinary::consent(
+        return Ok(ordinary::consent(
             &expected.hub,
             &credential,
             &remote.agent_id,
             &remote.clone_url,
             &remote.visibility,
-        )
-        .matches(repo);
+        ));
     }
     let policy_sources = client.privacy_policy_sources(repository, Some(&expected.agent_id))?;
     let sources = super::super::privacy::sources::Sources::bound_repository(
@@ -1331,7 +1339,7 @@ pub(crate) fn automatic_publication_consent(
         .repository_publishing_key(repository, expected)?
         .require_current(repository)?;
     let recipient = viewing.viewing_recipient()?;
-    AutoConsent {
+    Ok(AutoConsent {
         version: 1,
         mode: Default::default(),
         hub: expected.hub.clone(),
@@ -1342,8 +1350,7 @@ pub(crate) fn automatic_publication_consent(
         visibility: remote.visibility,
         policy_digest: Some(policy.digest()?),
         recipient: Some(recipient.fingerprint()?),
-    }
-    .matches(repo)
+    })
 }
 
 fn verify_url(hub: &str, url: &str) -> Result<()> {
