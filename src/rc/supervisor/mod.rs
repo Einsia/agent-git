@@ -3644,6 +3644,16 @@ pub(crate) fn items_from_lines_with_mode(
     lines: &[crate::rc::tail::TailedLine],
     mode: super::codex_history::HistoryMode,
 ) -> (Vec<ItemCompleted>, Vec<String>) {
+    items_from_lines_profiled(runtime, redactor, lines, mode, &mut |_, _| {})
+}
+
+pub(crate) fn items_from_lines_profiled(
+    runtime: &str,
+    redactor: &redact::Redactor,
+    lines: &[crate::rc::tail::TailedLine],
+    mode: super::codex_history::HistoryMode,
+    record_timing: &mut dyn FnMut(&'static str, f64),
+) -> (Vec<ItemCompleted>, Vec<String>) {
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return (vec![], vec![]);
     };
@@ -3683,7 +3693,7 @@ pub(crate) fn items_from_lines_with_mode(
         .iter()
         .map(|(_, raw, pointers)| (raw, pointers.as_slice()))
         .collect();
-    let protected = redactor.scrub_native_batch(&inputs);
+    let protected = redactor.scrub_native_batch_profiled(&inputs, record_timing);
     let mut out = vec![];
     let mut registered = std::collections::HashSet::new();
     let mut protection_error_emitted = false;

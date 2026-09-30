@@ -421,11 +421,20 @@ impl Redactor {
         self.scrub_native_batch(&[(value, pointers)]).remove(0)
     }
 
-    /// Healthy pages share a dictionary transaction; identity masks remain occurrence-scoped.
-    #[cfg(feature = "rc")]
+    #[cfg(all(feature = "rc", test))]
     pub(crate) fn scrub_native_batch(
         &self,
         records: &[(&serde_json::Value, &[&str])],
+    ) -> Vec<NativeJson> {
+        self.scrub_native_batch_profiled(records, &mut |_, _| {})
+    }
+
+    /// Healthy pages share a dictionary transaction; identity masks remain occurrence-scoped.
+    #[cfg(feature = "rc")]
+    pub(crate) fn scrub_native_batch_profiled(
+        &self,
+        records: &[(&serde_json::Value, &[&str])],
+        record_timing: &mut dyn FnMut(&'static str, f64),
     ) -> Vec<NativeJson> {
         let withheld = || NativeJson {
             value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
@@ -450,9 +459,12 @@ impl Redactor {
                     })
                     .collect());
             };
+            let started = std::time::Instant::now();
             let mut native = native
                 .lock()
                 .map_err(|_| anyhow::anyhow!("native protection context is unavailable"))?;
+            record_timing("identity_lock_ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
             let runtime = native.runtime.clone();
             let session = native.session.clone();
             if !native.seeded && !session.is_empty() {
@@ -466,6 +478,8 @@ impl Redactor {
                 }
                 native.seeded = true;
             }
+            record_timing("identity_seed_ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
             let masks: Vec<_> = records
                 .iter()
                 .map(|(value, pointers)| {
@@ -488,6 +502,10 @@ impl Redactor {
                     mask
                 })
                 .collect();
+            record_timing(
+                "identity_masks_ms",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
             let Some(dictionary) = &self.dictionary else {
                 return Ok(records
                     .iter()
@@ -512,18 +530,23 @@ impl Redactor {
                     .collect());
             };
             let registered = self.registered.snapshot();
-            let protect = |range: std::ops::Range<usize>| -> crate::Result<Vec<NativeJson>> {
+            let mut protect = |range: std::ops::Range<usize>| -> crate::Result<Vec<NativeJson>> {
                 let mut input = String::new();
                 for (value, _) in &records[range.clone()] {
                     input.push_str(&serde_json::to_string(value)?);
                     input.push('\n');
                 }
                 let mut index = range.start;
-                let protected = dictionary.protect_with_masks(&input, &registered, |_| {
-                    let mask = masks[index].clone();
-                    index += 1;
-                    mask
-                })?;
+                let protected = dictionary.protect_with_masks_profiled(
+                    &input,
+                    &registered,
+                    |_| {
+                        let mask = masks[index].clone();
+                        index += 1;
+                        mask
+                    },
+                    record_timing,
+                )?;
                 anyhow::ensure!(
                     protected.intact == 0,
                     "native page exceeds its reversible protection limit"
@@ -554,7 +577,9 @@ impl Redactor {
             };
             // A single oversized or malformed record must not hide healthy neighbors. Retry
             // each record with its original mask, while keeping every failed record fail-closed.
-            match protect(0..records.len()) {
+            let started = std::time::Instant::now();
+            let protected = protect(0..records.len());
+            let result = match protected {
                 Ok(values) => Ok(values),
                 Err(batch_error) => {
                     let mut values = Vec::with_capacity(records.len());
@@ -579,7 +604,12 @@ impl Redactor {
                     }
                     Ok(values)
                 }
-            }
+            };
+            record_timing(
+                "dictionary_protect_ms",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+            result
         })();
         result.unwrap_or_else(|error| {
             eprintln!(

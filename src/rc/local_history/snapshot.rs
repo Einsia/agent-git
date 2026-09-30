@@ -299,9 +299,17 @@ pub(super) fn read(
                     let context = select_view(&mut lines, runtime, params);
                     Ok((lines, next, mode, context))
                 })?;
+            let mut projection_phases: std::collections::BTreeMap<&'static str, f64> =
+                std::collections::BTreeMap::new();
             let items: Vec<Value> = timings.measure("projection_ms", || {
-                let (items, _) = super::super::supervisor::items_from_lines_with_mode(
-                    runtime, &redactor, &lines, mode,
+                let (items, _) = super::super::supervisor::items_from_lines_profiled(
+                    runtime,
+                    &redactor,
+                    &lines,
+                    mode,
+                    &mut |name, elapsed| {
+                        *projection_phases.entry(name).or_default() += elapsed;
+                    },
                 );
                 items
                     .into_iter()
@@ -320,6 +328,9 @@ pub(super) fn read(
                     .collect()
             });
 
+            for (name, elapsed) in projection_phases {
+                *timings.0.entry(name).or_default() += elapsed;
+            }
             if !items.is_empty() || next == 0 || skipped == 7 {
                 break (items, next);
             }

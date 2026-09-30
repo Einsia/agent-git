@@ -209,9 +209,23 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     /// wire representation. Malformed/truncated lines fall back to literal text
     /// so the transformation remains fail-closed for readable bytes.
     pub fn protect_jsonl(&self, text: &str, global: &Matcher) -> crate::Result<ProtectionReport> {
+        self.protect_jsonl_profiled(text, global, &mut |_, _| {})
+    }
+
+    fn protect_jsonl_profiled(
+        &self,
+        text: &str,
+        global: &Matcher,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> crate::Result<ProtectionReport> {
+        let started = std::time::Instant::now();
         self.store.with_lock(|| {
+            record_timing("dictionary_lock_ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
             let (unlocked, records) = ProtectionState::read_records(&self.store)?;
             let allowlist = local_allowlist(&records, global, unlocked.as_ref())?;
+            record_timing("dictionary_read_ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
             // A finding larger than a reversible record cannot become a
             // placeholder, but that is a fact about *that* finding — it says
             // nothing about the registered secret three lines above it. Only
@@ -235,13 +249,15 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                         && !allowlist.contains(candidate)
                 })
             };
+            record_timing("dictionary_candidates_ms", started.elapsed().as_secs_f64() * 1000.0);
             if candidates.over_capacity {
                 bail!(
                     "more than {} MiB of new heuristic secret values were found in one settlement; no repository dictionary update was written",
                     crate::domain::secrets::MAX_NEW_CANDIDATE_BYTES / (1024 * 1024)
                 );
             }
-            let mut state = ProtectionState::from_records(
+            let started = std::time::Instant::now();
+            let mut state = ProtectionState::from_records_profiled(
                 &self.store,
                 global,
                 &candidates.values,
@@ -249,15 +265,21 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 unlocked,
                 records,
                 allowlist,
+                record_timing,
             )?;
+            record_timing("dictionary_matcher_ms", started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
             state.oversized_threshold = Some(MAX_REPOSITORY_SECRET_BYTES);
             let (text, replacements) = transform_jsonl_in(text, |s, image, credential_field| {
                 state.protect_string_in(s, image, credential_field)
             })?;
+            record_timing("dictionary_transform_ms", started.elapsed().as_secs_f64() * 1000.0);
             let new_records = state.new_records;
             let new_heuristic_records = state.new_heuristic_records;
             let intact = state.intact_hits;
+            let started = std::time::Instant::now();
             state.persist()?;
+            record_timing("dictionary_persist_ms", started.elapsed().as_secs_f64() * 1000.0);
             Ok(ProtectionReport {
                 text,
                 replacements,
@@ -326,7 +348,17 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         &self,
         text: &str,
         global: &Matcher,
+        mask_for: impl FnMut(&Value) -> crate::domain::secrets::identity::RecordMask,
+    ) -> crate::Result<ProtectionReport> {
+        self.protect_with_masks_profiled(text, global, mask_for, &mut |_, _| {})
+    }
+
+    pub(crate) fn protect_with_masks_profiled(
+        &self,
+        text: &str,
+        global: &Matcher,
         mut mask_for: impl FnMut(&Value) -> crate::domain::secrets::identity::RecordMask,
+        record_timing: &mut dyn FnMut(&'static str, f64),
     ) -> crate::Result<ProtectionReport> {
         let registered = global.merged(&self.registered_matcher()?)?;
         let mut hidden = std::collections::HashMap::<String, String>::new();
@@ -367,7 +399,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 input.push_str(chunk);
             }
         }
-        let mut report = self.protect_jsonl(&input, global)?;
+        let mut report = self.protect_jsonl_profiled(&input, global, record_timing)?;
         if !hidden.is_empty() {
             report.text = transform_jsonl(&report.text, |text| {
                 let mut restored = String::with_capacity(text.len());
@@ -1364,6 +1396,30 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
         records: Vec<DecryptedRecord>,
         allowlist: LocalAllowlist,
     ) -> crate::Result<Self> {
+        Self::from_records_profiled(
+            store,
+            global,
+            candidates,
+            scope,
+            unlocked,
+            records,
+            allowlist,
+            &mut |_, _| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_records_profiled(
+        store: &'a VaultStore<K>,
+        global: &Matcher,
+        candidates: &[Zeroizing<String>],
+        scope: ExistingRecordScope,
+        unlocked: Option<Unlocked>,
+        records: Vec<DecryptedRecord>,
+        allowlist: LocalAllowlist,
+        record_timing: &mut dyn FnMut(&'static str, f64),
+    ) -> crate::Result<Self> {
+        let started = std::time::Instant::now();
         let mut specs: Vec<PatternSpec> =
             Vec::with_capacity(records.len() + global.rules() + candidates.len());
         for record in &records {
@@ -1427,16 +1483,20 @@ impl<'a, K: KeyStore> ProtectionState<'a, K> {
             });
         }
 
+        record_timing(
+            "dictionary_pattern_prepare_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let started = std::time::Instant::now();
         let ac = if patterns.is_empty() {
             None
         } else {
-            Some(Arc::new(
-                AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::Standard)
-                    .build(patterns.iter().map(|p| p.as_bytes()))
-                    .context("cannot build the repository secret protector")?,
-            ))
+            Some(super::protection_matcher::compile(&patterns)?)
         };
+        record_timing(
+            "dictionary_automaton_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
 
         Ok(Self {
             store,

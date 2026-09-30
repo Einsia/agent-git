@@ -392,12 +392,36 @@ static SET: LazyLock<RuleSet> = LazyLock::new(|| {
 });
 
 static GLOBAL_ALLOW: OnceLock<Vec<Allow>> = OnceLock::new();
+static PRESET_REJECTIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
+    OnceLock::new();
+const PRESET_REJECTION_LIMIT: usize = 65_536;
 
 /// Global preset allowances apply to candidate values regardless of how they were discovered.
 pub(crate) fn preset_allows(secret: &str) -> bool {
-    global_allow()
+    use sha2::{Digest, Sha256};
+    let key: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
+    let cache = PRESET_REJECTIONS.get_or_init(Default::default);
+    if cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&key)
+    {
+        return false;
+    }
+    let allowed = global_allow()
         .iter()
-        .any(|allow| allow.allows(secret, secret, secret))
+        .any(|allow| allow.allows(secret, secret, secret));
+    // Embedded presets are immutable for the process. Only rejections are memoized;
+    // cache reuse cannot introduce an exemption or retain a plaintext secret.
+    if !allowed {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() < PRESET_REJECTION_LIMIT {
+            cache.insert(key);
+        }
+    }
+    allowed
 }
 
 fn global_allow() -> &'static [Allow] {

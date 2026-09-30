@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use zeroize::{Zeroize, Zeroizing};
 
+mod decoded_records;
 #[cfg(target_os = "macos")]
 mod os_keychain;
+mod protection_matcher;
 mod repository;
 mod repository_sync;
 pub use repository_sync::{PolicySyncConflict, RepositoryPolicyTransport};
@@ -134,6 +136,7 @@ struct PlainRecord {
     updated_at: String,
 }
 
+#[derive(Clone)]
 struct DecryptedRecord {
     id: String,
     name: String,
@@ -1690,6 +1693,10 @@ fn decode_padded(plaintext: &[u8]) -> crate::Result<PlainRecord> {
 }
 
 fn decrypt_records(file: &VaultFile, dek: &[u8]) -> crate::Result<Vec<DecryptedRecord>> {
+    decoded_records::read(file, dek, || decrypt_records_uncached(file, dek))
+}
+
+fn decrypt_records_uncached(file: &VaultFile, dek: &[u8]) -> crate::Result<Vec<DecryptedRecord>> {
     let mut out = Vec::with_capacity(file.records.len());
     for stored in &file.records {
         if stored.version != RECORD_VERSION {

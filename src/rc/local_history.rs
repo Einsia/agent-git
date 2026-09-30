@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Default, serde::Serialize)]
-pub(crate) struct Timings(std::collections::BTreeMap<&'static str, f64>);
+pub struct Timings(std::collections::BTreeMap<&'static str, f64>);
 
 impl Timings {
     fn measure<T>(&mut self, phase: &'static str, operation: impl FnOnce() -> T) -> T {
@@ -23,7 +23,7 @@ pub fn read(params: Value) -> crate::Result<Value> {
     read_timed(params, &mut Timings::default())
 }
 
-pub(crate) fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> {
+pub fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> {
     let roster = timings.measure("roster_ms", super::roster::Roster::try_load)?;
     let compressed = params["response_encoding"] == transfer::ENCODING;
     let page = read_with_roster(params, &roster, timings)?;
