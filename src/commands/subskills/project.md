@@ -45,11 +45,11 @@ and its sessions are published by `project sync`. Binding fails only when no run
 provide hooks.
 
 The Stop hook hands the completed conversation to a background process and returns, so the
-turn is not held by import, inspection or upload. That process imports/saves it through the
-ordinary import path, then publishes through existing identity and privacy gates, plus
-consent for an encrypted repository. A private ordinary repository reports secret findings
-and publishes; it does not stop on them. There is no resident retry queue. A failed push
-keeps local history, and `status` shows the last result. Retry with `project sync`.
+turn is not held by import or upload. That process imports/saves it through the ordinary
+import path, then publishes with identity and authorization checks, plus consent for an
+encrypted repository. Local privacy processing and dictionary synchronization are best
+effort and never gate publication. There is no resident retry queue. A failed push keeps
+local history, and `status` shows the last result. Retry with `project sync`.
 For an encrypted repository, policy, account, recipient or destination changes require review
 and renewed binding consent; an ordinary repository's automatic uploads follow `push.auto` alone.
 RC-owned sessions keep their supervisor lifecycle and are not taken over by this command;

@@ -9,7 +9,7 @@ use crate::domain::{
     link::Link,
     native_archive,
     repo::{GitRecordBudgetExceeded, Repo},
-    secret_filter::{HydrationBudgetExceeded, HydrationReport, KeyStore, RepositoryDictionary},
+    secret_filter::{HydrationBudgetExceeded, HydrationReport},
     storage, transcript, turn,
 };
 use crate::{Result, adapter};
@@ -104,8 +104,15 @@ pub fn discover(
     limits: Limits,
 ) -> Result<Proposals> {
     validate_selection(repo, slug, selected)?;
-    let dictionary = RepositoryDictionary::open(repo.root())?;
-    discover_with_dictionary(repo, slug, selected, native, limits, &dictionary)
+    inspect_with_hydrator(
+        repo,
+        slug,
+        selected,
+        native,
+        limits,
+        &|inputs, limit| hydrate(repo, inputs, limit),
+        None,
+    )
 }
 
 /// Recheck a selected immutable proposal without resolving its former display references again.
@@ -116,14 +123,13 @@ pub(crate) fn candidate_still_matches(
     native: &[u8],
     expected: &Candidate,
 ) -> Result<bool> {
-    let dictionary = RepositoryDictionary::open(repo.root())?;
-    let result = inspect_with_dictionary(
+    let result = inspect_with_hydrator(
         repo,
         slug,
         selected,
         native,
         Limits::default(),
-        &dictionary,
+        &|inputs, limit| hydrate(repo, inputs, limit),
         Some(expected),
     )?;
     Ok(result
@@ -150,24 +156,85 @@ fn validate_selection(repo: &Repo, slug: &str, selected: &Link) -> Result<()> {
     Ok(())
 }
 
-fn discover_with_dictionary<K: KeyStore>(
-    repo: &Repo,
-    slug: &str,
-    selected: &Link,
-    native: &[u8],
-    limits: Limits,
-    dictionary: &RepositoryDictionary<K>,
-) -> Result<Proposals> {
-    inspect_with_dictionary(repo, slug, selected, native, limits, dictionary, None)
+type Hydrator<'a> = dyn Fn(&[&str], usize) -> Result<Vec<Result<HydrationReport>>> + 'a;
+
+fn hydrate(repo: &Repo, inputs: &[&str], limit: usize) -> Result<Vec<Result<HydrationReport>>> {
+    let mut remaining = limit;
+    inputs
+        .iter()
+        .map(|text| {
+            #[cfg(feature = "cli")]
+            let output = crate::domain::privacy::service::transform(
+                Some(repo.root()),
+                text,
+                crate::domain::privacy::projector::Mode::HydrateJsonl,
+            );
+            #[cfg(not(feature = "cli"))]
+            let output = {
+                let _ = repo;
+                crate::domain::privacy::projector::Outcome::skipped(text)
+            };
+            remaining = remaining
+                .checked_sub(output.content.len())
+                .ok_or(HydrationBudgetExceeded)?;
+            let unresolved = crate::domain::privacy::projector::tokens(&output.content).count();
+            Ok(Ok(HydrationReport {
+                text: output.content,
+                replacements: output.replacements,
+                unresolved,
+            }))
+        })
+        .collect()
 }
 
-fn inspect_with_dictionary<K: KeyStore>(
+#[cfg(test)]
+fn discover_with_dictionary<K: crate::domain::secret_filter::KeyStore>(
     repo: &Repo,
     slug: &str,
     selected: &Link,
     native: &[u8],
     limits: Limits,
-    dictionary: &RepositoryDictionary<K>,
+    dictionary: &crate::domain::secret_filter::RepositoryDictionary<K>,
+) -> Result<Proposals> {
+    inspect_with_hydrator(
+        repo,
+        slug,
+        selected,
+        native,
+        limits,
+        &|inputs, limit| dictionary.hydrate_batch_readonly_bounded(inputs, limit),
+        None,
+    )
+}
+
+#[cfg(test)]
+fn inspect_with_dictionary<K: crate::domain::secret_filter::KeyStore>(
+    repo: &Repo,
+    slug: &str,
+    selected: &Link,
+    native: &[u8],
+    limits: Limits,
+    dictionary: &crate::domain::secret_filter::RepositoryDictionary<K>,
+    frozen: Option<&Candidate>,
+) -> Result<Proposals> {
+    inspect_with_hydrator(
+        repo,
+        slug,
+        selected,
+        native,
+        limits,
+        &|inputs, limit| dictionary.hydrate_batch_readonly_bounded(inputs, limit),
+        frozen,
+    )
+}
+
+fn inspect_with_hydrator(
+    repo: &Repo,
+    slug: &str,
+    selected: &Link,
+    native: &[u8],
+    limits: Limits,
+    hydrate: &Hydrator<'_>,
     frozen: Option<&Candidate>,
 ) -> Result<Proposals> {
     validate_selection(repo, slug, selected)?;
@@ -268,7 +335,7 @@ fn inspect_with_dictionary<K: KeyStore>(
     let inputs: Vec<_> = std::iter::once(live)
         .chain(snapshots.iter().map(|snapshot| snapshot.raw.as_str()))
         .collect();
-    let reports = match dictionary.hydrate_batch_readonly_bounded(&inputs, limits.hydrated_bytes) {
+    let reports = match hydrate(&inputs, limits.hydrated_bytes) {
         Ok(reports) => reports,
         Err(error) => {
             proposals.unavailable(None, hydration_failure(&error));
@@ -602,6 +669,7 @@ fn prefix_end(text: &str, records: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::domain::meta;
+    use crate::domain::secret_filter::{KeyStore, RepositoryDictionary};
     use sha2::{Digest, Sha256};
     use zeroize::Zeroizing;
 

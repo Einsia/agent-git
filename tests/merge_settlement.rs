@@ -333,55 +333,112 @@ fn complete_pending_content_is_settled_before_manual_merge() {
     assert!(String::from_utf8_lossy(&view.stdout).contains("SYNTHETIC-PENDING"));
 }
 
+/// Settlement retains its exact committed prefix through worker timeout and recovery loss.
+/// A privacy error must neither veto a new turn nor reproject previously settled content.
 #[test]
-fn native_settlement_proof_hydrates_secrets_without_changing_the_dictionary() {
+fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
     use std::io::Write as _;
     use std::process::Stdio;
-
-    for dictionary_present in [true, false] {
-        let lab = Lab::new();
-        let mut register = lab
-            .command()
-            .args(["secrets", "add", "synthetic", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        register
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"SYNTHETIC-PRIVATE-VALUE\n")
-            .unwrap();
-        assert!(register.wait().unwrap().success());
-        let native = format!(
-            "{}{}{}",
-            fs::read_to_string(&lab.native).unwrap(),
-            message("user", "SYNTHETIC-PRIVATE-VALUE"),
-            message("assistant", "SYNTHETIC-SECRET-REPLY")
-        );
-        fs::write(&lab.native, &native).unwrap();
-        lab.success(&["commit", "me/qa@work"]);
-        fs::remove_file(lab.credential()).unwrap();
-        let dictionary = lab.repo().join(".git/agit/secret-dictionary/vault.json");
-        let before = fs::read(&dictionary).unwrap();
-        if !dictionary_present {
-            fs::remove_file(&dictionary).unwrap();
+    let lab = Lab::new();
+    let mut register = lab
+        .command()
+        .args(["secrets", "add", "synthetic", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    register
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"SYNTHETIC-PRIVATE-VALUE\n")
+        .unwrap();
+    assert!(register.wait().unwrap().success());
+    let native = format!(
+        "{}{}{}",
+        fs::read_to_string(&lab.native).unwrap(),
+        message("user", "SYNTHETIC-PRIVATE-VALUE"),
+        message("assistant", "SYNTHETIC-SECRET-REPLY")
+    );
+    fs::write(&lab.native, &native).unwrap();
+    lab.success(&["commit", "me/qa@work"]);
+    let saved = agit::domain::storage::materialize_at(
+        &lab.repo(),
+        "refs/heads/work",
+        agit::domain::meta::LOG_FILE,
+    )
+    .unwrap();
+    assert!(saved.contains("{{AGIT_SECRET_V2:"));
+    assert!(!saved.contains("SYNTHETIC-PRIVATE-VALUE"));
+    let legacy = lab.store.join("secret-filter");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("vault.json"), b"{}").unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(legacy.join("vault.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let native = format!(
+        "{native}{}{}",
+        message("user", "AKIA5RJ2NV7MQXP3TC6Z"),
+        message("assistant", "reply while privacy is unavailable")
+    );
+    fs::write(&lab.native, &native).unwrap();
+    let mut child = lab
+        .command()
+        .args(["commit", "me/qa@work"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
         }
-        let head = lab.git(&["rev-parse", "refs/heads/work"]);
-        let out = lab.merge();
-        assert_eq!(out.status.success(), dictionary_present, "{out:?}");
-        assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
-        assert_eq!(fs::read_to_string(&lab.native).unwrap(), native);
-        if dictionary_present {
-            assert_eq!(fs::read(&dictionary).unwrap(), before);
-        } else {
-            assert!(!dictionary.exists());
-            assert!(!lab.repo().join(".git/AGIT_MERGE_TX").exists());
-            fs::write(dictionary, before).unwrap();
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("privacy timeout blocked native settlement");
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    drop(lock);
+    let degraded = agit::domain::storage::materialize_at(
+        &lab.repo(),
+        "refs/heads/work",
+        agit::domain::meta::LOG_FILE,
+    )
+    .unwrap();
+    assert!(degraded.starts_with(&saved));
+    assert!(degraded.contains("AKIA5RJ2NV7MQXP3TC6Z"));
+    let native = format!(
+        "{native}{}{}",
+        message("user", "AKIA4X7QZ2M5RT6VW3JH"),
+        message("assistant", "reply after privacy recovers")
+    );
+    fs::write(&lab.native, &native).unwrap();
+    lab.success(&["commit", "me/qa@work"]);
+    let recovered = agit::domain::storage::materialize_at(
+        &lab.repo(),
+        "refs/heads/work",
+        agit::domain::meta::LOG_FILE,
+    )
+    .unwrap();
+    assert!(recovered.starts_with(&degraded));
+    assert!(!recovered.contains("AKIA4X7QZ2M5RT6VW3JH"));
+    fs::remove_file(lab.credential()).unwrap();
+    fs::rename(lab.store.join("privacy"), lab.home.join("saved-privacy")).unwrap();
+    let head = lab.git(&["rev-parse", "refs/heads/work"]);
+    let out = lab.merge();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+    assert_eq!(fs::read_to_string(&lab.native).unwrap(), native);
 }
 
 #[test]

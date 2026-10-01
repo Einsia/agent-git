@@ -67,7 +67,7 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
                     break;
                 }
                 service_authenticated |=
-                    line.to_ascii_lowercase() == "authorization: bearer service-fixture\r\n";
+                    line.eq_ignore_ascii_case("authorization: bearer service-fixture\r\n");
             }
             assert!(service_authenticated);
             let body = serde_json::to_string(&DialedConnection {

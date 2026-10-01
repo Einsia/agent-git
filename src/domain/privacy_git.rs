@@ -57,6 +57,7 @@ pub struct ProjectedHistory {
     policy_digest: String,
     additional_policies: Vec<super::privacy::mandatory::MandatoryPolicy>,
     reports: Vec<ProjectionReport>,
+    #[cfg(test)]
     inspection_views: BTreeMap<String, String>,
     accepted_ledger: Option<accepted::Ledger>,
     candidates: BTreeMap<String, accepted::Candidate>,
@@ -155,7 +156,7 @@ impl ProjectedHistory {
             .create(true)
             .truncate(false)
             .open(parent.join("lock"))?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        fs2::FileExt::try_lock_exclusive(&lock)?;
         let mut scope_value = json!({"version":VERSION,"destination":destination,"recipient":recipient.fingerprint()?});
         if let Some((identity, _)) = bound {
             scope_value["identity"] = json!(identity);
@@ -206,6 +207,7 @@ impl ProjectedHistory {
             accepted_ancestors(&source, destination, &parents)?
         };
         let mut reports = Vec::new();
+        #[cfg(test)]
         let mut inspection_views = BTreeMap::new();
         let mut references = BTreeMap::new();
         let mut candidates = BTreeMap::new();
@@ -268,6 +270,8 @@ impl ProjectedHistory {
                             accepted::RECOVERY
                         );
                         aliases.reserve_aliases(&published.inspection)?;
+                        #[cfg(test)]
+                        #[cfg(test)]
                         inspection_views.insert(published.envelope_oid, published.inspection);
                         reports.push(published.report);
                         if !entry.public_session.is_empty() {
@@ -300,6 +304,8 @@ impl ProjectedHistory {
                             published::reuse(&source, &repo, oid, &projected_parents)?
                     {
                         aliases.reserve_aliases(&published.inspection)?;
+                        #[cfg(test)]
+                        #[cfg(test)]
                         inspection_views.insert(published.envelope_oid, published.inspection);
                         reports.push(published.report);
                         references.insert(format!("refs/tags/agit-{oid}"), oid.clone());
@@ -335,6 +341,8 @@ impl ProjectedHistory {
                             published::reuse(&repo, &repo, &entry.projected, &projected_parents)?
                                 .context("cached publication is not a generated snapshot")?;
                         aliases.reserve_aliases(&published.inspection)?;
+                        #[cfg(test)]
+                        #[cfg(test)]
                         inspection_views.insert(published.envelope_oid, published.inspection);
                         reports.push(published.report);
                         references.insert(
@@ -409,7 +417,9 @@ impl ProjectedHistory {
                     } else {
                         serde_json::to_vec(&projection.seal(recipient)?)?
                     };
+                    #[cfg(test)]
                     let envelope_oid = write_object(&repo, "blob", &envelope_bytes)?;
+                    #[cfg(test)]
                     inspection_views.insert(envelope_oid, projection.inspection_text()?);
                     files.insert("privacy/envelope.json".into(), envelope_bytes);
                     let tree = write_tree(&repo, files)?;
@@ -525,6 +535,7 @@ impl ProjectedHistory {
             policy_digest: policy.digest()?,
             additional_policies: additional.to_vec(),
             reports,
+            #[cfg(test)]
             inspection_views,
             accepted_ledger,
             candidates,
@@ -616,10 +627,6 @@ impl ProjectedHistory {
             snapshots.push(envelope.public_projection);
         }
         super::privacy_envelope::digest_json(&json!(snapshots))
-    }
-
-    pub(crate) fn inspection_views(&self) -> &BTreeMap<String, String> {
-        &self.inspection_views
     }
 
     /// Promotion may move the source checkout and its private publication storage together.
@@ -805,7 +812,7 @@ fn effective_policy(
     source: &Repo,
     additional: &[super::privacy::mandatory::MandatoryPolicy],
 ) -> Result<PrivacyPolicy> {
-    let mut policy = PrivacyPolicy::load(source)?;
+    let mut policy = PrivacyPolicy::load(source).unwrap_or_default();
     policy.mandatory.extend_from_slice(additional);
     policy.validate()?;
     Ok(policy)

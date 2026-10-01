@@ -23,7 +23,8 @@ pub mod pending;
 /// One hub's credentials. The whole file is this single object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubCredential {
-    #[serde(default)]
+    /// Immutable account identity returned by the authenticated Hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     pub username: String,
     #[serde(default)]

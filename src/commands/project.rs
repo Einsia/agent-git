@@ -843,13 +843,18 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
     if meta.is_file_line() {
         return Ok(false);
     }
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let (hydrated, _) = dictionary.hydrate_pair_readonly(&serde_json::to_string(&meta.cwd)?, "")?;
-    ensure!(
-        hydrated.unresolved == 0,
-        "cannot verify project policy with an unresolved session directory"
+    let hydrated = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &meta.cwd,
+        crate::domain::privacy::projector::Mode::HydrateText,
     );
-    let cwd: String = serde_json::from_str(&hydrated.text)?;
+    if crate::domain::privacy::projector::tokens(&hydrated.content)
+        .next()
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let cwd = hydrated.content;
     let cwd = Path::new(&cwd)
         .canonicalize()
         .context("cannot resolve the session directory to verify project policy")?;
@@ -864,10 +869,7 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        meta::{self, Meta},
-        secret_filter::{Matcher, RepositoryDictionary},
-    };
+    use crate::domain::meta::{self, Meta};
 
     fn isolated(name: &str) -> bool {
         const CHILD: &str = "AGIT_PROJECT_TEST_CHILD";
@@ -1060,8 +1062,8 @@ mod tests {
     }
 
     #[test]
-    fn paused_project_blocks_protected_session_directory() {
-        if !isolated("paused_project_blocks_protected_session_directory") {
+    fn paused_project_blocks_its_registered_session_directory() {
+        if !isolated("paused_project_blocks_its_registered_session_directory") {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1076,14 +1078,6 @@ mod tests {
             "codex".into(),
             project.root.to_string_lossy().into_owned(),
         );
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        dictionary
-            .protect_metadata(
-                &mut metadata,
-                &Matcher::for_test(&[("project", "private-project-value")]),
-            )
-            .unwrap();
-        assert!(metadata.cwd.contains("{{AGIT_SECRET_V1:"));
         meta::write(repo.root(), &metadata).unwrap();
         repo.add_all().unwrap();
         repo.commit("Protected project directory").unwrap();

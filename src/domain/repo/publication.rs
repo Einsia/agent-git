@@ -55,7 +55,6 @@ pub struct PublicationPlan {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InspectionScope {
     pub(crate) commits: Vec<String>,
-    pub(crate) tags: Vec<String>,
     pub(crate) excluded: BTreeSet<String>,
 }
 
@@ -63,7 +62,6 @@ impl InspectionScope {
     pub(crate) fn full(plan: &PublicationPlan) -> Self {
         Self {
             commits: plan.commit_objects.clone(),
-            tags: plan.tag_objects.clone(),
             excluded: BTreeSet::new(),
         }
     }
@@ -120,12 +118,6 @@ impl InspectionScope {
         Ok(Self {
             commits: plan
                 .commit_objects
-                .iter()
-                .filter(|oid| !excluded.contains(*oid))
-                .cloned()
-                .collect(),
-            tags: plan
-                .tag_objects
                 .iter()
                 .filter(|oid| !excluded.contains(*oid))
                 .cloned()

@@ -197,7 +197,6 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
     let found = collect(&repo, &n)?;
-    super::secret_vault::report_pending_declarations(&repo)?;
     super::report_binary_carriers(found.binary_carriers);
     echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
     let any_hit = !found.hits.is_empty();

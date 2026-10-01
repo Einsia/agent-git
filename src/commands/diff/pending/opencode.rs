@@ -195,7 +195,7 @@ pub(super) fn compare_snapshot(
     log: &str,
     bytes: &[u8],
     limits: Limits,
-    status: bool,
+    _status: bool,
 ) -> crate::Result<String> {
     let live = std::str::from_utf8(bytes).context("OpenCode snapshot is not UTF-8")?;
     let materialized = claim.baseline_bytes.is_some()
@@ -218,24 +218,12 @@ pub(super) fn compare_snapshot(
             .get(key)
             .is_some_and(|prior| prior.facts != row.facts)
     }) {
-        let reports = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-            .hydrate_batch_readonly_with_limits(
-                &[log, live],
-                limits.working_bytes,
-                status.then_some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
-            )?;
-        let mut reports = reports.into_iter();
-        let left = reports.next().context("missing saved hydration result")??;
-        let right = reports
-            .next()
-            .context("missing native hydration result")??;
-        ensure!(
-            left.unresolved == 0 && right.unresolved == 0,
-            "OpenCode comparison requires unavailable repository secret mappings"
-        );
+        use crate::domain::privacy::{projector::Mode, service};
+        let left = service::transform(Some(repo.root()), log, Mode::HydrateEnvelopes);
+        let right = service::transform(Some(repo.root()), live, Mode::HydrateJsonl);
         Some((
-            Rows::read(&left.text, &claim.session_id, true, limits)?,
-            Rows::read(&right.text, &claim.session_id, false, limits)?,
+            Rows::read(&left.content, &claim.session_id, true, limits)?,
+            Rows::read(&right.content, &claim.session_id, false, limits)?,
         ))
     } else {
         None
@@ -249,8 +237,16 @@ fn same_facts(
     projected: Option<(&JsonFacts, &JsonFacts)>,
 ) -> bool {
     match (left, right) {
-        (JsonFacts::String(_), JsonFacts::String(_)) => {
-            projected.map_or(left == right, |(a, b)| a == b)
+        (JsonFacts::String(a), JsonFacts::String(b)) => {
+            if a == b {
+                return true;
+            }
+            match projected {
+                Some((JsonFacts::String(a), JsonFacts::String(b))) => {
+                    crate::domain::privacy::continuity::compatible_string(a, b)
+                }
+                _ => crate::domain::privacy::continuity::compatible_string(a, b),
+            }
         }
         (JsonFacts::Object(a), JsonFacts::Object(b)) => {
             a.len() == b.len()

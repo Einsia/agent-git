@@ -903,7 +903,7 @@ mod bound_lineage_tests {
                         ),
                         term_tx: None,
                         online: false,
-                        secret_filter: Default::default(),
+
                         settlement,
                         started_at: std::time::Instant::now(),
                         notes,

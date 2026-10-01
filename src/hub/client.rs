@@ -240,6 +240,13 @@ impl Client {
         client
     }
 
+    /// A terminable privacy worker must never consume a single-use refresh credential.
+    pub(crate) fn for_privacy(hub: &str) -> Client {
+        let mut client = Self::stored_hub_with_timeout(hub.to_owned(), Duration::from_secs(2));
+        *client.cred.get_mut() = None;
+        client
+    }
+
     /// [`Self::from_env_without_refresh`] for a request that must speak for the signed-in
     /// account or not be sent at all.
     ///
@@ -304,13 +311,6 @@ impl Client {
             .borrow()
             .as_ref()
             .map(|cred| cred.username.clone())
-    }
-
-    pub(crate) fn credential_account_id(&self) -> Option<String> {
-        self.cred
-            .borrow()
-            .as_ref()
-            .and_then(|cred| cred.account_id.clone())
     }
 
     pub(crate) fn checked_access_token(&self) -> Result<Option<String>> {
@@ -1339,6 +1339,38 @@ pub(super) fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+impl crate::domain::privacy::sync::Transport for Client {
+    fn ensure_key(&self) -> Result<crate::domain::privacy::keys::CloudKey> {
+        self.post("api/me/privacy/key", &serde_json::json!({}))
+    }
+
+    fn key(&self, version: i64) -> Result<crate::domain::privacy::keys::CloudKey> {
+        anyhow::ensure!(version > 0, "invalid privacy key version");
+        self.get(&format!("api/me/privacy/keys/{version}"))
+    }
+
+    fn upload(
+        &self,
+        id: &str,
+        envelope: &crate::domain::privacy::crypto::Envelope,
+    ) -> Result<crate::domain::privacy::sync::Receipt> {
+        uuid::Uuid::parse_str(id)?;
+        self.put(&format!("api/me/privacy/packages/{id}"), envelope)
+    }
+
+    fn inventory(&self, after: i64) -> Result<crate::domain::privacy::sync::Inventory> {
+        self.get(&format!(
+            "api/me/privacy/packages?after={}&limit=100",
+            after.max(0)
+        ))
+    }
+
+    fn download(&self, id: &str) -> Result<crate::domain::privacy::crypto::Envelope> {
+        uuid::Uuid::parse_str(id)?;
+        self.get(&format!("api/me/privacy/packages/{id}"))
+    }
 }
 
 #[cfg(test)]

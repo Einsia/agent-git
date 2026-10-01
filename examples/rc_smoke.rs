@@ -102,17 +102,7 @@ async fn main() -> anyhow::Result<()> {
         });
     // Generation number: distinguishes which generation exited when the same logical id is
     // relaunched. The smoke script has only one.
-    let session = Session::launch(
-        info,
-        spec,
-        ftx,
-        notes_tx,
-        conf_rx,
-        settlement_rx,
-        1,
-        agit::domain::secret_filter::MatcherHandle::default(),
-    )
-    .await?;
+    let session = Session::launch(info, spec, ftx, notes_tx, conf_rx, settlement_rx, 1).await?;
     let (ctx, crx) = mpsc::channel::<Command>(16);
     let mut supervisor = tokio::spawn(session.run(crx));
 

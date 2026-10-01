@@ -160,20 +160,6 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         env_text
     };
-    let account = if encrypted && args.viewing_public_key.is_none() {
-        Some(super::require_login()?)
-    } else {
-        None
-    };
-    let sources = frozen
-        .as_ref()
-        .map(|_| super::privacy::sources::Sources::resolve(Some((&repo, &slug)), account.as_ref()))
-        .transpose()?;
-    let additional = sources
-        .as_ref()
-        .map(|sources| sources.additional_rules())
-        .transpose()?
-        .unwrap_or_default();
     let viewing = if encrypted && args.viewing_public_key.is_none() {
         Some(super::privacy::publication_key::PublicationKey::resolve(
             &repo,
@@ -191,7 +177,7 @@ pub fn run(args: Args) -> CmdResult {
                 &log,
                 &view,
                 &metadata,
-                &additional,
+                &[],
             )?,
         )
     } else {
@@ -209,14 +195,12 @@ pub fn run(args: Args) -> CmdResult {
         )?;
         projection.select(&selected)?
     } else {
-        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-        let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-        let selected = dictionary.protect_envelopes(&selected, &registered)?;
-        anyhow::ensure!(
-            selected.intact == 0,
-            "export exceeds the reversible protection limit; no output was written"
-        );
-        selected.text
+        crate::domain::privacy::service::transform(
+            Some(repo.root()),
+            &selected,
+            crate::domain::privacy::projector::Mode::ProtectEnvelopes,
+        )
+        .content
     };
     let result = match args.format.as_str() {
         "privacy-envelope" => {
@@ -277,9 +261,6 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(viewing) = viewing.as_ref() {
         viewing.verify(&repo)?;
         eprintln!("Repository key source: {}", viewing.source());
-    }
-    if let Some(sources) = sources.as_ref() {
-        sources.verify()?;
     }
 
     match &args.out {

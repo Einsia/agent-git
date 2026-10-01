@@ -19,7 +19,6 @@ struct Lab {
     home: PathBuf,
     hub: TcpListener,
     base: String,
-    vault_backup: Option<Vec<u8>>,
 }
 
 impl Lab {
@@ -38,7 +37,6 @@ impl Lab {
             home,
             hub,
             base,
-            vault_backup: None,
         };
         let output = lab
             .command(env!("CARGO_BIN_EXE_agit"))
@@ -182,128 +180,6 @@ impl Lab {
             self.hub.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-    }
-}
-
-impl Drop for Lab {
-    fn drop(&mut self) {
-        if let Some(bytes) = &self.vault_backup {
-            let _ = fs::write(self.home.join("secret-filter/vault.json"), bytes);
-        }
-        #[cfg(windows)]
-        {
-            use agit::domain::secret_filter::KeyStore;
-            if let Ok(bytes) = fs::read(self.home.join("secret-filter/vault.json"))
-                && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                && let Some(id) = value["vault_id"].as_str()
-            {
-                let _ = agit::domain::secret_filter::OsKeyStore.delete(id);
-            }
-        }
-    }
-}
-
-#[test]
-fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
-    use agit::domain::secret_filter::{SelectedKeyStore, VaultStore};
-    use zeroize::Zeroizing;
-
-    const SECRET: &str = "local-publication-scan-canary";
-    for mode in ["human", "quiet", "json1", "json2"] {
-        let mut lab = Lab::new();
-        let repo = lab.seed("alice", "qa", true);
-        let vault_path = lab.home.join("secret-filter/vault.json");
-        #[cfg(unix)]
-        let keys = SelectedKeyStore::File(agit::domain::secret_filter::FileKeyStore::new(
-            lab.home.join("keystore"),
-        ));
-        #[cfg(not(unix))]
-        let keys = SelectedKeyStore::Os(agit::domain::secret_filter::OsKeyStore);
-        VaultStore::new(vault_path.clone(), keys)
-            .add("publication-canary", Zeroizing::new(SECRET.into()), false)
-            .unwrap();
-        let vault_bytes = fs::read(&vault_path).unwrap();
-        lab.vault_backup = Some(vault_bytes.clone());
-        let warm = lab.push("alice/qa", mode, false);
-        assert_eq!(warm.status.code(), Some(0), "{warm:?}");
-        let before = lab.state();
-        let refs = lab.git(&repo, &["show-ref"]);
-        lab.no_requests();
-
-        fs::write(&vault_path, b"{").unwrap();
-        let blocked = lab.state();
-        for acceptance in ["none", "environment", "explicit"] {
-            let mut command = lab.push_command("alice/qa", mode, false);
-            match acceptance {
-                "environment" => {
-                    command.env("AGIT_ALLOW_SECRETS", "1");
-                }
-                "explicit" => {
-                    command.arg("--allow-secrets");
-                }
-                _ => {}
-            }
-            let output = lab.push_output(&mut command);
-            assert_output(&output, mode, 4, "inspection local policy is unavailable");
-            assert_eq!(lab.state(), blocked);
-            assert_eq!(lab.git(&repo, &["show-ref"]), refs);
-            lab.no_requests();
-        }
-        for accepted in [false, true] {
-            let mut command = lab.push_command("alice/qa", mode, false);
-            command.env("AGIT_SECRETS_KEYSTORE", "invalid-keystore");
-            if accepted {
-                command.arg("--allow-secrets");
-            }
-            let invalid_config = lab.push_output(&mut command);
-            assert_output(
-                &invalid_config,
-                mode,
-                2,
-                "inspection configuration is invalid",
-            );
-            assert_eq!(lab.state(), blocked);
-            lab.no_requests();
-        }
-
-        fs::write(&vault_path, &vault_bytes).unwrap();
-        let repaired = lab.push("alice/qa", mode, false);
-        assert_eq!(repaired.status.code(), Some(0), "{repaired:?}");
-        assert_eq!(lab.state(), before);
-        assert_eq!(lab.git(&repo, &["show-ref"]), refs);
-        lab.no_requests();
-
-        fs::write(repo.join("AGENTS.md"), format!("Secret: {SECRET}\n")).unwrap();
-        lab.git(&repo, &["add", "."]);
-        lab.git(&repo, &["commit", "-m", "Record protected content"]);
-        let refs = lab.git(&repo, &["show-ref"]);
-        let policy_state = lab.state();
-        // Findings in a private destination are reported and accepted; only a public one
-        // requires the explicit acceptance.
-        let private = lab.push("alice/qa", mode, false);
-        assert_eq!(private.status.code(), Some(0), "{private:?}");
-        assert!(!String::from_utf8_lossy(&private.stdout).contains(SECRET));
-        assert!(!String::from_utf8_lossy(&private.stderr).contains(SECRET));
-        assert_eq!(lab.state(), policy_state);
-        let policy = lab.push_output(lab.push_command("alice/qa", mode, false).arg("--public"));
-        assert_output(
-            &policy,
-            mode,
-            7,
-            "ordinary publication contains secret findings",
-        );
-        assert!(!String::from_utf8_lossy(&policy.stdout).contains(SECRET));
-        assert!(!String::from_utf8_lossy(&policy.stderr).contains(SECRET));
-        assert_eq!(lab.state(), policy_state);
-        let allowed = lab.push_output(
-            lab.push_command("alice/qa", mode, false)
-                .arg("--public")
-                .env("AGIT_ALLOW_SECRETS", "1"),
-        );
-        assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
-        assert_eq!(lab.state(), policy_state);
-        assert_eq!(lab.git(&repo, &["show-ref"]), refs);
-        lab.no_requests();
     }
 }
 

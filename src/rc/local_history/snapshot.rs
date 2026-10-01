@@ -286,9 +286,7 @@ pub(super) fn read(
             (page, start)
         }
     } else {
-        let redactor = timings
-            .measure("protection_context_ms", || target.redactor())?
-            .for_readonly_history();
+        let redactor = timings.measure("protection_context_ms", || target.redactor())?;
         let mut cursor = before;
         let mut skipped = 0;
         // Metadata-only tails must not cost another network round trip. Bound the scan

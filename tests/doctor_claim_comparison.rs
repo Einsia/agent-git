@@ -456,37 +456,6 @@ fn doctor_checks_real_cross_runtime_materialization_against_its_own_baseline() {
 }
 
 #[test]
-fn doctor_hydrates_existing_secrets_without_mutating_the_dictionary() {
-    let lab = Lab::new(true);
-    let dictionary = lab.repo().join(".git/agit/secret-dictionary/vault.json");
-    let lock = dictionary.parent().unwrap().join("vault.lock");
-    let before = fs::read(&dictionary).unwrap();
-    let modified = fs::metadata(&dictionary).unwrap().modified().unwrap();
-    let claim = fs::read(&lab.link).unwrap();
-    fs::remove_file(&lock).unwrap();
-    lab.assert_status("clean");
-    assert_eq!(fs::read(&dictionary).unwrap(), before);
-    assert_eq!(
-        fs::metadata(&dictionary).unwrap().modified().unwrap(),
-        modified
-    );
-    assert_eq!(fs::read(&lab.link).unwrap(), claim);
-    assert!(!lock.exists());
-    fs::rename(lab.store.join("keystore"), lab.store.join("keystore-saved")).unwrap();
-    lab.assert_status("clean");
-    assert_eq!(fs::read(&dictionary).unwrap(), before);
-    assert!(!lock.exists());
-    let directory = dictionary.parent().unwrap();
-    fs::rename(directory.join("keys"), directory.join("keys-saved")).unwrap();
-    assert!(
-        lab.assert_status("unavailable")
-            .contains("repository secret reconstruction is unavailable")
-    );
-    assert_eq!(fs::read(&dictionary).unwrap(), before);
-    assert!(!lock.exists());
-}
-
-#[test]
 fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
     let lab = Lab::new(false);
     let original = fs::read(&lab.live).unwrap();
@@ -521,7 +490,12 @@ fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
         "--independent",
     ]);
     assert_eq!(fs::read(&lab.live).unwrap(), original);
-    let dictionary = lab.repo().join(".git/agit/secret-dictionary/vault.json");
+    let dictionary = walkdir::WalkDir::new(lab.store.join("privacy"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == "journal.sqlite")
+        .unwrap()
+        .into_path();
     let before = fs::read(&dictionary).unwrap();
     let modified = fs::metadata(&dictionary).unwrap().modified().unwrap();
     let out = lab.comparison();

@@ -511,7 +511,7 @@ fn linked_bare_and_sha256_sources_use_the_captured_object_store() {
         }
         let receiver = receiver(&root, &format!("receiver-{name}.git"), format);
         let carrier = Repo::at(carrier);
-        let common = prepare_policy_snapshot(&carrier);
+        let common = prepare_private_fixture(&carrier);
         let common_before = cache_disk_snapshot(&common);
         let before = inventory(carrier.root());
         let publication = build(&carrier, &plan, &receiver);
@@ -916,38 +916,23 @@ fn cache_disk_snapshot(root: &Path) -> BTreeMap<PathBuf, (bool, Vec<u8>)> {
         .collect()
 }
 
-fn prepare_policy_snapshot(repo: &Repo) -> PathBuf {
+fn prepare_private_fixture(repo: &Repo) -> PathBuf {
     let source = Source::new(repo).unwrap();
     let common = source.text(&["rev-parse", "--git-common-dir"]).unwrap();
     let common = absolute_path(&source.root, &common)
         .unwrap()
         .canonicalize()
         .unwrap();
-    let expected = cache_disk_snapshot(&common);
-    #[cfg(feature = "secret-vault")]
-    let expected = {
-        let mut expected = expected;
-        for path in ["agit", "agit/secret-dictionary"] {
-            let entry = expected.entry(path.into()).or_insert((true, Vec::new()));
-            assert_eq!(*entry, (true, Vec::new()));
-        }
-        assert!(
-            expected
-                .insert(
-                    "agit/secret-dictionary/vault.lock".into(),
-                    (false, Vec::new())
-                )
-                .is_none()
-        );
-        assert!(!expected.contains_key(Path::new("agit/secret-dictionary/vault.json")));
-        expected
-    };
-    crate::domain::secrets::publication::CapturedPolicy::capture(&common).unwrap();
-    assert_eq!(cache_disk_snapshot(&common), expected);
-    #[cfg(feature = "secret-vault")]
+    let private = common.join("agit/secret-dictionary");
+    std::fs::create_dir_all(&private).unwrap();
     std::fs::write(
-        common.join("agit/secret-dictionary/vault.lock"),
+        private.join("vault.lock"),
         b"opaque fixture lock contents\n",
+    )
+    .unwrap();
+    std::fs::write(
+        private.join("vault.json"),
+        b"unavailable private dictionary",
     )
     .unwrap();
     common
@@ -1120,7 +1105,7 @@ fn frozen_cache_path_and_deferred_failure_survive_later_source_changes() {
     let receiver = receiver(&root, "receiver.git", "sha1");
     let gitdir = inspection_git_path_spelling(repo.root().join(".git").canonicalize().unwrap());
     git(repo.root(), &["config", "lfs.storage", "selected-cache"]);
-    prepare_policy_snapshot(&repo);
+    prepare_private_fixture(&repo);
     let before = cache_disk_snapshot(repo.root());
     let publication = build(&repo, &plan, &receiver);
     assert_eq!(cache_disk_snapshot(repo.root()), before);

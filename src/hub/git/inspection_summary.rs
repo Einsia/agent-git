@@ -25,8 +25,7 @@ pub enum ModelReviewState {
 #[serde(rename_all = "snake_case")]
 pub enum LfsInspectionCoverage {
     RemotePresentNotInspected,
-    BinaryNotScannedAsText,
-    TextInspected,
+    PrivacyExcluded,
     InspectionNotConfirmed,
     AvailabilityNotConfirmed,
 }
@@ -76,6 +75,7 @@ pub struct InspectionSummary<'a> {
     pub tags: Vec<SelectedRef<'a>>,
     pub deterministic: DeterministicInspectionState,
     pub model_review: ModelReviewState,
+    pub privacy_processing: &'static str,
     pub findings: Vec<Finding<'a>>,
     pub findings_truncated: bool,
     pub unscanned: UnscannedSummary<'a>,
@@ -116,6 +116,7 @@ impl<'a> InspectionSummary<'a> {
                 None => DeterministicInspectionState::Complete,
             },
             model_review: ModelReviewState::NotPerformed,
+            privacy_processing: "not_performed",
             findings: scan
                 .hits
                 .iter()
@@ -146,16 +147,14 @@ impl<'a> InspectionSummary<'a> {
                 .iter()
                 .map(|pointer| LfsPayloadSummary {
                     pointer,
-                    // A blocked Git pass may precede every LFS visit; availability uses the full plan.
+                    // Availability covers every selected pointer even if integrity verification stops early.
                     coverage: match prepared.availability(pointer) {
                         Ok(PreparedPayloadAvailability::RemotePresent) => {
                             LfsInspectionCoverage::RemotePresentNotInspected
                         }
                         Ok(PreparedPayloadAvailability::Staged) => {
                             if binary.contains(pointer.oid.as_str()) {
-                                LfsInspectionCoverage::BinaryNotScannedAsText
-                            } else if blocked.is_none() {
-                                LfsInspectionCoverage::TextInspected
+                                LfsInspectionCoverage::PrivacyExcluded
                             } else {
                                 LfsInspectionCoverage::InspectionNotConfirmed
                             }
@@ -176,12 +175,13 @@ impl<'a> InspectionSummary<'a> {
             format!("Agent identity: {}", quoted(&self.identity.agent_id)),
             match &self.deterministic {
                 DeterministicInspectionState::Complete => {
-                    "Deterministic inspection: complete for captured Git carriers and owned LFS bytes".into()
+                    "Payload integrity: verified for owned LFS bytes; privacy processing is local and optional".into()
                 }
                 DeterministicInspectionState::Blocked { reason } => {
-                    format!("Deterministic inspection: blocked; {}", quoted(reason))
+                    format!("Payload integrity: blocked; {}", quoted(reason))
                 }
             },
+            "Secret scanning: not performed during publication".into(),
             "Model review: not performed".into(),
             "This summary does not authorize publication.".into(),
         ];
@@ -241,11 +241,8 @@ impl<'a> InspectionSummary<'a> {
                 LfsInspectionCoverage::RemotePresentNotInspected => {
                     "remote present; bytes not inspected"
                 }
-                LfsInspectionCoverage::BinaryNotScannedAsText => {
-                    "owned binary; not scanned as text"
-                }
-                LfsInspectionCoverage::TextInspected => {
-                    "owned text; deterministic inspection complete"
+                LfsInspectionCoverage::PrivacyExcluded => {
+                    "owned bytes; integrity verified; excluded from privacy processing"
                 }
                 LfsInspectionCoverage::InspectionNotConfirmed => {
                     "owned bytes; inspection not fully confirmed"
@@ -286,6 +283,7 @@ mod tests {
             tags: Vec::new(),
             deterministic: DeterministicInspectionState::Complete,
             model_review: ModelReviewState::NotPerformed,
+            privacy_processing: "not_performed",
             findings: Vec::new(),
             findings_truncated: false,
             unscanned: UnscannedSummary {
@@ -343,39 +341,8 @@ mod tests {
             text.chars()
                 .all(|character| character == '\n' || !character.is_control())
         );
-        assert_eq!(text.lines().count(), 16);
+        assert_eq!(text.lines().count(), 17);
         assert!(text.contains("\\u{1b}]52;c;clipboard\\u{7}\\r\\n\\t\\u{85}\\u{2028}\\u{2029}\\u{202e}\\u{2066}\\\\\\\""));
         assert!(text.contains("bytes not inspected"));
-    }
-
-    #[test]
-    fn blocked_empty_findings_preserve_reason_and_lower_bound_without_model_approval() {
-        let identity = RemoteIdentity {
-            hub: "https://example.invalid".into(),
-            agent_id: "identity".into(),
-        };
-        let mut summary = empty(&identity);
-        summary.deterministic = DeterministicInspectionState::Blocked {
-            reason: InspectionFailure::Content.to_string(),
-        };
-        summary.unscanned.over_budget = Some(BudgetExceeded {
-            counted_bytes_at_least: 8,
-            budget_bytes: 7,
-        });
-        summary.findings_truncated = true;
-        let text = summary.render();
-        assert!(text.contains("Deterministic inspection: blocked"));
-        assert!(text.contains("cannot read its captured content"));
-        assert!(text.contains("Findings truncated: true"));
-        assert!(text.contains("at least 8 bytes counted against a 7 byte budget"));
-        assert!(text.contains("Model review: not performed"));
-        assert!(!text.contains("Deterministic inspection: complete"));
-        let json = serde_json::to_value(&summary).unwrap();
-        assert_eq!(json["model_review"], "not_performed");
-        assert_eq!(json["deterministic"]["state"], "blocked");
-        assert_eq!(
-            json["unscanned"]["over_budget"]["counted_bytes_at_least"],
-            8
-        );
     }
 }

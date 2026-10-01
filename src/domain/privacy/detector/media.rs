@@ -331,7 +331,7 @@ mod tests {
             );
             #[cfg(feature = "secret-vault")]
             assert!(
-                super::super::secret_candidates_jsonl(&text, |_| true)
+                crate::domain::secrets::secret_candidates_jsonl(&text, |_| true)
                     .values
                     .iter()
                     .any(|candidate| candidate.as_str() == data)

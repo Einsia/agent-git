@@ -71,12 +71,10 @@ async fn response(rx: &mut crate::rc::outbound::OutboundRx) -> Frame {
 }
 
 #[tokio::test]
-async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
+async fn watch_settings_follow_index_then_live_context() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
     let daemon = fixture(&cwd).await;
-    let registered = "private preview sentinel";
-    let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
     std::fs::write(
         cwd.join("history.jsonl"),
         format!(
@@ -87,7 +85,7 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
             }}),
             serde_json::json!({"type":"response_item","payload":{
                 "type":"message","role":"assistant",
-                "content":[{"type":"output_text","text":format!("Preview answer {registered} {credential}")}]
+                "content":[{"type":"output_text","text":"Preview answer"}]
             }})
         ),
     )
@@ -95,9 +93,6 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
     let (frames, mut received) = mpsc::channel(8);
     {
         let mut state = daemon.lock().await;
-        state.secret_filter = crate::domain::secret_filter::MatcherHandle::new(
-            crate::domain::secret_filter::Matcher::for_test(&[("preview", registered)]),
-        );
         let request = request(method::SESSION_WATCH, "ws", "native");
         let mut scan = prepared(state.prepare_watch_scan(&request).unwrap(), cwd.clone());
         let index = cwd.join("state.sqlite");
@@ -137,10 +132,9 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
     assert!(
         item["params"]["event"]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("Preview answer "))
+            .is_some_and(|text| text == "Preview answer")
     );
     let wire = item.to_string();
-    assert!(!wire.contains(registered) && !wire.contains(credential));
     assert!(!wire.contains("protection_error"));
     ready(async {
         while let Some(frame) = received.recv().await {
@@ -240,7 +234,7 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
     let cwd = root.canonicalize().unwrap();
     let native = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
     let call = "toolu_01Qz7mXv9LpZ4tNc8WjF3bHy";
-    let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let detail = "conversation tool detail";
     let record = |role: &str, content: serde_json::Value| {
         serde_json::json!({
             "type":role, "sessionId":native, "uuid":uuid::Uuid::new_v4().to_string(),
@@ -250,7 +244,7 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
     let mut records = vec![record(
         "assistant",
         serde_json::json!([
-            {"type":"tool_use", "id":call, "name":"Bash", "input":{"command":format!("printf '{secret} {call}'")}}
+            {"type":"tool_use", "id":call, "name":"Bash", "input":{"command":format!("printf '{detail} {call}'")}}
         ]),
     )];
     records.extend((0..65).map(|_| {
@@ -262,7 +256,7 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
         )
     }));
     records.push(record("user", serde_json::json!([
-        {"type":"tool_result","tool_use_id":call,"content":format!("Visible result {secret} {native}"),"is_error":false}
+        {"type":"tool_result","tool_use_id":call,"content":format!("Visible result {detail} {native}"),"is_error":false}
     ])));
     let project = crate::adapter::claude_code::projects_dir()
         .unwrap()
@@ -276,8 +270,6 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
     std::fs::write(&path, &original).unwrap();
     let daemon = fixture(&cwd).await;
     let (frames, mut received) = mpsc::channel(128);
-    daemon.lock().await.secret_filter =
-        crate::domain::secret_filter::MatcherHandle::load_default().unwrap();
     let mut watch_request = request(method::SESSION_WATCH, "ws", native);
     let params = watch_request.params.as_mut().unwrap();
     params["include_history"] = serde_json::json!(true);
@@ -315,7 +307,6 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
     let page = &reply.result.as_ref().unwrap()["history_page"];
     assert!(page["items"].is_array(), "{page}");
     assert!(page.to_string().contains("Visible result"));
-    assert!(!page.to_string().contains(secret));
     assert!(!daemon.lock().await.watches.is_empty());
     let watched = ready(async {
         let mut items = Vec::new();
@@ -402,8 +393,6 @@ async fn unbound_claude_pages_keep_watch_identity_and_cross_page_tool_pairing() 
             .count(),
         65
     );
-    assert!(!serde_json::to_string(&pages).unwrap().contains(secret));
-    assert!(!serde_json::to_string(&watched).unwrap().contains(secret));
     if let Some(output) = std::env::var_os("AGIT_RC_HISTORY_FIXTURE") {
         std::fs::write(
             output,

@@ -97,15 +97,14 @@ pub struct Link {
     /// Local evidence for the "one branch, one session" invariant: settle uses it to find the
     /// branch to advance.
     pub branch: Option<String>,
-    /// The materialization baseline: the byte count of the live transcript generated at the
-    /// moment resume/run/fork installs the VIEW into the runtime. Settlement reads only the bytes
-    /// appended **after** the baseline; the baseline content is a materialized copy of history
-    /// already in the repo (its ids have been reminted), so comparing it byte for byte against
-    /// committed content is neither right nor possible.
+    /// Byte boundary of a VIEW installed into a runtime. Appends are read after this boundary;
+    /// reminted runtime identifiers cannot be compared to the original committed envelopes.
     pub baseline_bytes: Option<u64>,
     /// SHA-256 of the baseline region: doctor verifies that "the live transcript has had no
     /// non-append write inside the baseline".
     pub baseline_hash: Option<String>,
+    /// Optional native-prefix evidence, independent of materialization and claim identity.
+    pub native_checkpoint: Option<NativeCheckpoint>,
     /// The exact session-branch tip represented by this runtime instance's recorded baseline.
     ///
     /// A runtime-local id is not durable lineage. This commit id lets resume distinguish an
@@ -128,6 +127,14 @@ pub struct Link {
     pub naming_ignored: bool,
 }
 
+/// Local raw bytes are bound to an immutable settled tip; the digest never enters Git objects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeCheckpoint {
+    pub tip: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
 /// The on-disk form. Empty optional fields are omitted rather than written as `null`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Body {
@@ -145,6 +152,8 @@ struct Body {
     baseline_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_checkpoint: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     materialized_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +184,7 @@ impl Link {
             branch: None,
             baseline_bytes: None,
             baseline_hash: None,
+            native_checkpoint: None,
             materialized_from: None,
             privacy_recovery: None,
             privacy_recovery_format: None,
@@ -206,6 +216,10 @@ impl Link {
             branch: self.branch.clone(),
             baseline_bytes: self.baseline_bytes,
             baseline_hash: self.baseline_hash.clone(),
+            native_checkpoint: self
+                .native_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| serde_json::to_value(checkpoint).ok()),
             materialized_from: self.materialized_from.clone(),
             privacy_recovery: self.privacy_recovery.clone(),
             privacy_recovery_format: self.privacy_recovery_format.clone(),
@@ -548,6 +562,9 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         branch: body.branch,
         baseline_bytes: body.baseline_bytes,
         baseline_hash: body.baseline_hash,
+        native_checkpoint: body
+            .native_checkpoint
+            .and_then(|value| serde_json::from_value(value).ok()),
         materialized_from: body.materialized_from,
         privacy_recovery: body.privacy_recovery,
         privacy_recovery_format: body.privacy_recovery_format,

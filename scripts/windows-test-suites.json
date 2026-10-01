@@ -19,6 +19,7 @@
     "adapter::codex_ownership::tests::observation_distinguishes_live_released_and_unknown_native_ownership",
     "infra::local_git::tests",
     "infra::windows_security::tests",
+    "domain::privacy::",
     "domain::secret_filter::repository::tests::bounded_",
     "domain::secret_filter::repository_keys::tests",
     "rc::transport::tests",
@@ -37,6 +38,7 @@
     "windows_json_capture",
     "rc_startup",
     "hub_credential_binding",
+    "privacy_lifecycle",
     "session_files",
     "resume_cwd_selection"
   ],

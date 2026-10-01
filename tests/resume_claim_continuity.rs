@@ -30,8 +30,6 @@ fn resume_keeps_a_settled_prefix_resumable_after_later_repository_records() {
         "alice/qa@after-mapping",
         "--independent",
     ]);
-    let dictionary = lab.repo().join(".git/agit/secret-dictionary/vault.json");
-    let dictionary_before = fs::read(&dictionary).unwrap();
     let live_before = fs::read(&lab.live).unwrap();
 
     let untouched = lab.run(&["resume", "alice/qa@work", "--no-launch"]);
@@ -67,8 +65,7 @@ fn resume_keeps_a_settled_prefix_resumable_after_later_repository_records() {
         "{appended}"
     );
 
-    // A comparison reads the dictionary and the transcript; it persists neither.
-    assert_eq!(fs::read(&dictionary).unwrap(), dictionary_before);
+    // Comparison and native reuse preserve the source transcript.
     let mut expected_live = live_before;
     expected_live.extend_from_slice(lab.turn(3).as_bytes());
     assert_eq!(fs::read(&lab.live).unwrap(), expected_live);
@@ -172,10 +169,6 @@ impl Lab {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    fn repo(&self) -> PathBuf {
-        self.store.join("repos/alice/qa")
     }
 
     fn turn(&self, n: usize) -> String {

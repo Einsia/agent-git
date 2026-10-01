@@ -14,22 +14,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[path = "support/privacy_policy_sources.rs"]
-mod privacy_policy_sources;
+#[path = "support/publication_identity.rs"]
+mod publication_identity;
 
 const ACCESS: &str = "SYNTHETIC-category-access";
 const REFRESH: &str = "SYNTHETIC-category-refresh";
 const CONTENT: &str = "SYNTHETIC-SAVED-SHARE-CONTENT";
 const BUILTIN_SECRET: &str = "AKIA4X7QZ2M5RT6VW3JH";
-const REGISTERED_SECRET: &str = "SYNTHETIC-registered-share-secret-alpha";
-const REGISTERED_LABEL: &str = "SYNTHETIC-private-share-label";
 
 #[derive(Clone, Copy, Debug)]
 enum Reply {
     Status(u16),
     TruncatedHeaders,
     EmptyList,
-    Share,
 }
 
 #[derive(Debug)]
@@ -75,7 +72,11 @@ impl Hub {
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let request = read_request(&mut stream);
-                if let Some((status, body)) = privacy_policy_sources::route(
+                if request.target.starts_with("/api/me/privacy/") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                if let Some((status, body)) = publication_identity::route(
                     &policy_hub,
                     "me",
                     &request.method,
@@ -109,10 +110,6 @@ impl Hub {
                     }
                     Reply::EmptyList => {
                         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").unwrap();
-                    }
-                    Reply::Share => {
-                        let body = json!({"format_version":2,"slug":"checked","url":"https://example.invalid/s/checked"}).to_string();
-                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
                 }
                 stream.flush().unwrap();
@@ -287,16 +284,6 @@ impl Lab {
         run_bounded(self.command(base, args))
     }
 
-    fn register_secret(&self, base: &str) {
-        let input = self.work.join("synthetic-secret.txt");
-        fs::write(&input, REGISTERED_SECRET).unwrap();
-        let mut command = self.command(base, &["secrets", "add", REGISTERED_LABEL, "--stdin"]);
-        command.stdin(fs::File::open(input).unwrap());
-        let output = success(run_bounded(command));
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(REGISTERED_SECRET));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(REGISTERED_SECRET));
-    }
-
     fn repo(&self) -> PathBuf {
         self.store.join("repos/me/qa")
     }
@@ -341,6 +328,14 @@ impl Lab {
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         walkdir::WalkDir::new(self.root.path())
             .into_iter()
+            .filter(|entry| {
+                !entry.as_ref().is_ok_and(|entry| {
+                    entry
+                        .path()
+                        .strip_prefix(self.root.path())
+                        .is_ok_and(|path| path.starts_with("agit/privacy"))
+                })
+            })
             .map(|entry| {
                 let entry = entry.unwrap();
                 assert!(!entry.file_type().is_symlink());
@@ -629,56 +624,6 @@ fn an_empty_share_list_is_still_successful_and_keeps_credentials() {
         assert_eq!(lab.state(), before);
     }
     assert_eq!(hub.finish().len(), 4);
-}
-
-#[test]
-fn secret_shares_publish_checked_projections_in_all_modes() {
-    for secret in [BUILTIN_SECRET, REGISTERED_SECRET] {
-        let hub = Hub::new(Reply::Share);
-        let lab = Lab::new(&hub.base);
-        lab.write_saved(secret);
-        if secret == REGISTERED_SECRET {
-            lab.register_secret(&hub.base);
-        }
-        let before = lab.git(&["rev-parse", "HEAD"]);
-        for (mode, mut flags) in modes() {
-            flags.extend(["--yes", "share", "me/qa@chosen", "--public"]);
-            let mut command = lab.command(&hub.base, &flags);
-            command.env("AGIT_ALLOW_SECRETS", "1");
-            let output = success(run_bounded(command));
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let text = format!("{stdout}{stderr}");
-            for private in [secret, REGISTERED_LABEL, ACCESS, REFRESH] {
-                assert!(!text.contains(private), "public preview disclosed a secret");
-            }
-            assert!(text.contains("https://example.invalid/s/checked"));
-            if let Some(version) = mode.strip_prefix("json") {
-                assert!(stderr.is_empty(), "{output:?}");
-                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
-                assert_eq!(value["exit_code"], 0);
-                assert_eq!(value["ok"], true);
-            }
-            assert_eq!(lab.git(&["rev-parse", "HEAD"]), before);
-        }
-        let requests = hub.finish();
-        assert_eq!(requests.len(), modes().len());
-        for request in requests {
-            assert_eq!(request.method, "POST");
-            assert_eq!(request.target, "/api/shares/privacy");
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            let public: Value = serde_json::from_str(body["payload"].as_str().unwrap()).unwrap();
-            assert_eq!(public["kind"], "share");
-            assert!(public.get("private_payload").is_none());
-            for private in [secret, REGISTERED_LABEL, ACCESS, REFRESH] {
-                assert!(
-                    !public.to_string().contains(private),
-                    "public share disclosed a secret"
-                );
-            }
-        }
-    }
 }
 
 #[test]

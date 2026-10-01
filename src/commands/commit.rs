@@ -1814,8 +1814,6 @@ fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
         "unborn settlement tree still contains managed storage paths: {}",
         leaked.join(", ")
     );
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
     let mut edits = Vec::new();
     for path in repo.ls_tree_result(&tree)? {
         let Some(entry) = file_commit_tree_entry(repo, &tree, &path)? else {
@@ -1825,11 +1823,11 @@ fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
             continue;
         }
         let bytes = read_protected_file_blob(repo, &entry.oid, &path)?;
-        if let Some(protected) = protect_shared_file_text(&dictionary, &global, &path, &bytes)? {
+        if let Some(protected) = protect_shared_file_text(repo, &path, &bytes) {
             edits.push((path, Some(protected.into_bytes())));
         }
     }
-    super::plumbing::tree_apply_owned(repo, &tree, edits)
+    Ok(super::plumbing::tree_apply_owned(repo, &tree, edits).unwrap_or(tree))
 }
 
 /// Install one canonical v1 session snapshot on top of an unborn branch's shared-file tree.
@@ -1962,39 +1960,11 @@ fn settle_bytes(
     // lands, as a file line — that is the W1 deadlock.
     let file_line = head_meta.as_ref().is_some_and(|m| m.is_file_line());
 
-    // Canonical session objects carry repository-scoped placeholders. The
-    // runtime remains plaintext; conversion happens here, before envelope
-    // hashes and commit identities are formed. A pure file line remains on the
-    // existing push-gate policy and must not needlessly unlock a session vault.
-    let global_secrets = if file_line {
-        crate::domain::secret_filter::Matcher::empty()
-    } else {
-        crate::domain::secret_filter::VaultStore::open_default()?.matcher()?
+    use crate::domain::privacy::{
+        projector::{Mode as PrivacyMode, Status as PrivacyStatus},
+        service as privacy,
     };
-    let secret_dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let mut protected_full = if file_line {
-        crate::domain::secret_filter::ProtectionReport {
-            text: text.clone(),
-            replacements: 0,
-            new_records: 0,
-            new_heuristic_records: 0,
-            intact: 0,
-        }
-    } else {
-        secret_dictionary
-            .protect_source_session_jsonl(&text, &global_secrets, &lk.source, lk.native_thread_id(), &lk.session_id, Path::new(lk.cwd.as_deref().unwrap_or(".")))
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "cannot protect this session's secrets before committing: {error:#}\n\
-                     repository keys live beside the dictionary in local private files; \
-                     an existing dictionary may require its previous keystore for one-time migration"
-                )
-            })?
-    };
-    anyhow::ensure!(
-        protected_full.intact == 0,
-        "session protection exceeds the reversible record limit; the native transcript is unchanged and no version was published"
-    );
+    let mut native_prefix = (0usize, String::new());
 
     // ── Materialized baseline or native continuation ──
     let (region_start, region, head_turn_base) = if let Some(base) = lk.baseline_bytes {
@@ -2041,111 +2011,33 @@ fn settle_bytes(
                 })?
             }
         };
-        if transcript::continuity(&committed, &protected_full.text) == Continuity::Diverged {
-            // Both classification questions have to be asked on a view where
-            // projection differences cannot be mistaken for content differences.
-            //
-            // «Is this the same session?» is decided on hydrated plaintext. The
-            // settled prefix already carries placeholders from whichever records
-            // were active when it landed, so comparing it against the live
-            // plaintext reports Diverged for every session that ever projected
-            // anything — and «already claimed by another session» is the one
-            // verdict a user cannot argue with.
-            //
-            // Both sides are hydrated, not just the settled one. A transcript
-            // can legitimately carry this repository's own placeholder as
-            // content — an agent that ran `agit show`, or read back
-            // `session/log.jsonl` — and projection keeps a syntactically valid
-            // token opaque, so such a token settles verbatim. Expanding it on
-            // the committed side alone would make the session look foreign for
-            // exactly the reason this comparison exists to remove. Neither
-            // hydrated view is ever written: `protected_full` is what settles.
-            let settled_plaintext = secret_dictionary.hydrate_jsonl(&committed)?;
-            let live_plaintext = secret_dictionary.hydrate_jsonl(&text)?;
-            let plaintext_continues =
-                transcript::continuity_of_content(&settled_plaintext.text, &live_plaintext.text)
-                    != Continuity::Diverged;
-            // «Would a registered rule rewrite what is already settled?» is
-            // decided on the settled *content*, not on the envelopes carrying
-            // it. `_session_id` and `_object_hash` are AgentGit's own generated
-            // identities and the next snapshot recomputes them from scratch, so
-            // a registered literal that happens to be a substring of one
-            // rewrites nothing — the scanner masks those same two fields for
-            // the mirror-image reason (see `mask_valid_envelope_stream`).
-            //
-            // Projecting the *live* text instead cannot answer this at all: any
-            // heuristic placeholder the prefix already holds is absent from a
-            // registered-only view of the live text, so an ordinary forward
-            // projection would read as a rewrite. Projecting the settled
-            // content leaves its existing placeholders opaque and changes bytes
-            // only where that content still carries a registered value in the
-            // clear — precisely the condition that must be refused. Count
-            // replacements rather than diffing: `protect_*` re-serializes every
-            // line it parses, so an unchanged stream comes back with different
-            // bytes.
-            let settled_content = transcript::unwrap_strict(&committed)?;
-            let registered_rewrite =
-                secret_dictionary.protect_registered_jsonl(&settled_content)?;
-            let settled_prefix_is_stable = registered_rewrite.replacements == 0;
-            if plaintext_continues && settled_prefix_is_stable {
-                // Forward-only projection is allowed to make the next snapshot
-                // canonical while its parent retains the pre-dictionary bytes.
-                // Both tests above read the records that actually change the
-                // settled prefix, not whether this invocation happened to
-                // create them: a failed/no-op/CAS-conflicted attempt may
-                // already have saved the heuristic mapping before this retry.
-                // This creates no rewritten object/ref and is exactly why the
-                // dictionary keeps a versioned pure projection boundary.
-                //
-                // The reverse direction — `agit secrets allow` on a value the
-                // settled prefix already carries as a placeholder — lands here
-                // too, and is likewise legitimate: allow is defined to change
-                // future projection only, this snapshot is that future, and the
-                // parent commit keeps the protected bytes.
-            } else if plaintext_continues {
-                ui::error("a registered secret now matches the already-settled plaintext prefix.");
-                ui::hint(
-                    "existing Git objects cannot be replaced without changing version IDs; migrate that unpublished history explicitly before pushing",
-                );
-                return Ok(ExitCode::Policy);
-            } else if settled_plaintext.unresolved > 0 {
-                // Reached only once the comparison has already failed, and it
-                // says which of the two failures happened: the settled history
-                // could not be read back, which is a different fact from «this
-                // is someone else's branch». The dictionary lives in `.git` and
-                // is never fetched, so history settled on another device — or
-                // whose dictionary was deleted — arrives with placeholders
-                // nothing here can expand. Saying «claimed by another session»
-                // would send the user to `agit import` to abandon a lineage
-                // that is in fact their own.
-                ui::error(&format!(
-                    "{} repository secret placeholder(s) in the settled history cannot be resolved on this device.",
-                    settled_plaintext.unresolved
-                ));
-                ui::hint(
-                    "the repository dictionary lives in .git and is never fetched: settle from the device that owns it, or re-adopt this history explicitly with `agit import`",
-                );
-                return Ok(ExitCode::Policy);
-            } else {
-                let held = head_meta
-                    .as_ref()
-                    .map(|m| m.session.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("?");
-                ui::error(&format!(
-                    "{slug} @ {branch} is already claimed by another session."
-                ));
-                println!(
-                    "  this branch’s session is {} — and {} is not its continuation",
-                    ui::bold(&meta::short(held)),
-                    ui::bold(&link::short(&lk.session_id))
-                );
-                ui::hint(
-                    "one branch, one session: adopt this one onto a new branch with `agit import <session> --from <runtime> --into <owner/repo>@<new-branch>`; choose a proposed base, pass `--onto <ref>`, or explicitly request `--independent`",
-                );
-                return Ok(ExitCode::Policy);
-            }
-        }
+        let checkpoint_verified = lk.native_checkpoint.as_ref().is_some_and(|checkpoint| {
+            use sha2::Digest as _;
+            Some(checkpoint.tip.as_str()) == settlement_tip.as_deref()
+                && usize::try_from(checkpoint.bytes)
+                    .ok()
+                    .and_then(|end| bytes.get(..end))
+                    .is_some_and(|prefix| {
+                        hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256
+                    })
+        });
+        let comparable = if !checkpoint_verified
+            && transcript::continuity(&committed, &text) == Continuity::Diverged
+        {
+            privacy::transform(Some(repo.root()), &committed, PrivacyMode::HydrateEnvelopes).content
+        } else {
+            committed.clone()
+        };
+        let Some(retained) =
+            crate::domain::privacy::continuity::retain_prefix(&committed, &comparable, &text)?
+        else {
+            ui::error("the native transcript does not continue this branch's settled content");
+            ui::hint(
+                "import the changed session onto a separate branch to preserve both histories",
+            );
+            return Ok(ExitCode::Policy);
+        };
+        native_prefix = retained;
         let settled = head_meta.as_ref().and_then(|s| s.turn).map(|t| t as usize);
         // No turn ordinal (a newborn session line, or history pushed in from outside): parse
         // the committed content and count its turns.
@@ -2272,11 +2164,7 @@ fn settle_bytes(
             metadata.runtime_instances.push(binding.thread_id.clone());
             metadata.kind = Kind::File;
             metadata.milestone = None;
-            let protected = secret_dictionary.protect_metadata(&mut metadata, &global_secrets)?;
-            anyhow::ensure!(
-                protected.intact == 0,
-                "native identity protection is incomplete"
-            );
+            privacy::protect_metadata(repo.root(), &mut metadata);
             let tree = super::plumbing::tree_apply_owned(
                 repo,
                 tip,
@@ -2360,6 +2248,34 @@ fn settle_bytes(
         );
         return Ok(ExitCode::Precondition);
     }
+
+    // Privacy sees only the complete native suffix selected by the settlement boundary.
+    let privacy_start = if materialized_mode {
+        region_start
+    } else {
+        native_prefix.0
+    };
+    let privacy_end = region_start + new_chunks.last().expect("non-empty chunks").end_byte;
+    let protected_increment = privacy::transform(
+        Some(repo.root()),
+        &text[privacy_start..privacy_end],
+        PrivacyMode::ProtectJsonl,
+    );
+    let mut protected_full = if materialized_mode {
+        text[..region_start].to_owned()
+    } else {
+        native_prefix.1
+    };
+    protected_full.push_str(&protected_increment.content);
+    protected_full.push_str(&text[privacy_end..]);
+    let materialized_projection = if materialized_mode {
+        Some(native::Projection::new(
+            &text[privacy_start..privacy_end],
+            &protected_increment.content,
+        )?)
+    } else {
+        None
+    };
 
     // Slow-path resume materializes only HEAD VIEW. Preserve HEAD LOG as the immutable evidence
     // prefix and HEAD VIEW as the provenance-bearing projection prefix; the runtime baseline is
@@ -2446,7 +2362,7 @@ fn settle_bytes(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             let cwd = lk.cwd.clone().unwrap_or_default();
-            meta::session_hash(&cwd, protected_full.text.as_bytes())
+            meta::session_hash(&cwd, protected_full.as_bytes())
         });
     let source = runtime.as_str();
 
@@ -2518,37 +2434,11 @@ fn settle_bytes(
             home.as_deref(),
         )
     });
-    let protected_observations =
-        secret_dictionary.protect_metadata(&mut observations, &global_secrets)?;
-    // A value learned from an observation can also occur in the transcript. Finish discovery
-    // before constructing content-addressed events so both surfaces use the same dictionary.
-    if protected_observations.new_heuristic_records > 0 {
-        let projected = secret_dictionary.protect_source_session_jsonl(
-            &text,
-            &global_secrets,
-            &lk.source,
-            lk.native_thread_id(),
-            &lk.session_id,
-            Path::new(&cwd),
-        )?;
-        protected_full.text = projected.text;
-        protected_full.replacements = projected.replacements;
-        protected_full.new_records += projected.new_records;
-        protected_full.new_heuristic_records += projected.new_heuristic_records;
-        protected_full.intact = projected.intact;
-    }
-    protected_full.replacements += protected_observations.replacements;
-    protected_full.new_records += protected_observations.new_records;
-    protected_full.new_heuristic_records += protected_observations.new_heuristic_records;
-    protected_full.intact += protected_observations.intact;
-    anyhow::ensure!(
-        protected_full.intact == 0,
-        "session metadata exceeds the reversible record limit; no version was published"
-    );
+    privacy::protect_metadata(repo.root(), &mut observations);
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
             &text,
-            &protected_full.text,
+            &protected_full,
             &ir,
             source,
             &claim,
@@ -2591,6 +2481,11 @@ fn settle_bytes(
                 })
             })
         };
+        if last {
+            snap.milestone = opts.milestone.as_ref().map(|value| {
+                privacy::transform(Some(repo.root()), value, PrivacyMode::ProtectText).content
+            });
+        }
         let subject = {
             let one = c.gist.split_whitespace().collect::<Vec<_>>().join(" ");
             let s: String = one.chars().take(72).collect();
@@ -2611,7 +2506,8 @@ fn settle_bytes(
                 msg.push_str(&format!("\n\ncode: {a}"));
             }
         }
-        let protected_message = secret_dictionary.protect_text(&msg, &global_secrets)?;
+        let protected_message =
+            privacy::transform(Some(repo.root()), &msg, PrivacyMode::ProtectText);
         let snap_text = meta::to_text(&snap)?;
         let base = pending_parent
             .as_deref()
@@ -2640,18 +2536,14 @@ fn settle_bytes(
             let (base_log, base_view) = materialized_base
                 .as_ref()
                 .expect("materialized history retains its committed LOG and VIEW");
-            let protected_addition = secret_dictionary.protect_source_session_jsonl(
-                &region[..c.end_byte],
-                &global_secrets,
-                &lk.source,
-                lk.native_thread_id(),
-                &lk.session_id,
-                Path::new(&cwd),
-            )?;
+            let projected_end = materialized_projection
+                .as_ref()
+                .expect("materialized projection")
+                .end(c.end_byte)?;
             let (log, view) = extend_materialized_snapshot(
                 base_log,
                 base_view,
-                &protected_addition.text,
+                &protected_increment.content[..projected_end],
                 source,
                 &claim,
             )?;
@@ -2671,12 +2563,12 @@ fn settle_bytes(
             repo,
             &tree,
             &parents,
-            &protected_message.text,
+            &protected_message.content,
             (owner, &email),
         )?;
         pending_parent = Some(last_sha.clone());
         let protected_subject = protected_message
-            .text
+            .content
             .lines()
             .next()
             .unwrap_or(&subject)
@@ -2717,15 +2609,20 @@ fn settle_bytes(
     lk.agent = Some(slug.split('/').nth(1).unwrap_or(slug).to_string());
     lk.branch = Some(branch.to_string());
     let new_baseline = region_start + new_chunks.last().map(|c| c.end_byte).unwrap_or(0);
-    if lk.baseline_bytes.is_some() {
+    if materialized_mode {
+        lk.privacy_recovery = None;
+        lk.privacy_recovery_format = None;
         use sha2::Digest as _;
-        // Materialized mode: the baseline and its source tip advance together. Keeping the hash
-        // lets a later prepare prove that this runtime has stayed untouched before superseding it.
         lk.baseline_bytes = Some(new_baseline as u64);
         lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])));
         lk.materialized_from = Some(last_sha.clone());
-        lk.privacy_recovery = None;
-        lk.privacy_recovery_format = None;
+    } else if std::str::from_utf8(bytes).is_ok() {
+        use sha2::Digest as _;
+        lk.native_checkpoint = Some(link::NativeCheckpoint {
+            tip: last_sha.clone(),
+            bytes: new_baseline as u64,
+            sha256: hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])),
+        });
     }
     // The same lock (`link::lock`) as import's claim/rollback critical section, plus a CAS:
     // write only while the disk still holds what it held when settlement started — a claim
@@ -2760,14 +2657,16 @@ fn settle_bytes(
         if let Some(why) = &in_flight {
             explain_in_flight(why);
         }
-        if protected_full.replacements > 0 {
+        if protected_increment.replacements > 0 {
             ui::info(format_args!(
-                "{}",
-                ui::dim(&format!(
-                    "  protected {} secret occurrence(s) with {} new repository-local key(s)",
-                    protected_full.replacements, protected_full.new_records
-                ))
+                "  protected {} secret occurrence(s) with reversible local mappings",
+                protected_increment.replacements
             ));
+        }
+        if protected_increment.status != PrivacyStatus::Complete {
+            ui::warning(
+                "privacy processing was incomplete; settlement continued with the available content",
+            );
         }
         if fresh {
             ui::info(format_args!(
@@ -3572,24 +3471,14 @@ fn file_commit_inner(
     // a managed path or mode into the commit after the checks had passed.
     let tree = repo.git(&["write-tree"])?;
     validate_file_commit_tree(repo, base, tree.trim(), layout, expected_meta.as_deref())?;
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let tree = protect_file_commit_index(
-        repo,
-        base,
-        tree.trim(),
-        layout,
-        &dictionary,
-        &global,
-        original,
-    )?;
+    let tree = protect_file_commit_index(repo, base, tree.trim(), layout, original)?;
     validate_file_commit_tree(repo, base, tree.trim(), layout, expected_meta.as_deref())?;
-    let protected_message = dictionary.protect_text(&message, &global)?;
-    anyhow::ensure!(
-        protected_message.intact == 0,
-        "commit message exceeds the reversible protection limit"
-    );
-    let message = protected_message.text;
+    let message = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &message,
+        crate::domain::privacy::projector::Mode::ProtectText,
+    )
+    .content;
 
     // Build an unreachable commit with the frozen tip as its only parent, then publish it with
     // expected-old CAS. `git commit` cannot express that final CAS and may otherwise silently
@@ -3619,17 +3508,15 @@ enum FileCommitOutcome {
 }
 
 /// Freeze and protect the selected staged bytes; an unstaged edit is a separate local layer.
-#[allow(clippy::too_many_arguments)]
 fn protect_file_commit_index(
     repo: &Repo,
     base: &str,
     tree: &str,
     layout: meta::LayoutVersion,
-    dictionary: &crate::domain::secret_filter::RepositoryDictionary,
-    global: &crate::domain::secret_filter::Matcher,
     original: &mut FileCommitState,
 ) -> crate::Result<String> {
     let mut edits = Vec::new();
+    let mut worktree_updates = Vec::new();
     for path in file_commit_tree_paths(repo, base, tree)? {
         if meta::is_storage_path_for(layout, &path) {
             continue;
@@ -3641,99 +3528,81 @@ fn protect_file_commit_index(
             continue;
         }
         let bytes = read_protected_file_blob(repo, &entry.oid, &path)?;
-        let Some(protected) = protect_shared_file_text(dictionary, global, &path, &bytes)? else {
+        let Some(protected) = protect_shared_file_text(repo, &path, &bytes) else {
             continue;
         };
-        let oid = super::plumbing::raw_git(
-            repo,
-            &["hash-object", "-w", "--no-filters", "--stdin"],
-            Some(&protected),
-        )?;
-        repo.git(&[
-            "update-index",
-            "--cacheinfo",
-            &format!("{},{},{}", entry.mode, oid.trim(), path),
-        ])?;
-
+        worktree_updates.push((path.clone(), bytes, protected.as_bytes().to_vec()));
+        edits.push((path, Some(protected.into_bytes())));
+    }
+    if edits.is_empty() {
+        return Ok(tree.to_owned());
+    }
+    let Ok(protected_tree) = super::plumbing::tree_apply_owned(repo, tree, edits) else {
+        return Ok(tree.to_owned());
+    };
+    if !repo
+        .git(&["write-tree"])
+        .is_ok_and(|current| current.trim() == tree)
+    {
+        return Ok(protected_tree);
+    }
+    if repo.git(&["read-tree", &protected_tree]).is_err() {
+        return Ok(tree.to_owned());
+    }
+    for (path, staged, protected) in worktree_updates {
         let mut local = repo.root().to_path_buf();
-        let mut regular_path = true;
-        for component in Path::new(&path).components() {
+        let regular = Path::new(&path).components().all(|component| {
             local.push(component);
-            if !std::fs::symlink_metadata(&local)
+            std::fs::symlink_metadata(&local)
                 .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-            {
-                regular_path = false;
-                break;
-            }
+        });
+        if !regular || !std::fs::read(&local).is_ok_and(|current| current == staged) {
+            continue;
         }
-        if regular_path && std::fs::read(&local).is_ok_and(|current| current == bytes) {
-            original
-                .protected_files
-                .push(FileSnapshot::capture(local.clone())?);
-            let parent = local.parent().expect("repository file has a parent");
-            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-            std::io::Write::write_all(&mut temporary, protected.as_bytes())?;
+        let saved = (|| -> crate::Result<FileSnapshot> {
+            let snapshot = FileSnapshot::capture(local.clone())?;
+            let mut temporary =
+                tempfile::NamedTempFile::new_in(local.parent().context("file has no parent")?)?;
+            std::io::Write::write_all(&mut temporary, &protected)?;
             temporary
                 .as_file()
                 .set_permissions(std::fs::metadata(&local)?.permissions())?;
             temporary.persist(&local)?;
+            Ok(snapshot)
+        })();
+        if let Ok(saved) = saved {
+            original.protected_files.push(saved);
         }
-        edits.push((path, Some(protected.into_bytes())));
     }
-    let protected_tree = super::plumbing::tree_apply_owned(repo, tree, edits)?;
-    anyhow::ensure!(
-        repo.git(&["write-tree"])? == protected_tree,
-        "the index changed during secret protection; no file commit was published"
-    );
     Ok(protected_tree)
 }
 
-fn read_protected_file_blob(repo: &Repo, oid: &str, path: &str) -> crate::Result<Vec<u8>> {
-    const FILE_PROTECTION_LIMIT: usize = 8 * 1024 * 1024;
+fn read_protected_file_blob(repo: &Repo, oid: &str, _path: &str) -> crate::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    repo.git_cat_file_batch(vec![oid.to_owned()], FILE_PROTECTION_LIMIT, |_, _, body| {
-        match body {
-            crate::domain::repo::ObjectBody::Read(content) => bytes.extend_from_slice(content),
-            crate::domain::repo::ObjectBody::TooLarge(size) => anyhow::bail!(
-                "shared file inspection limit exceeded for {path}: {size} bytes exceeds the {FILE_PROTECTION_LIMIT}-byte text protection limit; no commit was published. Stage this artifact with `agit file add --lfs <path>` and commit again. LFS does not remove ordinary blobs already present in history"
-            ),
+    repo.git_cat_file_batch(vec![oid.to_owned()], 8 * 1024 * 1024, |_, _, body| {
+        if let crate::domain::repo::ObjectBody::Read(content) = body {
+            bytes.extend_from_slice(content);
         }
         Ok(())
     })?;
     Ok(bytes)
 }
 
-fn protect_shared_file_text(
-    dictionary: &crate::domain::secret_filter::RepositoryDictionary,
-    global: &crate::domain::secret_filter::Matcher,
-    path: &str,
-    bytes: &[u8],
-) -> crate::Result<Option<String>> {
-    if crate::domain::lfs::Pointer::parse(bytes)?.is_some() {
-        return Ok(None);
+fn protect_shared_file_text(repo: &Repo, path: &str, bytes: &[u8]) -> Option<String> {
+    if matches!(crate::domain::lfs::Pointer::parse(bytes), Ok(Some(_))) {
+        return None;
     }
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        ui::warning(&format!(
-            "shared file {path} is non-UTF-8; its binary bytes are retained without reversible text protection"
-        ));
-        return Ok(None);
-    };
+    let text = std::str::from_utf8(bytes).ok()?;
     if text.contains('\0') {
-        ui::warning(&format!(
-            "shared file {path} contains binary data; its bytes are retained without reversible text protection"
-        ));
-        return Ok(None);
+        return None;
     }
-    let protected = if path.ends_with(".json") || path.ends_with(".jsonl") {
-        dictionary.protect_jsonl(text, global)?
+    let mode = if path.ends_with(".json") || path.ends_with(".jsonl") {
+        crate::domain::privacy::projector::Mode::ProtectJsonl
     } else {
-        dictionary.protect_text(text, global)?
+        crate::domain::privacy::projector::Mode::ProtectText
     };
-    anyhow::ensure!(
-        protected.intact == 0,
-        "shared file {path} exceeds the reversible protection limit"
-    );
-    Ok((protected.replacements > 0).then_some(protected.text))
+    let outcome = crate::domain::privacy::service::transform(Some(repo.root()), text, mode);
+    (outcome.replacements > 0).then_some(outcome.content)
 }
 
 fn staged_paths(repo: &Repo, base: &str) -> crate::Result<Vec<String>> {
@@ -5977,8 +5846,7 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
     }
 
     #[test]
-    fn command_identity_evidence_survives_settlement_and_repository_reopen() {
-        use crate::domain::{secret_filter::RepositoryDictionary, secrets};
+    fn settlement_repairs_native_binding_without_changing_conversation_history() {
         let (_home, repo) = setup_repo();
         let (_dir, store) = store();
         let native = "6508bdee-7103-459b-89c2-8245793861ca";
@@ -5993,7 +5861,7 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         lk.session_id = binding.key().unwrap();
         lk.native_binding = Some(binding);
         lk.cwd = Some(repo.root().to_string_lossy().into_owned());
-        let mut text = serde_json::json!({"type":"session_meta", "payload":{
+        let text = serde_json::json!({"type":"session_meta", "payload":{
             "id":native,"cwd":repo.root(),"timestamp":"2026-09-18T00:00:00Z"
         }})
         .to_string()
@@ -6072,254 +5940,6 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             repaired,
             "identity repair must be idempotent"
         );
-        let initial_records = RepositoryDictionary::open(repo.root())
-            .unwrap()
-            .review()
-            .unwrap()
-            .len();
-        let git_output = repo
-            .git(&["commit", "--allow-empty", "-m", "ordinary code commit"])
-            .unwrap();
-        let git_id = repo.git(&["rev-parse", "HEAD"]).unwrap();
-        let tag = format!("agit-{version}");
-        repo.git(&["tag", "-a", "-m", "version annotation", &tag, &version])
-            .unwrap();
-        let refs = repo.git(&["show-ref", "--tags"]).unwrap();
-        let pair = |id: &str, command: &str, output: &str| {
-            let args = serde_json::json!({"cmd":command,"workdir":repo.root()}).to_string();
-            serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":id,"arguments":args}}).to_string()
-                + "\n" + &serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":id,"output":output}}).to_string() + "\n"
-        };
-        text += &codex_user("record the command outcomes");
-        text += &pair(
-            "git-one",
-            "git commit --allow-empty -m 'ordinary code commit'",
-            &git_output,
-        );
-        text += &pair(
-            "agit-one",
-            "agit commit",
-            &format!("#1 {} initial turn", &version[..9]),
-        );
-        text += &pair("refs-one", "git show-ref --tags", &refs);
-        text += &codex_asst(&format!(
-            "commit `{git_id}`, version `{tag}`, version `{}`, ref `refs/tags/{tag}`.",
-            meta::short(&tag)
-        ));
-        settle(&text);
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        assert_eq!(
-            dictionary.review().unwrap().len(),
-            initial_records,
-            "identities alone must not create dictionary records"
-        );
-        let canonical = storage::materialize_at(repo.root(), "HEAD", meta::LOG_FILE).unwrap();
-        assert!(canonical.contains(&git_id) && canonical.contains(&tag));
-        for _ in 0..2 {
-            let reopened = Repo::at(repo.root());
-            let report = secrets::scan_agent_repo(&reopened, &secrets::ScanPlan::full()).unwrap();
-            assert!(
-                report.hits.is_empty() && report.unscanned.is_empty(),
-                "hits: {:?}; coverage: {:?}",
-                report.hits,
-                report.unscanned
-            );
-        }
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        let hex = "e9873bc2a40965f831bd0ae764c15f902bd378af61906ce52abec90875413d2f6";
-        text += &codex_user("check credentials too");
-        text += &serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":"credential carrier","token":git_id,"signature":hex,"sha":secret,"provenance":{"text":format!("agit-{hex}")}}}).to_string();
-        text += "\n";
-        text += &codex_asst(&format!(
-            "commit `{git_id}` remains available. token = {secret}"
-        ));
-        settle(&text);
-        let stored = storage::materialize_at(repo.root(), "HEAD", meta::LOG_FILE).unwrap();
-        assert!(!stored.contains(secret) && !stored.contains(hex));
-        let records = dictionary.review().unwrap().len();
-        let again = dictionary
-            .protect_session_jsonl(
-                &text,
-                &crate::domain::secret_filter::Matcher::empty(),
-                "codex",
-                native,
-                repo.root(),
-            )
-            .unwrap();
-        assert_eq!(again.new_records, 0);
-        assert_eq!(dictionary.review().unwrap().len(), records);
-        assert!(stored.contains(&format!("commit `{git_id}`")));
-        assert!(!stored.contains(&format!("\"token\":\"{git_id}\"")));
-        let report =
-            secrets::scan_agent_repo(&Repo::at(repo.root()), &secrets::ScanPlan::full()).unwrap();
-        assert!(report.hits.is_empty(), "{:?}", report.hits);
-        let local = dictionary.hydrate_envelopes_readonly(&stored).unwrap();
-        assert!(local.text.contains(secret) && local.text.contains(hex));
-        let exported = dictionary
-            .protect_envelopes(&stored, &crate::domain::secret_filter::Matcher::empty())
-            .unwrap();
-        assert_eq!(exported.new_records, 0);
-        assert_eq!(exported.text, stored);
-        let history =
-            crate::domain::redact::Redactor::new(crate::domain::redact::Persona::default())
-                .with_repository(repo.root())
-                .unwrap()
-                .with_native_context("codex", native, repo.root(), repo.root());
-        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-        let displayed = history.scrub_native_json(&last, &[]);
-        assert!(displayed.value.to_string().contains(&git_id));
-        assert!(!displayed.value.to_string().contains(secret));
-        assert_eq!(dictionary.review().unwrap().len(), records);
-        let other = tempfile::tempdir().unwrap();
-        let clone = other.path().join("clone");
-        repo.git(&[
-            "clone",
-            "--no-local",
-            repo.root().to_str().unwrap(),
-            clone.to_str().unwrap(),
-        ])
-        .unwrap();
-        let foreign = RepositoryDictionary::open(&clone).unwrap();
-        assert!(!foreign.exists());
-        assert_eq!(
-            foreign.hydrate_envelopes_readonly(&stored).unwrap().text,
-            stored
-        );
-        let report =
-            secrets::scan_agent_repo(&Repo::at(&clone), &secrets::ScanPlan::full()).unwrap();
-        assert!(report.hits.is_empty(), "{:?}", report.hits);
-        assert!(!foreign.exists());
-        let index = std::fs::read(clone.join(meta::LOG_FILE)).unwrap();
-        std::fs::write(clone.join("shared-index.txt"), index).unwrap();
-        let cloned = Repo::at(&clone);
-        cloned
-            .git(&["config", "user.name", "Carrier fixture"])
-            .unwrap();
-        cloned
-            .git(&["config", "user.email", "test@example.invalid"])
-            .unwrap();
-        cloned.add_all().unwrap();
-        cloned.commit("ordinary shared carrier").unwrap();
-        let report = secrets::scan_agent_repo(&cloned, &secrets::ScanPlan::full()).unwrap();
-        assert!(
-            report
-                .hits
-                .iter()
-                .any(|hit| hit.source == secrets::Source::BlobObject)
-        );
-        dictionary
-            .block_add(
-                "explicit identity credential",
-                zeroize::Zeroizing::new(git_id.clone()),
-                false,
-            )
-            .unwrap();
-        let blocked = dictionary
-            .protect_session_jsonl(
-                &text,
-                &crate::domain::secret_filter::Matcher::empty(),
-                "codex",
-                native,
-                repo.root(),
-            )
-            .unwrap();
-        assert!(!blocked.text.contains(&git_id));
-        let report = secrets::scan_agent_repo(&repo, &secrets::ScanPlan::full()).unwrap();
-        assert!(
-            report
-                .hits
-                .iter()
-                .any(|hit| hit.rule == "registered-secret")
-        );
-    }
-
-    #[test]
-    fn a_protection_limit_cannot_publish_an_unprotected_session_version() {
-        let (_home, repo) = setup_repo();
-        let (_dir, store) = store();
-        let oversized = format!(
-            "-----BEGIN PRIVATE KEY-----\n{}",
-            "private material\n".repeat(8192)
-        );
-        let text = format!("{META}\n{}{}", codex_user(&oversized), codex_asst("reply"));
-        let error = settle_bytes(
-            &store,
-            &repo,
-            "alice/photo",
-            "main",
-            link(),
-            text.as_bytes(),
-            "alice",
-            opts(),
-            true,
-            true,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("reversible record limit"));
-        assert!(repo.git_opt(&["rev-parse", "--verify", "HEAD"]).is_none());
-    }
-
-    #[test]
-    fn unborn_shared_files_are_projected_without_mutating_the_original_index() {
-        let (_home, repo) = setup_repo();
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        std::fs::write(repo.root().join("shared.txt"), secret).unwrap();
-        repo.git(&["add", "--", "shared.txt"]).unwrap();
-        let index = repo.git(&["write-tree"]).unwrap();
-        let protected = unborn_worktree_tree(&repo).unwrap();
-        let stored = repo.show_raw(&protected, "shared.txt").unwrap();
-        assert!(!stored.contains(secret));
-        assert!(stored.contains("{{AGIT_SECRET_V1:"));
-        assert_eq!(repo.git(&["write-tree"]).unwrap(), index);
-        assert_eq!(
-            std::fs::read_to_string(repo.root().join("shared.txt")).unwrap(),
-            secret
-        );
-        let dictionary =
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-        assert_eq!(dictionary.hydrate_text(&stored).unwrap().text, secret);
-    }
-
-    #[test]
-    fn file_commit_protects_selected_bytes_and_keeps_unstaged_edits() {
-        let (_home, repo) = setup_repo();
-        init_main_file_line(&repo);
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        std::fs::write(repo.root().join("selected.md"), secret).unwrap();
-        std::fs::write(repo.root().join("partial.md"), secret).unwrap();
-        repo.git(&["add", "--", "selected.md", "partial.md"])
-            .unwrap();
-        std::fs::write(repo.root().join("partial.md"), "unstaged work").unwrap();
-        assert_eq!(
-            commit_staged_files(&repo, "alice/photo", "main", secret).unwrap(),
-            ExitCode::Ok
-        );
-        let stored = repo.show_raw("HEAD", "selected.md").unwrap();
-        assert!(stored.contains("{{AGIT_SECRET_V1:"));
-        assert!(!stored.contains(secret));
-        assert_eq!(repo.show_raw("HEAD", "partial.md").unwrap(), stored);
-        assert_eq!(
-            std::fs::read_to_string(repo.root().join("selected.md")).unwrap(),
-            stored
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.root().join("partial.md")).unwrap(),
-            "unstaged work"
-        );
-        assert!(
-            repo.git(&["diff", "--cached", "--name-only"])
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !repo
-                .git(&["log", "-1", "--format=%B"])
-                .unwrap()
-                .contains(secret)
-        );
-        let dictionary =
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-        assert_eq!(dictionary.hydrate_text(&stored).unwrap().text, secret);
     }
 
     /// A brand-new repo plus `-b exp`: the first turn commit must land on exp, and no session

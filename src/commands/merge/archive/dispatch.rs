@@ -4,7 +4,6 @@ use anyhow::{Context, ensure};
 
 use crate::Result;
 use crate::domain::merge_archive::{ArchivePhase, ExplorationBinding};
-use crate::domain::secret_filter::VaultStore;
 use crate::domain::{
     archive_history, merge_archive, mergetx,
     repo::{self, Repo},
@@ -141,7 +140,6 @@ pub(in crate::commands::merge) fn continue_selected(
     let (owner, name) = super::super::super::parse_slug(&binding.source.slug)?;
     let source = Repo::open(crate::infra::config::repo_dir(&owner, &name)?)
         .context("the frozen merge source repository is unavailable")?;
-    let global = VaultStore::open_default()?.matcher()?;
     let request = landing::LandingRequest {
         repo,
         source_repo: &source,
@@ -149,9 +147,9 @@ pub(in crate::commands::merge) fn continue_selected(
         binding,
     };
     if resolved.is_empty() {
-        landing::land(request, &global)
+        landing::land(request)
     } else {
-        landing::land_resolved(request, &global, resolved)
+        landing::land_resolved(request, resolved)
     }
 }
 

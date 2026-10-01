@@ -253,7 +253,7 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
                 assert!(!request_line.contains("/privacy/"));
             }
             if let Some(mut response) =
-                eligibility::response(&server_hub, &request_line, &body, encryption_enabled)
+                eligibility::response(&server_hub, &request_line, encryption_enabled)
             {
                 if request_line.contains("/privacy/publishing-key ") {
                     use base64::Engine;

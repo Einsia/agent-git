@@ -78,7 +78,7 @@ pub(super) fn rpc_test_daemon(
         terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         term_tx: None,
         online: true,
-        secret_filter: Default::default(),
+
         settlement,
         started_at: std::time::Instant::now(),
         notes,

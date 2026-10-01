@@ -181,6 +181,14 @@ impl Lab {
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         walkdir::WalkDir::new(self.root.path())
             .into_iter()
+            .filter(|entry| {
+                !entry.as_ref().is_ok_and(|entry| {
+                    entry
+                        .path()
+                        .strip_prefix(self.root.path())
+                        .is_ok_and(|path| path.starts_with("agit/privacy"))
+                })
+            })
             .map(|entry| {
                 let entry = entry.unwrap();
                 assert!(!entry.file_type().is_symlink());
@@ -293,6 +301,10 @@ impl HttpWorker {
                 }
                 let header = String::from_utf8(bytes).unwrap();
                 let first = header.lines().next().unwrap().to_owned();
+                if first.contains(" /api/me/privacy/") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
                 assert!(header.lines().any(|line| {
                     line.split_once(':').is_some_and(|(name, value)| {
                         name.eq_ignore_ascii_case("authorization")

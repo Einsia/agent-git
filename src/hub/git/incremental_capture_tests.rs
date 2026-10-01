@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::secrets::{ScanLimits, Source as Carrier};
+use crate::domain::secrets::ScanLimits;
 use crate::hub::git::{CompleteContentInspection, ContentInspection};
 
 fn capture(repo: &Repo, roots: &[String], budget: u64) -> Result<CapturedPublication> {
@@ -46,7 +46,6 @@ fn capture(repo: &Repo, roots: &[String], budget: u64) -> Result<CapturedPublica
             },
         )?;
     }
-    objects.extend(git.scope.tags.iter().cloned());
     let bytes: u64 = git.lfs_inventory.iter().map(|pointer| pointer.size).sum();
     let started = std::time::Instant::now();
     let captured = CapturedPublication::stage(repo, &plan, budget, false, source, git)?;
@@ -121,8 +120,6 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
         pointer.size
     );
     std::fs::write(repo.root().join("payload"), &pointer_text).unwrap();
-    let secret = "AKIA4X7QZ2M5RT6VW3JH";
-    std::fs::write(repo.root().join("old-secret"), secret).unwrap();
     let base = commit(&repo, "Base");
     let cache = repo
         .root()
@@ -133,10 +130,12 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
     std::fs::write(&cache, payload).unwrap();
     let first = inspect(capture(&repo, &[], pointer.size).unwrap());
-    assert!(first.has_findings());
     assert_eq!(first.captured().pointers(), std::slice::from_ref(&pointer));
     let unavailable = inspect(capture(&repo, &["a".repeat(40)], pointer.size).unwrap());
-    assert!(unavailable.has_findings());
+    assert_eq!(
+        unavailable.captured().pointers(),
+        std::slice::from_ref(&pointer)
+    );
     std::fs::remove_file(&cache).unwrap();
     let roots = vec![base.clone()];
     let mut captured = capture(&repo, &roots, 0).unwrap();
@@ -148,7 +147,6 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     let url = "https://hub.invalid/alice/repo.git";
     captured.git.baseline = Some((url.into(), identity.clone()));
     let repeat = inspect(captured);
-    assert!(!repeat.has_findings());
     assert!(repeat.captured().pointers().is_empty());
     let other_identity =
         RemoteIdentity::new(&identity.hub, "00000000-0000-0000-0000-000000000002").unwrap();
@@ -166,47 +164,17 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     );
     assert!(capture(&repo, &[], pointer.size).is_err());
 
-    repo.git(&["checkout", "-b", "side"]).unwrap();
-    std::fs::write(
-        repo.root().join("removed-secret"),
-        format!("new = {secret}"),
-    )
-    .unwrap();
-    commit(&repo, "Add unpublished secret");
-    repo.git(&["rm", "removed-secret"]).unwrap();
-    commit(&repo, "Delete unpublished secret");
-    repo.git(&["checkout", "main"]).unwrap();
-    std::fs::write(repo.root().join("clean"), "clean content").unwrap();
-    commit(&repo, "Independent branch update");
-    repo.git(&[
-        "merge",
-        "--no-ff",
-        "side",
-        "-m",
-        "Merge unpublished history",
-    ])
-    .unwrap();
+    std::fs::write(repo.root().join("clean"), "appended content").unwrap();
+    commit(&repo, "Append history without new payloads");
     let tip = repo.git(&["rev-parse", "HEAD"]).unwrap();
     repo.git(&["update-ref", "refs/remotes/origin/main", &tip])
         .unwrap();
     let appended = inspect(capture(&repo, &roots, 0).unwrap());
-    assert!(appended.report().scan().hits.iter().any(|hit| {
-        hit.file
-            .as_deref()
-            .is_some_and(|file| file.contains("removed-secret"))
-    }));
     assert!(appended.captured().pointers().is_empty());
     let roots = vec![tip];
-    repo.git(&["tag", "-a", "new-tag", &base, "-m", secret])
+    repo.git(&["tag", "-a", "new-tag", &base, "-m", "initial annotation"])
         .unwrap();
     let tag = inspect(capture(&repo, &roots, 0).unwrap());
-    assert!(
-        tag.report()
-            .scan()
-            .hits
-            .iter()
-            .any(|hit| hit.source == Carrier::TagObject)
-    );
     repo.git(&[
         "tag",
         "-f",
@@ -214,20 +182,10 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
         "new-tag",
         &base,
         "-m",
-        &format!("changed {secret}"),
+        "changed annotation",
     ])
     .unwrap();
     assert!(tag.verify_source(&repo).is_err());
-    let changed = inspect(capture(&repo, &roots, 0).unwrap());
-    assert!(
-        changed
-            .report()
-            .scan()
-            .hits
-            .iter()
-            .any(|hit| hit.source == Carrier::TagObject)
-    );
-
     std::fs::write(
         repo.root().join("new-pointer"),
         pointer_text.replace("git-lfs.github.com", "hawser.github.com"),

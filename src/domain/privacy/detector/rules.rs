@@ -1,46 +1,6 @@
-//! Rule set and rule engine.
-//!
-//! # Why gitleaks' rules and our own engine
-//!
-//! A dozen hand-written rules do not hold up against the real world: the secret shapes that have
-//! turned up in transcripts go far past AWS and GitHub. The gitleaks rule set (222 rules) is the
-//! most used one for this job, MIT licensed, and can be vendored directly. **Execution** does not
-//! need its binary: Go's `regexp` is RE2, the same family as Rust's `regex` (no lookahead, no
-//! backreferences), and 221 regexes carry over verbatim and all compile.
-//!
-//! What matters more is "one source for both sides": the server-side gate is pure Rust, with no
-//! Node and no Go runtime. The rules live in `agit::domain::secrets` (not behind the `cli`
-//! feature), so a backend depending on this crate with `default-features = false` gets the same
-//! rules — two rule sets are certain to drift, and the one that drifts rots first.
-//!
-//! # Performance: the keyword prefilter is a requirement, not an optimization
-//!
-//! Observed on a 2.6MB transcript: running all 221 regexes takes **16.6 seconds**, and the
-//! keyword prefilter brings that down to **27ms**; compiling the whole set once already costs
-//! 1.37 seconds. Two hard constraints follow:
-//!
-//! 1. **Lazy compilation** — only a rule the prefilter hits is ever compiled into a `Regex`.
-//! 2. **One prefilter pass** — every rule's keywords go into one Aho–Corasick automaton and the
-//!    whole text is walked once. Per-rule `contains()` is O(rules × text length), and
-//!    330 passes × 2.6MB lands on the order of a second, which is the same as no prefilter.
-//!
-//! # TOML fields that are not implemented
-//!
-//! This engine scans **session content** (jsonl / VIEW / shared files / commit message), not an
-//! arbitrary source tree, so the fields below are deliberately ignored — written down here so it
-//! does not pretend to support all of them:
-//!
-//! * `path` / `paths` (rule-level and allowlist-level): switch rules on and off by file path. Our
-//!   scan surface is a fixed set of session files, and no path pattern describes them.
-//!   **Ignoring rule-level `path` means those 5 rules are always in effect here** — the direction
-//!   is better a false positive than a miss. Ignoring allowlist-level `paths` means those few
-//!   allows no longer apply (conservative in the same direction); the one exception is an entry
-//!   with `condition = "AND"`: dropping one AND test **widens** the allow, so such an entry is
-//!   voided whole (see [`Allow::unsupported`]).
-//! * `regexTarget = "line"` is implemented; metadata such as `commits` / `description` takes no
-//!   part in the verdict.
-//! * The global `[allowlist]` takes only `regexes` and `stopwords` (both apply to the secret);
-//!   `paths` is ignored as above.
+//! Vendored rules share one keyword automaton and compile regular expressions lazily.
+//! Entropy and built-in exceptions filter heuristic matches. User policy is applied
+//! by the caller and must never weaken explicit literal blocks.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
@@ -54,22 +14,10 @@ const GITLEAKS_TOML: &str = include_str!("gitleaks.toml");
 /// agit's own rules: shapes gitleaks cannot have, or does not reach and that have bitten us.
 const AGIT_TOML: &str = include_str!("agit-rules.toml");
 
-/// Upper bound on the size of a compiled regex program.
-///
-/// 3 of the official rules exceed `regex`'s default 10MB limit (all of them very long literal
-/// alternations); at 64MB all 221 compile. Nothing here is syntactically incompatible — the
-/// default budget is too small.
+/// Complex literal alternations must fit within a bounded compiled program.
 const SIZE_LIMIT: usize = 64 << 20;
 
-/// Cache limit for the lazy DFA. **This one is the performance watershed, not a tuning knob.**
-///
-/// A rule like `generic-api-key` is one long `(?i)` alternation of literals with a large NFA
-/// state count; when the cache cannot hold it the lazy DFA clears itself over and over and
-/// finally falls back to PikeVM character-by-character simulation. Observed scanning 2MB: the
-/// default (2MB cache) **916ms**, raised to 64MB **4.2ms** — 220x. `hashicorp-tf-password` is
-/// 519ms → 3.1ms. Leaving this value alone means these two rules eat back everything the keyword
-/// prefilter saves, and a gate that answers in seconds is no gate at all (the hint spells out how
-/// to bypass it).
+/// A bounded DFA cache avoids repeated fallback work for large assignment rules.
 const DFA_SIZE_LIMIT: usize = 64 << 20;
 
 // ── TOML schema ─────────────────────────────────────────────────────────
@@ -219,7 +167,7 @@ pub struct Rule {
     entropy: Option<f64>,
     secret_group: Option<usize>,
     raw_allows: Vec<RawAllow>,
-    /// Lazy: compiling all 221 takes 1.37 seconds, while one scan usually needs only a handful
+    /// Lazy compilation touches only rules selected by the keyword prefilter
     /// of rules to actually run.
     lazy: OnceLock<Option<Compiled>>,
 }
@@ -316,13 +264,9 @@ pub fn shannon(s: &str) -> f64 {
 
 // ── Loading ─────────────────────────────────────────────────────────────
 
-fn parse(toml_src: &str, into: &mut Vec<Rule>, global: &mut Vec<RawAllow>) {
-    // The rule files are vendored constants, so a parse failure can only mean we broke a file
-    // ourselves. But it **must not panic**: a bad file that takes down push is worse than a few
-    // missing rules.
+fn parse(toml_src: &str, into: &mut Vec<Rule>, global: &mut Vec<RawAllow>) -> bool {
     let Ok(cfg) = toml::from_str::<RawConfig>(toml_src) else {
-        debug_assert!(false, "a vendored rule file must parse");
-        return;
+        return false;
     };
     if let Some(a) = cfg.allowlist {
         global.push(a);
@@ -340,9 +284,11 @@ fn parse(toml_src: &str, into: &mut Vec<Rule>, global: &mut Vec<RawAllow>) {
             lazy: OnceLock::new(),
         });
     }
+    true
 }
 
 struct RuleSet {
+    healthy: bool,
     rules: Vec<Rule>,
     global: Vec<RawAllow>,
     /// keyword → the indices of the rules that use it.
@@ -355,11 +301,10 @@ struct RuleSet {
 static SET: LazyLock<RuleSet> = LazyLock::new(|| {
     let mut rules = vec![];
     let mut global = vec![];
-    parse(GITLEAKS_TOML, &mut rules, &mut global);
-    parse(AGIT_TOML, &mut rules, &mut global);
+    let gitleaks_loaded = parse(GITLEAKS_TOML, &mut rules, &mut global);
+    let agit_loaded = parse(AGIT_TOML, &mut rules, &mut global);
 
-    // Keyword dedup: the 221 rules share far fewer keywords than they have rules, and the
-    // automaton is built once.
+    // Shared keywords occupy one automaton pattern with all owning rules attached.
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut words: Vec<String> = vec![];
     let mut owners: Vec<Vec<usize>> = vec![];
@@ -383,6 +328,7 @@ static SET: LazyLock<RuleSet> = LazyLock::new(|| {
         .build(&words)
         .ok();
     RuleSet {
+        healthy: gitleaks_loaded && agit_loaded && prefilter.is_some(),
         rules,
         global,
         prefilter,
@@ -390,6 +336,10 @@ static SET: LazyLock<RuleSet> = LazyLock::new(|| {
         always,
     }
 });
+
+pub(super) fn healthy() -> bool {
+    SET.healthy
+}
 
 static GLOBAL_ALLOW: OnceLock<Vec<Allow>> = OnceLock::new();
 static PRESET_REJECTIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
@@ -441,8 +391,11 @@ pub fn all() -> &'static [Rule] {
 /// still has to run.
 ///
 /// The text is not `to_lowercase()`d: the automaton itself is ASCII case-insensitive and the
-/// keywords are all ASCII literals. That saves an MB-scale allocation plus a full rewrite.
+/// keywords are all ASCII literals, so case folding needs no copy of the input.
 pub fn candidates(text: &str) -> Vec<&'static Rule> {
+    if SET.prefilter.is_none() {
+        return SET.rules.iter().collect();
+    }
     let mut on = vec![false; SET.rules.len()];
     for &i in &SET.always {
         on[i] = true;
@@ -466,8 +419,7 @@ pub fn candidates(text: &str) -> Vec<&'static Rule> {
 
 /// For audit: compile every rule and return the ids that fail.
 ///
-/// Called only from tests — it pays the 1.37 seconds lazy compilation deliberately avoids. A rule
-/// that fails to compile is a silent hole, so a test has to pin "zero failures".
+/// Compiling all rules belongs to explicit diagnostics and tests, outside automatic scans.
 pub fn audit() -> Vec<&'static str> {
     SET.rules
         .iter()

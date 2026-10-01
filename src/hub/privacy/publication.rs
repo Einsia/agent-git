@@ -86,11 +86,9 @@ impl PublicationPolicy {
         policy_digest: &str,
         recipient: &str,
         visibility: &str,
-        content_policy_digest: &str,
     ) -> Result<Self> {
         validate_digest(policy_digest)?;
         validate_digest(recipient)?;
-        validate_digest(content_policy_digest)?;
         ensure!(
             matches!(visibility, "public" | "private"),
             "unsupported publication audience"
@@ -118,7 +116,6 @@ impl PublicationPolicy {
                 && mandatory.require_envelope
                 && mandatory.publication_format_version == ENVELOPE_FORMAT_VERSION
                 && matches!(mandatory.source.as_str(), "repository" | "organization")
-                && mandatory.content_policy_digest.as_deref() == Some(content_policy_digest)
                 && strategy.mandatory_policy_digest
                     == digest_bytes(&serde_json::to_vec(mandatory)?),
             "unsupported or inconsistent Hub mandatory publication policy"

@@ -92,74 +92,6 @@ impl Drop for VaultCleanup<'_> {
     }
 }
 
-fn secret_commands_reload_live_matcher(home: &Path) {
-    agit::rc::select_local_authority();
-    use agit::domain::secret_filter::MatcherHandle;
-    let matcher = MatcherHandle::load_default().unwrap();
-    let live = matcher.clone();
-    let listener = control::listen().unwrap();
-    let worker = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stop = false;
-            control::serve_one(&mut stream.unwrap(), |request| match request {
-                Request::Status => Reply::Status(control::Status {
-                    pid: std::process::id(),
-                    ..Default::default()
-                }),
-                Request::ReloadSecrets => match live.reload_default() {
-                    Ok(status) => Reply::SecretsReloaded {
-                        generation: status.generation,
-                        rules: status.rules,
-                    },
-                    Err(error) => Reply::Error {
-                        message: error.to_string(),
-                    },
-                },
-                Request::Stop => {
-                    stop = true;
-                    Reply::Stopping
-                }
-                Request::StopIfIdle { .. } => panic!("a reload fixture must not restart"),
-            })
-            .unwrap();
-            if stop {
-                break;
-            }
-        }
-    });
-    let added = command_input(
-        home,
-        "http://127.0.0.1:9",
-        &["secrets", "add", "native-fixture", "--stdin"],
-        Some("windows-fixture-secret\n"),
-    );
-    let after_add = matcher.snapshot();
-    let removed = command(
-        home,
-        "http://127.0.0.1:9",
-        &["secrets", "remove", "native-fixture", "--yes"],
-    );
-    let after_remove = matcher.snapshot();
-    assert!(matches!(
-        control::ask(&Request::Stop).unwrap(),
-        Reply::Stopping
-    ));
-    worker.join().unwrap();
-    assert!(
-        added.status.success(),
-        "{}",
-        String::from_utf8_lossy(&added.stderr)
-    );
-    assert!(
-        removed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&removed.stderr)
-    );
-    assert_eq!(after_add.find("windows-fixture-secret").len(), 1);
-    assert!(after_remove.find("windows-fixture-secret").is_empty());
-    assert!(after_remove.generation() > after_add.generation());
-}
-
 fn restricted_open(path: &Path, access: u32) -> std::io::Result<security::Handle> {
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser,
@@ -369,8 +301,6 @@ fn native_pipe_permissions_and_state_boundaries() {
         started.elapsed() < Duration::from_secs(12),
         "a stalled peer must not wedge later control requests"
     );
-
-    secret_commands_reload_live_matcher(&home);
 
     let hub = "http://127.0.0.1:9";
     assert!(!command(&home, hub, &["rc", "pair"]).status.success());

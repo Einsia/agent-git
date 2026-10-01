@@ -1,6 +1,6 @@
 //! Device-managed exclusions narrow every repository's candidate scope.
 
-use super::{ensure_valid_label, validate_patterns};
+use super::repository::{ensure_valid_label, validate_patterns};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{

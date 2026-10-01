@@ -231,10 +231,9 @@ the selected original records and is sealed to the accepted source publication's
 events and unrelated reverse mappings are absent from that layer. Independent repository files
 and attachments are outside the share payload.
 
-Before projection, sharing resolves the current account's mandatory Hub sources and the source
-repository's sources through the authenticated resolver below. Native sessions without a repository
-retain the account sources. After confirmation, the CLI refreshes every resolved scope and checks
-the local policy and repository identity again before uploading.
+Sharing applies local policy through the bounded privacy worker. A failed local transformation
+uses the available in-memory projection. Repository identity and the explicitly selected
+recipient remain authenticated transport requirements.
 
 The server stores the payload as an opaque string and returns `format_version: 2`. The CLI refuses
 an acknowledgement without that version and refuses recipient-key drift after preparation. A
@@ -358,26 +357,15 @@ creation, so a first push creates the destination without extra flags. Automatic
 ordinary publication follows `push.auto` without saved consent; outside RC it may
 create a missing destination with the non-interactive visibility default.
 
-Default inspection excludes Git objects reachable from the actual destination's live
-advertised refs, using only roots available in the isolated local object store. It
-checks new commit and tag bodies, new blobs throughout unpublished history, and the
-verified bytes behind new LFS pointer objects. Remote LFS availability alone cannot
-waive payload inspection. The complete frozen plan still controls source verification
-and upload refs. The baseline is bound to the destination URL and immutable repository
-identity; a changed destination or source invalidates the inspection.
-
-First publication, empty or unavailable advertisements, and unverifiable baselines
-fall back to full inspection. Encrypted scope is computed after projection from the
-public object graph, so changed policy or key material that creates new objects is
-included. Manual, automatic and dry-run push share this behavior. --audit always
-reviews complete selected history and payloads. Default incremental push does not
-retroactively apply updated scanner rules to remote content, and retains no scan
-results across pushes. Server-side scanning policy is unchanged. See
-[incremental inspection](push-incremental-inspection.md) for scope details and local measurements.
+Publication checks source object integrity and the availability and hashes of required LFS
+payloads. It performs no implicit secret scan and never reads LFS content for privacy processing.
+Every push schedules encrypted dictionary synchronization independently, including an up-to-date
+push. Privacy failures do not reject ordinary publication. Existing committed history remains
+unchanged. See [incremental integrity](push-incremental-inspection.md) for transport scope.
 
 The following projection and key requirements apply to encrypted repositories.
 
-`agit commit` settles original session records locally. When automatic publication is enabled,
+`agit commit` settles session records with best-effort local secret replacement. When automatic publication is enabled,
 its post-settlement child invokes `push` for the explicit session branch after releasing
 settlement locks. RC settlement uses the same unattended publication configuration. These paths
 share the same authoritative mode and destination as explicit push. Automatic encrypted
@@ -412,7 +400,7 @@ After clone, publication can retain known ancestry fetched from the same destina
 snapshot must match the supported public schema, exact generated metadata, LOG/VIEW event files,
 envelope and synthetic commit bytes. Its parents must already have passed
 the same reconstruction. Extra files, native archives, altered modes or mismatched parents block
-reuse. Public contents still pass secret inspection; the original ciphertext and historical policy
+reuse. No server content scan is performed; the original ciphertext and historical policy
 binding remain unchanged. New local snapshots use the current device's policy and viewing recipient.
 This preserves fast-forward ancestry without granting source-device directories local authority.
 
@@ -431,7 +419,7 @@ publication policy is a server-owned carrier restriction, separate from device c
 The CLI validates its version, envelope requirement and digest. The digest uses SHA-256 over the
 compact UTF-8 JSON struct in this field order: `version`, `source`, `require_envelope`,
 `publication_format_version`, `protected_paths`, followed by `content_policy_digest` when present.
-Protected pushes require this final digest to match the resolved destination content rules below.
+The compatibility content-policy marker does not impose cloud content rules.
 This encoding matches the strategy API; it is
 not the canonical sorted-object encoding used by public session digests.
 
@@ -514,7 +502,7 @@ authorized root; memory patterns use memory-relative paths. The system source is
 followed by configured sources in manifest order, then repository and branch exclusions. Built-in
 sensitive-file exclusions always remain effective. Source IDs must be unique. A listed source
 must exist and be a valid regular file; missing files, symlinks, malformed versions and unknown
-fields block processing. Each source or manifest is limited to 256 KiB, the manifest to 32 sources,
+fields make that optional local processing attempt unavailable. Each source or manifest is limited to 256 KiB, the manifest to 32 sources,
 and each source to 1024 patterns of at most 1024 bytes each.
 
 `privacy policy show` includes effective mandatory rules; editing the repository policy stores
@@ -522,95 +510,27 @@ only its local authorization. A `mandatory` field in repository JSON does not in
 Source IDs, revisions and rule contents participate in the effective digest, so rule changes
 invalidate publication consent and post-review verification even if the repository file is
 unchanged. Source documents, paths and local workspace roots are not uploaded; envelopes retain
-the digest. Device setup must install trusted sources separately after clone. This local loader
-remains independent of authenticated Hub discovery.
+the digest. Device setup must install trusted sources separately after clone. This local loader runs without cloud rule discovery.
 
-## Authenticated Hub policy sources
+## Local processing and fault isolation
 
-Push, share and remote-bound privacy export resolve mandatory Hub rules before preparing session
-projections.
-The authenticated `POST /api/privacy/policy-sources/resolve` request is:
+Secret policy and content exclusions are evaluated locally. Push, share, and export do not
+resolve cloud privacy rules or refresh cloud policy before publication. The Hub has no
+policy-source administration or resolver endpoints. It stores authenticated keys, encrypted
+recovery packages, and submitted publication objects.
 
-```json
-{"version":1,"repository":"owner/repo","agent_id":"immutable-agent-id","request_id":"random-request-uuid"}
-```
+The optional repository-encryption protocol still binds ciphertext to its intended viewing
+recipient, source identity, ref transition, and client-provided metadata digest. These are
+transport integrity contracts. The compatibility `mandatory_policy` response describes the
+supported envelope format; its `content_policy_digest` is a fixed client-only marker and does
+not depend on an account or organization rule registry.
 
-For a non-null repository, `agent_id: null` requires that the destination is absent and resolves
-its namespace rules before creation. An existing repository must match its immutable ID.
-`repository: null` and `agent_id: null` resolve the authenticated account's applicable namespace
-rules, including account-scoped sharing of an unbound native session. A null repository with a
-non-null agent ID is invalid. The server determines the account's namespace; a client cannot supply
-another owner ID. The response echoes the nullable scope fields and contains exactly:
-
-```json
-{
-  "version": 1,
-  "hub": "https://hub.example",
-  "repository": "owner/repo",
-  "agent_id": "immutable-agent-id",
-  "account_id": "authenticated-account-id",
-  "request_id": "random-request-uuid",
-  "owner_id": "immutable-namespace-id",
-  "revision": "organization-rule-revision",
-  "issued_at": "2026-09-23T00:00:00Z",
-  "expires_at": "2026-09-23T00:05:00Z",
-  "sources": [
-    {"version":1,"id":"organization","revision":"rules-1","exclude":["src/internal/**"],"memory_exclude":[]}
-  ]
-}
-```
-
-The CLI verifies the selected account through `/api/auth/me` and compares all request bindings.
-The response Hub must be canonical. Issuance may be at most 30 seconds ahead of the device clock;
-the lifetime is positive, at most five minutes, and not expired. The response is bounded to
-256 KiB and 32 uniquely identified sources. Source validation uses the exclusion-only device
-schema above. Unknown fields, duplicate IDs, invalid globs and unavailable endpoints refuse
-publication. Personal namespaces explicitly return a valid empty `sources` array when no rules
-apply; missing policy data is not treated as an empty array.
-
-Rules append to mandatory device restrictions before local allowlists are evaluated. A `hub-policy`
-marker binds the canonical JSON digest of `version`, `hub`, `account_id`, `repository`, `owner_id`,
-`revision` and `sources` into the effective policy. Request IDs and timestamps are excluded so
-fresh responses for the same rules preserve consent and incremental preparation. Repository IDs
-are verified separately: confirmed creation may replace an absent ID with the resulting immutable
-ID, while refresh cannot replace an existing ID. Source arrays retain server order, and both
-`exclude` and `memory_exclude` arrays are materialized before hashing.
-
-The destination's content-policy digest is the canonical JSON digest of `version`, `owner_id`,
-`revision` and `sources`, independently of the current actor. The strategy response's mandatory
-policy must carry this value as `content_policy_digest`. Its inclusion in the mandatory-policy
-digest binds preview, confirmation and receive to the same server rule revision. The backend
-must compute it from its current rule registry at all of those boundaries.
-
-Push refreshes the authenticated rules after confirmation and again against the materialized
-destination before upload. Changed namespace identity, revision or rules requires a fresh preview
-and renewed automatic consent. Copying a read-only source also retains that source repository's
-mandatory rules. Subsequent pushes retain the rules of pinned sources and origin/upstream scopes,
-including a copy's upstream repository. Scopes already resolved for the destination or immediate
-copy source are not appended twice. This preserves the effective policy across local promotion.
-Source remotes and local policy are checked before mutation; authenticated scopes and the source
-snapshot are checked again after controlled destination materialization. Responses live in memory;
-there is no offline fallback to an expired policy.
-The source documents are neither imported as local authority nor uploaded with the session.
-
-Share retains rules from the repository's immutable pin and its origin/upstream Hub scopes, even
-when the share is uploaded to a different Hub. Each source uses credentials for its own Hub.
-Unpinned remote sources first resolve an existing immutable repository ID. A local repository
-without remotes resolves its name on the selected share Hub; a missing lookup still requires
-the authenticated resolver to prove absence and namespace authority. Changed local policy,
-repository pin or remote URLs invalidate the prepared share. Responses are refreshed after the
-recipient check and immediately before upload; no cached or offline fallback grants publication.
-
-Privacy export (`--privacy` or `--format privacy-envelope`) retains the same source pin and
-origin/upstream rules and rechecks local policy, repository bindings and fresh source responses
-before writing output. An export using a verified repository publication's key also applies account
-rules and verifies the key again before output. An explicit `--viewing-public-key` selects the
-recipient but does not bypass authenticated source rules. Only a repository without a remote
-identity, origin or upstream can export using local/device rules alone; with an explicit key its
-encrypted export is fully offline. Rule or recipient drift leaves the output file untouched.
-
-This contract requires the corresponding backend resolver and mandatory-policy field. Export
-does not upload its content or register Git receive receipts.
+Automatic secret processing uses the independent bounded worker described in
+[rfc-local-privacy.md](rfc-local-privacy.md). Share and privacy export also run local path-policy
+loading and alias allocation in that worker. Unavailable or invalid local policy falls back to
+an in-memory default projection; original selected records remain recoverable in an encrypted
+envelope. Explicit repository encryption never silently changes the chosen audience or sends
+its private layer unencrypted.
 
 ## Automatic publication consent
 

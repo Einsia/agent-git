@@ -53,6 +53,38 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn configure_std(command: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    pub fn attach_std(&self, child: &std::process::Child) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        if unsafe { AssignProcessToJobObject(self.handle.0, child.as_raw_handle().cast()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        resume_primary_thread(child.id())
+    }
+
+    pub fn limit_memory(&self, bytes: usize) -> io::Result<()> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.JobMemoryLimit = bytes;
+        if unsafe {
+            SetInformationJobObject(
+                self.handle.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn new() -> io::Result<Self> {
         let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if raw.is_null() {

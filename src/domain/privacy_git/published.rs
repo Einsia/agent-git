@@ -21,6 +21,7 @@ struct PublicSession {
 }
 
 pub(super) struct Reused {
+    #[cfg(test)]
     pub envelope_oid: String,
     pub inspection: String,
     pub report: ProjectionReport,
@@ -105,6 +106,7 @@ pub(super) fn reuse(
         &public.session.view,
         &envelope.policy_digest,
     )?;
+    #[cfg(test)]
     let envelope_oid = write_object(destination, "blob", &bytes)?;
     files.insert("privacy/envelope.json".into(), bytes);
     let tree = write_tree(destination, files)?;
@@ -119,6 +121,7 @@ pub(super) fn reuse(
         "published ancestry changed object identity"
     );
     Ok(Some(Reused {
+        #[cfg(test)]
         envelope_oid,
         inspection,
         report: public.report,

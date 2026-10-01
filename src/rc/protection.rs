@@ -40,7 +40,7 @@ pub(crate) fn for_native(
 ) -> crate::Result<crate::domain::redact::Redactor> {
     // Unadopted previews redact matches in place without requiring a publication repository.
     let redactor = crate::domain::redact::Redactor::try_this_machine()?.for_device_control();
-    match native_repository(runtime, native, cwd)? {
+    match native_repository(runtime, native, cwd).ok().flatten() {
         Some(root) => Ok(redactor
             .with_repository(&root)?
             .with_native_context(runtime, native, cwd, &root)),

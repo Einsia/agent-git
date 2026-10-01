@@ -342,11 +342,38 @@ pub(crate) fn same_repo_matches(
     snapshots: &[Option<meta::Meta>],
     origin: &str,
 ) -> Vec<bool> {
-    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
-        .and_then(|dictionary| same_repo_matches_in(&dictionary, snapshots, origin))
-        .unwrap_or_else(|_| vec![false; snapshots.len()])
+    let input: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.as_ref().and_then(|meta| meta.code.as_deref()))
+        .collect();
+    let Ok(input) = serde_json::to_string(&input) else {
+        return vec![false; snapshots.len()];
+    };
+    let hydrated = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &input,
+        crate::domain::privacy::projector::Mode::HydrateJsonl,
+    );
+    serde_json::from_str::<Vec<Option<String>>>(&hydrated.content)
+        .ok()
+        .filter(|values| values.len() == snapshots.len())
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| {
+                    value.is_some_and(|code| {
+                        crate::domain::privacy::projector::tokens(&code)
+                            .next()
+                            .is_none()
+                            && same_repo_as(&code, origin)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false; snapshots.len()])
 }
 
+#[cfg(test)]
 fn same_repo_matches_in<K: crate::domain::secret_filter::KeyStore>(
     dictionary: &crate::domain::secret_filter::RepositoryDictionary<K>,
     snapshots: &[Option<meta::Meta>],
@@ -580,8 +607,7 @@ fn cwd_resume_decision(
         return Ok(CwdResumeDecision::Continue);
     };
     let mut local_snapshot = snapshot.clone();
-    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_metadata_readonly(&mut local_snapshot)?;
+    crate::domain::privacy::service::hydrate_metadata(repo.root(), &mut local_snapshot);
     let snapshot = &local_snapshot;
     let recorded = snapshot.cwd_state.as_ref().expect("recorded state exists");
     let comparison = compare_cwd_state(recorded, &current);
@@ -1098,8 +1124,12 @@ fn resume_branch_for(
         // overlays cannot authorize replaying evidence excluded from the current snapshot.
         if let Ok(live) = lk.read()
             && matches!(
-                native_claim_activity(repo, &committed_log, &live)?,
-                ClaimActivity::Untouched | ClaimActivity::Appended
+                crate::domain::privacy::service::native_continuity(
+                    repo.root(),
+                    &committed_log,
+                    &live
+                )?,
+                transcript::Continuity::Append | transcript::Continuity::Noop
             )
             && let Some(cmd) = native_resume_cmd(
                 from,
@@ -1750,13 +1780,8 @@ fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Res
     if transcript::continuity(committed, live) == transcript::Continuity::Noop {
         return Ok(ClaimActivity::Untouched);
     }
-    let (committed, live) = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_pair_readonly(committed, live)?;
-    if committed.unresolved > 0 || live.unresolved > 0 {
-        return Ok(ClaimActivity::Unverifiable);
-    }
     Ok(
-        match transcript::continuity_of_content(&committed.text, &live.text) {
+        match crate::domain::privacy::service::native_continuity(repo.root(), committed, live)? {
             transcript::Continuity::Noop => ClaimActivity::Untouched,
             transcript::Continuity::Append => ClaimActivity::Appended,
             transcript::Continuity::Diverged => ClaimActivity::Rewritten,
@@ -2027,9 +2052,21 @@ fn materialize_and_resume(
         let bootstrap = &text[..text.len() - raw_bytes];
         saved.insert_str(0, &transcript::wrap_lines(bootstrap, from, &snap.session));
     }
-    let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_envelopes(&saved)?;
-    let saved = hydrated.text;
+    let hydrated = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &saved,
+        crate::domain::privacy::projector::Mode::HydrateEnvelopes,
+    );
+    if hydrated.unresolved > 0 {
+        ui::warning(&format!(
+            "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",
+            hydrated.unresolved
+        ));
+        ui::hint(
+            "encrypted dictionaries synchronize independently; retry restoration after synchronization",
+        );
+    }
+    let saved = hydrated.content;
 
     let mut locked_supersede = Vec::with_capacity(supersede.len());
     for previous in &supersede {

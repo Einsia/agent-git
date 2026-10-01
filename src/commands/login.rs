@@ -147,6 +147,7 @@ pub fn run(args: Args) -> CmdResult {
             if args.hub.is_some() {
                 let _ = config::set_global("hub.url", Some(&hub));
             }
+            crate::domain::privacy::service::schedule_sync(&hub);
             let who = ui::bold(&signed_in.who);
             ui::success(&match origin {
                 Origin::Obtained => format!("signed in as {who}"),

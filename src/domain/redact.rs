@@ -1,12 +1,7 @@
 //! Content redaction: erasing the coordinates before publishing.
 //!
-//! # The split with the `secrets` module
-//!
-//! `secrets` is the **gate**: a secret found stops the push. This is the **rewrite**: it makes a
-//! byte stream that can be published, with secrets replaced by `[redacted:<rule>]` and
-//! environment markers (username, home, hostname, public IP) replaced by stable stand-ins. The
-//! gate decides "may this be pushed"; this module answers "what does the published copy look
-//! like".
+//! Secret replacement is delegated to the optional local privacy service, which persists
+//! reversible mappings before returning replacements. Persona masking remains independent.
 //!
 //! # Why stand-ins and not truncation
 //!
@@ -47,10 +42,6 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 
 /// What one redaction pass produced.
 #[derive(Debug, Clone)]
@@ -80,19 +71,6 @@ pub struct JsonReport {
     pub registered_ids: Vec<String>,
 }
 
-impl JsonReport {
-    fn withheld(error: &anyhow::Error) -> Self {
-        eprintln!("agit: JSON privacy protection failed; content withheld: {error:#}");
-        Self {
-            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
-            secrets: 0,
-            paths: 0,
-            ips: 0,
-            registered_ids: vec![],
-        }
-    }
-}
-
 #[cfg(feature = "rc")]
 pub(crate) struct NativeJson {
     pub value: serde_json::Value,
@@ -100,10 +78,8 @@ pub(crate) struct NativeJson {
     pub registered_ids: Vec<String>,
 }
 
-/// User-facing text for a native record that could not pass the local privacy boundary.
-/// Internal protection errors belong in the daemon log and must not be sent to viewers.
-pub(crate) const PROTECTION_ERROR_TEXT: &str =
-    "[content unavailable: local privacy protection could not complete]";
+#[cfg(feature = "rc")]
+pub(crate) const PROTECTION_ERROR_TEXT: &str = "[content unavailable: invalid native record]";
 
 /// The device-local persona: "who this machine is", read out of the environment.
 #[derive(Debug, Clone, Default)]
@@ -142,29 +118,12 @@ impl Persona {
 #[derive(Clone)]
 pub struct Redactor {
     persona: Persona,
+    repo: Option<std::path::PathBuf>,
     preserve_device_identity: bool,
-    username_pattern: Option<Regex>,
-    hostname_pattern: Option<Regex>,
     #[cfg(feature = "secret-vault")]
-    require_repository: bool,
-    buffered_stream_bytes: Arc<AtomicUsize>,
-    #[cfg(feature = "secret-vault")]
-    registered: crate::domain::secret_filter::MatcherHandle,
-    #[cfg(feature = "secret-vault")]
-    dictionary: Option<Arc<crate::domain::secret_filter::RepositoryDictionary>>,
+    fallback_fingerprint: String,
     #[cfg(feature = "rc")]
-    native: Option<Arc<std::sync::Mutex<NativeProtection>>>,
-    #[cfg(feature = "rc")]
-    readonly_history: bool,
-}
-
-#[cfg(feature = "rc")]
-struct NativeProtection {
-    source: Option<crate::protocol::NativeSourceRef>,
-    runtime: String,
-    session: String,
-    evidence: Option<crate::domain::secrets::identity::Evidence>,
-    seeded: bool,
+    native: std::sync::Arc<std::sync::Mutex<(String, String)>>,
 }
 
 /// The name appearing in `/home/<name>` / `/Users/<name>`. The reserved macOS shared
@@ -221,7 +180,15 @@ fn public_ip(ip: &str) -> bool {
 /// lost to the two-character `\n` in jsonl); a span corresponds to the original at equal length,
 /// so the replacement lands on the same range of the original.
 fn apply_spans(out: &mut String, spans: &[(usize, usize, String)], count: &mut usize) {
+    #[cfg(feature = "secret-vault")]
+    let opaque: Vec<_> = crate::domain::privacy::projector::tokens(out)
+        .map(|(s, e, _)| (s, e))
+        .collect();
     for (s, e, r) in spans.iter().rev() {
+        #[cfg(feature = "secret-vault")]
+        if opaque.iter().any(|(start, end)| *s < *end && *e > *start) {
+            continue;
+        }
         out.replace_range(*s..*e, r);
         *count += 1;
     }
@@ -229,7 +196,11 @@ fn apply_spans(out: &mut String, spans: &[(usize, usize, String)], count: &mut u
 
 /// Replacement wrapped in word boundaries (the regex crate has no lookaround, so the boundary is
 /// "capture what precedes + check what follows by hand").
-fn replace_token(text: &str, token: &str, re: &Regex, with: &str, count: &mut usize) -> String {
+fn replace_token(text: &str, token: &str, with: &str, count: &mut usize) -> String {
+    // Boundary character set: path separators, dots and colons all count as "outside", so
+    // /etc/<user>, <user>@host and <user>:<group> all match while <user>name and my<user> do
+    // not.
+    let re = Regex::new(&format!(r"(^|[^A-Za-z0-9._-]){}", regex::escape(token))).unwrap();
     let view = crate::domain::secrets::view_of(text);
     let mut spans: Vec<(usize, usize, String)> = vec![];
     let mut pos = 0;
@@ -255,520 +226,214 @@ fn replace_token(text: &str, token: &str, re: &Regex, with: &str, count: &mut us
     out
 }
 
-fn token_pattern(token: Option<&str>) -> Option<Regex> {
-    // Dots, underscores, hyphens, and ASCII alphanumerics keep a token inside a longer name.
-    token
-        .filter(|token| token.len() >= 3)
-        .map(|token| Regex::new(&format!(r"(^|[^A-Za-z0-9._-]){}", regex::escape(token))).unwrap())
-}
-
 impl Redactor {
     pub fn new(persona: Persona) -> Self {
         Redactor {
-            username_pattern: token_pattern(persona.username.as_deref()),
-            hostname_pattern: token_pattern(persona.hostname.as_deref()),
             persona,
+            repo: None,
             preserve_device_identity: false,
             #[cfg(feature = "secret-vault")]
-            require_repository: false,
-            buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
-            #[cfg(feature = "secret-vault")]
-            registered: Default::default(),
-            #[cfg(feature = "secret-vault")]
-            dictionary: None,
+            fallback_fingerprint: uuid::Uuid::new_v4().to_string(),
             #[cfg(feature = "rc")]
-            native: None,
-            #[cfg(feature = "rc")]
-            readonly_history: false,
+            native: Default::default(),
         }
     }
 
-    /// Authorized RC views need copyable device paths; secret and IP protection still apply.
+    pub fn for_repository(mut self, repo: Option<&std::path::Path>) -> Self {
+        self.repo = repo.map(std::path::Path::to_owned);
+        self
+    }
+
+    pub fn with_repository(self, root: &std::path::Path) -> crate::Result<Self> {
+        Ok(self.for_repository(Some(root)))
+    }
+
+    pub fn try_scrub(&self, text: &str) -> crate::Result<Report> {
+        Ok(self.scrub(text))
+    }
+    pub fn try_scrub_json(&self, value: &serde_json::Value) -> crate::Result<JsonReport> {
+        Ok(self.scrub_json(value))
+    }
+
     #[cfg(feature = "rc")]
     pub(crate) fn for_device_control(mut self) -> Self {
         self.preserve_device_identity = true;
         self
     }
 
-    /// A history page cannot wait for dictionary writes performed by a running session.
     #[cfg(feature = "rc")]
-    pub(crate) fn for_readonly_history(mut self) -> Self {
-        self.readonly_history = true;
+    pub(crate) fn with_native_context(
+        self,
+        runtime: &str,
+        session: &str,
+        _cwd: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Self {
+        self.for_repository(Some(root))
+            .with_unbound_native_context(runtime, session)
+    }
+    #[cfg(feature = "rc")]
+    pub(crate) fn with_unbound_native_context(self, runtime: &str, session: &str) -> Self {
+        if let Ok(mut native) = self.native.try_lock() {
+            *native = (runtime.into(), session.into());
+        }
         self
     }
-
-    #[cfg(feature = "secret-vault")]
-    pub fn with_registered(
-        persona: Persona,
-        registered: crate::domain::secret_filter::MatcherHandle,
-    ) -> Self {
-        Redactor {
-            registered,
-            ..Self::new(persona)
+    #[cfg(feature = "rc")]
+    pub(crate) fn bind_native_session(&self, session: &str) {
+        if let Ok(mut native) = self.native.try_lock() {
+            native.1 = session.into();
         }
     }
-
-    /// The caller supplies the selected Agent repository; a source-code working directory does
-    /// not select the repository that owns this session's reversible mappings.
     #[cfg(feature = "secret-vault")]
-    pub fn with_repository(mut self, repo_root: &std::path::Path) -> crate::Result<Self> {
-        self.dictionary = Some(Arc::new(
-            crate::domain::secret_filter::RepositoryDictionary::open(repo_root)?,
-        ));
-        Ok(self)
+    fn dictionary_query(&self, action: &str) -> Option<serde_json::Value> {
+        #[cfg(feature = "cli")]
+        return crate::domain::privacy::service::manage(
+            self.repo.as_deref(),
+            crate::domain::privacy::management::Command {
+                action: action.into(),
+                global: self.repo.is_none(),
+                id: None,
+                name: None,
+                secret: None,
+            },
+        )
+        .ok();
+        #[cfg(not(feature = "cli"))]
+        {
+            let _ = action;
+            None
+        }
     }
-
-    /// Only local cache state may retain this digest of persona and secret-rule dependencies.
     #[cfg(feature = "secret-vault")]
     pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
-        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&(
-            &self.persona.username,
-            &self.persona.home,
-            &self.persona.hostname,
-            self.registered.snapshot().publication_fingerprint()?,
-            self.dictionary
-                .as_ref()
-                .map(|dictionary| dictionary.publication_fingerprint())
-                .transpose()?,
-        ))?);
-        Ok(crate::domain::privacy_envelope::digest_bytes(&bytes))
+        let policy = self
+            .dictionary_query("fingerprint")
+            .unwrap_or_else(|| serde_json::json!(&self.fallback_fingerprint));
+        Ok(crate::domain::privacy_envelope::digest_bytes(
+            &serde_json::to_vec(&(
+                &self.persona.username,
+                &self.persona.home,
+                &self.persona.hostname,
+                policy,
+            ))?,
+        ))
     }
-
-    /// Encryption carries protection only for literals used in the original session, including
-    /// private records that never enter the public scanner.
     #[cfg(feature = "secret-vault")]
     pub(crate) fn publication_values_matching(
         &self,
         used: impl Fn(&str) -> bool,
     ) -> crate::Result<std::collections::BTreeSet<String>> {
-        let mut values = self
-            .registered
-            .snapshot()
-            .publication_values_matching(&used);
-        if let Some(dictionary) = &self.dictionary {
-            values.extend(dictionary.publication_values_matching(used)?);
-        }
-        Ok(values)
+        Ok(self
+            .dictionary_query("values")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|value| used(value))
+            .collect())
     }
 
-    /// Repository-bound sessions must persist reversible mappings before publishing secrets.
-    #[cfg(feature = "rc")]
-    pub(crate) fn require_repository(mut self) -> Self {
-        self.require_repository = true;
-        self
-    }
-
-    #[cfg(feature = "rc")]
-    pub(crate) fn with_native_context(
-        mut self,
-        runtime: &str,
-        session: &str,
-        cwd: &std::path::Path,
-        root: &std::path::Path,
-    ) -> Self {
-        self.native = Some(Arc::new(std::sync::Mutex::new(NativeProtection {
-            source: None,
-            runtime: runtime.into(),
-            session: session.into(),
-            evidence: Some(crate::domain::secrets::identity::Evidence::new(
-                &crate::domain::repo::Repo::at(root),
-                cwd,
-            )),
-            seeded: false,
-        })));
-        self
-    }
-
-    /// An unbound session has native schema identities but no repository publication authority.
-    #[cfg(feature = "rc")]
-    pub(crate) fn with_unbound_native_context(mut self, runtime: &str, session: &str) -> Self {
-        self.native = Some(Arc::new(std::sync::Mutex::new(NativeProtection {
-            source: None,
-            runtime: runtime.into(),
-            session: session.into(),
-            evidence: None,
-            seeded: false,
-        })));
-        self
-    }
-
-    #[cfg(feature = "rc")]
-    pub(crate) fn with_native_source(
-        self,
-        source: Option<crate::protocol::NativeSourceRef>,
-    ) -> Self {
-        if let Some(native) = &self.native
-            && let Ok(mut native) = native.lock()
-        {
-            native.source = source;
-            if let Some(evidence) = &mut native.evidence {
-                evidence.reset();
-            }
-            native.seeded = false;
-        }
-        self
-    }
-
-    #[cfg(feature = "rc")]
-    pub(crate) fn bind_native_session(&self, session: &str) {
-        if let Some(native) = &self.native
-            && let Ok(mut native) = native.lock()
-            && native.session != session
-        {
-            if let Some(evidence) = &mut native.evidence {
-                evidence.reset();
-            }
-            native.seeded = false;
-            native.session = session.to_owned();
-        }
-    }
-
-    #[cfg(all(feature = "rc", test))]
-    pub(crate) fn scrub_native_json(
-        &self,
-        value: &serde_json::Value,
-        pointers: &[&str],
-    ) -> NativeJson {
-        self.scrub_native_batch(&[(value, pointers)]).remove(0)
-    }
-
-    #[cfg(all(feature = "rc", test))]
-    pub(crate) fn scrub_native_batch(
-        &self,
-        records: &[(&serde_json::Value, &[&str])],
-    ) -> Vec<NativeJson> {
-        self.scrub_native_batch_profiled(records, &mut |_, _| {})
-    }
-
-    /// Healthy pages share a dictionary transaction; identity masks remain occurrence-scoped.
     #[cfg(feature = "rc")]
     pub(crate) fn scrub_native_batch_profiled(
         &self,
         records: &[(&serde_json::Value, &[&str])],
-        record_timing: &mut dyn FnMut(&'static str, f64),
+        timing: &mut dyn FnMut(&'static str, f64),
     ) -> Vec<NativeJson> {
-        let withheld = || NativeJson {
-            value: serde_json::json!({"protection_error": PROTECTION_ERROR_TEXT}),
-            secret_projection: true,
-            registered_ids: Vec::new(),
-        };
-        if records.is_empty() {
-            return Vec::new();
-        }
-        let result = (|| -> crate::Result<Vec<NativeJson>> {
-            let Some(native) = &self.native else {
-                return Ok(records
-                    .iter()
-                    .map(|(value, pointers)| {
-                        let report = self.scrub_json_with_verified_fields(value, pointers);
-                        NativeJson {
-                            secret_projection: report.secrets > 0
-                                || report.value.get("protection_error").is_some(),
-                            value: report.value,
-                            registered_ids: report.registered_ids,
-                        }
-                    })
-                    .collect());
-            };
-            let started = std::time::Instant::now();
-            let mut native = native
-                .lock()
-                .map_err(|_| anyhow::anyhow!("native protection context is unavailable"))?;
-            record_timing("identity_lock_ms", started.elapsed().as_secs_f64() * 1000.0);
-            let started = std::time::Instant::now();
-            let runtime = native.runtime.clone();
-            let session = native.session.clone();
-            if !native.seeded && !session.is_empty() {
-                let instance = native
-                    .source
-                    .as_ref()
-                    .map(|source| source.session_ref(&session))
-                    .unwrap_or_else(|| session.clone());
-                if let Some(evidence) = &mut native.evidence {
-                    evidence.seed_native_profiled(&runtime, &instance, record_timing)?;
-                }
-                native.seeded = true;
-            }
-            record_timing("identity_seed_ms", started.elapsed().as_secs_f64() * 1000.0);
-            let started = std::time::Instant::now();
-            let masks: Vec<_> = records
+        let started = std::time::Instant::now();
+        let (runtime, session) = self
+            .native
+            .try_lock()
+            .map(|native| native.clone())
+            .unwrap_or_default();
+        let batch = crate::domain::privacy::projector::NativeBatch {
+            runtime,
+            session,
+            records: records.iter().map(|(value, _)| (*value).clone()).collect(),
+            pointers: records
                 .iter()
-                .map(|(value, pointers)| {
-                    let mut mask = match &mut native.evidence {
-                        Some(evidence) => evidence.record(&runtime, &session, value),
-                        None => crate::domain::secrets::identity::native_record_mask(
-                            &runtime, &session, value,
-                        ),
-                    };
-                    for pointer in *pointers {
-                        if let Some(text) =
-                            value.pointer(pointer).and_then(serde_json::Value::as_str)
-                        {
-                            mask.0.push(((*pointer).into(), 0..text.len()));
-                        }
-                    }
-                    mask.0
-                        .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.start.cmp(&b.1.start)));
-                    mask.0.dedup();
-                    mask
-                })
-                .collect();
-            record_timing(
-                "identity_masks_ms",
-                started.elapsed().as_secs_f64() * 1000.0,
-            );
-            let Some(dictionary) = &self.dictionary else {
-                return Ok(records
-                    .iter()
-                    .zip(&masks)
-                    .map(|((value, _), mask)| {
-                        let pointers: Vec<_> = mask
-                            .0
-                            .iter()
-                            .filter_map(|(pointer, span)| {
-                                let text = value.pointer(pointer)?.as_str()?;
-                                (span == &(0..text.len())).then_some(pointer.as_str())
-                            })
-                            .collect();
-                        let report = self.scrub_json_with_verified_fields(value, &pointers);
-                        NativeJson {
-                            secret_projection: report.secrets > 0
-                                || report.value.get("protection_error").is_some(),
-                            value: report.value,
-                            registered_ids: report.registered_ids,
-                        }
-                    })
-                    .collect());
-            };
-            let registered = self.registered.snapshot();
-            let mut protect = |range: std::ops::Range<usize>| -> crate::Result<Vec<NativeJson>> {
-                let mut input = String::new();
-                for (value, _) in &records[range.clone()] {
-                    input.push_str(&serde_json::to_string(value)?);
-                    input.push('\n');
+                .map(|(_, pointers)| pointers.iter().map(|p| (*p).to_owned()).collect())
+                .collect(),
+        };
+        let projected = serde_json::to_string(&batch).ok().map(|input| {
+            crate::domain::privacy::service::transform(
+                self.repo.as_deref(),
+                &input,
+                crate::domain::privacy::projector::Mode::ProtectNative,
+            )
+        });
+        let values = projected
+            .and_then(|outcome| {
+                serde_json::from_str::<Vec<serde_json::Value>>(&outcome.content).ok()
+            })
+            .filter(|values| values.len() == records.len())
+            .unwrap_or(batch.records);
+        timing(
+            "dictionary_protect_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        values
+            .into_iter()
+            .zip(records)
+            .map(|(mut value, (original, _))| {
+                let secret_projection = value != **original;
+                self.scrub_json_inner(&mut value, &mut JsonTotals::default());
+                NativeJson {
+                    value,
+                    secret_projection,
+                    registered_ids: Vec::new(),
                 }
-                let protected = if self.readonly_history {
-                    dictionary.protect_with_masks_snapshot_profiled(
-                        &input,
-                        &registered,
-                        &masks[range.clone()],
-                        record_timing,
-                    )?
-                } else {
-                    let mut mask_index = range.start;
-                    dictionary.protect_with_masks_profiled(
-                        &input,
-                        &registered,
-                        |_| {
-                            let mask = masks[mask_index].clone();
-                            mask_index += 1;
-                            mask
-                        },
-                        record_timing,
-                    )?
-                };
-                anyhow::ensure!(
-                    protected.intact == 0,
-                    "native page exceeds its reversible protection limit"
-                );
-                let values: Vec<serde_json::Value> = protected
-                    .text
-                    .lines()
-                    .map(serde_json::from_str)
-                    .collect::<Result<_, _>>()?;
-                anyhow::ensure!(
-                    values.len() == range.len(),
-                    "native protection changed record boundaries"
-                );
-                values
-                    .into_iter()
-                    .zip(&records[range])
-                    .map(|(mut value, (original, _))| {
-                        // Persona changes preserve source hashes; secret projection cannot expose them.
-                        let secret_projection = value != **original;
-                        self.scrub_persona_json(&mut value, &mut JsonTotals::default())?;
-                        Ok(NativeJson {
-                            value,
-                            secret_projection,
-                            registered_ids: Vec::new(),
-                        })
-                    })
-                    .collect()
-            };
-            // A single oversized or malformed record must not hide healthy neighbors. Retry
-            // each record with its original mask, while keeping every failed record fail-closed.
-            let started = std::time::Instant::now();
-            let protected = protect(0..records.len());
-            let result = match protected {
-                Ok(values) => Ok(values),
-                Err(error)
-                    if self.readonly_history
-                        && error
-                            .is::<crate::domain::secret_filter::NativeHistoryPolicyUnavailable>(
-                            ) =>
-                {
-                    Err(error)
-                }
-                Err(batch_error) => {
-                    let mut values = Vec::with_capacity(records.len());
-                    let mut first_failure = None;
-                    for index in 0..records.len() {
-                        match protect(index..index + 1) {
-                            Ok(mut item) => values.append(&mut item),
-                            Err(error) => {
-                                first_failure.get_or_insert(error);
-                                values.push(withheld());
-                            }
-                        }
-                    }
-                    if let Some(error) = first_failure {
-                        eprintln!(
-                            "agitd: native secret projection batch failed; retried {} records: {batch_error:#}",
-                            records.len()
-                        );
-                        eprintln!(
-                            "agitd: native secret projection withheld one or more records: {error:#}"
-                        );
-                    }
-                    Ok(values)
-                }
-            };
-            record_timing(
-                "dictionary_protect_ms",
-                started.elapsed().as_secs_f64() * 1000.0,
-            );
-            result
-        })();
-        result.unwrap_or_else(|error| {
-            eprintln!(
-                "agitd: native secret projection withheld {} records: {error:#}",
-                records.len()
-            );
-            records.iter().map(|_| withheld()).collect()
-        })
+            })
+            .collect()
     }
 
-    #[cfg(feature = "secret-vault")]
-    fn scrub_persona_json(
-        &self,
-        value: &mut serde_json::Value,
-        totals: &mut JsonTotals,
-    ) -> crate::Result<()> {
-        match value {
-            serde_json::Value::String(text) => {
-                let report = self.scrub_persona(text);
-                totals.add(&report);
-                *text = report.text;
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    self.scrub_persona_json(value, totals)?;
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for (key, mut value) in std::mem::take(map) {
-                    let report = self.scrub_persona(&key);
-                    totals.add(&report);
-                    self.scrub_persona_json(&mut value, totals)?;
-                    anyhow::ensure!(
-                        map.insert(report.text, value).is_none(),
-                        "privacy projection produced duplicate JSON keys"
-                    );
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// The infallible form: panicking on a vault failure is safer than silently publishing
-    /// unscanned content. An outbound path calls [`Self::try_this_machine`] instead, so the user
-    /// gets an actionable error.
     pub fn this_machine() -> Self {
-        Self::try_this_machine()
-            .expect("the device-local secret-filter vault could not be authenticated")
+        Self::new(Persona::this_machine())
     }
 
-    /// An outbound path handles an unlock failure explicitly; it must not degrade to an empty
-    /// rule set and publish anyway.
     pub fn try_this_machine() -> crate::Result<Self> {
-        #[cfg(feature = "secret-vault")]
-        {
-            Ok(Self::with_registered(
-                Persona::this_machine(),
-                crate::domain::secret_filter::MatcherHandle::load_default()?,
-            ))
-        }
-        #[cfg(not(feature = "secret-vault"))]
-        {
-            Ok(Self::new(Persona::this_machine()))
-        }
+        Ok(Self::this_machine())
     }
 
     pub fn stream(&self) -> StreamRedactor {
         StreamRedactor {
             redactor: self.clone(),
             pending: String::new(),
-            failed: false,
         }
     }
 
     /// Redact one text. Deterministic: same input, same persona ⇒ same output.
     pub fn scrub(&self, text: &str) -> Report {
-        self.try_scrub(text).unwrap_or_else(|error| {
-            eprintln!("agit: text privacy protection failed; content withheld: {error:#}");
-            Report {
-                text: PROTECTION_ERROR_TEXT.into(),
-                ..empty_report()
-            }
-        })
-    }
-
-    /// Mapping persistence must succeed before any protected bytes leave this call.
-    pub fn try_scrub(&self, text: &str) -> crate::Result<Report> {
-        self.try_scrub_in(text, false)
-    }
-
-    fn try_scrub_in(&self, text: &str, credential_field: bool) -> crate::Result<Report> {
-        // ── 1. Secrets first: later rewrites must not change rule hits, or the reverse ──
-        // Inspect both policies on original bytes. Rewriting either first can
-        // destroy the evidence needed to recognize an overlapping sensitive region.
-        #[cfg(feature = "secret-vault")]
-        let (out, secrets, registered_ids) = if let Some(dictionary) = &self.dictionary {
-            let report = dictionary.protect_text(text, &self.registered.snapshot())?;
-            anyhow::ensure!(
-                report.intact == 0,
-                "text exceeds the reversible protection limit"
-            );
-            (report.text, report.replacements, Vec::new())
-        } else {
-            let scrubbed = crate::domain::secrets::scrub_registered(
-                text,
-                &self.registered.snapshot(),
-                credential_field,
-            );
-            anyhow::ensure!(
-                !self.require_repository || scrubbed.1 == 0,
-                "content withheld: reversible protection requires the session's Agent repository"
-            );
-            scrubbed
-        };
-
-        #[cfg(not(feature = "secret-vault"))]
-        let (out, secrets) = crate::domain::secrets::scrub_in(text, credential_field);
-        #[cfg(not(feature = "secret-vault"))]
-        let registered_ids = Vec::new();
-
-        let mut report = self.scrub_persona(&out);
+        #[cfg(feature = "cli")]
+        let protected = crate::domain::privacy::service::transform(
+            self.repo.as_deref(),
+            text,
+            crate::domain::privacy::projector::Mode::ProtectJsonl,
+        );
+        #[cfg(feature = "cli")]
+        let (out, secrets) = (protected.content, protected.replacements);
+        #[cfg(not(feature = "cli"))]
+        let (out, secrets) = (text.to_owned(), 0);
+        let mut report = self.persona_only(&out);
         report.secrets = secrets;
-        report.registered_ids = registered_ids;
-        Ok(report)
+        #[cfg(feature = "secret-vault")]
+        if secrets > 0 {
+            report.registered_ids = crate::domain::privacy::projector::tokens(&out)
+                .map(|(_, _, token)| token.to_owned())
+                .collect();
+        }
+        report
     }
 
-    /// Call only after secret projection: environment substitutions are intentionally irreversible.
-    pub(crate) fn scrub_persona(&self, protected: &str) -> Report {
-        let mut out = protected.to_owned();
+    #[cfg(feature = "cli")]
+    pub(crate) fn scrub_persona(&self, text: &str) -> Report {
+        self.persona_only(text)
+    }
+
+    fn persona_only(&self, text: &str) -> Report {
         let mut paths = 0;
+        let mut out = text.to_owned();
+        let secrets = 0;
+        let registered_ids = Vec::new();
 
         if !self.preserve_device_identity {
             // ── 2. The full home prefix ──
@@ -829,11 +494,15 @@ impl Redactor {
             }
 
             // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
-            if let (Some(user), Some(pattern)) = (persona_user, &self.username_pattern) {
-                out = replace_token(&out, user, pattern, "user", &mut paths);
+            if let Some(user) = persona_user
+                && user.len() >= 3
+            {
+                out = replace_token(&out, user, "user", &mut paths);
             }
-            if let (Some(host), Some(pattern)) = (&self.persona.hostname, &self.hostname_pattern) {
-                out = replace_token(&out, host, pattern, "host", &mut paths);
+            if let Some(host) = &self.persona.hostname
+                && host.len() >= 3
+            {
+                out = replace_token(&out, host, "host", &mut paths);
             }
         }
 
@@ -862,139 +531,68 @@ impl Redactor {
 
         Report {
             text: out,
-            secrets: 0,
+            secrets,
             paths,
             ips,
-            registered_ids: Vec::new(),
+            registered_ids,
         }
     }
 
-    /// Scrub every semantic JSON string, including object keys. This is the
+    /// Scrub semantic JSON string values while preserving schema keys. This is the
     /// only safe boundary for serialized runtime events: matching the wire text
     /// would miss `\"`, `\\` and `\n` inside a registered literal.
     pub fn scrub_json(&self, value: &serde_json::Value) -> JsonReport {
-        self.try_scrub_json(value)
-            .unwrap_or_else(|error| JsonReport::withheld(&error))
-    }
-
-    /// Pointers are supplied only after the caller validates schema-owned identities.
-    /// Explicit registrations still override identity evidence at those exact occurrences.
-    #[cfg(feature = "secret-vault")]
-    pub(crate) fn scrub_json_with_verified_fields(
-        &self,
-        value: &serde_json::Value,
-        pointers: &[&str],
-    ) -> JsonReport {
-        let registered = match &self.dictionary {
-            Some(dictionary) => match dictionary
-                .registered_matcher()
-                .and_then(|local| self.registered.snapshot().merged(&local))
-            {
-                Ok(matcher) => matcher,
-                Err(error) => return JsonReport::withheld(&error),
-            },
-            None => self.registered.snapshot(),
-        };
-        let mut input = value.clone();
-        let mut retained = Vec::new();
-        for pointer in pointers {
-            if let Some(field) = input.pointer_mut(pointer)
-                && let Some(identity) = field.as_str()
-                && registered.find(identity).is_empty()
-            {
-                retained.push((*pointer, field.take()));
-            }
-        }
-        let mut report = self.scrub_json(&input);
-        for (pointer, identity) in retained {
-            if let Some(field) = report.value.pointer_mut(pointer) {
-                *field = identity;
-            }
-        }
-        report
-    }
-
-    pub fn try_scrub_json(&self, value: &serde_json::Value) -> crate::Result<JsonReport> {
-        #[cfg(feature = "secret-vault")]
-        if let Some(dictionary) = &self.dictionary {
-            let protected = dictionary
-                .protect_jsonl(&serde_json::to_string(value)?, &self.registered.snapshot())?;
-            anyhow::ensure!(
-                protected.intact == 0,
-                "JSON exceeds the reversible protection limit"
-            );
-            let mut value = serde_json::from_str(&protected.text)?;
-            let mut totals = JsonTotals::default();
-            self.scrub_persona_json(&mut value, &mut totals)?;
-            return Ok(JsonReport {
-                value,
-                secrets: protected.replacements,
-                paths: totals.paths,
-                ips: totals.ips,
-                registered_ids: Vec::new(),
-            });
-        }
+        #[cfg(feature = "cli")]
+        let protected = crate::domain::privacy::service::transform(
+            self.repo.as_deref(),
+            &serde_json::to_string(value).unwrap_or_default(),
+            crate::domain::privacy::projector::Mode::ProtectJsonl,
+        );
+        #[cfg(feature = "cli")]
+        let mut value = serde_json::from_str(&protected.content).unwrap_or_else(|_| value.clone());
+        #[cfg(not(feature = "cli"))]
         let mut value = value.clone();
         let mut totals = JsonTotals::default();
-        self.scrub_json_inner(&mut value, &mut totals, false)?;
-        // Some built-in gitleaks rules need assignment context spanning a JSON
-        // key and value. Preserve the previous whole-wire pass after semantic
-        // registered matching; otherwise `{"token":"..."}` could regress
-        // even though quoted/newline registered values are now handled safely.
-        let wire = serde_json::to_string(&value)?;
-        let (wire, built_in) = crate::domain::secrets::scrub(&wire);
-        if built_in > 0
-            && let Ok(scrubbed) = serde_json::from_str(&wire)
+        #[cfg(feature = "cli")]
         {
-            value = scrubbed;
-            totals.secrets = totals.secrets.saturating_add(built_in);
+            totals.secrets = protected.replacements;
+            if protected.replacements > 0 {
+                totals.registered_ids.extend(
+                    crate::domain::privacy::projector::tokens(&protected.content)
+                        .map(|(_, _, token)| token.to_owned()),
+                );
+            }
         }
-        Ok(JsonReport {
+        self.scrub_json_inner(&mut value, &mut totals);
+        JsonReport {
             value,
             secrets: totals.secrets,
             paths: totals.paths,
             ips: totals.ips,
             registered_ids: totals.registered_ids.into_iter().collect(),
-        })
+        }
     }
 
-    fn scrub_json_inner(
-        &self,
-        value: &mut serde_json::Value,
-        totals: &mut JsonTotals,
-        credential_field: bool,
-    ) -> crate::Result<()> {
+    fn scrub_json_inner(&self, value: &mut serde_json::Value, totals: &mut JsonTotals) {
         match value {
             serde_json::Value::String(text) => {
-                let report = self.try_scrub_in(text, credential_field)?;
+                let report = self.persona_only(text);
                 totals.add(&report);
                 *text = report.text;
             }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    self.scrub_json_inner(value, totals, credential_field)?;
+                    self.scrub_json_inner(value, totals);
                 }
             }
             serde_json::Value::Object(map) => {
-                let old = std::mem::take(map);
-                for (key, mut value) in old {
-                    let key_report = self.try_scrub(&key)?;
-                    totals.add(&key_report);
-                    self.scrub_json_inner(
-                        &mut value,
-                        totals,
-                        crate::domain::secrets::is_credential_field(&key),
-                    )?;
-                    // Redaction can theoretically collapse two keys. Keep the
-                    // first instead of losing the whole object or restoring a
-                    // secret-bearing key on the outbound path.
-                    map.entry(key_report.text).or_insert(value);
+                for value in map.values_mut() {
+                    self.scrub_json_inner(value, totals);
                 }
             }
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
             }
         }
-        Ok(())
     }
 }
 
@@ -1016,95 +614,47 @@ impl JsonTotals {
     }
 }
 
-/// Buffer an item until finalization: contextual and multiline findings may
-/// depend on bytes beyond any fixed tail. Capacity failure poisons the item so
-/// neither later chunks nor finalization can release an unchecked suffix.
+/// A bounded native tail gives the worker context across transport chunks. Failed processing
+/// releases the original bytes so live delivery cannot depend on privacy availability.
 pub struct StreamRedactor {
     redactor: Redactor,
     pending: String,
-    failed: bool,
 }
-
-pub(crate) const MAX_STREAM_ITEM_BYTES: usize = 1024 * 1024;
-const MAX_STREAM_BUFFER_BYTES: usize = 8 * MAX_STREAM_ITEM_BYTES;
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("stream protection failed or exceeded its limit; no item bytes were emitted")]
-pub struct StreamProtectionError;
 
 impl StreamRedactor {
-    pub fn push(&mut self, chunk: &str) -> Result<Report, StreamProtectionError> {
-        if self.failed || chunk.len() > MAX_STREAM_ITEM_BYTES.saturating_sub(self.pending.len()) {
-            self.fail();
-            return Err(StreamProtectionError);
-        }
-        if self
-            .redactor
-            .buffered_stream_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(chunk.len())
-                    .filter(|total| *total <= MAX_STREAM_BUFFER_BYTES)
-            })
-            .is_err()
-        {
-            self.fail();
-            return Err(StreamProtectionError);
-        }
-        if self.pending.try_reserve_exact(chunk.len()).is_err() {
-            self.redactor
-                .buffered_stream_bytes
-                .fetch_sub(chunk.len(), Ordering::Relaxed);
-            self.fail();
-            return Err(StreamProtectionError);
-        }
+    pub fn push(&mut self, chunk: &str) -> Report {
         self.pending.push_str(chunk);
-        Ok(empty_report())
+        #[cfg(feature = "cli")]
+        {
+            let outcome = crate::domain::privacy::service::transform(
+                self.redactor.repo.as_deref(),
+                &self.pending,
+                crate::domain::privacy::projector::Mode::ProtectStream,
+            );
+            let consumed = outcome.consumed.unwrap_or(self.pending.len());
+            if consumed > self.pending.len() || !self.pending.is_char_boundary(consumed) {
+                return self.flush();
+            }
+            self.pending.drain(..consumed);
+            let mut report = self.redactor.persona_only(&outcome.content);
+            report.secrets = outcome.replacements;
+            if outcome.replacements > 0 {
+                report.registered_ids = crate::domain::privacy::projector::tokens(&outcome.content)
+                    .map(|(_, _, token)| token.to_owned())
+                    .collect();
+            }
+            report
+        }
+        #[cfg(not(feature = "cli"))]
+        self.flush()
     }
 
-    pub fn flush(&mut self) -> Result<Report, StreamProtectionError> {
-        if self.failed {
-            return Err(StreamProtectionError);
-        }
+    pub fn flush(&mut self) -> Report {
         if self.pending.is_empty() {
-            return Ok(empty_report());
+            return empty_report();
         }
         let ready = std::mem::take(&mut self.pending);
-        self.redactor
-            .buffered_stream_bytes
-            .fetch_sub(ready.len(), Ordering::Relaxed);
-        #[cfg(feature = "rc")]
-        if let Some(native) = &self.redactor.native {
-            let mut native = native.lock().map_err(|_| StreamProtectionError)?;
-            if native
-                .evidence
-                .as_mut()
-                .is_some_and(|evidence| evidence.contains_object_identity(&ready))
-            {
-                // The authoritative completed record carries the operation/result relationship.
-                return Ok(empty_report());
-            }
-        }
-        self.redactor.try_scrub(&ready).map_err(|error| {
-            eprintln!("agit: stream privacy protection failed; content withheld: {error:#}");
-            self.failed = true;
-            StreamProtectionError
-        })
-    }
-
-    fn fail(&mut self) {
-        self.failed = true;
-        self.redactor
-            .buffered_stream_bytes
-            .fetch_sub(self.pending.len(), Ordering::Relaxed);
-        #[cfg(feature = "secret-vault")]
-        zeroize::Zeroize::zeroize(&mut self.pending);
-        self.pending.clear();
-    }
-}
-
-impl Drop for StreamRedactor {
-    fn drop(&mut self) {
-        self.fail();
+        self.redactor.scrub(&ready)
     }
 }
 
@@ -1122,329 +672,6 @@ fn empty_report() -> Report {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "secret-vault")]
-    #[test]
-    fn repository_streams_persist_reversible_values_and_reuse_local_blocks() {
-        use crate::domain::secret_filter::{MatcherHandle, RepositoryDictionary};
-        let dir = tempfile::tempdir().unwrap();
-        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        dictionary
-            .block_add("local", "blue horse battery".to_string().into(), false)
-            .unwrap();
-        let value = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        let redactor = Redactor::with_registered(Persona::default(), MatcherHandle::default())
-            .with_repository(repo.root())
-            .unwrap();
-        let input = format!("blue horse battery {value}");
-        let mut stream = redactor.stream();
-        assert!(stream.push(&input[..27]).unwrap().text.is_empty());
-        assert!(stream.push(&input[27..]).unwrap().text.is_empty());
-        let protected = stream.flush().unwrap();
-        assert!(!protected.text.contains(value));
-        assert!(!protected.text.contains("blue horse battery"));
-        assert_eq!(
-            dictionary.hydrate_text(&protected.text).unwrap().text,
-            input
-        );
-        let reopened = Redactor::with_registered(Persona::default(), MatcherHandle::default())
-            .with_repository(repo.root())
-            .unwrap();
-        assert_eq!(reopened.try_scrub(&input).unwrap().text, protected.text);
-        let json = serde_json::json!({"result": value});
-        let protected_json = reopened.try_scrub_json(&json).unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &dictionary
-                    .hydrate_jsonl(&protected_json.value.to_string())
-                    .unwrap()
-                    .text
-            )
-            .unwrap(),
-            json
-        );
-    }
-
-    #[cfg(feature = "rc")]
-    #[test]
-    fn native_batch_keeps_identity_masks_local_and_reloads_explicit_policy() {
-        use crate::domain::secret_filter::RepositoryDictionary;
-        let dir = tempfile::tempdir().unwrap();
-        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        let identity = serde_json::json!({"identity":secret,"path":"/home/operator/work"});
-        let credential = serde_json::json!({"token":secret,"text":"A quoted \"value\" and a newline\nremain readable."});
-        let clean = serde_json::json!({"text":"No credentials here."});
-        let redactor = Redactor::new(Persona {
-            home: Some("/home/operator".into()),
-            ..Default::default()
-        })
-        .with_repository(repo.root())
-        .unwrap()
-        .with_native_context("codex", "", repo.root(), repo.root());
-        let records: &[(&serde_json::Value, &[&str])] = &[
-            (&identity, &["/identity"]),
-            (&credential, &[]),
-            (&clean, &[]),
-        ];
-        let projected = redactor.scrub_native_batch(records);
-        assert_eq!(projected.len(), records.len());
-        assert_eq!(projected[0].value["identity"], secret);
-        assert_eq!(projected[0].value["path"], "~/work");
-        assert!(!projected[0].secret_projection);
-        assert!(projected[1].secret_projection);
-        assert!(!projected[1].value.to_string().contains(secret));
-        let hydrated: serde_json::Value = serde_json::from_str(
-            &dictionary
-                .hydrate_jsonl(&projected[1].value.to_string())
-                .unwrap()
-                .text,
-        )
-        .unwrap();
-        assert_eq!(hydrated, credential);
-        assert_eq!(projected[2].value, clean);
-        assert!(!projected[2].secret_projection);
-        dictionary
-            .block_add("explicit", secret.to_string().into(), false)
-            .unwrap();
-        let updated = redactor.scrub_native_batch(records);
-        assert!(updated[0].secret_projection);
-        assert!(!updated[0].value.to_string().contains(secret));
-        assert_eq!(updated[2].value, clean);
-    }
-
-    #[cfg(feature = "rc")]
-    #[test]
-    fn unbound_native_identities_are_schema_scoped_and_explicit_rules_still_apply() {
-        use crate::domain::secret_filter::{Matcher, MatcherHandle};
-        let session = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
-        let record_id = "8d5c2a51-8af0-4e5f-9f9e-731acee20c17";
-        let call_id = "toolu_01Qz7mXv9LpZ4tNc8WjF3bHy";
-        let message_id = "msg_01Qz7mXv9LpZ4tNc8WjF3bHy";
-        let secret = "blue horse battery";
-        let matcher = MatcherHandle::new(Matcher::for_test(&[("secret", secret)]));
-        let redactor = Redactor::with_registered(Persona::default(), matcher)
-            .with_unbound_native_context("claude-code", session);
-        let raw = serde_json::json!({
-            "type":"assistant", "sessionId":session, "uuid":record_id, "parentUuid":session,
-            "message":{"type":"message", "id":message_id,"role":"assistant", "content":[
-                {"type":"text", "text":format!("Readable reply {session} {record_id} {secret} {message_id} {call_id}")},
-                {"type":"tool_use", "id":call_id,"name":"Bash","input":{"command":"pwd"}}
-            ]},
-            "nested":{"sessionId":session,"uuid":record_id}
-        });
-        let protected = redactor.scrub_native_json(&raw, &[]);
-        assert_eq!(protected.value["sessionId"], session);
-        assert_eq!(protected.value["uuid"], record_id);
-        assert_eq!(protected.value["parentUuid"], session);
-        assert_eq!(protected.value["message"]["id"], message_id);
-        assert_eq!(protected.value["message"]["content"][1]["id"], call_id);
-        let content = protected.value["message"]["content"][0].to_string();
-        assert!(content.contains("Readable reply"));
-        for original in [session, record_id, secret, message_id, call_id] {
-            assert!(!content.contains(original));
-            assert!(!protected.value["nested"].to_string().contains(original));
-        }
-        assert!(protected.secret_projection);
-        assert_eq!(protected.registered_ids, vec!["secret"]);
-        let mut clean = raw.clone();
-        clean.as_object_mut().unwrap().remove("nested");
-        clean["message"]["content"] = serde_json::json!("Readable ordinary reply");
-        let projected = redactor.scrub_native_json(&clean, &[]);
-        assert_eq!(projected.value, clean);
-        assert!(!projected.secret_projection);
-        let mut untrusted = raw.clone();
-        untrusted["message"]["role"] = serde_json::json!("user");
-        assert!(
-            !redactor
-                .scrub_native_json(&untrusted, &[])
-                .value
-                .to_string()
-                .contains(session)
-        );
-        let wrong_session =
-            Redactor::new(Persona::default()).with_unbound_native_context("claude-code", record_id);
-        assert_ne!(
-            wrong_session.scrub_native_json(&raw, &[]).value["uuid"],
-            record_id
-        );
-        let explicit = Redactor::with_registered(
-            Persona::default(),
-            MatcherHandle::new(Matcher::for_test(&[
-                ("identity", record_id),
-                ("call", call_id),
-            ])),
-        )
-        .with_unbound_native_context("claude-code", session);
-        assert_ne!(
-            explicit.scrub_native_json(&raw, &[]).value["uuid"],
-            record_id
-        );
-        assert_ne!(
-            explicit.scrub_native_json(&raw, &[]).value["message"]["content"][1]["id"],
-            call_id
-        );
-    }
-
-    #[cfg(feature = "rc")]
-    #[test]
-    fn dictionary_io_failures_withhold_content_and_log_the_cause() {
-        const CHILD: &str = "AGIT_REDACTOR_IO_TEST_CHILD";
-        const SECRET: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "domain::redact::tests::dictionary_io_failures_withhold_content_and_log_the_cause", "--nocapture"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            let logs = String::from_utf8_lossy(&output.stderr);
-            assert!(logs.contains("cannot read secret-filter vault"), "{logs}");
-            assert!(
-                logs.contains("cannot create") && logs.contains("keys"),
-                "{logs}"
-            );
-            for boundary in [
-                "text privacy protection failed",
-                "JSON privacy protection failed",
-                "native secret projection withheld",
-                "stream privacy protection failed",
-            ] {
-                assert!(logs.contains(boundary), "missing {boundary}: {logs}");
-            }
-            assert!(!logs.contains(SECRET));
-            assert!(!logs.contains("PRIVATE_RECORD_BODY"));
-            return;
-        }
-        for failing_read in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-            let redactor = Redactor::new(Persona::default())
-                .require_repository()
-                .with_repository(repo.root())
-                .unwrap()
-                .with_native_context("claude-code", "", repo.root(), repo.root());
-            let dictionary = repo.root().join(".git/agit/secret-dictionary");
-            std::fs::create_dir_all(&dictionary).unwrap();
-            if failing_read {
-                std::fs::create_dir(dictionary.join("vault.json")).unwrap();
-            } else {
-                std::fs::write(dictionary.join("keys"), "blocked directory").unwrap();
-            }
-            let text = format!("PRIVATE_RECORD_BODY {SECRET}");
-            let raw = serde_json::json!({"text": text});
-            assert_eq!(redactor.scrub(&text).text, PROTECTION_ERROR_TEXT);
-            assert_eq!(
-                redactor.scrub_json(&raw).value,
-                serde_json::json!({"protection_error":PROTECTION_ERROR_TEXT})
-            );
-            assert_eq!(
-                redactor.scrub_native_json(&raw, &[]).value,
-                serde_json::json!({"protection_error":PROTECTION_ERROR_TEXT})
-            );
-            let mut stream = redactor.stream();
-            assert!(stream.push(&text).unwrap().text.is_empty());
-            assert!(stream.flush().is_err());
-        }
-    }
-
-    #[cfg(feature = "rc")]
-    #[test]
-    fn native_batch_isolates_unprotectable_records_without_exposing_neighbors() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-        let redactor = Redactor::new(Persona::default())
-            .with_repository(repo.root())
-            .unwrap()
-            .with_native_context("codex", "", repo.root(), repo.root());
-        let clean = serde_json::json!({"text":"The first reply stays readable."});
-        let oversized = serde_json::json!({"text":format!(
-            "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
-            "A".repeat(65537)
-        )});
-        let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-        let adjacent = serde_json::json!({"text":"The last reply stays readable.","token":secret});
-        let projected =
-            redactor.scrub_native_batch(&[(&clean, &[]), (&oversized, &[]), (&adjacent, &[])]);
-        assert_eq!(projected.len(), 3);
-        assert_eq!(projected[0].value, clean);
-        assert!(projected[1].value.get("protection_error").is_some());
-        assert!(projected[1].secret_projection);
-        assert!(
-            !projected[1]
-                .value
-                .to_string()
-                .contains("BEGIN RSA PRIVATE KEY")
-        );
-        assert_eq!(projected[2].value["text"], adjacent["text"]);
-        assert!(!projected[2].value.to_string().contains(secret));
-        assert!(projected[2].secret_projection);
-    }
-
-    /// Device-control streams and native history preserve ordinary links while exact allowances retain restoration.
-    #[cfg(feature = "rc")]
-    #[test]
-    fn device_control_preserves_locations_across_stream_and_history() {
-        use crate::domain::secret_filter::{Matcher, RepositoryDictionary};
-        let directory = tempfile::tempdir().unwrap();
-        let repo = crate::domain::repo::Repo::init(directory.path()).unwrap();
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        let redactor = Redactor::new(persona())
-            .for_device_control()
-            .with_repository(repo.root())
-            .unwrap()
-            .with_native_context("codex", "", repo.root(), repo.root());
-        let path = "/Users/alice/Projects/onepager-qa/reports/frontier-code-2026-09-28.md";
-        let url = "https://docs.example.org/docx/R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-        let text = format!("[Local report]({path})\n[Web report]({url})");
-        let mut stream = redactor.stream();
-        assert!(stream.push(&text[..35]).unwrap().text.is_empty());
-        assert!(stream.push(&text[35..]).unwrap().text.is_empty());
-        assert_eq!(stream.flush().unwrap().text, text);
-        let value = serde_json::json!({"text":text,"file_path":"artifacts/R7kQ2mXv9LpZ4tNc8WjF3bHy/output"});
-        assert_eq!(redactor.try_scrub_json(&value).unwrap().value, value);
-        let page = redactor.scrub_native_batch(&[(&value, &[])]);
-        assert_eq!(page[0].value, value);
-        assert!(!page[0].secret_projection);
-        assert!(dictionary.review().unwrap().is_empty());
-
-        let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-        let value_with_secret = serde_json::json!({"text":format!("{text} {credential}")});
-        let page = redactor.scrub_native_batch(&[(&value_with_secret, &[])]);
-        let protected = page[0].value["text"].as_str().unwrap();
-        assert!(protected.contains(&text));
-        assert!(!protected.contains(credential));
-
-        let prior = serde_json::json!({"password":path}).to_string();
-        let protected = dictionary.protect_jsonl(&prior, &Matcher::empty()).unwrap();
-        assert!(!protected.text.contains(path));
-        let value = serde_json::json!({"text":format!("[Local report]({path})")});
-        let page = redactor.scrub_native_batch(&[(&value, &[])]);
-        assert_ne!(page[0].value, value);
-        let token = serde_json::from_str::<serde_json::Value>(&protected.text).unwrap();
-        let id = token["password"]
-            .as_str()
-            .unwrap()
-            .split(':')
-            .next_back()
-            .unwrap()
-            .trim_end_matches('}');
-        dictionary.allow(id).unwrap();
-        assert_eq!(
-            redactor.scrub_native_batch(&[(&value, &[])])[0].value,
-            value
-        );
-        assert_eq!(
-            dictionary.hydrate_jsonl(&protected.text).unwrap().text,
-            prior
-        );
-    }
-
     fn persona() -> Persona {
         Persona {
             username: Some("nana".into()),
@@ -1455,27 +682,6 @@ mod tests {
 
     fn scrub(p: Persona, text: &str) -> Report {
         Redactor::new(p).scrub(text)
-    }
-
-    #[cfg(all(feature = "rc", feature = "secret-vault"))]
-    #[test]
-    fn device_control_keeps_copyable_paths_but_still_protects_secrets() {
-        let secret = "private-device-control-credential";
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_device", secret)]);
-        let redactor = Redactor::with_registered(
-            persona(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        )
-        .for_device_control();
-        let path = "/cluster/home/hongdeyao/sci-100/tasks";
-        let own_path = "/cluster/home/nana/projects/dataflow";
-        let input = serde_json::json!({"path": path, "text": format!("nana {own_path} {secret}")});
-        let report = redactor.scrub_json(&input);
-        assert_eq!(report.value["path"], path);
-        assert!(report.value["text"].as_str().unwrap().contains(own_path));
-        assert!(!report.value.to_string().contains(secret));
-        assert_eq!(report.secrets, 1);
-        assert_ne!(Redactor::new(persona()).scrub(path).text, path);
     }
 
     #[test]
@@ -1548,18 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn secrets_are_replaced_in_place() {
-        // The fake token has to be high-entropy: the rule set carries an entropy threshold and
-        // filters `"a".repeat(36)` out as a placeholder, so a test written with that exercises a
-        // path that never fires.
-        let leak = "ghp_7Kd2mQ9xR4vB1nT8sW3zY6cL5jH0gF2aE4pU";
-        let r = scrub(persona(), &format!("token: {leak} done"));
-        assert!(!r.text.contains(leak));
-        assert!(r.text.contains("[redacted:github-pat]"), "{}", r.text);
-        assert_eq!(r.secrets, 1);
-    }
-
-    #[test]
     fn deterministic_on_same_input() {
         let text = "/home/nana/x and /home/alice/y via 47.91.17.103 and ghp_".to_string()
             + &"z".repeat(36);
@@ -1569,151 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_persona_still_scrubs_secrets() {
+    fn empty_persona_keeps_ordinary_text() {
         let r = Redactor::new(Persona::default()).scrub("no persona here");
         assert_eq!(r.text, "no persona here");
         assert_eq!(r.paths, 0);
-    }
-
-    /// Credential context survives arrays but ends at nested object fields, without a repository.
-    #[test]
-    fn json_credentials_above_the_bare_entropy_limit_remain_redacted() {
-        let redactor = Redactor::new(Persona::default());
-        let data = crate::domain::secrets::media::fixture().replace(['/', '+'], "_");
-        for length in [16_384, 16_385, 32_768] {
-            let token = &data[..length];
-            let input = serde_json::json!({
-                "authorization": token,
-                "credentials": ["", [token], {"message": token}],
-                "message": token,
-            });
-            let report = redactor.try_scrub_json(&input).unwrap();
-            assert_eq!(
-                report.value["authorization"],
-                "[redacted:high-entropy-value]"
-            );
-            assert_eq!(
-                report.value["credentials"][1][0],
-                "[redacted:high-entropy-value]"
-            );
-            assert_eq!(report.value["credentials"][0], "");
-            if length > crate::domain::secrets::MAX_BARE_ENTROPY_BYTES {
-                assert_eq!(report.secrets, 2);
-                assert_eq!(report.value["message"], token);
-                assert_eq!(report.value["credentials"][2]["message"], token);
-            }
-            #[cfg(feature = "rc")]
-            {
-                let page = redactor.scrub_native_batch(&[(&input, &[])]);
-                assert!(page[0].secret_projection);
-                assert_eq!(page[0].value, report.value);
-            }
-        }
-    }
-
-    #[cfg(feature = "secret-vault")]
-    #[test]
-    fn json_scrubbing_matches_semantic_strings_not_escape_bytes() {
-        let secret = "quote\" slash\\ and\nnewline";
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_json", secret)]);
-        let redactor = Redactor::with_registered(
-            Persona::default(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        );
-        let input = serde_json::json!({"message": format!("before {secret} after")});
-        let report = redactor.scrub_json(&input);
-        assert_eq!(report.secrets, 1);
-        assert_eq!(report.registered_ids, vec!["sec_json"]);
-        assert_eq!(
-            report.value["message"],
-            "before [redacted:registered-secret] after"
-        );
-    }
-
-    #[cfg(feature = "secret-vault")]
-    #[test]
-    fn repository_placeholder_remains_opaque_across_every_chunk_boundary() {
-        let token = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_0123456789abcdef0123456789abcdef}}";
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_stream", "AGIT")]);
-        let redactor = Redactor::with_registered(
-            Persona::default(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        );
-
-        for split in 1..token.len() {
-            let mut stream = redactor.stream();
-            let mut output = stream.push(&token[..split]).unwrap().text;
-            output.push_str(&stream.push(&token[split..]).unwrap().text);
-            output.push_str(&stream.flush().unwrap().text);
-            assert_eq!(
-                output, token,
-                "placeholder was changed at byte boundary {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn vendor_and_pem_fragments_are_not_released_before_finalization() {
-        let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-        let pem = format!("-----BEGIN PRIVATE KEY-----\n{token}\nprivate body");
-        for text in [token, pem.as_str()] {
-            for split in 1..text.len() {
-                let mut stream = Redactor::new(Persona::default()).stream();
-                let first = stream.push(&text[..split]).unwrap();
-                let second = stream.push(&text[split..]).unwrap();
-                assert!(first.text.is_empty() && second.text.is_empty());
-                let output = stream.flush().unwrap().text;
-                assert!(output.starts_with("[redacted:"));
-                assert!(!output.contains(token));
-                assert!(!output.contains("private body"));
-            }
-        }
-    }
-
-    #[cfg(feature = "secret-vault")]
-    #[test]
-    fn a_registered_header_cannot_erase_evidence_for_the_private_key_body() {
-        let header = "-----BEGIN PRIVATE KEY-----";
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_header", header)]);
-        let redactor = Redactor::with_registered(
-            Persona::default(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        );
-        let report = redactor.scrub(&format!("{header}\nprivate body material"));
-        assert_eq!(report.text, "[redacted:registered-secret]");
-        assert_eq!(report.registered_ids, ["sec_header"]);
-    }
-
-    #[test]
-    fn exceeding_stream_capacity_cannot_release_a_suffix_on_retry_or_flush() {
-        let mut stream = Redactor::new(Persona::default()).stream();
-        assert!(
-            stream
-                .push(&"a".repeat(MAX_STREAM_ITEM_BYTES))
-                .unwrap()
-                .text
-                .is_empty()
-        );
-        assert!(stream.push("b").is_err());
-        assert!(stream.pending.is_empty());
-        assert!(stream.push("suffix").is_err());
-        assert!(stream.flush().is_err());
-    }
-
-    #[test]
-    fn concurrent_items_share_a_reclaimable_buffer_budget() {
-        let redactor = Redactor::new(Persona::default());
-        let mut streams: Vec<_> = (0..MAX_STREAM_BUFFER_BYTES / MAX_STREAM_ITEM_BYTES)
-            .map(|_| redactor.stream())
-            .collect();
-        let chunk = "a".repeat(MAX_STREAM_ITEM_BYTES);
-        for stream in &mut streams {
-            assert!(stream.push(&chunk).is_ok());
-        }
-        assert!(redactor.clone().stream().push("overflow").is_err());
-        streams.pop();
-        assert!(redactor.stream().push(&chunk).is_ok());
-        drop(streams);
-        assert_eq!(redactor.buffered_stream_bytes.load(Ordering::Relaxed), 0);
     }
 }

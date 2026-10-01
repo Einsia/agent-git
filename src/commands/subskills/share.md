@@ -42,12 +42,11 @@ agit share list
 agit share rm abc123
 ```
 
-A share is read-only and does not grant write access to the Agent repo. Before creating a link, agit asks for a final confirmation of the target, visibility, and expiry; `-y/--yes` confirms the generated preview without an interactive prompt. Saved refs and adopted live sessions use the same privacy processor, path aliases, content rewrites, and final secret scan as privacy export and push. The command prints the outgoing preview and report before upload.
+A share is read-only and does not grant write access to the Agent repo. Before creating a link, agit asks for a final confirmation of the target, visibility, and expiry; `-y/--yes` confirms the generated preview without an interactive prompt. Saved refs and adopted live sessions use the same privacy processor, path aliases, content rewrites, and independent local secret processor as privacy export. Scanner and dictionary failures skip affected privacy work. The command prints the outgoing preview and report before upload.
 
-Shares apply mandatory rules from the signed-in account and any source repositories, including
-sources on another Hub. Each Hub requires its own credentials. Unbound native sessions retain the
-account's rules. The CLI refreshes every scope after confirmation; changed local or remote rules,
-source repository bindings, or viewing keys require a fresh preview before upload.
+Shares use local policy only. Policy loading, alias allocation, scanning, and dictionary failures
+skip affected privacy work within the worker deadline. The Hub does not inspect or reject content
+for privacy findings. The selected source and encryption recipient remain integrity boundaries.
 
 Saved refs such as `owner/repo@branch`, tags, commit IDs, `~n`, and `#n` share the VIEW
 at that exact point. Missing or invalid VIEW content is refused; it never falls back to LOG.

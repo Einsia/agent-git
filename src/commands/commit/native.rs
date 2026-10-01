@@ -6,6 +6,38 @@ use crate::domain::{meta, storage, transcript};
 use anyhow::{Context as _, ensure};
 use std::collections::BTreeMap;
 
+/// Native and projected coordinates share line boundaries, never byte offsets.
+pub(super) struct Projection {
+    raw: Vec<usize>,
+    projected: Vec<usize>,
+}
+
+impl Projection {
+    pub(super) fn new(raw: &str, projected: &str) -> Result<Self> {
+        let ends = |text: &str| {
+            let mut out = vec![0];
+            for line in text.split_inclusive('\n') {
+                out.push(out.last().copied().unwrap_or(0) + line.len());
+            }
+            out
+        };
+        let raw = ends(raw);
+        let projected = ends(projected);
+        ensure!(
+            raw.len() == projected.len(),
+            "privacy projection changed native line boundaries"
+        );
+        Ok(Self { raw, projected })
+    }
+
+    pub(super) fn end(&self, raw: usize) -> Result<usize> {
+        Ok(self.projected[self
+            .raw
+            .binary_search(&raw)
+            .map_err(|_| anyhow::anyhow!("projection end is not a native boundary"))?])
+    }
+}
+
 pub(super) struct NativeSnapshots {
     raw_ends: Vec<usize>,
     event_counts: Vec<usize>,

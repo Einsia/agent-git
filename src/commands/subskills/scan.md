@@ -29,7 +29,7 @@ agit scan @ --sensitive
 agit scan szh/p1@feature-a --json
 ```
 
-`--secrets` and `--sensitive` are mutually exclusive. `--json` uses the common CLI envelope (version 2 by default; `--json-version 1` selects version 1). The report is at `result.value` when `result.format` is `json`. Secret scanning remains deterministic and repo-wide. Publishing gates use the secret scan, not a model's classifications.
+`--secrets` and `--sensitive` are mutually exclusive. `--json` uses the common CLI envelope (version 2 by default; `--json-version 1` selects version 1). The report is at `result.value` when `result.format` is `json`. Secret scanning remains deterministic and repo-wide. Explicit scan results are diagnostic; neither local nor server privacy scanning blocks ordinary publication.
 
 Client secret scans honor exact local declarations, including pending ones, and warn when those decisions are not confirmed server policy. Inspect `agit secrets review --repo <path> --json` for the distinction. For authorized publication, review the matched values and source locations, declare clearly publishable false positives by record ID or stdin, and rescan. Follow [push](push.md) for pending synchronization and explicit operation-wide acceptance. Continue until truncated reports are resolved; displayed examples do not establish that omitted findings are publishable. Missing or unreadable content is an incomplete scan, not a credential finding that can be classified away.
 

@@ -301,6 +301,63 @@ async fn run_executor(
     }
 }
 
+pub struct Route {
+    key: String,
+    api: Client,
+    target: Device,
+}
+
+impl Route {
+    pub fn new(api: Client, target: Device) -> crate::Result<Self> {
+        ensure!(
+            target.owner.issuer == api.origin(),
+            "cloud target issuer mismatch"
+        );
+        let key = serde_json::json!([api.origin(), target.id, target.certificate.fingerprint()])
+            .to_string();
+        Ok(Self { key, api, target })
+    }
+}
+
+impl Connector for Route {
+    fn key(&self) -> &str {
+        &self.key
+    }
+    fn authority(&self) -> Authority {
+        Authority::CloudPrincipal
+    }
+    fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
+        Box::pin(async move {
+            let source = super::commands::controller(self.api.origin()).await?;
+            let identity = Arc::new(source.identity);
+            let mut refresh = false;
+            loop {
+                let credentials = Arc::new(agit_controller::cloud::Credentials {
+                    identity: identity.clone(),
+                    device: source.credential.clone(),
+                    account: super::account_token(self.api.origin(), refresh).await?,
+                });
+                let route = agit_controller::cloud::Route::new(
+                    self.api.clone(),
+                    credentials,
+                    self.target.clone(),
+                )?;
+                match route.open(worker).await {
+                    Err(error)
+                        if !refresh
+                            && error
+                                .downcast_ref::<agit_peer::client::HttpFailure>()
+                                .is_some_and(|error| error.status == 401) =>
+                    {
+                        refresh = true;
+                    }
+                    result => return result,
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod presence_tests {
     use super::*;
@@ -379,62 +436,5 @@ mod presence_tests {
             PresenceEvent::Offer { .. }
         ));
         assert!(children.is_empty());
-    }
-}
-
-pub struct Route {
-    key: String,
-    api: Client,
-    target: Device,
-}
-
-impl Route {
-    pub fn new(api: Client, target: Device) -> crate::Result<Self> {
-        ensure!(
-            target.owner.issuer == api.origin(),
-            "cloud target issuer mismatch"
-        );
-        let key = serde_json::json!([api.origin(), target.id, target.certificate.fingerprint()])
-            .to_string();
-        Ok(Self { key, api, target })
-    }
-}
-
-impl Connector for Route {
-    fn key(&self) -> &str {
-        &self.key
-    }
-    fn authority(&self) -> Authority {
-        Authority::CloudPrincipal
-    }
-    fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
-        Box::pin(async move {
-            let source = super::commands::controller(self.api.origin()).await?;
-            let identity = Arc::new(source.identity);
-            let mut refresh = false;
-            loop {
-                let credentials = Arc::new(agit_controller::cloud::Credentials {
-                    identity: identity.clone(),
-                    device: source.credential.clone(),
-                    account: super::account_token(self.api.origin(), refresh).await?,
-                });
-                let route = agit_controller::cloud::Route::new(
-                    self.api.clone(),
-                    credentials,
-                    self.target.clone(),
-                )?;
-                match route.open(worker).await {
-                    Err(error)
-                        if !refresh
-                            && error
-                                .downcast_ref::<agit_peer::client::HttpFailure>()
-                                .is_some_and(|error| error.status == 401) =>
-                    {
-                        refresh = true;
-                    }
-                    result => return result,
-                }
-            }
-        })
     }
 }

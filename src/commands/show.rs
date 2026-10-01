@@ -777,15 +777,12 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
                 let text = if args.raw {
                     text
                 } else {
-                    match crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
-                        .and_then(|dictionary| dictionary.hydrate_pair_readonly(&text, ""))
-                    {
-                        Ok((report, _)) => report.text,
-                        Err(error) => {
-                            ui::error(&format!("cannot restore local display: {error:#}"));
-                            return Some(ExitCode::Precondition);
-                        }
-                    }
+                    crate::domain::privacy::service::transform(
+                        Some(repo.root()),
+                        &text,
+                        crate::domain::privacy::projector::Mode::HydrateJsonl,
+                    )
+                    .content
                 };
                 print!("{text}");
                 return Some(ExitCode::Ok);
@@ -871,19 +868,19 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
 }
 
 fn local_display_envelopes(repo: &Repo, envelopes: &str) -> crate::Result<String> {
-    Ok(
-        crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-            .hydrate_envelopes_readonly(envelopes)?
-            .text,
+    Ok(crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        envelopes,
+        crate::domain::privacy::projector::Mode::HydrateEnvelopes,
     )
+    .content)
 }
 
 fn render_saved_point(repo: &Repo, sha: &str, envelopes: &str, args: &Args) -> crate::Result<()> {
     let parsed = transcript::display::parse(envelopes)?;
     let mut snapshot = meta::read_at_ref_result(repo, sha)?
         .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
-    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_metadata_readonly(&mut snapshot)?;
+    crate::domain::privacy::service::hydrate_metadata(repo.root(), &mut snapshot);
     let (status, seconds, _) = repo.git_status_local(&[
         "show",
         "--no-patch",
@@ -1081,50 +1078,6 @@ mod tests {
         assert_eq!(url(None), bare);
         assert_eq!(url(Some("bob_2-x")), format!("{bare}&sharer=bob_2-x"));
         assert_eq!(url(Some("bob&ref=main")), bare);
-    }
-
-    #[test]
-    fn local_display_restores_known_values_and_keeps_foreign_tokens_without_writing_git() {
-        use crate::domain::{
-            repo::Repo,
-            secret_filter::{Matcher, RepositoryDictionary},
-            transcript,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let repo = Repo::init(&dir.path().join("owner")).unwrap();
-        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        let raw = serde_json::json!({"message":{"content":secret}}).to_string();
-        let protected = dictionary.protect_jsonl(&raw, &Matcher::empty()).unwrap();
-        let saved = transcript::wrap_lines(
-            &protected.text,
-            "claude-code",
-            &format!("agit-{}", "a".repeat(40)),
-        );
-        std::fs::write(repo.root().join("saved.jsonl"), &saved).unwrap();
-        repo.add_all().unwrap();
-        repo.commit("Store protected fixture").unwrap();
-        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
-        let vault = repo.root().join(".git/agit/secret-dictionary/vault.json");
-        let vault_before = std::fs::read(&vault).unwrap();
-        let shown = super::local_display_envelopes(&repo, &saved).unwrap();
-        assert!(shown.contains(secret));
-        assert_eq!(
-            std::fs::read_to_string(repo.root().join("saved.jsonl")).unwrap(),
-            saved
-        );
-        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
-        assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
-        assert_eq!(std::fs::read(&vault).unwrap(), vault_before);
-        let foreign = Repo::init(&dir.path().join("foreign")).unwrap();
-        assert_eq!(
-            super::local_display_envelopes(&foreign, &saved).unwrap(),
-            saved
-        );
-        assert!(!foreign.root().join(".git/agit/secret-dictionary").exists());
-        std::fs::write(vault, "broken dictionary").unwrap();
-        assert!(super::local_display_envelopes(&repo, &saved).is_err());
     }
 
     #[test]

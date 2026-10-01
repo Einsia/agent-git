@@ -6,7 +6,6 @@ use crate::domain::link::{self, Link};
 use crate::domain::merge_archive::{
     self, ArchiveJournalGuard, ArchivePhase, ExplorationBinding, MergeArchiveRole, RuntimeLinkKey,
 };
-use crate::domain::secret_filter::VaultStore;
 use crate::domain::{mergetx, repo::Repo, store::Store};
 use crate::{ExitCode, Result};
 
@@ -275,16 +274,12 @@ pub(super) fn settle(store: &Store, selected: &Link) -> Result<Option<ExitCode>>
         }
         let landed = admit(&repo, store, selected, role, &native, None)?;
         if landed {
-            let global = VaultStore::open_default()?.matcher()?;
-            match core::settle_tail(
-                TailDestination {
-                    repo: &repo,
-                    store,
-                    role,
-                    native: &native,
-                },
-                &global,
-            )? {
+            match core::settle_tail(TailDestination {
+                repo: &repo,
+                store,
+                role,
+                native: &native,
+            })? {
                 TailOutcome::Noop { .. } => {}
                 TailOutcome::Published { commit, .. } => super::record_supervisor_result(&commit)?,
             }
@@ -334,7 +329,6 @@ pub(crate) fn finish_child(repo: &Repo, store: &Store, binding: &ExplorationBind
             )?,
             "archive merge child exited before the merge landed; the transaction remains open"
         );
-        let global = VaultStore::open_default()?.matcher()?;
         core::settle_final_tail(
             TailDestination {
                 repo,
@@ -343,7 +337,6 @@ pub(crate) fn finish_child(repo: &Repo, store: &Store, binding: &ExplorationBind
                 native: &binding.native,
             },
             binding,
-            &global,
         )?;
         Ok(())
     })())

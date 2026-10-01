@@ -131,14 +131,9 @@ impl WatchScan {
         let cwd = policy::require_within(Path::new(&local.cwd), &roots)
             .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
         let protection_repo =
-            crate::rc::protection::native_repository(&runtime, &request.session_id, &cwd).map_err(
-                |_| {
-                    RpcError::new(
-                        ErrorCode::RuntimeUnavailable,
-                        "session protection context is unavailable",
-                    )
-                },
-            )?;
+            crate::rc::protection::native_repository(&runtime, &request.session_id, &cwd)
+                .ok()
+                .flatten();
         let (source, from_line, total_lines, absolute_lines) = if runtime == "opencode" {
             use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
             let source = OpenCode
@@ -429,30 +424,16 @@ impl Daemon {
                 "the prior runtime source watch is detaching; retry the updated source",
             ));
         }
-        // A read-only follow and a supervised session take the same outbound
-        // path, so they share the daemon's secret filter: loading a copy here
-        // freezes a snapshot on this stream, which keeps allowing by the old
-        // rules after `agit rc secrets reload`.
-        let secret_filter = self.secret_filter.clone();
         let native_id = enrolled
             .as_ref()
             .map(|watch| watch.native_id.as_str())
             .unwrap_or(&request.session_id);
-        let mut redactor = crate::domain::redact::Redactor::with_registered(
-            crate::domain::redact::Persona::this_machine(),
-            secret_filter,
-        )
-        .for_device_control()
-        .with_unbound_native_context(&runtime, native_id);
+        let mut redactor = crate::domain::redact::Redactor::this_machine()
+            .for_device_control()
+            .with_unbound_native_context(&runtime, native_id);
         if let Some(root) = &protection_repo {
-            redactor = redactor.with_repository(root).map_err(|_| {
-                RpcError::new(
-                    ErrorCode::RuntimeUnavailable,
-                    "session protection context is unavailable",
-                )
-            })?;
+            redactor = redactor.for_repository(Some(root));
             redactor = redactor.with_native_context(&runtime, native_id, &cwd, root);
-            redactor = redactor.with_native_source(enrolled.as_ref().map(|watch| watch.identity()));
         }
         let model_settings = settings
             .as_ref()

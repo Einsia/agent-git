@@ -115,10 +115,10 @@ pub fn upload_selected(
     repo: &Repo,
     references: &[String],
     identity: &crate::hub::identity::RemoteIdentity,
-    allow_secrets: bool,
+    _allow_secrets: bool,
 ) -> Result<()> {
     crate::telemetry::measure(crate::telemetry::Operation::ArtifactUpload, || {
-        upload_selected_inner(repo, references, identity, allow_secrets)
+        upload_selected_inner(repo, references, identity, _allow_secrets)
     })
 }
 
@@ -126,49 +126,16 @@ fn upload_selected_inner(
     repo: &Repo,
     references: &[String],
     identity: &crate::hub::identity::RemoteIdentity,
-    allow_secrets: bool,
+    _allow_secrets: bool,
 ) -> Result<()> {
     let pointers = reachable(repo, references)?;
     let pointers = crate::hub::git::missing_lfs_uploads(repo, &pointers, identity)?;
     if pointers.is_empty() {
         return Ok(());
     }
-    let limits = crate::domain::secrets::ScanLimits::default();
-    let mut remaining = limits.budget_bytes;
-    let allowlist = crate::domain::secrets::load_allowlist(&crate::infra::config::agit_home()?);
-    let registered = crate::domain::secrets::registered_matcher_for_repo(repo)?;
-    // Historical payloads absent from the destination leave the machine even during an incremental push.
+    // LFS payloads are outside privacy processing; native transfer still needs valid objects.
     for pointer in &pointers {
-        let payload =
-            super::inspection::cached(repo, pointer, limits.max_object_bytes, &mut remaining)?;
-        let (blocked, complete) = match payload {
-            super::inspection::Payload::Binary => (false, true),
-            super::inspection::Payload::Text(text) => (
-                !crate::domain::secrets::scan_text_registered_with(&text, &allowlist, &registered)
-                    .is_empty(),
-                true,
-            ),
-            super::inspection::Payload::TooLarge => {
-                pointer.verify(std::fs::File::open(object_path(repo, pointer)?)?)?;
-                (true, false)
-            }
-        };
-        if blocked {
-            ensure!(
-                (allow_secrets && complete) || crate::infra::config::allow_secrets(),
-                "LFS upload blocked: payload {} contains suspected secrets or cannot be completely scanned",
-                pointer.oid
-            );
-            if allow_secrets && complete {
-                crate::ui::warning(
-                    "--allow-secrets explicitly accepts credential findings in this verified LFS payload.",
-                );
-            } else {
-                crate::ui::warning(
-                    "AGIT_ALLOW_SECRETS is set — uploading an LFS payload that did not pass the secret scan.",
-                );
-            }
-        }
+        pointer.verify(std::fs::File::open(object_path(repo, pointer)?)?)?;
     }
     // Explicit objects keep native Git traversal from changing the inspected upload scope.
     for batch in pointers.chunks(100) {

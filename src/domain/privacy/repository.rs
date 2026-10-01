@@ -1,10 +1,3 @@
-//! Device-local repository privacy policy and path candidate evaluation.
-//!
-//! The policy is a fail-closed allowlist. It decides which local paths may enter a publication
-//! candidate set; secret scanning and content rewriting remain mandatory
-//! later stages. The policy file lives below the repository's Git common directory and is never a
-//! tracked file.
-
 use crate::domain::repo::Repo;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -14,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-pub mod mandatory;
+use super::mandatory;
 
 /// Current on-disk policy schema.
 pub const POLICY_VERSION: u32 = 1;
@@ -554,7 +547,7 @@ fn policy_path(repo: &Repo) -> Result<PathBuf> {
     Ok(repo.common_dir()?.join(POLICY_DIRECTORY).join(POLICY_FILE))
 }
 
-fn ensure_valid_label(label: &str) -> Result<()> {
+pub(super) fn ensure_valid_label(label: &str) -> Result<()> {
     ensure!(
         !label.is_empty() && label.len() <= 64,
         "external root labels must be non-empty and bounded"
@@ -576,7 +569,7 @@ fn ensure_no_control_path(path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_patterns(patterns: &[String]) -> Result<()> {
+pub(super) fn validate_patterns(patterns: &[String]) -> Result<()> {
     for pattern in patterns {
         ensure!(
             !pattern.is_empty(),

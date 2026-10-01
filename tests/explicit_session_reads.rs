@@ -1,7 +1,7 @@
 //! Reading and sharing an omitted target follows the explicitly selected branch, never recency.
 
-#[path = "support/privacy_policy_sources.rs"]
-mod privacy_policy_sources;
+#[path = "support/publication_identity.rs"]
+mod publication_identity;
 
 use agit::domain::{meta, repo::Repo, storage, transcript};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -193,7 +193,7 @@ fn share_payload(home: &Path, work: &Path) -> String {
                     .unwrap();
                 r#"{"format_version":2,"slug":"synthetic-share","url":"http://localhost/s/synthetic-share"}"#
                     .to_owned()
-            } else if let Some((_, response)) = privacy_policy_sources::route(
+            } else if let Some((_, response)) = publication_identity::route(
                 &response_hub,
                 "me",
                 request_line.split_whitespace().next().unwrap(),

@@ -65,13 +65,20 @@ ratios, counts of tests or table entries, and phrasing that points at another ve
 review round. It judges shapes; deciding what a sentence was trying to say, and rewriting it
 as the invariant, is still yours. It is not a CI gate.
 
-## Tests and CI stay focused
+## Tests must justify their continued existence
 
-- Add a test only when it protects a user-visible behavior, a protocol contract, or a failure
-  boundary that a plausible implementation could break.
-- Prefer one representative end-to-end check over duplicated fixtures and broad combinations
-  that exercise the same code path.
-- Keep CI fast: run the smallest relevant test target, avoid redundant builds and matrices,
-  and do not add nonessential checks to required jobs.
-- A local exploratory check can remain outside CI when it does not protect a maintained
-  contract.
+- Every maintained test must have an explicit purpose: name the user-visible behavior,
+  protocol contract, or failure boundary it protects and what a materially wrong
+  implementation would do. Use a clear test name and a short contract comment where needed.
+- A bug fix, a feature removal, or "preventing regression" is not by itself a reason to add
+  a test. Do not add one test for every fix or removed feature.
+- Before adding a test, identify the distinct contract that existing coverage cannot
+  establish. Prefer updating or consolidating an existing test. If no distinct maintained
+  contract is missing, do not add a test.
+- Remove tests for deleted behavior, duplicate assertions of the same contract, and tests
+  that merely mirror implementation details. Do not retain obsolete fixtures or helpers.
+- Prefer a representative end-to-end check over repeated fixtures and broad combinations
+  that exercise the same path. Keep focused unit tests only for independently meaningful
+  boundaries that such a check cannot establish.
+- Keep CI fast: run the smallest relevant targets, avoid redundant builds and matrices,
+  and do not add nonessential required checks. Exploratory measurements can remain outside CI.

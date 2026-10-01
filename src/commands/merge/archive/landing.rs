@@ -17,6 +17,8 @@ use crate::domain::merge_archive::{
     ArchiveJournal, ArchiveJournalGuard, ArchivePhase, ArchivePublicationKind, ExplorationBinding,
     PreparedArchivePublication, RetainedMergeLanding, checked_landing_transaction,
 };
+use crate::domain::privacy::{projector::Mode, service as privacy};
+#[cfg(test)]
 use crate::domain::secret_filter::{KeyStore, Matcher, RepositoryDictionary};
 use crate::domain::{
     archive_history, mergetx, meta, native_archive, repo::Repo, storage, store::Store, transcript,
@@ -36,21 +38,19 @@ pub struct LandingOutcome {
     pub archived_records: usize,
 }
 
-pub fn land(request: LandingRequest<'_>, global: &Matcher) -> Result<LandingOutcome> {
-    land_resolved(request, global, &[])
+pub fn land(request: LandingRequest<'_>) -> Result<LandingOutcome> {
+    land_resolved(request, &[])
 }
 
 pub(super) fn land_resolved(
     request: LandingRequest<'_>,
-    global: &Matcher,
     resolved: &[String],
 ) -> Result<LandingOutcome> {
     require_destination_routing(request.repo, &request.binding.role.branch)?;
-    let dictionary = RepositoryDictionary::open(request.repo.root())?;
+    let repo = request.repo.root();
     land_with_resolved(
         request,
-        &dictionary,
-        global,
+        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
         read_native,
         |_| Ok(()),
         resolved,
@@ -318,10 +318,9 @@ fn require_transaction(control: &mergetx::ControlGuard, json: &str) -> Result<()
     Ok(())
 }
 
-fn land_with_resolved<K: KeyStore>(
+fn land_with_resolved(
     request: LandingRequest<'_>,
-    dictionary: &RepositoryDictionary<K>,
-    global: &Matcher,
+    protect: &dyn Fn(&str) -> String,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
     resolved: &[String],
@@ -445,7 +444,7 @@ fn land_with_resolved<K: KeyStore>(
     let protected = if capture.record_count == 0 {
         String::new()
     } else {
-        dictionary.protect_jsonl(&capture.records, global)?.text
+        protect(&capture.records)
     };
     ensure!(
         protected.len() <= storage::MAX_MATERIALIZED_BYTES,
@@ -982,6 +981,29 @@ pub(super) fn complete_visible(
 }
 
 #[cfg(test)]
+fn land_fixture<K: KeyStore>(
+    request: LandingRequest<'_>,
+    dictionary: &RepositoryDictionary<K>,
+    global: &Matcher,
+    read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
+    checkpoint: impl FnMut(Checkpoint) -> Result<()>,
+    resolved: &[String],
+) -> Result<LandingOutcome> {
+    land_with_resolved(
+        request,
+        &|text| {
+            dictionary
+                .protect_jsonl(text, global)
+                .map(|r| r.text)
+                .unwrap_or_else(|_| text.to_owned())
+        },
+        read_native,
+        checkpoint,
+        resolved,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     fn land_with<K: KeyStore>(
         request: LandingRequest<'_>,
@@ -990,7 +1012,7 @@ mod tests {
         read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
         checkpoint: impl FnMut(Checkpoint) -> Result<()>,
     ) -> Result<LandingOutcome> {
-        land_with_resolved(request, dictionary, global, read_native, checkpoint, &[])
+        land_fixture(request, dictionary, global, read_native, checkpoint, &[])
     }
 
     use super::*;
@@ -1280,7 +1302,7 @@ mod tests {
             paths: &[String],
             checkpoint: impl FnMut(Checkpoint) -> Result<()>,
         ) -> Result<LandingOutcome> {
-            land_with_resolved(
+            land_fixture(
                 self.request(),
                 &self.dictionary,
                 &Matcher::empty(),
@@ -2241,7 +2263,7 @@ mod tests {
 
     #[test]
     fn opencode_landing_and_final_tail_share_the_terminal_frontier() {
-        use super::super::{TailDestination, TailOutcome, settle_tail_mode};
+        use super::super::{TailDestination, TailOutcome, settle_tail_fixture};
         for aborted in [false, true] {
             let baseline = b"{\"id\":\"INSTALLED\",\"kind\":\"opencode.meta\"}\n";
             let fixture = Fixture::with_native("opencode", baseline);
@@ -2272,7 +2294,7 @@ mod tests {
             assert!(!log.contains("partial tool output"));
             assert!(!view.contains("stable exploration"));
             let settle = || {
-                settle_tail_mode(
+                settle_tail_fixture(
                     TailDestination {
                         repo: &fixture.repo,
                         store: &fixture.store,
@@ -2354,7 +2376,7 @@ mod tests {
     #[test]
     fn opencode_summary_revisions_survive_git_cas_stops_without_rebuilding_observations() {
         use super::super::{
-            Checkpoint as TailCheckpoint, TailDestination, TailOutcome, settle_tail_mode,
+            Checkpoint as TailCheckpoint, TailDestination, TailOutcome, settle_tail_fixture,
         };
         for (stop, ref_lock) in [
             (TailCheckpoint::Prepared, false),
@@ -2402,7 +2424,7 @@ mod tests {
                     .unwrap()
                     .contains("\"numeric\":1e0")
             );
-            let result = settle_tail_mode(
+            let result = settle_tail_fixture(
                 TailDestination {
                     repo: &fixture.repo,
                     store: &fixture.store,
@@ -2439,7 +2461,7 @@ mod tests {
             let publication = pending.publication.as_ref().unwrap();
             assert_eq!(publication.appended_records, 2);
             write_revision("later summary");
-            let replay = settle_tail_mode(
+            let replay = settle_tail_fixture(
                 TailDestination {
                     repo: &fixture.repo,
                     store: &fixture.store,
@@ -2476,7 +2498,7 @@ mod tests {
             assert!(!replay_log.contains(secret));
             assert!(!replay_log.contains("later summary"));
             let settle = || {
-                settle_tail_mode(
+                settle_tail_fixture(
                     TailDestination {
                         repo: &fixture.repo,
                         store: &fixture.store,

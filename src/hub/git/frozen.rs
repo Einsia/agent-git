@@ -36,7 +36,7 @@ pub use prepared::{
 };
 
 /// A prepared destination and publication plan survive ambient configuration and ref changes.
-/// Local preparation may create private scan locks and temporary state; it performs no network request.
+/// Local preparation creates temporary content owners; it performs no network request.
 /// Callers enforce review and confirmation before push.
 pub struct FrozenPublication {
     transport: TransportIdentity,
@@ -46,10 +46,6 @@ pub struct FrozenPublication {
     http: std::result::Result<(String, ureq::Agent), http::Failure>,
     lfs_objects: std::result::Result<PathBuf, lfs_cache::Failure>,
     lfs_preferences: std::result::Result<BTreeMap<String, String>, http::Failure>,
-    inspection_policy: std::result::Result<
-        crate::domain::secrets::publication::CapturedPolicy,
-        crate::domain::secrets::publication::InspectionFailure,
-    >,
     plan: PublicationPlan,
     scope: crate::domain::repo::publication::InspectionScope,
     lfs_inventory: Vec<crate::domain::lfs::Pointer>,
@@ -190,7 +186,6 @@ impl FrozenPublication {
             directory,
             format,
             lfs_objects,
-            inspection_policy,
             plan,
             lfs_inventory,
             scope,
@@ -229,7 +224,6 @@ impl FrozenPublication {
             http,
             lfs_objects,
             lfs_preferences,
-            inspection_policy,
             plan,
             lfs_inventory,
             scope,
@@ -348,7 +342,6 @@ impl FrozenPublication {
         policy_digest: &str,
         recipient: &str,
         visibility: &str,
-        content_policy_digest: &str,
     ) -> Result<crate::hub::privacy::publication::PublicationPolicy> {
         ensure!(
             self.lfs_inventory.is_empty(),
@@ -372,7 +365,6 @@ impl FrozenPublication {
             policy_digest,
             recipient,
             visibility,
-            content_policy_digest,
         )
     }
 

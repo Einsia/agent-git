@@ -6,7 +6,7 @@ mod execution;
 use super::{PreparedPayloadAvailability, PreparedPublication};
 use crate::domain::lfs::Pointer;
 use crate::domain::repo::{Repo, publication::InspectionScope};
-use crate::domain::secrets::publication::{CapturedPolicy, InspectionFailure, Inspector};
+use crate::domain::secrets::publication::InspectionFailure;
 use crate::domain::secrets::{ScanLimits, ScanReport, Unscanned};
 use crate::hub::git::frozen::CapturedPublication;
 use crate::hub::git::inspection_summary::InspectionSummary;
@@ -36,8 +36,7 @@ impl InspectionReport {
     }
 }
 
-/// Only a complete deterministic pass can construct this owner.
-/// Complete findings are retained; this type is neither consent nor model approval.
+/// The owner retains verified payloads; this type is neither consent nor model approval.
 pub struct CompleteInspection {
     prepared: PreparedPublication,
     report: InspectionReport,
@@ -110,12 +109,10 @@ impl PreparedPublication {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// Inspect captured Git objects and owned LFS payloads without new network requests.
-    /// Ambient acceptance flags cannot complete an unread or truncated carrier.
+    /// Verify owned LFS payloads without new network requests or privacy dependencies.
     pub fn inspect(self, limits: ScanLimits) -> PublicationInspection {
         let repo = Repo::at(self.publication.directory.path()).exact_bare_root_inspection();
         let (report, reason) = inspect_content(
-            &self.publication.inspection_policy,
             &repo,
             &self.publication.scope,
             self.pointers(),
@@ -163,18 +160,12 @@ impl CapturedPublication {
     /// Every captured payload participates even when a destination already holds its object ID.
     pub fn inspect(self, limits: ScanLimits) -> ContentInspection {
         let repo = Repo::at(self.snapshot_git_dir()).exact_bare_root_inspection();
-        let (report, reason) = inspect_content(
-            &self.git.inspection_policy,
-            &repo,
-            &self.git.scope,
-            self.pointers(),
-            limits,
-            |pointer| {
+        let (report, reason) =
+            inspect_content(&repo, &self.git.scope, self.pointers(), limits, |pointer| {
                 Ok(Some(
                     Box::new(self.open_payload(pointer)?) as Box<dyn Read + '_>
                 ))
-            },
-        );
+            });
         match reason {
             None => ContentInspection::Complete(CompleteContentInspection {
                 captured: self,
@@ -210,7 +201,7 @@ impl CompleteContentInspection {
     /// A copied repository must authorize the same captured bytes under its own policy.
     /// Refreshing policy keeps owned payloads and frozen object IDs intact.
     pub fn reinspect(self, repo: &Repo, limits: ScanLimits) -> anyhow::Result<ContentInspection> {
-        Ok(self.captured.refresh_policy(repo)?.inspect(limits))
+        Ok(self.captured.refresh_source(repo)?.inspect(limits))
     }
 
     /// Bind only after review and publication consent, using the validated actual destination.
@@ -261,70 +252,38 @@ impl BlockedContentInspection {
     pub fn reason(&self) -> InspectionFailure {
         self.reason
     }
-
-    /// A pass that stopped at its finding cap or byte budget publishes only for a caller that
-    /// accepts every finding at this destination: the unread remainder could only add findings.
-    /// Unreadable content or an unavailable policy stays blocked, because nothing was judged.
-    pub fn accept_incomplete(self) -> Option<CompleteContentInspection> {
-        (self.reason == InspectionFailure::Incomplete).then(|| CompleteContentInspection {
-            captured: self.captured,
-            report: self.report,
-        })
-    }
 }
 
 fn inspect_content<R: Read>(
-    policy: &Result<CapturedPolicy, InspectionFailure>,
-    repo: &Repo,
-    scope: &InspectionScope,
+    _repo: &Repo,
+    _scope: &InspectionScope,
     pointers: &[Pointer],
-    limits: ScanLimits,
+    _limits: ScanLimits,
     mut payload: impl FnMut(&Pointer) -> anyhow::Result<Option<R>>,
 ) -> (InspectionReport, Option<InspectionFailure>) {
-    let policy = match policy {
-        Ok(policy) => policy,
-        Err(reason) => {
-            return (
-                InspectionReport {
-                    scan: ScanReport {
-                        binary_carriers: 0,
-                        hits: Vec::new(),
-                        truncated: false,
-                        unscanned: Unscanned::default(),
-                    },
-                    binary_git_objects: 0,
-                    binary_lfs: Vec::new(),
-                    remote_present: Vec::new(),
-                },
-                Some(*reason),
-            );
-        }
-    };
-    let mut inspector = Inspector::new(policy, limits);
-    let mut binary_lfs = Vec::new();
-    let mut remote_present = Vec::new();
-    let result = (|| {
-        inspector.git_scoped(repo, scope)?;
-        for pointer in pointers {
-            match payload(pointer).map_err(|_| InspectionFailure::Content)? {
-                None => remote_present.push(pointer.clone()),
-                Some(reader) => {
-                    if inspector.lfs(reader, pointer)? {
-                        binary_lfs.push(pointer.clone());
-                    }
-                }
-            }
-        }
-        inspector.require_complete()
-    })();
-    let (scan, binary_git_objects) = inspector.finish();
-    (
-        InspectionReport {
-            scan,
-            binary_git_objects,
-            binary_lfs,
-            remote_present,
+    let mut report = InspectionReport {
+        scan: ScanReport {
+            binary_carriers: 0,
+            hits: vec![],
+            truncated: false,
+            unscanned: Unscanned::default(),
         },
-        result.err(),
-    )
+        binary_git_objects: 0,
+        binary_lfs: vec![],
+        remote_present: vec![],
+    };
+    // Publication verifies payload ownership and integrity; privacy never grants admission.
+    for pointer in pointers {
+        match payload(pointer) {
+            Ok(None) => report.remote_present.push(pointer.clone()),
+            Ok(Some(reader)) => {
+                if pointer.verify(reader).is_err() {
+                    return (report, Some(InspectionFailure::Content));
+                }
+                report.binary_lfs.push(pointer.clone());
+            }
+            _ => return (report, Some(InspectionFailure::Content)),
+        }
+    }
+    (report, None)
 }

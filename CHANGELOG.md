@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-10-02
+
 ### Added
 
 - Each settled commit records the runtime's own name for the session in
@@ -20,21 +22,38 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Changed
 
-- **Secret findings no longer stop uploads to a private ordinary repository.**
-  `agit push`, automatic push and `agit project sync` report the findings and
-  publish, because only the repository's collaborators can read it. This includes
-  an inspection that stopped at its finding or byte limit, which previously refused
-  even with `--allow-secrets`. A public repository still requires an explicit
-  `--allow-secrets`, and an encrypted one still requires clean processed content.
-- The project Stop hook starts the session upload in a background process and
-  returns immediately, so a long import or upload no longer holds the agent's turn
-  or runs into the runtime's hook timeout. `agit project status` shows the result.
+- Privacy processing runs in a bounded local worker. Detected secrets receive
+  reversible placeholders when their originals can be saved. Incomplete scans
+  keep completed replacements; unavailable storage, scan failures and timeouts
+  skip the affected privacy work and let conversation operations continue.
+- Signed-in accounts obtain an automatically generated cloud dictionary key.
+  Without a usable key, mappings remain in private local pending storage. Push,
+  login and fetch schedule encrypted dictionary synchronization independently;
+  another signed-in device can restore mappings after synchronization succeeds.
+- Local default, global user and repository user rules share one policy path.
+  Explicit blocks override allows, and allows override heuristic findings.
+  Recovery records survive rule changes without becoming permanent block rules.
+- Uploads require no secret-finding review or cloud privacy-policy resolution.
+  Existing Git history is preserved. LFS payloads are outside privacy processing;
+  their authorization, availability and integrity checks remain in place.
+- This release requires the matching backend update to remove older server
+  privacy gates. A skipped local transformation may retain original sensitive
+  content, and pending dictionaries become recoverable on other devices only
+  after successful encrypted synchronization.
+
+- Project Stop hooks start session uploads in a background process and return
+  immediately. Project status reports the resulting upload state.
 
 ### Fixed
 
-- `agit project bind --auto-upload` no longer fails when Codex is installed but
-  cannot report an enabled hooks feature. Claude Code hooks are still installed,
-  and Codex sessions in the project are published by `agit project sync`.
+- Automatic project binding installs hooks for available runtimes that support
+  them; other runtime sessions remain publishable through project sync.
+
+- Live output preserves every emitted fragment and the remaining stream tail
+  when local privacy processing is unavailable.
+- Legacy native message identifiers stored as secret placeholders can be restored
+  without changing unmasked carrier identities.
+
 - `agit project sync` publishes a session that another repository already claims, such
   as one started from a desktop RC project, as a separate copy of that claim's branch
   in the project repository, instead of failing with "session already belongs to another

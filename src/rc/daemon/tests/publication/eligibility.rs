@@ -26,20 +26,7 @@ pub(super) fn configure(repo: &Repo, hub: &str, published: &PublicationReceipt) 
     }
     let directory = repo.common_dir().unwrap().join("agit");
     std::fs::create_dir_all(&directory).unwrap();
-    let mut policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap();
-    policy
-        .mandatory
-        .push(crate::domain::privacy::mandatory::MandatoryPolicy {
-            version: 1,
-            id: "hub-policy".into(),
-            revision: crate::domain::privacy_envelope::digest_json(&json!({
-                "version":1, "hub":hub, "account_id":"account-1", "repository":"owner/project",
-                "owner_id":"owner-1", "revision":"revision-1", "sources":[],
-            }))
-            .unwrap(),
-            exclude: vec![],
-            memory_exclude: vec![],
-        });
+    let policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap();
     std::fs::write(
         directory.join("privacy-auto-consent.json"),
         serde_json::to_vec(&json!({
@@ -55,7 +42,6 @@ pub(super) fn configure(repo: &Repo, hub: &str, published: &PublicationReceipt) 
 pub(super) fn response(
     hub: &str,
     request: &str,
-    body: &[u8],
     encryption_enabled: bool,
 ) -> Option<serde_json::Value> {
     let mut parts = request.split_whitespace();
@@ -76,16 +62,6 @@ pub(super) fn response(
             Some(
                 json!({"agent_id":"00000000-0000-0000-0000-000000000002", "config_version":1,
                 "current":{"recipient":crate::domain::privacy_key::recipient_id(&public), "public_key_algorithm":"x25519", "public_key":public}}),
-            )
-        }
-        ("POST", "/api/privacy/policy-sources/resolve") => {
-            let request: serde_json::Value = serde_json::from_slice(body).unwrap();
-            let now = chrono::Utc::now();
-            Some(
-                json!({"version":1, "hub":hub, "repository":request["repository"],
-                "agent_id":request["agent_id"], "request_id":request["request_id"],
-                "account_id":"account-1", "owner_id":"owner-1", "revision":"revision-1",
-                "issued_at":now, "expires_at":now + chrono::Duration::minutes(5), "sources":[]}),
             )
         }
         _ => None,

@@ -1,7 +1,10 @@
 //! Resolve device-local placeholders before generating public and encrypted session views.
 
 use super::*;
-use crate::domain::{repo::Repo, secret_filter::RepositoryDictionary};
+use crate::domain::{
+    privacy::{projector::Mode, service},
+    repo::Repo,
+};
 
 pub(crate) struct PublicationSnapshot {
     source_log: Zeroizing<String>,
@@ -19,13 +22,24 @@ impl PublicationSnapshot {
         let records = storage::parse_envelopes(log)?;
         let native = Zeroizing::new(transcript::unwrap_strict(log)?);
         let mut metadata = metadata.clone();
-        let (hydrated, protected_values) = RepositoryDictionary::open(repo.root())?
-            .hydrate_publication_snapshot(&native, &mut metadata)?;
-        ensure!(
-            hydrated.unresolved == 0,
-            "publication has unresolved secret placeholders; restore the source dictionary or unlock the original publication"
+        let source_metadata = Zeroizing::new(serde_json::to_string(&metadata)?);
+        let recovered = service::manage(
+            Some(repo.root()),
+            super::super::privacy::management::Command {
+                action: "used_values".into(),
+                global: false,
+                id: None,
+                name: None,
+                secret: Some(format!("{}\n{}", native.as_str(), source_metadata.as_str())),
+            },
         );
-        let hydrated = Zeroizing::new(hydrated.text);
+        let protected_values = recovered
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let hydrated = service::transform(Some(repo.root()), &native, Mode::HydrateJsonl);
+        service::hydrate_metadata(repo.root(), &mut metadata);
+        let hydrated = Zeroizing::new(hydrated.content);
         PrivateLayer::check_session_size(hydrated.len(), 0)?;
         let contents = hydrated
             .lines()

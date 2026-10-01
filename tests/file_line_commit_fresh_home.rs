@@ -1,13 +1,5 @@
-//! Two regressions reached through the command entry point, both on a machine that has **never
-//! run import / new**:
-//!
-//! 1. `agit commit <owner/repo>@main -m` needs no session store. The file line's contract is to
-//!    depend on no session; an entry point that requires `$AGIT_HOME/store` to exist before it
-//!    resolves the target makes the manual path `repo create → clone → init → write README →
-//!    commit` exit at its last step.
-//! 2. `agit init` taking over an empty checkout does not overwrite user content. An AGENTS.md
-//!    written by hand after the clone and not yet committed is the user's bytes; the scaffold
-//!    must not paint over it.
+//! File-line commits work without a session store, and initialization preserves existing user files.
+//! Selecting a file line must not require importing a session or replace hand-written scaffolding.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

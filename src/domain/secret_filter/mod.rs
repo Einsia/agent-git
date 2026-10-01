@@ -28,8 +28,6 @@ mod decoded_records;
 mod os_keychain;
 mod protection_matcher;
 mod repository;
-#[cfg(feature = "rc")]
-pub(crate) use repository::NativeHistoryPolicyUnavailable;
 mod repository_sync;
 pub use repository_sync::{PolicySyncConflict, RepositoryPolicyTransport};
 mod repository_keys;
@@ -37,6 +35,7 @@ pub use repository_keys::RepositoryKeyStore;
 
 pub(crate) use repository::HydrationBudgetExceeded;
 #[cfg(any(feature = "cli", test))]
+#[cfg(test)]
 pub(crate) use repository::ReadonlyDictionaryLimits;
 pub use repository::{
     DeclarationOperation, DeclarationTarget, HydrationReport, ProtectionReport,
@@ -1161,25 +1160,6 @@ impl Matcher {
         self.inner.generation
     }
 
-    /// Cache dependencies identify effective rules, not a generation shared by unrelated vaults.
-    pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
-        let bytes = Zeroizing::new(serde_json::to_vec(&(
-            &self.inner.ids,
-            &self.inner.explicit,
-            self.inner
-                .patterns
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
-            self.inner
-                .allowlist
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
-        ))?);
-        Ok(crate::domain::privacy_envelope::digest_bytes(&bytes))
-    }
-
     pub fn rules(&self) -> usize {
         self.inner.ids.len()
     }
@@ -1188,7 +1168,7 @@ impl Matcher {
         self.inner.max_pattern_len
     }
 
-    fn patterns(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub(crate) fn patterns(&self) -> impl Iterator<Item = (&str, &str)> {
         self.inner
             .ids
             .iter()
@@ -1198,16 +1178,6 @@ impl Matcher {
 
     pub(crate) fn allowed_values(&self) -> impl Iterator<Item = &str> {
         self.inner.allowlist.iter().map(|value| value.as_str())
-    }
-
-    pub(crate) fn publication_values_matching(
-        &self,
-        used: impl Fn(&str) -> bool,
-    ) -> std::collections::BTreeSet<String> {
-        self.patterns()
-            .filter(|(_, value)| used(value))
-            .map(|(_, value)| value.to_owned())
-            .collect()
     }
 
     pub(crate) fn repository_identities(&self) -> &HashSet<String> {
@@ -1335,24 +1305,6 @@ impl Matcher {
 
     pub fn find(&self, text: &str) -> Vec<RegisteredMatch> {
         self.find_capped(text, usize::MAX).0
-    }
-
-    /// Visit original spans without allocating a record-id copy for each occurrence.
-    pub(crate) fn visit_matches(&self, text: &str, mut visit: impl FnMut(usize, usize, &str)) {
-        let Some(ac) = &self.inner.ac else { return };
-        let mut cursor = 0;
-        for (start, end, _) in
-            repository::token_segments(text).chain(std::iter::once((text.len(), text.len(), "")))
-        {
-            for found in ac.find_iter(&text.as_bytes()[cursor..start]) {
-                visit(
-                    cursor + found.start(),
-                    cursor + found.end(),
-                    &self.inner.ids[found.pattern().as_usize()],
-                );
-            }
-            cursor = end;
-        }
     }
 
     /// Return the earliest registered match or opaque repository token that
@@ -2088,41 +2040,6 @@ mod tests {
             encode_padded(&a).unwrap().len(),
             encode_padded(&b).unwrap().len()
         );
-    }
-
-    #[test]
-    fn streaming_redactor_catches_a_match_split_across_deltas() {
-        let matcher = Matcher::for_test(&[("sec_test", "correct horse battery")]);
-        let handle = MatcherHandle::new(matcher);
-        let redactor = crate::domain::redact::Redactor::with_registered(
-            crate::domain::redact::Persona::default(),
-            handle,
-        );
-        let mut stream = redactor.stream();
-        let first = stream.push("before correct horse ").unwrap();
-        let second = stream.push("battery after").unwrap();
-        let last = stream.flush().unwrap();
-        let text = format!("{}{}{}", first.text, second.text, last.text);
-        assert_eq!(text, format!("before {PLACEHOLDER} after"));
-        let ids = [first, second, last]
-            .into_iter()
-            .flat_map(|report| report.registered_ids)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["sec_test"]);
-    }
-
-    #[test]
-    fn matcher_handle_replacement_is_visible_to_existing_redactors() {
-        let handle = MatcherHandle::default();
-        let redactor = crate::domain::redact::Redactor::with_registered(
-            crate::domain::redact::Persona::default(),
-            handle.clone(),
-        );
-        assert_eq!(redactor.scrub("blue horse battery").secrets, 0);
-        handle.replace(Matcher::for_test(&[("sec_new", "blue horse battery")]));
-        let report = redactor.scrub("blue horse battery");
-        assert_eq!(report.text, PLACEHOLDER);
-        assert_eq!(report.registered_ids, vec!["sec_new"]);
     }
 
     /// The file keystore keeps one private file per vault id and never replaces one: a

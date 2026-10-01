@@ -36,7 +36,7 @@ pub enum Cmd {
     },
     /// Repo details.
     Info { repo: Option<String> },
-    /// Change visibility (full name required; private→public triggers the server-side secret scan).
+    /// Change visibility (full name required).
     Visibility { repo: String, visibility: String },
     /// Manage collaborators.
     Collab {

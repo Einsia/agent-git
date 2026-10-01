@@ -4,7 +4,6 @@ use anyhow::{Result, ensure};
 
 pub(crate) mod publication;
 pub mod repository_keys;
-pub mod sources;
 
 fn repository_path(repository: &str) -> Result<String> {
     let (owner, name) = crate::commands::parse_slug(repository)?;

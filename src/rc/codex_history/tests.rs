@@ -258,7 +258,7 @@ fn native_compaction_does_not_replay_retained_prompts_as_new_speech() {
 }
 
 #[test]
-fn correlation_survives_raw_capping_but_never_bypasses_secret_redaction() {
+fn correlation_survives_raw_capping() {
     let identity = uuid::Uuid::new_v4().to_string();
     for mode in [HistoryMode::Legacy, HistoryMode::Paginated] {
         let raw = native_user(
@@ -287,24 +287,6 @@ fn correlation_survives_raw_capping_but_never_bypasses_secret_redaction() {
         assert_eq!(
             items[0].object_hash,
             crate::domain::transcript::object_hash(&raw)
-        );
-        let matcher = crate::domain::secret_filter::Matcher::for_test(&[("identity", &identity)]);
-        let redactor = Redactor::with_registered(
-            Persona::default(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        );
-        let (redacted, registered) =
-            crate::rc::supervisor::items_from_lines_with_mode("codex", &redactor, &[line], mode);
-        assert!(redacted[0].native_prompt_id.is_none());
-        assert!(!registered.is_empty());
-        assert_ne!(
-            redacted[0].object_hash,
-            crate::domain::transcript::object_hash(&raw)
-        );
-        assert!(
-            !serde_json::to_string(&redacted[0])
-                .unwrap()
-                .contains(&identity)
         );
     }
 }

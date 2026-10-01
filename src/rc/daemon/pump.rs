@@ -29,9 +29,7 @@ impl Daemon {
         // durably remove the fallback, preventing a stale snapshot from
         // rolling later roster updates back on another restart.
         let roster = Roster::try_load()?;
-        // A vault that exists but cannot be unlocked must not start a daemon that pretends to
-        // be filtering.
-        let secret_filter = crate::domain::secret_filter::MatcherHandle::load_default()?;
+        // Privacy dependencies are opened only by the isolated worker after daemon startup.
         let d = Arc::new(Mutex::new(Daemon {
             identity: identity.clone(),
             deferred: vec![],
@@ -51,7 +49,7 @@ impl Daemon {
             terminal_delivery_blockers: terminal_delivery_blockers.clone(),
             term_tx: None,
             online: false,
-            secret_filter: secret_filter.clone(),
+
             settlement: settlement_tx.clone(),
             started_at: std::time::Instant::now(),
             notes: notes_tx,
@@ -79,13 +77,11 @@ impl Daemon {
         {
             let d = d.clone();
             let stop_tx = stop_tx.clone();
-            let secret_filter = secret_filter.clone();
             std::thread::spawn(move || {
                 for stream in ctl.incoming() {
                     let Ok(mut stream) = stream else { continue };
                     let d = d.clone();
                     let stop_tx = stop_tx.clone();
-                    let secret_filter = secret_filter.clone();
                     let safe_stop_tx = safe_stop_tx.clone();
                     let (written_tx, written_rx) = tokio::sync::oneshot::channel();
                     let _ = control::serve_one(&mut stream, move |req| match req {
@@ -142,15 +138,13 @@ impl Daemon {
                                 })
                             }
                         }
-                        control::Request::ReloadSecrets => match secret_filter.reload_default() {
-                            Ok(status) => control::Reply::SecretsReloaded {
-                                generation: status.generation,
-                                rules: status.rules,
-                            },
-                            Err(e) => control::Reply::Error {
-                                message: format!("{e:#}"),
-                            },
-                        },
+                        control::Request::ReloadSecrets => {
+                            crate::domain::privacy::service::invalidate();
+                            control::Reply::SecretsReloaded {
+                                generation: 0,
+                                rules: 0,
+                            }
+                        }
                     });
                     let _ = written_tx.send(());
                 }

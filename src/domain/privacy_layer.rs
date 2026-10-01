@@ -141,8 +141,17 @@ impl PrivateLayer {
 
     pub(crate) fn import_protection(&self, repo: &super::repo::Repo) -> Result<()> {
         self.validate()?;
-        super::secret_filter::RepositoryDictionary::open(repo.root())?
-            .import_publication_values(&self.protected_values)
+        let _ = super::privacy::service::manage(
+            Some(repo.root()),
+            super::privacy::management::Command {
+                action: "remember".into(),
+                global: false,
+                id: None,
+                name: None,
+                secret: Some(serde_json::to_string(&self.protected_values)?),
+            },
+        );
+        Ok(())
     }
 
     /// Materialize into a fresh private staging directory, never into a path named by the payload.

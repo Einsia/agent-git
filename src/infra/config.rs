@@ -523,10 +523,7 @@ pub fn is_production_release() -> bool {
     RELEASE_CHANNEL == "prod"
 }
 
-/// Whether the secret scan is allowed through.
-///
-/// Accepts `1`/`true`/`yes`. Every time it takes effect it is printed explicitly — unlike git's
-/// `--no-verify`, which is silent — because "a secret entered shared history" is irreversible.
+/// Legacy server acceptance compatibility; local privacy never requires this flag.
 pub fn allow_secrets() -> bool {
     std::env::var("AGIT_ALLOW_SECRETS")
         .map(|v| {

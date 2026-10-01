@@ -1449,7 +1449,7 @@ pub enum Commands {
     Revert(revert::Args),
 
     // ── Remote ──────────────────────────────────────────────────────
-    /// Publish to the hub (secret scan first; visibility set once at first push; no --force)
+    /// Publish to the hub (visibility set once at first push; no --force)
     Push(push::Args),
     /// fetch: objects and remote refs only — local branches never move
     Fetch(fetch::Args),

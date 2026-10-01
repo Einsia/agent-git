@@ -37,7 +37,6 @@ struct Hub {
     missing_until_create: Arc<AtomicBool>,
     drop_receive_response: Arc<AtomicBool>,
     reject_advertisement: Arc<AtomicBool>,
-    require_secret_acceptance: Arc<AtomicBool>,
     payloads: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -75,8 +74,6 @@ impl Hub {
         let drop_response = drop_receive_response.clone();
         let reject_advertisement = Arc::new(AtomicBool::new(false));
         let reject_refs = reject_advertisement.clone();
-        let require_secret_acceptance = Arc::new(AtomicBool::new(false));
-        let require_acceptance = require_secret_acceptance.clone();
         let payloads = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
         let received_payloads = payloads.clone();
         let served_base = base.clone();
@@ -102,7 +99,6 @@ impl Hub {
                 let mut content_type = String::new();
                 let mut expected_ids = Vec::new();
                 let mut authorizations = Vec::new();
-                let mut accept_findings = Vec::new();
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
@@ -125,17 +121,13 @@ impl Hub {
                     {
                         authorizations.push(value.trim().to_owned());
                     }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("x-agentgit-accept-secret-findings")
-                    {
-                        accept_findings.push(value.trim().to_owned());
-                    }
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let words: Vec<_> = request.split_whitespace().collect();
                 let (method, target) = (words[0], words[1]);
-                if target != "/api/cli/version" {
+                // Publication request counts exclude independent account dictionary synchronization.
+                if target != "/api/cli/version" && !target.starts_with("/api/me/privacy/") {
                     recorded.lock().unwrap().push((
                         request.trim().into(),
                         serde_json::from_slice(&body).unwrap_or(Value::Null),
@@ -151,14 +143,6 @@ impl Hub {
                     {
                         let body = "publication is awaiting receive reconciliation";
                         write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                        continue;
-                    }
-                    if target.ends_with("/info/refs?service=git-receive-pack")
-                        && require_acceptance.load(Ordering::Acquire)
-                        && accept_findings != ["true"]
-                    {
-                        let body = "publication reconciliation requires explicit secret findings acceptance";
-                        write!(stream, "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                         continue;
                     }
                     let (headers, bytes) = ordinary_git_receiver::respond(
@@ -186,19 +170,8 @@ impl Hub {
                 }
                 let (status, response) = if target == "/api/cli/version" {
                     (200, json!({"version": "0.0.0", "tag": "v0.0.0"}))
-                } else if target.starts_with("/api/agents/alice/demo/secret-allowances?") {
-                    assert_eq!(method, "GET");
-                    assert_eq!(
-                        target,
-                        format!("/api/agents/alice/demo/secret-allowances?expected_agent_id={ID}")
-                    );
-                    (
-                        200,
-                        json!({
-                            "version": 1, "agent_id": ID, "revision": 0,
-                            "value_identity_scheme": "sha256-v1", "decisions": []
-                        }),
-                    )
+                } else if target.starts_with("/api/me/privacy/") {
+                    (503, json!({"error":"privacy storage unavailable"}))
                 } else if target == "/api/agents/alice/demo/privacy/publishing-key" {
                     assert_eq!(method, "GET");
                     assert_eq!(expected_ids, [ID]);
@@ -227,7 +200,6 @@ impl Hub {
             missing_until_create,
             drop_receive_response,
             reject_advertisement,
-            require_secret_acceptance,
             payloads,
             stop,
             worker: Some(worker),
@@ -526,8 +498,8 @@ fn ordinary_history_continues_with_original_ids_file_lines_tags_lfs_and_automati
         next
     );
     let commands = hub.requests.lock().unwrap();
-    assert!(commands[requests_before..].iter().any(|(request, body)| {
-        request.contains("/info/lfs/objects/batch") && body["operation"] == "download"
+    assert!(commands[requests_before..].iter().all(|(request, body)| {
+        !request.contains("/info/lfs/objects/batch") || body["operation"] != "download"
     }));
     assert!(
         commands[requests_before..]
@@ -568,12 +540,24 @@ fn ordinary_history_continues_with_original_ids_file_lines_tags_lfs_and_automati
 
     let accepted = PublicationReceipt::load(&repo, "work").unwrap().unwrap();
     let refs = ordinary_git_receiver::git(&remote, &["for-each-ref"]);
-    hub.payloads.lock().unwrap().remove(&oid);
+    // Missing or corrupt new payloads cannot be covered by the accepted history baseline.
+    let new_payload = b"Unpublished LFS attachment.\n";
+    let new_oid = hex::encode(sha2::Sha256::digest(new_payload));
+    std::fs::write(
+        repo.root().join("new-attachment.txt"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{new_oid}\nsize {}\n",
+            new_payload.len()
+        ),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Reference an unavailable attachment").unwrap();
     refused(automatic(), "cannot recover historical LFS object");
     hub.payloads
         .lock()
         .unwrap()
-        .insert(oid.clone(), vec![b'x'; pointer_bytes.len()]);
+        .insert(new_oid, vec![b'x'; new_payload.len()]);
     refused(automatic(), "cannot recover historical LFS object");
     assert_eq!(ordinary_git_receiver::git(&remote, &["for-each-ref"]), refs);
     assert_eq!(
@@ -616,14 +600,9 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     };
     let pending = serde_json::to_vec(&request).unwrap();
     let result = root.path().join("supervisor-result.json");
-    // Findings acceptance stays explicit, and never automatic, only for a public destination.
-    hub.response.lock().unwrap().1["visibility"] = json!("public");
-    let push = |accept_findings| {
+    let push = || {
         std::fs::write(&result, &pending).unwrap();
         let mut command = hub.command(root.path(), &["--yes", "push", "alice/demo@work"]);
-        if accept_findings {
-            command.arg("--allow-secrets");
-        }
         command
             .env(SUPERVISOR_RESULT_ENV, &result)
             .output()
@@ -631,40 +610,21 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     };
 
     hub.reject_advertisement.store(true, Ordering::Release);
-    refused(push(false), "answered 503 to the push-access probe");
+    refused(push(), "answered 503 to the push-access probe");
     assert!(PublicationReceipt::load(&repo, "work").unwrap().is_none());
     assert_eq!(std::fs::read(&result).unwrap(), pending);
 
     hub.reject_advertisement.store(false, Ordering::Release);
-    hub.require_secret_acceptance.store(true, Ordering::Release);
-    refused(push(false), "answered 422 to the push-access probe");
-    assert!(PublicationReceipt::load(&repo, "work").unwrap().is_none());
-    assert_eq!(std::fs::read(&result).unwrap(), pending);
-    let accepted = push(true);
+    let accepted = push();
     assert!(accepted.status.success(), "{accepted:?}");
     assert!(String::from_utf8_lossy(&accepted.stdout).contains("up to date"));
     let receipt = PublicationReceipt::load(&repo, "work").unwrap().unwrap();
     assert_eq!(receipt.published, head);
     assert_eq!(request.read_result(&result).unwrap(), receipt);
-    let automatic = |accept_findings| {
-        let mut command = hub.command(root.path(), &["--yes", "push", "alice/demo@work"]);
-        if accept_findings {
-            command
-                .arg("--allow-secrets")
-                .env("AGIT_ALLOW_SECRETS", "1");
-        }
-        command.env("AGIT_AUTO_PUSH", "1").output().unwrap()
-    };
-    refused(automatic(true), "answered 422 to the push-access probe");
-    // A private destination accepts findings for automatic publication without being asked.
-    hub.response.lock().unwrap().1["visibility"] = json!("private");
-    let private = automatic(false);
-    assert!(private.status.success(), "{private:?}");
-    assert!(String::from_utf8_lossy(&private.stdout).contains("up to date"));
     let request_count = hub.requests.lock().unwrap().len();
 
     hub.reject_advertisement.store(true, Ordering::Release);
-    refused(push(false), "answered 503 to the push-access probe");
+    refused(push(), "answered 503 to the push-access probe");
     assert_eq!(
         PublicationReceipt::load(&repo, "work").unwrap().unwrap(),
         receipt

@@ -1,54 +1,18 @@
-//! Secret scanning.
-//!
-//! # Why the gate is at push
-//!
-//! A session transcript records what the agent actually read and ran, so `cat .env`,
-//! `export TOKEN=...` and an API key pasted into the conversation are all in it. `push` is the
-//! moment **content first leaves this machine**, so the gate sits here.
-//!
-//! The client warns before content leaves the machine. Public pushes and private-to-public
-//! transitions also receive a strict server scan. An authenticated caller can explicitly
-//! accept credential findings with the publication workflow; incomplete server scans still
-//! prevent publication. Private pushes remain subject to the local check.
-//!
-//! `AGIT_ALLOW_SECRETS` affects local checking only. The push command's `--allow-secrets` option
-//! also communicates explicit acceptance to a supporting server for that operation.
-//!
-//! Settlement projects discovered values through the local repository dictionary before
-//! forming canonical objects. Publication independently inspects retained history and direct
-//! Git writes; protecting a new snapshot cannot remove secrets in its ancestors.
-//!
-//! # Err toward the false positive
-//!
-//! Uncertain token-like values become reversible repository placeholders. Independent entropy
-//! discovery and provider rules share the same inspection surface; neither is exhaustive.
-//!
-//! # Same source on both sides, different authority
-//!
-//! The rule engine lives in `domain` (not behind the `cli` feature), so a backend depending on
-//! this crate with `default-features = false` runs the same rules. But **the authority differs**:
-//! inline `agit:allow-secret` and the local allowlist are "do not stop me" switches that hold
-//! locally, and the server-side gate honours neither — otherwise anyone could push a secret by
-//! writing an annotation on their own line. The switch is [`Policy`]: the client uses
-//! [`Policy::CLIENT`], the server uses [`Policy::STRICT`].
-//!
-//! # Upgrading the vendored rules
-//!
-//! Copy gitleaks' `config/gitleaks.toml` over `gitleaks.toml`, keep the provenance / MIT comment
-//! at the top of the file and update the version, then run `cargo test --lib domain::secrets` —
-//! `every_rule_compiles` tells you whether there is a new rule Rust's `regex` cannot compile.
+//! Explicit local diagnostic scans over repository content.
+//! The automatic privacy pipeline uses the independent detector and never uses
+//! these repository reports as a publication prerequisite.
 
 pub(crate) mod identity;
-pub(crate) mod media;
+pub(crate) use crate::domain::privacy::detector::media;
 pub mod repository_policy;
 pub use repository_policy::value_identity;
 
-mod paths;
-pub(crate) mod placeholder;
+pub(crate) use crate::domain::privacy::detector::paths;
+#[cfg(feature = "secret-vault")]
+pub(crate) use crate::domain::privacy::detector::placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
-pub mod rules;
-mod syntax;
+pub use crate::domain::privacy::detector::rules;
 
 use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
@@ -177,84 +141,8 @@ pub(crate) struct SecretCandidateBatch {
 #[cfg(feature = "secret-vault")]
 pub(crate) const MAX_NEW_CANDIDATE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Length limits entropy-only discovery, not credential rules or repository record storage.
-pub(crate) const MAX_BARE_ENTROPY_BYTES: usize = 16 * 1024;
-
-/// Media types a data URL may declare, each with the file header its decoded payload must open
-/// with: JPEG, PNG, GIF, WebP (a RIFF container), PDF, gzip and zip.
-const MEDIA_HEADERS: [(&str, &[u8]); 9] = [
-    ("image/jpeg", &[0xFF, 0xD8, 0xFF]),
-    ("image/jpg", &[0xFF, 0xD8, 0xFF]),
-    (
-        "image/png",
-        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
-    ),
-    ("image/gif", b"GIF8"),
-    ("image/webp", b"RIFF"),
-    ("application/pdf", b"%PDF-"),
-    ("application/gzip", &[0x1F, 0x8B, 0x08]),
-    ("application/x-gzip", &[0x1F, 0x8B, 0x08]),
-    ("application/zip", &[b'P', b'K', 0x03, 0x04]),
-];
-
-/// Whether the token at `start` is the payload of a `data:<media type>;base64,` URL whose
-/// decoded bytes open with the file header that media type requires. A pasted screenshot
-/// arrives that way, as one token of hundreds of kilobytes, and is data rather than a
-/// credential. Carrier, declared type and decoded header must all agree: text that merely ends
-/// in `;base64,`, a data URL declaring another type, or a token that only starts like a header
-/// remain candidates.
-fn base64_media_payload(text: &str, start: usize) -> bool {
-    let before = &text[..start];
-    let Some(carrier) = before
-        .rfind("data:")
-        .map(|at| &before[at + "data:".len()..])
-    else {
-        return false;
-    };
-    let Some(parameters) = carrier.strip_suffix(";base64,") else {
-        return false;
-    };
-    if parameters
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b'<' | b'>'))
-    {
-        return false;
-    }
-    let media_type = parameters.split(';').next().unwrap_or_default();
-    let Some((_, header)) = MEDIA_HEADERS
-        .iter()
-        .find(|(declared, _)| declared.eq_ignore_ascii_case(media_type))
-    else {
-        return false;
-    };
-    let mut sextets = [0u8; 16];
-    let mut count = 0;
-    for byte in text[start..].bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => break,
-        };
-        sextets[count] = value;
-        count += 1;
-        if count == sextets.len() {
-            break;
-        }
-    }
-    if count < sextets.len() {
-        return false;
-    }
-    let mut decoded = [0u8; 12];
-    for (group, chunk) in sextets.chunks(4).enumerate() {
-        decoded[group * 3] = (chunk[0] << 2) | (chunk[1] >> 4);
-        decoded[group * 3 + 1] = (chunk[1] << 4) | (chunk[2] >> 2);
-        decoded[group * 3 + 2] = (chunk[2] << 6) | chunk[3];
-    }
-    decoded.starts_with(header)
-}
+#[cfg(test)]
+use crate::domain::privacy::detector::MAX_BARE_ENTROPY_BYTES;
 
 /// An irreversible fingerprint of a matched span.
 ///
@@ -416,7 +304,7 @@ impl HitCollector {
     /// answer that: the miss happens **inside** the carrier, and the collector sees only the few
     /// hits handed to it.
     ///
-    /// With the budget counted in unique spans ([`SpanBudget`]), hitting the budget happens to
+    /// With the budget counted in unique spans (the detector budget), hitting the budget happens to
     /// mean the collector is full and `is_full` sets the flag along with it — but that is **two
     /// independent decisions coinciding**: the budget's counting key, and the caller passing
     /// `remaining()` as `cap`. Change either side and the inference silently stops holding,
@@ -788,609 +676,12 @@ pub fn load_allowlist(dir: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// An equal-length view of JSON escaping.
-///
-/// A newline inside a jsonl body is two **characters** (`\` + `n`), and `n` is a word character —
-/// a token immediately after the escape therefore loses its left `\b` boundary and the rule
-/// misses it silently. Replacing `\\n \\r \\t \\"` with two spaces (equal length, producing a
-/// non-word boundary) before matching keeps span offsets in one-to-one correspondence with the
-/// original text.
-///
-/// One pass rather than four chained `String::replace` calls: that would be four megabyte-scale
-/// allocations plus four full rewrites, which on a 2 MB transcript costs more than running the
-/// regexes themselves.
-///
-/// Going byte by byte is safe: all four patterns are ASCII, and a UTF-8 continuation byte is
-/// always at least 0x80, so it can never be mistaken for a backslash. The four patterns also
-/// cannot overlap each other (none has a backslash as its second character), so one pass gives
-/// byte-for-byte the same result as replacing them in turn.
-pub fn view_of(s: &str) -> String {
-    let b = s.as_bytes();
-    if !b.contains(&b'\\') && !s.contains(placeholder::TOKEN_PREFIX) {
-        return s.to_string();
-    }
-    let mut out = Vec::with_capacity(b.len());
-    let mut opaque = placeholder::token_segments(s).peekable();
-    let mut i = 0;
-    while i < b.len() {
-        if let Some(&(start, end, _)) = opaque.peek()
-            && i == start
-        {
-            out.resize(end, b' ');
-            i = end;
-            opaque.next();
-            continue;
-        }
-        if b[i] == b'\\' && matches!(b.get(i + 1), Some(b'n' | b'r' | b't' | b'"')) {
-            out.extend_from_slice(b"  ");
-            i += 2;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
-}
-
-/// A line-number index: built on demand, so a clean scan pays nothing.
-struct Lines<'t> {
-    text: &'t str,
-    starts: Vec<usize>,
-}
-
-impl<'t> Lines<'t> {
-    fn new(text: &'t str) -> Self {
-        let mut starts = vec![0usize];
-        starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-        Lines { text, starts }
-    }
-
-    /// Byte offset → 1-based line number.
-    fn number_at(&self, off: usize) -> usize {
-        self.starts.partition_point(|&s| s <= off)
-    }
-
-    fn text_at(&self, off: usize) -> &'t str {
-        let i = self.number_at(off) - 1;
-        let start = self.starts[i];
-        let end = self.starts.get(i + 1).map_or(self.text.len(), |&e| e);
-        self.text[start..end].trim_end_matches(['\n', '\r'])
-    }
-}
-
-/// Where a hit sits in the text (byte offsets into the **view**, which corresponds to the
-/// original text at equal length).
-struct Raw {
-    rule: &'static str,
-    start: usize,
-    end: usize,
-}
-
-/// The scanning core: every public entry point ends up here.
-///
-/// The order is the whole of the performance and must not change:
-/// 1. the escape view (equal length, so offsets still map back to the original text)
-/// 2. keyword prefilter, one automaton over the text, selecting the rules that still need a regex
-/// 3. lazy compilation — only the rules that survived are compiled
-/// 4. match, take the secret span, entropy, the rule's own allowlist
-///
-/// Matching the whole text at once (rather than line by line) has two reasons: performance (line
-/// by line multiplies every rule's regex startup cost by the line count), and fidelity — rules
-/// such as `private-key` and `curl-auth-user` span lines by nature, and a line-by-line scan
-/// misses them.
-fn raw_hits(text: &str, credential_field: bool) -> Vec<Raw> {
-    // A budget of `usize::MAX` is never used up, so the "the bound was reached" flag is false.
-    let mut hits = raw_hits_capped(text, usize::MAX, |_, _| true).0;
-    if credential_field {
-        let view = view_of(text);
-        for (start, end) in entropy_candidate_spans(&view, true) {
-            if !rules::preset_allows(&view[start..end]) {
-                hits.push(Raw {
-                    rule: "high-entropy-value",
-                    start,
-                    end,
-                });
-            }
-        }
-        hits.sort_by_key(|hit| (hit.start, hit.end));
-        dedupe_same_span(&mut hits);
-    }
-    hits
-}
-
-/// A budget counted in **unique spans**.
-///
-/// # Why the budget cannot count the `Raw`s produced
-///
-/// `raw_hits_capped` produces `Raw`s, while what is finally reported is the list **after**
-/// [`dedupe_same_span`]: when two rules recognize the same characters (`token: npm_…` matches
-/// both `generic-api-key` and `npm-access-token`), the two `Raw`s dedupe into one hit.
-///
-/// Counting `Raw`s makes that one hit eat two slots. At `cap = 2` the budget is exhausted on the
-/// spot, dedupe leaves **one** hit, and the **other kind** of secret behind it was never scanned
-/// — while the collector is not full, so the report's `truncated` is still `false`. **A hit went
-/// unscanned and the report claims to be complete.**
-///
-/// So the budget counts distinct spans: the same `(start, end)` recognized again by a second rule
-/// costs nothing (after dedupe it was only ever one hit), `out` takes it as usual, and dedupe
-/// happens later.
-///
-/// # The counting key has to match the dedupe key
-///
-/// [`dedupe_same_span`]'s test is that `start` and `end` are **both equal**, so the key here is
-/// `(start, end)`. Out of step, what is counted here and what is finally reported are not the
-/// same set of things — and the fix itself would drift into the very shape it removes.
-struct SpanBudget {
-    cap: usize,
-    /// Spans that already cost budget. `None` = uncapped, see [`SpanBudget::new`].
-    counted: Option<HashSet<(usize, usize)>>,
-    /// The budget ran out while a reportable hit **really was** still waiting outside.
-    exhausted: bool,
-}
-
-impl SpanBudget {
-    /// `cap == usize::MAX` is [`raw_hits`]'s **uncapped** path: since the budget can never run
-    /// out, the bookkeeping set is pure waste — that path wants the full output anyway, and the
-    /// `agit share` / masking it serves never goes through this bound. So in that case the set is
-    /// not even built.
-    fn new(cap: usize) -> Self {
-        SpanBudget {
-            cap,
-            counted: (cap < usize::MAX).then(HashSet::new),
-            exhausted: false,
-        }
-    }
-
-    /// Charge a hit that has already passed every filter. Returns **whether scanning may
-    /// continue**.
-    ///
-    /// The moment it returns `false` it records [`Self::exhausted`]: what it holds right then is
-    /// a hit over the line, so "I stopped because of the budget" and "there really is an
-    /// unreported hit" are **one fact**, not an inference.
-    ///
-    /// Conversely, reaching exactly `cap` spans does **not** stop early: at that point whether
-    /// there is more behind is unknown. Scanning on until span `cap + 1` is actually met keeps
-    /// the flag honest — and the cost is bounded, since the first hit over the line stops it.
-    fn charge(&mut self, start: usize, end: usize) -> bool {
-        let Some(counted) = self.counted.as_mut() else {
-            return true; // Uncapped: nothing is charged and it never stops.
-        };
-        if counted.contains(&(start, end)) {
-            return true;
-        }
-        if counted.len() >= self.cap {
-            self.exhausted = true;
-            return false;
-        }
-        counted.insert((start, end));
-        true
-    }
-}
-
-/// The bounded version of [`raw_hits`]: stop once `cap` hits **that pass `keep`** are found.
-///
-/// # Why this bound has to live **in the engine**
-///
-/// Hits are a **function** of the input, not a subset of it: in text made of one repeated token
-/// the hit count is on the order of the length, and every `Raw` takes space of its own. Having
-/// the caller `truncate` the `Vec` afterwards achieves nothing — the allocation over the line
-/// already happened before `truncate` runs. Observed: 64 MiB of dense input produces about
-/// 3.2 million entries and about 600 MB, of which the report shows a few dozen.
-///
-/// So stopping has to happen **at the layer that pushes**, which is here.
-///
-/// # Why the filter is passed in too
-///
-/// What is counted has to be the hits that **will finally be reported**, not the raw ones. `keep`
-/// is the caller's post-filter (allowlist, inline pragma) moved forward into the loop: counting
-/// raw hits, an allowlist that swallows the first `cap` of them returns an empty list while a
-/// real hit sits right behind — a bound added purely to save memory flipping the verdict from
-/// dirty to clean. See [`scan_text_capped`].
-///
-/// `keep` receives **the matched span itself** and its start offset in the view, the same pair
-/// the post-filter looks at. Filtering before [`dedupe_same_span`] does not change the result:
-/// when two rules recognize the same characters, both have the same matched text and the same
-/// line, so filtering keeps both or drops both.
-///
-/// # Why it does not change the verdict
-///
-/// This bound presses on the **number** produced, not on "is there any": at `cap >= 1`, as long
-/// as the text holds any hit **not stopped by `keep`**, the returned list is non-empty and the
-/// caller's verdict (clean / dirty) is unchanged.
-///
-/// # The budget counts unique spans, not the `Raw`s produced
-///
-/// See [`SpanBudget`]: what is produced is `Raw`s and what is reported is the hits after
-/// [`dedupe_same_span`], which are not the same thing.
-///
-/// # The second return value: did it stop **because it reached `cap`**
-///
-/// The caller cannot infer that from "is my collector full" — the miss happens **inside a single
-/// carrier**, and the collector sees only the few hits handed to it. So this signal has to be
-/// passed explicitly out of the producing layer, all the way to
-/// [`HitCollector::mark_truncated`].
-fn raw_hits_capped(
-    text: &str,
-    cap: usize,
-    keep: impl FnMut(&str, usize) -> bool,
-) -> (Vec<Raw>, bool) {
-    raw_hits_capped_in(&view_of(text), cap, &entropy_exempt_regions(text), keep)
-}
-
-/// Context is read before escape normalization so literal contents cannot become code.
-/// These spans affect only bare entropy; credential fields and explicit detectors remain independent.
-fn entropy_exempt_regions(text: &str) -> Vec<(usize, usize)> {
-    let mut regions = media::regions(text);
-    regions.extend(paths::regions(text));
-    regions.extend(syntax::identifier_regions(text));
-    merge_regions(regions)
-}
-
-fn merge_regions(mut regions: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    regions.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in regions {
-        if let Some((_, last)) = merged.last_mut()
-            && start <= *last
-        {
-            *last = (*last).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    merged
-}
-
-fn raw_hits_capped_in(
-    view: &str,
-    cap: usize,
-    media: &[(usize, usize)],
-    mut keep: impl FnMut(&str, usize) -> bool,
-) -> (Vec<Raw>, bool) {
-    let mut out: Vec<Raw> = vec![];
-    if cap == 0 {
-        // No budget at all = not one byte was scanned, so this list cannot claim to be complete.
-        return (out, true);
-    }
-    let mut budget = SpanBudget::new(cap);
-    // The line text is only needed to decide `regexTarget = "line"`, so it is built on demand.
-    let mut lines: Option<Lines> = None;
-    let json_regions = std::cell::OnceCell::new();
-    'rules: for rule in rules::candidates(view) {
-        let Some(re) = rule.regex() else { continue };
-        if rule.has_groups() {
-            for caps in re.captures_iter(view) {
-                let whole = caps.get(0).expect("group 0 always exists");
-                let (s, e, secret) = rule.secret_span(&caps);
-                let line = lines
-                    .get_or_insert_with(|| Lines::new(view))
-                    .text_at(whole.start());
-                if !rule.accepts(secret, whole.as_str(), line) {
-                    continue;
-                }
-                if !keep(secret, s) {
-                    continue;
-                }
-                // The budget is gone and a reportable hit is right here: stop where it stands
-                // and leave both loops.
-                if !budget.charge(s, e) {
-                    break 'rules;
-                }
-                out.push(Raw {
-                    rule: rule.id.as_str(),
-                    start: s,
-                    end: e,
-                });
-            }
-        } else {
-            for m in re.find_iter(view) {
-                let line = lines
-                    .get_or_insert_with(|| Lines::new(view))
-                    .text_at(m.start());
-                let end = if rule.id == "agit-private-key-header" {
-                    let strings = json_regions.get_or_init(|| json_string_regions(view));
-                    let carrier_end = strings
-                        .iter()
-                        .find(|(start, end)| *start <= m.start() && m.end() <= *end)
-                        .map_or(view.len(), |(_, end)| *end);
-                    private_key_region_end(&view[..carrier_end], m.start(), m.end())
-                } else {
-                    m.end()
-                };
-                let secret = &view[m.start()..end];
-                if !rule.accepts(secret, secret, line) {
-                    continue;
-                }
-                if !keep(secret, m.start()) {
-                    continue;
-                }
-                if !budget.charge(m.start(), end) {
-                    break 'rules;
-                }
-                out.push(Raw {
-                    rule: rule.id.as_str(),
-                    start: m.start(),
-                    end,
-                });
-            }
-        }
-    }
-    for (start, end) in bare_candidate_spans(view) {
-        if media::contains(media, start, end) {
-            continue;
-        }
-        let secret = &view[start..end];
-        if rules::preset_allows(secret) || !keep(secret, start) {
-            continue;
-        }
-        if !budget.charge(start, end) {
-            break;
-        }
-        out.push(Raw {
-            rule: "high-entropy-value",
-            start,
-            end,
-        });
-    }
-    out.sort_by_key(|h| (h.start, h.end));
-    dedupe_same_span(&mut out);
-    (out, budget.exhausted)
-}
-
-/// Discover token-like values independently of provider rules or field names.
-fn bare_candidate_spans(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
-    entropy_candidate_spans(text, false)
-}
-
-fn entropy_candidate_spans(
-    text: &str,
-    credential_field: bool,
-) -> impl Iterator<Item = (usize, usize)> + '_ {
-    let bytes = text.as_bytes();
-    let locations = if credential_field {
-        Vec::new()
-    } else {
-        paths::regions(text)
-    };
-    let mut location = 0;
-    let mut start = 0;
-    std::iter::from_fn(move || {
-        while start < bytes.len() {
-            while location < locations.len() && locations[location].1 <= start {
-                location += 1;
-            }
-            if let Some(&(left, right)) = locations.get(location)
-                && left <= start
-            {
-                start = right;
-                continue;
-            }
-            if !is_token_byte(bytes[start]) {
-                start += 1;
-                continue;
-            }
-            let mut end = start + 1;
-            while end < bytes.len()
-                && is_token_byte(bytes[end])
-                && locations.get(location).is_none_or(|(left, _)| end < *left)
-            {
-                end += 1;
-            }
-            if !credential_field && end - start > MAX_BARE_ENTROPY_BYTES {
-                start = end;
-                continue;
-            }
-            let candidate = &text[start..end];
-            let hex_candidate = ["agit-", "sha1-", "sha256-"]
-                .iter()
-                .find_map(|prefix| candidate.strip_prefix(prefix))
-                .unwrap_or(candidate);
-            let is_hex = hex_candidate.bytes().any(|byte| byte.is_ascii_hexdigit())
-                && hex_candidate
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
-            let is_alpha = candidate.bytes().all(|byte| byte.is_ascii_alphabetic());
-            let has_separator = candidate.bytes().any(|byte| !byte.is_ascii_alphanumeric());
-            let min_len = if credential_field {
-                10
-            } else if is_hex {
-                32
-            } else if is_alpha {
-                24
-            } else {
-                20
-            };
-            let floor = if credential_field {
-                3.5
-            } else if is_hex {
-                3.2
-            } else if candidate.len() > 24 {
-                if has_separator { 4.45 } else { 4.3 }
-            } else if is_alpha {
-                3.8
-            } else if has_separator {
-                4.2
-            } else {
-                4.0
-            };
-            let mixed_alpha = candidate.bytes().any(|byte| byte.is_ascii_uppercase())
-                && candidate.bytes().any(|byte| byte.is_ascii_lowercase());
-            let has_digit = candidate.bytes().any(|byte| byte.is_ascii_digit());
-            if candidate.len() >= min_len
-                && rules::shannon(candidate) >= floor
-                && (mixed_alpha || has_digit || is_hex)
-                && !base64_media_payload(text, start)
-            {
-                let span = (start, end);
-                start = end;
-                return Some(span);
-            }
-            start = end;
-        }
-        None
-    })
-}
-
-fn is_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"_-+/=.!@#$%^&*?~".contains(&byte)
-}
-
-/// A private-key header opens a sensitive region until its matching footer or
-/// the end of the carrier. Incomplete captures retain the body as part of the
-/// finding, so replacing a header cannot erase the only evidence of sensitivity.
-fn private_key_region_end(text: &str, start: usize, header_end: usize) -> usize {
-    let header = &text[start..header_end];
-    let footer = header.replacen("-----BEGIN", "-----END", 1);
-    text[header_end..]
-        .find(&footer)
-        .map_or(text.len(), |offset| header_end + offset + footer.len())
-}
-
-/// Valid JSON delimiters belong to the carrier, outside its sensitive strings.
-/// Invalid input receives no structural exemption and remains ordinary text.
-fn json_string_regions(text: &str) -> Vec<(usize, usize)> {
-    if serde_json::from_str::<serde_json::Value>(text).is_err() {
-        return Vec::new();
-    }
-    let mut strings = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = text[cursor..].find('"') {
-        let start = cursor + relative;
-        let Some(end) = json_string_end(text.as_bytes(), start) else {
-            return Vec::new();
-        };
-        strings.push((start + 1, end - 1));
-        cursor = end;
-    }
-    strings
-}
-
-/// A raw detector span inside valid JSON identifies decoded bytes, including escaped newlines.
-/// Fragment boundaries must not cut an escape; an outer string's allowance cannot waive a span.
-fn semantic_match_value<'a>(
-    text: &'a str,
-    strings: &[(usize, usize)],
-    start: usize,
-    end: usize,
-) -> Option<std::borrow::Cow<'a, str>> {
-    let raw = text.get(start..end)?;
-    let index = strings.partition_point(|(s, _)| *s <= start);
-    let Some(&(string_start, string_end)) = index.checked_sub(1).and_then(|i| strings.get(i))
-    else {
-        return Some(raw.into());
-    };
-    if end > string_end {
-        return Some(raw.into());
-    }
-    let boundary = |offset: usize| {
-        let bytes = text.as_bytes();
-        for escape in offset.saturating_sub(5).max(string_start)..offset {
-            if bytes[escape] != b'\\' {
-                continue;
-            }
-            let mut preceding = escape;
-            while preceding > string_start && bytes[preceding - 1] == b'\\' {
-                preceding -= 1;
-            }
-            if (escape - preceding) % 2 != 0 {
-                continue;
-            }
-            let width = if bytes.get(escape + 1) == Some(&b'u') {
-                6
-            } else {
-                2
-            };
-            if escape + width > offset {
-                return false;
-            }
-        }
-        true
-    };
-    if !boundary(start) || !boundary(end) {
-        return None;
-    }
-    if !raw.contains('\\') {
-        return Some(raw.into());
-    }
-    serde_json::from_str::<String>(&format!("\"{raw}\""))
-        .ok()
-        .map(Into::into)
-}
-
-/// Selected fields retain their context through arrays, but nested object keys supply their own context.
-fn field_value_regions(text: &str, matches_field: fn(&str) -> bool) -> Vec<(usize, usize)> {
-    use serde_json::value::RawValue;
-
-    fn collect(
-        raw: &RawValue,
-        base: usize,
-        selected: bool,
-        matches_field: fn(&str) -> bool,
-        out: &mut Vec<(usize, usize)>,
-    ) {
-        match raw.get().as_bytes().first() {
-            Some(b'"') if selected => {
-                let start = raw.get().as_ptr() as usize - base;
-                out.push((start + 1, start + raw.get().len() - 1));
-            }
-            Some(b'{') => {
-                if let Ok(map) = serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()) {
-                    for (key, value) in map {
-                        collect(value, base, matches_field(&key), matches_field, out);
-                    }
-                }
-            }
-            Some(b'[') => {
-                if let Ok(values) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) {
-                    for value in values {
-                        collect(value, base, selected, matches_field, out);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut regions = Vec::new();
-    if let Ok(raw) = serde_json::from_str::<&RawValue>(text) {
-        collect(
-            raw,
-            text.as_ptr() as usize,
-            false,
-            matches_field,
-            &mut regions,
-        );
-    }
-    regions.sort_unstable();
-    regions
-}
-
-/// When two rules recognize the same characters, keep one.
-///
-/// In practice this is nearly always "`generic-api-key` colliding with a specialized rule" —
-/// `token: npm_…` matches both the generic assignment and the npm token. Reporting it twice is
-/// not wrong, but the report has a budget (push prints only the first twenty lines), and letting
-/// one leak take two lines pushes another leak off the screen. So the more specific rule is the
-/// one kept: `generic-api-key` is the only catch-all in the rule set, and whatever it says
-/// another rule says more precisely.
-fn dedupe_same_span(hits: &mut Vec<Raw>) {
-    const CATCH_ALL: &str = "generic-api-key";
-    let mut i = 0;
-    while i < hits.len() {
-        let mut j = i + 1;
-        while j < hits.len() && hits[j].start == hits[i].start && hits[j].end == hits[i].end {
-            j += 1;
-        }
-        if j - i > 1 {
-            // Within a group prefer a rule that is not the catch-all; if all are, keep the
-            // first.
-            let keep = (i..j).find(|&k| hits[k].rule != CATCH_ALL).unwrap_or(i);
-            hits.swap(i, keep);
-            hits.drain(i + 1..j);
-        }
-        i += 1;
-    }
-}
+pub use crate::domain::privacy::detector::view_of;
+use crate::domain::privacy::detector::{
+    Lines, Span as Raw, entropy_candidate_spans, entropy_exempt_regions, field_value_regions,
+    json_string_end, json_string_regions, merge_regions, raw_hits, raw_hits_capped_in,
+    semantic_match_value,
+};
 
 pub fn scan_text(text: &str, allowlist: &HashSet<String>) -> Vec<Hit> {
     scan_text_with(text, allowlist, Policy::CLIENT)
@@ -1440,7 +731,7 @@ pub fn scan_text_with(text: &str, allowlist: &HashSet<String>, policy: Policy) -
 /// body) into a complete `Vec<Hit>` before handing it to the collector. Capping the final list
 /// does not stop that stretch: a large file matching on every line still produces `Raw`s / `Hit`s
 /// on the order of its line count before `extend` takes over, each carrying its own `String`. So
-/// stopping has to happen at the producing layer, see [`raw_hits_capped`].
+/// stopping has to happen at the producing layer, see [`crate::domain::privacy::detector::raw_hits_capped`].
 ///
 /// # Why the filter moved into the producing loop
 ///
@@ -1465,7 +756,7 @@ pub fn scan_text_with(text: &str, allowlist: &HashSet<String>, policy: Policy) -
 /// The same characters recognized by two rules (`token: npm_…` → `generic-api-key` +
 /// `npm-access-token`) dedupe into **one**. Counting `Raw`s makes it eat two slots, so at
 /// `cap = 2` the budget is exhausted on the spot and the other kind of secret behind it is never
-/// scanned. See [`SpanBudget`].
+/// scanned. See the detector budget.
 ///
 /// # Why it returns a [`ScanReport`] and not a `Vec<Hit>`
 ///
@@ -1603,8 +894,8 @@ fn scan_semantic_strings(
                     let remaining = cap.saturating_sub(report.hits.len());
                     let mut record = |found: &str, start: usize| {
                         let value = &decoded[start..start + found.len()];
-                        !(policy.allowlist && is_allowlisted(value, allowlist))
-                            && !repository_policy::allows(repository_identities, value)
+                        !(policy.allowlist && is_allowlisted(value, allowlist)
+                            || repository_policy::allows(repository_identities, value))
                             && seen.insert((line, fingerprint(found)))
                     };
                     let media = if media::contains(&media, start, end)
@@ -2011,39 +1302,7 @@ impl CandidateBatch {
     }
 }
 
-/// Consecutive plaintext lines share a carrier so multiline sensitive regions
-/// are discovered and projected with identical boundaries.
-pub(crate) fn jsonl_chunks(
-    mut text: &str,
-) -> impl Iterator<Item = (&str, Option<serde_json::Value>)> {
-    let mut document = text
-        .contains('\n')
-        .then(|| serde_json::from_str(text).ok())
-        .flatten();
-    std::iter::from_fn(move || {
-        if let Some(value) = document.take() {
-            let chunk = text;
-            text = "";
-            return Some((chunk, Some(value)));
-        }
-        let mut lines = text.split_inclusive('\n');
-        let first = lines.next()?;
-        if let Ok(value) = serde_json::from_str(first) {
-            text = &text[first.len()..];
-            return Some((first, Some(value)));
-        }
-        let mut end = first.len();
-        for line in lines {
-            if serde_json::from_str::<serde_json::Value>(line).is_ok() {
-                break;
-            }
-            end += line.len();
-        }
-        let (chunk, remaining) = text.split_at(end);
-        text = remaining;
-        Some((chunk, None))
-    })
-}
+pub(crate) use crate::domain::privacy::detector::jsonl_chunks;
 
 /// Mask hashes in typed Git object headers only after resolving each reference
 /// in the repository. Arbitrary hash-shaped text stays part of the scan.
@@ -3861,23 +3120,6 @@ fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
 
 /// Return one past the end of a JSON string token. serde validates escape legality; this only
 /// locates the boundary.
-fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start) != Some(&b'\"') {
-        return None;
-    }
-    let mut i = start + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i = i.checked_add(2)?,
-            b'\"' => return Some(i + 1),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-/// Return one past the end of a JSON value token; nested values inside an envelope's `content`
-/// are supported.
 fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
     match *bytes.get(start)? {
         b'\"' => json_string_end(bytes, start),
@@ -4166,7 +3408,15 @@ fn scan_agent_repo_selected_inner(
             unscanned.record_unsupported(format!("unreadable working-tree file {rel}"));
             continue;
         };
-        if size > plan.limits.max_object_bytes && !is_lfs_worktree_file(repo, &rel)? {
+        if is_lfs_worktree_file(repo, &rel)? {
+            continue;
+        }
+        if size > plan.limits.max_object_bytes {
+            // Booked in **the working tree's own ledger**: the handle here is a path, not an
+            // oid (see [`Unscanned`]). A file over the line is not read at all, so not one of
+            // its bytes belongs in the cumulative budget — it is booked separately in
+            // `oversized_files` and must not eat the total (the same rule by which
+            // [`estimate_object_bytes`] skips objects over the line).
             unscanned.oversized_files.push((rel, size));
             continue;
         }
@@ -4174,81 +3424,53 @@ fn scan_agent_repo_selected_inner(
             unscanned.over_budget = Some((spent.saturating_add(size), plan.limits.budget_bytes));
             break;
         }
-        let mut remaining = plan.limits.budget_bytes - spent;
-        let inspected = std::fs::File::open(entry.path())
-            .map_err(anyhow::Error::from)
-            .and_then(|input| {
-                crate::domain::lfs::inspection::read(
-                    input,
-                    size,
-                    None,
-                    plan.limits.max_object_bytes,
-                    &mut remaining,
-                )
-            });
-        spent = plan.limits.budget_bytes - remaining;
-        let text = match inspected {
-            Ok(crate::domain::lfs::inspection::Payload::Text(text)) => text,
-            Ok(crate::domain::lfs::inspection::Payload::Binary) => {
-                out.binary_carriers += 1;
-                continue;
-            }
-            Ok(crate::domain::lfs::inspection::Payload::TooLarge) => {
-                unscanned.oversized_files.push((rel, size));
-                continue;
-            }
+        spent += size;
+        let text = match std::fs::read(entry.path()) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    out.binary_carriers += 1;
+                    continue;
+                }
+            },
             Err(_) => {
                 unscanned.record_unsupported(format!("working-tree file {rel}"));
                 continue;
             }
         };
-        let payload = inspect_lfs_text(
-            repo,
-            text.as_bytes(),
-            plan.limits.max_object_bytes,
-            &mut remaining,
-        )?;
-        spent = plan.limits.budget_bytes - remaining;
-        if matches!(
-            payload,
-            Some(crate::domain::lfs::inspection::Payload::Binary)
-        ) {
-            out.binary_carriers += 1;
-        }
-        if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = payload {
-            let pointer = crate::domain::lfs::Pointer::parse(text.as_bytes())?.unwrap();
-            unscanned.oversized_files.push((rel, pointer.size));
+        if crate::domain::lfs::Pointer::parse(text.as_bytes())
+            .ok()
+            .flatten()
+            .is_some()
+        {
             continue;
         }
-        let decoded = match &payload {
-            Some(crate::domain::lfs::inspection::Payload::Text(text)) => Some(text.as_str()),
-            _ => None,
-        };
-        for text in std::iter::once(text.as_str()).chain(decoded) {
+        {
             // The bound is **how much the collector can still take**: a large file matching on every
             // line materializes `Hit`s on the order of its line count before `extend` takes over, and
             // capping the final list does not stop that stretch. See [`scan_text_capped`].
             let cap = out.remaining();
-            let scanned =
-                if let Some(view) = protocol_payload_view(repo, text, &rel, &worktree_identities) {
-                    scan_text_capped_registered_views(
-                        text,
-                        &view,
-                        &allowlist,
-                        Policy::CLIENT,
-                        cap,
-                        &registered,
-                    )
-                } else {
-                    scan_repository_payload_capped(
-                        text,
-                        &allowlist,
-                        &worktree_identities,
-                        Policy::CLIENT,
-                        cap,
-                        &registered,
-                    )
-                };
+            let scanned = if let Some(view) =
+                protocol_payload_view(repo, &text, &rel, &worktree_identities)
+            {
+                scan_text_capped_registered_views(
+                    &text,
+                    &view,
+                    &allowlist,
+                    Policy::CLIENT,
+                    cap,
+                    &registered,
+                )
+            } else {
+                scan_repository_payload_capped(
+                    &text,
+                    &allowlist,
+                    &worktree_identities,
+                    Policy::CLIENT,
+                    cap,
+                    &registered,
+                )
+            };
             // This file's own budget ran out: it holds hits that were never scanned. Completeness is
             // stated by the side that knows.
             if scanned.truncated {
@@ -4288,19 +3510,6 @@ fn scan_agent_repo_selected_inner(
 fn is_lfs_worktree_file(repo: &crate::domain::repo::Repo, path: &str) -> crate::Result<bool> {
     let output = repo.git_bytes_result(&["check-attr", "-z", "filter", "--", path])?;
     Ok(output.split(|byte| *byte == 0).nth(2) == Some(b"lfs".as_slice()))
-}
-
-fn inspect_lfs_text(
-    repo: &crate::domain::repo::Repo,
-    bytes: &[u8],
-    text_limit: u64,
-    remaining: &mut u64,
-) -> crate::Result<Option<crate::domain::lfs::inspection::Payload>> {
-    crate::domain::lfs::Pointer::parse(bytes)?
-        .map(|pointer| {
-            crate::domain::lfs::inspection::cached(repo, &pointer, text_limit, remaining)
-        })
-        .transpose()
 }
 
 /// The whole block of the scan surface that **does not vary with the working tree**: reachable
@@ -4365,7 +3574,6 @@ fn scan_publish_objects(
         allowlist,
         registered,
         trusted_identities,
-        lfs_remaining: std::cell::Cell::new(plan.limits.budget_bytes - estimate),
         prepared_binary: None,
         #[cfg(feature = "cli")]
         prepared_remaining: None,
@@ -4471,15 +3679,7 @@ fn estimate_object_bytes(
         // [`crate::domain::repo::Repo::git_cat_file_batch_check`]), so the index is "which
         // enumeration record this answer belongs to".
         let mut at = 0usize;
-        let expected = history.is_snapshot().then(|| oids.clone());
-        repo.git_cat_file_batch_check(oids, |oid, kind, size| {
-            if let Some(expected) = &expected {
-                anyhow::ensure!(
-                    expected.get(at).is_some_and(|item| item == oid)
-                        && matches!(kind, "blob" | "tree" | "commit" | "tag"),
-                    "prepared object estimate contains an invalid response"
-                );
-            }
+        repo.git_cat_file_batch_check(oids, |_oid, kind, size| {
             let payload = has_path.get(at).copied().unwrap_or(false);
             at += 1;
             // The ones whose bodies get read: commits ([`scan_messages`]), tags
@@ -4491,12 +3691,6 @@ fn estimate_object_bytes(
             }
             Ok(())
         })?;
-        if let Some(expected) = &expected {
-            anyhow::ensure!(
-                at == expected.len(),
-                "prepared object estimate is incomplete"
-            );
-        }
         Ok(())
     };
 
@@ -4779,7 +3973,6 @@ struct BlobScanContext<'a> {
     allowlist: &'a HashSet<String>,
     registered: &'a RegisteredMatcher,
     trusted_identities: &'a TrustedEnvelopeIdentities,
-    lfs_remaining: std::cell::Cell<u64>,
     prepared_binary: Option<&'a std::cell::Cell<u64>>,
     #[cfg(feature = "cli")]
     prepared_remaining: Option<&'a std::cell::Cell<u64>>,
@@ -4854,37 +4047,20 @@ fn scan_blob_batch(
                 publication::scan_blob_payload(context, oid, payload, label, binary, out)?;
                 return Ok(());
             }
-            let mut remaining = context.lfs_remaining.get();
-            let inspected = inspect_lfs_text(
-                context.repo,
-                payload,
-                context.limits.max_object_bytes,
-                &mut remaining,
-            )?;
-            context.lfs_remaining.set(remaining);
-            if matches!(
-                inspected,
-                Some(crate::domain::lfs::inspection::Payload::Binary)
-            ) {
-                out.binary_carriers += 1;
-            }
-            if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = inspected {
-                let pointer = crate::domain::lfs::Pointer::parse(payload)?.unwrap();
-                unscanned
-                    .oversized
-                    .push((format!("lfs:{}", pointer.oid), pointer.size));
+            if crate::domain::lfs::Pointer::parse(payload)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return Ok(());
             }
-            let decoded = match &inspected {
-                Some(crate::domain::lfs::inspection::Payload::Text(text)) => Some(text.as_str()),
-                _ => None,
-            };
-            // Binary artifacts share the audit and LFS publication policy; their coverage is reported.
+            // Non-UTF-8 (binary) is skipped, the same test as `read_to_string` on the
+            // working-tree path.
             let Ok(text) = std::str::from_utf8(payload) else {
                 out.binary_carriers += 1;
                 return Ok(());
             };
-            for text in std::iter::once(text).chain(decoded) {
+            {
                 // The bound is **how much the collector can still take**, for the same reason as the
                 // working-tree path.
                 let cap = out.remaining();
@@ -5154,41 +4330,15 @@ enum HistorySelection<'a> {
     Revisions(&'a [&'a str]),
     // Frozen roots are validated full object ids, so stdin cannot introduce revision options.
     Frozen(&'a [String]),
-    #[cfg(feature = "cli")]
-    Snapshots(&'a [String]),
-    #[cfg(feature = "cli")]
-    Incremental(&'a [String], &'a std::collections::BTreeSet<String>),
 }
 
 impl HistorySelection<'_> {
-    fn is_snapshot(self) -> bool {
-        #[cfg(feature = "cli")]
-        if matches!(self, Self::Snapshots(_) | Self::Incremental(_, _)) {
-            return true;
-        }
-        false
-    }
-
     fn stream(
         self,
         repo: &crate::domain::repo::Repo,
         arguments: &[&str],
         on_record: impl FnMut(&[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        #[cfg(feature = "cli")]
-        if let Self::Incremental(roots, excluded) = self {
-            if roots.is_empty() {
-                return Ok(());
-            }
-            let mut on_record = on_record;
-            return Self::Snapshots(roots).stream_inner(repo, arguments, |record| {
-                let oid = record.split(|byte| *byte == b' ').next().unwrap_or(record);
-                if !excluded.contains(std::str::from_utf8(oid)?) {
-                    on_record(record)?;
-                }
-                Ok(())
-            });
-        }
         self.stream_inner(repo, arguments, on_record)
     }
 
@@ -5199,23 +4349,11 @@ impl HistorySelection<'_> {
         on_record: impl FnMut(&[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
         let mut arguments = arguments.to_vec();
-        #[cfg(feature = "cli")]
-        let selection = if let Self::Snapshots(roots) = self {
-            arguments.push("--no-walk");
-            Self::Frozen(roots)
-        } else {
-            self
-        };
-        #[cfg(not(feature = "cli"))]
         let selection = self;
         match selection {
             Self::Revisions(revisions) => {
                 arguments.extend_from_slice(revisions);
                 repo.git_stream_split(&arguments, b'\n', on_record)
-            }
-            #[cfg(feature = "cli")]
-            Self::Snapshots(_) | Self::Incremental(_, _) => {
-                unreachable!("snapshots are normalized before streaming")
             }
             Self::Frozen(roots) => {
                 use std::io::{Seek, Write};
@@ -5453,9 +4591,6 @@ fn scan_messages(
                 match history {
                     HistorySelection::Revisions(revisions) => revisions.join(" "),
                     HistorySelection::Frozen(_) => "frozen publication roots".into(),
-                    #[cfg(feature = "cli")]
-                    HistorySelection::Snapshots(_) | HistorySelection::Incremental(_, _) =>
-                        "captured publication snapshots".into(),
                 }
             )
         })?;
@@ -5533,10 +4668,7 @@ fn scan_messages(
             "git cat-file cannot read the commit bodies on {}, so the history cannot be confirmed clean: {e}",
             match history {
                 HistorySelection::Revisions(revisions) => revisions.join(" "),
-                HistorySelection::Frozen(_) => "frozen publication roots".into(),
-                    #[cfg(feature = "cli")]
-                    HistorySelection::Snapshots(_) | HistorySelection::Incremental(_, _) => "captured publication snapshots".into(),
-            }
+                HistorySelection::Frozen(_) => "frozen publication roots".into(),}
         )
     })
 }
@@ -5559,36 +4691,6 @@ pub(crate) fn scrub_in(text: &str, credential_field: bool) -> (String, usize) {
         writer.add(hit);
     }
     writer.finish()
-}
-
-#[cfg(feature = "secret-vault")]
-pub(crate) fn scrub_registered(
-    text: &str,
-    registered: &RegisteredMatcher,
-    credential_field: bool,
-) -> (String, usize, Vec<String>) {
-    let mut raw = raw_hits(text, credential_field).into_iter().peekable();
-    let mut writer = RedactionWriter::new(text);
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    registered.visit_matches(text, |start, end, id| {
-        while raw.peek().is_some_and(|hit| hit.start <= start) {
-            writer.add(raw.next().unwrap());
-        }
-        writer.add(Raw {
-            rule: "registered-secret",
-            start,
-            end,
-        });
-        if seen.insert(id.to_string()) {
-            ids.push(id.to_string());
-        }
-    });
-    for hit in raw {
-        writer.add(hit);
-    }
-    let (text, count) = writer.finish();
-    (text, count, ids)
 }
 
 struct RedactionWriter<'a> {
@@ -6131,194 +5233,6 @@ mod tests {
     const INTERNAL_HEX: &str = "9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb3";
     const UNTRUSTED_HEX: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// Working-tree and history inspections each count a binary payload once, including LFS indirection.
-    #[cfg(feature = "cli")]
-    #[test]
-    fn binary_carrier_counts_do_not_double_count_ordinary_blobs() {
-        use crate::domain::{lfs, repo::Repo};
-        use sha2::{Digest, Sha256};
-
-        for indirect in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let repo = Repo::init(directory.path()).unwrap();
-            let bytes = b"artifact\x00\xff";
-            let contents = if indirect {
-                if let Err(error) = lfs::local::require_client(&repo) {
-                    assert!(
-                        std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
-                        "{error:#}"
-                    );
-                    continue;
-                }
-                let pointer = lfs::Pointer {
-                    oid: hex::encode(Sha256::digest(bytes)),
-                    size: bytes.len() as u64,
-                };
-                let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
-                std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-                std::fs::write(cache, bytes).unwrap();
-                format!(
-                    "version {}\noid sha256:{}\nsize {}\n",
-                    lfs::VERSION,
-                    pointer.oid,
-                    pointer.size
-                )
-                .into_bytes()
-            } else {
-                bytes.to_vec()
-            };
-            std::fs::write(repo.root().join("artifact.bin"), contents).unwrap();
-            repo.add_all().unwrap();
-            repo.commit("record artifact").unwrap();
-            let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
-            assert!(report.hits.is_empty());
-            assert!(report.unscanned.is_empty());
-            assert_eq!(report.binary_carriers, 2, "LFS indirection: {indirect}");
-        }
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn lfs_scanning_reads_historical_payloads_and_refuses_missing_or_corrupt_content() {
-        use crate::domain::{lfs, repo::Repo};
-        use sha2::{Digest, Sha256};
-        let directory = tempfile::tempdir().unwrap();
-        let repo = Repo::init(directory.path()).unwrap();
-        if let Err(error) = lfs::local::require_client(&repo) {
-            assert!(
-                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
-                "{error:#}"
-            );
-            return;
-        }
-        let payload = format!("access_token = {GHP}\n");
-        let pointer = lfs::Pointer {
-            oid: hex::encode(Sha256::digest(payload.as_bytes())),
-            size: payload.len() as u64,
-        };
-        let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
-        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-        std::fs::write(&cache, &payload).unwrap();
-        let encoded = format!(
-            "version {}\noid sha256:{}\nsize {}\n",
-            lfs::VERSION,
-            pointer.oid,
-            pointer.size
-        );
-        std::fs::write(repo.root().join("report.txt"), &encoded).unwrap();
-        repo.add_all().unwrap();
-        repo.commit("record artifact").unwrap();
-        std::fs::write(repo.root().join("report.txt"), b"safe working content\n").unwrap();
-        let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
-        assert!(
-            report
-                .hits
-                .iter()
-                .any(|hit| hit.source == Source::BlobObject
-                    && hit
-                        .file
-                        .as_deref()
-                        .is_some_and(|path| path.ends_with("/report.txt"))),
-            "hits: {:?}, unread: {:?}",
-            report.hits,
-            report.unscanned
-        );
-        std::fs::remove_file(&cache).unwrap();
-        assert!(scan_agent_repo(&repo, &ScanPlan::full()).is_err());
-        std::fs::write(&cache, vec![0xff; payload.len()]).unwrap();
-        assert!(scan_agent_repo(&repo, &ScanPlan::full()).is_err());
-        std::fs::write(&cache, &payload).unwrap();
-        std::fs::write(repo.root().join("report.txt"), encoded).unwrap();
-        let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
-        assert!(
-            report
-                .hits
-                .iter()
-                .any(|hit| hit.file.as_deref() == Some("report.txt")),
-            "hits: {:?}, unread: {:?}",
-            report.hits,
-            report.unscanned
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn lfs_binary_scans_remain_bounded_and_oversized_text_remains_unscanned() {
-        use crate::domain::{lfs, repo::Repo};
-        use sha2::{Digest, Sha256};
-        let directory = tempfile::tempdir().unwrap();
-        let repo = Repo::init(directory.path()).unwrap();
-        if let Err(error) = lfs::local::require_client(&repo) {
-            assert!(
-                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
-                "{error:#}"
-            );
-            return;
-        }
-        let mut plan = ScanPlan::full();
-        plan.limits.max_object_bytes = 8192;
-        for (name, bytes) in [
-            ("video.bin", vec![0xff; 128 * 1024]),
-            ("report.txt", vec![b'x'; 128 * 1024]),
-        ] {
-            let pointer = lfs::Pointer {
-                oid: hex::encode(Sha256::digest(&bytes)),
-                size: bytes.len() as u64,
-            };
-            let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
-            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-            std::fs::write(&cache, &bytes).unwrap();
-            let encoded = format!(
-                "version {}\noid sha256:{}\nsize {}\n",
-                lfs::VERSION,
-                pointer.oid,
-                pointer.size
-            );
-            std::fs::write(repo.root().join(name), encoded).unwrap();
-            repo.add_all().unwrap();
-            repo.commit("record artifact").unwrap();
-            std::fs::write(
-                repo.root().join(".gitattributes"),
-                format!("{name} filter=lfs\n"),
-            )
-            .unwrap();
-            std::fs::write(repo.root().join(name), bytes).unwrap();
-            let report = scan_agent_repo(&repo, &plan).unwrap();
-            if name == "video.bin" {
-                assert!(
-                    report.binary_carriers > 0 && report.unscanned.is_empty(),
-                    "hits: {:?}, unread: {:?}",
-                    report.hits,
-                    report.unscanned
-                );
-                let mut tight = plan.clone();
-                tight.limits.budget_bytes = pointer.size - 1;
-                assert!(
-                    scan_agent_repo(&repo, &tight)
-                        .unwrap()
-                        .unscanned
-                        .over_budget
-                        .is_some()
-                );
-            } else {
-                assert!(
-                    !report.unscanned.oversized.is_empty(),
-                    "hits: {:?}, unread: {:?}",
-                    report.hits,
-                    report.unscanned
-                );
-                assert!(
-                    !report.unscanned.oversized_files.is_empty(),
-                    "hits: {:?}, unread: {:?}",
-                    report.hits,
-                    report.unscanned
-                );
-            }
-            std::fs::remove_file(repo.root().join(name)).unwrap();
-            std::fs::remove_file(repo.root().join(".gitattributes")).unwrap();
-        }
-    }
-
     fn agent_envelope(content: serde_json::Value) -> crate::domain::transcript::Envelope {
         crate::domain::transcript::Envelope {
             source: "codex".into(),
@@ -6589,7 +5503,7 @@ mod tests {
     /// # What this pins
     ///
     /// `token: npm_…` is recognized once by `generic-api-key` and once by `npm-access-token` on
-    /// **the same span**, and after [`dedupe_same_span`] only one remains. Were the budget to
+    /// **the same span**, and after span deduplication only one remains. Were the budget to
     /// count `Raw`s, that one hit would eat two slots: at `cap = 2` the budget is exhausted on the
     /// spot, dedupe leaves one reportable hit, and the **other kind** of secret behind it is never
     /// scanned — while the collector is not full and the report still calls itself complete.

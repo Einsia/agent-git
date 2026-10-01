@@ -42,7 +42,6 @@ pub(super) struct PreparedSpawn {
     pub(super) notes: mpsc::Sender<SessionNote>,
     pub(super) confinement: watch::Receiver<crate::rc::Confinement>,
     pub(super) settlement: watch::Receiver<SettlementState>,
-    pub(super) secret_filter: crate::domain::secret_filter::MatcherHandle,
     pub(super) prompt: Option<String>,
     pub(super) attribution: MessageAttribution,
 }
@@ -411,7 +410,6 @@ impl PreparedSpawn {
         let mut session = Session::launch(
             self.info.clone(), self.spec.clone(), out, self.notes.clone(),
             self.confinement.clone(), self.settlement.clone(), self.generation,
-            self.secret_filter.clone(),
         ).await.map_err(|failure| {
             if self.spec.resume_from.is_some() && failure.is_external_writer() {
                 return SpawnFailure {

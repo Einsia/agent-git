@@ -6,7 +6,6 @@ use crate::domain::repo::{
     Repo,
     publication::{InspectionScope, PublicationPlan},
 };
-use crate::domain::secrets::publication::{CapturedPolicy, InspectionFailure};
 use crate::hub::git::StagedLfsPayloads;
 use crate::hub::identity::RemoteIdentity;
 use anyhow::{Context, Result, ensure};
@@ -17,7 +16,6 @@ pub(super) struct GitContent {
     pub(super) directory: tempfile::TempDir,
     pub(super) format: String,
     pub(super) lfs_objects: std::result::Result<PathBuf, super::lfs_cache::Failure>,
-    pub(super) inspection_policy: std::result::Result<CapturedPolicy, InspectionFailure>,
     pub(super) plan: PublicationPlan,
     pub(super) scope: InspectionScope,
     pub(super) baseline: Option<(String, RemoteIdentity)>,
@@ -72,7 +70,6 @@ impl GitContent {
             "publication object store is not a directory"
         );
         let lfs_objects = super::lfs_cache::capture(source);
-        let inspection_policy = Self::capture_policy(source);
         let directory = private_git_directory(&format)?;
         write_alternate(directory.path(), &objects)?;
         let isolated = Repo::at(directory.path()).exact_bare_root_inspection();
@@ -94,24 +91,11 @@ impl GitContent {
             directory,
             format,
             lfs_objects,
-            inspection_policy,
             plan: plan.clone(),
             scope,
             baseline,
             lfs_inventory,
         })
-    }
-
-    fn capture_policy(source: &Source) -> std::result::Result<CapturedPolicy, InspectionFailure> {
-        let common = source
-            .text(&["rev-parse", "--git-common-dir"])
-            .map_err(|_| InspectionFailure::LocalState)?;
-        let common =
-            absolute_path(&source.root, &common).map_err(|_| InspectionFailure::LocalState)?;
-        let common = common
-            .canonicalize()
-            .map_err(|_| InspectionFailure::LocalState)?;
-        CapturedPolicy::capture(&common)
     }
 
     fn attach(&self, source: &Source) -> Result<()> {
@@ -195,26 +179,7 @@ pub struct CapturedPublication {
 }
 
 impl CapturedPublication {
-    /// Source allowances cannot authorize disclosure to a separately selected repository.
-    pub fn with_copy_policy(
-        mut self,
-        policy_repo: &Repo,
-        identities: std::collections::HashSet<String>,
-    ) -> Result<Self> {
-        self.git.inspection_policy = self.git.inspection_policy.and_then(|policy| {
-            policy
-                .for_copy(
-                    &policy_repo
-                        .common_dir()
-                        .map_err(|_| InspectionFailure::LocalState)?,
-                    identities,
-                )
-                .map_err(|_| InspectionFailure::LocalState)
-        });
-        Ok(self)
-    }
-
-    /// Projected objects retain the source repository's registered-secret inspection policy.
+    /// Capture generated objects independently of local privacy storage.
     pub fn capture_projected(
         projected: &crate::domain::privacy_git::ProjectedHistory,
         byte_budget: u64,
@@ -229,19 +194,14 @@ impl CapturedPublication {
         policy_repo: &Repo,
         target: Option<(&str, &RemoteIdentity)>,
     ) -> Result<Self> {
-        let mut captured = Self::capture_inner(
+        let _ = policy_repo;
+        Self::capture_inner(
             projected.repo(),
             projected.plan(),
             byte_budget,
             false,
             target,
-        )?;
-        captured.git.inspection_policy =
-            CapturedPolicy::capture(&policy_repo.common_dir()?).map(|mut policy| {
-                policy.privacy_views = projected.inspection_views().clone();
-                policy
-            });
-        Ok(captured)
+        )
     }
 
     /// Capture full selected history and stage every LFS pointer before contacting a destination.
@@ -391,11 +351,10 @@ impl CapturedPublication {
         self.plan().verify_captured(repo)
     }
 
-    pub(super) fn refresh_policy(mut self, repo: &Repo) -> Result<Self> {
+    pub(super) fn refresh_source(self, repo: &Repo) -> Result<Self> {
         self.verify_source(repo)?;
         let source = Source::at(repo, self.source.environment.clone())?;
         self.git.attach(&source)?;
-        self.git.inspection_policy = GitContent::capture_policy(&source);
         Ok(self)
     }
 

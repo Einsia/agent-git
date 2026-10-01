@@ -1,7 +1,7 @@
 //! Quiet remote commands retain data and authority while suppressing their own routine notices.
 
-#[path = "support/privacy_policy_sources.rs"]
-mod privacy_policy_sources;
+#[path = "support/publication_identity.rs"]
+mod publication_identity;
 
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -81,11 +81,12 @@ impl Hub {
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let request = read_request(&mut socket);
-                if request.method == "GET"
-                    && request.path == "/api/cli/version"
-                    && replies
-                        .front()
-                        .is_none_or(|reply| reply.path != "/api/cli/version")
+                if request.path.starts_with("/api/me/privacy/")
+                    || (request.method == "GET"
+                        && request.path == "/api/cli/version"
+                        && replies
+                            .front()
+                            .is_none_or(|reply| reply.path != "/api/cli/version"))
                 {
                     write!(
                         socket,
@@ -96,7 +97,7 @@ impl Hub {
                 }
                 if !replies.front().is_some_and(|reply| {
                     reply.method == request.method && reply.path == request.path
-                }) && let Some((status, body)) = privacy_policy_sources::route(
+                }) && let Some((status, body)) = publication_identity::route(
                     &response_hub,
                     "me",
                     &request.method,

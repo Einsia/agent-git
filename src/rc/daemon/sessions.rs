@@ -1219,7 +1219,6 @@ impl Daemon {
             notes: self.notes.clone(),
             confinement,
             settlement: self.settlement.subscribe(),
-            secret_filter: self.secret_filter.clone(),
             local_owner: self.opts.local_owner,
             prompt,
             attribution,

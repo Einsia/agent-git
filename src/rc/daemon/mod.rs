@@ -1107,7 +1107,7 @@ pub struct Daemon {
     online: bool,
     /// Shared by every live session; a control socket reload builds the replacement in full and
     /// swaps it in at once.
-    secret_filter: crate::domain::secret_filter::MatcherHandle,
+
     /// Live authorization for RC repository settlement. See
     /// [`SettlementState`]; every transition invalidates the previous epoch.
     settlement: tokio::sync::watch::Sender<SettlementState>,

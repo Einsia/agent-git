@@ -152,6 +152,9 @@ pub struct Args {
 /// Read-only clone (does not bind the current directory).
 pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     let client = crate::hub::Client::from_env();
+    if client.has_token() {
+        crate::domain::privacy::service::schedule_sync(client.base());
+    }
     let a = super::remote_request(client.get_agent(owner, name))?;
     let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
     let dest = config::repo_dir(owner, name)?;
@@ -273,6 +276,9 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         )?;
     }
     let client = crate::hub::Client::from_env();
+    if client.has_token() {
+        crate::domain::privacy::service::schedule_sync(client.base());
+    }
     let s = ui::theme::symbols();
 
     if args.name.is_some() && !args.mine {
@@ -1191,12 +1197,6 @@ fn relocate_promoted_checkout(
         );
     }
 
-    crate::domain::secret_filter::RepositoryDictionary::open(checkout)?.reset_policy_for_copy(
-        &crate::domain::secret_filter::DeclarationTarget {
-            hub: source_identity.hub.clone(),
-            repository_id: source_identity.agent_id.clone(),
-        },
-    )?;
     preserve_source_tracking(
         repo,
         repo.remote_is(crate::domain::repo::ORIGIN, &source.clone_url),
@@ -1411,9 +1411,21 @@ pub fn view_text_for_install(repo_root: &Path) -> crate::Result<String> {
             meta::VIEW_FILE
         ));
     }
-    let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo_root)?
-        .hydrate_jsonl(&text)?;
-    Ok(hydrated.text)
+    let hydrated = crate::domain::privacy::service::transform(
+        Some(repo_root),
+        &text,
+        crate::domain::privacy::projector::Mode::HydrateJsonl,
+    );
+    if hydrated.unresolved > 0 {
+        ui::warning(&format!(
+            "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",
+            hydrated.unresolved
+        ));
+        ui::hint(
+            "encrypted dictionaries sync independently; unavailable mappings can be retried after signing in",
+        );
+    }
+    Ok(hydrated.content)
 }
 
 /// The path of an agent on this machine (reused by `agit log --agent` and friends).

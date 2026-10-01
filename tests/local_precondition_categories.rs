@@ -1180,44 +1180,8 @@ fn secret_add_command(lab: &Lab, mode: &str, block: bool, name: &str, secret: &s
     command
 }
 
-struct OwnedSecretVault {
-    path: PathBuf,
-    restore: Option<Vec<u8>>,
-}
-
-impl OwnedSecretVault {
-    fn corrupt(&mut self) {
-        self.restore = Some(fs::read(&self.path).unwrap());
-        fs::write(&self.path, b"{").unwrap();
-    }
-
-    fn restore(&mut self) {
-        if let Some(bytes) = self.restore.take() {
-            fs::write(&self.path, bytes).unwrap();
-        }
-    }
-}
-
-impl Drop for OwnedSecretVault {
-    fn drop(&mut self) {
-        if let Some(bytes) = self.restore.take() {
-            let _ = fs::write(&self.path, bytes);
-        }
-        #[cfg(windows)]
-        {
-            use agit::domain::secret_filter::KeyStore;
-            if let Ok(bytes) = fs::read(&self.path)
-                && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                && let Some(id) = value["vault_id"].as_str()
-            {
-                let _ = agit::domain::secret_filter::OsKeyStore.delete(id);
-            }
-        }
-    }
-}
-
 #[test]
-fn secret_registration_input_is_usage_without_reclassifying_stored_vault_failures() {
+fn secret_registration_validates_hidden_input_before_opening_storage() {
     const SECRET: &str = "owned-secret-registration-canary";
     const SHORT: &str = "sH!rt?";
     for mode in ["human", "quiet", "json1", "json2"] {
@@ -1254,7 +1218,7 @@ fn secret_registration_input_is_usage_without_reclassifying_stored_vault_failure
             assert_eq!(lab.state(), before);
             lab.no_requests();
 
-            let vault_path = if block {
+            if block {
                 let template = lab.command("human", &[]);
                 let mut git = Command::new("git");
                 git.env_clear()
@@ -1264,45 +1228,9 @@ fn secret_registration_input_is_usage_without_reclassifying_stored_vault_failure
                             .filter_map(|(key, value)| value.map(|value| (key, value))),
                     )
                     .current_dir(template.get_current_dir().unwrap())
-                    .args(["-c", "init.templateDir=", "init", "--initial-branch=main"])
-                    .stdin(Stdio::null());
-                let output = run_bounded(git);
-                assert!(output.status.success(), "{output:?}");
-                lab.root
-                    .path()
-                    .join("work/.git/agit/secret-dictionary/vault.json")
-            } else {
-                lab.home.join("secret-filter/vault.json")
-            };
-            // Cleanup follows the owned vault identity even when a corruption assertion unwinds.
-            let mut vault = OwnedSecretVault {
-                path: vault_path,
-                restore: None,
-            };
-            let output = run_bounded(secret_add_command(&lab, mode, block, "seed", SECRET));
-            let text = output_text(&output, mode, "secrets", 0);
-            assert!(
-                !text.contains(SECRET),
-                "secret value reached terminal output"
-            );
-            assert!(vault.path.is_file());
-            lab.no_requests();
-
-            vault.corrupt();
-            let corrupt = lab.state();
-            let output = run_bounded(secret_add_command(
-                &lab,
-                mode,
-                block,
-                "retry",
-                "different-owned-registration-canary",
-            ));
-            let text = output_text(&output, mode, "secrets", 1);
-            assert!(!text.contains("different-owned-registration-canary"));
-            assert_eq!(lab.state(), corrupt);
-            lab.no_requests();
-
-            vault.restore();
+                    .args(["-c", "init.templateDir=", "init", "--initial-branch=main"]);
+                assert!(run_bounded(git).status.success());
+            }
             let mut command = secret_add_command(&lab, mode, block, "short-rule", SHORT);
             command.arg("--allow-short");
             let output = run_bounded(command);
@@ -1311,8 +1239,6 @@ fn secret_registration_input_is_usage_without_reclassifying_stored_vault_failure
                 !text.contains(SHORT),
                 "secret value reached terminal output"
             );
-            let value: Value = serde_json::from_slice(&fs::read(&vault.path).unwrap()).unwrap();
-            assert_eq!(value["records"].as_array().unwrap().len(), 2);
             lab.no_requests();
         }
     }

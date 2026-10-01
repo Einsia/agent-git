@@ -1456,8 +1456,9 @@ fn malformed_claim_inventory_keeps_pending_counts_unavailable() {
     );
 }
 
+/// Missing recovery data cannot suppress pending activity or mutate the recorded history.
 #[test]
-fn small_protected_history_refuses_an_oversized_dictionary_without_readonly_writes() {
+fn protected_pending_history_remains_available_with_an_unreadable_legacy_dictionary() {
     let mut lab = Lab::new();
     let placeholder = format!("{{{{AGIT_SECRET_V1:{SID}:sec_{}}}}}", "a".repeat(32));
     let protected = lab.prefix.replace("PRIVATE_SETTLED_PROMPT", &placeholder);
@@ -1467,52 +1468,7 @@ fn small_protected_history_refuses_an_oversized_dictionary_without_readonly_writ
         .root()
         .join(".git/agit/secret-dictionary/vault.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, vec![b' '; 256 * 1024 + 1]).unwrap();
-    lab.expect(
-        "inspection budget exhausted",
-        "current claim; process unverified",
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn protected_pending_history_uses_a_small_existing_vault_and_refuses_large_file_keys() {
-    use agit::domain::secret_filter::{FileKeyStore, RepositoryDictionary};
-    let mut lab = Lab::new();
-    let path = lab
-        .repo
-        .root()
-        .join(".git/agit/secret-dictionary/vault.json");
-    let key_dir = lab.root.path().join("agit/keystore");
-    let dictionary = RepositoryDictionary::new(path.clone(), FileKeyStore::new(key_dir.clone()));
-    dictionary
-        .block_add("fixture", "PRIVATE_SETTLED_PROMPT".to_owned().into(), false)
-        .unwrap();
-    let protected = dictionary.protect_existing_jsonl(&lab.prefix).unwrap().text;
-    assert!(protected.contains("{{AGIT_SECRET_V1:"));
-    lab.commit_protected_prefix(&protected);
-    let config = lab.root.path().join("agit/config.json");
-    fs::write(config, r#"{"secrets.keystore":"file"}"#).unwrap();
-    fs::remove_file(path.parent().unwrap().join("vault.lock")).unwrap();
-    lab.expect(
-        "1 user turns with pending activity (1 newly started)",
-        "current claim; process unverified",
-    );
-    let key = fs::read_dir(key_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let original = fs::read(&key).unwrap();
-    let mut oversized = original.clone();
-    oversized.resize(65, b' ');
-    fs::write(&key, &oversized).unwrap();
-    lab.expect(
-        "inspection budget exhausted",
-        "current claim; process unverified",
-    );
-    fs::write(&key, original).unwrap();
+    fs::write(&path, b"unavailable private dictionary").unwrap();
     lab.expect(
         "1 user turns with pending activity (1 newly started)",
         "current claim; process unverified",

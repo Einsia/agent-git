@@ -142,7 +142,7 @@ fn native_publication_consumes_owned_bytes_and_retains_refresh_into_refs() {
             );
             assert_eq!(
                 request.header("X-AgentGit-Accept-Secret-Findings"),
-                Some("true")
+                None
             );
             return native_git_reply(request, &receiver_path);
         }
@@ -170,7 +170,7 @@ fn native_publication_consumes_owned_bytes_and_retains_refresh_into_refs() {
             } else {
                 assert_eq!(
                     request.header("X-AgentGit-Accept-Secret-Findings"),
-                    Some("true")
+                    None
                 );
                 if request.header("Authorization") == Some("Bearer fake-alice-access") {
                     return denied();
@@ -225,7 +225,6 @@ fn native_publication_consumes_owned_bytes_and_retains_refresh_into_refs() {
             .prepare_payloads(pointer.size)
             .unwrap(),
     );
-    assert!(complete.has_findings());
     std::fs::write(&cache, b"changed original payload").unwrap();
     for (key, value) in [
         ("lfs.url", "https://unselected.invalid/lfs"),
@@ -277,43 +276,6 @@ fn native_publication_consumes_owned_bytes_and_retains_refresh_into_refs() {
         1
     );
     println!("native LFS upload and refs verified");
-    println!("{COMPLETE}");
-}
-
-#[test]
-fn native_publication_rejects_findings_without_operation_acceptance() {
-    if !isolated("native_publication_rejects_findings_without_operation_acceptance") {
-        return;
-    }
-    use crate::hub::git::SecretFindingsAcceptance;
-    let home = IsolatedHome::new();
-    let payload =
-        b"-----BEGIN PRIVATE KEY-----\nsynthetic fixture only\n-----END PRIVATE KEY-----\n";
-    let pointer = prepared_pointer(payload);
-    let returned = pointer.clone();
-    let hub = FakeHub::new(move |request| {
-        assert!(request.path.ends_with("/objects/batch"));
-        assert_eq!(request.header("X-AgentGit-Accept-Secret-Findings"), None);
-        prepared_batch(serde_json::json!([native_lfs_object(request, &returned)]))
-    });
-    let (repo, _, url, identity) = prepared_source(&home, &hub.base);
-    record_prepared_pointer(&repo, "payload", &pointer);
-    prepared_cache(&repo, &pointer, payload);
-    let complete = native_inspected(
-        FrozenPublication::prepare(&repo, &prepared_plan(&repo), &url, &identity)
-            .unwrap()
-            .prepare_payloads(pointer.size)
-            .unwrap(),
-    );
-    assert!(complete.has_findings());
-    unsafe {
-        std::env::set_var("AGIT_ALLOW_SECRETS", "1");
-    }
-    let report = complete.publish(SecretFindingsAcceptance::Reject);
-    assert!(!report.ok());
-    assert!(report.error.is_some());
-    assert!(report.lfs.is_none() && report.heads.is_none() && report.tags.is_none());
-    assert_eq!(hub.finish().len(), 1);
     println!("{COMPLETE}");
 }
 

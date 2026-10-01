@@ -328,7 +328,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     terminal_delivery_blockers: blockers,
                     term_tx: None,
                     online: false,
-                    secret_filter: Default::default(),
+
                     settlement,
                     started_at: std::time::Instant::now(),
                     notes,

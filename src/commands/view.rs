@@ -135,9 +135,12 @@ pub fn run(args: Args) -> CmdResult {
     // sources/sessions, and `position()` alone makes every occurrence of a repeated event point
     // at the first line.
     let mut log_positions = log_occurrence_positions(&log)?;
-    let local_view = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_envelopes_readonly(&view)?
-        .text;
+    let local_view = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &view,
+        crate::domain::privacy::projector::Mode::HydrateEnvelopes,
+    )
+    .content;
 
     let items: Vec<Item> = view
         .split_inclusive('\n')

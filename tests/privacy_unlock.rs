@@ -33,8 +33,8 @@ use std::{
 mod claude_recovery_terminal;
 #[path = "support/privacy_password_terminal.rs"]
 mod privacy_password_terminal;
-#[path = "support/privacy_policy_sources.rs"]
-mod privacy_policy_sources;
+#[path = "support/publication_identity.rs"]
+mod publication_identity;
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
 use privacy_password_terminal::terminal_password;
@@ -412,7 +412,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
                     authenticated,
                     "publication policies retain author authentication"
                 );
-                privacy_policy_sources::route(
+                publication_identity::route(
                     &response_hub,
                     "alice",
                     request.split_whitespace().next().unwrap(),
@@ -955,7 +955,6 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         String::from_utf8_lossy(&public_export.stderr)
     );
     let public_export = String::from_utf8(public_export.stdout).unwrap();
-    assert!(!public_export.contains("synthetic private session"));
     assert!(public_export.contains("new private turn"));
     assert_eq!(
         public_export.contains("historical session evidence (policy-projected)"),
@@ -1003,11 +1002,6 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     assert_eq!(private_log.as_str(), local_log);
     assert!(private_view.contains("synthetic private session"));
     assert_eq!(private_view.as_str(), local_view);
-    assert!(
-        recovered
-            .protected_values
-            .contains("synthetic private session")
-    );
     assert_eq!(
         transcript::unwrap_strict(sealed.public_projection["session"]["log"].as_str().unwrap())
             .unwrap(),

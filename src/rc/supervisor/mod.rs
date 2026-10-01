@@ -1253,33 +1253,25 @@ impl Session {
         confinement: tokio::sync::watch::Receiver<crate::rc::Confinement>,
         settlement: tokio::sync::watch::Receiver<SettlementState>,
         generation: u64,
-        secret_filter: crate::domain::secret_filter::MatcherHandle,
     ) -> Result<Session, crate::rc::harness::proc::LaunchError> {
         let agit_session = spec.agit_session.clone();
         let cwd = spec.cwd.clone();
-        let mut redactor =
-            redact::Redactor::with_registered(redact::Persona::this_machine(), secret_filter)
-                .for_device_control()
-                .with_unbound_native_context(
-                    &info.runtime,
-                    spec.resume_from.as_deref().unwrap_or(""),
-                );
+        let mut redactor = redact::Redactor::this_machine()
+            .for_device_control()
+            .with_unbound_native_context(&info.runtime, spec.resume_from.as_deref().unwrap_or(""));
         if let Some(session) = &agit_session {
             let repo = session
                 .repo_dir()
                 .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
             redactor = redactor
-                .require_repository()
                 .with_repository(&repo)
                 .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
-            redactor = redactor
-                .with_native_context(
-                    &info.runtime,
-                    spec.resume_from.as_deref().unwrap_or(""),
-                    &cwd,
-                    &repo,
-                )
-                .with_native_source(info.native_source.clone());
+            redactor = redactor.with_native_context(
+                &info.runtime,
+                spec.resume_from.as_deref().unwrap_or(""),
+                &cwd,
+                &repo,
+            );
         }
         // **Whether this is a new run or a continuation is known at this moment.**
         //
@@ -1921,21 +1913,10 @@ impl Session {
         let Some(mut stream) = self.delta_streams.remove(item_id) else {
             return;
         };
-        let report = match stream.flush() {
-            Ok(report) => report,
-            Err(error) => {
-                tracing_note(&format!("Stream protection failed: {error}"));
-                self.emit(
-                    method::ITEM_DELTA,
-                    ItemDelta {
-                        item_id: item_id.to_string(),
-                        text: "[output withheld: stream protection exceeded its buffer limit; the local transcript is retained]".into(),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+        self.emit_delta_report(item_id, stream.flush()).await;
+    }
+
+    async fn emit_delta_report(&mut self, item_id: &str, report: redact::Report) {
         if report.text.is_empty() {
             return;
         }
@@ -2817,17 +2798,17 @@ impl Session {
                 .await;
             }
             HarnessEvent::Delta { item_id, text } => {
-                // Item completion is the inspection boundary. An overflow poisons
-                // the buffer and is reported by `flush_delta`; no suffix is released.
+                // Each fragment releases inspected bytes; completion flushes the bounded tail.
                 if !self.delta_streams.contains_key(&item_id) {
                     let stream = self.redactor.stream();
                     self.delta_streams.insert(item_id.clone(), stream);
                 }
-                let _ = self
+                let report = self
                     .delta_streams
                     .get_mut(&item_id)
                     .expect("delta stream was inserted above")
                     .push(&text);
+                self.emit_delta_report(&item_id, report).await;
             }
             HarnessEvent::ItemCompleted { item_id } => {
                 self.flush_delta(&item_id).await;
@@ -3911,9 +3892,6 @@ fn trace_phase(session_id: &str, phase: &str, started: std::time::Instant) {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, unix))]
-mod privacy_tests;
 
 #[cfg(test)]
 mod settle_tests;

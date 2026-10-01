@@ -139,23 +139,18 @@ fn branch_relation(
     let relation = match snapshot.code.as_deref() {
         None => "other",
         Some(code) => {
-            let code = if code.contains("{{AGIT_SECRET_V1:") {
-                let input = serde_json::to_string(code)?;
-                let dictionary =
-                    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-                let report = dictionary
-                    .hydrate_batch_readonly_with_limits(
-                        &[&input],
-                        MAX_METADATA_BYTES,
-                        Some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
-                    )?
-                    .pop()
-                    .expect("one code observation")?;
-                anyhow::ensure!(report.unresolved == 0, "code identity is unavailable");
-                serde_json::from_str::<String>(&report.text)?
-            } else {
-                code.to_owned()
-            };
+            let hydrated = crate::domain::privacy::service::transform(
+                Some(repo.root()),
+                code,
+                crate::domain::privacy::projector::Mode::HydrateText,
+            );
+            anyhow::ensure!(
+                crate::domain::privacy::projector::tokens(&hydrated.content)
+                    .next()
+                    .is_none(),
+                "code identity is unavailable"
+            );
+            let code = hydrated.content;
             let (recorded, sha) = code
                 .rsplit_once('@')
                 .ok_or_else(|| anyhow::anyhow!("recorded code identity is unavailable"))?;

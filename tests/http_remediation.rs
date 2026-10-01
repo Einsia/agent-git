@@ -90,7 +90,9 @@ mod unix {
                         .set_write_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
                     let request = read_request(&mut stream);
-                    if request.method == "GET" && request.target.ends_with("/api/cli/version") {
+                    if (request.method == "GET" && request.target.ends_with("/api/cli/version"))
+                        || request.target.starts_with("/api/me/privacy/")
+                    {
                         write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                         continue;
                     }

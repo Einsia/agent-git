@@ -473,7 +473,7 @@ old line stays exactly as it was.
 **Publish**:
 
 ```sh
-agit push --dry-run     # rehearsal: runs the secret scan, lists what would be sent, no network
+agit push --dry-run     # rehearsal: shows the selected publication without sending Git refs
 agit push
 ```
 
@@ -558,8 +558,8 @@ Every `agit commit` (the Stop hook's automatic settlement included) collects the
 **relative to the baseline taken at launch** into the session branch, as one file commit: what was
 newly written, modified or deleted at the top level, plus the agent's edits and deletions inside
 the mirrored subdirectories. Personal memory that was already there at launch and was not touched
-this time does not enter the branch. A file the secret scan hits (including values registered
-with `agit secrets`) is not collected, and is named. A session not launched through agit has no
+this time does not enter the branch. Secret matches receive reversible local replacements when possible; unavailable privacy
+processing leaves the affected content unchanged and does not stop collection. A session not launched through agit has no
 baseline: settlement establishes the baseline and collects nothing, and an explicit
 `agit memory sync` is what pulls in everything currently at the top level.
 `agit config memory.track off` turns local collection off.
@@ -571,7 +571,7 @@ phase is done:
 ```sh
 agit memory status          # one line per file: branch vs main, local vs branch
 agit memory diff notes.md
-agit distill                # files that differ from main enter main after item-by-item confirmation (each passes the secret scan first)
+agit distill                # files that differ from main enter main after item-by-item confirmation (with best-effort local protection)
 agit push -b main
 ```
 
@@ -723,8 +723,7 @@ perform its own I/O. Unsettled turns and working files are outside this selected
 Reports are advisory: AgentGit never applies model-supplied remedies automatically.
 
 A completed review returns exit 0 without findings or exit 7 with findings. Failure to run or
-complete the model review returns exit 4. The deterministic secret scan remains the publishing
-gate. See the [scan command manual](../src/commands/subskills/scan.md) for runtime requirements,
+complete the model review returns exit 4. The deterministic secret scan is an explicit diagnostic and never gates publication. See the [scan command manual](../src/commands/subskills/scan.md) for runtime requirements,
 scope selection, review limits, and report fields.
 
 To review the complete outgoing publication interactively, use:
@@ -920,7 +919,7 @@ from the stored value.
 | `4` | An execution precondition is not met |
 | `5` | Authentication is missing or no longer valid |
 | `6` | Network or Hub request failure |
-| `7` | Policy refusal, including publication and secret gates |
+| `7` | Policy refusal for explicit policy operations |
 | `8` | Interaction or explicit candidate selection is required |
 
 `1` is a supported generic result when the command cannot establish a more precise cause.

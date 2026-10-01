@@ -35,6 +35,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    crate::domain::privacy::service::schedule_sync(&crate::infra::config::hub_url());
     if args.all {
         return fetch_all();
     }

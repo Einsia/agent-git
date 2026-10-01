@@ -91,11 +91,6 @@ impl Evidence {
         self
     }
 
-    #[cfg(feature = "rc")]
-    pub(crate) fn reset(&mut self) {
-        *self = Self::new(&self.agent, &self.cwd);
-    }
-
     pub(crate) fn add_cwd_alias(&mut self, alias: &str) {
         self.cwd_aliases.insert(PathBuf::from(alias));
     }
@@ -115,19 +110,6 @@ impl Evidence {
         let repo = Repo::at(self.agent.root()).local_objects_only();
         let cwd = self.cwd.clone();
         super::seed_native_evidence(&repo, &cwd, runtime, native, self, record_timing)
-    }
-
-    /// A text delta has no typed result field. Delay possible object identities until its native record.
-    #[cfg(feature = "rc")]
-    pub(crate) fn contains_object_identity(&mut self, text: &str) -> bool {
-        let roots = [self.agent.root().to_owned(), self.cwd.clone()];
-        candidates(text).any(|span| {
-            let token = &text[span];
-            token.len() >= 32
-                && roots
-                    .iter()
-                    .any(|root| self.resolve(root, token, false).is_some())
-        })
     }
 
     pub(crate) fn record(&mut self, runtime: &str, native: &str, value: &Value) -> RecordMask {

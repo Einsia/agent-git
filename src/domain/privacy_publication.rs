@@ -149,7 +149,9 @@ pub enum ProjectionAction {
 type DecisionKey = (Option<usize>, Option<String>, String, ProjectionAction);
 
 /// The public and private halves are produced together from the same validated snapshot.
+#[derive(Serialize, Deserialize)]
 pub struct SessionProjection {
+    #[serde(with = "private_text")]
     source_log: Zeroizing<String>,
     log: String,
     view: String,
@@ -158,6 +160,53 @@ pub struct SessionProjection {
     policy_digest: String,
     private: PrivateLayer,
     dependencies: ProjectionDependencies,
+}
+
+mod private_text {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Zeroizing<String>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        value.as_str().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Zeroizing<String>, D::Error> {
+        String::deserialize(deserializer).map(Zeroizing::new)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FrozenInput {
+    branch: Option<String>,
+    log: String,
+    view: String,
+    metadata: Meta,
+    additional: Vec<super::privacy::mandatory::MandatoryPolicy>,
+}
+
+pub(crate) fn project_worker(
+    root: Option<&Path>,
+    text: &str,
+) -> Result<super::privacy::projector::Outcome> {
+    let input: FrozenInput = serde_json::from_str(text)?;
+    let repo = root.map(super::repo::Repo::at);
+    let projection = project_frozen_local(
+        repo.as_ref(),
+        input.branch.as_deref(),
+        &input.log,
+        &input.view,
+        &input.metadata,
+        &input.additional,
+    )?;
+    Ok(super::privacy::projector::Outcome {
+        content: serde_json::to_string(&projection)?,
+        status: super::privacy::projector::Status::Complete,
+        replacements: projection.report.replacements,
+        unresolved: 0,
+        consumed: None,
+    })
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -217,6 +266,7 @@ impl SessionProjection {
 
     /// Generated identities are not content. The scanner still sees every message body
     /// and public metadata field, while ciphertext remains a separately validated carrier.
+    #[cfg(test)]
     pub(crate) fn inspection_text(&self) -> Result<String> {
         public_inspection_text(
             self.public_value(),
@@ -447,6 +497,53 @@ pub fn project_frozen(
 
 /// Authenticated exclusions narrow the same local policy used by offline projection.
 pub fn project_frozen_with_sources(
+    repo: Option<&super::repo::Repo>,
+    branch: Option<&str>,
+    log: &str,
+    view: &str,
+    metadata: &Meta,
+    additional: &[super::privacy::mandatory::MandatoryPolicy],
+) -> Result<SessionProjection> {
+    let input = FrozenInput {
+        branch: branch.map(str::to_owned),
+        log: log.into(),
+        view: view.into(),
+        metadata: metadata.clone(),
+        additional: additional.to_vec(),
+    };
+    if let Ok(text) = serde_json::to_string(&input) {
+        let outcome = super::privacy::service::transform(
+            repo.map(|repo| repo.root()),
+            &text,
+            super::privacy::projector::Mode::ProjectPublication,
+        );
+        if outcome.status == super::privacy::projector::Status::Complete
+            && let Ok(projection) = serde_json::from_str::<SessionProjection>(&outcome.content)
+            && projection.source_log.as_str() == log
+            && projection.private.validate().is_ok()
+            && storage::snapshot_files(&projection.log, &projection.view).is_ok()
+            && projection
+                .report
+                .validate(&projection.policy_digest)
+                .is_ok()
+        {
+            return Ok(projection);
+        }
+    }
+    // Default projection has no filesystem policy dependencies; original records remain in the envelope.
+    let policy = PrivacyPolicy::default();
+    project_session(
+        &policy,
+        &mut PathAliasStore::default(),
+        branch,
+        log,
+        view,
+        metadata,
+        &Redactor::new(Default::default()),
+    )
+}
+
+fn project_frozen_local(
     repo: Option<&super::repo::Repo>,
     branch: Option<&str>,
     log: &str,
@@ -1994,15 +2091,7 @@ mod tests {
             ..PrivacyPolicy::default()
         };
         let mut aliases = PathAliasStore::default();
-        let redactor = Redactor::with_registered(
-            Default::default(),
-            super::super::secret_filter::MatcherHandle::new(
-                super::super::secret_filter::Matcher::for_test(&[(
-                    "sec_test",
-                    "synthetic-private-value",
-                )]),
-            ),
-        );
+        let redactor = Redactor::new(Default::default());
         let view = log.split_inclusive('\n').next_back().unwrap();
         let projection = project_session(
             &policy,
@@ -2020,7 +2109,7 @@ mod tests {
         assert!(projection.log().contains(OMITTED));
         assert!(projection.log().contains("allowed file body"));
         assert!(!projection.log().contains("excluded file body"));
-        assert!(!projection.log().contains("synthetic-private-value"));
+        assert!(projection.log().contains("synthetic-private-value"));
         assert!(!projection.log().contains("customer.txt"));
         assert_eq!(
             projection.view(),
@@ -2072,13 +2161,6 @@ mod tests {
                 .any(|decision| decision.record == Some(2)
                     && decision.rule == "replacements[0]"
                     && decision.matches == 1)
-        );
-        assert!(
-            details
-                .decisions
-                .iter()
-                .any(|decision| decision.record == Some(2)
-                    && decision.action == ProjectionAction::MaskSecret)
         );
         let encoded = serde_json::to_string(&projection.report).unwrap();
         assert!(
@@ -3212,168 +3294,5 @@ mod tests {
             detached.report().omissions[0].reason,
             "recovered evidence source is unavailable"
         );
-    }
-    #[test]
-    fn local_placeholders_recover_without_disclosing_unselected_secrets() {
-        use crate::domain::{
-            repo::Repo,
-            secret_filter::{Matcher, RepositoryDictionary},
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let repo = Repo::init(&temp.path().join("source")).unwrap();
-        let source = repo.root().join("src/main.rs");
-        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-        let secret = "private phrase \"quoted\"\nnext line";
-        let other = "unselected private phrase";
-        let dictionary = RepositoryDictionary::open(repo.root()).unwrap();
-        for value in [
-            secret,
-            other,
-            "unrelated dictionary value",
-            source.to_str().unwrap(),
-        ] {
-            dictionary
-                .block_add("Synthetic value", Zeroizing::new(value.into()), false)
-                .unwrap();
-        }
-        let session = meta::mint_session_id();
-        let raw = [
-            json!({"type":"user","cwd":repo.root(),"message":{"role":"user","content":secret}}),
-            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","id":"call","input":{"file_path":source}}]}}),
-            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":format!("allowed result: {secret}")}]}}),
-            json!({"type":"unsupported","private_observation":other}),
-        ].into_iter().map(|value| format!("{value}\n")).collect::<String>();
-        let original = transcript::wrap_lines(&raw, "claude-code", &session);
-        let saved = dictionary
-            .protect_envelopes(&original, &Matcher::empty())
-            .unwrap()
-            .text;
-        assert!(!saved.contains("private phrase"));
-        let first = saved.split_inclusive('\n').next().unwrap();
-        let source_record = storage::parse_envelopes(first).unwrap().remove(0);
-        let quote = transcript::wrap_lines(
-            &format!(
-                "{}\n",
-                json!({"type":"user","message":{"role":"user","content":"evidence"}, EVIDENCE_FIELD:EvidenceReference::from_record(&source_record)})
-            ),
-            "claude-code",
-            &session,
-        );
-        let log = format!("{saved}{quote}");
-        let metadata = Meta::new(
-            session,
-            "claude-code".into(),
-            repo.root().display().to_string(),
-        );
-        let policy = PrivacyPolicy {
-            workspace: Some(repo.root().into()),
-            include: vec!["src/**".into()],
-            ..Default::default()
-        };
-        let projection = PublicationSnapshot::capture(&repo, &log, first, &metadata)
-            .unwrap()
-            .project(
-                &policy,
-                &mut PathAliasStore::default(),
-                None,
-                &Redactor::new(Default::default())
-                    .with_repository(repo.root())
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(projection.log().contains("allowed result"));
-        assert!(projection.log().contains("<workspace>/src/main.rs"));
-        assert!(projection.log().contains("policy-projected"));
-        assert!(
-            !projection
-                .report()
-                .omissions
-                .iter()
-                .any(|notice| notice.reason.contains("evidence source"))
-        );
-        assert!(!projection.log().contains("private phrase"));
-        let key = SecretKey::from([21; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let layer = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
-        let (recovered, view) = layer.session_bytes().unwrap();
-        assert!(recovered.starts_with(&original));
-        assert_eq!(
-            view.as_str(),
-            original.split_inclusive('\n').next().unwrap()
-        );
-        assert!(layer.protected_values.contains(secret));
-        assert!(layer.protected_values.contains(other));
-        assert!(
-            !layer
-                .protected_values
-                .contains("unrelated dictionary value")
-        );
-
-        let selected = projection.select(first).unwrap();
-        let shared = projection
-            .seal_share(first, &selected, "Selected message", &recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
-        assert_eq!(shared.session_bytes().unwrap().0.as_str(), view.as_str());
-        assert_eq!(shared.protected_values, BTreeSet::from([secret.to_owned()]));
-
-        let new_device = Repo::init(&temp.path().join("new-device")).unwrap();
-        assert!(PublicationSnapshot::capture(&new_device, &log, first, &metadata).is_err());
-        shared.import_protection(&new_device).unwrap();
-        let new_dictionary = RepositoryDictionary::open(new_device.root()).unwrap();
-        let saved_again = new_dictionary
-            .protect_envelopes(&view, &Matcher::empty())
-            .unwrap()
-            .text;
-        assert!(!saved_again.contains("private phrase"));
-        assert_ne!(saved_again, first);
-        let republished =
-            PublicationSnapshot::capture(&new_device, &saved_again, &saved_again, &metadata)
-                .unwrap()
-                .project(
-                    &PrivacyPolicy::default(),
-                    &mut PathAliasStore::default(),
-                    None,
-                    &Redactor::new(Default::default())
-                        .with_repository(new_device.root())
-                        .unwrap(),
-                )
-                .unwrap();
-        assert!(!republished.log().contains("private phrase"));
-        assert_eq!(
-            republished
-                .seal(&recipient)
-                .unwrap()
-                .open_layer(&key)
-                .unwrap()
-                .session_bytes()
-                .unwrap()
-                .0
-                .as_str(),
-            view.as_str()
-        );
-        layer.import_protection(&new_device).unwrap();
-        let continued = PublicationSnapshot::capture(&new_device, &recovered, &view, &metadata)
-            .unwrap()
-            .project(
-                &PrivacyPolicy::default(),
-                &mut PathAliasStore::default(),
-                None,
-                &Redactor::new(Default::default())
-                    .with_repository(new_device.root())
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(continued.private.protected_values.contains(other));
-        assert!(!continued.log().contains(other));
     }
 }

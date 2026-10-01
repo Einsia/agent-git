@@ -242,45 +242,4 @@ mod tests {
         assert!(output.public_bytes.is_none());
         assert!(output.private_bytes.is_none());
     }
-
-    #[test]
-    fn replacement_output_is_checked_before_publication() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("src/main.rs");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let original = b"synthetic replacement marker";
-        fs::write(&path, original).unwrap();
-        let secret = "synthetic private value";
-        let policy = PrivacyPolicy {
-            workspace: Some(temp.path().to_path_buf()),
-            replacements: vec![ReplacementRule {
-                pattern: String::from_utf8(original.to_vec()).unwrap(),
-                replacement: secret.into(),
-                regex: false,
-            }],
-            ..PrivacyPolicy::default()
-        };
-        let matcher =
-            crate::domain::secret_filter::Matcher::for_test(&[("sec_replacement", secret)]);
-        let redactor = Redactor::with_registered(
-            Default::default(),
-            crate::domain::secret_filter::MatcherHandle::new(matcher),
-        );
-        let output = project_file_with_redactor(
-            &policy,
-            &mut PathAliasStore::default(),
-            &path,
-            None,
-            original,
-            &redactor,
-        )
-        .unwrap();
-        assert_eq!(output.private_bytes.as_deref(), Some(original.as_slice()));
-        assert_eq!(
-            output.public_bytes.as_deref(),
-            Some(b"[redacted:registered-secret]".as_slice())
-        );
-        assert_eq!(output.replacements, 1);
-        assert_eq!(output.secret_matches, 1);
-    }
 }

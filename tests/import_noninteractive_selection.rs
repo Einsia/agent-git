@@ -1469,9 +1469,9 @@ fn legacy_import_onto_accepts_qualified_session_and_historic_commit_targets() {
     }
 }
 
-/// Device allowances govern both automatic protection and scans of the resulting history.
+/// Import applies explicit blocks before allows and preserves the native transcript.
 #[test]
-fn device_allowlist_wins_over_entropy_and_registered_rules_during_import() {
+fn device_policy_precedence_applies_during_import() {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -1534,31 +1534,15 @@ fn device_allowlist_wins_over_entropy_and_registered_rules_during_import() {
             target_git(&lab, &repo, &["show", &format!("allowed:{path}")])
         })
         .collect();
-    for value in [entropy, provider, registered, preset] {
+    for value in [entropy, provider, preset] {
         assert!(
             log.contains(value),
             "allowed candidate {value} remains literal"
         );
     }
+    assert!(!log.contains(registered));
     assert!(!log.contains(protected));
-    assert!(log.contains("AGIT_SECRET_V1"));
-    let scan = lab
-        .command()
-        .args(["scan", "--secrets", "me/qa@allowed", "--json"])
-        .output()
-        .unwrap();
-    assert!(scan.status.success(), "{scan:?}");
-
-    fs::write(lab.store.join(".agit-allow-secrets"), "").unwrap();
-    let scan = lab
-        .command()
-        .args(["scan", "--secrets", "me/qa@allowed", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(scan.status.code(), Some(7), "{scan:?}");
-    let report = String::from_utf8(scan.stdout).unwrap();
-    assert!(report.contains("registered-secret"));
-    assert!(report.contains("high-entropy-value"));
+    assert!(log.contains("AGIT_SECRET_V2"));
 }
 
 /// Generated observations must use the same secret projection as the imported transcript.
@@ -1619,6 +1603,13 @@ fn imported_and_live_metadata_remain_publishable() {
     );
     target_git(&lab, &lab.work, &["checkout", "-b", secret]);
     let source = &lab.sources[0].1;
+    let mut native = fs::OpenOptions::new().append(true).open(source).unwrap();
+    writeln!(
+        native,
+        "{}",
+        serde_json::json!({"type":"custom-title","customTitle":format!("{secret} session")})
+    )
+    .unwrap();
     let original = fs::read(source).unwrap();
     let imported = lab
         .command()
@@ -1646,6 +1637,13 @@ fn imported_and_live_metadata_remain_publishable() {
     assert!(!snapshot.cwd.contains(lab.work.to_str().unwrap()));
     assert_eq!(snapshot.runtime, "claude-code");
     assert_eq!(snapshot.turn, Some(1));
+    assert!(
+        snapshot
+            .title
+            .as_deref()
+            .unwrap()
+            .contains("AGIT_SECRET_V2")
+    );
     let source_head = target_git(&lab, &lab.work, &["rev-parse", "HEAD"]);
 
     let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
@@ -1674,7 +1672,7 @@ fn imported_and_live_metadata_remain_publishable() {
     agit::domain::meta::validate(&snapshot).unwrap();
     assert!(!metadata.contains(milestone_secret));
     assert_eq!(snapshot.turn, Some(2));
-    assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V1"));
+    assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V2"));
     assert_eq!(
         snapshot.cwd_state.as_ref().unwrap().head.as_deref(),
         Some(source_head.trim())
@@ -1685,20 +1683,7 @@ fn imported_and_live_metadata_remain_publishable() {
             .unwrap()
             .branch
             .unwrap()
-            .contains("AGIT_SECRET_V1")
-    );
-    let vault = repo.join(".git/agit/secret-dictionary/vault.json");
-    let vault_before = fs::read(&vault).unwrap();
-    let scan = lab
-        .command()
-        .args(["scan", "--secrets", "me/qa@metadata", "--json"])
-        .output()
-        .unwrap();
-    assert!(scan.status.success(), "{scan:?}");
-    assert_eq!(fs::read(&vault).unwrap(), vault_before);
-    assert_eq!(
-        target_git(&lab, &repo, &["show", "metadata:session/meta.json"]),
-        metadata
+            .contains("AGIT_SECRET_V2")
     );
     let resumed = lab
         .command()
@@ -1732,16 +1717,5 @@ fn imported_and_live_metadata_remain_publishable() {
     assert!(
         String::from_utf8_lossy(&candidates.stdout).contains("same-repo  me/qa @ metadata"),
         "{candidates:?}"
-    );
-    fs::remove_file(repo.join(".git/agit/secret-dictionary/vault.json")).unwrap();
-    let unavailable = lab
-        .command()
-        .args(["resume", "me/qa@metadata", "--no-launch", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(unavailable.status.code(), Some(8), "{unavailable:?}");
-    assert!(
-        String::from_utf8_lossy(&unavailable.stdout).contains("cannot be compared"),
-        "{unavailable:?}"
     );
 }

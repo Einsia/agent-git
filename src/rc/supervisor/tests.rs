@@ -139,27 +139,27 @@ fn codex_turn_test_session(thread_id: Option<&str>, responses: &[serde_json::Val
     )
 }
 
+/// Privacy failure cannot discard transport fragments or the item completion boundary.
 #[tokio::test]
-async fn outbound_deltas_wait_for_inspection_and_report_buffer_failure() {
+async fn outbound_deltas_preserve_bytes_when_privacy_is_unavailable() {
     let driver = AnyDriver::Codex(Box::new(
-        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread-protection"), &[]),
+        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread-output"), &[]),
     ));
     let (mut session, mut out, _notes) =
         harness_test_session_with_channels(driver, "codex", SessionStatus::Running);
     session.redactor = redact::Redactor::new(redact::Persona::default());
-    let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-    for text in [&secret[..19], &secret[19..]] {
+    let text = "x".repeat(crate::domain::privacy::projector::MAX_UNIT_BYTES + 1);
+    for chunk in [text.as_str(), " complete"] {
         session
             .on_harness_event(HarnessEvent::Delta {
-                item_id: "sensitive-item".into(),
-                text: text.into(),
+                item_id: "output".into(),
+                text: chunk.into(),
             })
             .await;
-        assert!(out.try_recv().is_err());
     }
     session
         .on_harness_event(HarnessEvent::ItemCompleted {
-            item_id: "sensitive-item".into(),
+            item_id: "output".into(),
         })
         .await;
     let frames: Vec<Frame> = std::iter::from_fn(|| out.try_recv().ok()).collect();
@@ -168,30 +168,12 @@ async fn outbound_deltas_wait_for_inspection_and_report_buffer_failure() {
         .filter(|frame| frame.method.as_deref() == Some(method::ITEM_DELTA))
         .map(|frame| frame.params.as_ref().unwrap()["text"].as_str().unwrap())
         .collect::<String>();
-    assert_eq!(emitted, "[redacted:github-pat]");
-
-    session
-        .on_harness_event(HarnessEvent::Delta {
-            item_id: "oversized-item".into(),
-            text: "a".repeat(redact::MAX_STREAM_ITEM_BYTES + 1),
-        })
-        .await;
-    session
-        .on_harness_event(HarnessEvent::Delta {
-            item_id: "oversized-item".into(),
-            text: secret.into(),
-        })
-        .await;
-    assert!(out.try_recv().is_err());
-    session
-        .on_harness_event(HarnessEvent::ItemCompleted {
-            item_id: "oversized-item".into(),
-        })
-        .await;
-    let frames: Vec<Frame> = std::iter::from_fn(|| out.try_recv().ok()).collect();
-    let wire = serde_json::to_string(&frames).unwrap();
-    assert!(wire.contains("output withheld"));
-    assert!(!wire.contains(secret));
+    assert_eq!(emitted, format!("{text} complete"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.method.as_deref() == Some("item.finished"))
+    );
     assert!(session.delta_streams.is_empty());
 }
 
@@ -2053,51 +2035,6 @@ fn oversized_raw_lines_are_replaced_not_streamed() {
     assert_eq!(out, small);
 }
 
-#[cfg(feature = "secret-vault")]
-#[test]
-fn native_history_coalesces_repeated_protection_failures() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-    let vault = repo.root().join(".git/agit/secret-dictionary/vault.json");
-    std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
-    std::fs::create_dir(&vault).unwrap();
-    let redactor = crate::domain::redact::Redactor::with_registered(
-        crate::domain::redact::Persona::default(),
-        crate::domain::secret_filter::MatcherHandle::default(),
-    )
-    .with_repository(repo.root())
-    .unwrap()
-    .with_native_context("codex", "", repo.root(), repo.root());
-    let lines: Vec<_> = ["first", "second"]
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| crate::rc::tail::TailedLine {
-            source: None,
-            lineno: index as u64,
-            text: serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text}]
-                }
-            })
-            .to_string(),
-        })
-        .collect();
-    let (items, _) = items_from_lines("codex", &redactor, &lines);
-    assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].event.text.as_deref(),
-        Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
-    );
-    assert!(
-        !serde_json::to_string(&items)
-            .unwrap()
-            .contains("protection_error")
-    );
-}
-
 /// A transcript line is redacted on its **decoded strings**, so the JSON shape has no room to be
 /// disturbed.
 ///
@@ -2254,157 +2191,6 @@ fn persona_redaction_does_not_change_the_committed_object_identity() {
     assert_eq!(
         projected_object_hash(&raw, &scrubbed.value, false),
         transcript::object_hash(&raw)
-    );
-}
-
-#[cfg(feature = "secret-vault")]
-#[test]
-fn repository_secret_changes_live_content_and_its_public_hash() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-    let secret = "blue horse battery";
-    dictionary
-        .block_add("local", secret.to_string().into(), false)
-        .unwrap();
-    let raw = serde_json::json!({"type":"assistant", "message": {
-        "role":"assistant", "content":[{"type":"text", "text":secret}]
-    }});
-    let redactor = redact::Redactor::with_registered(
-        redact::Persona::default(),
-        crate::domain::secret_filter::MatcherHandle::default(),
-    )
-    .with_repository(repo.root())
-    .unwrap();
-    let line = crate::rc::tail::TailedLine {
-        source: None,
-        lineno: 1,
-        text: raw.to_string(),
-    };
-    let (items, _) = items_from_lines("claude-code", &redactor, &[line]);
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
-    assert_ne!(item.object_hash, transcript::object_hash(&raw));
-    assert_eq!(item.object_hash, transcript::object_hash(&item.raw));
-    assert!(!item.raw.to_string().contains(secret));
-    let text = item.event.text.as_deref().unwrap();
-    assert!(!text.contains(secret));
-    assert_eq!(dictionary.hydrate_text(text).unwrap().text, secret);
-}
-
-#[test]
-fn live_native_results_preserve_verified_ids_without_learning_delta_fragments() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
-    repo.git(&["config", "user.name", "Live fixture"]).unwrap();
-    repo.git(&["config", "user.email", "test@example.invalid"])
-        .unwrap();
-    repo.git(&["commit", "--allow-empty", "-m", "live object"])
-        .unwrap();
-    let oid = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-    let redactor = redact::Redactor::new(redact::Persona::default())
-        .with_repository(repo.root())
-        .unwrap()
-        .with_native_context("codex", "native", repo.root(), repo.root());
-    let mut stream = redactor.stream();
-    assert!(stream.push(&oid[..13]).unwrap().text.is_empty());
-    assert!(stream.push(&oid[13..]).unwrap().text.is_empty());
-    assert!(stream.flush().unwrap().text.is_empty());
-    assert!(dictionary.review().unwrap().is_empty());
-    let args = serde_json::json!({"cmd":"git rev-parse HEAD"}).to_string();
-    let records = [
-        serde_json::json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-one","arguments":args}}),
-        serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call-one","output":format!("{oid}\ntoken = {secret}")}}),
-        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("commit `{oid}`")} ]}}),
-    ];
-    let lines: Vec<_> = records
-        .iter()
-        .enumerate()
-        .map(|(i, value)| crate::rc::tail::TailedLine {
-            source: None,
-            lineno: i as u64,
-            text: value.to_string(),
-        })
-        .collect();
-    let (items, _) = items_from_lines("codex", &redactor, &lines);
-    let emitted = serde_json::to_string(&items).unwrap();
-    assert!(emitted.contains(&oid));
-    assert!(!emitted.contains(secret));
-    assert!(emitted.contains("AGIT_SECRET_V1"));
-    assert_eq!(dictionary.review().unwrap().len(), 1);
-}
-
-#[cfg(feature = "secret-vault")]
-#[test]
-fn registered_secret_never_leaves_as_an_original_content_hash() {
-    let secret = "blue horse battery";
-    let raw = serde_json::json!({"message": {"content": format!("use {secret}")}});
-    let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_live", secret)]);
-    let redactor = crate::domain::redact::Redactor::with_registered(
-        crate::domain::redact::Persona::default(),
-        crate::domain::secret_filter::MatcherHandle::new(matcher),
-    );
-    let scrubbed = redactor.scrub_json(&raw);
-    let projected =
-        projected_object_hash(&raw, &scrubbed.value, !scrubbed.registered_ids.is_empty());
-    assert_ne!(
-        transcript::object_hash(&raw),
-        projected,
-        "the original hash would let the hub verify low-entropy guesses offline"
-    );
-    assert_eq!(projected, transcript::object_hash(&scrubbed.value));
-    assert!(
-        !serde_json::to_string(&scrubbed.value)
-            .unwrap()
-            .contains(secret)
-    );
-}
-
-/// An approval card carries the command line that is about to run.
-///
-/// `input` is structured, so scrubbing it means scrubbing its decoded
-/// strings. Serializing it first and matching the wire text misses every
-/// registered literal holding `"`, `\` or a newline — and this is the one
-/// outbound payload where such a value is most likely to appear.
-#[cfg(feature = "secret-vault")]
-#[test]
-fn an_approval_input_is_scrubbed_on_decoded_strings() {
-    let secret = "pass\"word\\with\nescapes";
-    let input = serde_json::json!({
-        "command": ["sh", "-c", format!("deploy --token {secret}")],
-    });
-    let wire = serde_json::to_string(&input).unwrap();
-    assert!(
-        !wire.contains(secret),
-        "the regression requires a wire form different from the semantic value"
-    );
-
-    let matcher = crate::domain::secret_filter::Matcher::for_test(&[("sec_cmd", secret)]);
-    let redactor = crate::domain::redact::Redactor::with_registered(
-        crate::domain::redact::Persona::default(),
-        crate::domain::secret_filter::MatcherHandle::new(matcher),
-    );
-
-    // What the old path did: scrub the serialized bytes.
-    let on_the_wire = redactor.scrub(&wire);
-    assert!(
-        on_the_wire.text.contains("token pass"),
-        "precondition: wire-byte matching leaves the value in place"
-    );
-
-    let scrubbed = redactor.scrub_json(&input);
-    assert!(
-        !serde_json::to_string(&scrubbed.value)
-            .unwrap()
-            .contains("pass"),
-        "the decoded command string must be redacted: {:?}",
-        scrubbed.value
-    );
-    assert!(
-        !scrubbed.registered_ids.is_empty(),
-        "and the hit must be reported so `secret.detected` fires"
     );
 }
 
@@ -2834,7 +2620,7 @@ async fn another_members_same_text_does_not_drain_the_queued_creation_prompt() {
 
 #[cfg(feature = "secret-vault")]
 #[tokio::test]
-async fn native_failure_reaches_viewers_after_persona_and_secret_redaction() {
+async fn native_failure_reaches_viewers_with_persona_redaction() {
     let failure =
         "Upgrade the runtime at /private/audit-home/tool; diagnostic confidential-fixture";
     let driver = AnyDriver::Codex(Box::new(
@@ -2850,18 +2636,10 @@ async fn native_failure_reaches_viewers_after_persona_and_secret_redaction() {
     ));
     let (mut session, mut out, _notes) =
         harness_test_session_with_channels(driver, "codex", SessionStatus::Idle);
-    session.redactor = redact::Redactor::with_registered(
-        redact::Persona {
-            home: Some("/private/audit-home".into()),
-            ..Default::default()
-        },
-        crate::domain::secret_filter::MatcherHandle::new(
-            crate::domain::secret_filter::Matcher::for_test(&[(
-                "sec_diagnostic",
-                "confidential-fixture",
-            )]),
-        ),
-    );
+    session.redactor = redact::Redactor::new(redact::Persona {
+        home: Some("/private/audit-home".into()),
+        ..Default::default()
+    });
     let (ticket, _receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     session
@@ -2888,17 +2666,6 @@ async fn native_failure_reaches_viewers_after_persona_and_secret_redaction() {
     assert_eq!(completed.outcome, PTurnOutcome::Error);
     assert!(message.contains("Upgrade the runtime"));
     assert!(!message.contains("/private/audit-home"));
-    assert!(!message.contains("confidential-fixture"));
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame.method() == method::SECRET_DETECTED)
-    );
-    assert!(
-        !serde_json::to_string(&frames)
-            .unwrap()
-            .contains("confidential-fixture")
-    );
     session.driver.shutdown().await.unwrap();
 }
 

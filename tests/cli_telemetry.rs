@@ -715,7 +715,12 @@ fn reply_to_login(listener: &TcpListener, child: &mut std::process::Child, body:
             stream.read_exact(&mut byte).unwrap();
             header.push(byte[0]);
         }
-        if header.starts_with(b"GET /api/cli/version ") {
+        let path = String::from_utf8_lossy(&header)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        if path == "/api/cli/version" || path.starts_with("/api/me/privacy/") {
             write!(
                 stream,
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -723,6 +728,10 @@ fn reply_to_login(listener: &TcpListener, child: &mut std::process::Child, body:
             .unwrap();
             continue;
         }
+        assert!(
+            path.starts_with("/api/auth/"),
+            "unexpected login request: {path}"
+        );
         let length = String::from_utf8_lossy(&header)
             .lines()
             .find_map(|line| {

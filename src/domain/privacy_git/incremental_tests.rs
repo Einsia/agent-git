@@ -1,13 +1,10 @@
 use super::*;
-use crate::domain::{
-    secret_filter::{Matcher, MatcherHandle, RepositoryDictionary},
-    storage, transcript,
-};
+use crate::domain::{storage, transcript};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crypto_box::SecretKey;
 
-/// Source identity alone cannot authorize reuse after policy, secret rules, dictionary or path
-/// permissions change. New secret rules may share a generation with the previous rule set.
+/// A cached projection must bind path permissions and recipient identity; an edited local
+/// index cannot authorize reuse even when the source commit is unchanged.
 #[test]
 fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index() {
     let temp = tempfile::tempdir().unwrap();
@@ -53,8 +50,7 @@ fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index()
         &STANDARD.encode(key.public_key().as_bytes()),
     )
     .unwrap();
-    let registered = MatcherHandle::new(Matcher::for_test(&[("one", "Unrelated value")]));
-    let redactor = Redactor::with_registered(Default::default(), registered.clone());
+    let redactor = Redactor::new(Default::default());
     let prepare = || {
         ProjectedHistory::prepare_with_redactor(
             &source,
@@ -117,33 +113,6 @@ fn incremental_reuse_rechecks_mutable_dependencies_and_authenticates_its_index()
         assert_eq!(prepare().unwrap().preparations, 1);
     }
 
-    let new_rules = Matcher::for_test(&[("two", "Public request")]);
-    assert_eq!(new_rules.generation(), registered.snapshot().generation());
-    registered.replace(new_rules);
-    let changed = prepare().unwrap();
-    assert_eq!(changed.preparations, 1);
-    let scope = crate::domain::repo::publication::InspectionScope::incremental(
-        &changed.repo.clone().exact_root_inspection(),
-        &changed.plan,
-        [published].into_iter(),
-    )
-    .unwrap();
-    assert_eq!(scope.commits, changed.plan.commit_objects());
-    assert!(
-        !changed
-            .inspection_views
-            .values()
-            .any(|text| text.contains("Public request"))
-    );
-    drop(changed);
-    assert_eq!(prepare().unwrap().preparations, 0);
-
-    RepositoryDictionary::open(source.root())
-        .unwrap()
-        .import_publication_values(&BTreeSet::from(["new dictionary value".into()]))
-        .unwrap();
-    assert_eq!(prepare().unwrap().preparations, 1);
-    assert_eq!(prepare().unwrap().preparations, 0);
     policy.exclude.push("src/**".into());
     policy.save(&source).unwrap();
     let denied = prepare().unwrap();

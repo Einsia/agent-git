@@ -209,7 +209,7 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[tokio::test]
-async fn sticky_shared_home_allows_watch_and_settlement_without_trusting_replaceable_ancestors() {
+async fn sticky_shared_home_allows_settlement_and_watch_skips_unsafe_privacy_context() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let lab = Lab::new(0o002);
     fs::set_permissions(&lab.root, fs::Permissions::from_mode(0o3775)).unwrap();
@@ -291,16 +291,16 @@ async fn sticky_shared_home_allows_watch_and_settlement_without_trusting_replace
         })
         .await
         .unwrap();
-        if id >= 3 {
-            assert_eq!(response["error"]["code"], 305, "{response}");
-        } else {
-            assert!(response["error"].is_null(), "{response}");
+        assert!(response["error"].is_null(), "{response}");
+        if id >= 2 {
+            assert_eq!(response["result"]["read_only"], true, "{response}");
         }
     }
     assert_eq!(
         fs::metadata(&lab.root).unwrap().permissions().mode() & 0o7777,
         0o3775
     );
+    assert_eq!(mode(&lab.state.join("store/codex")), 0o777);
 }
 
 #[test]

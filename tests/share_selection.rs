@@ -15,8 +15,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-#[path = "support/privacy_policy_sources.rs"]
-mod privacy_policy_sources;
+#[path = "support/publication_identity.rs"]
+mod publication_identity;
 #[path = "support/publication_text.rs"]
 mod publication_text;
 
@@ -27,9 +27,6 @@ struct Hub {
     worker: Option<std::thread::JoinHandle<()>>,
     rotate_key: Arc<AtomicBool>,
     legacy: Arc<AtomicBool>,
-    hub_rules: Arc<Mutex<Vec<Value>>>,
-    policy_drift: Arc<AtomicUsize>,
-    policy_reads: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Hub {
@@ -45,12 +42,6 @@ impl Hub {
         let rotation = rotate_key.clone();
         let legacy = Arc::new(AtomicBool::new(false));
         let old_protocol = legacy.clone();
-        let hub_rules = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let rules = hub_rules.clone();
-        let policy_drift = Arc::new(AtomicUsize::new(0));
-        let drift = policy_drift.clone();
-        let policy_reads = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let reads = policy_reads.clone();
         let policy_hub = url.clone();
         let worker = std::thread::spawn(move || {
             let key_reads = AtomicUsize::new(0);
@@ -92,33 +83,13 @@ impl Hub {
                                 header.lines().next().unwrap().split_whitespace();
                             let method = request_line.next().unwrap();
                             let target = request_line.next().unwrap();
-                            if let Some((status, mut body)) = privacy_policy_sources::route(
+                            if let Some((status, body)) = publication_identity::route(
                                 &policy_hub,
                                 "me",
                                 method,
                                 target,
                                 &bytes[end + 4..end + 4 + length],
                             ) {
-                                if target == "/api/privacy/policy-sources/resolve" {
-                                    let request: Value =
-                                        serde_json::from_slice(&bytes[end + 4..end + 4 + length])
-                                            .unwrap();
-                                    let mut reads = reads.lock().unwrap();
-                                    let scope = if request["repository"].is_null() {
-                                        1
-                                    } else {
-                                        2
-                                    };
-                                    if drift.load(Ordering::SeqCst) == scope
-                                        && reads
-                                            .iter()
-                                            .any(|read| read["repository"] == request["repository"])
-                                    {
-                                        body["revision"] = json!("revision-2");
-                                    }
-                                    reads.push(request);
-                                    body["sources"] = json!(*rules.lock().unwrap());
-                                }
                                 let body = body.to_string();
                                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                                 break None;
@@ -186,9 +157,6 @@ impl Hub {
             worker: Some(worker),
             rotate_key,
             legacy,
-            hub_rules,
-            policy_drift,
-            policy_reads,
         }
     }
 
@@ -759,116 +727,12 @@ fn unbound_live_encrypted_shares_refuse_before_upload() {
 }
 
 #[test]
-fn shares_refresh_account_and_repository_rules_before_upload() {
-    for (target, scope) in [("unbound-native", 1), ("me/paper@chosen", 2)] {
-        let f = Fixture::new("EXCLUDED-LOG");
-        f.native("unbound-native");
-        f.hub.policy_drift.store(scope, Ordering::SeqCst);
-        let output = f.run(&[target, "--public"], None);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("mandatory Hub privacy rules changed"),
-            "{output:?}"
-        );
-        assert!(f.hub.payloads().is_empty());
-        let reads = f.hub.policy_reads.lock().unwrap();
-        assert!(reads.iter().any(|read| read["repository"].is_null()));
-        if scope == 2 {
-            assert!(reads.iter().any(|read| read["repository"] == "me/paper"));
-        }
-    }
-}
-
-#[test]
-fn privacy_exports_refresh_source_rules_and_recipient_before_releasing_output() {
-    use agit::domain::privacy::PrivacyPolicy;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
+fn privacy_exports_preserve_output_when_the_recipient_changes() {
     let f = Fixture::new("EXCLUDED-LOG");
-    f.repo
-        .set_remote_named("origin", &format!("{}/me/paper.git", f.hub.url))
-        .unwrap();
-    let path = f.home().join("managed.txt");
-    std::fs::write(&path, "LOCAL_FILE_BODY").unwrap();
-    let raw = [
-        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"managed","name":"Read","input":{"file_path":path}}]}}),
-        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"managed","content":"MANAGED_CAPTURED_TEXT"}]}}),
-        json!({"type":"assistant","message":{"role":"assistant","content":"Visible export reply"}}),
-    ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
-    let log = transcript::wrap_lines(&raw, "claude-code", &format!("agit-{}", "b".repeat(40)));
     f.repo.git(&["checkout", "chosen"]).unwrap();
-    storage::write_snapshot(f.repo.root(), &log, &log).unwrap();
-    f.repo.add_all().unwrap();
-    f.repo.commit("Session with managed tool text").unwrap();
-    PrivacyPolicy {
-        workspace: Some(f.home().to_path_buf()),
-        ..Default::default()
-    }
-    .save(&f.repo)
-    .unwrap();
-    *f.hub.hub_rules.lock().unwrap() =
-        vec![json!({"version":1,"id":"organization","revision":"r1","exclude":["managed.txt"]})];
-    let output_path = f.home().join("export.json");
-    let output_path = output_path.to_str().unwrap();
-    let key = STANDARD.encode(SecretKey::from([31; 32]).public_key().as_bytes());
-    let args = [
-        "me/paper@chosen",
-        "--format",
-        "privacy-envelope",
-        "--viewing-public-key",
-        key.as_str(),
-        "--out",
-        output_path,
-    ];
-
-    let result = f.run_command(
-        "export",
-        &["me/paper@chosen", "--privacy", "--out", output_path],
-        None,
-    );
-    assert!(result.status.success(), "{result:?}");
-    let public = std::fs::read_to_string(output_path).unwrap();
-    assert!(public.contains("Visible export reply"));
-    assert!(!public.contains("MANAGED_CAPTURED_TEXT"));
-
-    let result = f.run_command("export", &args, None);
-    assert!(result.status.success(), "{result:?}");
-    let envelope = PrivacyEnvelope::parse(&std::fs::read(output_path).unwrap()).unwrap();
-    assert!(
-        !envelope
-            .public_projection
-            .to_string()
-            .contains("MANAGED_CAPTURED_TEXT")
-    );
-    let private = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
-    let (original, _) = private.session_bytes().unwrap();
-    assert!(original.contains("MANAGED_CAPTURED_TEXT"));
-    assert!(!original.contains("LOCAL_FILE_BODY"));
-    assert!(
-        f.hub
-            .policy_reads
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|read| read["repository"] == "me/paper")
-    );
-
-    std::fs::write(output_path, "UNCHANGED_OUTPUT").unwrap();
-    f.hub.policy_reads.lock().unwrap().clear();
-    f.hub.policy_drift.store(2, Ordering::SeqCst);
-    let result = f.run_command("export", &args, None);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("mandatory Hub privacy rules changed"),
-        "{result:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(output_path).unwrap(),
-        "UNCHANGED_OUTPUT"
-    );
-    f.hub.policy_drift.store(0, Ordering::SeqCst);
-
     f.accept_current();
+    let output_path = f.home().join("export.json");
+    std::fs::write(&output_path, "UNCHANGED_OUTPUT").unwrap();
     f.hub.rotate_key.store(true, Ordering::SeqCst);
     let result = f.run_command(
         "export",
@@ -877,7 +741,7 @@ fn privacy_exports_refresh_source_rules_and_recipient_before_releasing_output() 
             "--format",
             "privacy-envelope",
             "--out",
-            output_path,
+            output_path.to_str().unwrap(),
         ],
         None,
     );
@@ -889,14 +753,6 @@ fn privacy_exports_refresh_source_rules_and_recipient_before_releasing_output() 
     assert_eq!(
         std::fs::read_to_string(output_path).unwrap(),
         "UNCHANGED_OUTPUT"
-    );
-    assert!(
-        f.hub
-            .policy_reads
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|read| read["repository"].is_null())
     );
     assert!(f.hub.payloads().is_empty());
 }
@@ -928,9 +784,6 @@ fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
         .unwrap(),
     )
     .unwrap();
-    *source_hub.hub_rules.lock().unwrap() = vec![
-        json!({"version":1,"id":"source-organization","revision":"r1","exclude":["src/managed.rs"]}),
-    ];
     let private_file = f.home().join("src/private.rs");
     let managed_file = f.home().join("src/managed.rs");
     let public_file = f.home().join("src/main.rs");
@@ -963,6 +816,7 @@ fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
     f.repo.git(&["tag", "privacy-saved"]).unwrap();
     f.repo.git(&["checkout", "main"]).unwrap();
     let policy = PrivacyPolicy {
+        exclude: vec!["src/managed.rs".into()],
         workspace: Some(f.home().to_path_buf()),
         replacements: vec![ReplacementRule {
             pattern: "PRIVATE_LABEL".into(),
@@ -1031,33 +885,6 @@ fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
         assert!(!preview.contains("HIDDEN_HISTORY"));
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
-    assert!(
-        source_hub
-            .policy_reads
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|read| read["repository"] == "me/paper")
-    );
-    assert!(
-        f.hub
-            .policy_reads
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|read| read["repository"].is_null())
-    );
-    source_hub.policy_drift.store(2, Ordering::SeqCst);
-    // Each operation starts a new review; the mutation must happen between its two resolutions.
-    source_hub.policy_reads.lock().unwrap().clear();
-    let before = f.hub.payloads().len();
-    let output = f.run(&["me/paper@chosen", "--public"], None);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("mandatory Hub privacy rules changed"),
-        "{output:?}"
-    );
-    assert_eq!(f.hub.payloads().len(), before);
 }
 
 #[test]

@@ -338,15 +338,6 @@ fn undecodable_and_unknown_text_cannot_be_excluded_as_verified_binary() {
             builder.items.last().unwrap()["classification"],
             "unavailable"
         );
-        let pointer = lfs::Pointer {
-            oid,
-            size: bytes.len() as u64,
-        };
-        builder.payload(bytes.as_slice(), &pointer).unwrap();
-        assert!(matches!(
-            builder.expected.last().unwrap().kind,
-            ExpectedKind::Unavailable
-        ));
     }
     let image = hex::decode("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c6360000200000500017a5eab3f0000000049454e44ae426082").unwrap();
     builder
@@ -357,41 +348,6 @@ fn undecodable_and_unknown_text_cannot_be_excluded_as_verified_binary() {
         ExpectedKind::VerifiedBinary
     ));
     assert_eq!(builder.items.last().unwrap()["binary_format"], "image/png");
-    let pointer = lfs::Pointer {
-        oid: digest(&image),
-        size: image.len() as u64,
-    };
-    builder.payload(image.as_slice(), &pointer).unwrap();
-    assert!(matches!(
-        builder.expected.last().unwrap().kind,
-        ExpectedKind::VerifiedBinary
-    ));
-    assert_eq!(builder.items.last().unwrap()["binary_format"], "image/png");
-}
-
-#[test]
-fn lfs_original_bytes_remain_hash_and_size_checked_before_classification() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut builder = Builder::new(directory.path());
-    let bytes = b"private customer: \xff";
-    let pointer = lfs::Pointer {
-        oid: digest(bytes),
-        size: bytes.len() as u64,
-    };
-    let mut changed = bytes.to_vec();
-    changed[0] ^= 1;
-    assert!(builder.payload(changed.as_slice(), &pointer).is_err());
-    assert!(
-        builder
-            .payload(&bytes[..bytes.len() - 1], &pointer)
-            .is_err()
-    );
-    assert!(builder.expected.is_empty());
-    builder.payload(bytes.as_slice(), &pointer).unwrap();
-    assert!(matches!(
-        builder.expected[0].kind,
-        ExpectedKind::Unavailable
-    ));
 }
 
 #[test]

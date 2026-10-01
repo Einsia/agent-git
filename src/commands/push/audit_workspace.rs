@@ -71,7 +71,7 @@ impl AuditWorkspace {
             )?;
         }
         for pointer in captured.pointers() {
-            builder.payload(captured.open_payload(pointer)?, pointer)?;
+            builder.payload(pointer)?;
         }
         let index = serde_json::to_vec_pretty(&builder.contexts)?;
         builder.reserve(index.len())?;
@@ -112,7 +112,7 @@ impl AuditWorkspace {
             "items":items,"snapshots":snapshots,
             "path_and_reference_index":"publication-paths",
             "coverage":"Complete raw published carriers remain required; native LOG omits envelope metadata.",
-            "binary_scope":"Only raw Git tree structure and bounded PNG images with validated critical chunks, checksums, and complete noninterlaced byte-depth scanlines are excluded. Supported UTF-8 is always text. PNG ancillary chunks, unsupported images, other encodings, and unknown bytes remain unavailable."
+            "binary_scope":"All LFS payloads, raw Git tree structure and bounded PNG images with validated critical chunks, checksums, and complete noninterlaced byte-depth scanlines are excluded. Non-LFS UTF-8 is text. PNG ancillary chunks, unsupported images, other encodings, and unknown bytes remain unavailable."
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         ensure!(
@@ -304,39 +304,20 @@ impl<'a> Builder<'a> {
         Ok(bytes)
     }
 
-    fn payload(&mut self, input: impl Read, pointer: &lfs::Pointer) -> Result<()> {
+    fn payload(&mut self, pointer: &lfs::Pointer) -> Result<()> {
         pointer.validate()?;
         ensure!(
             self.items.len() < audit_report::MAX_ITEMS,
             "audit evidence item limit exceeded"
         );
-        self.work.spend(1)?;
-        ensure!(
-            pointer.size <= (MAX_BYTES - self.bytes).min(MAX_OBJECT_BYTES) as u64,
-            "audit LFS payload exceeds its evidence limit"
-        );
-        let mut bytes = Vec::new();
-        input.take(pointer.size + 1).read_to_end(&mut bytes)?;
-        let mut remaining = (MAX_BYTES - self.bytes) as u64;
-        let payload = lfs::inspection::read(
-            bytes.as_slice(),
-            pointer.size,
-            Some(pointer),
-            MAX_OBJECT_BYTES as u64,
-            &mut remaining,
-        )?;
-        ensure!(
-            payload != lfs::inspection::Payload::TooLarge,
-            "audit LFS text exceeds its evidence limit"
-        );
-        self.reserve(bytes.len())?;
-        self.item(
+        // LFS content is outside privacy review; capture and publication verify its identity.
+        self.binary(
             &format!("lfs-{}", pointer.oid),
             "lfs",
             &pointer.oid,
-            &bytes,
-            false,
-        )
+            pointer.size,
+        );
+        Ok(())
     }
 
     fn item(

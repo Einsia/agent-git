@@ -7,6 +7,7 @@ pub(crate) const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V1:";
 pub(crate) const TOKEN_SUFFIX: &str = "}}";
 pub(crate) const CANONICAL_TOKEN_LEN: usize =
     TOKEN_PREFIX.len() + 36 + 1 + 4 + 32 + TOKEN_SUFFIX.len();
+const V2_PREFIX: &str = "{{AGIT_SECRET_V2:";
 const MAX_TOKEN_LEN: usize = CANONICAL_TOKEN_LEN + 2;
 #[cfg(feature = "secret-vault")]
 const MAX_ESCAPED_TOKEN_LEN: usize = MAX_TOKEN_LEN * 6;
@@ -23,6 +24,18 @@ pub(crate) fn token_segments(text: &str) -> TokenSegments<'_> {
 /// Recognize repository tokens after decoding literal and JSON unicode-escaped bytes. Raw scans
 /// run before JSON decoding, so every accepted spelling must remain opaque in both forms.
 fn valid_token(token: &str) -> bool {
+    if token.starts_with(V2_PREFIX) {
+        return token
+            .strip_prefix(V2_PREFIX)
+            .and_then(|body| body.strip_suffix(TOKEN_SUFFIX))
+            .and_then(|body| body.split_once(':'))
+            .is_some_and(|(dictionary, record)| {
+                dictionary.len() == 36
+                    && record.len() == 36
+                    && uuid::Uuid::parse_str(dictionary).is_ok()
+                    && uuid::Uuid::parse_str(record).is_ok()
+            });
+    }
     if CANONICAL.is_match(token) {
         return true;
     }
@@ -210,7 +223,10 @@ fn decoded_token_end(text: &str, start: usize) -> Option<usize> {
         let (byte, next) = decoded_unit(text, cursor)?;
         decoded.push(byte);
         cursor = next;
-        if decoded.len() <= TOKEN_PREFIX.len() && !TOKEN_PREFIX.as_bytes().starts_with(&decoded) {
+        if decoded.len() <= TOKEN_PREFIX.len()
+            && !TOKEN_PREFIX.as_bytes().starts_with(&decoded)
+            && !V2_PREFIX.as_bytes().starts_with(&decoded)
+        {
             return None;
         }
         if decoded.ends_with(TOKEN_SUFFIX.as_bytes()) {

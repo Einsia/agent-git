@@ -46,9 +46,6 @@ pub(super) fn run(
         !matches!(intent.action, Action::Copy(_)),
         "publish original local data to a separate destination with --to owner/new-repository; repository promotion cannot change encryption mode"
     );
-    if let Some(code) = synchronize_declarations(&repo, &client, &intent, args.dry_run)? {
-        return Ok(code);
-    }
     println!(
         "Destination encryption: disabled (ordinary source history; no viewing password required)."
     );
@@ -59,7 +56,7 @@ pub(super) fn run(
         "automatic publication cannot replace an interactive audit decision"
     );
     // Automatic ordinary publication needs only the repository's push.auto choice. It passes the
-    // same identity, write-access and secret gates as an explicit push, and a missing destination
+    // same identity, write-access and integrity checks as an explicit push, and a missing destination
     // is created with the non-interactive visibility default. Encrypted publication keeps its
     // saved-consent requirement.
     if automatic && !repo.auto_push_enabled()? {
@@ -108,48 +105,19 @@ pub(super) fn run(
             .as_ref()
             .map(|identity| (intent.url.as_str(), identity)),
     )?;
-    let inspected = apply_copy_policy(captured, &repo, &client, &intent)?.inspect(limits);
+    let inspected = captured.inspect(limits);
     spinner.finish_and_clear();
     emit_push_target(&checkout, branches, selection_source);
-    let accept_findings = intent.accept_secret_findings;
-    let inspected = match inspected {
-        ContentInspection::Complete(complete) => Ok((complete, false)),
-        ContentInspection::Blocked(blocked)
-            if accept_findings && blocked.reason() == InspectionFailure::Incomplete =>
-        {
-            let complete = blocked
-                .accept_incomplete()
-                .context("an incomplete inspection could not be accepted")?;
-            Ok((complete, true))
-        }
-        ContentInspection::Blocked(blocked) => Err(blocked),
-    };
-    let (complete, partial) = match inspected {
-        Ok(inspected) => inspected,
-        Err(blocked) => {
+    let complete = match inspected {
+        ContentInspection::Complete(complete) => complete,
+        ContentInspection::Blocked(blocked) => {
             show_inspection(blocked.report());
             ui::error(&blocked.reason().to_string());
             return Ok(inspection_failure_code(blocked.reason()));
         }
     };
     show_inspection(complete.report());
-    if partial {
-        ui::warning(
-            "Inspection stopped before the end of the outgoing content; findings are accepted for this destination.",
-        );
-    }
-    if complete.has_findings() && !accept_findings {
-        ui::error(
-            "public ordinary publication contains secret findings; resolve them or explicitly accept them with --allow-secrets",
-        );
-        return Ok(ExitCode::Policy);
-    }
-    if complete.has_findings() {
-        ui::warning(&format!(
-            "Secret findings are accepted for this {} ordinary publication.",
-            intent.visibility
-        ));
-    }
+    let accept_findings = intent.accept_secret_findings;
     let displayed = intent.json();
     println!("Publication destination: {displayed}");
     println!("Publication refs: {}", serde_json::to_string(&plan)?);
@@ -215,30 +183,6 @@ pub(super) fn run(
         .context("the confirmed publication destination is unavailable")?;
     intent.verify_observed(&observed, Some(&remote.identity.agent_id))?;
     intent.verify_write_access(&client, &remote.identity.agent_id)?;
-    if intent.separate_target.is_none() && crate::commands::secret_vault::has_policy_state(&repo)? {
-        let result = if remote.first_publish {
-            crate::commands::secret_vault::synchronize_target(
-                &repo,
-                &client,
-                &intent.owner,
-                &intent.name,
-                &remote.identity,
-                false,
-            )
-        } else {
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-                .bind_declarations(&crate::domain::secret_filter::DeclarationTarget {
-                    hub: remote.identity.hub.clone(),
-                    repository_id: remote.identity.agent_id.clone(),
-                })
-        };
-        if let Some(code) = crate::commands::secret_vault::report_sync_for_push(
-            result,
-            intent.accept_secret_findings,
-        )? {
-            return Ok(code);
-        }
-    }
     complete.verify_source(&repo)?;
     if let Some(selection) = &local_target {
         selection.bind(&repo, &remote.identity)?;

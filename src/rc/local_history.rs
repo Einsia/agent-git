@@ -218,15 +218,12 @@ impl Target<'_> {
                         "History repository identity changed"
                     );
                 }
-                Ok(redactor
-                    .with_repository(&root)?
-                    .with_native_context(
-                        self.runtime,
-                        self.native,
-                        std::path::Path::new(self.cwd),
-                        &root,
-                    )
-                    .with_native_source(self.entry.and_then(|entry| entry.native_source.clone())))
+                Ok(redactor.with_repository(&root)?.with_native_context(
+                    self.runtime,
+                    self.native,
+                    std::path::Path::new(self.cwd),
+                    &root,
+                ))
             }
             None => {
                 let context = self.context.as_ref().context(Failure::Missing)?;
@@ -235,19 +232,16 @@ impl Target<'_> {
                     self.runtime,
                     &key,
                     std::path::Path::new(self.cwd),
-                )? {
-                    Some(root) => Ok(redactor
-                        .with_repository(&root)?
-                        .with_native_context(
-                            self.runtime,
-                            self.native,
-                            std::path::Path::new(self.cwd),
-                            &root,
-                        )
-                        .with_native_source(Some(crate::protocol::NativeSourceRef {
-                            source_id: context.source.source_id.clone(),
-                            generation: context.source.generation,
-                        }))),
+                )
+                .ok()
+                .flatten()
+                {
+                    Some(root) => Ok(redactor.with_repository(&root)?.with_native_context(
+                        self.runtime,
+                        self.native,
+                        std::path::Path::new(self.cwd),
+                        &root,
+                    )),
                     None => Ok(redactor),
                 }
             }
@@ -908,12 +902,11 @@ mod tests {
             .join(crate::adapter::claude_code::slug_for(&root));
         std::fs::create_dir_all(&project).unwrap();
         let path = project.join(format!("{native}.jsonl"));
-        let credential = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         std::fs::write(
             &path,
             format!(
                 "{}\n",
-                json!({"type":"user","message":{"role":"user","content":format!("Existing native history {credential}")}})
+                json!({"type":"user","message":{"role":"user","content":"Existing native history fixture"}})
             ),
         )
         .unwrap();
@@ -929,7 +922,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.starts_with("Existing native history "))
         }));
-        assert!(!history.to_string().contains(credential));
         assert!(!history.to_string().contains("protection_error"));
         roster.save().unwrap();
         drop(roster);

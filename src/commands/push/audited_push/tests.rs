@@ -221,17 +221,6 @@ fn noncanonical_or_credentialed_git_destinations_are_refused() {
     }
 }
 
-/// Findings stop only content that anyone can read. An implementation that keyed acceptance on
-/// automatic publication would refuse every private auto-upload with a false positive, and one
-/// that ignored visibility would publish public findings unasked or accept them under encryption.
-#[test]
-fn secret_findings_gate_only_public_ordinary_publication() {
-    assert!(accepts_secret_findings(false, "private", false));
-    assert!(!accepts_secret_findings(false, "public", false));
-    assert!(accepts_secret_findings(false, "public", true));
-    assert!(!accepts_secret_findings(true, "private", true));
-}
-
 #[test]
 fn incomplete_inspection_and_native_failures_keep_their_exit_categories() {
     assert_eq!(

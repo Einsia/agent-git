@@ -414,7 +414,7 @@ fn native_boundary(
     log: &str,
     live: &str,
     records: &Records,
-    hydration_limit: Option<usize>,
+    _hydration_limit: Option<usize>,
 ) -> crate::Result<usize> {
     let committed = storage::parse_envelopes(log)?;
     ensure!(
@@ -432,33 +432,8 @@ fn native_boundary(
         .zip(&records.records)
         .all(|(a, b)| a.object_hash == b.hash);
     if !direct {
-        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-        let (committed_plain, live_plain) = if let Some(limit) = hydration_limit {
-            let mut reports = dictionary
-                .hydrate_batch_readonly_with_limits(
-                    &[log, live],
-                    limit,
-                    Some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
-                )?
-                .into_iter();
-            let committed = reports
-                .next()
-                .context("missing committed hydration result")??;
-            let live = reports
-                .next()
-                .context("missing native hydration result")??;
-            (committed, live)
-        } else {
-            dictionary
-                .hydrate_pair_readonly(log, live)
-                .context("the existing repository secret mappings cannot be read")?
-        };
         ensure!(
-            committed_plain.unresolved == 0 && live_plain.unresolved == 0,
-            "the repository secret mappings needed to verify the settled prefix are unavailable"
-        );
-        ensure!(
-            transcript::continuity_of_content(&committed_plain.text, &live_plain.text)
+            crate::domain::privacy::service::native_continuity(repo.root(), log, live)?
                 != transcript::Continuity::Diverged,
             "the native transcript was rewritten inside the settled prefix"
         );

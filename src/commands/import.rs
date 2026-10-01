@@ -1324,6 +1324,7 @@ fn birth_session_branch(
         || lk.agent.as_deref() != Some(agent)
         || recorded_owner(lk) != Some(owner);
     if rerouted && !(created && onto_commit.is_some()) {
+        lk.native_checkpoint = None;
         lk.baseline_bytes = None;
         lk.baseline_hash = None;
         lk.materialized_from = None;
@@ -1502,9 +1503,7 @@ pub(super) fn declare_session_line(
     // The birth metadata is already part of publishable history, so it must use the same
     // reversible projection as later settlement metadata. Leaving `cwd` in this commit gives the
     // publication scan an older cleartext object to inspect even when the first turn is protected.
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    dictionary.protect_metadata(&mut born, &global)?;
+    crate::domain::privacy::service::protect_metadata(repo.root(), &mut born);
     let born_text = meta::to_text(&born)?;
     let tree = super::new::fresh_session_tree(repo, &head, &born_text)?;
     let commit = super::plumbing::commit_tree(
@@ -1597,8 +1596,7 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
 /// # The copy does not follow the original
 ///
 /// The original session keeps growing; the copy stops at the moment of redaction — following the
-/// original would turn the privacy gate into a one-time action, and secrets appended later would
-/// slip into an already published lineage. Run `import --privacy` again to update it.
+/// original would append records outside the selected copy. Run `import --privacy` again to update it.
 fn privacy_copy(found: &Found) -> crate::Result<Option<Found>> {
     if found.runtime != "claude-code" {
         ui::error(&format!(
@@ -1664,22 +1662,14 @@ fn protect_privacy_copy(found: &Found, root: &Path) -> crate::Result<()> {
         .resolve(&found.session_id, None)
         .context("the local privacy copy is unavailable")?;
     let raw = std::fs::read_to_string(&path)?;
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(root)?;
-    let protected = dictionary.protect_session_jsonl(
+    let protected = crate::domain::privacy::service::transform(
+        Some(root),
         &raw,
-        &global,
-        found.runtime,
-        &found.session_id,
-        Path::new(found.cwd.as_deref().unwrap_or(".")),
-    )?;
-    anyhow::ensure!(
-        protected.intact == 0,
-        "privacy copy exceeds the reversible protection limit"
+        crate::domain::privacy::projector::Mode::ProtectJsonl,
     );
     let redactor =
         crate::domain::redact::Redactor::new(crate::domain::redact::Persona::this_machine());
-    let report = redactor.scrub_persona(&protected.text);
+    let report = redactor.scrub_persona(&protected.content);
     std::fs::write(&path, report.text)?;
     ui::success(&format!(
         "protected local copy: {}",
@@ -1928,8 +1918,13 @@ fn attach(
     };
     // Destination selection can wait on remote permissions. Its link snapshot cannot replace a
     // claim, supersession marker or watermark another writer publishes while that request waits.
-    if current.as_ref().map(Link::to_json).transpose()?
-        != existing.as_ref().map(Link::to_json).transpose()?
+    let claim_json = |link: &Link| {
+        let mut claim = link.clone();
+        claim.native_checkpoint = None;
+        claim.to_json()
+    };
+    if current.as_ref().map(claim_json).transpose()?
+        != existing.as_ref().map(claim_json).transpose()?
     {
         anyhow::bail!(
             "the session link changed during destination selection; inspect its current claim with `agit status`, then retry the import"
@@ -2202,95 +2197,6 @@ mod tests {
             meta::is_file_line_at(&r, "refs/heads/mine"),
             "the base is the file line"
         );
-    }
-
-    /// The declaration commit must protect credentials in workspace paths before they enter history.
-    #[test]
-    fn a_new_session_line_projects_its_workspace_metadata_before_publishing() {
-        let d = tempfile::tempdir().unwrap();
-        let repo = Repo::init(&d.path().join("repo")).unwrap();
-        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
-        super::super::init::scaffold(repo.root()).unwrap();
-        repo.add_all().unwrap();
-        repo.commit("main file line").unwrap();
-        repo.git(&["branch", "session"]).unwrap();
-
-        let secret = "AKIA4X7QZ2M5RT6VW3JH";
-        let cwd = format!("/work/{secret}");
-        let link = Link {
-            source: "codex".into(),
-            session_id: "synthetic-session".into(),
-            cwd: Some(cwd.clone()),
-            ..Link::new("codex", "synthetic-session", None)
-        };
-        let published = declare_session_line(&repo, "session", &link)
-            .unwrap()
-            .expect("the branch tip must move");
-        let metadata = meta::read_at_ref(&repo, &published).unwrap();
-
-        assert_ne!(metadata.cwd, cwd);
-        assert!(metadata.cwd.contains("AGIT_SECRET_V1:"));
-        assert!(
-            !repo
-                .show_raw(&published, meta::FILE)
-                .unwrap()
-                .contains(secret)
-        );
-    }
-
-    /// A failed birth leaves no branch that can masquerade as a file line on the next retry.
-    #[test]
-    fn failed_birth_protection_removes_the_branch_before_retry() {
-        let d = tempfile::tempdir().unwrap();
-        let repo_dir = d.path().join("repo");
-        let repo = Repo::init(&repo_dir).unwrap();
-        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
-        super::super::init::scaffold(repo.root()).unwrap();
-        repo.add_all().unwrap();
-        repo.commit("main file line").unwrap();
-
-        let store = Store::at(d.path().join("store"));
-        let mut link = Link::new("codex", "retry-session", None);
-        link.cwd = Some("/work".into());
-        link::write(&store, &link).unwrap();
-
-        let vault = repo_dir.join(".git/agit/secret-dictionary/vault.json");
-        std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
-        std::fs::write(&vault, b"corrupt dictionary").unwrap();
-        let failed = birth_session_branch(
-            &mut link,
-            &store,
-            "photo",
-            "alice",
-            "alice",
-            repo_dir.clone(),
-            repo,
-            "retry".into(),
-            None,
-            None,
-            None,
-        );
-        assert!(failed.is_err());
-        let repo = Repo::open(&repo_dir).unwrap();
-        assert!(!repo.has_ref("refs/heads/retry"));
-
-        std::fs::remove_file(&vault).unwrap();
-        let retried = birth_session_branch(
-            &mut link,
-            &store,
-            "photo",
-            "alice",
-            "alice",
-            repo_dir.clone(),
-            repo,
-            "retry".into(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(retried, Placed::Ready(_)));
-        assert!(Repo::open(&repo_dir).unwrap().has_ref("refs/heads/retry"));
     }
 
     /// A legacy repo with no `main` still yields a base (the current head) instead of failing.

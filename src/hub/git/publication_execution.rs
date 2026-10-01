@@ -26,33 +26,19 @@ impl CompleteInspection {
         policy_digest: &str,
         recipient: &str,
         visibility: &str,
-        content_policy_digest: &str,
     ) -> Result<PublicationReport> {
-        ensure!(
-            !self.has_findings(),
-            "publication has unresolved secret findings"
-        );
-        let policy = self.prepared.publication.privacy_policy(
-            policy_digest,
-            recipient,
-            visibility,
-            content_policy_digest,
-        )?;
+        let policy =
+            self.prepared
+                .publication
+                .privacy_policy(policy_digest, recipient, visibility)?;
         Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy)))
     }
 
     fn publish_confirmed(
-        mut self,
-        acceptance: SecretFindingsAcceptance,
+        self,
+        _acceptance: SecretFindingsAcceptance,
         policy: Option<crate::hub::privacy::publication::PublicationPolicy>,
     ) -> PublicationReport {
-        if self.has_findings() && acceptance == SecretFindingsAcceptance::Reject {
-            return PublicationReport::refused(
-                "complete secret findings require explicit acceptance for this publication".into(),
-            );
-        }
-        self.prepared.publication.transport.accept_secret_findings =
-            acceptance == SecretFindingsAcceptance::Accept;
         let lfs = self.publish_lfs();
         if !lfs.ok() {
             return PublicationReport {

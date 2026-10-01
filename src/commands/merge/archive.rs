@@ -29,6 +29,8 @@ use crate::domain::merge_archive::{
     MergeArchiveRole, PreparedArchivePublication, RuntimeLinkKey,
 };
 use crate::domain::metadata_facts::JsonFacts;
+use crate::domain::privacy::{projector::Mode, service as privacy};
+#[cfg(test)]
 use crate::domain::secret_filter::{KeyStore, Matcher, RepositoryDictionary};
 use crate::domain::store::Store;
 use crate::domain::{
@@ -54,24 +56,28 @@ pub(crate) fn settlement_destination(primary: &Repo, branch: &str) -> Result<Rep
 }
 
 /// The caller has already selected a landed archive role; this core performs no lifecycle dispatch.
-pub fn settle_tail(destination: TailDestination<'_>, global: &Matcher) -> Result<TailOutcome> {
+pub fn settle_tail(destination: TailDestination<'_>) -> Result<TailOutcome> {
     require_destination_routing(destination.repo, &destination.role.branch)?;
-    let dictionary = RepositoryDictionary::open(destination.repo.root())?;
-    settle_tail_with(destination, &dictionary, global, read_native, |_| Ok(()))
+    let repo = destination.repo.root();
+    settle_tail_mode(
+        destination,
+        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
+        read_native,
+        |_| Ok(()),
+        None,
+    )
 }
 
 /// Final capture consumes any retained candidate before inspecting the child's last complete suffix.
 pub(crate) fn settle_final_tail(
     destination: TailDestination<'_>,
     binding: &ExplorationBinding,
-    global: &Matcher,
 ) -> Result<TailOutcome> {
     require_destination_routing(destination.repo, &destination.role.branch)?;
-    let dictionary = RepositoryDictionary::open(destination.repo.root())?;
+    let repo = destination.repo.root();
     settle_tail_mode(
         destination,
-        &dictionary,
-        global,
+        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
         read_native,
         |_| Ok(()),
         Some(binding),
@@ -217,6 +223,7 @@ fn read_native(link: &Link) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn settle_tail_with<K: KeyStore>(
     destination: TailDestination<'_>,
     dictionary: &RepositoryDictionary<K>,
@@ -226,18 +233,21 @@ fn settle_tail_with<K: KeyStore>(
 ) -> Result<TailOutcome> {
     settle_tail_mode(
         destination,
-        dictionary,
-        global,
+        &|text| {
+            dictionary
+                .protect_jsonl(text, global)
+                .map(|report| report.text)
+                .unwrap_or_else(|_| text.to_owned())
+        },
         read_native,
         checkpoint,
         None,
     )
 }
 
-fn settle_tail_mode<K: KeyStore>(
+fn settle_tail_mode(
     destination: TailDestination<'_>,
-    dictionary: &RepositoryDictionary<K>,
-    global: &Matcher,
+    protect: &dyn Fn(&str) -> String,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
     final_binding: Option<&ExplorationBinding>,
@@ -328,21 +338,18 @@ fn settle_tail_mode<K: KeyStore>(
         );
         return Ok(TailOutcome::Noop { pending_bytes });
     }
-    let protected = dictionary.protect_jsonl(&captured.records, global)?;
+    let protected = protect(&captured.records);
     ensure!(
-        protected.text.len() <= storage::MAX_MATERIALIZED_BYTES,
+        protected.len() <= storage::MAX_MATERIALIZED_BYTES,
         "protected archive records exceed their byte limit"
     );
-    let checked = native_archive::capture(
-        protected.text.as_bytes(),
-        0,
-        &hex::encode(Sha256::digest([])),
-    )?;
+    let checked =
+        native_archive::capture(protected.as_bytes(), 0, &hex::encode(Sha256::digest([])))?;
     ensure!(
         checked.record_count == captured.record_count && checked.unconsumed.is_empty(),
         "archive protection changed the complete record boundary"
     );
-    let envelopes = transcript::wrap_lines(&protected.text, &native.runtime, &role.logical_session);
+    let envelopes = transcript::wrap_lines(&protected, &native.runtime, &role.logical_session);
     let (candidate, tree) = build_candidate(repo, &head, role, &envelopes, captured.record_count)?;
     let mut pending = journal.clone();
     pending.publication = Some(PreparedArchivePublication {
@@ -580,6 +587,29 @@ fn publish_prepared(
         commit: publication.candidate.clone(),
         records: publication.appended_records,
     })
+}
+
+#[cfg(test)]
+fn settle_tail_fixture<K: KeyStore>(
+    destination: TailDestination<'_>,
+    dictionary: &RepositoryDictionary<K>,
+    global: &Matcher,
+    read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
+    checkpoint: impl FnMut(Checkpoint) -> Result<()>,
+    final_binding: Option<&ExplorationBinding>,
+) -> Result<TailOutcome> {
+    settle_tail_mode(
+        destination,
+        &|text| {
+            dictionary
+                .protect_jsonl(text, global)
+                .map(|r| r.text)
+                .unwrap_or_else(|_| text.to_owned())
+        },
+        read_native,
+        checkpoint,
+        final_binding,
+    )
 }
 
 #[cfg(test)]
@@ -1048,7 +1078,7 @@ mod tests {
             fixture.append(b"{\"event\":\"last child record\"}\n");
             let binding = fixture.journal().binding;
             let finish = || {
-                settle_tail_mode(
+                settle_tail_fixture(
                     fixture.destination(),
                     &fixture.dictionary,
                     &Matcher::empty(),
@@ -1088,7 +1118,7 @@ mod tests {
         let before = fixture.journal();
         let mut binding = before.binding.clone();
         binding.source.reference = "alice/elsewhere@source".into();
-        let error = settle_tail_mode(
+        let error = settle_tail_fixture(
             fixture.destination(),
             &fixture.dictionary,
             &Matcher::empty(),
@@ -1111,7 +1141,7 @@ mod tests {
         fixture.append(b"{\"event\":\"complete\"}\n{\"event\":\"partial\"}");
         let binding = fixture.journal().binding;
         let finish = || {
-            settle_tail_mode(
+            settle_tail_fixture(
                 fixture.destination(),
                 &fixture.dictionary,
                 &Matcher::empty(),
@@ -1657,15 +1687,12 @@ mod tests {
             let store = Store::at(input["store"].as_str().unwrap());
             let role: MergeArchiveRole = serde_json::from_value(input["role"].clone()).unwrap();
             let native: RuntimeLinkKey = serde_json::from_value(input["native"].clone()).unwrap();
-            let error = settle_tail(
-                TailDestination {
-                    repo: &repo,
-                    store: &store,
-                    role: &role,
-                    native: &native,
-                },
-                &Matcher::empty(),
-            )
+            let error = settle_tail(TailDestination {
+                repo: &repo,
+                store: &store,
+                role: &role,
+                native: &native,
+            })
             .unwrap_err();
             assert!(error.to_string().contains("upgrade Git"));
             assert!(format!("{error:#}").contains("unknown switch"));

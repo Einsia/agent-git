@@ -25,7 +25,6 @@ use crate::hub::identity::{self, RemoteIdentity};
 use crate::infra::{config, credentials};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
-use std::path::Path;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -71,8 +70,7 @@ pub struct Args {
     #[arg(long, require_equals = true, value_name = "true|false")]
     pub encryption: Option<bool>,
 
-    /// Accept secret findings at a public ordinary destination; a private one accepts them without
-    /// this flag, and encrypted publication requires a clean projection.
+    /// Compatibility flag for older servers; local privacy never requires approval.
     #[arg(long)]
     pub allow_secrets: bool,
 
@@ -223,6 +221,9 @@ pub fn run(mut args: Args) -> CmdResult {
         Ok(b) => b,
         Err(r) => {
             if r.code == ExitCode::Ok {
+                if !args.dry_run {
+                    crate::domain::privacy::service::schedule_sync(client.base());
+                }
                 ui::info(&r.msg);
                 if !ui::quiet() {
                     for hint in &r.hints {
@@ -273,6 +274,9 @@ pub fn run(mut args: Args) -> CmdResult {
                 unsettled.join(", ")
             ))
         ));
+    }
+    if !args.dry_run {
+        crate::domain::privacy::service::schedule_sync(client.base());
     }
     if branches.is_empty() {
         ui::info("nothing to publish yet — no turns have been settled.");
@@ -835,60 +839,6 @@ pub(crate) fn push_tags_for_test(
 fn code_origin(code: &str) -> Option<String> {
     let (origin, _) = code.rsplit_once('@')?;
     (!origin.is_empty()).then(|| origin.to_string())
-}
-
-/// Where a hit is shown — **by carrier**, not the file name for everything.
-///
-/// A workspace file shows its basename: the leading path helps little in locating it, and a
-/// narrower table reads better.
-///
-/// Every other carrier is shown whole. Their label is `<type> object <sha8>[/<path>]`, and the
-/// oid inside it is the handle those remedies use (`git cat-file blob <oid>`, `git log --all
-/// --find-object=<oid>`) — cut down to a basename, it is gone. The blob case especially: when
-/// the same file is both in the workspace and in a blob in history, the two hits share rule,
-/// line number and redacted excerpt, and taking the basename for both turns them into two
-/// **identical** rows that read like a bug in the report, while they are two things to handle
-/// separately.
-fn where_column(h: &secrets::Hit) -> String {
-    let at = h.file.as_deref().unwrap_or_default();
-    match h.source {
-        secrets::Source::File => Path::new(at)
-            .file_name()
-            .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        _ => at.to_string(),
-    }
-}
-
-/// Truncated results remain visibly incomplete so omitted findings are not mistaken for clean data.
-fn report_hits(hits: &[secrets::Hit], truncated: bool) {
-    ui::section("suspected secrets");
-    let rows: Vec<Vec<String>> = hits
-        .iter()
-        .take(20)
-        .map(|h| {
-            vec![
-                h.rule.clone(),
-                where_column(h),
-                h.line.to_string(),
-                // Only the redacted excerpt is shown — this output goes into CI logs.
-                h.redacted.clone(),
-            ]
-        })
-        .collect();
-    println!(
-        "{}",
-        ui::table::render(&["rule", "at", "line", "excerpt (redacted)"], &rows)
-    );
-    if hits.len() > 20 {
-        println!("{}", ui::dim(&format!("… {} more", hits.len() - 20)));
-    }
-    if truncated {
-        ui::hint(&format!(
-            "this list is incomplete: it shows {} findings and stops there, more remain — fix these, then run `agit push` again to see the rest",
-            hits.len()
-        ));
-    }
 }
 
 #[cfg(test)]

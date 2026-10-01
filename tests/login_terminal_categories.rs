@@ -84,7 +84,9 @@ impl Hub {
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let request = read_request(&mut stream);
-                if request.method == "GET" && request.target == "/api/cli/version" {
+                if (request.method == "GET" && request.target == "/api/cli/version")
+                    || request.target.starts_with("/api/me/privacy/")
+                {
                     write!(
                         stream,
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -387,6 +389,11 @@ impl Lab {
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         walkdir::WalkDir::new(self.root.path())
             .into_iter()
+            .filter_entry(|entry| {
+                !entry
+                    .path()
+                    .starts_with(self.root.path().join("agit/privacy"))
+            })
             .map(|entry| {
                 let entry = entry.unwrap();
                 assert!(!entry.file_type().is_symlink());
@@ -403,19 +410,6 @@ impl Lab {
                 )
             })
             .collect()
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Lab {
-    fn drop(&mut self) {
-        use agit::domain::secret_filter::KeyStore;
-        if let Ok(bytes) = fs::read(self.store.join("secret-filter/vault.json"))
-            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-            && let Some(id) = value["vault_id"].as_str()
-        {
-            let _ = agit::domain::secret_filter::OsKeyStore.delete(id);
-        }
     }
 }
 

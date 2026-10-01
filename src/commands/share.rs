@@ -15,7 +15,6 @@ use crate::domain::link;
 use crate::domain::meta;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
-use crate::domain::secrets;
 use crate::domain::storage;
 use crate::domain::store::Store;
 use crate::domain::transcript;
@@ -132,11 +131,7 @@ pub fn run(mut args: Args) -> CmdResult {
         );
         return Ok(ExitCode::Precondition);
     }
-    let sources = super::privacy::sources::Sources::resolve(
-        repo.as_ref().zip(source.repository.as_deref()),
-        Some(&client),
-    )?;
-    let prepared = protected_readable(&source, &sources.additional_rules()?)?;
+    let prepared = protected_readable(&source, &[])?;
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
     // Passphrase: hashed locally; the plaintext is never uploaded.
@@ -270,7 +265,6 @@ pub fn run(mut args: Args) -> CmdResult {
         source.policy_digest()? == prepared.policy_digest,
         "privacy policy changed after the share preview; review a fresh preview before sharing"
     );
-    sources.verify()?;
     let resp = match client.create_share(&ShareRequest {
         format_version: 2,
         payload,
@@ -363,7 +357,6 @@ struct ShareSource {
     label: String,
     selection_source: super::echo::Source,
     protection_repo: Option<std::path::PathBuf>,
-    repository: Option<String>,
     projection_log: Option<String>,
     metadata: meta::Meta,
     branch: Option<String>,
@@ -426,28 +419,12 @@ fn protected_readable(
     )?;
     let original = selected;
     let selected = projection.select(&original)?;
-    let (selected, secret_matches) = if let Some(repo) = repo.as_ref() {
-        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-        let registered = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-        let protected = dictionary.protect_envelopes(&selected, &registered)?;
-        anyhow::ensure!(
-            protected.intact == 0,
-            "share exceeds the reversible protection limit; no content was sent"
-        );
-        (protected.text, protected.replacements)
-    } else {
-        let parsed = transcript::display::parse(&selected)?;
-        let hits = secrets::scan_text_registered_with(
-            &serde_json::to_string(&parsed)?,
-            &std::collections::HashSet::new(),
-            &crate::domain::secret_filter::VaultStore::open_default()?.matcher()?,
-        );
-        anyhow::ensure!(
-            hits.is_empty(),
-            "this unclaimed native session needs an Agent repository for reversible protection; no content was sent"
-        );
-        (selected, 0)
-    };
+    let protected = crate::domain::privacy::service::transform(
+        source.protection_repo.as_deref(),
+        &selected,
+        crate::domain::privacy::projector::Mode::ProtectEnvelopes,
+    );
+    let (selected, secret_matches) = (protected.content, protected.replacements);
     let parsed = transcript::display::parse(&selected)?;
     anyhow::ensure!(
         source.policy_digest()? == policy_digest,
@@ -588,11 +565,6 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         ),
         selection_source: super::echo::Source::Explicit,
         protection_repo,
-        repository: native
-            .owner
-            .as_ref()
-            .zip(native.agent.as_ref())
-            .map(|(owner, name)| format!("{owner}/{name}")),
         projection_log: None,
         metadata,
         branch: native.branch.clone(),
@@ -729,7 +701,6 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         ),
         selection_source: point.selection_source,
         protection_repo: Some(point.repo.root().to_path_buf()),
-        repository: Some(point.slug),
         projection_log: Some(projection_log),
         metadata: snapshot,
         branch: point.branch,
@@ -922,39 +893,6 @@ mod tests {
         let w = W::parse_from(["x"]);
         assert!(!w.a.public, "the default must be encrypted");
         assert_eq!(w.a.expire, "7d", "the default must have an expiry");
-    }
-
-    #[test]
-    fn sharing_legacy_plaintext_projects_before_rendering_and_keeps_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = Repo::init(dir.path()).unwrap();
-        let secret = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
-        let raw = serde_json::json!({"type":"user","sessionId":"s1",
-            "message":{"role":"user","content": format!("token: {secret}")}})
-        .to_string()
-            + "\n";
-        let source = ShareSource {
-            envelope: Some(transcript::wrap_lines(&raw, "claude-code", &claim())),
-            raw: raw.clone(),
-            runtime: "claude-code".into(),
-            label: "fixture".into(),
-            selection_source: super::super::echo::Source::Explicit,
-            protection_repo: Some(repo.root().to_path_buf()),
-            repository: Some("owner/repo".into()),
-            projection_log: None,
-            metadata: meta::Meta::new(claim(), "claude-code".into(), String::new()),
-            branch: None,
-            snapshot: None,
-        };
-        let sent = protected_readable(&source, &[]).unwrap().text;
-        assert!(!sent.contains(secret));
-        assert_eq!(source.raw, raw);
-        assert!(
-            transcript::unwrap_strict(source.envelope.as_ref().unwrap())
-                .unwrap()
-                .contains(secret)
-        );
-        assert_eq!(protected_readable(&source, &[]).unwrap().text, sent);
     }
 
     #[test]

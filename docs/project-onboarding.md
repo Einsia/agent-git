@@ -86,10 +86,10 @@ Check that the Manager can open each developer's sessions in the shared reposito
 Repeat sync to verify that no duplicate branches appear. The last result distinguishes
 successful pushes and failures; a push does not prove that Hub search indexing has finished.
 
-Uploads use existing privacy and identity gates. A private ordinary repository reports secret
-findings and publishes; only a public one requires `--allow-secrets`. A failed upload retains
-the local imported history. There is no resident retry service in this minimal version: fix
-access, connectivity or privacy setup and rerun sync. The Stop hook starts the upload in a
+Uploads preserve identity and authorization checks. Local privacy processing is best effort:
+scanner, dictionary and synchronization failures never block publication. A failed upload
+retains the local imported history. There is no resident retry service in this minimal
+version: fix access or connectivity and rerun sync. The Stop hook starts the upload in a
 background process and returns at once; `agit project status` shows its last result.
 For an encrypted repository, an account, repository identity, policy or recipient change
 requires renewed explicit consent; an ordinary repository's automatic uploads follow `push.auto`

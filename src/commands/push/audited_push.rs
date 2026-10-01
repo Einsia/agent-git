@@ -165,38 +165,6 @@ pub(super) fn run(
         client.base(),
         target_id.as_deref().expect("existing destination"),
     )?;
-    if let Some(code) = synchronize_declarations(&repo, &client, &intent, args.dry_run)? {
-        return Ok(code);
-    }
-    let mut hub_policies = vec![(
-        target.clone(),
-        target_id.clone(),
-        client.privacy_policy_sources(&target, target_id.as_deref())?,
-    )];
-    if let Action::Copy(source) = &intent.action {
-        let repository = format!("{}/{}", source.owner, source.name);
-        let policy = client.privacy_policy_sources(&repository, Some(&source.agent_id))?;
-        hub_policies.push((repository, Some(source.agent_id.clone()), policy));
-    }
-    let sources = super::super::privacy::sources::Sources::bound_repository(
-        &repo,
-        &local_target
-            .as_ref()
-            .map_or_else(|| checkout.slug(), |target| target.repository.clone()),
-        &client,
-        &hub_policies
-            .iter()
-            .map(|(repository, id, _)| (repository.as_str(), id.as_deref()))
-            .collect::<Vec<_>>(),
-    )?;
-    let mut additional =
-        hub_policies
-            .iter()
-            .try_fold(Vec::new(), |mut rules, (_, _, source)| -> Result<_> {
-                rules.extend(source.additional_rules()?);
-                Ok(rules)
-            })?;
-    additional.extend(sources.additional_rules()?);
     let mut supervisor = SupervisorReply::from_env()?;
     let viewing = client
         .repository_publishing_key(&target, &destination_identity)?
@@ -207,7 +175,7 @@ pub(super) fn run(
         branches,
         &recipient,
         &intent.url,
-        &additional,
+        &[],
         &destination_identity,
     )?;
     let existing_receipts = match &intent.action {
@@ -291,7 +259,6 @@ pub(super) fn run(
             .as_ref()
             .map(|identity| (intent.url.as_str(), identity)),
     )?;
-    let captured = apply_copy_policy(captured, &repo, &client, &intent)?;
     let inspected = captured.inspect(limits);
     spinner.finish_and_clear();
     let complete = match inspected {
@@ -312,7 +279,6 @@ pub(super) fn run(
     if skip_allowed
         && projected.verify_source(&repo).is_ok()
         && complete.verify_source(projected.repo()).is_ok()
-        && !complete.has_findings()
         && complete.captured().pointers().is_empty()
         && existing_receipts.as_ref().is_some_and(|receipts| {
             receipts_match_current(&repo, receipts, &intent).unwrap_or(false)
@@ -326,8 +292,6 @@ pub(super) fn run(
             &projected,
             &intent,
             (&client, &viewing),
-            &hub_policies,
-            &sources,
             local_target.as_ref(),
         )?
     {
@@ -353,13 +317,6 @@ pub(super) fn run(
 
     emit_push_target(&checkout, branches, selection_source);
     show_inspection(complete.report());
-    if complete.has_findings() {
-        ui::error(
-            "privacy publication contains credential findings; update the policy or secret registrations before publishing",
-        );
-        return Ok(ExitCode::Policy);
-    }
-
     let mut destination = intent.json();
     destination["authorize_automatic_policy"] = json!(auto_enabled && !automatic);
     destination["recipient_fingerprint"] = json!(recipient.fingerprint()?);
@@ -440,8 +397,6 @@ pub(super) fn run(
     if let Some(local_target) = &local_target {
         local_target.verify(&repo)?;
     }
-    verify_hub_policies(&client, &hub_policies, None)?;
-    sources.verify()?;
     if let Some(expected) = &automatic_consent {
         ensure!(
             repo.auto_push_enabled()?
@@ -460,11 +415,8 @@ pub(super) fn run(
         .context("the confirmed publication destination is unavailable")?;
     intent.verify_observed(&observed, Some(&remote.identity.agent_id))?;
     intent.verify_write_access(&client, &remote.identity.agent_id)?;
-    verify_hub_policies(&client, &hub_policies, Some(&remote.identity.agent_id))?;
-    sources.verify_remote()?;
     projected.verify_source(&repo)?;
     intent.verify_source_binding(&repo)?;
-    drop(sources);
     let current_key = client
         .repository_publishing_key(&target, &remote.identity)?
         .require_current(&target)?;
@@ -497,7 +449,6 @@ pub(super) fn run(
         projected.policy_digest(),
         &recipient.fingerprint()?,
         &intent.visibility,
-        &hub_policies[0].2.content_digest()?,
     )?;
     projected.confirm_acceptance(&report)?;
     show_publication(&report);
@@ -562,28 +513,6 @@ fn verify_receipt_acknowledgements(
     Ok(())
 }
 
-fn apply_copy_policy(
-    captured: CapturedPublication,
-    repo: &Repo,
-    client: &Client,
-    intent: &Intent,
-) -> Result<CapturedPublication> {
-    if intent.separate_target.is_none() {
-        return Ok(captured);
-    }
-    let identities = match &intent.action {
-        Action::Existing(remote) => super::super::secret_vault::copy_policy_identities(
-            client,
-            &intent.owner,
-            &intent.name,
-            &remote.agent_id,
-        )?,
-        Action::Create => Default::default(),
-        Action::Copy(_) => anyhow::bail!("a separate publication cannot promote its source"),
-    };
-    captured.with_copy_policy(repo, identities)
-}
-
 fn inspection_destination(args: &Args, intent: &Intent) -> Result<Option<RemoteIdentity>> {
     if args.audit {
         return Ok(None);
@@ -592,53 +521,6 @@ fn inspection_destination(args: &Args, intent: &Intent) -> Result<Option<RemoteI
         Action::Existing(remote) => Ok(Some(RemoteIdentity::new(&intent.hub, &remote.agent_id)?)),
         Action::Create | Action::Copy(_) => Ok(None),
     }
-}
-
-fn synchronize_declarations(
-    repo: &Repo,
-    client: &Client,
-    intent: &Intent,
-    dry_run: bool,
-) -> Result<Option<ExitCode>> {
-    if intent.separate_target.is_some() {
-        return Ok(None);
-    }
-    if let Action::Existing(remote) = &intent.action {
-        let identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
-        if let Some(code) = super::super::secret_vault::synchronize_push_target(
-            repo,
-            client,
-            &intent.owner,
-            &intent.name,
-            &identity,
-            dry_run,
-            intent.accept_secret_findings,
-        )? {
-            return Ok(Some(code));
-        }
-    }
-    super::super::secret_vault::report_pending_declarations(repo)?;
-    Ok(None)
-}
-
-fn verify_hub_policies(
-    client: &Client,
-    policies: &[(
-        String,
-        Option<String>,
-        crate::hub::privacy::sources::PolicySources,
-    )],
-    created_target: Option<&str>,
-) -> Result<()> {
-    for (index, (repository, original_id, policy)) in policies.iter().enumerate() {
-        let agent_id = if index == 0 {
-            created_target.or(original_id.as_deref())
-        } else {
-            original_id.as_deref()
-        };
-        policy.verify_refresh(&client.privacy_policy_sources(repository, agent_id)?)?;
-    }
-    Ok(())
 }
 
 fn publication_receipts(
@@ -734,12 +616,6 @@ fn current_publication_state_matches(
         &Client,
         &crate::hub::privacy::repository_keys::PublishingKey,
     ),
-    hub_policies: &[(
-        String,
-        Option<String>,
-        crate::hub::privacy::sources::PolicySources,
-    )],
-    sources: &super::super::privacy::sources::Sources<'_>,
     local_target: Option<&crate::rc::local_repository::publication::Selection>,
 ) -> Result<bool> {
     let (client, viewing) = key_check;
@@ -752,8 +628,6 @@ fn current_publication_state_matches(
     if let Some(local_target) = local_target {
         local_target.verify(repo)?;
     }
-    verify_hub_policies(client, hub_policies, Some(&remote.agent_id))?;
-    sources.verify()?;
     let identity = RemoteIdentity::new(&intent.hub, &remote.agent_id)?;
     let current = client
         .repository_publishing_key(&format!("{}/{}", intent.owner, intent.name), &identity)?
@@ -780,18 +654,8 @@ fn emit_push_target(checkout: &Checkout, branches: &[String], source: super::sup
 }
 
 fn show_inspection(report: &InspectionReport) {
-    let scan = report.scan();
-    super::super::report_binary_carriers(scan.binary_carriers);
-    if !scan.hits.is_empty() {
-        report_hits(&scan.hits, scan.truncated);
-    }
-    if !scan.unscanned.is_empty() {
-        super::super::report_unscanned(&scan.unscanned);
-    }
     println!(
-        "Deterministic inspection: {} findings; {} binary Git objects; {} binary LFS payloads.",
-        scan.hits.len(),
-        report.binary_git_objects(),
+        "Publication integrity: {} owned LFS payloads verified.",
         report.binary_lfs().len()
     );
 }
@@ -828,15 +692,6 @@ fn confirm_publication(
         Some(true) => Decision::Publish,
         Some(false) | None => Decision::Declined,
     })
-}
-
-/// Ordinary findings gate only content that anyone can read. A private ordinary destination
-/// accepts them for explicit and automatic publication alike: only its collaborators can read
-/// it, and a refused session stays unpublished however many of its findings are false. A public
-/// destination still requires an explicit, non-automatic acceptance. Encrypted publication never
-/// accepts findings, because its projection must be clean.
-fn accepts_secret_findings(encryption_enabled: bool, visibility: &str, explicit: bool) -> bool {
-    !encryption_enabled && (explicit || visibility == "private")
 }
 
 #[derive(Debug)]
@@ -883,22 +738,17 @@ impl Intent {
         if let Some(selected) = &separate_target {
             selected.verify_lookup(source.as_ref())?;
         }
-        let automatic = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some();
-        let accept_secret_findings = !automatic && (args.allow_secrets || config::allow_secrets());
+        let accept_secret_findings = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV)
+            .is_none()
+            && (args.allow_secrets || config::allow_secrets());
         let copy = if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
             match &source {
-                // The probe of another namespace already carries the destination's acceptance:
-                // a private team repository accepts findings before its push access is known.
                 Some(remote) => !matches!(
                     super::super::remote_request(client.push_access_with_secret_acceptance(
                         &checkout.owner,
                         &checkout.name,
                         &remote.agent_id,
-                        accepts_secret_findings(
-                            remote.require_encryption_enabled()?,
-                            &remote.visibility,
-                            accept_secret_findings,
-                        ),
+                        accept_secret_findings && !remote.require_encryption_enabled()?,
                     ))?,
                     crate::hub::PushAccess::Writable
                 ),
@@ -1020,8 +870,6 @@ impl Intent {
                 "visibility flags only affect creation; the publication destination retains its existing audience",
             );
         }
-        let accept_secret_findings =
-            accepts_secret_findings(encryption_enabled, &visibility, accept_secret_findings);
         let intent = Self {
             hub,
             account: me.into(),
@@ -1030,7 +878,7 @@ impl Intent {
             url,
             visibility,
             encryption_enabled,
-            accept_secret_findings,
+            accept_secret_findings: accept_secret_findings && !encryption_enabled,
             action,
             separate_target,
         };
@@ -1400,16 +1248,7 @@ pub(crate) fn publication_consent_with_client(
             &remote.visibility,
         ));
     }
-    let policy_sources = client.privacy_policy_sources(repository, Some(&expected.agent_id))?;
-    let sources = super::super::privacy::sources::Sources::bound_repository(
-        repo,
-        repository,
-        client,
-        &[(repository, Some(&expected.agent_id))],
-    )?;
-    let mut policy = crate::domain::privacy::PrivacyPolicy::load(repo)?;
-    policy.mandatory.extend(policy_sources.additional_rules()?);
-    policy.mandatory.extend(sources.additional_rules()?);
+    let policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap_or_default();
     let viewing = client
         .repository_publishing_key(repository, expected)?
         .require_current(repository)?;

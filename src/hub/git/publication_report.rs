@@ -26,15 +26,6 @@ impl PublicationReport {
             && self.heads.as_ref().is_some_and(PublicationPhase::ok)
             && self.tags.as_ref().is_some_and(PublicationPhase::ok)
     }
-
-    pub(super) fn refused(error: String) -> Self {
-        Self {
-            lfs: None,
-            heads: None,
-            tags: None,
-            error: Some(error),
-        }
-    }
 }
 
 /// Native completion does not distinguish a new upload from an object already present.

@@ -59,10 +59,9 @@ impl Index {
     }
 }
 
-pub(super) fn dependencies(source: &Repo, redactor: &Redactor) -> Result<String> {
+pub(super) fn dependencies(_source: &Repo, redactor: &Redactor) -> Result<String> {
     digest_json(&json!({
         "build": env!("AGIT_BUILD_ID"),
         "redactor": redactor.publication_fingerprint()?,
-        "hydrator": crate::domain::secret_filter::RepositoryDictionary::open(source.root())?.publication_fingerprint()?,
     }))
 }

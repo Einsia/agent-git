@@ -30,7 +30,7 @@ agit push [owner/repo@branch] [options]
 | `--encryption=true\|false` | Select a new repository's fixed mode; omission uses local creation intent or `privacy.encryption` (default `false`, ordinary) |
 | `--to <owner/repo>` | Publish original history to another repository; for device-local RC, select its retained primary target |
 | `--separate` | With `--to`, publish a separate copy from local RC while retaining its primary target |
-| `--allow-secrets` | Accept deterministic findings for a public ordinary destination; a private ordinary destination accepts them without the flag, and encrypted publication still requires clean processed content |
+| `--allow-secrets` | Accepted for compatibility; privacy findings never gate publication |
 | `--audit` | Open an interactive sensitivity reviewer for the frozen outgoing publication, then ask separately before publishing |
 | `--dry-run` | Inspect the selected publication with Hub mode/identity lookups, without creating a repository or uploading history |
 | `--show-preview` | Expand readable snapshot content and summarize binary payloads |
@@ -63,24 +63,22 @@ choice applies only to this invocation. Agent and script callers use a complete
 target or `AGIT_SESSION`; workspace bindings, native IDs, and the newest session
 do not choose what to publish. `--yes` does not select a missing target.
 
-## Review secret protection before a public push
+## Automatic local privacy
 
-A private ordinary destination is readable only by its collaborators. Push reports its
-findings, including an inspection that stopped at its finding or byte bound, and publishes
-without `--allow-secrets`; do not run the review below for it. Before an authorized push to
-a public ordinary destination, complete this review using the selected Agent repo, not the
-source-code repository:
+Secret processing runs locally when content is captured or explicitly projected. Accepted
+findings become reversible placeholders after their mappings are durable. The independent
+worker returns partial results or skips unavailable work; scanner, key, dictionary and
+synchronization failures never refuse a push. Existing committed history remains unchanged.
 
-1. Inspect `agit secrets review --repo <agent-repo-path> --json` and run `agit scan <owner/repo>@<branch> --secrets --json`. Review existing protection candidates even when the scan is clean: already protected values appear as placeholders and may include false positives.
-2. Check the actual values in authorized local source content and assess them for the requested audience. `review` returns opaque IDs and policy metadata, not plaintext; a label or placeholder alone is insufficient evidence for `allow`. Keep real credentials and uncertain candidates protected.
-3. For each confirmed false positive, run `agit secrets allow <record-id> --repo <agent-repo-path> --reason <reason>`. When supplying the exact value directly, pipe it into `agit secrets allow --stdin --repo <agent-repo-path> --reason <reason>`. See [secrets](secrets.md) for input limits and structured local/synchronization results.
-4. Rescan after each batch of allowance changes and inspect synchronization status, then proceed with the original push target and options. A truncated or sampled report is not the full finding set; finish reviewing remaining findings before publishing. Keep genuine credentials protected throughout this workflow.
+Every push, including an up-to-date push, schedules dictionary synchronization independently.
+Account keys are generated automatically. Only encrypted packages are uploaded; unavailable
+cloud keys leave temporary private local records pending for retry. No acknowledgement or
+`--allow-secrets` flag is required before uploading conversation history. The Hub does not scan
+content or enforce secret decisions, and LFS payloads are excluded from privacy processing.
 
-Declarations synchronize immediately when possible and again before publication. Offline decisions remain pending; check their status before relying on server policy. Ordinary push refreshes acknowledged policy and completes pending synchronization before LFS, branch or tag uploads. First publication may create the selected repository before synchronization. An older Hub without the protocol reports a missing capability. `--dry-run` checks and reports pending synchronization without remote writes. A clean local scan does not acknowledge server policy.
-
-Use exact `allow` decisions for routine false positives. When publication is already authorized and you have determined that all remaining findings are suitable for that audience, you may use `--allow-secrets` yourself for ordinary publication. Explain the classification and report use of the flag. The review above is the agent's responsibility within the existing publication authorization; a scanner finding alone does not require another user confirmation. Unexamined findings in a bounded report still require review; incomplete scans, missing objects, integrity failures, authorization errors and other publication errors need their own diagnosis.
-
-`--allow-secrets` applies only to this command's branch and version-tag requests, including verified LFS content. It emits a warning and reports any declarations whose synchronization did not complete. An ordinary retry does not inherit acceptance. Hiding an event from VIEW leaves LOG and Git history available for publication; it does not clear a historical credential finding.
+Use `agit secrets review --repo <agent-repo-path> --json` and the explicit `agit scan` command
+when you want a diagnostic review. Correct confirmed false positives with local `allow`
+decisions. Diagnostics do not become prerequisites for another authorized operation.
 
 ## Ordinary publication
 
@@ -90,13 +88,13 @@ tags and LFS bytes. Selected file-line branches are supported, and an existing l
 The CLI prints the destination, mode and selected refs. A person at a terminal is asked
 to confirm, and declining or cancelling publishes nothing; without one (scripts, CI,
 agent sessions) ordinary publication proceeds without `--yes`. `--yes` skips the
-question and retains inspection, secret-finding, identity and access checks.
+question and retains integrity, identity and access checks.
 Successful publication updates ordinary branch tracking and saves session receipts.
 No viewing key, generated projection or privacy strategy is requested.
 
 For pointers in the inspection scope, if an LFS payload is absent locally, push downloads it from the source
 repository's pinned Hub identity into private inspection storage. Its size and
-hash are verified and its content is scanned even when the current version has
+hash are verified even when the current version has
 deleted the file or the destination already stores it. Unavailable or corrupt
 content blocks publication; restore the original payload or retry when the source
 is available. This also applies to dry runs and separate destinations.
@@ -206,8 +204,8 @@ inspection files are removed when the push command ends.
 
 Incomplete review, unreadable evidence, unsupported decoding, exhausted budgets,
 unanswered required questions, or an interrupted reviewer stop the audited push.
-Verified binary content is listed as excluded from text review. Model findings are
-advisory; the deterministic secret gate remains mandatory. The reviewer does not edit, redact, create repositories, or publish content.
+All LFS payloads are excluded from privacy review. Model findings are
+advisory; no deterministic privacy gate applies. The reviewer does not edit, redact, create repositories, or publish content.
 
 Encrypted repository creation and password initialization precede publication review.
 Implicit promotion of a read-only checkout remains refused. Explicit separate publication

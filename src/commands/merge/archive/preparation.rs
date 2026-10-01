@@ -418,10 +418,12 @@ fn prepare_with(
             );
             (String::new(), 0)
         } else {
-            let hydrated =
-                crate::domain::secret_filter::RepositoryDictionary::open(request.repo.root())?
-                    .hydrate_envelopes(&saved)?;
-            (hydrated.text, hydrated.unresolved)
+            let hydrated = crate::domain::privacy::service::transform(
+                Some(request.repo.root()),
+                &saved,
+                crate::domain::privacy::projector::Mode::HydrateEnvelopes,
+            );
+            (hydrated.content, hydrated.unresolved)
         };
         ensure!(
             install_text.len() <= storage::MAX_MATERIALIZED_BYTES,

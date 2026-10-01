@@ -641,29 +641,13 @@ fn credential_row(
     }
 }
 
-/// One keystore row: which store, whether it answers, and what stops working when it does not.
+/// Privacy health is advisory and queried through the same bounded worker as recording.
 fn keystore_row() -> Check {
-    use crate::domain::secret_filter::KeystoreHealth;
-    use crate::infra::config::SecretKeystore;
-    let label = |keystore: Option<SecretKeystore>, dir: Option<&Path>| match (keystore, dir) {
-        (Some(SecretKeystore::File), Some(dir)) => format!("file keystore {}", ui::tilde(dir)),
-        (Some(SecretKeystore::File), None) => "file keystore".to_string(),
-        (Some(SecretKeystore::Os), _) => "OS credential store".to_string(),
-        (None, _) => format!("`{}`", SecretKeystore::KEY),
-    };
-    match crate::domain::secret_filter::keystore_health() {
-        KeystoreHealth::Ok {
-            keystore,
-            dir,
-            vault,
-        } => Check::Ok(format!(
-            "{} — {vault}",
-            label(Some(keystore), dir.as_deref())
-        )),
-        KeystoreHealth::Problem { keystore, dir, why } => Check::Warn(format!(
-            "{}: {why} — `agit secrets add` and any commit that finds a secret fail",
-            label(keystore, dir.as_deref())
-        )),
+    use crate::domain::privacy::{management::Command, service};
+    match service::manage(None, Command { action: "status".into(), global: true, id: None, name: None, secret: None }) {
+        Ok(status) if status["encrypted"] == true => Check::Ok("privacy dictionary uses a cached cloud key".into()),
+        Ok(_) => Check::Warn("privacy dictionary is temporarily stored locally without encryption; cloud synchronization will retry".into()),
+        Err(_) => Check::Warn("privacy is temporarily unavailable; recording and upload remain available".into()),
     }
 }
 
@@ -990,13 +974,19 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
         .map_err(anyhow::Error::msg)
         .context("claimed committed storage is unavailable")?;
     let committed = committed_content(&stored.log)?;
-    let (committed, live) = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_pair_readonly(&committed, live)
-        .context("repository secret reconstruction is unavailable")?;
-    if committed.unresolved != 0 || live.unresolved != 0 {
-        anyhow::bail!("repository secret mappings needed for comparison are unavailable");
-    }
-    Ok((check_continuity(&committed.text, &live.text)?, None))
+    use crate::domain::privacy::{projector::Mode, service};
+    let committed = service::transform(Some(repo.root()), &committed, Mode::HydrateJsonl);
+    let live = service::transform(Some(repo.root()), live, Mode::HydrateJsonl);
+    anyhow::ensure!(
+        crate::domain::privacy::projector::tokens(&committed.content)
+            .next()
+            .is_none()
+            && crate::domain::privacy::projector::tokens(&live.content)
+                .next()
+                .is_none(),
+        "secret mappings needed for comparison are unavailable"
+    );
+    Ok((check_continuity(&committed.content, &live.content)?, None))
 }
 
 fn committed_content(log: &str) -> crate::Result<String> {

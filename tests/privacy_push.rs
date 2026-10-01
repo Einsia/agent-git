@@ -38,7 +38,7 @@ mod startup_cache;
 
 const AGENT_ID: &str = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7";
 const SOURCE_ID: &str = "3a48ec29-769e-449d-9593-ec777ea87fd7";
-const SESSION_SECRET: &str = "blue horse battery";
+const SESSION_SECRET: &str = "AKIA7F3X9Q2M8N5P6R4T";
 
 struct Hub {
     base: String,
@@ -46,9 +46,6 @@ struct Hub {
     deny: Arc<AtomicBool>,
     corrupt_receipt: Arc<AtomicBool>,
     confirmations: Arc<AtomicUsize>,
-    source_revision: Arc<AtomicUsize>,
-    change_sources_after_read: Arc<AtomicBool>,
-    resolutions: Arc<Mutex<Vec<serde_json::Value>>>,
     creations: Arc<AtomicUsize>,
     strategies: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
@@ -93,12 +90,6 @@ impl Hub {
         let corrupting = Arc::clone(&corrupt_receipt);
         let confirmations = Arc::new(AtomicUsize::new(0));
         let confirmed = Arc::clone(&confirmations);
-        let source_revision = Arc::new(AtomicUsize::new(1));
-        let served_revision = Arc::clone(&source_revision);
-        let change_sources_after_read = Arc::new(AtomicBool::new(false));
-        let change_sources = Arc::clone(&change_sources_after_read);
-        let resolutions = Arc::new(Mutex::new(Vec::new()));
-        let resolved = Arc::clone(&resolutions);
         let creations = Arc::new(AtomicUsize::new(0));
         let created = Arc::clone(&creations);
         let strategies = Arc::new(AtomicUsize::new(0));
@@ -110,11 +101,7 @@ impl Hub {
             let mut strategy = serde_json::Value::Null;
             let mut preview = serde_json::Value::Null;
             let mut pending_receipt = None;
-            let hub_sources = json!([{"version": 1, "id": "hub-organization", "revision": "r1", "exclude": ["src/hub/**"], "memory_exclude": []}]);
-            let content_digest = agit::domain::privacy_envelope::digest_json(
-                &json!({"version":1, "owner_id":"owner-1", "revision":"r1", "sources":hub_sources}),
-            )
-            .unwrap();
+            let content_digest = agit::domain::privacy_envelope::digest_bytes(b"client-only");
             let mandatory = format!(
                 r#"{{"version":1,"source":"repository","require_envelope":true,"publication_format_version":1,"protected_paths":["session/log.jsonl","session/VIEW"],"content_policy_digest":"{content_digest}"}}"#
             );
@@ -221,6 +208,10 @@ impl Hub {
                         continue;
                     }
                 }
+                if target.starts_with("/api/me/privacy/") {
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
                 let json = match (method, target) {
                     ("POST", "/api/auth/refresh") => {
                         assert_eq!(
@@ -234,58 +225,11 @@ impl Hub {
                     ("GET", "/api/auth/me") => {
                         Some(json!({"account_id":"account-1","username":"alice"}))
                     }
-                    ("GET", path)
-                        if path.starts_with("/api/agents/alice/app/secret-allowances?") =>
-                    {
-                        assert_eq!(
-                            path,
-                            format!(
-                                "/api/agents/alice/app/secret-allowances?expected_agent_id={AGENT_ID}"
-                            )
-                        );
-                        assert!(body.is_empty());
-                        Some(json!({
-                            "version": 1, "agent_id": AGENT_ID, "revision": 0,
-                            "value_identity_scheme": "sha256-v1", "decisions": []
-                        }))
-                    }
                     ("GET", "/api/agents/alice/app/privacy/publishing-key") => {
                         let current = served_public.lock().unwrap().clone();
                         Some(
                             json!({"agent_id":AGENT_ID,"config_version":served_version.load(Ordering::Acquire),"current":if current.is_empty() { serde_json::Value::Null } else { json!({"recipient":agit::domain::privacy_key::recipient_id(&current),"public_key_algorithm":"x25519","public_key":current}) }}),
                         )
-                    }
-                    ("POST", "/api/privacy/policy-sources/resolve") => {
-                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        assert_eq!(request["version"], 1);
-                        let source = request["repository"] == "team/app";
-                        if source {
-                            assert_eq!(request["agent_id"], SOURCE_ID);
-                        } else {
-                            assert_eq!(request["repository"], "alice/app");
-                            assert_eq!(
-                                request["agent_id"],
-                                if root.join("alice/app.git").is_dir() {
-                                    json!(AGENT_ID)
-                                } else {
-                                    serde_json::Value::Null
-                                }
-                            );
-                        }
-                        resolved.lock().unwrap().push(request.clone());
-                        assert!(!request["request_id"].as_str().unwrap().is_empty());
-                        let now = chrono::Utc::now();
-                        let revision = served_revision.load(Ordering::Acquire);
-                        if change_sources.swap(false, Ordering::AcqRel) {
-                            served_revision.store(2, Ordering::Release);
-                        }
-                        Some(json!({
-                            "version": 1, "hub": resolver_hub, "repository": request["repository"], "agent_id": request["agent_id"],
-                            "account_id": "account-1", "request_id": request["request_id"], "owner_id": if source { "source-owner" } else { "owner-1" },
-                            "revision": format!("r{revision}"),
-                            "issued_at": now, "expires_at": now + chrono::Duration::minutes(5),
-                            "sources": if source { json!([{"version":1,"id":"source-organization","revision":"r1","exclude":["src/source/**"],"memory_exclude":[]}]) } else { hub_sources.clone() }
-                        }))
                     }
                     ("POST", "/api/agents") => {
                         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -460,9 +404,6 @@ impl Hub {
             deny,
             corrupt_receipt,
             confirmations,
-            source_revision,
-            change_sources_after_read,
-            resolutions,
             creations,
             strategies,
             viewing_public,
@@ -561,8 +502,7 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
     let workspace = temp.path().join("workspace");
-    fs::create_dir_all(workspace.join("src/hub")).unwrap();
-    fs::create_dir_all(workspace.join("src/source")).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
     let remote_root = temp.path().join("remote");
     fs::create_dir_all(&remote_root).unwrap();
     let key = SecretKey::from([25; 32]);
@@ -618,10 +558,6 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
     repo.commit("Source files").unwrap();
     repo.git(&["checkout", "-b", "work"]).unwrap();
     let mut raw = [
-            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"destination","name":"Read","input":{"file_path":workspace.join("src/hub/private.rs")}}]}}),
-            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"destination","content":"DESTINATION_RESTRICTED_TEXT"}]}}),
-            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"source","name":"Read","input":{"file_path":workspace.join("src/source/private.rs")}}]}}),
-            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"source","content":"SOURCE_RESTRICTED_TEXT"}]}}),
             json!({"type":"assistant","message":{"role":"assistant","content":"Visible session reply"}}),
         ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
     if local_rc {
@@ -837,8 +773,6 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
         assert!(!public.contains(SESSION_SECRET));
         assert!(!public.contains("content unavailable"));
     }
-    assert!(!public.contains("DESTINATION_RESTRICTED_TEXT"));
-    assert_eq!(public.contains("SOURCE_RESTRICTED_TEXT"), !copying);
     let private = envelope.open_layer(&key).unwrap();
     let (original_log, original_view) = private.session_bytes().unwrap();
     assert_eq!(original_log.as_str(), log);
@@ -904,12 +838,6 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
         assert!(String::from_utf8_lossy(&repeated.stdout).contains("already up to date"));
         assert_eq!(hub.confirmations.load(Ordering::Acquire), confirmations);
         assert_eq!(git(&destination, &["for-each-ref"]), published_refs);
-        let resolutions = hub.resolutions.lock().unwrap();
-        for (repository, id) in [("team/app", SOURCE_ID), ("alice/app", AGENT_ID)] {
-            assert!(resolutions.iter().any(|request| request["repository"] == repository && request["agent_id"] == id));
-        }
-        drop(resolutions);
-
         let ciphertext_clone = home.join("repos/team/cipher");
         git(
             temp.path(),
@@ -985,26 +913,13 @@ fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
         fs::read_to_string(local.root().join("private.txt")).unwrap(),
         "INDEPENDENT_SOURCE_FILE"
     );
-    let resolutions = hub.resolutions.lock().unwrap();
-    assert!(
-        resolutions
-            .iter()
-            .any(|request| request["repository"] == "alice/app" && request["agent_id"] == AGENT_ID)
-    );
     if let Some(before) = source_refs {
         assert_eq!(git(&source_remote, &["for-each-ref"]), before);
-        assert!(
-            resolutions
-                .iter()
-                .any(|request| request["repository"] == "team/app"
-                    && request["agent_id"] == SOURCE_ID)
-        );
         assert_eq!(
             local.upstream_url().unwrap(),
             format!("{}/team/app.git", hub.base)
         );
     }
-    drop(resolutions);
     let mut before = git(&destination, &["for-each-ref"]);
     let repeat_target = if local_rc {
         target.as_str()
@@ -1519,8 +1434,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
         json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"allowed-call", "content":public_tool_output}]}}),
         json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"mandatory-call", "name":"Read", "input":{"file_path":workspace.join("src/managed/private.rs")}}]}}),
         json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"mandatory-call", "content":"MANDATORY_TOOL_OUTPUT_MARKER"}]}}),
-        json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"hub-call", "name":"Read", "input":{"file_path":workspace.join("src/hub/private.rs")}}]}}),
-        json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"hub-call", "content":"HUB_PRIVATE_TOOL_OUTPUT_MARKER"}]}}),
     ].into_iter().chain(publication_text::records(&workspace)).map(|record| format!("{record}\n")).collect::<String>();
     let log = transcript::wrap_lines(&raw, "claude-code", &session);
     let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
@@ -1663,7 +1576,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
         "PRIVATE_TOOL_OUTPUT_MARKER",
         "PRIVATE_SHARED_FILE_MARKER",
         "MANDATORY_TOOL_OUTPUT_MARKER",
-        "HUB_PRIVATE_TOOL_OUTPUT_MARKER",
         "\u{1b}[2J",
     ] {
         assert!(!preview.contains(private), "preview exposes {private}");
@@ -1759,16 +1671,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
     assert!(git(&remote, &["for-each-ref"]).is_empty());
     hub.corrupt_receipt.store(false, Ordering::Release);
-    hub.change_sources_after_read.store(true, Ordering::Release);
-    let drifted = run(&["--yes", "push", "alice/app@work"]);
-    assert!(!drifted.status.success());
-    assert!(
-        String::from_utf8_lossy(&drifted.stderr).contains("mandatory Hub privacy rules changed"),
-        "{drifted:?}"
-    );
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    assert!(git(&remote, &["for-each-ref"]).is_empty());
-    hub.source_revision.store(1, Ordering::Release);
     assert_success(&run(&["--yes", "push", "alice/app@work"]));
     let receipt = repo
         .common_dir()
@@ -2112,14 +2014,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
     assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
     fs::write(&mandatory_file, mandatory.to_string()).unwrap();
 
-    hub.source_revision.store(2, Ordering::Release);
-    let stale = auto();
-    assert!(!stale.status.success());
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("renewed confirmation"));
-    assert_eq!(hub.posts.load(Ordering::Acquire), before_posts);
-    assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
-    hub.source_revision.store(1, Ordering::Release);
-
     let mut policy = PrivacyPolicy::load(&repo).unwrap();
     policy.exclude.push("new-private/**".into());
     policy.save(&repo).unwrap();
@@ -2164,12 +2058,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
     assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
 
     let clone = Repo::at(new_home.join("repos/alice/app"));
-    let new_dictionary =
-        agit::domain::secret_filter::RepositoryDictionary::open(clone.root()).unwrap();
-    assert!(
-        new_dictionary.review().unwrap().is_empty(),
-        "policy synchronization must not recover private dictionary records"
-    );
     git(clone.root(), &["config", "user.name", "New Device"]);
     git(
         clone.root(),
@@ -2199,10 +2087,6 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
         "synthetic-repository-password",
     );
     assert!(status.success(), "{output}");
-    assert!(
-        !new_dictionary.review().unwrap().is_empty(),
-        "unlock must restore private dictionary records"
-    );
     let cache = clone
         .common_dir()
         .unwrap()

@@ -277,7 +277,7 @@ pub fn remove(hub: &str, secret: &str) -> Result<()> {
 
 fn remove_in(dir: &Path, authority: &HubAuthority, secret: &str) -> Result<()> {
     let _guard = mutation_guard(dir)?;
-    if !load_from(dir, authority)?.is_some_and(|request| request.secret == secret) {
+    if load_from(dir, authority)?.is_none_or(|request| request.secret != secret) {
         return Ok(());
     }
     let path = record_path(dir, authority);
@@ -308,10 +308,11 @@ pub(super) fn discard_all(dir: &Path) -> usize {
         };
         if (extension == EXTENSION || extension == CLAIMED_EXTENSION)
             && std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
-            && std::fs::remove_file(&path).is_ok()
-            && extension == EXTENSION
         {
-            forgotten += 1;
+            let removed = std::fs::remove_file(&path).is_ok();
+            if removed && extension == EXTENSION {
+                forgotten += 1;
+            }
         }
     }
     forgotten

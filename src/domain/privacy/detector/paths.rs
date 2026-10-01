@@ -97,7 +97,7 @@ fn valid_url(text: &str) -> bool {
 }
 
 /// Relative paths require a link destination or a named path field; a slash alone is not evidence.
-pub(super) fn field_path(text: &str) -> bool {
+pub(crate) fn field_path(text: &str) -> bool {
     valid_url(text) || valid_path(text, true)
 }
 
@@ -132,7 +132,7 @@ fn valid_path(text: &str, relative: bool) -> bool {
             }))
 }
 
-pub(super) fn is_path_field(field: &str) -> bool {
+pub(crate) fn is_path_field(field: &str) -> bool {
     matches!(
         field.to_ascii_lowercase().rsplit(['_', '-']).next(),
         Some("path" | "paths" | "cwd" | "directory" | "filename" | "filepath" | "filepaths")

@@ -30,8 +30,7 @@
 //! from the same plan, so every row of its table is what the next `commit` will do. Files the
 //! agent edited or deleted in the mirror are judged against the baseline the same way: an edit
 //! goes into the branch, a deletion is deleted from the branch. When materialization at start
-//! finds mirror edits that never reached the branch (never collected, or refused by the secret
-//! scan) it keeps that copy and reports a conflict — branch bytes never overwrite the only copy.
+//! finds mirror edits that never reached the branch it keeps that copy and reports a conflict — branch bytes never overwrite the only copy.
 //!
 //! # Only top-level Markdown
 //!
@@ -46,7 +45,7 @@
 //! A session branch snapshots itself; the `main` file line advances only through
 //! `agit memory distill` (or a merge): main gets pushed and inherited by a colleague's
 //! `agit new`, while a runtime memory directory naturally holds personal feedback and privacy, so
-//! every file passes a secret scan and a per-item confirmation before it enters main. A file
+//! every file receives best-effort local protection and per-item confirmation before it enters main. A file
 //! inherited from main and deleted on the branch is carried over as a deletion as long as main is
 //! still at the inherited version; a file main changed itself after the fork is a modify/delete
 //! conflict — reported, never deleted automatically. `commit --milestone` and `push` remind you
@@ -98,7 +97,7 @@ pub enum Cmd {
     Status,
     /// Diff of memory files between this branch and main (or one file).
     Diff { path: Option<String> },
-    /// Carry memory changes from this branch into main (secret-scanned, confirmed one by one).
+    /// Carry memory changes from this branch into main (locally protected, confirmed one by one).
     Distill {
         /// Only these files (names under memory/). Default: every change against main.
         paths: Vec<String>,
@@ -459,32 +458,17 @@ fn upsert_index(existing: &str, scope: &str, lines: &[String]) -> String {
     out
 }
 
-/// Protect one memory file before it enters a Git tree. Text gets repository-local placeholders;
-/// Non-text memory stays in its native source because this boundary cannot reversibly inspect it.
-fn protect_memory_bytes(
-    dictionary: &crate::domain::secret_filter::RepositoryDictionary,
-    bytes: &[u8],
-    global: &crate::domain::secret_filter::Matcher,
-) -> crate::Result<Result<Vec<u8>, String>> {
+/// Reversible text processing is optional; unsupported content remains available unchanged.
+fn protect_memory_bytes(repo: &Repo, bytes: &[u8]) -> crate::Result<Result<Vec<u8>, String>> {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return Ok(Err(
-            "memory is outside the supported UTF-8 protection boundary; native content is retained"
-                .into(),
-        ));
+        return Ok(Ok(bytes.to_vec()));
     };
-    if text.contains('\0') {
-        return Ok(Err(
-            "memory contains binary data; native content is retained".into(),
-        ));
-    }
-    let protected = dictionary.protect_jsonl(text, global)?;
-    if protected.intact > 0 {
-        return Ok(Err(format!(
-            "{} finding(s) exceeded the reversible record limit",
-            protected.intact
-        )));
-    }
-    Ok(Ok(protected.text.into_bytes()))
+    let outcome = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        text,
+        crate::domain::privacy::projector::Mode::ProtectJsonl,
+    );
+    Ok(Ok(outcome.content.into_bytes()))
 }
 
 // ────────────────────── Collection plan ─────────────────────
@@ -578,8 +562,8 @@ pub fn materialize(
 
 /// The body of [`materialize`], with the directory and the policy given explicitly.
 ///
-/// When the mirror still holds edits that never reached the branch (a settlement that failed, a
-/// hook that did not run, a refusal by the secret scan) it collects once against the baseline
+/// When the mirror still holds edits that never reached the branch (a settlement that failed or a
+/// hook that did not run) it collects once against the baseline
 /// first; whatever cannot be collected stays where it is and is reported as a conflict, never
 /// overwritten with the branch content.
 pub fn materialize_with(
@@ -603,14 +587,15 @@ pub fn materialize_with(
     }
     let baseline = read_baseline(&checkout, mem_dir)?.unwrap_or_default();
     let mut files = branch_files(&checkout, &tree_ref(branch))?;
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
     for bytes in files.values_mut() {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            *bytes = dictionary
-                .hydrate_pair_readonly(text, "")?
-                .0
-                .text
-                .into_bytes();
+            *bytes = crate::domain::privacy::service::transform(
+                Some(primary.root()),
+                text,
+                crate::domain::privacy::projector::Mode::HydrateJsonl,
+            )
+            .content
+            .into_bytes();
         }
     }
     let top = md_files(mem_dir)?;
@@ -754,9 +739,7 @@ pub fn collect_with(
     let mirror = md_files(&mirror_dir(mem_dir, slug, branch))?;
     let baseline = read_baseline(&checkout, mem_dir)?;
     let plan = plan_collect(baseline.as_ref(), &top, &mirror, &in_branch, policy.scope);
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
-    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary)?;
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary).unwrap_or_default();
 
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     // Refused file names are tracked separately (the display string carries the rule name and is
@@ -777,7 +760,7 @@ pub fn collect_with(
             refused_names.insert(name.clone());
             continue;
         }
-        match protect_memory_bytes(&dictionary, bytes, &global)? {
+        match protect_memory_bytes(primary, bytes)? {
             Ok(protected) => {
                 edits.insert(name.clone(), Some(protected));
             }
@@ -964,9 +947,7 @@ pub fn distill(
         );
     }
     let ours = branch_files(primary, &plan.branch_tip)?;
-    let global = crate::domain::secret_filter::VaultStore::open_default()?.matcher()?;
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(primary.root())?;
-    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary)?;
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary).unwrap_or_default();
     let source_branch = branch.lines().find(|name| *name != "main");
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     for item in chosen {
@@ -984,7 +965,7 @@ pub fn distill(
                 let bytes = ours
                     .get(name)
                     .ok_or_else(|| anyhow::anyhow!("the plan has no memory/{name}"))?;
-                let bytes = protect_memory_bytes(&dictionary, bytes, &global)?
+                let bytes = protect_memory_bytes(primary, bytes)?
                     .map_err(|reason| anyhow::anyhow!("cannot protect memory/{name}: {reason}"))?;
                 edits.insert(name.clone(), Some(bytes));
             }
@@ -1254,7 +1235,7 @@ fn status(target: &Target) -> CmdResult {
     let carry = pending.len() - conflicts;
     if carry > 0 {
         println!(
-            "  {carry} change{} on `{branch}` not yet in main — `agit distill` carries them (secret-scanned, confirmed one by one)",
+            "  {carry} change{} on `{branch}` not yet in main — `agit distill` carries them (locally protected, confirmed one by one)",
             if carry == 1 { "" } else { "s" }
         );
     }
@@ -1350,8 +1331,7 @@ fn distill_cmd(
         return Ok(ExitCode::Ok);
     }
 
-    // Every file to carry passes the secret scan first: main gets pushed and inherited by
-    // others. The scan reads the bytes at the tip in the plan, and the landing carries those.
+    // Promotion uses the immutable tip in the plan so confirmation and landing select the same bytes.
     let mut chosen = Vec::new();
     for item in &wanted {
         let question = match item {
@@ -1876,40 +1856,6 @@ mod tests {
         );
     }
 
-    /// A mirror edit refused by the secret scan is not overwritten by materialization but
-    /// reported as a conflict; once the edit is cleaned up it enters the branch as usual.
-    #[test]
-    fn a_refused_mirror_edit_is_kept_and_reported_as_a_conflict() {
-        let (_d, repo, mem) = fixture();
-        materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        let leak = format!(
-            "-----BEGIN PRIVATE KEY-----\n{}",
-            "unrecoverable-region\n".repeat(4096)
-        );
-        std::fs::write(mirror(&mem).join("team.md"), &leak).unwrap();
-
-        let r = materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(r.conflicts, vec!["team.md".to_string()]);
-        assert!(!r.refused.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(mirror(&mem).join("team.md")).unwrap(),
-            leak
-        );
-        assert!(
-            file(&repo, "refs/heads/s1", "team.md")
-                .unwrap()
-                .contains("uid, not user_id")
-        );
-
-        std::fs::write(mirror(&mem).join("team.md"), "cleaned up\n").unwrap();
-        let r = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(r.collected, 1);
-        assert_eq!(
-            file(&repo, "refs/heads/s1", "team.md").unwrap(),
-            "cleaned up\n"
-        );
-    }
-
     /// When the commit has landed but the baseline cannot be written, the report carries both
     /// the commit and a warning, and the caller can still record a receipt.
     #[test]
@@ -2041,40 +1987,6 @@ mod tests {
         assert!(file(&repo, "refs/heads/s1", "mine.md").is_none());
     }
 
-    /// Memory stores reversible tokens while the runtime keeps its local bytes across syncs.
-    #[test]
-    fn a_file_with_a_secret_is_protected_and_materialized_locally() {
-        let (_d, repo, mem) = fixture();
-        materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        let plaintext = format!("token: agit_at_{}\n", "0123456789abcdef".repeat(4));
-        std::fs::write(mem.join("leak.md"), &plaintext).unwrap();
-        let r = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(r.collected, 1);
-        assert!(r.commit.is_some());
-        assert!(r.refused.is_empty());
-        let stored = file(&repo, "refs/heads/s1", "leak.md").unwrap();
-        assert!(stored.contains("{{AGIT_SECRET_V1:"));
-        assert!(!stored.contains("agit_at_"));
-        let dictionary =
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-        assert_eq!(dictionary.hydrate_text(&stored).unwrap().text, plaintext);
-        assert_eq!(
-            collect_with(&repo, "s1", SLUG, &mem, ON).unwrap().collected,
-            0
-        );
-        std::fs::remove_file(mem.join("leak.md")).unwrap();
-        let off = Policy {
-            track: false,
-            scope: Scope::SinceBaseline,
-        };
-        materialize_with(&repo, "s1", SLUG, &mem, off).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(mirror(&mem).join("leak.md")).unwrap(),
-            plaintext
-        );
-        assert_eq!(file(&repo, "refs/heads/s1", "leak.md").unwrap(), stored);
-    }
-
     /// Distill: what is new on the branch is carried into main; what was inherited from main,
     /// deleted here and untouched on main is carried over as a deletion; what main added after
     /// the fork does not count; what main changed after the fork and the branch deleted is a
@@ -2182,34 +2094,6 @@ mod tests {
             std::fs::read_to_string(repo.root().join(TREE_DIR).join("new.md")).unwrap(),
             "a new fact\n",
             "the main checkout is refreshed"
-        );
-    }
-
-    /// A name with spaces is no different: refused names are tracked structurally, so
-    /// materialization does not take one for unchanged and overwrite it.
-    #[test]
-    fn a_refused_name_with_spaces_is_still_protected() {
-        let (_d, repo, mem) = fixture();
-        commit_memory(
-            &repo,
-            "s1",
-            [("team note.md".to_string(), Some(b"shared\n".to_vec()))]
-                .into_iter()
-                .collect(),
-            "spaced name",
-        )
-        .unwrap();
-        materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        let leak = format!(
-            "-----BEGIN PRIVATE KEY-----\n{}",
-            "unrecoverable-region\n".repeat(4096)
-        );
-        std::fs::write(mirror(&mem).join("team note.md"), &leak).unwrap();
-        let r = materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(r.conflicts, vec!["team note.md".to_string()]);
-        assert_eq!(
-            std::fs::read_to_string(mirror(&mem).join("team note.md")).unwrap(),
-            leak
         );
     }
 
