@@ -111,24 +111,44 @@ pub(super) fn run(
     let inspected = apply_copy_policy(captured, &repo, &client, &intent)?.inspect(limits);
     spinner.finish_and_clear();
     emit_push_target(&checkout, branches, selection_source);
-    let complete = match inspected {
-        ContentInspection::Complete(complete) => complete,
-        ContentInspection::Blocked(blocked) => {
+    let accept_findings = intent.accept_secret_findings;
+    let inspected = match inspected {
+        ContentInspection::Complete(complete) => Ok((complete, false)),
+        ContentInspection::Blocked(blocked)
+            if accept_findings && blocked.reason() == InspectionFailure::Incomplete =>
+        {
+            let complete = blocked
+                .accept_incomplete()
+                .context("an incomplete inspection could not be accepted")?;
+            Ok((complete, true))
+        }
+        ContentInspection::Blocked(blocked) => Err(blocked),
+    };
+    let (complete, partial) = match inspected {
+        Ok(inspected) => inspected,
+        Err(blocked) => {
             show_inspection(blocked.report());
             ui::error(&blocked.reason().to_string());
             return Ok(inspection_failure_code(blocked.reason()));
         }
     };
     show_inspection(complete.report());
-    let accept_findings = intent.accept_secret_findings;
+    if partial {
+        ui::warning(
+            "Inspection stopped before the end of the outgoing content; findings are accepted for this destination.",
+        );
+    }
     if complete.has_findings() && !accept_findings {
         ui::error(
-            "ordinary publication contains secret findings; resolve them or explicitly accept them with --allow-secrets",
+            "public ordinary publication contains secret findings; resolve them or explicitly accept them with --allow-secrets",
         );
         return Ok(ExitCode::Policy);
     }
     if complete.has_findings() {
-        ui::warning("Secret findings are explicitly accepted for this ordinary publication.");
+        ui::warning(&format!(
+            "Secret findings are accepted for this {} ordinary publication.",
+            intent.visibility
+        ));
     }
     let displayed = intent.json();
     println!("Publication destination: {displayed}");

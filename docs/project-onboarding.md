@@ -70,7 +70,8 @@ Claude Code or Codex normally. Rebind with `--history all` if you later want the
 
 The command installs hooks for available supported runtimes. Codex must report an enabled
 hooks feature and may ask you to trust the installed commands. A runtime without working
-hooks cannot provide automatic capture; omit `--auto-upload` and use manual sync instead.
+hooks cannot provide automatic capture; its sessions are published by `project sync`, and
+binding with `--auto-upload` fails only when no runtime can provide hooks.
 
 ## Verify, retry and pause
 
@@ -85,9 +86,11 @@ Check that the Manager can open each developer's sessions in the shared reposito
 Repeat sync to verify that no duplicate branches appear. The last result distinguishes
 successful pushes and failures; a push does not prove that Hub search indexing has finished.
 
-Uploads use existing privacy and identity gates. A failed upload retains the local imported
-history. There is no resident retry service in this minimal version: fix access, connectivity
-or privacy setup and rerun sync. Hooks can wait for scanning/upload; this is not token streaming.
+Uploads use existing privacy and identity gates. A private ordinary repository reports secret
+findings and publishes; only a public one requires `--allow-secrets`. A failed upload retains
+the local imported history. There is no resident retry service in this minimal version: fix
+access, connectivity or privacy setup and rerun sync. The Stop hook starts the upload in a
+background process and returns at once; `agit project status` shows its last result.
 For an encrypted repository, an account, repository identity, policy or recipient change
 requires renewed explicit consent; an ordinary repository's automatic uploads follow `push.auto`
 alone.

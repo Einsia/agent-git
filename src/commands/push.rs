@@ -71,7 +71,8 @@ pub struct Args {
     #[arg(long, require_equals = true, value_name = "true|false")]
     pub encryption: Option<bool>,
 
-    /// Accept secret findings in ordinary mode; encrypted publication requires a clean projection.
+    /// Accept secret findings at a public ordinary destination; a private one accepts them without
+    /// this flag, and encrypted publication requires a clean projection.
     #[arg(long)]
     pub allow_secrets: bool,
 

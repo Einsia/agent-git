@@ -143,6 +143,14 @@ fn captured_inspection_blocks_before_destination_binding_when_budget_is_incomple
     assert_eq!(blocked.reason(), InspectionFailure::Incomplete);
     assert!(blocked.report().scan().unscanned.over_budget.is_some());
     assert_eq!(blocked.captured().plan(), &plan);
+    // Accepting every finding at the destination admits the same captured bytes, and the
+    // unread remainder stays reported rather than being presented as scanned.
+    let accepted = blocked
+        .accept_incomplete()
+        .expect("a pass that stopped at its budget is acceptable");
+    assert_eq!(accepted.captured().plan(), &plan);
+    assert!(accepted.report().scan().unscanned.over_budget.is_some());
+    accepted.verify_source(&repo).unwrap();
     assert!(hub.finish().is_empty());
     println!("{COMPLETE}");
 }

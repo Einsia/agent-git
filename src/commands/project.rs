@@ -53,6 +53,9 @@ pub enum Action {
     Status { path: PathBuf },
     /// Stop project hook capture; retain local and remote session history.
     Unbind { path: PathBuf },
+    /// Publish the project's hook-reported sessions; the hook that starts it does not wait.
+    #[command(hide = true)]
+    Capture { path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -77,7 +80,7 @@ struct Project {
     last_result: Option<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Candidate {
     runtime: String,
     session_id: String,
@@ -480,6 +483,10 @@ pub fn run(args: Args) -> CmdResult {
             ensure!(project.enabled, "project is paused");
             sync(&mut project)
         }
+        Action::Capture { path } => {
+            drain(&root(&path)?)?;
+            Ok(ExitCode::Ok)
+        }
     }
 }
 
@@ -601,7 +608,7 @@ fn bind(
     )?;
     let repo = verify(&project)?;
     if automatic {
-        super::setup::require_project_hooks()?;
+        let runtimes = super::setup::project_hook_runtimes()?;
         ensure!(
             super::config::get("commit.auto").as_deref() != Some("false"),
             "commit.auto is disabled; enable it explicitly before automatic project capture"
@@ -621,19 +628,17 @@ fn bind(
         } else {
             confirm("Enable repository-wide automatic push to this ordinary repository?")?;
         }
-        for runtime in ["claude-code", "codex"] {
-            if adapter::get(runtime)?.available() {
-                child(
-                    &[
-                        "setup".into(),
-                        "--runtime".into(),
-                        runtime.into(),
-                        "--hooks".into(),
-                    ],
-                    &root,
-                    false,
-                )?;
-            }
+        for runtime in runtimes {
+            child(
+                &[
+                    "setup".into(),
+                    "--runtime".into(),
+                    runtime.into(),
+                    "--hooks".into(),
+                ],
+                &root,
+                false,
+            )?;
         }
         if encrypted {
             consent.save(&repo)?;
@@ -666,7 +671,134 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         session_id: session.into(),
         cwd,
     };
-    capture_candidate(project, candidate)
+    // A session claimed elsewhere is left to its own repository; only an explicit sync copies it.
+    if !matches!(placement(&project, &candidate), Ok(Placement::Claim(_))) {
+        return Ok(false);
+    }
+    if !project.enabled
+        || !project.auto_upload
+        || project
+            .excluded
+            .contains(&key(&candidate.runtime, &candidate.session_id))
+    {
+        return Ok(true);
+    }
+    enqueue(&project.root, &candidate)?;
+    // The probe lock is released before spawning, so the new worker can take it.
+    let idle = capture_worker(&project.root)?.is_some();
+    if idle && spawn_capture(&project.root).is_err() {
+        drain(&project.root)?;
+    }
+    Ok(true)
+}
+
+/// Import, inspection and upload outlast a runtime's hook budget for a long session, and a
+/// runtime that ends its hook on timeout would end the upload with it. The hook therefore hands
+/// the project to a detached worker that holds no pipe of the hook, so the turn ends at once.
+fn spawn_capture(root: &Path) -> Result<()> {
+    let mut command = crate::infra::background::command(std::env::current_exe()?);
+    command
+        .args(["--quiet", "project", "capture"])
+        .arg(root)
+        .current_dir(root)
+        .env_remove("AGIT_SESSION")
+        .env_remove("AGIT_YES")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn()?;
+    Ok(())
+}
+
+fn pending_dir(root: &Path) -> Result<PathBuf> {
+    Ok(state_path(root)?.with_extension("pending"))
+}
+
+/// A session's marker is keyed by the session, so Stops that arrive while a worker is busy
+/// coalesce into one later capture of the session's latest content.
+fn enqueue(root: &Path, candidate: &Candidate) -> Result<()> {
+    let pending = pending_dir(root)?;
+    config::create_state_dir(&pending)?;
+    let mut file = tempfile::NamedTempFile::new_in(&pending)?;
+    file.write_all(&serde_json::to_vec(candidate)?)?;
+    file.persist(pending.join(hash(&key(&candidate.runtime, &candidate.session_id))))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// The queued markers; a temporary file of an interrupted enqueue is not one.
+fn markers(root: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(pending_dir(root)?) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut markers = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.len() == 24 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            markers.push(path);
+        }
+    }
+    Ok(markers)
+}
+
+/// Removes one marker before its capture, so a Stop during that capture queues the session again.
+fn take_pending(root: &Path) -> Result<Option<Candidate>> {
+    for path in markers(root)? {
+        let bytes = fs::read(&path)?;
+        fs::remove_file(&path)?;
+        if let Ok(candidate) = serde_json::from_slice(&bytes) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// At most one worker captures a project. `None` means another worker holds it and will see
+/// any marker written before it lets go.
+fn capture_worker(root: &Path) -> Result<Option<fs::File>> {
+    config::create_state_dir(&home()?)?;
+    let file = config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state_path(root)?.with_extension("capture"))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if crate::infra::local_state::is_contended(&e) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Publishes queued sessions one at a time. After letting the worker lock go it looks once more,
+/// so a marker written while it was finishing is not left for the next turn.
+fn drain(root: &Path) -> Result<()> {
+    loop {
+        let Some(worker) = capture_worker(root)? else {
+            return Ok(());
+        };
+        while let Some(candidate) = take_pending(root)? {
+            let Some(project) = read(root)? else {
+                return Ok(());
+            };
+            // A failure is recorded in the project's last result; the remaining sessions go on.
+            let _ = capture_candidate(project, candidate);
+        }
+        drop(worker);
+        if markers(root)?.is_empty() {
+            return Ok(());
+        }
+    }
 }
 
 fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool> {
@@ -683,6 +815,11 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     project = read(&project.root)?.context("project policy disappeared")?;
     if !project.enabled || !project.auto_upload || project.excluded.contains(&session_key) {
         return Ok(true);
+    }
+    // A queued capture outlives its Stop: a directory bound on its own in between belongs to
+    // that binding's history and upload choices, not to this project's.
+    if !includes(&project, &candidate.cwd)? {
+        return Ok(false);
     }
     let result = sync_one(&project, &candidate, Trigger::Hook);
     project.last_result = Some(
@@ -851,6 +988,75 @@ mod tests {
         drop(guard);
         assert!(worker.join().unwrap().unwrap());
         assert!(read(&latest.root).unwrap().unwrap().last_result.is_none());
+    }
+
+    /// Stops that arrive while a worker holds the project coalesce into one marker per session,
+    /// and another drainer leaves them to that worker. A worker per Stop would pile up waiting
+    /// processes that each import, inspect and upload the same session again.
+    #[test]
+    fn busy_capture_worker_coalesces_stops_into_one_worker() {
+        if !isolated("busy_capture_worker_coalesces_stops_into_one_worker") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        save(&project).unwrap();
+        let candidate = |id: &str| Candidate {
+            runtime: "codex".into(),
+            session_id: id.into(),
+            cwd: project.root.clone(),
+        };
+        let worker = capture_worker(&project.root).unwrap().unwrap();
+        for _ in 0..3 {
+            enqueue(
+                &project.root,
+                &candidate("cccccccc-0000-4000-8000-000000000003"),
+            )
+            .unwrap();
+        }
+        enqueue(
+            &project.root,
+            &candidate("dddddddd-0000-4000-8000-000000000004"),
+        )
+        .unwrap();
+        assert_eq!(markers(&project.root).unwrap().len(), 2);
+        assert!(capture_worker(&project.root).unwrap().is_none());
+        drain(&project.root).unwrap();
+        assert_eq!(markers(&project.root).unwrap().len(), 2);
+        drop(worker);
+        drain(&project.root).unwrap();
+        assert!(markers(&project.root).unwrap().is_empty());
+        assert!(read(&project.root).unwrap().unwrap().last_result.is_some());
+    }
+
+    /// A capture queued before its directory was bound on its own is skipped, so the parent
+    /// project does not import or publish a session the nested binding now owns.
+    #[test]
+    fn queued_capture_respects_a_nested_binding_made_afterwards() {
+        if !isolated("queued_capture_respects_a_nested_binding_made_afterwards") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let parent = project(work.path());
+        save(&parent).unwrap();
+        let nested = parent.root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        enqueue(
+            &parent.root,
+            &Candidate {
+                runtime: "codex".into(),
+                session_id: "cccccccc-0000-4000-8000-000000000003".into(),
+                cwd: nested.clone(),
+            },
+        )
+        .unwrap();
+        let mut child = project(&nested);
+        child.repository = "alice/nested".into();
+        child.auto_upload = false;
+        save(&child).unwrap();
+        drain(&parent.root).unwrap();
+        assert!(markers(&parent.root).unwrap().is_empty());
+        assert!(read(&parent.root).unwrap().unwrap().last_result.is_none());
     }
 
     #[test]

@@ -8,8 +8,23 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Changed
+
+- **Secret findings no longer stop uploads to a private ordinary repository.**
+  `agit push`, automatic push and `agit project sync` report the findings and
+  publish, because only the repository's collaborators can read it. This includes
+  an inspection that stopped at its finding or byte limit, which previously refused
+  even with `--allow-secrets`. A public repository still requires an explicit
+  `--allow-secrets`, and an encrypted one still requires clean processed content.
+- The project Stop hook starts the session upload in a background process and
+  returns immediately, so a long import or upload no longer holds the agent's turn
+  or runs into the runtime's hook timeout. `agit project status` shows the result.
+
 ### Fixed
 
+- `agit project bind --auto-upload` no longer fails when Codex is installed but
+  cannot report an enabled hooks feature. Claude Code hooks are still installed,
+  and Codex sessions in the project are published by `agit project sync`.
 - `agit project sync` publishes a session that another repository already claims, such
   as one started from a desktop RC project, as a separate copy of that claim's branch
   in the project repository, instead of failing with "session already belongs to another

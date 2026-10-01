@@ -40,12 +40,16 @@ and enables the existing **repository-wide** `push.auto` preference. Other manag
 sessions in that local repository inherit that preference. Global preferences are not
 changed. An encrypted repository must have its viewing key initialized by its owner;
 never request the viewing password in chat. Codex hooks must be supported, enabled and
-trusted in the installed runtime. Unsupported hook setup is an error, not success.
+trusted in the installed runtime; a Codex without it does not block Claude Code capture,
+and its sessions are published by `project sync`. Binding fails only when no runtime can
+provide hooks.
 
-The Stop hook imports/saves the completed conversation through the ordinary import path,
-then publishes through existing identity and privacy gates, plus consent for an encrypted
-repository. Upload is synchronous;
-there is no resident retry queue. A failed push keeps local history. Retry with `project sync`.
+The Stop hook hands the completed conversation to a background process and returns, so the
+turn is not held by import, inspection or upload. That process imports/saves it through the
+ordinary import path, then publishes through existing identity and privacy gates, plus
+consent for an encrypted repository. A private ordinary repository reports secret findings
+and publishes; it does not stop on them. There is no resident retry queue. A failed push
+keeps local history, and `status` shows the last result. Retry with `project sync`.
 For an encrypted repository, policy, account, recipient or destination changes require review
 and renewed binding consent; an ordinary repository's automatic uploads follow `push.auto` alone.
 RC-owned sessions keep their supervisor lifecycle and are not taken over by this command;

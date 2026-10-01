@@ -442,6 +442,14 @@ fn remote(lab: &Lab, owner: &str, id: &str) -> Value {
         "clone_url":format!("{}/{owner}/qa.git", lab.base)})
 }
 
+/// Secret findings stop publication only at a public destination, so tests of that gate and of
+/// the declarations that relax it publish to one.
+fn public_remote(lab: &Lab, owner: &str, id: &str) -> Value {
+    let mut remote = remote(lab, owner, id);
+    remote["visibility"] = json!("public");
+    remote
+}
+
 fn assert_failure(output: &Output, mode: &str, code: i32) -> String {
     assert_command_failure(output, mode, code, "push")
 }
@@ -553,13 +561,18 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
                     Step::new(&get, Reply::Status(404)),
                     Step::new("POST /api/agents", reply),
                 ],
-                "foreign-access" => vec![
-                    Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
-                    Step::new(
+                "foreign-access" => {
+                    // The private destination's acceptance accompanies its first probe.
+                    let mut probe = Step::new(
                         "GET /other/qa.git/info/refs?service=git-receive-pack",
                         reply,
-                    ),
-                ],
+                    );
+                    probe.acceptance = true;
+                    vec![
+                        Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
+                        probe,
+                    ]
+                }
                 "foreign-org" => vec![
                     Step::new(&get, Reply::Status(404)),
                     Step::new("GET /api/orgs/other", reply),
@@ -709,24 +722,24 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
             Step::new("GET /api/agents/team/qa", confirmation),
         ];
         if confirmed {
-            steps.extend([
-                Step::new(
+            // A private destination accepts findings, so every receive request says so.
+            let receive = |status| {
+                let mut step = Step::new(
                     "GET /team/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
+                    Reply::Status(status),
+                );
+                step.acceptance = true;
+                step
+            };
+            steps.extend([
+                receive(200),
                 Step::new(
                     "GET /api/agents/team/qa",
                     Reply::Json(remote(&lab, "team", AGENT_ID)),
                 ),
-                Step::new(
-                    "GET /team/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
+                receive(200),
+                receive(503),
             ]);
-            steps.push(Step::new(
-                "GET /team/qa.git/info/refs?service=git-receive-pack",
-                Reply::Status(503),
-            ));
         }
         let server = Server::start(&lab, steps);
         let visibility = (case != "default-public-race").then_some("--private");
@@ -831,6 +844,12 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
         lab.git(&path, &["remote", "remove", "origin"]);
         fs::remove_dir_all(store).unwrap();
         assert_eq!(lab.state(), before);
+        // A private destination accepts findings, so every receive request says so.
+        let mut failed_receive = Step::new(
+            "GET /alice/qa.git/info/refs?service=git-receive-pack",
+            Reply::Status(status),
+        );
+        failed_receive.acceptance = true;
         let server = Server::start(
             &lab,
             vec![
@@ -848,22 +867,13 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
                     "GET /api/agents/alice/qa",
                     Reply::Json(remote(&lab, "alice", AGENT_ID)),
                 ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
+                accepted_probe(),
                 Step::new(
                     "GET /api/agents/alice/qa",
                     Reply::Json(remote(&lab, "alice", AGENT_ID)),
                 ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(status),
-                ),
+                accepted_probe(),
+                failed_receive,
             ],
         );
         let output = lab.push("alice/qa", mode, false);
@@ -976,7 +986,7 @@ fn remote_declarations_enable_push_without_local_policy_state() {
         assert_eq!(dictionary.exists(), discovered);
         assert!(!dictionary.has_policy_state().unwrap());
 
-        let remote = remote(&lab, "alice", AGENT_ID);
+        let remote = public_remote(&lab, "alice", AGENT_ID);
         let server = Server::start(
             &lab,
             vec![
@@ -1023,7 +1033,7 @@ fn remote_declarations_enable_push_without_local_policy_state() {
 fn old_hub_accepts_push_without_local_policy_state() {
     let lab = Lab::new();
     let path = lab.seed("alice", "qa", true);
-    let remote = remote(&lab, "alice", AGENT_ID);
+    let remote = public_remote(&lab, "alice", AGENT_ID);
     let server = Server::start(
         &lab,
         vec![
@@ -1088,7 +1098,7 @@ fn separate_push_does_not_inherit_source_allowances() {
         lab.git(&path, &["add", "."]);
         lab.git(&path, &["commit", "-m", "Record source allowance"]);
         let before = lab.state();
-        let mut destination = remote(&lab, "alice", OTHER_ID);
+        let mut destination = public_remote(&lab, "alice", OTHER_ID);
         destination["name"] = json!("copy");
         destination["clone_url"] = json!(format!("{}/alice/copy.git", lab.base));
         let mut policy = policy_view(0, vec![]);
@@ -1357,12 +1367,55 @@ fn exact_declaration_offline_dry_run_and_first_publication_keep_policy_before_co
     assert!(output.status.success(), "{output:?}");
 }
 
+/// The first push-access probe of another namespace already carries the destination's
+/// acceptance. Deriving it from the explicit flag alone would let a Hub that still requires
+/// acceptance refuse an automatic upload to a private team repository before the private
+/// acceptance applies; a public team repository still sends none.
+#[test]
+fn team_probe_carries_private_acceptance_for_automatic_push() {
+    for (visibility, acceptance) in [("private", true), ("public", false)] {
+        let lab = Lab::new();
+        let path = lab.seed("team", "qa", true);
+        identity::pin(
+            &Repo::at(&path),
+            &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+        )
+        .unwrap();
+        let mut response = remote(&lab, "team", AGENT_ID);
+        response["visibility"] = json!(visibility);
+        let mut probe = Step::new(
+            "GET /team/qa.git/info/refs?service=git-receive-pack",
+            Reply::Status(503),
+        );
+        probe.acceptance = acceptance;
+        let server = Server::start(
+            &lab,
+            vec![
+                Step::new("GET /api/agents/team/qa", Reply::Json(response)),
+                probe,
+            ],
+        );
+        let output = lab
+            .push_command("team/qa", "json2", false, None)
+            .env("AGIT_AUTO_PUSH", "1")
+            .output()
+            .unwrap();
+        server.finish();
+        assert!(!output.status.success(), "{visibility}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("push-access probe"),
+            "{visibility}: {output:?}"
+        );
+        lab.no_requests();
+    }
+}
+
 #[test]
 fn exact_declaration_old_hub_requires_explicit_acceptance_each_time() {
     let lab = Lab::new();
     let path = lab.seed("alice", "qa", true);
     let a = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-    let remote = remote(&lab, "alice", AGENT_ID);
+    let remote = public_remote(&lab, "alice", AGENT_ID);
     let server = Server::start(
         &lab,
         vec![

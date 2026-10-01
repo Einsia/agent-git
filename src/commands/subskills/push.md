@@ -30,7 +30,7 @@ agit push [owner/repo@branch] [options]
 | `--encryption=true\|false` | Select a new repository's fixed mode; omission uses local creation intent or `privacy.encryption` (default `false`, ordinary) |
 | `--to <owner/repo>` | Publish original history to another repository; for device-local RC, select its retained primary target |
 | `--separate` | With `--to`, publish a separate copy from local RC while retaining its primary target |
-| `--allow-secrets` | Explicitly accept deterministic findings in ordinary mode; encrypted publication still requires clean processed content |
+| `--allow-secrets` | Accept deterministic findings for a public ordinary destination; a private ordinary destination accepts them without the flag, and encrypted publication still requires clean processed content |
 | `--audit` | Open an interactive sensitivity reviewer for the frozen outgoing publication, then ask separately before publishing |
 | `--dry-run` | Inspect the selected publication with Hub mode/identity lookups, without creating a repository or uploading history |
 | `--show-preview` | Expand readable snapshot content and summarize binary payloads |
@@ -63,9 +63,13 @@ choice applies only to this invocation. Agent and script callers use a complete
 target or `AGIT_SESSION`; workspace bindings, native IDs, and the newest session
 do not choose what to publish. `--yes` does not select a missing target.
 
-## Review secret protection before pushing
+## Review secret protection before a public push
 
-Before an authorized push, complete this review using the selected Agent repo, not the source-code repository:
+A private ordinary destination is readable only by its collaborators. Push reports its
+findings, including an inspection that stopped at its finding or byte bound, and publishes
+without `--allow-secrets`; do not run the review below for it. Before an authorized push to
+a public ordinary destination, complete this review using the selected Agent repo, not the
+source-code repository:
 
 1. Inspect `agit secrets review --repo <agent-repo-path> --json` and run `agit scan <owner/repo>@<branch> --secrets --json`. Review existing protection candidates even when the scan is clean: already protected values appear as placeholders and may include false positives.
 2. Check the actual values in authorized local source content and assess them for the requested audience. `review` returns opaque IDs and policy metadata, not plaintext; a label or placeholder alone is insufficient evidence for `allow`. Keep real credentials and uncertain candidates protected.
@@ -118,8 +122,9 @@ the push unsuccessful and does not replace local publication receipts or confirm
 a supervisor result. This requires a Hub with ordinary-history reconciliation
 support. RC becomes synchronized only after its receiver returns a durable ACK;
 Git `UpToDate` and local publication receipts do not provide that acknowledgement.
-Explicit secret-findings acceptance accompanies both ordinary push-access probes
-and native publication; automatic pushes do not inherit that exception.
+Secret-findings acceptance accompanies both ordinary push-access probes and native
+publication. A private ordinary destination always sends it; a public one sends it only
+for an explicit, non-automatic `--allow-secrets`.
 
 Ciphertext-only history cannot be published as unencrypted originals. If selected
 ancestry contains encrypted snapshots, push requires the original historical data;

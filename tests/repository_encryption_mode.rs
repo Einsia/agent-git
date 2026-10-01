@@ -616,6 +616,8 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     };
     let pending = serde_json::to_vec(&request).unwrap();
     let result = root.path().join("supervisor-result.json");
+    // Findings acceptance stays explicit, and never automatic, only for a public destination.
+    hub.response.lock().unwrap().1["visibility"] = json!("public");
     let push = |accept_findings| {
         std::fs::write(&result, &pending).unwrap();
         let mut command = hub.command(root.path(), &["--yes", "push", "alice/demo@work"]);
@@ -644,16 +646,21 @@ fn unchanged_ordinary_push_requires_live_reconciliation_before_saving_a_receipt(
     let receipt = PublicationReceipt::load(&repo, "work").unwrap().unwrap();
     assert_eq!(receipt.published, head);
     assert_eq!(request.read_result(&result).unwrap(), receipt);
-    let automatic = hub
-        .command(
-            root.path(),
-            &["--yes", "push", "alice/demo@work", "--allow-secrets"],
-        )
-        .env("AGIT_AUTO_PUSH", "1")
-        .env("AGIT_ALLOW_SECRETS", "1")
-        .output()
-        .unwrap();
-    refused(automatic, "answered 422 to the push-access probe");
+    let automatic = |accept_findings| {
+        let mut command = hub.command(root.path(), &["--yes", "push", "alice/demo@work"]);
+        if accept_findings {
+            command
+                .arg("--allow-secrets")
+                .env("AGIT_ALLOW_SECRETS", "1");
+        }
+        command.env("AGIT_AUTO_PUSH", "1").output().unwrap()
+    };
+    refused(automatic(true), "answered 422 to the push-access probe");
+    // A private destination accepts findings for automatic publication without being asked.
+    hub.response.lock().unwrap().1["visibility"] = json!("private");
+    let private = automatic(false);
+    assert!(private.status.success(), "{private:?}");
+    assert!(String::from_utf8_lossy(&private.stdout).contains("up to date"));
     let request_count = hub.requests.lock().unwrap().len();
 
     hub.reject_advertisement.store(true, Ordering::Release);

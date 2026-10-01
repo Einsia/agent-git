@@ -278,7 +278,14 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
         lab.git(&repo, &["commit", "-m", "Record protected content"]);
         let refs = lab.git(&repo, &["show-ref"]);
         let policy_state = lab.state();
-        let policy = lab.push("alice/qa", mode, false);
+        // Findings in a private destination are reported and accepted; only a public one
+        // requires the explicit acceptance.
+        let private = lab.push("alice/qa", mode, false);
+        assert_eq!(private.status.code(), Some(0), "{private:?}");
+        assert!(!String::from_utf8_lossy(&private.stdout).contains(SECRET));
+        assert!(!String::from_utf8_lossy(&private.stderr).contains(SECRET));
+        assert_eq!(lab.state(), policy_state);
+        let policy = lab.push_output(lab.push_command("alice/qa", mode, false).arg("--public"));
         assert_output(
             &policy,
             mode,
@@ -290,6 +297,7 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
         assert_eq!(lab.state(), policy_state);
         let allowed = lab.push_output(
             lab.push_command("alice/qa", mode, false)
+                .arg("--public")
                 .env("AGIT_ALLOW_SECRETS", "1"),
         );
         assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");

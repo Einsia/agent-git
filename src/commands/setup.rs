@@ -350,20 +350,28 @@ fn codex_hooks_capability() -> Option<CodexHooksCapability> {
     parse_codex_hooks_capability(&String::from_utf8_lossy(&output.stdout))
 }
 
-pub(super) fn require_project_hooks() -> crate::Result<()> {
-    let claude = crate::adapter::get("claude-code")?.available();
-    let codex = crate::adapter::get("codex")?.available();
-    anyhow::ensure!(
-        claude || codex,
-        "install Claude Code or Codex before enabling project hooks"
-    );
-    if codex {
-        anyhow::ensure!(
-            codex_hooks_capability().is_some_and(|c| c.enabled),
-            "Codex must report an enabled hooks feature before automatic project capture; use manual project sync otherwise"
-        );
+/// The runtimes whose hooks can capture project sessions automatically. Codex counts only when
+/// it reports an enabled hooks feature; a Codex that cannot does not take Claude Code capture
+/// down with it, and its sessions remain available to manual project sync.
+pub(super) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
+    let mut runtimes = Vec::new();
+    if crate::adapter::get("claude-code")?.available() {
+        runtimes.push("claude-code");
     }
-    Ok(())
+    if crate::adapter::get("codex")?.available() {
+        if codex_hooks_capability().is_some_and(|c| c.enabled) {
+            runtimes.push("codex");
+        } else {
+            ui::warning(
+                "Codex does not report an enabled hooks feature; its sessions in this project are published by `agit project sync` instead of automatically",
+            );
+        }
+    }
+    anyhow::ensure!(
+        !runtimes.is_empty(),
+        "install Claude Code, or Codex with its hooks feature enabled, before enabling automatic project capture; use manual project sync otherwise"
+    );
+    Ok(runtimes)
 }
 
 fn parse_codex_hooks_capability(output: &str) -> Option<CodexHooksCapability> {

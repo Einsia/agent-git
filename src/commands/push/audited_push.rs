@@ -830,6 +830,15 @@ fn confirm_publication(
     })
 }
 
+/// Ordinary findings gate only content that anyone can read. A private ordinary destination
+/// accepts them for explicit and automatic publication alike: only its collaborators can read
+/// it, and a refused session stays unpublished however many of its findings are false. A public
+/// destination still requires an explicit, non-automatic acceptance. Encrypted publication never
+/// accepts findings, because its projection must be clean.
+fn accepts_secret_findings(encryption_enabled: bool, visibility: &str, explicit: bool) -> bool {
+    !encryption_enabled && (explicit || visibility == "private")
+}
+
 #[derive(Debug)]
 enum Action {
     Existing(RemoteAgent),
@@ -874,17 +883,22 @@ impl Intent {
         if let Some(selected) = &separate_target {
             selected.verify_lookup(source.as_ref())?;
         }
-        let accept_secret_findings = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV)
-            .is_none()
-            && (args.allow_secrets || config::allow_secrets());
+        let automatic = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some();
+        let accept_secret_findings = !automatic && (args.allow_secrets || config::allow_secrets());
         let copy = if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
             match &source {
+                // The probe of another namespace already carries the destination's acceptance:
+                // a private team repository accepts findings before its push access is known.
                 Some(remote) => !matches!(
                     super::super::remote_request(client.push_access_with_secret_acceptance(
                         &checkout.owner,
                         &checkout.name,
                         &remote.agent_id,
-                        accept_secret_findings && !remote.require_encryption_enabled()?,
+                        accepts_secret_findings(
+                            remote.require_encryption_enabled()?,
+                            &remote.visibility,
+                            accept_secret_findings,
+                        ),
                     ))?,
                     crate::hub::PushAccess::Writable
                 ),
@@ -1006,6 +1020,8 @@ impl Intent {
                 "visibility flags only affect creation; the publication destination retains its existing audience",
             );
         }
+        let accept_secret_findings =
+            accepts_secret_findings(encryption_enabled, &visibility, accept_secret_findings);
         let intent = Self {
             hub,
             account: me.into(),
@@ -1014,7 +1030,7 @@ impl Intent {
             url,
             visibility,
             encryption_enabled,
-            accept_secret_findings: accept_secret_findings && !encryption_enabled,
+            accept_secret_findings,
             action,
             separate_target,
         };

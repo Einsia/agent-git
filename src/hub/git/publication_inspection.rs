@@ -261,6 +261,16 @@ impl BlockedContentInspection {
     pub fn reason(&self) -> InspectionFailure {
         self.reason
     }
+
+    /// A pass that stopped at its finding cap or byte budget publishes only for a caller that
+    /// accepts every finding at this destination: the unread remainder could only add findings.
+    /// Unreadable content or an unavailable policy stays blocked, because nothing was judged.
+    pub fn accept_incomplete(self) -> Option<CompleteContentInspection> {
+        (self.reason == InspectionFailure::Incomplete).then(|| CompleteContentInspection {
+            captured: self.captured,
+            report: self.report,
+        })
+    }
 }
 
 fn inspect_content<R: Read>(
