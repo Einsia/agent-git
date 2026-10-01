@@ -1,6 +1,5 @@
 //! Authenticated records may be reused only for identical key, ciphertext, and associated data.
 use super::{DecryptedRecord, VaultFile};
-use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
@@ -20,10 +19,19 @@ pub(super) fn read(
     dek: &[u8],
     authenticate: impl FnOnce() -> crate::Result<Vec<DecryptedRecord>>,
 ) -> crate::Result<Vec<DecryptedRecord>> {
-    let mut digest = Sha256::new();
-    digest.update(b"agit-authenticated-records-v1");
+    read_in(file, dek, authenticate, CACHE.get_or_init(Default::default))
+}
+
+fn read_in(
+    file: &VaultFile,
+    dek: &[u8],
+    authenticate: impl FnOnce() -> crate::Result<Vec<DecryptedRecord>>,
+    cache: &Mutex<VecDeque<Entry>>,
+) -> crate::Result<Vec<DecryptedRecord>> {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"agit-authenticated-records-blake3-v1");
     let mut field = |bytes: &[u8]| {
-        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(&(bytes.len() as u64).to_le_bytes());
         digest.update(bytes);
     };
     // Callers unwrap the current key before this boundary; a missing or revoked key still fails.
@@ -36,7 +44,6 @@ pub(super) fn read(
         field(record.sealed.ciphertext.as_bytes());
     }
     let key: [u8; 32] = digest.finalize().into();
-    let cache = CACHE.get_or_init(Default::default);
     let cached = {
         let mut entries = cache
             .lock()
@@ -110,16 +117,40 @@ mod tests {
             )
             .unwrap();
         let unlocked = store.unlock_existing().unwrap();
-        let first = super::super::decrypt_records(&unlocked.file, &unlocked.dek).unwrap();
-        let cached = super::super::decrypt_records(&unlocked.file, &unlocked.dek).unwrap();
+        let cache = std::sync::Mutex::default();
+        let decode = |file: &super::VaultFile, dek: &[u8]| {
+            super::read_in(
+                file,
+                dek,
+                || super::super::decrypt_records_uncached(file, dek),
+                &cache,
+            )
+        };
+        let first = decode(&unlocked.file, &unlocked.dek).unwrap();
+        let cached = decode(&unlocked.file, &unlocked.dek).unwrap();
         assert_eq!(first[0].secret.as_str(), cached[0].secret.as_str());
+        super::read_in(
+            &unlocked.file,
+            &unlocked.dek,
+            || panic!("identical authenticated records must use the cached snapshot"),
+            &cache,
+        )
+        .unwrap();
         let mut changed = unlocked.file.clone();
         changed.records[0].sealed.ciphertext.push('A');
-        assert!(super::super::decrypt_records(&changed, &unlocked.dek).is_err());
-        assert!(super::super::decrypt_records(&unlocked.file, &[0; 32]).is_err());
+        assert!(decode(&changed, &unlocked.dek).is_err());
+        assert!(decode(&unlocked.file, &[0; 32]).is_err());
         changed = unlocked.file.clone();
         changed.records[0].id.push('x');
-        assert!(super::super::decrypt_records(&changed, &unlocked.dek).is_err());
+        assert!(decode(&changed, &unlocked.dek).is_err());
+        changed = unlocked.file.clone();
+        changed.records[0].sealed.nonce.push('A');
+        assert!(decode(&changed, &unlocked.dek).is_err());
+        changed = unlocked.file.clone();
+        changed.records[0].version += 1;
+        assert!(decode(&changed, &unlocked.dek).is_err());
+        changed.records.clear();
+        assert!(decode(&changed, &unlocked.dek).unwrap().is_empty());
         use crate::domain::secret_filter::KeyStore;
         store.keys.delete(&unlocked.file.vault_id).unwrap();
         assert!(store.matcher().is_err());
