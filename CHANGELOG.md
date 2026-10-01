@@ -10,6 +10,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `agit push <owner/repo@branch> --to <existing repository>` (and `agit project sync`
+  copies of sessions claimed elsewhere) no longer push the source repository's
+  `main` file line. The destination keeps its own `main`; before, the copy failed
+  as a rejected non-fast-forward, or fast-forwarded the destination's shared files
+  to the source's. A destination the push creates still receives the source's `main`.
 - A Claude Code prompt whose record starts with a runtime-injected block, such as the
   worktree reminder the desktop app puts ahead of a session's first message, is
   kept as the turn's prompt instead of being dropped with the injection. Such a

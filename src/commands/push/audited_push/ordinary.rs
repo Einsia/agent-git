@@ -66,7 +66,14 @@ pub(super) fn run(
         .into());
     }
 
-    let plan = PublicationPlan::freeze(&repo, branches)?;
+    // An existing separate destination keeps its own file line. The source's `main` would either
+    // be refused as a non-fast-forward, failing the whole copy, or fast-forward the destination's
+    // shared files to the source's. Only a destination this publication creates receives it.
+    let plan = if intent.separate_target.is_some() && matches!(intent.action, Action::Existing(_)) {
+        PublicationPlan::freeze_selected(&repo, branches)?
+    } else {
+        PublicationPlan::freeze(&repo, branches)?
+    };
     require_original_history(&repo, &plan)?;
     let mut supervisor = SupervisorReply::from_env()?;
     if let Some(reply) = &supervisor {

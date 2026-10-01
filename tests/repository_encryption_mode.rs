@@ -1024,6 +1024,37 @@ fn check_separate_ordinary_destination(local_rc: bool) {
         PublicationReceipt::load(&repo, "work").unwrap(),
         Some(primary)
     );
+    // A session branch copied into the now existing destination leaves that destination's file
+    // line alone, even when the source's own `main` has advanced.
+    let destination_main = ordinary_git_receiver::git(&target, &["rev-parse", "main"]);
+    let source_main = repo.git(&["rev-parse", "main"]).unwrap();
+    let tree = repo.git(&["rev-parse", "main^{tree}"]).unwrap();
+    let advanced = repo
+        .git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            "main",
+            "-m",
+            "Advance the source file line",
+        ])
+        .unwrap();
+    repo.git(&["update-ref", "refs/heads/main", &advanced])
+        .unwrap();
+    let mut explicit = vec!["--yes", "push"];
+    let selected = format!("{source_slug}@work");
+    explicit.extend([selected.as_str(), "--to", "alice/demo"]);
+    if local_rc {
+        explicit.push("--separate");
+    }
+    let copied = hub.run(root.path(), &explicit);
+    assert!(copied.status.success(), "{copied:?}");
+    assert_eq!(
+        ordinary_git_receiver::git(&target, &["rev-parse", "main"]),
+        destination_main
+    );
+    repo.git(&["update-ref", "refs/heads/main", &source_main])
+        .unwrap();
     let requests = hub.requests.lock().unwrap();
     let mutation_count = requests
         .iter()
