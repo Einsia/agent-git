@@ -1,6 +1,6 @@
 # RFC Local Privacy and Recoverable Secret Dictionaries
 
-Status: Accepted requirements; implementation integrated; delivery verification in progress.
+Status: Accepted requirements; implemented, verified, deployed, and released.
 
 This RFC specifies AgentGit's default privacy behavior, the independent local
 modules that implement it, the cloud storage contract, and the implementation
@@ -10,7 +10,8 @@ Its failure must never reject an otherwise valid conversation operation.
 This decision supersedes the fail-closed publication and local-only dictionary
 requirements in `05_global_secret_filter.md`,
 `06_repository_secret_dictionary.md`, and `explicit-secret-acceptance.md`.
-The backend's confirmed-publication RFC must be reconciled with this decision.
+The backend's confirmed-publication RFC is superseded by the storage-only contract
+documented in its `docs/local-privacy-storage.md`.
 
 ## 1 Final requirements
 
@@ -308,7 +309,7 @@ caps produce partial/skipped privacy results, not publication refusals.
 - Retain authorization, immutable refs, provenance, transport and LFS integrity,
   repository locks, quota checks, and snapshot-bound visibility confirmation.
 - Add automatic account key provisioning and opaque encrypted package storage.
-- Add focused route tests for user isolation, idempotency, and acceptance of
+- Maintain focused route coverage for user isolation, idempotency, and acceptance of
   synthetic secret-shaped conversation content without scanner invocation.
 - Remove or reconcile obsolete privacy acceptance flags, reports, UI claims,
   documentation, and tests that require server privacy rejection.
@@ -377,8 +378,9 @@ The implementation resides in `src/domain/privacy/`. `detector` and `policy`
 operate without storage or networking. `dictionary`, `crypto`, `storage`, `keys`,
 `sync`, `management`, `projector`, `continuity`, `worker`, and `service` have
 separate responsibilities. The backend storage API and optional schema migration
-are implemented in the companion backend change. Production deployment and CLI
-release remain outstanding until all required checks pass.
+are implemented in the companion backend change. Production deployment is verified
+in all regions. CLI 0.2.16 is released on GitHub and npm with delivery verification
+complete.
 
 ### Concrete local boundaries
 
@@ -418,7 +420,7 @@ release remain outstanding until all required checks pass.
   implicit privacy scan. Login, push (including no-op), fetch and clone schedule
   bounded independent synchronization. LFS payloads never enter privacy processing.
 
-### Verification evidence so far
+### Verification evidence
 
 The focused validation includes detector partial results, policy precedence,
 durable projection with long values, owner-bound authenticated encryption,
@@ -436,9 +438,11 @@ local publication preconditions, upload identity/confirmation/network categories
 doctor and input categories, strict all-target
 Clippy, and the library build without default features. Backend validation includes
 the storage protocol against PostgreSQL, LFS and publication paths, frontend
-settings/type checks, and strict all-target Clippy. Relevant broader integration
-checks and release verification are still in progress; this is not a completion
-claim.
+settings/type checks, and strict all-target Clippy. The required Linux, macOS,
+Windows, musl, distribution compatibility and npm checks all pass on the final
+implementation. The merged source tree is identical to the checked merge-request
+tree. Live model-credential checks remain opt-in and were not run; deterministic
+native runtime and protocol checks cover the maintained local contracts.
 
 `AGENTS.md` requires a distinct maintained purpose for each test. Obsolete privacy
 refusal tests, deleted LFS scanning tests, and duplicate legacy projection tests
@@ -488,3 +492,31 @@ the original fragment. Completion cannot discard bytes already consumed by the p
 Test maintenance removes fail-closed privacy fixtures, cloud-rule resolver fixtures, and duplicate
 legacy scanner assertions inside command tests. Durable alias recovery, selected history,
 transport integrity, staged/unstaged isolation, and live fragment delivery retain distinct checks.
+
+### Delivery evidence
+
+- [CLI implementation and required CI](https://git.xiaoaojianghu.fun:114/dev/agentgit/agent-git/-/merge_requests/358)
+  merged as `02eb36958448b5c3c321a3b1924d8dab924ac2c4`. Pipeline `24151`
+  verifies the same source tree, including native-title protection.
+- [Backend implementation](https://git.xiaoaojianghu.fun:114/dev/agentgit/AgentGit-backend/-/merge_requests/705)
+  is deployed from source `93a2f8ff345e8b4113ec35503740a8b7602d944d`.
+  Expand migration 58 owns account keys and encrypted packages; its absence
+  remains isolated from ordinary application readiness.
+- [Staging receipt](https://git.xiaoaojianghu.fun:114/dev/agentgit/gitops/-/jobs/92150/artifacts/file/deployment-receipt.json)
+  and [production receipt](https://git.xiaoaojianghu.fun:114/dev/agentgit/gitops/-/jobs/92183/artifacts/file/deployment-receipt.json)
+  verify image `sha256:b5bfc4400e976673f5c364232236a1738410e9017e703594d09e3aa9e2fcf65f`
+  in `ap-southeast-1`, `us-east-2`, and `us-west-2`. Production completed at
+  `2026-10-01T19:54:02Z` with runtime, frontend, public transport, compatibility,
+  and functional acceptance checks passing.
+- [CLI 0.2.16](https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.16)
+  is a published stable release from the mirrored source
+  `015c555518c69fb2cbf5c84c71c436af36f2161a`.
+  [Release verification](https://github.com/Einsia/agent-git/actions/runs/36922897288)
+  passes for Linux and macOS on both architectures and Windows x64. All five
+  archives are present, and `SHA256SUMS` matches their published asset digests.
+- [npm publication and installation verification](https://github.com/Einsia/agent-git/actions/runs/36927554447)
+  passes. The main package, `create-agit`, and all five platform packages are
+  publicly available at `0.2.16`, with `latest` pointing to that version.
+  The installation preflight resolves a published platform package and verifies
+  `agit --version`; public registry metadata confirms exact dependency versions
+  and provenance attestations for the complete package family.
