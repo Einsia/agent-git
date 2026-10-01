@@ -175,6 +175,21 @@ fn record(log: &Option<super::super::diagnostics::Log>, event: &str, metadata: s
     }
 }
 
+async fn receive_presence(
+    presence: &mut Presence,
+    children: &mut tokio::task::JoinSet<()>,
+) -> anyhow::Result<PresenceEvent> {
+    // Reaping offer workers must not cancel a consumed ping's pending pong write.
+    let receiving = presence.next();
+    tokio::pin!(receiving);
+    loop {
+        tokio::select! {
+            Some(_) = children.join_next(), if !children.is_empty() => {},
+            offer = &mut receiving => return offer,
+        }
+    }
+}
+
 async fn run_executor(
     hub: String,
     worker: Worker,
@@ -206,8 +221,7 @@ async fn run_executor(
                         children.abort_all();
                         return Ok(());
                     }
-                    Some(_) = children.join_next(), if !children.is_empty() => {},
-                    offer = presence.next() => {
+                    offer = receive_presence(&mut presence, &mut children) => {
                         let PresenceEvent::Offer { link_id, source_id, ticket, grant_token, grant } = offer? else { continue };
                         let Ok(permit) = slots.clone().try_acquire_owned() else {
                             record(&log, "cloud.offer_capacity", serde_json::json!({"hub":hub,"link_id":link_id}));
@@ -284,6 +298,87 @@ async fn run_executor(
             }
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+    use agit_tunnel::Packet;
+    use futures_util::poll;
+    use tokio::sync::oneshot;
+
+    /// Finishing an offer worker cannot leave a consumed heartbeat's reply unpolled.
+    #[tokio::test]
+    async fn offer_completion_keeps_the_inflight_heartbeat_alive() {
+        let (packets, incoming) = mpsc::unbounded_channel();
+        let source = futures_util::stream::unfold(incoming, |mut incoming| async move {
+            incoming.recv().await.map(|packet| (Ok(packet), incoming))
+        });
+        let (pong_started, started) = oneshot::channel();
+        let (release_pong, pong_released) = oneshot::channel();
+        let (written, mut writes) = mpsc::unbounded_channel();
+        let sink = futures_util::sink::unfold(
+            (Some(pong_started), pong_released, written),
+            |(mut started, mut released, written), packet| async move {
+                if matches!(packet, Packet::Pong(_)) {
+                    started.take().unwrap().send(()).unwrap();
+                    (&mut released).await.unwrap();
+                }
+                written.send(packet).unwrap();
+                Ok::<_, anyhow::Error>((started, released, written))
+            },
+        );
+        packets
+            .send(Packet::Text(
+                serde_json::to_string(&PresenceEvent::Ready {
+                    epoch: "presence".into(),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let mut presence = Presence::open(agit_tunnel::Connection::from_parts(
+            0,
+            Box::pin(sink),
+            Box::pin(source),
+        ))
+        .await
+        .unwrap();
+        let (finish_offer, offer_finished) = oneshot::channel();
+        let (completed, completion) = oneshot::channel();
+        let mut children = tokio::task::JoinSet::new();
+        children.spawn(async move {
+            offer_finished.await.unwrap();
+            completed.send(()).unwrap();
+        });
+        packets.send(Packet::Ping(vec![1])).unwrap();
+        let mut receiving = Box::pin(receive_presence(&mut presence, &mut children));
+        assert!(poll!(&mut receiving).is_pending());
+        started.await.unwrap();
+        finish_offer.send(()).unwrap();
+        completion.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut receiving).is_pending());
+        release_pong.send(()).unwrap();
+        assert!(poll!(&mut receiving).is_pending());
+        assert_eq!(writes.try_recv().unwrap(), Packet::Pong(vec![1]));
+        packets
+            .send(Packet::Text(
+                serde_json::to_string(&PresenceEvent::Offer {
+                    link_id: "link".into(),
+                    source_id: "source".into(),
+                    ticket: Secret::new("ticket".into()),
+                    grant_token: Secret::new("grant".into()),
+                    grant: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            receiving.await.unwrap(),
+            PresenceEvent::Offer { .. }
+        ));
+        assert!(children.is_empty());
     }
 }
 
