@@ -250,7 +250,18 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
     Ok(value)
 }
 
-fn selected_branch(project: &Project, candidate: &Candidate) -> Result<String> {
+/// Where a project session is published. A native session holds one claim, and the project
+/// never moves it: a session claimed by another repository, such as a desktop RC project, is
+/// published to the project repository as a separate copy of that claim's branch.
+#[derive(Debug, PartialEq, Eq)]
+enum Placement {
+    /// The project repository holds, or will hold, the session's claim on this branch.
+    Claim(String),
+    /// Another repository holds the claim; the value is its `owner/repo@branch`.
+    Copy(String),
+}
+
+fn placement(project: &Project, candidate: &Candidate) -> Result<Placement> {
     crate::domain::merge_archive::RuntimeLinkKey {
         runtime: candidate.runtime.clone(),
         session_id: candidate.session_id.clone(),
@@ -259,31 +270,82 @@ fn selected_branch(project: &Project, candidate: &Candidate) -> Result<String> {
     let store = Store::at(config::store_root()?);
     if let Some(link) = link::get(&store, &candidate.runtime, &candidate.session_id) {
         ensure!(
-            link.is_active() && link.merge_archive.is_none() && link.native_binding.is_none(),
-            "session has a protected or inactive claim"
+            link.is_active() && link.merge_archive.is_none(),
+            "session has an inactive or archived claim"
         );
         if let Some(branch) = &link.branch {
+            let (Some(owner), Some(agent)) = (link.owner.as_deref(), link.agent.as_deref()) else {
+                anyhow::bail!("session has an incomplete claim");
+            };
+            let source = format!("{owner}/{agent}");
+            if source != project.repository {
+                return Ok(Placement::Copy(format!("{source}@{branch}")));
+            }
             ensure!(
-                format!(
-                    "{}/{}",
-                    link.owner.as_deref().unwrap_or_default(),
-                    link.agent.as_deref().unwrap_or_default()
-                ) == project.repository,
-                "session already belongs to another repository"
+                link.native_binding.is_none(),
+                "session has a protected claim"
             );
-            return Ok(branch.clone());
+            return Ok(Placement::Claim(branch.clone()));
         }
+        ensure!(
+            link.native_binding.is_none(),
+            "session has a protected claim"
+        );
     }
-    Ok(format!(
+    Ok(Placement::Claim(format!(
         "project-{}-{}",
         candidate.runtime,
         hash(&key(&candidate.runtime, &candidate.session_id))
-    ))
+    )))
 }
 
-fn sync_one(project: &Project, candidate: &Candidate) -> Result<String> {
+/// The outcome of one session's publication.
+enum Synced {
+    Claimed(String),
+    Copied(String),
+}
+
+/// Who started a publication. Only an explicit sync may publish a copy: a hook capture checked
+/// its placement before waiting for the project lock, and the claim can move to another
+/// repository while it waits, so the placement read under the lock decides again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    Explicit,
+    Hook,
+}
+
+/// The placement a publication acts on, re-read where it is used.
+fn publication(project: &Project, candidate: &Candidate, trigger: Trigger) -> Result<Placement> {
+    let placement = placement(project, candidate)?;
+    ensure!(
+        trigger == Trigger::Explicit || matches!(placement, Placement::Claim(_)),
+        "session is claimed by another repository; only an explicit project sync publishes its copy"
+    );
+    Ok(placement)
+}
+
+fn sync_one(project: &Project, candidate: &Candidate, trigger: Trigger) -> Result<Synced> {
     verify(project)?;
-    let branch = selected_branch(project, candidate)?;
+    let branch = match publication(project, candidate, trigger)? {
+        Placement::Claim(branch) => branch,
+        Placement::Copy(source) => {
+            // An explicit separate publication: the claim, and an RC repository's own
+            // publication target, stay where they are.
+            child(
+                &[
+                    "push".into(),
+                    source.clone(),
+                    "--to".into(),
+                    project.repository.clone(),
+                    "--separate".into(),
+                    "--yes".into(),
+                ],
+                &candidate.cwd,
+                false,
+            )?;
+            return Ok(Synced::Copied(source));
+        }
+    };
     let target = format!("{}@{branch}", project.repository);
     child(
         &[
@@ -315,7 +377,7 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<String> {
         args.push("--yes".into());
     }
     child(&args, &candidate.cwd, project.auto_upload)?;
-    Ok(branch)
+    Ok(Synced::Claimed(branch))
 }
 
 fn sync(project: &mut Project) -> CmdResult {
@@ -328,8 +390,11 @@ fn sync(project: &mut Project) -> CmdResult {
         {
             continue;
         }
-        let outcome = match sync_one(project, &candidate) {
-            Ok(branch) => serde_json::json!({"branch": branch, "status": "pushed"}),
+        let outcome = match sync_one(project, &candidate, Trigger::Explicit) {
+            Ok(Synced::Claimed(branch)) => {
+                serde_json::json!({"branch": branch, "status": "pushed"})
+            }
+            Ok(Synced::Copied(source)) => serde_json::json!({"source": source, "status": "copied"}),
             Err(error) => {
                 failed = true;
                 serde_json::json!({"status": "failed", "error": format!("{error:#}")})
@@ -480,12 +545,20 @@ fn bind(
         }
     }
     if history == History::None {
+        // Earlier sessions stay out whether or not another repository claims them; only a
+        // session already claimed in this repository keeps publishing here.
         let store = Store::at(config::store_root()?);
         project.excluded.extend(
             rows.iter()
                 .filter(|s| {
-                    link::get(&store, &s.runtime, &s.session_id)
-                        .is_none_or(|link| link.branch.is_none())
+                    link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
+                        link.branch.is_none()
+                            || format!(
+                                "{}/{}",
+                                link.owner.as_deref().unwrap_or_default(),
+                                link.agent.as_deref().unwrap_or_default()
+                            ) != repository
+                    })
                 })
                 .map(|s| key(&s.runtime, &s.session_id)),
         );
@@ -597,7 +670,9 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
 }
 
 fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool> {
-    if selected_branch(&project, &candidate).is_err() {
+    // A copy is an explicit separate publication; automatic capture leaves a session claimed
+    // elsewhere to its own repository's settlement.
+    if !matches!(placement(&project, &candidate), Ok(Placement::Claim(_))) {
         return Ok(false);
     }
     let session_key = key(&candidate.runtime, &candidate.session_id);
@@ -609,7 +684,7 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     if !project.enabled || !project.auto_upload || project.excluded.contains(&session_key) {
         return Ok(true);
     }
-    let result = sync_one(&project, &candidate);
+    let result = sync_one(&project, &candidate, Trigger::Hook);
     project.last_result = Some(
         serde_json::json!({"at":chrono::Utc::now(),"session_id":candidate.session_id,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))}),
     );
@@ -699,6 +774,58 @@ mod tests {
             excluded: BTreeSet::new(),
             last_result: None,
         }
+    }
+
+    /// A session claimed by another repository, such as a desktop RC project, is published as a
+    /// copy of that claim; a session claimed here keeps its branch. A placement that refused
+    /// every foreign claim would leave RC sessions out of the project, and one that imported them
+    /// independently would move a claim its own repository still settles.
+    #[test]
+    fn foreign_claims_are_copied_and_never_reassigned() {
+        if !isolated("foreign_claims_are_copied_and_never_reassigned") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        let store = Store::at(config::store_root().unwrap());
+        let candidate = |id: &str| Candidate {
+            runtime: "codex".into(),
+            session_id: id.into(),
+            cwd: project.root.clone(),
+        };
+        let claim = |id: &str, owner: &str, agent: &str, branch: &str| {
+            let mut claim = link::Link::new("codex", id, Some(&project.root));
+            claim.owner = Some(owner.into());
+            claim.agent = Some(agent.into());
+            claim.branch = Some(branch.into());
+            link::write(&store, &claim).unwrap();
+        };
+        let rc = "cccccccc-0000-4000-8000-000000000003";
+        claim(rc, "desktop-machine", "project-local", "rc-branch");
+        assert_eq!(
+            placement(&project, &candidate(rc)).unwrap(),
+            Placement::Copy("desktop-machine/project-local@rc-branch".into())
+        );
+        let own = "dddddddd-0000-4000-8000-000000000004";
+        claim(own, "alice", "app", "kept");
+        assert_eq!(
+            placement(&project, &candidate(own)).unwrap(),
+            Placement::Claim("kept".into())
+        );
+        let fresh = "eeeeeeee-0000-4000-8000-000000000005";
+        assert!(matches!(
+            placement(&project, &candidate(fresh)).unwrap(),
+            Placement::Claim(branch) if branch.starts_with("project-codex-")
+        ));
+        // A hook capture that saw an unclaimed session refuses once the claim has moved to
+        // another repository, instead of publishing the copy only an explicit sync may make.
+        assert!(publication(&project, &candidate(fresh), Trigger::Hook).is_ok());
+        claim(fresh, "desktop-machine", "project-local", "moved");
+        assert!(publication(&project, &candidate(fresh), Trigger::Hook).is_err());
+        assert_eq!(
+            publication(&project, &candidate(fresh), Trigger::Explicit).unwrap(),
+            Placement::Copy("desktop-machine/project-local@moved".into())
+        );
     }
 
     #[test]

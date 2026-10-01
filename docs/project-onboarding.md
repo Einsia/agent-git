@@ -46,8 +46,10 @@ directories with another explicit binding. Paths belong to native session metada
 files need not be stored inside the project. Each developer/machine can use a different path.
 
 Confirm the destination, independent import of unclaimed histories, and publication policy.
-Existing claims in the same repository keep their branch. Claims in another repository,
-superseded instances and protected RC sources are not reassigned; inspect reported failures.
+Existing claims in the same repository keep their branch. A session claimed by another
+repository, including a desktop RC project, keeps that claim; sync publishes a separate copy
+of its branch to this repository (status `copied`), and later syncs refresh the copy.
+Archived or superseded instances are not published; inspect reported failures.
 
 `--auto-upload` uses the existing repository-wide `push.auto` preference. Other managed
 sessions in this local repository inherit it. The command does not alter global preferences.
@@ -61,7 +63,8 @@ Use the same command with `--history none`:
 agit project bind /work/new-project --repo MANAGER/project-name --history none --auto-upload
 ```
 
-Existing unclaimed sessions are excluded. Newly created sessions are adopted and uploaded
+Existing sessions are excluded unless this repository already claims them. Newly created
+sessions are adopted and uploaded
 at the end of their first completed turn; later turns update that same branch. Keep using
 Claude Code or Codex normally. Rebind with `--history all` if you later want the old sessions.
 
@@ -95,5 +98,5 @@ project bindings are independent. Already in-flight operations finish before unb
 the project lock; the command reports a lock error if they do not finish in time.
 
 RC retains its own supervisor and publishing lifecycle. This command does not migrate or
-take over RC-owned sessions. It also does not add project question-answering, a dashboard,
+take over RC-owned sessions; it publishes copies of them, refreshed by each sync. It also does not add project question-answering, a dashboard,
 or a new web interface.

@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- `agit project sync` publishes a session that another repository already claims, such
+  as one started from a desktop RC project, as a separate copy of that claim's branch
+  in the project repository, instead of failing with "session already belongs to another
+  repository". The original claim and the RC project's own publication target are
+  unchanged; each later sync refreshes the copy. `--history none` keeps excluding such
+  earlier sessions.
+
 ## [0.2.15] - 2026-10-01
 
 ### Changed

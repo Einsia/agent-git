@@ -28,9 +28,12 @@ publication policy before confirming; unattended use requires explicit `--yes`.
 `--history all` imports and publishes native Codex and Claude Code sessions discovered
 under the directory, including subdirectories without their own binding. Unclaimed
 sessions start independent histories; existing claims in the same repository retain
-their branch. Conflicting or protected claims are not reassigned. `--history none`
-excludes unclaimed sessions already present at enrollment; it does not silently publish
-their old content when they are resumed. Rebind with `--history all` to include them.
+their branch. A session claimed by another repository, including a desktop RC project,
+keeps that claim: `sync` publishes a separate copy of its branch to the project repository
+(status `copied`) and refreshes it on later syncs. Archived or superseded claims are reported
+as failures. `--history none` excludes sessions already present at enrollment unless this
+repository claims them; it does not silently publish their old content when they are
+resumed. Rebind with `--history all` to include them.
 
 `--auto-upload` installs available runtime hooks, confirms the current publication policy,
 and enables the existing **repository-wide** `push.auto` preference. Other managed
@@ -45,7 +48,8 @@ repository. Upload is synchronous;
 there is no resident retry queue. A failed push keeps local history. Retry with `project sync`.
 For an encrypted repository, policy, account, recipient or destination changes require review
 and renewed binding consent; an ordinary repository's automatic uploads follow `push.auto` alone.
-RC-owned sessions keep their supervisor lifecycle and are not taken over by this command.
+RC-owned sessions keep their supervisor lifecycle and are not taken over by this command;
+their copies refresh only on `project sync`, not from hooks.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is
 complete. `unbind` pauses project hook capture and automatic publication for the selected
