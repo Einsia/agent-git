@@ -497,17 +497,24 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             read_file_bytes(&self.store.path, limits).map(Some)
         };
         let started = std::time::Instant::now();
+        let reading = std::time::Instant::now();
         let bytes = match read() {
             Ok(bytes) => bytes,
             Err(Unavailable::Changed) => return Ok(SnapshotProtection::Changed),
             Err(error) => return Err(NativeHistoryPolicyUnavailable(error.into()).into()),
         };
+        record_timing("dictionary_io_ms", reading.elapsed().as_secs_f64() * 1000.0);
+        let parsing = std::time::Instant::now();
         let file: Option<super::VaultFile> = bytes
             .as_ref()
             .map(|bytes| serde_json::from_slice(bytes))
             .transpose()
             .context("the repository secret dictionary is malformed")
             .map_err(NativeHistoryPolicyUnavailable)?;
+        record_timing(
+            "dictionary_parse_ms",
+            parsing.elapsed().as_secs_f64() * 1000.0,
+        );
         let key_context = file.as_ref().map(|file| super::VaultFile {
             version: file.version,
             key_version: file.key_version,
@@ -520,16 +527,26 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             records: Vec::new(),
             repository_policy: None,
         });
+        let unlocking = std::time::Instant::now();
         let unlocked = file
             .map(|file| self.store.unlock_file(file, true))
             .transpose()
             .map_err(NativeHistoryPolicyUnavailable)?;
+        record_timing(
+            "dictionary_unlock_ms",
+            unlocking.elapsed().as_secs_f64() * 1000.0,
+        );
+        let decoding = std::time::Instant::now();
         let records = unlocked
             .as_ref()
             .map(|unlocked| super::decrypt_records(&unlocked.file, &unlocked.dek))
             .transpose()
             .map_err(NativeHistoryPolicyUnavailable)?
             .unwrap_or_default();
+        record_timing(
+            "dictionary_records_ms",
+            decoding.elapsed().as_secs_f64() * 1000.0,
+        );
         record_timing(
             "dictionary_read_ms",
             started.elapsed().as_secs_f64() * 1000.0,
