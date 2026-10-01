@@ -2564,6 +2564,31 @@ pub(crate) fn seed_native_evidence(
         "identity_seed_refs_ms",
         started.elapsed().as_secs_f64() * 1000.0,
     );
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+    let started = std::time::Instant::now();
+    let fingerprint = dictionary.publication_fingerprint()?;
+    let cache_key = evidence
+        .is_unseeded()
+        .then(|| {
+            identity::seed_cache::Key::new(repo, cwd, runtime, native, &roots, fingerprint.clone())
+                .ok()
+        })
+        .flatten();
+    let restored = cache_key
+        .as_ref()
+        .is_some_and(|key| identity::seed_cache::restore(key, evidence));
+    record_timing(
+        "identity_seed_cache_ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    if restored {
+        record_timing("identity_seed_cache_hit", 1.0);
+        return Ok(());
+    }
+    record_timing("identity_seed_cache_hit", 0.0);
     let specs: Vec<_> = roots
         .iter()
         .map(|root| format!("{root}:{}", crate::domain::meta::FILE))
@@ -2585,9 +2610,9 @@ pub(crate) fn seed_native_evidence(
         started.elapsed().as_secs_f64() * 1000.0,
     );
     matching.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.turn));
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
     let mut sessions = HashSet::new();
     let mut remaining = TRUSTED_EVIDENCE_MAX_BYTES;
+    let mut cacheable = !matching.is_empty();
     for (root, mut meta) in matching {
         if !sessions.insert(meta.session.clone()) {
             continue;
@@ -2632,6 +2657,7 @@ pub(crate) fn seed_native_evidence(
                 );
                 remaining = remaining.saturating_sub(bytes);
                 if !budget.reserve(bytes as u64) {
+                    cacheable = false;
                     break;
                 }
                 *evidence = provisional;
@@ -2645,6 +2671,7 @@ pub(crate) fn seed_native_evidence(
             maximum,
             record_timing,
         ) else {
+            cacheable = false;
             continue;
         };
         record_timing(
@@ -2653,6 +2680,7 @@ pub(crate) fn seed_native_evidence(
         );
         remaining = remaining.saturating_sub(saved.len());
         if !budget.reserve(saved.len() as u64) {
+            cacheable = false;
             break;
         }
         let started = std::time::Instant::now();
@@ -2666,6 +2694,11 @@ pub(crate) fn seed_native_evidence(
             "identity_seed_records_ms",
             started.elapsed().as_secs_f64() * 1000.0,
         );
+    }
+    if let Some(key) = cache_key.filter(|_| cacheable)
+        && dictionary.publication_fingerprint()? == fingerprint
+    {
+        identity::seed_cache::save(key, evidence);
     }
     Ok(())
 }

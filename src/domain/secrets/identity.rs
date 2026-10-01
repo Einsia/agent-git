@@ -8,6 +8,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+#[cfg(feature = "secret-vault")]
+pub(super) mod seed_cache;
+
 const MAX_PROOFS: usize = 1024;
 static CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:refs/tags/)?agit-[0-9a-f]+|[0-9a-f]{4,64}").unwrap());
@@ -58,6 +61,17 @@ pub(crate) struct Evidence {
 }
 
 impl Evidence {
+    #[cfg(feature = "secret-vault")]
+    pub(super) fn is_unseeded(&self) -> bool {
+        !self.cwd_is_agent
+            && self.calls.is_empty()
+            && self.completed.is_empty()
+            && self.seen_calls.is_empty()
+            && self.proven.is_empty()
+            && self.resolved.is_empty()
+            && self.cwd_aliases.is_empty()
+    }
+
     pub(crate) fn new(agent: &Repo, cwd: &Path) -> Self {
         Self {
             agent: Repo::at(agent.root()).local_objects_only(),
@@ -798,6 +812,38 @@ mod tests {
         let mut valid = Evidence::new(&repo, repo.root());
         valid.seed_native("codex", native).unwrap();
         assert!(!valid.record("codex", native, &narrative).0.is_empty());
+
+        let mut replayed = Evidence::new(&repo, repo.root());
+        let mut reused = false;
+        replayed
+            .seed_native_profiled("codex", native, &mut |name, value| {
+                if name == "identity_seed_cache_hit" {
+                    reused = value == 1.0;
+                }
+            })
+            .unwrap();
+        assert!(reused, "unchanged immutable evidence can be replayed");
+        assert!(!replayed.record("codex", native, &narrative).0.is_empty());
+        let credential = serde_json::json!({"type":"response_item", "payload":{
+            "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":format!("token: {oid}")}]}});
+        assert!(replayed.record("codex", native, &credential).0.is_empty());
+
+        let dictionary = repo.root().join(".git/agit/secret-dictionary/vault.json");
+        std::fs::create_dir_all(dictionary.parent().unwrap()).unwrap();
+        std::fs::write(&dictionary, b"invalid dictionary").unwrap();
+        assert!(
+            Evidence::new(&repo, repo.root())
+                .seed_native("codex", native)
+                .is_err(),
+            "a cached seed cannot bypass dictionary authentication"
+        );
+        std::fs::remove_file(dictionary).unwrap();
+
+        let mut unrelated = Evidence::new(&repo, repo.root());
+        unrelated
+            .seed_native("codex", "another-native-session")
+            .unwrap();
+        assert!(unrelated.record("codex", native, &narrative).0.is_empty());
 
         let event = meta::event_path(&storage::event_id(&tail).unwrap()).unwrap();
         std::fs::write(
