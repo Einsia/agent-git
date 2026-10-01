@@ -15,6 +15,7 @@ struct Write {
 }
 
 const HANDSHAKE: Duration = Duration::from_secs(20);
+const DISCOVERY_RETRY: Duration = Duration::from_secs(1);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -169,21 +170,35 @@ async fn describe(
     route: &dyn Connector,
 ) -> anyhow::Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
+    let mut ids = vec![id.clone()];
     let mut frame =
         serde_json::json!({"jsonrpc":"2.0","id":id,"method":"machine.describe","params":{}});
     if !route.session_events() {
         frame["params"]["session_events"] = Value::Bool(false);
     }
     sink.send(Packet::Text(frame.to_string())).await?;
+    let retry = tokio::time::sleep(DISCOVERY_RETRY);
+    tokio::pin!(retry);
     loop {
-        let packet = source
-            .next()
-            .await
-            .context("peer closed during handshake")??;
+        let packet = tokio::select! {
+            biased;
+            packet = source.next() => packet.context("peer closed during handshake")??,
+            _ = &mut retry, if ids.len() == 1 => {
+                // Discovery is read-only; each attempt needs its own admission permit.
+                let id = uuid::Uuid::new_v4().to_string();
+                frame["id"] = Value::String(id.clone());
+                ids.push(id);
+                sink.send(Packet::Text(frame.to_string())).await?;
+                continue;
+            }
+        };
         let Some(frame) = decode(packet)? else {
             continue;
         };
-        if frame["id"].as_str() != Some(&id) {
+        if !frame["id"]
+            .as_str()
+            .is_some_and(|id| ids.iter().any(|sent| sent == id))
+        {
             continue;
         }
         ensure!(frame.get("error").is_none(), "peer rejected discovery");

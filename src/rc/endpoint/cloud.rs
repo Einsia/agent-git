@@ -77,20 +77,31 @@ pub(super) fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let write = async {
+            let mut first_response = true;
             while let Some(message) = messages.next().await? {
+                let opening = first_response;
+                first_response = false;
+                let projecting = std::time::Instant::now();
+                if opening && let Some(log) = &log {
+                    log.record(
+                        "cloud.initial_response_dequeued",
+                        serde_json::json!({"client_id":client}),
+                    );
+                }
                 if let Some(text) = projection.project(&message.record)? {
                     let frame_bytes = text.len();
                     let started = std::time::Instant::now();
-                    if frame_bytes >= 16 * 1024
+                    if (opening || frame_bytes >= 16 * 1024)
                         && let Some(log) = &log
                     {
                         log.record(
                             "cloud.write_started",
-                            serde_json::json!({"client_id":client,"frame_bytes":frame_bytes}),
+                            serde_json::json!({"client_id":client,"frame_bytes":frame_bytes,"initial_response":opening,"projection_ms":projecting.elapsed().as_secs_f64()*1000.0}),
                         );
                     }
                     let result = sink.send(Packet::Text(text)).await;
-                    if (frame_bytes >= 16 * 1024
+                    if (opening
+                        || frame_bytes >= 16 * 1024
                         || result.is_err()
                         || started.elapsed() >= std::time::Duration::from_secs(1))
                         && let Some(log) = &log

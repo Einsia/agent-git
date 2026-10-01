@@ -79,6 +79,50 @@ fn request(
 }
 
 #[tokio::test]
+async fn discovery_recovers_a_missing_reply_and_accepts_a_delayed_original() {
+    for delayed_original in [false, true] {
+        let controller = controller();
+        let (config, mut incoming, server) = endpoint().await;
+        controller.connect("peer".into(), config, None).unwrap();
+        let mut socket = incoming.recv().await.unwrap();
+        let first = read(&mut socket).await;
+        let retry = read(&mut socket).await;
+        assert_eq!(first["method"], "machine.describe");
+        assert_eq!(retry["method"], first["method"]);
+        assert_eq!(retry["params"], first["params"]);
+        assert_ne!(retry["id"], first["id"]);
+        if !delayed_original {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1100), socket.next())
+                    .await
+                    .is_err()
+            );
+        }
+        let answered = if delayed_original { &first } else { &retry };
+        response(
+            &mut socket,
+            &answered["id"],
+            json!({
+                "protocol_version":1,"authority":"local-owner","instance_id":"instance",
+                "machine":{"machine_fingerprint":"same-host"},
+            }),
+        )
+        .await;
+        let ready = controller.ready("peer", WAIT).await.unwrap();
+        assert!(matches!(ready.state, State::Online));
+        let late = if delayed_original { &retry } else { &first };
+        response(&mut socket, &late["id"], json!({"late":true})).await;
+        let action = request(&controller, "peer", "one action", WAIT);
+        let sent = read(&mut socket).await;
+        assert_eq!(sent["method"], "turn.start");
+        response(&mut socket, &sent["id"], json!({"accepted":true})).await;
+        assert_eq!(action.await.unwrap().unwrap()["result"]["accepted"], true);
+        controller.disconnect("peer");
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn responses_correlate_out_of_order_and_events_keep_peer_namespaces() {
     let controller = controller();
     let (config, mut incoming, server) = endpoint().await;
