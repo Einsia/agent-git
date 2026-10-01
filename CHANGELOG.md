@@ -17,9 +17,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   to the source's. A destination the push creates still receives the source's `main`.
 - A Claude Code prompt whose record starts with a runtime-injected block, such as the
   worktree reminder the desktop app puts ahead of a session's first message, is
-  kept as the turn's prompt instead of being dropped with the injection. Such a
-  session lost its opening prompt, and one with a single prompt had no turn to save
-  or upload.
+  kept as the turn's prompt instead of being dropped with the injection, whether
+  the reminder is a separate text block or leads the same string. Such a session
+  lost its opening prompt, and one with a single prompt had no turn to save or
+  upload.
 
 ## [0.2.16] - 2026-10-02
 

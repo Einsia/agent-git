@@ -1001,12 +1001,15 @@ fn is_compact_summary(v: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Take the plain text out of `message.content`. content is a string or an array of blocks.
 /// Splits a record whose leading text blocks are runtime injections from the human's words that
 /// follow them. `None` when no block is injected ahead of human text, so the record is judged
 /// whole; a record of injections alone stays an injection.
 fn split_leading_injection(content: Option<&serde_json::Value>) -> Option<(String, String)> {
-    let blocks: Vec<&str> = content?
+    let content = content?;
+    if let Some(text) = content.as_str() {
+        return split_leading_reminders(text);
+    }
+    let blocks: Vec<&str> = content
         .as_array()?
         .iter()
         .filter(|b| b.get("type").and_then(|x| x.as_str()) == Some("text"))
@@ -1025,6 +1028,26 @@ fn split_leading_injection(content: Option<&serde_json::Value>) -> Option<(Strin
     ))
 }
 
+/// The string form of the same record: complete `<system-reminder>` elements ahead of the
+/// human's words. Only an element with its closing tag is cut off; anything else leaves the
+/// record to be judged whole.
+fn split_leading_reminders(text: &str) -> Option<(String, String)> {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = text.trim_start();
+    let mut injected = Vec::new();
+    while rest.starts_with(OPEN) {
+        let end = rest.find(CLOSE)? + CLOSE.len();
+        injected.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    if injected.is_empty() || rest.trim().is_empty() || is_synthetic_user_text(rest) {
+        return None;
+    }
+    Some((injected.join("\n"), rest.to_owned()))
+}
+
+/// Take the plain text out of `message.content`. content is a string or an array of blocks.
 fn extract_text(content: Option<&serde_json::Value>) -> Option<String> {
     let c = content?;
     if let Some(s) = c.as_str() {
@@ -1903,7 +1926,8 @@ mod tests {
         assert_eq!(c.dropped, 4, "{c:?}");
     }
 
-    /// A desktop worktree session puts its reminder ahead of the human's words in one record.
+    /// A desktop worktree session puts its reminder ahead of the human's words in one record, as a
+    /// leading text block or, for a prompt sent through the SDK, inside the same string.
     /// The words remain the turn's prompt, the record belongs wholly to the turn it opens, and a
     /// record of injections alone stays dropped. Judging the joined text by its opening would
     /// lose the session's opening prompt and a single-prompt session's only turn; leaving the
@@ -1922,6 +1946,8 @@ mod tests {
             r#"{"type":"user","sessionId":"s","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nreminder\n</system-reminder>"},{"type":"text","text":"<command-name>/goal</command-name>"}]}}"#.into(),
             mixed("Now update the API"),
             r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.into(),
+            r#"{"type":"user","sessionId":"s","origin":{"kind":"human"},"promptSource":"sdk","message":{"role":"user","content":"<system-reminder>\nYou are operating in a git worktree.\n</system-reminder>\nThen deploy to staging"}}"#.into(),
+            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":"<system-reminder>\nreminder only\n</system-reminder>"}}"#.into(),
         ];
         let s = ClaudeCode.parse(&lines.join("\n")).unwrap();
         let prompts: Vec<_> = s
@@ -1934,11 +1960,12 @@ mod tests {
             prompts,
             [
                 "Add lazy loading to the sessions page",
-                "Now update the API"
+                "Now update the API",
+                "Then deploy to staging"
             ]
         );
         let groups = crate::domain::turn::groups_of(&s);
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 3);
         let second_line = s.events[groups[1][0]].line;
         assert!(groups[0].iter().all(|&i| s.events[i].line < second_line));
     }
