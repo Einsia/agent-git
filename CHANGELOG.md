@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- A Claude Code prompt whose record starts with a runtime-injected block, such as the
+  worktree reminder the desktop app puts ahead of a session's first message, is
+  kept as the turn's prompt instead of being dropped with the injection. Such a
+  session lost its opening prompt, and one with a single prompt had no turn to save
+  or upload.
+
 ## [0.2.16] - 2026-10-02
 
 ### Added

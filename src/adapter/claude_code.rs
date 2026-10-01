@@ -292,6 +292,24 @@ impl Adapter for ClaudeCode {
                         continue;
                     }
                     if let Some(t) = extract_text(content) {
+                        // A runtime can inject its own text block ahead of the human's words in
+                        // one record, as a desktop worktree session's reminder does. Judging the
+                        // joined text by its opening would drop the prompt with the injection.
+                        // The prompt goes first so the record's line opens its turn: an event of
+                        // that line left in the previous turn would carry that turn's settlement
+                        // boundary past the new prompt.
+                        if !is_system_generated(&v, &t)
+                            && !is_compact_summary(&v)
+                            && let Some((injected, human)) = split_leading_injection(content)
+                        {
+                            events.push(
+                                Event::text(EventKind::UserPrompt, human, ts.clone())
+                                    .at_line(lineno),
+                            );
+                            events
+                                .push(Event::text(EventKind::Other, injected, ts).at_line(lineno));
+                            continue;
+                        }
                         // A compact summary is a **synthesized** user record: `type` and
                         // `message.role` are both `"user"`, but nobody typed it. The only
                         // reliable test is the top-level `isCompactSummary: true` — the body
@@ -984,6 +1002,29 @@ fn is_compact_summary(v: &serde_json::Value) -> bool {
 }
 
 /// Take the plain text out of `message.content`. content is a string or an array of blocks.
+/// Splits a record whose leading text blocks are runtime injections from the human's words that
+/// follow them. `None` when no block is injected ahead of human text, so the record is judged
+/// whole; a record of injections alone stays an injection.
+fn split_leading_injection(content: Option<&serde_json::Value>) -> Option<(String, String)> {
+    let blocks: Vec<&str> = content?
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(|x| x.as_str()) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(|x| x.as_str()))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    let first_human = blocks
+        .iter()
+        .position(|text| !is_synthetic_user_text(text))?;
+    if first_human == 0 {
+        return None;
+    }
+    Some((
+        blocks[..first_human].join("\n"),
+        blocks[first_human..].join("\n"),
+    ))
+}
+
 fn extract_text(content: Option<&serde_json::Value>) -> Option<String> {
     let c = content?;
     if let Some(s) = c.as_str() {
@@ -1860,6 +1901,46 @@ mod tests {
         assert_eq!(c.prompts, 1, "{c:?}");
         assert_eq!(c.interjections, 0, "{c:?}");
         assert_eq!(c.dropped, 4, "{c:?}");
+    }
+
+    /// A desktop worktree session puts its reminder ahead of the human's words in one record.
+    /// The words remain the turn's prompt, the record belongs wholly to the turn it opens, and a
+    /// record of injections alone stays dropped. Judging the joined text by its opening would
+    /// lose the session's opening prompt and a single-prompt session's only turn; leaving the
+    /// injection in the previous turn would let that turn's settled lines reach the new prompt
+    /// while its tool call is still running.
+    #[test]
+    fn a_leading_injected_block_does_not_hide_the_human_prompt() {
+        let mixed = |prompt: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"s","origin":{{"kind":"human"}},"message":{{"role":"user","content":[{{"type":"text","text":"<system-reminder>\nYou are operating in a git worktree.\n</system-reminder>"}},{{"type":"text","text":"{prompt}"}}]}}}}"#
+            )
+        };
+        let lines = [
+            mixed("Add lazy loading to the sessions page"),
+            r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#.into(),
+            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nreminder\n</system-reminder>"},{"type":"text","text":"<command-name>/goal</command-name>"}]}}"#.into(),
+            mixed("Now update the API"),
+            r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.into(),
+        ];
+        let s = ClaudeCode.parse(&lines.join("\n")).unwrap();
+        let prompts: Vec<_> = s
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::UserPrompt)
+            .filter_map(|e| e.text.as_deref())
+            .collect();
+        assert_eq!(
+            prompts,
+            [
+                "Add lazy loading to the sessions page",
+                "Now update the API"
+            ]
+        );
+        let groups = crate::domain::turn::groups_of(&s);
+        assert_eq!(groups.len(), 2);
+        let second_line = s.events[groups[1][0]].line;
+        assert!(groups[0].iter().all(|&i| s.events[i].line < second_line));
     }
 
     /// Installing back into Claude Code emits an interjection as an ordinary user message: the
