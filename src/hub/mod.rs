@@ -28,6 +28,7 @@ pub mod git;
 pub mod identity;
 mod json_response;
 pub mod privacy;
+pub(crate) mod project_publication;
 /// Session reuse receipts that `agit run` sends when it starts from a session.
 pub mod reuse;
 pub(crate) mod transport;

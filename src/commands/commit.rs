@@ -2251,6 +2251,66 @@ fn settle_bytes(
     };
 
     if new_chunks.is_empty() {
+        if opts.message.is_none()
+            && recovered.is_none()
+            && let (Some(tip), Some(metadata), Some(binding)) = (
+                settlement_tip.as_deref(),
+                head_meta.as_ref(),
+                lk.native_binding.as_ref(),
+            )
+            && !metadata.is_file_line()
+            && metadata.runtime_instances.contains(&lk.session_id)
+            && !metadata.runtime_instances.contains(&binding.thread_id)
+        {
+            // Source-qualified identity and native UUID jointly prove saved runtime fields.
+            // Preserve the completed turn and its event objects when only that proof is absent.
+            anyhow::ensure!(
+                binding.key()? == lk.session_id,
+                "native capture identity changed"
+            );
+            let mut metadata = metadata.clone();
+            metadata.runtime_instances.push(binding.thread_id.clone());
+            metadata.kind = Kind::File;
+            metadata.milestone = None;
+            let protected = secret_dictionary.protect_metadata(&mut metadata, &global_secrets)?;
+            anyhow::ensure!(
+                protected.intact == 0,
+                "native identity protection is incomplete"
+            );
+            let tree = super::plumbing::tree_apply_owned(
+                repo,
+                tip,
+                vec![
+                    (
+                        meta::FILE.into(),
+                        Some(meta::to_text(&metadata)?.into_bytes()),
+                    ),
+                    ("privacy/envelope.json".into(), None),
+                ],
+            )?;
+            record_supervisor_prepared()?;
+            let email =
+                credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+            let commit = super::plumbing::commit_tree_as(
+                repo,
+                &tree,
+                &[tip],
+                "agit: record native capture identity",
+                (owner, &email),
+            )?;
+            maybe_interleave_publication(repo, branch);
+            super::plumbing::update_branch_cas_and_refresh(repo, branch, &commit, tip, false)?;
+            if lk.materialized_from.is_some() {
+                lk.materialized_from = Some(commit.clone());
+                let current =
+                    std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
+                if current.is_none() || current == link_disk_at_entry {
+                    link::write(store, &lk)?;
+                }
+            }
+            record_supervisor_result(&commit)?;
+            return Ok(ExitCode::Ok);
+        }
         // No new turn. Two legal moves remain: a `-m` file commit, or a no-op.
         if let Some(msg) = &opts.message {
             let public_meta = if recovered.is_some() {
@@ -2429,6 +2489,11 @@ fn settle_bytes(
         .or_else(|| meta::code_of(Path::new(&cwd)));
     let mut observations = Meta::new(claim.clone(), source.to_string(), cwd.clone());
     observations.runtime_instances.push(lk.session_id.clone());
+    if lk.native_thread_id() != lk.session_id {
+        observations
+            .runtime_instances
+            .push(lk.native_thread_id().to_owned());
+    }
     observations.cwd_is_agent_repository = crate::domain::repo::Repo::open(Path::new(&cwd))
         .and_then(|code| {
             let code = code
@@ -5908,7 +5973,15 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         let (_dir, store) = store();
         let native = "6508bdee-7103-459b-89c2-8245793861ca";
         let mut lk = link();
-        lk.session_id = native.into();
+        let binding = crate::domain::link::NativeBinding {
+            source: crate::protocol::NativeSourceRef {
+                source_id: "src-7515edda-e15c-4fa8-a822-2468c04c5e19".into(),
+                generation: 2,
+            },
+            thread_id: native.into(),
+        };
+        lk.session_id = binding.key().unwrap();
+        lk.native_binding = Some(binding);
         lk.cwd = Some(repo.root().to_string_lossy().into_owned());
         let mut text = serde_json::json!({"type":"session_meta", "payload":{
             "id":native,"cwd":repo.root(),"timestamp":"2026-09-18T00:00:00Z"
@@ -5937,6 +6010,58 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             repo.git(&["rev-parse", "HEAD"]).unwrap()
         };
         let version = settle(&text);
+        let metadata = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert!(metadata.runtime_instances.contains(&lk.session_id));
+        assert!(metadata.runtime_instances.iter().any(|id| id == native));
+        let mut qualified_only = metadata.clone();
+        qualified_only.runtime_instances.retain(|id| id != native);
+        let tree = super::super::plumbing::tree_apply_owned(
+            &repo,
+            &version,
+            vec![(
+                meta::FILE.into(),
+                Some(meta::to_text(&qualified_only).unwrap().into_bytes()),
+            )],
+        )
+        .unwrap();
+        let qualified_version = super::super::plumbing::commit_tree_as(
+            &repo,
+            &tree,
+            &[&version],
+            "qualified identity fixture",
+            ("alice", "alice@agit.local"),
+        )
+        .unwrap();
+        super::super::plumbing::update_branch_cas_and_refresh(
+            &repo,
+            "main",
+            &qualified_version,
+            &version,
+            false,
+        )
+        .unwrap();
+        let repaired = settle(&text);
+        assert_ne!(repaired, qualified_version);
+        let repaired_meta = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(repaired_meta.turn, metadata.turn);
+        assert_eq!(repaired_meta.session, metadata.session);
+        assert!(
+            repaired_meta
+                .runtime_instances
+                .iter()
+                .any(|id| id == native)
+        );
+        for path in [meta::LOG_FILE, meta::VIEW_FILE] {
+            assert_eq!(
+                repo.show_raw(&repaired, path),
+                repo.show_raw(&version, path)
+            );
+        }
+        assert_eq!(
+            settle(&text),
+            repaired,
+            "identity repair must be idempotent"
+        );
         let initial_records = RepositoryDictionary::open(repo.root())
             .unwrap()
             .review()

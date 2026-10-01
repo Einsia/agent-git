@@ -20,7 +20,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct SharedServiceUnsupported;
 impl std::fmt::Display for SharedServiceUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the selected Codex executable does not advertise a shared app-server listener")
+        f.write_str("the selected Codex runtime cannot use its shared app-server listener")
     }
 }
 impl std::error::Error for SharedServiceUnsupported {}
@@ -69,6 +69,19 @@ impl Source {
 
     /// Native startup owns stale socket recovery; an accepting listener is never replaced.
     pub async fn connect_or_start(&self) -> crate::Result<Client> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let capacity = std::mem::size_of::<libc::sockaddr_un>()
+                - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            if self.socket.as_os_str().as_bytes().len() >= capacity {
+                ensure!(
+                    self.socket == self.home.join("app-server-control/app-server-control.sock"),
+                    "the registered Codex endpoint exceeds the local socket path limit"
+                );
+                return Err(SharedServiceUnsupported.into());
+            }
+        }
         match self.connect().await {
             Ok(client) => return Ok(client),
             Err(error) if socket_absent(&error) || self.stale_socket(&error).await => {}
@@ -380,6 +393,23 @@ mod tests {
 
     fn source(home: &Path, socket: &Path) -> Source {
         Source::new(home, &std::env::current_exe().unwrap(), Some(socket)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unaddressable_standard_socket_uses_the_private_runtime_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("native-home-".repeat(16));
+        std::fs::create_dir(&home).unwrap();
+        let standard = Source::new(&home, &std::env::current_exe().unwrap(), None).unwrap();
+        let error = standard.connect_or_start().await.err().unwrap();
+        assert!(error.is::<SharedServiceUnsupported>());
+
+        let custom = source(&home, &home.join("custom.sock"));
+        let error = custom.connect_or_start().await.err().unwrap();
+        assert!(
+            !error.is::<SharedServiceUnsupported>(),
+            "a registered endpoint cannot select an unrelated private executor"
+        );
     }
 
     #[tokio::test]

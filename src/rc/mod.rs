@@ -353,8 +353,8 @@ impl Drop for TestAgitHomeGuard {
     }
 }
 
-/// Isolating descriptor-sensitive fixtures prevents other tests' forks from retaining their files.
-#[cfg(all(test, unix))]
+/// Subprocess isolation keeps namespace selection and filesystem fixtures independent.
+#[cfg(test)]
 pub(crate) fn in_isolated_test(name: &str) -> bool {
     const CHILD_CASE: &str = "AGIT_TEST_ISOLATED_RC_CASE";
     if std::env::var(CHILD_CASE).as_deref() == Ok(name) {

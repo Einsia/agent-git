@@ -72,6 +72,7 @@ pub(super) struct Prepared {
     authority: Guard,
     logical: String,
     native: String,
+    native_source: Option<crate::protocol::NativeSourceRef>,
     runtime: String,
     lineage: AgitSession,
     credential_dir: PathBuf,
@@ -98,24 +99,27 @@ impl Daemon {
         if !self.opts.local_owner || caller.workspace_id != crate::rc::endpoint::WORKSPACE {
             return Err(forbidden());
         }
-        let logical = self
-            .roster
-            .logical_for_thread(&scope.runtime, &scope.session_id, &caller.workspace_id)
-            .ok_or_else(unbound)?;
+        let (logical, row, native) = native_binding(
+            &self.roster,
+            &scope.runtime,
+            &scope.session_id,
+            &caller.workspace_id,
+        )
+        .ok_or_else(unbound)?;
         if request.session_id != logical && request.session_id != scope.session_id {
             return Err(forbidden());
         }
-        let row = self.roster.get(&logical).ok_or_else(forbidden)?;
         let mut lineage = AgitSession::parse(
             row.agit_session.as_deref().ok_or_else(unbound)?,
             row.expected_agent_id.as_deref().ok_or_else(unbound)?,
         )
         .map_err(|_| forbidden())?;
-        lineage.capture = self.roster.captures.get(&logical).cloned();
+        lineage.capture = self.roster.captures.get(logical).cloned();
         Ok(Prepared {
             authority: frame.authority.clone(),
-            logical,
-            native: scope.session_id.clone(),
+            logical: logical.into(),
+            native: native.into(),
+            native_source: row.native_source.clone(),
             runtime: scope.runtime.clone(),
             lineage,
             credential_dir: store::directory().map_err(|_| unavailable())?,
@@ -124,12 +128,33 @@ impl Daemon {
     }
 }
 
+fn native_binding<'a>(
+    roster: &'a Roster,
+    runtime: &str,
+    reference: &str,
+    workspace: &str,
+) -> Option<(&'a str, &'a crate::rc::roster::Entry, &'a str)> {
+    roster.sessions.iter().find_map(|(logical, row)| {
+        if row.runtime != runtime || row.workspace_id != workspace {
+            return None;
+        }
+        let native = std::iter::once(&row.thread_id)
+            .chain(row.prior_threads.iter())
+            .find(|native| match &row.native_source {
+                Some(source) => source.session_ref(native) == reference,
+                None => native.as_str() == reference,
+            })?;
+        Some((logical.as_str(), row, native.as_str()))
+    })
+}
+
 impl Prepared {
     fn check_lineage(&self, daemon: &Daemon) -> Result<(), RpcError> {
         let row = daemon.roster.get(&self.logical).ok_or_else(forbidden)?;
         if !daemon.opts.local_owner
             || row.workspace_id != crate::rc::endpoint::WORKSPACE
             || row.runtime != self.runtime
+            || row.native_source != self.native_source
             || (row.thread_id != self.native && !row.prior_threads.contains(&self.native))
             || row.agit_session.as_deref() != Some(self.lineage.to_string().as_str())
             || row.expected_agent_id.as_deref() != Some(self.lineage.agent_id())
@@ -270,6 +295,7 @@ impl Prepared {
             );
             let authority = self.authority.clone();
             let expected_destination = destination.clone();
+            let native_source = self.native_source.clone();
             let notification = blocking(move || {
                 let repo = Repo::open(&path).context("publication repository is missing")?;
                 ensure!(
@@ -277,7 +303,13 @@ impl Prepared {
                     "publication destination changed"
                 );
                 authority.publication_grant()?;
-                let notification = Entry::bind_notification(&repo, &request, executor).ok();
+                let notification = Entry::bind_notification_for_source(
+                    &repo,
+                    &request,
+                    executor,
+                    native_source.as_ref(),
+                )
+                .ok();
                 if notification.is_some() {
                     let _ = Entry::reclaim_acknowledged(&repo, &request);
                 }
@@ -358,7 +390,7 @@ impl Prepared {
             self.authority.publication_grant()?;
             let state = daemon.lock().await;
             self.check_lineage(&state)?;
-            let coverage = current_coverage(&state, &delivery.notification.capture);
+            let coverage = current_coverage(&state, &entry.capture);
             items.push(json!({"notification_id":id, "status":"acknowledged", "notification":delivery.notification, "receipt":receipt, "coverage":coverage}));
         }
         self.authority.publication_grant()?;
@@ -499,7 +531,10 @@ fn unavailable() -> RpcError {
     )
 }
 
-fn same_device(a: &agit_peer::cloud::Device, b: &agit_peer::cloud::Device) -> bool {
+pub(in crate::rc) fn same_device(
+    a: &agit_peer::cloud::Device,
+    b: &agit_peer::cloud::Device,
+) -> bool {
     a.id == b.id
         && a.owner == b.owner
         && a.certificate == b.certificate
@@ -510,6 +545,78 @@ fn same_device(a: &agit_peer::cloud::Device, b: &agit_peer::cloud::Device) -> bo
 mod status_tests {
     use super::*;
     use crate::protocol::{PublicationProgress as Progress, PublicationReason as Reason};
+
+    #[tokio::test]
+    async fn publication_binding_keeps_native_store_identity_through_delivery() {
+        let lineage = AgitSession::new(
+            "desktop-local/project",
+            "00000000-0000-0000-0000-000000000001",
+            "s/work",
+        )
+        .unwrap();
+        let mut roster = Roster::default();
+        for (logical, source) in [
+            ("alpha", Some("alpha")),
+            ("beta", Some("beta")),
+            ("legacy", None),
+        ] {
+            roster.record(logical, serde_json::from_value(json!({
+                "runtime":"codex", "thread_id":"copied-native", "cwd":"/project",
+                "workspace_id":"local-owner", "prior_threads":["earlier-native"],
+                "native_source":source.map(|source_id| json!({"source_id":source_id,"generation":7})),
+                "agit_session":lineage.to_string(), "expected_agent_id":lineage.agent_id()
+            })).unwrap()).unwrap();
+        }
+        let source = roster.get("beta").unwrap().native_source.clone().unwrap();
+        let reference = source.session_ref("copied-native");
+        let (logical, row, native) =
+            native_binding(&roster, "codex", &reference, "local-owner").unwrap();
+        assert_eq!((logical, native), ("beta", "copied-native"));
+        assert_eq!(row.native_source.as_ref(), Some(&source));
+        assert_eq!(
+            native_binding(&roster, "codex", "copied-native", "local-owner")
+                .unwrap()
+                .0,
+            "legacy"
+        );
+        assert_eq!(
+            native_binding(
+                &roster,
+                "codex",
+                &source.session_ref("earlier-native"),
+                "local-owner"
+            )
+            .unwrap()
+            .0,
+            "beta"
+        );
+        assert!(native_binding(&roster, "claude-code", &reference, "local-owner").is_none());
+        assert!(native_binding(&roster, "codex", &reference, "another-workspace").is_none());
+        let prepared = Prepared {
+            authority: Guard::default(),
+            logical: logical.into(),
+            native: native.into(),
+            native_source: Some(source),
+            runtime: "codex".into(),
+            lineage,
+            credential_dir: PathBuf::new(),
+            after: None,
+        };
+        let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), roster);
+        let mut daemon = daemon.lock().await;
+        daemon.opts.local_owner = true;
+        prepared.check_lineage(&daemon).unwrap();
+        daemon
+            .roster
+            .sessions
+            .get_mut("beta")
+            .unwrap()
+            .native_source
+            .as_mut()
+            .unwrap()
+            .generation += 1;
+        assert!(prepared.check_lineage(&daemon).is_err());
+    }
 
     #[test]
     fn only_receiver_evidence_reports_rejection_or_complete_acknowledgement() {

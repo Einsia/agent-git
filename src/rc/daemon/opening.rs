@@ -24,6 +24,7 @@ pub(super) enum SessionOpening {
 }
 
 pub(super) struct PreparedSpawn {
+    pub(super) capture_project: Option<(String, PathBuf)>,
     pub(super) local_owner: bool,
     pub(super) prior_entry: Option<roster::Entry>,
     pub(super) prior_capture: Option<crate::rc::capture::RepositoryKind>,
@@ -189,7 +190,7 @@ impl PreparedSpawn {
         let entry = self.prior_entry.clone();
         let saved = self.prior_capture.clone();
         let wire = self.spec.agit_session.clone();
-        let lineage = tokio::task::spawn_blocking(move || -> crate::Result<_> {
+        let mut lineage = tokio::task::spawn_blocking(move || -> crate::Result<_> {
             let prior = match entry.as_ref() {
                 Some(entry)
                     if entry.agit_session.is_some() || entry.expected_agent_id.is_some() =>
@@ -242,9 +243,141 @@ impl PreparedSpawn {
             );
             error
         })?;
+        if lineage.is_none()
+            && let Some((project_id, project)) = self.capture_project.clone()
+        {
+            self.authority.check()?;
+            self.authority.check_project(&project_id, &project)?;
+            let logical = self.info.session_id.clone();
+            let cwd = self.spec.cwd.clone();
+            let proposal = tokio::task::spawn_blocking(move || -> crate::Result<_> {
+                anyhow::ensure!(
+                    cwd.canonicalize()?.starts_with(project.canonicalize()?),
+                    "native capture is outside its bound project"
+                );
+                let repository =
+                    crate::rc::local_repository::ensure_repository(&project_id, &project)?;
+                let mut proposal = crate::rc::lineage::AgitSession::new(
+                    &repository.slug,
+                    &repository.agent_id,
+                    &format!("desktop-{}", logical.trim_start_matches("agit-")),
+                )?;
+                proposal.capture = Some(crate::rc::capture::RepositoryKind::DeviceLocal {
+                    agent_id: repository.agent_id,
+                });
+                Ok(proposal)
+            })
+            .await
+            .map_err(|_| RpcError::new(ErrorCode::Internal, "capture preparation failed"))?
+            .map_err(|_| {
+                RpcError::new(
+                    ErrorCode::Internal,
+                    "project capture repository is unavailable",
+                )
+            })?;
+            let native = self
+                .spec
+                .resume_from
+                .as_deref()
+                .expect("resume identity was checked");
+            let mut args = crate::commands::rc::land_argv(
+                &proposal.slug(),
+                proposal.agent_id(),
+                proposal.branch(),
+                &self.info.runtime,
+                native,
+                &self.spec.cwd.to_string_lossy(),
+            );
+            args.extend(["--local-owner".into(), "--adopt-unclaimed".into()]);
+            if let Some(source) = &self.info.native_source {
+                args.extend([
+                    "--source-id".into(),
+                    source.source_id.clone(),
+                    "--source-generation".into(),
+                    source.generation.to_string(),
+                ]);
+            }
+            let exe = std::env::current_exe().map_err(|_| {
+                RpcError::new(ErrorCode::Internal, "capture program is unavailable")
+            })?;
+            let mut command =
+                tokio::process::Command::from(crate::infra::background::command(&exe));
+            command
+                .args(args)
+                .env(
+                    crate::rc::capture::CAPTURE_ENV,
+                    serde_json::to_string(
+                        proposal
+                            .capture
+                            .as_ref()
+                            .expect("capture kind was assigned"),
+                    )
+                    .expect("capture kind serializes"),
+                )
+                .env_remove("AGIT_SESSION")
+                .env_remove("AGIT_MERGE_TX")
+                .env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV)
+                .env_remove(crate::rc::harness::SUPERVISED_HOOK_ENV)
+                .env_remove(crate::commands::commit::archive::NATIVE_ENV)
+                .env_remove(crate::commands::commit::archive::ROLE_ENV);
+            // The subprocess owns branch and native-claim locks through adoption.
+            let mut settlement = self.settlement.clone();
+            let lease = *settlement.borrow();
+            let output = crate::rc::supervisor::guarded_output(&mut settlement, lease, command)
+                .await
+                .ok_or_else(|| {
+                    RpcError::new(ErrorCode::SessionBusy, "capture adoption was interrupted")
+                })?;
+            if !output.status.success() {
+                return Err(RpcError::new(
+                    ErrorCode::Forbidden,
+                    "native capture could not be adopted without changing its existing claim",
+                ));
+            }
+            self.authority.check()?;
+            lineage = Some(proposal);
+        }
         self.info.agent = lineage.as_ref().map(|lineage| lineage.slug());
         self.info.branch = lineage.as_ref().map(|lineage| lineage.branch().into());
         self.spec.agit_session = lineage;
+        Ok(())
+    }
+
+    async fn revalidate_capture(&self) -> Result<(), RpcError> {
+        if self.local_owner
+            && let Some(lineage) = self.spec.agit_session.clone()
+        {
+            let runtime = self.info.runtime.clone();
+            let native = self.spec.resume_from.as_ref().map(|native| {
+                self.info
+                    .native_source
+                    .as_ref()
+                    .map(|source| source.session_ref(native))
+                    .unwrap_or_else(|| native.clone())
+            });
+            let cwd = self.spec.cwd.clone();
+            tokio::task::spawn_blocking(move || -> crate::Result<()> {
+                crate::rc::capture::require(&lineage)?;
+                if let Some(native) = native {
+                    crate::rc::capture::resolve(
+                        &runtime,
+                        &native,
+                        &cwd,
+                        Some(&lineage),
+                        lineage.capture.as_ref(),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| RpcError::new(ErrorCode::Internal, "capture revalidation failed"))?
+            .map_err(|_| {
+                RpcError::new(
+                    ErrorCode::Forbidden,
+                    "capture binding changed before launch",
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -272,39 +405,9 @@ impl PreparedSpawn {
         self.authority
             .check()
             .map_err(SpawnFailure::before_launch)?;
-        if self.local_owner
-            && let Some(lineage) = self.spec.agit_session.clone()
-        {
-            let runtime = self.info.runtime.clone();
-            let native = self.spec.resume_from.clone();
-            let cwd = self.spec.cwd.clone();
-            tokio::task::spawn_blocking(move || -> crate::Result<()> {
-                crate::rc::capture::require(&lineage)?;
-                if let Some(native) = native {
-                    crate::rc::capture::resolve(
-                        &runtime,
-                        &native,
-                        &cwd,
-                        Some(&lineage),
-                        lineage.capture.as_ref(),
-                    )?;
-                }
-                Ok(())
-            })
+        self.revalidate_capture()
             .await
-            .map_err(|_| {
-                SpawnFailure::before_launch(RpcError::new(
-                    ErrorCode::Internal,
-                    "capture revalidation failed",
-                ))
-            })?
-            .map_err(|_| {
-                SpawnFailure::before_launch(RpcError::new(
-                    ErrorCode::Forbidden,
-                    "capture binding changed before launch",
-                ))
-            })?;
-        }
+            .map_err(SpawnFailure::before_launch)?;
         let mut session = Session::launch(
             self.info.clone(), self.spec.clone(), out, self.notes.clone(),
             self.confinement.clone(), self.settlement.clone(), self.generation,
@@ -340,6 +443,20 @@ impl Daemon {
             return Ok(());
         }
         spawn.authority.check()?;
+        if let Some((project_id, project)) = &spawn.capture_project {
+            spawn.authority.check_project(project_id, project)?;
+            if self
+                .mirror
+                .project_path(&spawn.info.workspace_id, project_id)
+                .as_ref()
+                != Some(project)
+            {
+                return Err(RpcError::new(
+                    ErrorCode::Forbidden,
+                    "capture project binding changed",
+                ));
+            }
+        }
         if self.settlement.borrow().epoch != spawn.epoch
             || self
                 .opening_sessions
@@ -804,6 +921,10 @@ mod tests {
         spawn.resolve_capture().await.unwrap();
         assert_eq!(spawn.info.agent.as_deref(), Some("alice/imported"));
         assert_eq!(spawn.info.branch.as_deref(), Some("work"));
+        spawn.revalidate_capture().await.unwrap();
+        spawn.info.native_source.as_mut().unwrap().source_id = uuid::Uuid::now_v7().to_string();
+        assert!(spawn.revalidate_capture().await.is_err());
+        spawn.info.native_source = Some(binding.source.clone());
         let mut state = daemon.lock().await;
         roster::fail_next_saves(1, 0);
         assert!(state.persist_capture(&spawn).is_err());

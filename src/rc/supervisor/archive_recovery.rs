@@ -41,11 +41,18 @@ impl Session {
     }
 }
 
-/// Only the local executor's capture authority can recover a repository writer.
-pub(crate) async fn recover(
+pub(crate) struct Prepared {
+    job: Job,
+    request: SupervisorPushRequest,
+    state: tokio::sync::watch::Receiver<SettlementState>,
+    lease: SettlementState,
+}
+
+/// A capture reservation protects native settlement, not the network publication wait.
+pub(crate) async fn prepare(
     job: Job,
     mut state: tokio::sync::watch::Receiver<SettlementState>,
-) -> crate::Result<()> {
+) -> crate::Result<Prepared> {
     let lease = settlement_lease(&state).context("archive recovery has no capture lease")?;
     ensure!(
         lease.local_owner,
@@ -181,7 +188,7 @@ pub(crate) async fn recover(
         destination: destination.identity,
         notification_id: None,
     };
-    let saved = Entry::begin(
+    Entry::begin(
         &repo,
         &mut request,
         Capture {
@@ -193,6 +200,29 @@ pub(crate) async fn recover(
             through_seq: None,
         },
     )?;
+    Ok(Prepared {
+        job,
+        request,
+        state,
+        lease,
+    })
+}
+
+pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
+    let Prepared {
+        job,
+        request,
+        mut state,
+        lease,
+    } = prepared;
+    ensure!(
+        settlement_lease_is_current(&state, lease),
+        "archive capture lease changed"
+    );
+    let lineage = job.session()?;
+    let repo = crate::rc::capture::require(&lineage)?;
+    let exe = std::env::current_exe()?;
+    let saved = Entry::load(&repo, &request)?.context("archive publication intent is missing")?;
     if saved.publication.is_none() {
         let mut result = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
         result.write_all(&serde_json::to_vec(&request)?)?;

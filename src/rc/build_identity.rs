@@ -11,6 +11,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "local-settlement-v1",
     "publication-delivery-v1",
     "session-publication-status-v1",
+    "project-publication-bind-v1",
     "source-catalog-v1",
     "source-catalog-resolve-v1",
     "source-catalog-delta-v1",

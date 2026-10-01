@@ -67,8 +67,9 @@ mod dispatch;
 mod guard;
 mod opening;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
+pub(in crate::rc) mod project_publication;
 mod projection;
-mod publication;
+pub(in crate::rc) mod publication;
 mod pump;
 mod restart;
 mod session_metadata;
@@ -1616,6 +1617,7 @@ fn min_role(method_name: &str) -> Role {
         // workspace), add a directory to the allowlist, open a real shell.
         method::FS_READ_DIRECTORY
         | method::PROJECT_BIND
+        | method::PROJECT_PUBLICATION_BIND
         | method::PROJECT_UNBIND
         | method::TERMINAL_OPEN
         | method::TERMINAL_INPUT

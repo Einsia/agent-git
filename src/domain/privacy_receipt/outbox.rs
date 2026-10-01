@@ -19,6 +19,8 @@ pub struct Entry {
     version: u32,
     pub notification_id: String,
     pub capture: Capture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notification_source: Option<crate::protocol::NativeSourceRef>,
     request: SupervisorPushRequest,
     #[serde(default)]
     pub prepared: Option<PublicationReceipt>,
@@ -68,6 +70,7 @@ impl Entry {
             version: 2,
             notification_id,
             capture,
+            notification_source: None,
             request: request.clone(),
             prepared: None,
             publication: None,
@@ -109,8 +112,29 @@ impl Entry {
         request: &SupervisorPushRequest,
         executor: Executor,
     ) -> Result<Notification> {
+        Self::bind_notification_for_source(repo, request, executor, None)
+    }
+
+    pub(crate) fn bind_notification_for_source(
+        repo: &Repo,
+        request: &SupervisorPushRequest,
+        executor: Executor,
+        source: Option<&crate::protocol::NativeSourceRef>,
+    ) -> Result<Notification> {
         let (path, _lock) = locked_path(repo, request)?;
         let mut saved = Self::load(repo, request)?.context("publication intent is missing")?;
+        if saved.notification.is_some() {
+            ensure!(
+                saved
+                    .notification_source
+                    .as_ref()
+                    .map(|source| &source.source_id)
+                    == source.map(|source| &source.source_id),
+                "publication notification source changed"
+            );
+        } else {
+            saved.notification_source = source.cloned();
+        }
         if let Some(publication) = saved.publication.as_ref().or(saved.prepared.as_ref())
             && publication.projected_session_id.is_none()
         {
@@ -146,7 +170,7 @@ impl Entry {
                 .projected_session_id
                 .clone()
                 .context("publication has no verified projected session identity")?,
-            capture: saved.capture.clone(),
+            capture: saved.notification_capture(),
         };
         notification.validate()?;
         if let Some(frozen) = &saved.notification {
@@ -159,6 +183,14 @@ impl Entry {
             saved.write(&path)?;
         }
         Ok(notification)
+    }
+
+    fn notification_capture(&self) -> Capture {
+        let mut capture = self.capture.clone();
+        if let Some(source) = &self.notification_source {
+            capture.native_session_id = source.session_ref(&capture.native_session_id);
+        }
+        capture
     }
 
     /// The caller validates an authenticated response and its live grant before persisting it.
@@ -348,7 +380,7 @@ impl Entry {
                 .context("notification has no generated publication")?;
             ensure!(
                 notification.notification_id == self.notification_id
-                    && notification.capture == self.capture
+                    && notification.capture == self.notification_capture()
                     && notification.repository_id == publication.destination.agent_id
                     && notification.executor.owner.issuer == publication.destination.hub
                     && notification.branch == publication.branch
@@ -602,7 +634,46 @@ mod tests {
             ..receipt.clone()
         };
         Entry::prepare(&repo, &next, &next_receipt).unwrap();
-        let uncertain = Entry::bind_notification(&repo, &next, executor).unwrap();
+        let source = crate::protocol::NativeSourceRef {
+            source_id: "registered-source".into(),
+            generation: 7,
+        };
+        let uncertain =
+            Entry::bind_notification_for_source(&repo, &next, executor.clone(), Some(&source))
+                .unwrap();
+        assert_eq!(
+            uncertain.capture.native_session_id,
+            source.session_ref("native")
+        );
+        assert_eq!(
+            Entry::load(&repo, &next)
+                .unwrap()
+                .unwrap()
+                .capture
+                .native_session_id,
+            "native"
+        );
+        assert_eq!(
+            Entry::bind_notification_for_source(&repo, &next, executor.clone(), Some(&source))
+                .unwrap(),
+            uncertain
+        );
+        let renewed = crate::protocol::NativeSourceRef {
+            generation: 8,
+            ..source.clone()
+        };
+        assert_eq!(
+            Entry::bind_notification_for_source(&repo, &next, executor.clone(), Some(&renewed))
+                .unwrap(),
+            uncertain
+        );
+        let changed = crate::protocol::NativeSourceRef {
+            source_id: "another-store".into(),
+            ..source
+        };
+        assert!(
+            Entry::bind_notification_for_source(&repo, &next, executor, Some(&changed)).is_err()
+        );
         assert!(
             Entry::load(&repo, &next)
                 .unwrap()

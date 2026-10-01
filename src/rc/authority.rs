@@ -11,6 +11,10 @@ pub(crate) trait Authority: Send + Sync {
         None
     }
 
+    fn owned_machine_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
+        None
+    }
+
     fn watch_owner(&self) -> Option<String> {
         None
     }
@@ -33,6 +37,24 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
+    pub fn owned_machine_grant(&self) -> Result<agit_peer::cloud::ConnectionGrant, RpcError> {
+        let mut grant = None;
+        if self.admit(|| {
+            grant = self
+                .0
+                .as_ref()
+                .and_then(|authority| authority.owned_machine_grant());
+            grant.is_some()
+        }) {
+            Ok(grant.expect("admitted owned-machine grant"))
+        } else {
+            Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "project publication requires current device-owner authority",
+            ))
+        }
+    }
+
     pub fn publication_grant(&self) -> Result<agit_peer::cloud::ConnectionGrant, RpcError> {
         let mut grant = None;
         if self.admit(|| {

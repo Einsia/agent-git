@@ -40,11 +40,13 @@ impl Drop for Service {
 struct Task {
     presence: tokio::task::JoinHandle<()>,
     enrollment: Option<tokio::task::JoinHandle<()>>,
+    publication: tokio::task::JoinHandle<()>,
     changed: watch::Sender<()>,
 }
 impl Drop for Task {
     fn drop(&mut self) {
         self.presence.abort();
+        self.publication.abort();
         if let Some(enrollment) = &self.enrollment {
             enrollment.abort();
         }
@@ -57,6 +59,7 @@ impl Service {
         incoming: mpsc::Sender<Authenticated>,
         log: Option<super::super::diagnostics::Log>,
     ) -> Self {
+        let publication_directory = store::directory().ok();
         let task = tokio::spawn(async move {
             let mut tasks = HashMap::<String, Task>::new();
             let slots = Arc::new(tokio::sync::Semaphore::new(16));
@@ -102,6 +105,11 @@ impl Service {
                                 receiver,
                             )),
                             enrollment: None,
+                            publication: spawn_publication(
+                                &hub,
+                                publication_directory.as_ref(),
+                                &log,
+                            ),
                             changed,
                         }
                     });
@@ -114,6 +122,10 @@ impl Service {
                             log.clone(),
                             task.changed.subscribe(),
                         ));
+                    }
+                    if task.publication.is_finished() {
+                        task.publication =
+                            spawn_publication(&hub, publication_directory.as_ref(), &log);
                     }
                     if pending && task.enrollment.as_ref().is_none_or(|job| job.is_finished()) {
                         let (changed, log) = (task.changed.clone(), log.clone());
@@ -142,6 +154,19 @@ impl Service {
         });
         Self { task }
     }
+}
+
+fn spawn_publication(
+    hub: &str,
+    directory: Option<&std::path::PathBuf>,
+    log: &Option<super::super::diagnostics::Log>,
+) -> tokio::task::JoinHandle<()> {
+    let (hub, directory, log) = (hub.to_owned(), directory.cloned(), log.clone());
+    tokio::spawn(async move {
+        if let Some(directory) = directory {
+            super::publication::run(hub, directory, log).await;
+        }
+    })
 }
 
 fn record(log: &Option<super::super::diagnostics::Log>, event: &str, metadata: serde_json::Value) {

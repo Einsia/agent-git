@@ -182,7 +182,11 @@ impl Client {
     }
 
     pub(crate) fn for_stored_hub(hub: &str) -> Client {
-        Self::stored_hub_with_timeout(hub.to_string(), Duration::from_secs(30))
+        Self::for_stored_hub_with_timeout(hub, Duration::from_secs(30))
+    }
+
+    pub(crate) fn for_stored_hub_with_timeout(hub: &str, timeout: Duration) -> Client {
+        Self::stored_hub_with_timeout(hub.to_string(), timeout)
     }
 
     fn stored_hub_with_timeout(base: String, timeout: Duration) -> Client {
@@ -1324,7 +1328,7 @@ impl Default for Client {
 /// Hand-written rather than pulling in the urlencoding crate: it is used on two query parameters
 /// and the logic is a few lines. RFC 3986's unreserved set is kept as is, everything else is
 /// percent-encoded byte by byte (correct for UTF-8).
-fn urlencode(s: &str) -> String {
+pub(super) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {
@@ -1880,6 +1884,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn publication_reads_use_the_named_hubs_saved_account() {
+        let _home = CredentialTestHome::new();
+        let identity = agit_peer::Identity::generate().unwrap();
+        let device = agit_peer::cloud::Device {
+            id: "device".into(),
+            owner: agit_peer::access::Principal {
+                issuer: "https://cloud.example".into(),
+                account_id: "account".into(),
+            },
+            machine_id: "machine".into(),
+            display_name: "Fixture".into(),
+            certificate: identity.certificate().clone(),
+            credential_epoch: 1,
+        };
+        let target = serde_json::json!({
+            "web_workspace_id":"workspace", "web_project_id":"project",
+            "workspace_id":"local-owner", "project_id":"executor-project",
+            "local_path":"/project", "repository":"owner/project",
+            "repository_id":"repository", "encryption_enabled":false,
+        });
+        let (base, hub) = fake_hub(2, move |request| {
+            assert!(request.contains("Bearer at-new"));
+            assert!(!request.contains("foreign-account-token"));
+            let body =
+                if request.starts_with("GET /api/peer/devices/device/project-publications ") {
+                    serde_json::json!({"device":device,"entries":[target],"next_cursor":null})
+                } else {
+                    assert!(request.starts_with(
+                        "GET /api/workspaces/workspace/projects/project/publication "
+                    ));
+                    serde_json::json!({"device":device,"entry":target})
+                };
+            (200, body.to_string())
+        });
+        credentials::save(&base, &new_pair(&base, "owner")).unwrap();
+        let foreign_hub = "https://foreign.example";
+        let mut foreign = new_pair(foreign_hub, "other");
+        foreign.access_token = "foreign-account-token".into();
+        credentials::save(foreign_hub, &foreign).unwrap();
+        unsafe { std::env::set_var("AGIT_HUB_URL", foreign_hub) };
+        let client = Client::for_stored_hub_with_timeout(&base, Duration::from_secs(5));
+        let page = client.project_publication_plan("device", None).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let verified = client
+            .current_project_publication(&page.entries[0])
+            .unwrap();
+        assert_eq!(verified.entry, page.entries[0]);
+        assert_eq!(hub.join().unwrap().len(), 2);
     }
 
     #[test]

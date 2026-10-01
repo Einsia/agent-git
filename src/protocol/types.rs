@@ -278,6 +278,30 @@ pub struct ProjectBindResult {
     pub git_origin: Option<String>,
 }
 
+/// An owned Cloud machine binds a confirmed project to an immutable private Hub repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPublicationBind {
+    pub workspace_id: String,
+    pub project_id: String,
+    pub local_path: String,
+    pub repository: String,
+    pub repository_id: String,
+    pub encryption_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPublicationBindResult {
+    pub project_id: String,
+    pub local_path: String,
+    pub repository: String,
+    pub repository_id: String,
+    pub local_repository_id: String,
+    pub auto_push_enabled: bool,
+    pub consent_ready: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectUnbind {
     pub workspace_id: String,

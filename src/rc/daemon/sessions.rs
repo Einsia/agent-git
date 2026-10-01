@@ -1192,6 +1192,17 @@ impl Daemon {
         );
         let confinement = self.confinement_for(&info.workspace_id);
         Ok(PreparedSpawn {
+            capture_project: self
+                .opts
+                .local_owner
+                .then(|| {
+                    info.project_id.as_ref().and_then(|id| {
+                        self.mirror
+                            .project_path(&info.workspace_id, id)
+                            .map(|path| (id.clone(), path))
+                    })
+                })
+                .flatten(),
             prior_entry: self.roster.get(&info.session_id).cloned(),
             prior_capture: self.roster.captures.get(&info.session_id).cloned(),
             incarnation: self.identity.instance_id.clone(),

@@ -1,4 +1,4 @@
-//! Recovery reserves a capture writer independently of browser attachments and native ownership.
+//! Recovery reserves a capture writer only until its immutable publication intent is durable.
 
 use super::*;
 use crate::rc::archive_jobs::Job;
@@ -49,13 +49,24 @@ pub(super) fn start(
                     }
                     state.settlement.subscribe()
                 };
-                let completed = tokio::select! {
+                let prepared = tokio::select! {
                     biased;
                     _ = stop.wait_for(|stopped| *stopped) => None,
                     result = tokio::time::timeout(std::time::Duration::from_secs(60),
-                        crate::rc::supervisor::archive_recovery::recover(job.clone(), authority)) => Some(result),
+                        crate::rc::supervisor::archive_recovery::prepare(job.clone(), authority)) => Some(result),
                 };
                 daemon.lock().await.archive_recovering.remove(&job.logical);
+                let completed = match prepared {
+                    Some(Ok(Ok(prepared))) => tokio::select! {
+                        biased;
+                        _ = stop.wait_for(|stopped| *stopped) => None,
+                        result = tokio::time::timeout(std::time::Duration::from_secs(60),
+                            crate::rc::supervisor::archive_recovery::publish(prepared)) => Some(result),
+                    },
+                    Some(Ok(Err(error))) => Some(Ok(Err(error))),
+                    Some(Err(error)) => Some(Err(error)),
+                    None => None,
+                };
                 match completed {
                     Some(Ok(Ok(()))) => {}
                     Some(result) => eprintln!(
@@ -181,6 +192,7 @@ mod tests {
         };
         assert!(state.require_launch_slot(&alias.info, &spec).is_err());
         state.archive_recovering.clear();
+        assert!(state.require_launch_slot(&alias.info, &spec).is_ok());
         state.sessions.insert("alias".into(), alias);
         assert!(!state.reserve_archive(&job));
         state.sessions.clear();

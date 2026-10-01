@@ -201,6 +201,7 @@ pub fn authorize(
             let resolved = if matches!(
                 method.as_str(),
                 "session.catalog.settings"
+                    | "session.publication.deliver"
                     | "session.goal.read"
                     | "session.resume"
                     | "session.watch"
@@ -247,6 +248,7 @@ pub fn authorize(
                 if !matches!(
                     method.as_str(),
                     "session.catalog.settings"
+                        | "session.publication.deliver"
                         | "session.goal.read"
                         | "session.resume"
                         | "session.watch"
@@ -261,10 +263,24 @@ pub fn authorize(
                         "this operation requires source-aware session attachment",
                     ));
                 }
-                params["source_id"] = serde_json::json!(source.source_id);
-                params["source_generation"] = serde_json::json!(source.generation);
-                params["native_session_id"] = serde_json::json!(session.native_id);
-                params["expected_cwd"] = serde_json::json!(session.cwd);
+                if method == "session.publication.deliver" {
+                    for field in [
+                        "source_id",
+                        "source_generation",
+                        "native_session_id",
+                        "expected_cwd",
+                    ] {
+                        params
+                            .as_object_mut()
+                            .expect("request parameters")
+                            .remove(field);
+                    }
+                } else {
+                    params["source_id"] = serde_json::json!(source.source_id);
+                    params["source_generation"] = serde_json::json!(source.generation);
+                    params["native_session_id"] = serde_json::json!(session.native_id);
+                    params["expected_cwd"] = serde_json::json!(session.cwd);
+                }
             } else if method == "session.catalog.settings" {
                 return Err(RpcError::new(
                     ErrorCode::SessionNotFound,
@@ -325,10 +341,15 @@ pub fn authorize(
                 (Target::Machine, Need::Admin)
             }
         }
-        "fs.readDirectory" | "fs.readFile" | "project.bind" | "project.unbind"
-        | "terminal.open" | "terminal.input" | "terminal.resize" | "terminal.close" => {
-            (Target::Machine, Need::Admin)
-        }
+        "fs.readDirectory"
+        | "fs.readFile"
+        | "project.bind"
+        | "project.publication.bind"
+        | "project.unbind"
+        | "terminal.open"
+        | "terminal.input"
+        | "terminal.resize"
+        | "terminal.close" => (Target::Machine, Need::Admin),
         _ => return Err(denied()),
     };
     let permit = Permit {
@@ -431,6 +452,30 @@ mod tests {
                 "native_source":{"source_id":"source-a", "generation":3}
             }}),
         );
+        let delivery = Frame::request(
+            "session.publication.deliver",
+            json!({
+                "session_id":reference, "source_id":"forged", "native_session_id":"foreign"
+            }),
+        );
+        let (delivery, permit) = authorize(
+            delivery.clone(),
+            &principal,
+            &policy(Access::Control),
+            &mut resources,
+        )
+        .unwrap();
+        let params = delivery.params.as_ref().unwrap();
+        assert_eq!(params["session_id"], reference);
+        assert!(params.get("source_id").is_none());
+        assert!(params.get("native_session_id").is_none());
+        assert!(!permit.authority_matches(
+            &resources,
+            &policy(Access::Read),
+            &principal,
+            "operator"
+        ));
+        assert!(authorize(delivery, &principal, &policy(Access::Read), &mut resources).is_err());
         for method in ["turn.start", "turn.steer"] {
             let request = Frame::request(
                 method,

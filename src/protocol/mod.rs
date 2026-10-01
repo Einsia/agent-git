@@ -542,6 +542,7 @@ pub mod method {
     // ── hub / viewer → agitd (relayed) ──
     pub const WORKSPACE_LIST: &str = "workspace.list";
     pub const PROJECT_BIND: &str = "project.bind";
+    pub const PROJECT_PUBLICATION_BIND: &str = "project.publication.bind";
     pub const PROJECT_UNBIND: &str = "project.unbind";
     pub const FS_READ_DIRECTORY: &str = "fs.readDirectory";
     pub const FS_READ_FILE: &str = "fs.readFile";

@@ -75,7 +75,7 @@ pub(super) fn private_lock(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-pub(super) fn read<T: serde::de::DeserializeOwned>(
+pub(in crate::rc) fn read<T: serde::de::DeserializeOwned>(
     path: &Path,
     limit: u64,
 ) -> crate::Result<Option<T>> {
@@ -273,7 +273,11 @@ pub fn status(hub: &str) -> crate::Result<serde_json::Value> {
 }
 
 pub fn policy() -> crate::Result<Policy> {
-    Ok(read(&super::super::rc_dir()?.join(POLICY_FILE), 4 * 1024 * 1024)?.unwrap_or_default())
+    policy_in(&super::super::rc_dir()?)
+}
+
+pub(in crate::rc) fn policy_in(directory: &Path) -> crate::Result<Policy> {
+    Ok(read(&directory.join(POLICY_FILE), 4 * 1024 * 1024)?.unwrap_or_default())
 }
 
 pub fn save_policy(policy: &Policy) -> crate::Result<()> {

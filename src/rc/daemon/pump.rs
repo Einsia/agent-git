@@ -561,6 +561,14 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
+                            if frame.method() == method::PROJECT_PUBLICATION_BIND =>
+                        {
+                            super::project_publication::dispatch(
+                                d.clone(), &frame, epoch, out_tx.clone(),
+                                &mut session_rpc_tasks, session_rpc_stop_tx.subscribe(),
+                            ).await;
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_PUBLICATION_DELIVER =>
                         {
                             super::publication::dispatch(

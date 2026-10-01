@@ -27,6 +27,13 @@ pub struct Mirror {
 const FILE: &str = "workspaces.json";
 
 impl Mirror {
+    pub(in crate::rc) fn load_in(directory: &Path) -> crate::Result<Self> {
+        let mut mirror: Self =
+            super::cloud::store::read(&directory.join(FILE), 4 * 1024 * 1024)?.unwrap_or_default();
+        mirror.rebuild_verified();
+        Ok(mirror)
+    }
+
     pub fn load() -> Mirror {
         let mut mirror: Mirror = super::load_json(FILE);
         mirror.rebuild_verified();

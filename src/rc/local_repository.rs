@@ -78,6 +78,26 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
         return Ok(repository.clone());
     }
     let machine = super::identity::identity()?;
+    let mut existing = repositories
+        .values()
+        .filter(|repo| repo.directory == directory);
+    if let Some(candidate) = existing.next() {
+        ensure!(
+            existing.all(|repo| repo.agent_id == candidate.agent_id
+                && repo.slug == candidate.slug
+                && repo.authority == candidate.authority),
+            "this directory has conflicting local repositories; reconcile their histories before binding another project"
+        );
+        let lineage = AgitSession::new(&candidate.slug, &candidate.agent_id, "main")?;
+        let repo =
+            Repo::open(&lineage.repo_dir()?).context("shared project repository is missing")?;
+        require_identity(&repo, &candidate.agent_id, &machine.machine_fingerprint)?;
+        let mut repository = candidate.clone();
+        repository.project_id = project_id.into();
+        repositories.insert(project_id.into(), repository.clone());
+        super::save_json("repositories.json", &repositories)?;
+        return Ok(repository);
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let owner = format!("desktop-{}", machine.machine_fingerprint);
     let slug = format!("{owner}/project-{id}");
@@ -102,6 +122,69 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Workspace aliases share an immutable repository; conflicting legacy histories are not selected by ordering.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_directory_aliases_share_publication_identity_without_selecting_conflicting_history()
+     {
+        if crate::rc::in_isolated_test(
+            "rc::local_repository::tests::canonical_directory_aliases_share_publication_identity_without_selecting_conflicting_history",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let cwd = root.path().join("project");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&cwd).unwrap();
+        std::os::unix::fs::symlink(&cwd, &alias).unwrap();
+        let first = ensure_repository("workspace-a", &cwd).unwrap();
+        let lineage = AgitSession::new(&first.slug, &first.agent_id, "main").unwrap();
+        let repo = require(&lineage).unwrap();
+        let target = crate::hub::identity::RemoteIdentity::new(
+            "https://hub.example",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        publication::Selection::prepare(&repo, Some("owner/project"), &target.hub)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &target)
+            .unwrap();
+        let second = ensure_repository("workspace-b", &alias).unwrap();
+        assert_eq!(second.agent_id, first.agent_id);
+        assert_eq!(second.slug, first.slug);
+        assert_eq!(second.project_id, "workspace-b");
+        let shared =
+            require(&AgitSession::new(&second.slug, &second.agent_id, "main").unwrap()).unwrap();
+        assert_eq!(
+            publication::Destination::load(&shared)
+                .unwrap()
+                .unwrap()
+                .identity,
+            target
+        );
+        assert!(
+            publication::Selection::prepare(&shared, Some("owner/other"), &target.hub).is_err()
+        );
+        let registry = crate::rc::rc_dir().unwrap().join("repositories.json");
+        let mut records: BTreeMap<String, Repository> =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        let mut conflicting = first.clone();
+        conflicting.project_id = "legacy".into();
+        conflicting.agent_id = uuid::Uuid::new_v4().to_string();
+        records.insert("legacy".into(), conflicting);
+        std::fs::write(&registry, serde_json::to_vec(&records).unwrap()).unwrap();
+        assert!(ensure_repository("workspace-c", &cwd).is_err());
+        assert_eq!(
+            ensure_repository("workspace-a", &cwd).unwrap().agent_id,
+            first.agent_id
+        );
+    }
 
     #[test]
     fn local_identity_uses_last_values_without_accepting_embedded_keys() {

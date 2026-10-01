@@ -5,6 +5,7 @@ mod commands;
 mod delegation;
 pub mod host;
 pub mod ingress;
+mod publication;
 pub mod resources;
 pub mod store;
 pub use commands::{Args, run};

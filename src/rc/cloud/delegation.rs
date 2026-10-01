@@ -134,11 +134,8 @@ impl Owners {
         // Pending admissions retain the ownership boundary even when every connection closes.
         let slot = self.slot(&key, &owner);
         let (pending, file_owner) = (slot.clone(), owner.clone());
-        tokio::task::spawn_blocking(move || {
-            let path = super::super::rc_dir()?.join(format!("cloud-session-owner-{key}.json"));
-            pending.publish(&path, &file_owner)
-        })
-        .await??;
+        let path = super::super::rc_dir()?.join(format!("cloud-session-owner-{key}.json"));
+        tokio::task::spawn_blocking(move || pending.publish(&path, &file_owner)).await??;
         Ok(Some(Controller {
             scope,
             owner,
@@ -725,7 +722,12 @@ mod tests {
                 Access::Deny
             );
             assert!(resources.prepare_controller_source(&reference).is_err());
-            assert!(resources.prepare_controller_source(&other).is_ok());
+            let unaffected = resources.prepare_controller_source(&other);
+            assert!(
+                unaffected.is_ok(),
+                "unaffected source: {:?}",
+                unaffected.err()
+            );
         });
     }
 

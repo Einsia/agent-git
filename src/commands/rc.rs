@@ -70,6 +70,9 @@ pub struct GrantsArgs {
 
 #[derive(ClapArgs)]
 pub struct LandArgs {
+    /// Adopt only a native conversation that has no existing repository claim.
+    #[arg(long, hide = true, requires = "local_owner")]
+    pub adopt_unclaimed: bool,
     /// Use pinned local repository authority without contacting a Hub.
     #[arg(long)]
     pub local_owner: bool,
@@ -605,6 +608,14 @@ fn landed_link(
     } else {
         crate::domain::link::get_checked(store, &args.runtime, &key)?
     };
+    if args.adopt_unclaimed {
+        anyhow::ensure!(
+            existing.as_ref().is_none_or(|link| {
+                link.owner.is_none() && link.agent.is_none() && link.branch.is_none()
+            }),
+            "native capture acquired a repository claim before adoption"
+        );
+    }
     let mut lk =
         existing.unwrap_or_else(|| crate::domain::link::Link::new(&args.runtime, &key, None));
     if let Some(previous) = &lk.native_binding {
@@ -1208,6 +1219,7 @@ mod tests {
         resumed.materialized_from = Some("a".repeat(40));
         link::write(&store, &resumed).unwrap();
         let mut args = super::LandArgs {
+            adopt_unclaimed: false,
             local_owner: false,
             slug: "alice/photo".into(),
             agent_id: AGENT_ID.into(),
@@ -1224,6 +1236,10 @@ mod tests {
         assert_eq!(repeated.materialized_from, resumed.materialized_from);
         assert_eq!(repeated.cwd.as_deref(), Some(args.cwd.as_str()));
 
+        args.adopt_unclaimed = true;
+        assert!(super::landed_link(&store, &args, "photo").is_err());
+        args.adopt_unclaimed = false;
+
         args.branch = "recovery".into();
         let rerouted = super::landed_link(&store, &args, "photo").unwrap();
         assert!(rerouted.baseline_bytes.is_none());
@@ -1235,6 +1251,7 @@ mod tests {
         link::write(&store, &resumed).unwrap();
         assert!(super::landed_link(&store, &args, "photo").is_err());
         let empty = Store::at(dir.path().join("empty"));
+        args.adopt_unclaimed = true;
         let fresh = super::landed_link(&empty, &args, "photo").unwrap();
         assert!(fresh.baseline_bytes.is_none());
         assert!(fresh.baseline_hash.is_none());

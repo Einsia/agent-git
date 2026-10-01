@@ -1319,10 +1319,20 @@ pub(crate) fn automatic_publication_consent(
     repository: &str,
     expected: &RemoteIdentity,
 ) -> Result<bool> {
+    let client = Client::from_env_with_timeout(std::time::Duration::from_secs(5));
+    automatic_publication_consent_with_client(repo, repository, expected, &client)
+}
+
+pub(crate) fn automatic_publication_consent_with_client(
+    repo: &Repo,
+    repository: &str,
+    expected: &RemoteIdentity,
+    client: &Client,
+) -> Result<bool> {
     if !repo.auto_push_enabled()? {
         return Ok(false);
     }
-    let current = publication_consent(repo, repository, expected)?;
+    let current = publication_consent_with_client(repo, repository, expected, client)?;
     if !current.mode.is_encrypted() {
         return Ok(true);
     }
@@ -1336,6 +1346,15 @@ pub(crate) fn publication_consent(
     expected: &RemoteIdentity,
 ) -> Result<AutoConsent> {
     let client = Client::from_env_with_timeout(std::time::Duration::from_secs(5));
+    publication_consent_with_client(repo, repository, expected, &client)
+}
+
+pub(crate) fn publication_consent_with_client(
+    repo: &Repo,
+    repository: &str,
+    expected: &RemoteIdentity,
+    client: &Client,
+) -> Result<AutoConsent> {
     ensure!(
         identity::normalize_hub(client.base())? == expected.hub,
         "publication Hub changed"
@@ -1369,7 +1388,7 @@ pub(crate) fn publication_consent(
     let sources = super::super::privacy::sources::Sources::bound_repository(
         repo,
         repository,
-        &client,
+        client,
         &[(repository, Some(&expected.agent_id))],
     )?;
     let mut policy = crate::domain::privacy::PrivacyPolicy::load(repo)?;

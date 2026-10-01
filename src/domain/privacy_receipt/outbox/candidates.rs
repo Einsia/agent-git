@@ -41,6 +41,7 @@ impl Entry {
             version: 2,
             notification_id,
             capture: original.capture,
+            notification_source: None,
             request: selected.clone(),
             prepared: Some(receipt.clone()),
             publication: None,

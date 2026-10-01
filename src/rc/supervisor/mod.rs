@@ -301,7 +301,7 @@ enum SettlementBoundary {
 /// Any negotiation transition cancels the whole process group. The epoch check
 /// means a fast disconnect/reconnect cannot revive an operation from the old
 /// connection even if both endpoints support the feature.
-async fn guarded_output(
+pub(in crate::rc) async fn guarded_output(
     state: &mut tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
     mut command: tokio::process::Command,

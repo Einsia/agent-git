@@ -270,6 +270,22 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn owned_machine_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
+        if self.permit.method != crate::protocol::method::PROJECT_PUBLICATION_BIND {
+            return None;
+        }
+        let mut grant = self.grant.clone()?;
+        if grant.session_controller.is_some()
+            || grant.project_controller.is_some()
+            || grant.caller != grant.target.owner
+            || grant.source.owner != grant.target.owner
+        {
+            return None;
+        }
+        grant.expires_at_ms = self.lease.expires_at_ms();
+        Some(grant)
+    }
+
     fn publication_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
         if self.permit.method != crate::protocol::method::SESSION_PUBLICATION_DELIVER {
             return None;
@@ -485,6 +501,7 @@ impl Client {
             return Ok(self.accepts_notification(&frame).then(|| frame.to_json()));
         }
         if !self.current() {
+            self.record_dropped_response(&frame, "authority_expired");
             return Ok(None);
         }
         self.observe_response(&frame);
@@ -504,6 +521,7 @@ impl Client {
             .as_ref()
             .and_then(|controller| controller.current());
         if self.controller.is_some() && owner.is_none() {
+            self.record_dropped_response(&frame, "controller_replaced");
             return Ok(None);
         }
         if let Some(Some(pending)) = &permit {
@@ -535,7 +553,26 @@ impl Client {
             }
             return Ok(Some(frame.to_json()));
         }
-        Ok(matches!(permit, Some(None)).then(|| frame.to_json()))
+        if matches!(permit, Some(None)) {
+            Ok(Some(frame.to_json()))
+        } else {
+            self.record_dropped_response(&frame, "request_permit_missing");
+            Ok(None)
+        }
+    }
+
+    fn record_dropped_response(&self, frame: &Frame, reason: &str) {
+        if let Some(log) = &self.log {
+            log.record(
+                "cloud.response_dropped",
+                serde_json::json!({
+                    "request_id":frame.id,
+                    "reason":reason,
+                    "connected":*self.live.read().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    "lease_current":self.lease.current(),
+                }),
+            );
+        }
     }
 
     pub fn receipt_key(&self, key: String, frame: &Frame) -> String {
@@ -635,6 +672,15 @@ mod tests {
                 let ordinary = registry.client(principal(), now + 60_000);
                 assert!(ordinary.authorize(request()).is_err());
                 let client = registry.admitted(grant.clone()).await.unwrap();
+                assert!(
+                    std::fs::read_dir(crate::rc::rc_dir().unwrap())
+                        .unwrap()
+                        .any(|entry| entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("cloud-session-owner-"))
+                );
                 let frame = client.authorize(request()).unwrap();
                 assert_eq!(frame.authority.publication_grant().unwrap().id, "grant");
                 client.lease().renew(now + 120_000).unwrap();
@@ -672,6 +718,94 @@ mod tests {
             issuer: "https://cloud.example".into(),
             account_id: "reader".into(),
         }
+    }
+
+    /// Destination setup requires an owned machine grant and cannot lend receipt-delivery authority.
+    #[tokio::test]
+    async fn project_publication_grants_require_the_current_device_owner() {
+        use agit_peer::cloud::{ConnectionGrant, Device};
+        let owner = principal();
+        let policy = || {
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: owner.clone(),
+                    resource: Resource::Machine,
+                    access: Access::Admin,
+                }],
+            )
+            .unwrap()
+        };
+        let registry = Registry::fixed(policy());
+        let device = Device {
+            id: "executor".into(),
+            owner: owner.clone(),
+            machine_id: "machine".into(),
+            display_name: "Fixture".into(),
+            credential_epoch: 1,
+            certificate: agit_peer::Identity::generate()
+                .unwrap()
+                .certificate()
+                .clone(),
+        };
+        let grant = ConnectionGrant {
+            id: "owner-grant".into(),
+            caller: owner.clone(),
+            source: Device {
+                id: "controller".into(),
+                ..device.clone()
+            },
+            target: device,
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+            session_controller: None,
+            project_controller: None,
+        };
+        let request = || {
+            Frame::request(
+                crate::protocol::method::PROJECT_PUBLICATION_BIND,
+                json!({"project_id":"project", "grant_id":"untrusted"}),
+            )
+        };
+        let unbound = registry.client(owner.clone(), grant.expires_at_ms);
+        assert!(
+            unbound
+                .authorize(request())
+                .unwrap()
+                .authority
+                .owned_machine_grant()
+                .is_err()
+        );
+        let client = registry.admitted(grant.clone()).await.unwrap();
+        let frame = client.authorize(request()).unwrap();
+        assert_eq!(
+            frame.authority.owned_machine_grant().unwrap().id,
+            "owner-grant"
+        );
+        assert!(frame.authority.publication_grant().is_err());
+        assert!(
+            client
+                .authorize(Frame::request("project.bind", json!({})))
+                .unwrap()
+                .authority
+                .owned_machine_grant()
+                .is_err()
+        );
+        registry.state.write().unwrap().policy = Policy::default();
+        assert!(frame.authority.owned_machine_grant().is_err());
+        registry.state.write().unwrap().policy = policy();
+        let mut transferred = grant.clone();
+        transferred.target.owner.account_id = "another-owner".into();
+        let foreign = registry.admitted(transferred).await.unwrap();
+        assert!(
+            foreign
+                .authorize(request())
+                .unwrap()
+                .authority
+                .owned_machine_grant()
+                .is_err()
+        );
+        drop(client);
+        assert!(frame.authority.owned_machine_grant().is_err());
     }
 
     fn policy() -> Policy {
