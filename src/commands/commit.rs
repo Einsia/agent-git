@@ -2508,6 +2508,16 @@ fn settle_bytes(
     observations.code = observed_code.clone();
     observations.cwd_state = cwd_state.clone();
     observations.milestone = opts.milestone.clone();
+    // A bound source whose home cannot be resolved records no title rather than one read from
+    // this process's default home.
+    observations.title = lk.native_home().ok().and_then(|home| {
+        crate::adapter::native_title::native_title(
+            source,
+            lk.native_thread_id(),
+            &text,
+            home.as_deref(),
+        )
+    });
     let protected_observations =
         secret_dictionary.protect_metadata(&mut observations, &global_secrets)?;
     // A value learned from an observation can also occur in the transcript. Finish discovery

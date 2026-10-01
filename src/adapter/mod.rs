@@ -39,6 +39,7 @@ pub mod enrich;
 pub mod hermes;
 mod native_message;
 pub mod native_snapshot;
+pub mod native_title;
 pub mod openclaw;
 pub mod opencode;
 pub(crate) mod preview;

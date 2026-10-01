@@ -403,6 +403,11 @@ pub struct Meta {
     /// The phase summary added by `--milestone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub milestone: Option<String>,
+    /// The runtime's own name for the session when this commit was settled, such as a Claude
+    /// Code title or a Codex thread name. A rename shows up in the next settlement; absent when
+    /// the runtime keeps no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The live transcript's baseline byte count once the settlement completes (what doctor
     /// tests "still append-only" against).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,6 +437,7 @@ impl Meta {
             turn: None,
             completeness: None,
             milestone: None,
+            title: None,
             baseline_bytes: None,
             runtime_instances: Vec::new(),
             cwd_is_agent_repository: false,

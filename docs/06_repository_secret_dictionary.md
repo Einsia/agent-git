@@ -23,7 +23,7 @@ runtime plaintext
 
 Session settlement protects native event content and generated commit messages, together
 with user-controlled observations in `session/meta.json`: working directory, code origin,
-observed branch and milestone. Metadata schema, session identity, object hashes and enum
+observed branch, milestone and the runtime's session title. Metadata schema, session identity, object hashes and enum
 values remain structural. Heuristic discovery completes before event objects are formed,
 so values learned from observations also protect matching transcript content.
 

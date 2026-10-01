@@ -14,11 +14,30 @@ pub(super) fn preview(title: &str) -> Option<String> {
 }
 
 pub(super) fn apply_names(path: &Path, sessions: &mut [SessionRef]) {
-    let _ = read_names(path, sessions);
+    let mut pending: HashMap<_, _> = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| (session.id.clone(), index))
+        .collect();
+    let _ = latest_names(path, &mut pending, |index, name| {
+        sessions[index].title = preview(name);
+    });
 }
 
-fn read_names(path: &Path, sessions: &mut [SessionRef]) -> std::io::Result<()> {
-    if sessions.is_empty() || !std::fs::symlink_metadata(path)?.is_file() {
+/// The latest name Codex recorded for one thread, unshortened.
+pub(super) fn name(path: &Path, id: &str) -> Option<String> {
+    let mut pending = HashMap::from([(id.to_owned(), 0)]);
+    let mut found = None;
+    let _ = latest_names(path, &mut pending, |_, name| found = Some(name.to_owned()));
+    found
+}
+
+fn latest_names(
+    path: &Path,
+    pending: &mut HashMap<String, usize>,
+    mut found: impl FnMut(usize, &str),
+) -> std::io::Result<()> {
+    if pending.is_empty() || !std::fs::symlink_metadata(path)?.is_file() {
         return Ok(());
     }
     let mut file = std::fs::File::open(path)?;
@@ -39,11 +58,6 @@ fn read_names(path: &Path, sessions: &mut [SessionRef]) -> std::io::Result<()> {
     if begin > end {
         return Ok(());
     }
-    let mut pending: HashMap<_, _> = sessions
-        .iter()
-        .enumerate()
-        .map(|(index, session)| (session.id.clone(), index))
-        .collect();
     #[derive(serde::Deserialize)]
     struct Name {
         id: String,
@@ -58,7 +72,7 @@ fn read_names(path: &Path, sessions: &mut [SessionRef]) -> std::io::Result<()> {
             continue;
         };
         if let Some(index) = pending.remove(&name.id) {
-            sessions[index].title = preview(&name.thread_name);
+            found(index, &name.thread_name);
             if pending.is_empty() {
                 break;
             }
@@ -91,9 +105,11 @@ mod tests {
             gist: Some("Opening prompt".into()),
             title: Some("Indexed title".into()),
         });
-        read_names(&path, &mut sessions).unwrap();
+        apply_names(&path, &mut sessions);
         assert_eq!(sessions[0].title.as_deref(), Some("Indexed title"));
         assert_eq!(sessions[1].title.as_deref(), Some("Complete rename"));
+        assert_eq!(name(&path, "recent").as_deref(), Some("Complete rename"));
+        assert_eq!(name(&path, "older"), None);
         assert!(
             sessions
                 .iter()

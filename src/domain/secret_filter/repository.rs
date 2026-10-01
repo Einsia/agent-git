@@ -2576,6 +2576,7 @@ fn observation_fields(metadata: &mut crate::domain::meta::Meta) -> Vec<&mut Stri
     let mut fields = vec![&mut metadata.cwd];
     fields.extend(metadata.code.iter_mut());
     fields.extend(metadata.milestone.iter_mut());
+    fields.extend(metadata.title.iter_mut());
     if let Some(state) = metadata.cwd_state.as_mut() {
         if !crate::domain::secrets::identity::empty_status_digest(state) {
             fields.extend(state.status_digest.iter_mut());

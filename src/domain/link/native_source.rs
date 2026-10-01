@@ -86,6 +86,17 @@ impl Link {
         Ok((context, roots))
     }
 
+    /// The runtime home this link's session is read from: its registered source at the bound
+    /// generation, or `None` for a link without a source binding.
+    #[cfg(feature = "rc")]
+    pub fn native_home(&self) -> crate::Result<Option<PathBuf>> {
+        if self.native_binding.is_none() {
+            return Ok(None);
+        }
+        let (context, _) = self.source_context()?;
+        Ok(Some(context.source.home))
+    }
+
     #[cfg(feature = "rc")]
     pub(super) fn resolve_source(&self) -> crate::Result<PathBuf> {
         let (context, roots) = self.source_context()?;
@@ -139,6 +150,15 @@ impl Link {
         )?;
         context.validate()?;
         Ok(bytes)
+    }
+
+    #[cfg(not(feature = "rc"))]
+    pub fn native_home(&self) -> crate::Result<Option<PathBuf>> {
+        ensure!(
+            self.native_binding.is_none(),
+            "native source resolution requires runtime support"
+        );
+        Ok(None)
     }
 
     #[cfg(not(feature = "rc"))]

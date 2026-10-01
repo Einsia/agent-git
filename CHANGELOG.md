@@ -8,6 +8,16 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- Each settled commit records the runtime's own name for the session in
+  `session/meta.json` as `title`: the latest Claude Code title (`custom-title`,
+  falling back to an older transcript's `summary`) or the Codex thread name from
+  `session_index.jsonl`. A rename appears from the next settlement on. The
+  `agit: unnamed` and `agit <owner/repo@branch>` placeholders that agit's own
+  SessionStart hook assigns are not recorded. The title is protected like other
+  metadata observations and is not part of encrypted metadata projection.
+
 ### Changed
 
 - **Secret findings no longer stop uploads to a private ordinary repository.**
