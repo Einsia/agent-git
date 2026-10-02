@@ -1150,6 +1150,48 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                     .is_some_and(|receipt| receipt.source == unpublished)
             }));
             assert!(resumed.publication_retry.next.is_none());
+
+            // Project binding can finish after native settlement; idle recovery must publish
+            // the retained source without another user turn or bypassing disabled auto-push.
+            let destination = repo
+                .git(&["config", "--get", "agit.desktopPublication"])
+                .unwrap();
+            repo.git(&["config", "--unset", "agit.desktopPublication"])
+                .unwrap();
+            repo.set_auto_push(Some(false)).unwrap();
+            std::fs::write(&fixture.exe, &script).unwrap();
+            let pushes = std::fs::read(fixture.repo.join(".git/push-calls")).unwrap();
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            let awaiting_binding = fixture.head();
+            let deadline = resumed.publication_retry.next.expect(
+                "a missing destination must leave the completed source eligible for idle recovery",
+            );
+            tokio::time::sleep_until(deadline).await;
+            assert!(resumed.idle_settlement_ready());
+            std::fs::write(&fixture.exe, &retry_script).unwrap();
+            repo.git(&["config", "agit.desktopPublication", destination.trim()])
+                .unwrap();
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(
+                std::fs::read(fixture.repo.join(".git/push-calls")).unwrap(),
+                pushes
+            );
+            let deadline = resumed
+                .publication_retry
+                .next
+                .expect("disabled publication remains pending until the project enables auto-push");
+            repo.set_auto_push(Some(true)).unwrap();
+            tokio::time::sleep_until(deadline).await;
+            assert!(resumed.idle_settlement_ready());
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(fixture.head(), awaiting_binding);
+            assert!(read_entries().iter().any(|entry| {
+                entry
+                    .publication
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.source == awaiting_binding)
+            }));
+            assert!(resumed.publication_retry.next.is_none());
         });
     });
 }

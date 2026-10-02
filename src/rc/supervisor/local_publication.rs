@@ -115,7 +115,13 @@ impl Session {
         let (repo, request, result) = match prepared {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
-                self.finish_publication_outcome(PublicationOutcome::Complete(None));
+                // A durable receipt ends this attempt; an unconfigured source still needs
+                // idle recovery when its project destination becomes ready.
+                self.finish_publication_outcome(if retained {
+                    PublicationOutcome::Complete(None)
+                } else {
+                    PublicationOutcome::Retry
+                });
                 return;
             }
             Err(error) => {
