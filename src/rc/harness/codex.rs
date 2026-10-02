@@ -2115,6 +2115,7 @@ fn item_kind(item: &Value) -> (ItemKind, Option<String>) {
         "userMessage" => (ItemKind::UserMessage, None),
         "agentMessage" | "plan" => (ItemKind::AssistantMessage, None),
         "reasoning" => (ItemKind::Reasoning, None),
+        "contextCompaction" => (ItemKind::ContextCompaction, None),
         "commandExecution" => (
             ItemKind::ToolCall,
             item.get("command")
@@ -3067,6 +3068,29 @@ mod tests {
         assert_eq!(item_kind(&msg).0, ItemKind::AssistantMessage);
         let r = json!({"type":"reasoning","id":"i","summary":[],"content":[]});
         assert_eq!(item_kind(&r).0, ItemKind::Reasoning);
+        let compaction = json!({"type":"contextCompaction","id":"compact"});
+        assert_eq!(item_kind(&compaction).0, ItemKind::ContextCompaction);
+    }
+
+    /// Compaction remains an identified activity so viewers can retire its exact progress row.
+    #[tokio::test]
+    async fn compaction_stream_preserves_start_and_completion_identity() {
+        let mut driver = probe();
+        let item = json!({"id":"compact", "type":"contextCompaction"});
+        assert!(matches!(
+            driver.classify(json!({"method":"item/started", "params":{"item":item}})).await,
+            Some(HarnessEvent::ItemStarted { item_id, kind: ItemKind::ContextCompaction, tool: None })
+                if item_id == "compact"
+        ));
+        assert_eq!(
+            serde_json::to_value(ItemKind::ContextCompaction).unwrap(),
+            "context_compaction"
+        );
+        assert!(matches!(
+            driver.classify(json!({"method":"item/completed", "params":{"item":item}})).await,
+            Some(HarnessEvent::ItemCompleted { item_id }) if item_id == "compact"
+        ));
+        driver.shutdown().await.expect("stop test process");
     }
 
     /// External RPCs never occupy the creation-time pre-ready slot or report a

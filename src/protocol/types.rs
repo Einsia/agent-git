@@ -955,6 +955,7 @@ pub enum ItemKind {
     UserMessage,
     AssistantMessage,
     Reasoning,
+    ContextCompaction,
     ToolCall,
     ToolResult,
     Other,
