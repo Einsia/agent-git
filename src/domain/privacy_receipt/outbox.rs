@@ -10,6 +10,7 @@ const MAX_ENTRIES: usize = 4096;
 
 mod candidates;
 mod reclaim;
+mod recovery;
 
 pub use agit_peer::publication::Capture;
 

@@ -248,7 +248,7 @@ impl Prepared {
             agit_peer::client::Client::new(&destination.identity.hub).map_err(|_| unavailable())?;
         let mut items = vec![];
         let mut processed = self.after.clone();
-        for entry in selected.into_iter().take(BATCH_SIZE) {
+        for mut entry in selected.into_iter().take(BATCH_SIZE) {
             if tokio::time::Instant::now() >= deadline {
                 next_after = processed;
                 break;
@@ -264,8 +264,19 @@ impl Prepared {
             }
             let id = entry.notification_id.clone();
             if entry.publication.is_none() && entry.prepared.is_none() {
-                items.push(json!({"notification_id":id, "status":"awaiting_publication"}));
-                continue;
+                let (path, request) = (repo_path.clone(), entry.request().clone());
+                let recovered = blocking(move || {
+                    let repo = Repo::open(&path).context("publication repository is missing")?;
+                    Entry::prepare_retained_ancestor(&repo, &request)
+                })
+                .await?;
+                if let Some(recovered) = recovered {
+                    entry = recovered;
+                }
+                if entry.publication.is_none() && entry.prepared.is_none() {
+                    items.push(json!({"notification_id":id, "status":"awaiting_publication"}));
+                    continue;
+                }
             }
             let (directory, hub) = (
                 self.credential_dir.clone(),
