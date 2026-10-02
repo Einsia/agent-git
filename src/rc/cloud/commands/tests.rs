@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
-async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentials() {
+async fn explicit_inbound_switches_accounts_and_recovers_revocation_without_rotating_healthy_credentials()
+ {
     if let Ok(hub) = std::env::var("AGIT_RECOVERY_TEST_HUB") {
         super::super::super::select_local_authority();
         crate::infra::credentials::save(
@@ -62,9 +63,9 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
             !enroll_pending(&hub).await.unwrap(),
             "background retry must preserve revocation"
         );
-        let controller = controller(&hub).await.unwrap();
+        let outgoing = controller(&hub).await.unwrap();
         assert_eq!(
-            controller.credential.token.expose(),
+            outgoing.credential.token.expose(),
             first.credential.token.expose()
         );
         store::request_inbound(&hub).unwrap();
@@ -83,6 +84,118 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
             first.identity.certificate()
         );
         assert!(!store::inbound_pending(&hub).unwrap());
+
+        let old_owner = restored.credential.device.owner.clone();
+        store::grant(Rule {
+            principal: Principal {
+                issuer: hub.clone(),
+                account_id: "collaborator".into(),
+            },
+            resource: Resource::Project("shared-project".into()),
+            access: Access::Control,
+        })
+        .unwrap();
+        let other_hub = Rule {
+            principal: Principal {
+                issuer: "https://other.example".into(),
+                account_id: "other-owner".into(),
+            },
+            resource: Resource::Machine,
+            access: Access::Admin,
+        };
+        store::grant(other_hub.clone()).unwrap();
+        let mut credential = crate::infra::credentials::load_checked(&hub)
+            .unwrap()
+            .unwrap();
+        crate::infra::credentials::remove(&hub).unwrap();
+        assert!(store::request_inbound(&hub).is_err());
+        assert_eq!(
+            store::load(&hub).unwrap().unwrap().credential.device.owner,
+            old_owner
+        );
+
+        credential.account_id = Some("new-owner".into());
+        credential.access_token = "fixture-new-account".into();
+        crate::infra::credentials::save(&hub, &credential).unwrap();
+        assert!(
+            controller(&hub).await.is_err(),
+            "outgoing access cannot reuse another account's device"
+        );
+        let policy_lock =
+            store::private_lock(&store::directory().unwrap().join("cloud-access.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&policy_lock).unwrap();
+        assert!(store::request_inbound(&hub).is_err());
+        let interrupted = store::load(&hub).unwrap().unwrap();
+        assert!(!interrupted.inbound_enabled);
+        assert_eq!(interrupted.credential.device.owner, old_owner);
+        drop(policy_lock);
+        store::request_inbound(&hub).unwrap();
+        assert!(store::load(&hub).unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(store::policy().unwrap().rules()).unwrap(),
+            json!([other_hub.clone()])
+        );
+        assert!(store::inbound_pending(&hub).unwrap());
+        assert!(enroll_pending(&hub).await.unwrap());
+        let switched = store::load(&hub).unwrap().unwrap();
+        assert_eq!(switched.credential.device.owner.account_id, "new-owner");
+        assert_ne!(switched.credential.device.id, restored.credential.device.id);
+        assert_eq!(
+            switched.credential.device.machine_id,
+            restored.credential.device.machine_id
+        );
+        assert_ne!(
+            switched.identity.certificate(),
+            restored.identity.certificate()
+        );
+        assert!(switched.inbound_enabled);
+        assert!(
+            !store::policy()
+                .unwrap()
+                .rules()
+                .iter()
+                .any(|rule| rule.principal == old_owner)
+        );
+        store::request_inbound(&hub).unwrap();
+        assert!(!enroll_pending(&hub).await.unwrap());
+        assert_eq!(
+            store::load(&hub)
+                .unwrap()
+                .unwrap()
+                .credential
+                .token
+                .expose(),
+            switched.credential.token.expose()
+        );
+
+        credential.account_id = Some("owner".into());
+        credential.access_token = "fixture-account".into();
+        crate::infra::credentials::save(&hub, &credential).unwrap();
+        inbound(&hub, true).await.unwrap();
+        let returned = store::load(&hub).unwrap().unwrap();
+        assert_eq!(returned.credential.device.owner, old_owner);
+        assert_eq!(
+            returned.credential.device.machine_id,
+            first.credential.device.machine_id
+        );
+        assert!(returned.inbound_enabled);
+        assert!(
+            store::policy()
+                .unwrap()
+                .rules()
+                .iter()
+                .any(|rule| rule.principal == other_hub.principal
+                    && rule.resource == other_hub.resource
+                    && rule.access == other_hub.access)
+        );
+        assert!(
+            !store::policy()
+                .unwrap()
+                .rules()
+                .iter()
+                .any(|rule| rule.principal.account_id == "new-owner"
+                    || rule.principal.account_id == "collaborator")
+        );
         return;
     }
 
@@ -105,11 +218,17 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
             socket.read_line(&mut line).await.unwrap();
             let request = line.clone();
             let mut length = 0;
+            let mut authorization = String::new();
             loop {
                 line.clear();
                 socket.read_line(&mut line).await.unwrap();
                 if line == "\r\n" {
                     break;
+                }
+                if let Some((key, value)) = line.split_once(':')
+                    && key.eq_ignore_ascii_case("authorization")
+                {
+                    authorization = value.trim().to_owned();
                 }
                 if let Some((key, value)) = line.split_once(':')
                     && key.eq_ignore_ascii_case("content-length")
@@ -122,7 +241,12 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
             let reply = if request.starts_with("POST /api/peer/devices ") {
                 registrations += 1;
                 let body: Value = serde_json::from_slice(&body).unwrap();
-                device = json!({"id":"executor", "owner":{"issuer":issuer,"account_id":"owner"},
+                let (account, id) = match authorization.as_str() {
+                    "Bearer fixture-account" => ("owner", "executor"),
+                    "Bearer fixture-new-account" => ("new-owner", "new-executor"),
+                    _ => panic!("unexpected enrollment authorization"),
+                };
+                device = json!({"id":id, "owner":{"issuer":issuer,"account_id":account},
                     "machine_id":body["machine_id"], "display_name":body["display_name"],
                     "certificate":body["certificate"], "credential_epoch":registrations});
                 revoked = false;
@@ -161,7 +285,7 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
         (registrations, pages, renames)
     });
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "rc::cloud::commands::tests::explicit_inbound_recovers_revocation_without_rotating_healthy_credentials", "--nocapture"])
+        .args(["--exact", "rc::cloud::commands::tests::explicit_inbound_switches_accounts_and_recovers_revocation_without_rotating_healthy_credentials", "--nocapture"])
         .env("AGIT_RECOVERY_TEST_HUB", &hub).env("AGIT_HOME", home.path())
         .env("AGIT_HUB_URL", &hub).env("NO_PROXY", "127.0.0.1").env("no_proxy", "127.0.0.1")
         .output().await.unwrap();
@@ -174,7 +298,7 @@ async fn explicit_inbound_recovers_revocation_without_rotating_healthy_credentia
     );
     assert_eq!(
         server.await.unwrap(),
-        (2, 4, 1),
-        "only explicit recovery may register again; discovery must follow pagination"
+        (4, 6, 1),
+        "only explicit recovery or account switching may register again; discovery must follow pagination"
     );
 }

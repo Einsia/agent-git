@@ -25,6 +25,11 @@ and enables inbound control for your own account. Open the printed Workspaces UR
 same account, choose the device and a project folder, and start a conversation. No pairing
 code, separate enrollment command, or configuration edit is required.
 
+After signing in to a different account, run `agit rc start --detach` again. Startup
+replaces that Cloud's device registration and clears its previous executor access grants.
+The new account receives owner access; local history and other Cloud origins are preserved.
+Existing connections for the replaced registration close as the daemon reloads it.
+
 Other users need explicit device admission and executor access grants. Workspace membership
 alone does not grant access to a device. Authentication and authorization remain independent
 of tunnel transport.

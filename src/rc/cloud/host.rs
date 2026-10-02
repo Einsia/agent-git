@@ -38,6 +38,7 @@ impl Drop for Service {
 }
 
 struct Task {
+    device: Option<Device>,
     presence: tokio::task::JoinHandle<()>,
     enrollment: Option<tokio::task::JoinHandle<()>>,
     publication: tokio::task::JoinHandle<()>,
@@ -72,14 +73,18 @@ impl Service {
                         .into_iter()
                         .map(|hub| {
                             let pending = store::inbound_pending(&hub)?;
-                            let renamed = store::load(&hub)?.is_some_and(|enrollment| {
+                            let enrollment = store::load(&hub)?;
+                            let renamed = enrollment.as_ref().is_some_and(|enrollment| {
                                 enrollment.inbound_enabled
                                     && super::super::identity::identity().is_ok_and(|identity| {
                                         identity.display_name
                                             != enrollment.credential.device.display_name
                                     })
                             });
-                            Ok((hub, pending || renamed))
+                            let device = enrollment
+                                .filter(|enrollment| enrollment.inbound_enabled)
+                                .map(|enrollment| enrollment.credential.device);
+                            Ok((hub, pending || renamed, device))
                         })
                         .collect::<crate::Result<Vec<_>>>()
                 })
@@ -91,11 +96,12 @@ impl Service {
                         continue;
                     }
                 };
-                tasks.retain(|hub, _| origins.iter().any(|(origin, _)| origin == hub));
-                for (hub, pending) in origins {
+                retire_changed_enrollments(&mut tasks, &origins);
+                for (hub, pending, device) in origins {
                     let task = tasks.entry(hub.clone()).or_insert_with(|| {
                         let (changed, receiver) = watch::channel(());
                         Task {
+                            device,
                             presence: tokio::spawn(run_executor(
                                 hub.clone(),
                                 worker.clone(),
@@ -153,6 +159,31 @@ impl Service {
             }
         });
         Self { task }
+    }
+}
+
+fn retire_changed_enrollments(
+    tasks: &mut HashMap<String, Task>,
+    origins: &[(String, bool, Option<Device>)],
+) {
+    tasks.retain(|hub, task| {
+        origins.iter().any(|(origin, _, device)| {
+            origin == hub && same_enrollment(task.device.as_ref(), device.as_ref())
+        })
+    });
+}
+
+fn same_enrollment(left: Option<&Device>, right: Option<&Device>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.id == right.id
+                && left.owner == right.owner
+                && left.machine_id == right.machine_id
+                && left.certificate == right.certificate
+                && left.credential_epoch == right.credential_epoch
+        }
+        _ => false,
     }
 }
 
@@ -364,6 +395,66 @@ mod presence_tests {
     use agit_tunnel::Packet;
     use futures_util::poll;
     use tokio::sync::oneshot;
+
+    /// An enrollment replacement ends the lifetimes held by old Cloud connections and workers.
+    #[tokio::test]
+    async fn replacing_an_enrollment_retires_cloud_authority_without_interrupting_a_rename() {
+        let device = Device {
+            id: "device".into(),
+            owner: agit_peer::access::Principal {
+                issuer: "https://cloud.example".into(),
+                account_id: "owner".into(),
+            },
+            machine_id: "machine".into(),
+            display_name: "original".into(),
+            certificate: agit_peer::Identity::generate()
+                .unwrap()
+                .certificate()
+                .clone(),
+            credential_epoch: 1,
+        };
+        let (lifetime, mut stopped) = watch::channel(());
+        let presence = tokio::spawn(async move {
+            let _lifetime = lifetime;
+            std::future::pending::<()>().await;
+        });
+        let (publication, mut publication_stopped) = watch::channel(());
+        let publication = tokio::spawn(async move {
+            let _lifetime = publication;
+            std::future::pending::<()>().await;
+        });
+        let hub = device.owner.issuer.clone();
+        let mut tasks = HashMap::from([(
+            hub.clone(),
+            Task {
+                device: Some(device.clone()),
+                presence,
+                enrollment: None,
+                publication,
+                changed: watch::channel(()).0,
+            },
+        )]);
+        let mut renamed = device.clone();
+        renamed.display_name = "renamed".into();
+        retire_changed_enrollments(&mut tasks, &[(hub.clone(), false, Some(renamed.clone()))]);
+        assert_eq!(tasks.len(), 1);
+        assert!(stopped.has_changed().is_ok());
+        renamed.owner.account_id = "new-owner".into();
+        retire_changed_enrollments(&mut tasks, &[(hub, false, Some(renamed))]);
+        assert!(tasks.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stopped.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), publication_stopped.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 
     /// Finishing an offer worker cannot leave a consumed heartbeat's reply unpolled.
     #[tokio::test]

@@ -186,7 +186,12 @@ async fn register(
     name: Option<String>,
     mode: Registration,
 ) -> crate::Result<(store::Enrollment, bool)> {
-    let mut saved = store::load(api.origin())?;
+    let mut saved = if matches!(mode, Registration::Validate) {
+        let hub = api.origin().to_owned();
+        tokio::task::spawn_blocking(move || store::prepare_enrollment(&hub)).await??
+    } else {
+        store::load(api.origin())?
+    };
     if let Some(enrollment) = &saved {
         let owner = enrollment.credential.device.owner.clone();
         tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner)).await??;

@@ -177,28 +177,64 @@ fn intent_path(hub: &str) -> crate::Result<PathBuf> {
     Ok(super::super::rc_dir()?.join(filename(hub)?.replace("cloud-device-", "cloud-inbound-")))
 }
 
-pub(super) fn verify_signed_in_owner(owner: &agit_peer::access::Principal) -> crate::Result<()> {
-    let credential = crate::infra::credentials::load_checked(&owner.issuer)?
-        .context("Sign in to the device owner's account before enabling Cloud access")?;
+fn signed_in_owner(hub: &str) -> crate::Result<agit_peer::access::Principal> {
+    let credential = crate::infra::credentials::load_checked(hub)?
+        .context("Sign in before enabling Cloud access")?;
     let account = match credential.account_id {
         Some(ref account) => account.clone(),
-        None => crate::hub::Client::for_credential(&owner.issuer, &credential)
+        None => crate::hub::Client::for_credential(hub, &credential)
             .me()?
             .account_id
             .context("Cloud did not return an account identity")?,
     };
+    Ok(agit_peer::access::Principal {
+        issuer: Client::new(hub)?.origin().into(),
+        account_id: account,
+    })
+}
+
+pub(super) fn verify_signed_in_owner(owner: &agit_peer::access::Principal) -> crate::Result<()> {
     ensure!(
-        account == owner.account_id,
-        "This daemon is enrolled to another account. Sign in as its owner or use a separate AGIT_HOME for the new account"
+        signed_in_owner(&owner.issuer)? == *owner,
+        "This daemon is enrolled to another account. Run `agit rc start` to enable Cloud access for the signed-in account"
     );
     Ok(())
+}
+
+/// Callers hold the enrollment lock. Retiring an owner removes that origin's grants before
+/// removing its credentials, so an interrupted switch cannot transfer old access to a new device.
+pub(super) fn prepare_enrollment(hub: &str) -> crate::Result<Option<Enrollment>> {
+    let Some(mut enrollment) = load(hub)? else {
+        return Ok(None);
+    };
+    if signed_in_owner(hub)? == enrollment.credential.device.owner {
+        return Ok(Some(enrollment));
+    }
+    enrollment.inbound_enabled = false;
+    save(&enrollment)?;
+    let _lock = policy_lock()?;
+    let old = policy()?;
+    let rules = old
+        .rules()
+        .iter()
+        .filter(|rule| rule.principal.issuer != enrollment.credential.device.owner.issuer)
+        .cloned()
+        .collect();
+    let policy = Policy::new(
+        old.revision()
+            .checked_add(1)
+            .context("cloud policy revision exhausted")?,
+        rules,
+    )?;
+    save_policy(&policy)?;
+    std::fs::remove_file(super::super::rc_dir()?.join(filename(hub)?))?;
+    Ok(None)
 }
 
 pub fn request_inbound(hub: &str) -> crate::Result<()> {
     let api = Client::new(hub)?;
     let _lock = enrollment_lock(api.origin())?;
-    if let Some(mut enrollment) = load(api.origin())? {
-        verify_signed_in_owner(&enrollment.credential.device.owner)?;
+    if let Some(mut enrollment) = prepare_enrollment(api.origin())? {
         grant_enrolling_owner(&enrollment)?;
         enrollment.inbound_enabled = true;
         save(&enrollment)?;
