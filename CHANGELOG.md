@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-10-02
+
 ### Added
 
 - Remote control on the web can send messages into a Claude Code session that is
@@ -18,7 +20,7 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   In bypass-permissions mode, the device owner's messages go through a relay that
   agit's Claude Code Stop hook (installed by `agit setup`) starts once a turn ends
   in that mode; Claude Code holds everyone else's messages, and the owner's while
-  no relay runs, for approval on the machine. Only the device owner may send
+  no relay runs, for approval on the machine. Only a workspace owner may send
   messages to a session whose transcript shows it has ever run in
   bypass-permissions mode, or records no permission mode at all.
 
@@ -35,6 +37,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   the reminder is a separate text block or leads the same string. Such a session
   lost its opening prompt, and one with a single prompt had no turn to save or
   upload.
+- Remote control publishes a turn that finished while the device's sign-in had
+  lapsed as soon as authentication recovers, instead of waiting for the next turn.
+- Opening a device from the web no longer stalls when the device's first discovery
+  reply is lost: the controller retries the read-only discovery once.
 
 ## [0.2.16] - 2026-10-02
 
