@@ -24,7 +24,7 @@ pub struct Mirror {
     verified: BTreeMap<String, BTreeMap<String, PathBuf>>,
 }
 
-const FILE: &str = "workspaces.json";
+pub(super) const FILE: &str = "workspaces.json";
 
 impl Mirror {
     pub(in crate::rc) fn load_in(directory: &Path) -> crate::Result<Self> {

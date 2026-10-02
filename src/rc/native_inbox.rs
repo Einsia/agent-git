@@ -1,7 +1,9 @@
 //! Native inbox delivery keeps the existing runtime as the sole transcript writer.
 //!
 //! The queue is the only capability implemented here. Queue acceptance does not grant live
-//! steering, interruption, approvals or a second transcript writer.
+//! steering, interruption, approvals or a second transcript writer. Codex receives messages
+//! through `codex queue`; a Claude Code session that runs in another process receives them
+//! through that process's messaging socket ([`super::claude_inbox`]).
 
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
@@ -83,6 +85,20 @@ pub fn valid_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
 }
 
+/// The runtime that receives the message.
+pub(crate) enum Native {
+    /// The Codex executable whose `queue` command delivers it.
+    Codex(PathBuf),
+    Claude(ClaudeTarget),
+}
+
+pub(crate) struct ClaudeTarget {
+    /// The process found when the request was prepared; delivery requires the same one.
+    pub(crate) live: super::claude_inbox::Live,
+    pub(crate) registry: PathBuf,
+    pub(crate) queue: PathBuf,
+}
+
 pub struct Prepared {
     pub(crate) source: Option<super::runtime_context::RuntimeContext>,
     pub(crate) authority: super::authority::Guard,
@@ -91,7 +107,7 @@ pub struct Prepared {
     pub request: Request,
     pub transcript: PathBuf,
     pub cwd: PathBuf,
-    pub codex: PathBuf,
+    pub(crate) native: Native,
     pub hub: String,
     pub account: String,
     pub username: Option<String>,
@@ -104,7 +120,7 @@ struct Receipt {
     status: String,
 }
 
-fn sync_directory(path: &Path) -> crate::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> crate::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
@@ -182,10 +198,40 @@ impl Prepared {
         Ok(())
     }
 
+    /// The transcript still belongs to the requested session, and its runtime still accepts
+    /// messages from this caller.
+    async fn validate_native(&self) -> crate::Result<()> {
+        let Native::Claude(_) = &self.native else {
+            return verify_transcript(&self.transcript, &self.request.session_id);
+        };
+        ensure!(
+            self.transcript
+                .file_name()
+                .is_some_and(|name| *name == *format!("{}.jsonl", self.request.session_id)),
+            "native transcript identity does not match the requested session"
+        );
+        open_regular(&self.transcript)?;
+        if !self.allow_dangerous {
+            let transcript = self.transcript.clone();
+            let unchecked = tokio::task::spawn_blocking(move || {
+                super::claude_inbox::transcript_ran_unchecked(&transcript)
+            })
+            .await??;
+            if unchecked {
+                return Err(crate::protocol::RpcError::new(
+                    crate::protocol::ErrorCode::DangerousSessionLocked,
+                    "this Claude Code session has run without permission checks, so only its owner may send it messages",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub async fn deliver(self) -> crate::Result<Value> {
         self.request.validate()?;
         self.validate_source()?;
-        verify_transcript(&self.transcript, &self.request.session_id)?;
+        self.validate_native().await?;
         std::fs::create_dir_all(&self.receipts)?;
         ensure!(
             !std::fs::symlink_metadata(&self.receipts)?
@@ -242,10 +288,23 @@ impl Prepared {
                 "status": receipt.status
             }));
         }
-        ensure!(
-            queue_available(self.codex.clone()).await,
-            "Codex native queue is unavailable"
-        );
+        match &self.native {
+            Native::Codex(codex) => ensure!(
+                queue_available(codex.clone()).await,
+                "Codex native queue is unavailable"
+            ),
+            Native::Claude(target) => {
+                if !super::claude_inbox::discover_in(&target.registry, &self.request.session_id)
+                    .is_some_and(|live| live.same_process(&target.live))
+                {
+                    return Err(crate::protocol::RpcError::new(
+                        crate::protocol::ErrorCode::RuntimeUnavailable,
+                        "this Claude Code session is no longer running in the process that was found",
+                    )
+                    .into());
+                }
+            }
+        }
         self.validate_source()?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -287,15 +346,100 @@ impl Prepared {
                 )
             },
         );
-        let mut command =
-            tokio::process::Command::from(crate::infra::background::command(&self.codex));
+        match &self.native {
+            Native::Codex(codex) => self.queue_codex(codex, &message).await?,
+            Native::Claude(target) => {
+                if let Err(error) = self.send_claude(target, &key, &message).await {
+                    return Err(match error {
+                        super::claude_inbox::SendError::NotDelivered(error) => {
+                            // Nothing reached the session, so the claim guards no possible
+                            // delivery and a retry may send the message.
+                            std::fs::remove_file(&path)?;
+                            sync_directory(&self.receipts)?;
+                            error.context("Claude Code did not receive the message; retry when the session is running")
+                        }
+                        super::claude_inbox::SendError::Uncertain(error) => error.context(
+                            "Claude Code did not confirm delivery; retry with the same client message id",
+                        ),
+                    });
+                }
+            }
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&self.receipts)?;
+        file.write_all(&serde_json::to_vec(&Receipt {
+            digest,
+            status: "queued".into(),
+        })?)?;
+        file.as_file().sync_all()?;
+        file.persist(&path)?;
+        sync_directory(&self.receipts)?;
+        Ok(json!({"client_msg_id":self.request.client_msg_id,"status":"queued"}))
+    }
+
+    /// The owner's message passes through the session's queue, where a relay may deliver it as
+    /// the session itself; anyone else's goes straight to the socket under the peer token.
+    /// Authority is checked at the moment the message becomes visible to a relay or leaves.
+    async fn send_claude(
+        &self,
+        target: &ClaudeTarget,
+        key: &str,
+        message: &str,
+    ) -> Result<(), super::claude_inbox::SendError> {
+        use super::claude_inbox::SendError::NotDelivered;
+        // Claude Code holds a peer message for approval by the session's live permission mode,
+        // which the transcript gate cannot see; a relay would deliver past that hold.
+        let queue = self
+            .allow_dangerous
+            .then(|| super::claude_inbox::Queue::open(target.queue.clone()))
+            .transpose()
+            .map_err(NotDelivered)?;
+        self.validate_source().map_err(NotDelivered)?;
+        let mut enqueued = None;
+        let admitted = {
+            let confinement = self.confinement.as_ref().map(|receiver| receiver.borrow());
+            if let Some(confinement) = &confinement {
+                super::policy::require_within(&self.cwd, &confinement.roots)
+                    .map_err(|error| NotDelivered(error.into()))?;
+            }
+            self.authority.admit(|| {
+                enqueued = queue.as_ref().map(|queue| {
+                    queue.enqueue(
+                        key,
+                        &self.request.client_msg_id,
+                        message,
+                        &target.live,
+                        self.allow_dangerous,
+                    )
+                });
+                true
+            })
+        };
+        if !admitted {
+            return Err(NotDelivered(anyhow::anyhow!(
+                "request authority expired before native delivery"
+            )));
+        }
+        let Some(queue) = queue else {
+            return super::claude_inbox::send_direct(
+                &target.live,
+                &self.request.client_msg_id,
+                message,
+            )
+            .await;
+        };
+        enqueued.expect("accepted native delivery attempts the enqueue")?;
+        super::claude_inbox::forward(&queue, &target.live, key).await
+    }
+
+    async fn queue_codex(&self, codex: &Path, message: &str) -> crate::Result<()> {
+        let mut command = tokio::process::Command::from(crate::infra::background::command(codex));
         command
             .args([
                 "queue",
                 "--thread",
                 &self.request.session_id,
                 "--message",
-                &message,
+                message,
             ])
             .current_dir(&self.cwd)
             .stdin(std::process::Stdio::null())
@@ -330,15 +474,7 @@ impl Prepared {
             status.success(),
             "native inbox did not confirm delivery; check that Codex supports `codex queue` and retry with the same client message id"
         );
-        let mut file = tempfile::NamedTempFile::new_in(&self.receipts)?;
-        file.write_all(&serde_json::to_vec(&Receipt {
-            digest,
-            status: "queued".into(),
-        })?)?;
-        file.as_file().sync_all()?;
-        file.persist(&path)?;
-        sync_directory(&self.receipts)?;
-        Ok(json!({"client_msg_id":self.request.client_msg_id,"status":"queued"}))
+        Ok(())
     }
 }
 
@@ -360,7 +496,7 @@ mod tests {
             },
             transcript: root.join("transcript.jsonl"),
             cwd: root.into(),
-            codex: root.join("codex"),
+            native: Native::Codex(root.join("codex")),
             hub: "https://hub.test".into(),
             account: "member".into(),
             username: Some("collaborator".into()),
@@ -381,6 +517,140 @@ mod tests {
         value.request.session_id = uuid::Uuid::new_v4().to_string();
         value.request.message = "x".repeat(MAX_MESSAGE + 1);
         assert!(value.request.validate().is_err());
+    }
+
+    /// A Claude Code session running in another process receives the message through its own
+    /// socket, so that process stays the only transcript writer. This pins the exact frames, one
+    /// delivery per client message id, that a non-owner's message goes out under the peer token
+    /// even while a relay runs, that the owner's goes through the relay under the session's own
+    /// token, that a held lock which no relay acts on falls back to the peer token, and that a
+    /// transcript which ever bypassed permission checks takes messages only from the owner.
+    /// Resending on retry, queueing a non-owner's message where a relay sends it as the session,
+    /// counting a held lock as delivery, or judging only a later mode each fails here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_sessions_get_each_message_once_and_bypass_history_needs_the_owner() {
+        use crate::rc::claude_inbox::fixture;
+        async fn next(
+            connections: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<Value>>,
+        ) -> Vec<Value> {
+            tokio::time::timeout(Duration::from_secs(5), connections.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let registry = root.path().join("sessions");
+        let socket = root.path().join("claude.sock");
+        let mut connections = fixture::listen(&socket);
+        let peer = "00112233445566778899aabbccddeeff";
+        fixture::register(&registry, std::process::id(), &session, &socket, Some(peer));
+        let transcript = root.path().join(format!("{session}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({"type":"user","sessionId":session,"permissionMode":"default",
+                    "message":{"role":"user","content":"Start here."}})
+            ),
+        )
+        .unwrap();
+        let live = crate::rc::claude_inbox::discover_in(&registry, &session).unwrap();
+        let queue = root.path().join("queue");
+        let send = |client: &str, owner: bool| {
+            let mut request = prepared(root.path(), &session, client);
+            request.transcript = transcript.clone();
+            request.allow_dangerous = owner;
+            request.native = Native::Claude(ClaudeTarget {
+                live: live.clone(),
+                registry: registry.clone(),
+                queue: queue.clone(),
+            });
+            request.deliver()
+        };
+        let frames = |client: &str, token: &str| {
+            vec![
+                json!({"type":"auth","token":token}),
+                json!({"type":"user","session_id":session,"msg_id":client,"from":"agit-rc",
+                    "priority":"next","message":{"role":"user",
+                    "content":"[AgentGit workspace message from @collaborator]\nPlease investigate this bug."}}),
+            ]
+        };
+
+        let first = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&first, false).await.unwrap()["status"], "queued");
+        assert_eq!(next(&mut connections).await, frames(&first, peer));
+        // The retry answers from its receipt; the next connection belongs to a later message.
+        assert_eq!(send(&first, false).await.unwrap()["status"], "queued");
+
+        let child = "0123456789abcdef0123456789abcdef";
+        let relay = fixture::relay(&registry, &queue, &session, &socket, child);
+        let inbox = crate::rc::claude_inbox::Queue::open(queue.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !inbox.relay_active().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the relay starts");
+        let peers = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&peers, false).await.unwrap()["status"], "queued");
+        assert_eq!(
+            next(&mut connections).await,
+            frames(&peers, peer),
+            "a non-owner's message never passes through the relay"
+        );
+        let owners = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&owners, true).await.unwrap()["status"], "queued");
+        assert_eq!(
+            next(&mut connections).await,
+            frames(&owners, child),
+            "the relay delivers the owner's message as the session"
+        );
+        relay.abort();
+        let _ = relay.await;
+
+        let held = inbox.try_lock().unwrap().unwrap();
+        let fallback = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&fallback, true).await.unwrap()["status"], "queued");
+        assert_eq!(
+            next(&mut connections).await,
+            frames(&fallback, peer),
+            "a lock no relay acts on leaves the message to the daemon"
+        );
+        assert_eq!(std::fs::read_dir(queue.join("pending")).unwrap().count(), 0);
+        drop(held);
+
+        let mut history = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            history,
+            "{}",
+            json!({"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":session})
+        )
+        .unwrap();
+        writeln!(
+            history,
+            "{}",
+            json!({"type":"permission-mode","permissionMode":"default","sessionId":session})
+        )
+        .unwrap();
+        let refused = send(&uuid::Uuid::new_v4().to_string(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused
+                .downcast_ref::<crate::protocol::RpcError>()
+                .unwrap()
+                .code,
+            crate::protocol::ErrorCode::DangerousSessionLocked as i32
+        );
+        let owner = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&owner, true).await.unwrap()["status"], "queued");
+        assert_eq!(next(&mut connections).await, frames(&owner, peer));
     }
 
     #[cfg(unix)]

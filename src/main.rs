@@ -318,6 +318,12 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
         Commands::Mcp(_) => Startup::ToolDispatcher,
+        // A relay outlives the hook that starts it and touches only its own message queue.
+        Commands::Hooks(args)
+            if matches!(args.action, Some(commands::hooks::Action::Relay { .. })) =>
+        {
+            Startup::ToolDispatcher
+        }
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() || args.repair_permissions.is_some() => {
             Startup::ScopedDoctor

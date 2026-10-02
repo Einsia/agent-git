@@ -52,6 +52,12 @@ pub(crate) fn projects_dir() -> Result<PathBuf> {
     )
 }
 
+/// Claude Code registers each live process as `<config>/sessions/<pid>.json`, beside `projects`.
+#[cfg(feature = "rc")]
+pub(crate) fn sessions_dir() -> Result<PathBuf> {
+    Ok(projects_dir()?.with_file_name("sessions"))
+}
+
 fn projects_dir_from(config: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Result<PathBuf> {
     let root = match config.filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),

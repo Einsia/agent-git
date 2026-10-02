@@ -17,6 +17,8 @@ const MAX_WATCH_SCANS: usize = 4;
 pub(super) struct WatchScan {
     request: SessionWatch,
     snapshot: sessions::LocalSessionSnapshot,
+    /// The caller owns the workspace, so every native inbox lane is open to it.
+    owner: bool,
 }
 
 pub(super) struct PreparedWatch {
@@ -80,7 +82,11 @@ impl PreparedWatch {
 
 impl WatchScan {
     pub(super) fn run(self) -> Result<PreparedWatch, RpcError> {
-        let Self { request, snapshot } = self;
+        let Self {
+            request,
+            snapshot,
+            owner,
+        } = self;
         let roots = snapshot.roots.clone();
         if let Some(enrolled) =
             super::source_watch::SourceWatch::resolve(&request.session_id, &roots)
@@ -110,7 +116,12 @@ impl WatchScan {
                 )
                 .with_hint("refresh the session list; its folder may no longer be bound")
             })?;
-        Self::prepare_source(request, roots, local)
+        let mut prepared = Self::prepare_source(request, roots, local)?;
+        if prepared.runtime == "claude-code" {
+            prepared.native_inbox =
+                claude_native_inbox(&prepared.request.session_id, &prepared.cwd, owner);
+        }
+        Ok(prepared)
     }
 
     fn prepare_source(
@@ -236,6 +247,27 @@ impl WatchScan {
     }
 }
 
+/// The lane a live Claude Code process offers this caller. It accepts messages over its own
+/// socket and stays the only writer. A non-owner may use it only when the transcript that process
+/// writes never ran without permission checks, the test `session.enqueue` applies; otherwise the
+/// lane is reported unavailable rather than offered and then refused.
+fn claude_native_inbox(session_id: &str, cwd: &Path, owner: bool) -> Option<String> {
+    use crate::rc::claude_inbox;
+    let live = claude_inbox::discover(session_id)?;
+    let open = owner
+        || claude_inbox::live_transcript(&live, cwd)
+            .and_then(|transcript| claude_inbox::transcript_ran_unchecked(&transcript))
+            .is_ok_and(|unchecked| !unchecked);
+    Some(
+        if open {
+            claude_inbox::NATIVE_INBOX
+        } else {
+            claude_inbox::NATIVE_INBOX_UNAVAILABLE
+        }
+        .to_owned(),
+    )
+}
+
 fn history_cursor(runtime: &str, path: &Path, offset: u64) -> (u64, Option<String>) {
     if runtime == "codex" {
         return match crate::rc::local_history::watch_cursor(path, offset) {
@@ -264,6 +296,7 @@ impl Daemon {
         Ok(WatchScan {
             request,
             snapshot: self.local_session_scan(&caller.workspace_id),
+            owner: caller.is_owner(),
         })
     }
 
@@ -330,6 +363,25 @@ impl Daemon {
                 "session is now supervised by this machine; refresh the list",
             ));
         }
+        // The roster half of the owner-only test `session.enqueue` applies; the scan judged the
+        // transcript half.
+        let native_inbox = match native_inbox {
+            Some(lane)
+                if lane == crate::rc::claude_inbox::NATIVE_INBOX
+                    && danger::authorize(
+                        &self.roster,
+                        &caller,
+                        &runtime,
+                        &p.session_id,
+                        &p.workspace_id,
+                        &cwd.to_string_lossy(),
+                    )
+                    .is_err() =>
+            {
+                Some(crate::rc::claude_inbox::NATIVE_INBOX_UNAVAILABLE.to_owned())
+            }
+            lane => lane,
+        };
         let project_id = self
             .mirror
             .workspaces

@@ -8,6 +8,20 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- Remote control on the web can send messages into a Claude Code session that is
+  running in another process, such as the Claude desktop app or the `claude` CLI,
+  through Claude Code's cross-session messaging (Claude Code 2.1.224 or later). The
+  running session stays the only writer of its transcript: a message sent during a
+  turn is read between tool calls, and an idle session starts a new turn with it.
+  In bypass-permissions mode, the device owner's messages go through a relay that
+  agit's Claude Code Stop hook (installed by `agit setup`) starts once a turn ends
+  in that mode; Claude Code holds everyone else's messages, and the owner's while
+  no relay runs, for approval on the machine. Only the device owner may send
+  messages to a session whose transcript shows it has ever run in
+  bypass-permissions mode, or records no permission mode at all.
+
 ### Fixed
 
 - `agit push <owner/repo@branch> --to <existing repository>` (and `agit project sync`

@@ -835,7 +835,10 @@ pub struct SessionWatchResult {
     pub absolute_lines: bool,
     /// The daemon does not own the native runtime's controls.
     pub read_only: bool,
-    /// Messages may be submitted to the existing runtime without resuming another writer.
+    /// Messages may be submitted to the existing runtime without resuming another writer:
+    /// `codex_queue` through `codex queue`, `claude_socket` through the messaging socket of the
+    /// Claude Code process that runs the session. `unavailable` names a lane this caller may not
+    /// use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_inbox: Option<String>,
     /// Observed native settings remain readable without granting runtime controls.

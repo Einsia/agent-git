@@ -591,7 +591,7 @@ impl Daemon {
             .validate_message()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
         frame.authority.check()?;
-        let (cwd, transcript, codex, source) = if let Some(watch) = enrolled {
+        let (cwd, transcript, native, source) = if let Some(watch) = enrolled {
             use super::source_sessions::unavailable;
             if watch.context.source.session_ref(&watch.native_id) != request.session_id {
                 return Err(unavailable("native inbox reference changed"));
@@ -638,7 +638,7 @@ impl Daemon {
             (
                 watch.cwd,
                 watch.path,
-                native.executable().to_path_buf(),
+                crate::rc::native_inbox::Native::Codex(native.executable().to_path_buf()),
                 Some(watch.context),
             )
         } else {
@@ -650,42 +650,79 @@ impl Daemon {
                 .ok_or_else(|| {
                     RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
                 })?;
-            if local.runtime != "codex" {
-                return Err(RpcError::new(
-                    ErrorCode::RuntimeUnavailable,
-                    "this runtime does not offer a native inbox",
-                ));
+            // A Claude Code session receives messages only through the process that runs it.
+            let claude = match local.runtime.as_str() {
+                "codex" => None,
+                "claude-code" => Some(
+                    crate::rc::claude_inbox::discover(&request.session_id).ok_or_else(|| {
+                        RpcError::new(
+                            ErrorCode::RuntimeUnavailable,
+                            "this Claude Code session is not running in a process that accepts messages",
+                        )
+                        .with_hint("open the session in Claude Code on this machine, then send again")
+                    })?,
+                ),
+                _ => {
+                    return Err(RpcError::new(
+                        ErrorCode::RuntimeUnavailable,
+                        "this runtime does not offer a native inbox",
+                    ));
+                }
+            };
+            let roots = self.mirror.roots(&request.workspace_id);
+            let cwd = policy::require_within(Path::new(&local.cwd), &roots)
+                .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
+            // The message drives the process where it runs, which must lie inside the workspace too.
+            if let Some(process) = claude.as_ref().and_then(|live| live.cwd()) {
+                policy::require_within(process, &roots)
+                    .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
             }
-            let cwd = policy::require_within(
-                Path::new(&local.cwd),
-                &self.mirror.roots(&request.workspace_id),
-            )
-            .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
             let _ = danger::authorize(
                 &self.roster,
                 &caller,
-                "codex",
+                &local.runtime,
                 &request.session_id,
                 &request.workspace_id,
                 &cwd.to_string_lossy(),
             )?;
-            let transcript = {
-                use crate::adapter::Adapter;
-                crate::adapter::codex::Codex
-                    .resolve(&request.session_id, Some(&cwd))
+            // The danger gate reads the transcript the live process writes; another copy of the
+            // session can record another permission history.
+            let transcript = match &claude {
+                Some(live) => {
+                    crate::rc::claude_inbox::live_transcript(live, &cwd).map_err(|error| {
+                        RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())
+                    })?
+                }
+                None => crate::adapter::get(&local.runtime)
+                    .ok()
+                    .and_then(|adapter| adapter.resolve(&request.session_id, Some(&cwd)))
                     .ok_or_else(|| {
                         RpcError::new(
                             ErrorCode::SessionNotFound,
-                            "cannot locate this Codex transcript",
+                            "cannot locate this session's transcript",
                         )
-                    })?
+                    })?,
             };
-            let codex = crate::adapter::which("codex")
-                .and_then(|path| path.canonicalize().ok())
-                .ok_or_else(|| {
-                    RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
-                })?;
-            (cwd, transcript, codex, None)
+            let internal =
+                |error: anyhow::Error| RpcError::new(ErrorCode::Internal, error.to_string());
+            let native = match claude {
+                Some(live) => {
+                    crate::rc::native_inbox::Native::Claude(crate::rc::native_inbox::ClaudeTarget {
+                        live,
+                        registry: crate::adapter::claude_code::sessions_dir().map_err(internal)?,
+                        queue: crate::rc::claude_inbox::Queue::path_for(&request.session_id)
+                            .map_err(internal)?,
+                    })
+                }
+                None => crate::rc::native_inbox::Native::Codex(
+                    crate::adapter::which("codex")
+                        .and_then(|path| path.canonicalize().ok())
+                        .ok_or_else(|| {
+                            RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
+                        })?,
+                ),
+            };
+            (cwd, transcript, native, None)
         };
         let receipts = crate::rc::rc_dir()
             .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
@@ -698,7 +735,7 @@ impl Daemon {
             request,
             transcript,
             cwd,
-            codex,
+            native,
             receipts,
             hub: self.opts.hub.clone(),
             account: caller

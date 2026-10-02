@@ -624,7 +624,8 @@ impl Daemon {
                                                 prepared.confinement = Some(state.confinement_for(&prepared.request.workspace_id));
                                                 prepared
                                             };
-                                            prepared.deliver().await.map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))
+                                            prepared.deliver().await.map_err(|error| error.downcast::<RpcError>()
+                                                .unwrap_or_else(|error| RpcError::new(ErrorCode::Internal, error.to_string())))
                                         }.await;
                                         let response = match result {
                                             Ok(value) => Frame::response(id, value),

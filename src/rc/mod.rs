@@ -68,6 +68,7 @@ pub(crate) mod archive_jobs;
 pub(crate) mod authority;
 pub mod build_identity;
 pub(crate) mod capture;
+pub(crate) mod claude_inbox;
 pub mod cloud;
 pub(crate) mod codex_history;
 #[cfg(unix)]

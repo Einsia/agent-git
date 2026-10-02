@@ -6,6 +6,9 @@
 //!   answer** to "which session is running now", see below.
 //! * **`settle` (Stop)**: a turn ended, so settle it.
 //!
+//! `settle` also starts a Claude Code session's message relay when it needs one
+//! ([`crate::rc::claude_inbox`]); `relay` is that detached process, never installed as a hook.
+//!
 //! Ordinary hook failures stay quiet. Archive settlement errors return failure so lost evidence
 //! cannot be acknowledged as saved. `ingest` may return one valid SessionStart JSON response;
 //! sessions that are none of agit's business produce no output.
@@ -73,6 +76,13 @@ pub enum Action {
     Ingest,
     /// Stop: settle the turn that just ended, located by the payload's session_id.
     Settle,
+    /// Deliver a Claude Code session's queued workspace messages while that session runs.
+    #[command(hide = true)]
+    Relay {
+        /// The Claude Code session whose messages to deliver.
+        #[arg(long, value_name = "id")]
+        session: String,
+    },
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -80,6 +90,11 @@ pub fn run(args: Args) -> CmdResult {
     match args.action.unwrap_or(Action::Ingest) {
         Action::Ingest => ingest(runtime.as_deref()),
         Action::Settle => settle(runtime.as_deref()),
+        Action::Relay { session } => {
+            // The relay has no audience; it ends quietly when it cannot or need not run.
+            let _ = crate::rc::claude_inbox::run_relay(&session);
+            Ok(ExitCode::Ok)
+        }
     }
 }
 
@@ -120,6 +135,8 @@ struct Event {
     transcript_path: Option<String>,
     source: Source,
     session_title: Option<String>,
+    hook_event_name: Option<String>,
+    permission_mode: Option<String>,
 }
 
 fn parse_event(buf: &str) -> Option<Event> {
@@ -140,7 +157,20 @@ fn parse_event(buf: &str) -> Option<Event> {
         transcript_path: get("transcript_path"),
         source: Source::parse(v.get("source").and_then(|s| s.as_str())),
         session_title: get("session_title"),
+        hook_event_name: get("hook_event_name"),
+        permission_mode: get("permission_mode"),
     })
+}
+
+/// Whether this hook starts the session's message relay. A Claude Code session receives
+/// workspace messages through its own process, and its hook is the only place the session's
+/// messaging token is visible. The relay delivers the owner's messages past the approval hold
+/// that Claude Code applies only in bypass-permissions mode, so it starts only where the payload
+/// reports that live mode: a Stop. A SessionStart payload reports no mode.
+fn starts_inbox_relay(runtime: Option<&str>, event: &Event) -> bool {
+    runtime_of(runtime, event.transcript_path.as_deref()) == "claude-code"
+        && event.hook_event_name.as_deref() == Some("Stop")
+        && crate::rc::claude_inbox::relay_serves(event.permission_mode.as_deref())
 }
 
 fn read_event(runtime: Option<&str>) -> Option<Event> {
@@ -543,10 +573,16 @@ fn settle(runtime: Option<&str>) -> CmdResult {
 }
 
 fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
+    let event = read_event(runtime);
+    if let Some(ev) = &event
+        && starts_inbox_relay(runtime, ev)
+    {
+        crate::rc::claude_inbox::start_relay(&ev.session_id);
+    }
     if super::config::get("commit.auto").as_deref() == Some("false") {
         return Ok(());
     }
-    let Some(ev) = read_event(runtime) else {
+    let Some(ev) = event else {
         super::commit::archive::require_hook_identity(false)?;
         return Ok(());
     };
@@ -593,6 +629,14 @@ mod tests {
             vec!["agit", "hooks"],
             vec!["agit", "hooks", "ingest", "--runtime", "codex"],
             vec!["agit", "hooks", "settle", "--runtime", "codex"],
+            // Spawned by the Stop hook rather than installed, but parsed the same way.
+            vec![
+                "agit",
+                "hooks",
+                "relay",
+                "--session",
+                "8e1d7c3a-4f0b-4a51-9a8e-2f6b1c0d9e47",
+            ],
         ] {
             crate::commands::Cli::try_parse_from(&argv)
                 .unwrap_or_else(|e| panic!("`{}` must parse: {e}", argv.join(" ")));
@@ -671,6 +715,44 @@ mod tests {
         assert_eq!(start.transcript_path, stop.transcript_path);
         assert_eq!(start.source, Source::Startup);
         assert_eq!(stop.source, Source::Other);
+    }
+
+    /// The message relay delivers the owner's messages as the session itself, past the hold
+    /// Claude Code applies in bypass-permissions mode, so only a Claude Code Stop that reports
+    /// that live mode starts one. A relay started from SessionStart, from a Stop in another or an
+    /// unreported mode, or for another runtime fails here.
+    #[test]
+    fn only_a_bypass_permissions_claude_stop_starts_the_inbox_relay() {
+        let event = |hook: &str, mode: Option<&str>| {
+            super::parse_event(
+                &serde_json::json!({
+                    "session_id": "8e1d7c3a-4f0b-4a51-9a8e-2f6b1c0d9e47",
+                    "transcript_path": "/home/me/.claude/projects/-work/8e1d7c3a-4f0b-4a51-9a8e-2f6b1c0d9e47.jsonl",
+                    "cwd": "/work",
+                    "hook_event_name": hook,
+                    "permission_mode": mode,
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        assert!(super::starts_inbox_relay(
+            None,
+            &event("Stop", Some("bypassPermissions"))
+        ));
+        for (runtime, hook, mode) in [
+            (None, "SessionStart", Some("bypassPermissions")),
+            (None, "SessionStart", None),
+            (None, "Stop", Some("default")),
+            (None, "Stop", Some("acceptEdits")),
+            (None, "Stop", None),
+            (Some("codex"), "Stop", Some("bypassPermissions")),
+        ] {
+            assert!(
+                !super::starts_inbox_relay(runtime, &event(hook, mode)),
+                "{runtime:?} {hook} {mode:?} must not start a relay"
+            );
+        }
     }
 
     /// Claiming happens only on startup.

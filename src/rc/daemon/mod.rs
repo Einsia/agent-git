@@ -2167,6 +2167,11 @@ fn native_session_likely_active(
     {
         return active;
     }
+    // A registered Claude Code process is an exact writer even while its transcript is quiet;
+    // without a registration only recency is known.
+    if runtime == "claude-code" && crate::rc::claude_inbox::session_is_live(thread_id) {
+        return true;
+    }
     recent()
 }
 
