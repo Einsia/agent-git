@@ -176,10 +176,11 @@ impl Session {
                 ))
                 .await;
             // A verified Git result remains in the outbox until a durable receiver accepts it.
-            if status.progress == Progress::Failed {
-                PublicationOutcome::Retry
-            } else {
+            if status.progress == Progress::AwaitingAck {
                 PublicationOutcome::Complete(None)
+            } else {
+                // Restored credentials must resume an unpublished source without another turn.
+                PublicationOutcome::Retry
             }
         };
         if boundary.is_some() {

@@ -1087,7 +1087,7 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 &script[..commit_start],
                 &script[push_start..]
             );
-            std::fs::write(&fixture.exe, retry_script).unwrap();
+            std::fs::write(&fixture.exe, &retry_script).unwrap();
             drop(session);
             let (mut resumed, mut out, _notes, authority, _) = fixture.session();
             resumed.agit_session = Some(
@@ -1124,6 +1124,32 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 std::fs::read(fixture.repo.join(".git/push-calls")).unwrap(),
                 b"xxx"
             );
+
+            std::fs::write(
+                &fixture.exe,
+                script.replace(
+                    "push)\n",
+                    &format!("push)\n exit {}\n", crate::ExitCode::Auth as i32),
+                ),
+            )
+            .unwrap();
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            let unpublished = fixture.head();
+            let deadline = resumed.publication_retry.next.expect(
+                "authentication failure must retain an idle retry until credentials recover",
+            );
+            tokio::time::sleep_until(deadline).await;
+            assert!(resumed.idle_settlement_ready());
+            std::fs::write(&fixture.exe, &retry_script).unwrap();
+            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(fixture.head(), unpublished);
+            assert!(read_entries().iter().any(|entry| {
+                entry
+                    .publication
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.source == unpublished)
+            }));
+            assert!(resumed.publication_retry.next.is_none());
         });
     });
 }
