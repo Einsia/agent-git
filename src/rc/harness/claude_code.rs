@@ -533,7 +533,7 @@ impl ClaudeCodeDriver {
         // not know to wait for it. The method of the same name on the codex side refuses the
         // same way; the two must mean the same thing.
         if self.current_turn.is_none() {
-            anyhow::bail!("no turn is running — send a message instead of steering");
+            return Err(super::TurnNotRunning.into());
         }
         self.awaiting_echoes.push_back(message.to_string());
         let prompt_id = self
@@ -2075,7 +2075,7 @@ for line in sys.stdin:
             .steer("nothing to steer")
             .await
             .expect_err("steering with no running turn must be an error");
-        assert!(error.to_string().contains("no turn is running"));
+        assert!(error.is::<super::super::TurnNotRunning>());
         assert!(d.awaiting_echoes.is_empty());
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), d.proc.next())

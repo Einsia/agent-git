@@ -36,6 +36,18 @@ pub mod models;
 pub mod opencode;
 pub mod proc;
 
+/// Proves that steering was refused before any input reached the native process.
+#[derive(Debug)]
+pub(crate) struct TurnNotRunning;
+
+impl std::fmt::Display for TurnNotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no turn is running — send a message instead of steering")
+    }
+}
+
+impl std::error::Error for TurnNotRunning {}
+
 use crate::protocol::{
     ApprovalRequest, ApprovalResponse, Delivery, ItemKind, PermissionApply, PermissionMode,
     RuntimeCapability,

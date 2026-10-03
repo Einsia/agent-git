@@ -1849,3 +1849,17 @@ fn unknown_shared_turn_receipt_keeps_observation_and_forbids_automatic_resubmiss
             .contains("continues")
     );
 }
+
+#[test]
+fn only_a_typed_idle_steer_refusal_authorizes_resubmitting_input() {
+    let error = super::super::map_receipt::<()>(Ok(Err(crate::rc::harness::TurnNotRunning.into())))
+        .unwrap_err();
+    assert!(error.is(crate::protocol::ErrorCode::SessionBusy));
+    assert_eq!(error.data.unwrap()["outcome"], "not_sent");
+    let uncertain = super::super::map_receipt::<()>(Ok(Err(anyhow::anyhow!(
+        "no turn is running — send a message instead of steering"
+    ))))
+    .unwrap_err();
+    assert!(uncertain.is(crate::protocol::ErrorCode::Internal));
+    assert!(uncertain.data.is_none());
+}

@@ -1807,6 +1807,11 @@ fn map_receipt<T>(
 ) -> Result<T, RpcError> {
     match got {
         Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error.is::<crate::rc::harness::TurnNotRunning>() => {
+            let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
+            error.data = Some(serde_json::json!({"outcome":"not_sent"}));
+            Err(error)
+        }
         Ok(Err(error)) => Err(RpcError::new(ErrorCode::Internal, error.to_string())),
         Err(_) => Err(RpcError::new(ErrorCode::Internal, "session went away")),
     }

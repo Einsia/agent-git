@@ -1110,7 +1110,7 @@ impl CodexDriver {
     pub async fn steer(&mut self, message: &str) -> crate::Result<Delivery> {
         let prompt_id = self.next_prompt_id.take();
         let (Some(tid), Some(turn)) = (self.thread_id.clone(), self.current_turn.clone()) else {
-            anyhow::bail!("no turn is running — send a message instead of steering");
+            return Err(super::TurnNotRunning.into());
         };
         let id = self.alloc_id()?;
         let mut params = json!({
