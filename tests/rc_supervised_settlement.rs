@@ -101,7 +101,7 @@ mod unix {
     fn strict_supervisor_commit_writes_the_real_new_head_to_its_result_file() {
         use base64::Engine as _;
         let root = tempfile::tempdir().unwrap();
-        let cwd = root.path().join("workspace");
+        let cwd = root.path().canonicalize().unwrap().join("workspace");
         let agit_home = root.path().join("agit-home");
         let runtime_home = root.path().join("runtime-home");
         let repo = agit_home.join("repos/alice/photo");
@@ -208,7 +208,7 @@ mod unix {
             "type": "assistant", "sessionId": session_id,
             "uuid": "cf91e4b3-c951-42f6-98ce-9d4a9cedbaf3",
             "parentUuid": "81567b2e-195a-4ed3-a180-06eca3efc210",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+            "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}
         });
         let originals = [user, assistant, result, completed];
         std::fs::write(
@@ -247,9 +247,43 @@ mod unix {
 
         let (log, view) = agit::domain::storage::materialize_pair_at(&repo, "HEAD").unwrap();
         assert!(!log.contains(secret));
-        let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(&repo).unwrap();
-        let restored_log = dictionary.hydrate_envelopes(&log).unwrap().text;
-        let restored_view = dictionary.hydrate_envelopes(&view).unwrap().text;
+        let (restored_log, restored_view) = {
+            use std::io::{Read, Write};
+            use std::process::Stdio;
+            let mut worker = base_command(root.path(), &["__privacy-worker-v1"])
+                .env("HOME", &runtime_home)
+                .env("AGIT_HUB_URL", hub)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut hydrate = |text: &str| {
+                let request = serde_json::to_vec(&serde_json::json!({
+                    "repo":repo,"mode":"hydrate_envelopes","text":text
+                }))
+                .unwrap();
+                let input = worker.stdin.as_mut().unwrap();
+                input
+                    .write_all(&(request.len() as u32).to_be_bytes())
+                    .unwrap();
+                input.write_all(&request).unwrap();
+                input.flush().unwrap();
+                let output = worker.stdout.as_mut().unwrap();
+                let mut size = [0; 4];
+                output.read_exact(&mut size).unwrap();
+                let size = u32::from_be_bytes(size) as usize;
+                assert!(size < 1024 * 1024);
+                let mut response = vec![0; size];
+                output.read_exact(&mut response).unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+                assert_eq!(response["unresolved"], 0);
+                response["content"].as_str().unwrap().to_owned()
+            };
+            let pair = (hydrate(&log), hydrate(&view));
+            worker.kill().unwrap();
+            worker.wait().unwrap();
+            pair
+        };
         let restored: Vec<_> = agit::domain::storage::parse_envelopes(&restored_log)
             .unwrap()
             .into_iter()
@@ -257,40 +291,35 @@ mod unix {
             .collect();
         assert_eq!(restored, originals);
 
-        let policy = agit::domain::privacy::PrivacyPolicy {
-            workspace: Some(cwd.clone()),
-            ..Default::default()
-        };
         let key = crypto_box::SecretKey::from([29; 32]);
-        let redactor = agit::domain::redact::Redactor::new(Default::default())
-            .with_repository(&repo)
-            .unwrap();
-        let metadata = agit::domain::meta::read(&repo).unwrap();
-        let projection = agit::domain::privacy_publication::project_session(
-            &policy,
-            &mut Default::default(),
-            Some(branch),
-            &restored_log,
-            &restored_view,
-            &metadata,
-            &redactor,
+        let exported = base_command(
+            root.path(),
+            &[
+                "export",
+                &format!("alice/photo@{branch}"),
+                "--format",
+                "privacy-envelope",
+                "--viewing-public-key",
+                &base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes()),
+            ],
         )
+        .env("HOME", &runtime_home)
+        .env("AGIT_HUB_URL", hub)
+        .output()
         .unwrap();
-        let recipient = agit::domain::privacy_envelope::ViewingRecipient::from_base64(
-            "fixture".into(),
-            &base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let envelope = projection.seal(&recipient).unwrap();
+        assert!(exported.status.success(), "{exported:?}");
+        let envelope =
+            agit::domain::privacy_envelope::PrivacyEnvelope::parse(&exported.stdout).unwrap();
         let public = envelope.public_projection.to_string();
-        for marker in [
-            "settle this turn",
-            "Readable reply",
-            "Readable command",
-            "Readable output",
-            "done",
-        ] {
-            assert!(public.contains(marker));
+        for marker in ["settle this turn", "Readable reply", "done"] {
+            assert!(
+                public.contains(marker),
+                "public projection omitted {marker}"
+            );
+        }
+        // Unclassified shell calls have no file-scope authority in the public projection.
+        for marker in ["Readable command", "Readable output"] {
+            assert!(!public.contains(marker));
         }
         assert!(!public.contains(secret));
         assert!(!public.contains("content unavailable"));

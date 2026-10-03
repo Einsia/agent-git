@@ -140,7 +140,7 @@ impl Lab {
                 "type": "assistant", "sessionId": session_id, "cwd": cwd,
                 "uuid": format!("{session_id}-a{n}"),
                 "timestamp": format!("2026-08-29T00:00:{n:02}.500Z"),
-                "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+                "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": reply}]}
             })
         )
     }
@@ -230,6 +230,10 @@ fn the_strict_result_follows_the_memory_commit() {
     let identity = agit::hub::identity::RemoteIdentity::new(HUB, AGENT_ID).unwrap();
     agit::hub::identity::pin(&repo, &identity).unwrap();
 
+    let mut privacy = agit::domain::privacy::PrivacyPolicy::default();
+    privacy.memory_allow.push("**/*.md".into());
+    privacy.save(&repo).unwrap();
+
     // Establish the baseline: an explicit sync collects the memory already sitting at the top.
     let mem = lab.memory_dir();
     fs::create_dir_all(&mem).unwrap();
@@ -254,7 +258,9 @@ fn the_strict_result_follows_the_memory_commit() {
     );
     assert!(
         repo.show("refs/heads/s1", "memory/second.md").is_some(),
-        "the memory commit landed"
+        "the memory commit landed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
         repo.git(&["log", "-1", "--format=%s", "refs/heads/s1"])

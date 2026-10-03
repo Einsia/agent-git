@@ -315,6 +315,12 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
         replies.push(reply);
     }
     assert_eq!(replies[1]["result"]["read_only"], true);
+    let selection = &replies[1]["result"]["native_selection"];
+    assert_eq!(selection["session_ref"], native);
+    assert_eq!(selection["runtime_session_id"], native);
+    assert_eq!(selection["runtime"], "claude-code");
+    assert_eq!(selection["project_id"], "observed-project");
+    assert_eq!(selection["cwd"], cwd.to_string_lossy().as_ref());
     let logical = replies[1]["result"]["archive_session"]["session_id"]
         .as_str()
         .unwrap()

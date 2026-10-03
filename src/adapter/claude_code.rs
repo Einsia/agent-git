@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 pub struct ClaudeCode;
 
 /// Tool results and intermediate assistant records cannot settle an observed user turn.
-#[cfg(feature = "rc")]
+#[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn completed_turn_boundary(text: &str) -> Option<usize> {
     let mut offset = 0;
     let mut completed = None;

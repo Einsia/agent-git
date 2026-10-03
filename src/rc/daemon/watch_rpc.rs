@@ -23,6 +23,7 @@ pub(super) struct WatchScan {
 
 pub(super) struct PreparedWatch {
     request: SessionWatch,
+    selection: LocalSession,
     roots: policy::CanonicalRoots,
     runtime: String,
     cwd: PathBuf,
@@ -93,7 +94,7 @@ impl WatchScan {
                 .map_err(source_sessions::unavailable)?
         {
             let local = LocalSession {
-                runtime_session_id: request.session_id.clone(),
+                runtime_session_id: enrolled.native_id.clone(),
                 runtime: "codex".into(),
                 cwd: enrolled.cwd.to_string_lossy().into(),
                 modified_at: String::new(),
@@ -138,6 +139,7 @@ impl WatchScan {
         local: LocalSession,
         enrolled: Option<super::source_watch::SourceWatch>,
     ) -> Result<PreparedWatch, RpcError> {
+        let selection = local.clone();
         let runtime = local.runtime;
         let cwd = policy::require_within(Path::new(&local.cwd), &roots)
             .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
@@ -228,6 +230,7 @@ impl WatchScan {
         };
         Ok(PreparedWatch {
             request,
+            selection,
             roots,
             runtime,
             cwd,
@@ -311,6 +314,7 @@ impl Daemon {
         let p: SessionWatch = frame.params_as()?;
         let PreparedWatch {
             request,
+            selection,
             roots,
             runtime,
             cwd,
@@ -742,6 +746,12 @@ impl Daemon {
                 Err(error) => (None, Some(error.to_string())),
             };
         let result = serde_json::to_value(SessionWatchResult {
+            native_selection: Some(crate::protocol::NativeSessionSelection {
+                session_ref: p.session_id.clone(),
+                native_source: info.native_source.clone(),
+                project_id: info.project_id.clone(),
+                session: selection,
+            }),
             archive_session,
             archive_error,
             before_cursor,

@@ -215,7 +215,7 @@ impl Lab {
                 "type": "assistant", "sessionId": session_id, "cwd": cwd,
                 "uuid": format!("{session_id}-a{n}"),
                 "timestamp": format!("2026-08-29T00:00:{n:02}.500Z"),
-                "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+                "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": reply}]}
             })
         )
     }

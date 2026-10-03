@@ -369,6 +369,7 @@ fn run_inner(args: Args) -> CmdResult {
         milestone: args.milestone,
         tag: args.tag,
         code: args.code,
+        completed_only: args.from_supervisor,
         historical: false,
         message: args.message,
         paths: args.paths,
@@ -663,6 +664,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             milestone: None,
             tag: None,
             code: false,
+            completed_only: false,
             historical: false,
             message: None,
             paths: Vec::new(),
@@ -1065,6 +1067,7 @@ struct SettleOpts {
     milestone: Option<String>,
     tag: Option<String>,
     code: bool,
+    completed_only: bool,
     historical: bool,
     message: Option<String>,
     paths: Vec<String>,
@@ -1144,7 +1147,6 @@ pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<boo
     Ok(in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some())
 }
 
-#[cfg(feature = "rc")]
 pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Result<Option<u64>> {
     if runtime == "claude-code" {
         return Ok(crate::adapter::claude_code::completed_turn_boundary(text)
@@ -1994,9 +1996,10 @@ fn settle_bytes(
         service as privacy,
     };
     let mut native_prefix = (0usize, String::new());
+    let mut verified_native_checkpoint = false;
 
     // ── Materialized baseline or native continuation ──
-    let (region_start, region, head_turn_base) = if let Some(base) = lk.baseline_bytes {
+    let (region_start, region, mut head_turn_base) = if let Some(base) = lk.baseline_bytes {
         let base = base as usize;
         if bytes.len() < base {
             ui::error(
@@ -2050,6 +2053,7 @@ fn settle_bytes(
                         hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256
                     })
         });
+        verified_native_checkpoint = checkpoint_verified;
         let comparable = if !checkpoint_verified
             && transcript::continuity(&committed, &text) == Continuity::Diverged
         {
@@ -2157,7 +2161,29 @@ fn settle_bytes(
         .map(|a| a.open_tool_calls(&region))
         .unwrap_or_default();
     let in_flight = in_flight_tail(&ir, &open_calls);
-    let chunks = turn_chunks(&region, &ir, &open_calls);
+    let chunks = if opts.completed_only {
+        // Recovery can read a newer native snapshot than the completed turn that queued it.
+        let end = completed_native_boundary(&runtime, &region)?.unwrap_or(0) as usize;
+        let completed = &region[..end];
+        let adapter = crate::adapter::get(&runtime)?;
+        let completed_ir = adapter.parse(completed)?;
+        if verified_native_checkpoint
+            && head_turn_base > 0
+            && let Some(checkpoint) = &lk.native_checkpoint
+            && let Some(prefix) = region.get(..checkpoint.bytes as usize)
+            && completed_native_boundary(&runtime, prefix)?.unwrap_or(0) < checkpoint.bytes
+        {
+            // An incomplete retained turn grows in a descendant commit with the same ordinal.
+            head_turn_base -= 1;
+        }
+        turn_chunks(
+            completed,
+            &completed_ir,
+            &adapter.open_tool_calls(completed),
+        )
+    } else {
+        turn_chunks(&region, &ir, &open_calls)
+    };
 
     let new_chunks: Vec<&Chunk> = if region_start == 0 && head_turn_base == 0 {
         chunks.iter().collect()
@@ -3965,6 +3991,7 @@ pub(super) fn record_at(
         milestone: None,
         tag: None,
         code: false,
+        completed_only: false,
         historical: true,
         message: None,
         paths: vec![],
@@ -4088,11 +4115,70 @@ mod tests {
             milestone: None,
             tag: None,
             code: false,
+            completed_only: false,
             historical: false,
             message: None,
             paths: vec![],
             quiet: false,
         }
+    }
+
+    #[test]
+    fn supervisor_settlement_waits_for_completion_and_extends_a_retained_partial_turn() {
+        let (_directory, store) = store();
+        let (_repository, repo) = setup_repo();
+        let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+        let first = format!("{META}\n{}{}{end}", codex_user("first"), codex_asst("done"));
+        let active = format!("{first}{}{}", codex_user("second"), codex_asst("working"));
+        let settle = |text: &str, completed_only, fresh| {
+            let mut options = opts();
+            options.completed_only = completed_only;
+            let claim = link::get(&store, "codex", "AB").unwrap_or_else(link);
+            assert_eq!(
+                settle_bytes(
+                    &store,
+                    &repo,
+                    "alice/photo",
+                    "main",
+                    claim,
+                    text.as_bytes(),
+                    "alice",
+                    options,
+                    fresh,
+                    true
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+        };
+        settle(&active, true, true);
+        let completed = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(completed.turn, Some(1));
+        assert_eq!(completed.baseline_bytes, Some(first.len() as u64));
+
+        settle(&active, false, false);
+        let partial = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(2));
+        settle(&active, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned(),
+            partial
+        );
+
+        let finished = format!("{active}{}{end}", codex_asst("final reply"));
+        settle(&finished, true, false);
+        let repaired = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(repaired.turn, Some(2));
+        assert_eq!(repaired.baseline_bytes, Some(finished.len() as u64));
+        assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), partial);
+        let (_, view) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        assert!(view.contains("final reply"));
+        let tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        settle(&finished, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned(),
+            tip
+        );
     }
 
     #[test]

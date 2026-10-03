@@ -40,6 +40,17 @@ async fn fixture(root: &Path) -> Arc<Mutex<Daemon>> {
 
 fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
     PreparedWatch {
+        selection: LocalSession {
+            runtime_session_id: scan.request.session_id.clone(),
+            runtime: "codex".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            modified_at: String::new(),
+            gist: None,
+            title: None,
+            adopted: false,
+            agent: None,
+            likely_active: false,
+        },
         request: scan.request,
         roots: scan.snapshot.roots,
         runtime: "codex".into(),

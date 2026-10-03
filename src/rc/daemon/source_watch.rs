@@ -94,10 +94,10 @@ mod tests {
             let registry = crate::rc::runtime_sources::Registry::open().unwrap();
             let source = registry.register(&home, None, None, None).unwrap();
             let roots = CanonicalRoots::from_untrusted([project.clone()]);
-            crate::rc::runtime_catalog::Catalog::open()
-                .unwrap()
-                .reconcile(&roots)
-                .unwrap();
+            let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
+            for _ in registry.list().unwrap() {
+                catalog.reconcile(&roots).unwrap();
+            }
             let watch = SourceWatch::resolve(&source.session_ref(&native), &roots)
                 .unwrap()
                 .unwrap();

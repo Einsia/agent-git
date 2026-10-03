@@ -802,6 +802,9 @@ pub struct SessionWatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWatchResult {
+    /// A watch can be restored without repeating native catalog discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_selection: Option<NativeSessionSelection>,
     /// Canonical archive identity is separate from the read-only stream alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_session: Option<SessionInfo>,
@@ -847,6 +850,17 @@ pub struct SessionWatchResult {
     /// Observed native settings remain readable without granting runtime controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_settings: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeSessionSelection {
+    pub session_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_source: Option<NativeSourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(flatten)]
+    pub session: LocalSession,
 }
 
 /// An older daemon sends no `absolute_lines`, and its numbers **are** physical

@@ -125,6 +125,12 @@ impl Lab {
         ] {
             writeln!(file, "{}", serde_json::json!({"type":"response_item","payload":{"type":"message","role":role,"content":[{"type":kind,"text":format!("{text}-{turn}")}]}})).unwrap();
         }
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+        )
+        .unwrap();
     }
 
     fn import(&self, id: &str, branch: &str) {
