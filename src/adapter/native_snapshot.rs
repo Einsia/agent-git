@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const MAX_NATIVE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_NATIVE_RECORDS: usize = 262_144;
 pub const MAX_WORKING_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_LOOKUP_ENTRIES: usize = 262_144;
@@ -24,6 +25,17 @@ impl Default for Limits {
             records: MAX_NATIVE_RECORDS,
             working_bytes: MAX_WORKING_BYTES,
             lookup_entries: MAX_LOOKUP_ENTRIES,
+        }
+    }
+}
+
+impl Limits {
+    /// Selected exports cover admitted capture prefixes; read-only callers retain their own limits.
+    pub(crate) fn capture() -> Self {
+        Self {
+            bytes: MAX_CAPTURE_BYTES,
+            working_bytes: MAX_CAPTURE_BYTES * 2,
+            ..Self::default()
         }
     }
 }
@@ -267,8 +279,8 @@ pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
         .bytes
         .checked_add(1)
         .ok_or(Unavailable::BudgetExceeded)?;
-    let capacity = usize::try_from(before.len()).unwrap_or(usize::MAX).min(cap);
-    if capacity > limits.working_bytes {
+    let capacity = usize::try_from(before.len()).map_err(|_| Unavailable::BudgetExceeded)?;
+    if capacity > limits.bytes || capacity > limits.working_bytes {
         return Err(Unavailable::BudgetExceeded);
     }
     let mut options = std::fs::OpenOptions::new();

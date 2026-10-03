@@ -709,7 +709,7 @@ impl Adapter for Codex {
         };
         Ok(lineage_bytes(
             &source,
-            super::native_snapshot::Limits::default(),
+            super::native_snapshot::Limits::capture(),
             true,
             None,
         )?)
@@ -1436,6 +1436,101 @@ fn extract_output_text(output: Option<&serde_json::Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // An explicitly selected export must cover admitted capture prefixes without enlarging
+    // the budget available to read-only native inspection.
+    #[test]
+    fn native_export_exceeds_preview_budget_without_weakening_capture_bounds() {
+        use super::super::{
+            Adapter,
+            native_snapshot::{Limits, MAX_NATIVE_BYTES, Source, Unavailable},
+        };
+        use super::Codex;
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let home = cwd.join("native-home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let native = "00000000-0000-4000-8000-000000000001";
+        let path = home
+            .join("sessions")
+            .join(format!("rollout-2026-10-03T00-00-00-{native}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let header = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":cwd}})
+        );
+        let record = format!(
+            "{}\n",
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(128 * 1024)}]
+            }})
+        );
+        let mut digest = Sha256::new();
+        for bytes in std::iter::once(header.as_bytes()).chain(std::iter::repeat_n(
+            record.as_bytes(),
+            MAX_NATIVE_BYTES / record.len() + 1,
+        )) {
+            file.write_all(bytes).unwrap();
+            digest.update(bytes);
+        }
+        file.flush().unwrap();
+        let length = file.metadata().unwrap().len();
+        assert!(length > MAX_NATIVE_BYTES as u64);
+        let source = Source {
+            runtime: "codex",
+            session_id: native.into(),
+            path: path.clone(),
+            database: false,
+        };
+        assert_eq!(
+            Codex
+                .snapshot_native_readonly(&source, Limits::default())
+                .unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
+        let exported = Codex.read_native_bytes_at(native, &path).unwrap();
+        assert_eq!(exported.len() as u64, length);
+        let expected_digest = digest.finalize();
+        assert_eq!(Sha256::digest(&exported), expected_digest);
+        drop(exported);
+        #[cfg(feature = "rc")]
+        crate::rc::with_agit_home(&cwd.join("agit"), || {
+            use crate::domain::link::{Link, NativeBinding};
+            let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES (?1,?2,?3,'question','cli',1,0)",
+                rusqlite::params![native, path.to_str(), cwd.to_str()],
+            )
+            .unwrap();
+            let source = crate::rc::runtime_sources::Registry::open()
+                .unwrap()
+                .register(&home, None, None, None)
+                .unwrap();
+            let link = Link::from_native(
+                NativeBinding {
+                    source: crate::protocol::NativeSourceRef {
+                        source_id: source.source_id,
+                        generation: source.generation,
+                    },
+                    thread_id: native.into(),
+                },
+                &cwd,
+            )
+            .unwrap();
+            let exported = link.read_bytes().unwrap();
+            assert_eq!(exported.len() as u64, length);
+            assert_eq!(Sha256::digest(&exported), expected_digest);
+            drop(exported);
+            file.set_len(512 * 1024 * 1024 + 1).unwrap();
+            assert!(link.read_bytes().is_err());
+        });
+        file.set_len(512 * 1024 * 1024 + 1).unwrap();
+        assert!(Codex.read_native_bytes_at(native, &path).is_err());
+    }
+
     #[test]
     fn session_choice_headers_preserve_explicit_internal_session_discovery() {
         let directory = tempfile::tempdir().unwrap();

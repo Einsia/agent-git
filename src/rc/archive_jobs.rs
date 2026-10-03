@@ -17,7 +17,7 @@ use crate::{
 
 const MAX_JOBS: usize = 4096;
 const MAX_JOB_BYTES: u64 = 32 * 1024;
-const MAX_PREFIX_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PREFIX_BYTES: u64 = crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

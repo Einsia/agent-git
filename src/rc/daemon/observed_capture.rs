@@ -147,7 +147,7 @@ fn capture_boundary(
     let file = std::fs::File::open(&path)?;
     let size = file.metadata()?.len();
     ensure!(
-        size <= 512 * 1024 * 1024,
+        size <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
         "Observed native transcript exceeds its capture budget"
     );
     let mut bytes = vec![];

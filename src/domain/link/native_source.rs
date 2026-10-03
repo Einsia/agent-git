@@ -133,7 +133,7 @@ impl Link {
         };
         let bytes = crate::adapter::codex::lineage_bytes_with_lookup(
             &source,
-            Limits::default(),
+            Limits::capture(),
             false,
             None,
             |id, limits| {
