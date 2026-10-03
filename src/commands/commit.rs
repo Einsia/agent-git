@@ -2167,20 +2167,22 @@ fn settle_bytes(
         let completed = &region[..end];
         let adapter = crate::adapter::get(&runtime)?;
         let completed_ir = adapter.parse(completed)?;
-        if verified_native_checkpoint
-            && head_turn_base > 0
-            && let Some(checkpoint) = &lk.native_checkpoint
-            && let Some(prefix) = region.get(..checkpoint.bytes as usize)
-            && completed_native_boundary(&runtime, prefix)?.unwrap_or(0) < checkpoint.bytes
-        {
-            // An incomplete retained turn grows in a descendant commit with the same ordinal.
-            head_turn_base -= 1;
-        }
-        turn_chunks(
+        let completed_chunks = turn_chunks(
             completed,
             &completed_ir,
             &adapter.open_tool_calls(completed),
-        )
+        );
+        if verified_native_checkpoint
+            && head_turn_base > 0
+            && let Some(checkpoint) = &lk.native_checkpoint
+            && completed_chunks
+                .get(head_turn_base as usize - 1)
+                .is_some_and(|chunk| chunk.end_byte as u64 > checkpoint.bytes)
+        {
+            // A retained user turn can grow through partial capture or autonomous continuation.
+            head_turn_base -= 1;
+        }
+        completed_chunks
     } else {
         turn_chunks(&region, &ir, &open_calls)
     };
@@ -4178,6 +4180,23 @@ mod tests {
         assert_eq!(
             repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned(),
             tip
+        );
+        // Goal continuations can complete without another user prompt opening a new ordinal.
+        let continued = format!("{finished}{}{end}", codex_asst("goal phase complete"));
+        let still_running = format!("{continued}{}", codex_asst("next phase in progress"));
+        settle(&still_running, true, false);
+        let continuation = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(continuation.turn, Some(2));
+        assert_eq!(continuation.baseline_bytes, Some(continued.len() as u64));
+        assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), tip);
+        let (_, view) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        assert!(view.contains("goal phase complete"));
+        assert!(!view.contains("next phase in progress"));
+        let continued_tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        settle(&still_running, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
+            continued_tip
         );
     }
 
