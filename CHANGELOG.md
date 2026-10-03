@@ -8,6 +8,32 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-10-03
+
+### Changed
+
+- Remote control imports existing history when a session is resumed or explicitly
+  watched in a workspace. Completed turns are archived in the workspace's Agit
+  repository and uploaded automatically; a missing repository is created private.
+  Collection and upload retries continue after the viewer disconnects and recover
+  after a daemon restart without requiring another prompt.
+- Remote history can return only messages after a verified canonical archive
+  checkpoint. The matching backend and web update read saved history from ordinary
+  Agit session storage and combine it with the device's uncached messages, without
+  maintaining a separate web transcript.
+- Remote viewers receive context-compaction activity from supported runtimes.
+
+### Fixed
+
+- Starting remote control after switching Cloud accounts enrolls the daemon for
+  the current account and disables grants from the previous enrollment. Existing
+  local conversation history remains available.
+- Archive retries remain pending until the workspace publication target is ready,
+  and recover when a confirmed push already retains the requested turn.
+- Native Codex and Claude collection waits for the runtime's explicit completion
+  boundary instead of archiving a partial turn between tool calls. Interrupted
+  Codex turns also settle and upload their completed transcript.
+
 ## [0.2.17] - 2026-10-02
 
 ### Added

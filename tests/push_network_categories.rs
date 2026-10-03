@@ -257,7 +257,8 @@ impl Lab {
             let first = header.lines().next().unwrap();
             // Declaration synchronization can outlive the publication command it accompanies.
             assert!(
-                first.starts_with("GET /api/me/privacy/"),
+                first.starts_with("GET /api/me/privacy/")
+                    || first == "POST /api/me/privacy/key HTTP/1.1",
                 "unexpected publication request: {first}"
             );
             stream
