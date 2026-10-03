@@ -53,7 +53,7 @@ impl Anchor {
             .as_ref()
             .map(super::super::capture::RepositoryKind::discover)
             .transpose()?;
-        let lineage = super::super::capture::resolve(
+        let lineage = super::super::capture::inspect(
             target.runtime,
             &native,
             std::path::Path::new(target.cwd),
@@ -74,6 +74,18 @@ impl Anchor {
         let store = Store::open()?.context("Archive capture store is missing")?;
         let claim = link::get_checked(&store, target.runtime, &native)?
             .context("Archive claim is missing")?;
+        ensure!(
+            claim.is_active()
+                && claim
+                    .owner
+                    .as_ref()
+                    .zip(claim.agent.as_ref())
+                    .map(|(owner, name)| format!("{owner}/{name}"))
+                    .as_deref()
+                    == Some(lineage.slug().as_str())
+                && claim.branch.as_deref() == Some(lineage.branch()),
+            "Archive capture route changed"
+        );
         let (bytes, hash) = if let Some(checkpoint) = claim
             .native_checkpoint
             .as_ref()
@@ -239,7 +251,19 @@ mod tests {
         assert_eq!(pending["items"].as_array().unwrap().len(), 2);
         let receipt: PublicationReceipt = serde_json::from_value(json!({"version":2,"mode":"ordinary","repository":route.slug(),"branch":route.branch(),"source":commit,"published":commit,"destination":destination,"url":"https://hub.invalid/alice/history"})).unwrap();
         Entry::complete(&repo, &request, &receipt).unwrap();
-        let tail = read(params.clone()).unwrap();
+        // The published prefix remains readable while settlement owns the mutable branch.
+        let branch_writer = link::lock_branch(&store, &route.slug(), route.branch()).unwrap();
+        let claim_writer = link::lock(&store, "claude-code", &native).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reading = params.clone();
+        let worker = std::thread::spawn(move || sent.send(read(reading)).unwrap());
+        let result = received.recv_timeout(std::time::Duration::from_secs(5));
+        drop(claim_writer);
+        drop(branch_writer);
+        worker.join().unwrap();
+        let tail = result
+            .expect("history must not wait for the archive writer")
+            .unwrap();
         assert_eq!(tail["after_archive"], anchor);
         assert_eq!(tail["before"], 0);
         assert_eq!(tail["archived_sources"][0]["before"], prefix.len());

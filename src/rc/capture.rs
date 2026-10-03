@@ -74,6 +74,29 @@ pub(crate) fn resolve(
     prior: Option<&AgitSession>,
     saved: Option<&RepositoryKind>,
 ) -> Result<Option<AgitSession>> {
+    select(runtime, native, cwd, prior, saved, true)
+}
+
+/// Read-only history checks the claim image without waiting for an active settlement writer.
+/// A changed image cannot prove an archive boundary and leaves the native history visible.
+pub(crate) fn inspect(
+    runtime: &str,
+    native: &str,
+    cwd: &Path,
+    prior: Option<&AgitSession>,
+    saved: Option<&RepositoryKind>,
+) -> Result<Option<AgitSession>> {
+    select(runtime, native, cwd, prior, saved, false)
+}
+
+fn select(
+    runtime: &str,
+    native: &str,
+    cwd: &Path,
+    prior: Option<&AgitSession>,
+    saved: Option<&RepositoryKind>,
+    serialize: bool,
+) -> Result<Option<AgitSession>> {
     let Some(store) = Store::open()? else {
         ensure!(
             prior.is_none() && saved.is_none(),
@@ -113,8 +136,14 @@ pub(crate) fn resolve(
         "00000000-0000-0000-0000-000000000001",
         branch,
     )?;
-    let _branch = link::lock_branch(&store, &probe.slug(), branch)?;
-    let _claim = link::lock(&store, runtime, native)?;
+    let _locks = if serialize {
+        Some((
+            link::lock_branch(&store, &probe.slug(), branch)?,
+            link::lock(&store, runtime, native)?,
+        ))
+    } else {
+        None
+    };
     let current =
         link::get_checked(&store, runtime, native)?.context("capture claim disappeared")?;
     ensure!(
@@ -162,6 +191,14 @@ pub(crate) fn resolve(
     ensure!(
         active.len() == 1 && active[0].instance() == claim.instance(),
         "capture branch has conflicting runtime claims"
+    );
+    ensure!(
+        link::get_checked(&store, runtime, native)?
+            .map(|current| current.to_json())
+            .transpose()?
+            .as_ref()
+            == Some(&claim.to_json()?),
+        "capture claim changed during inspection"
     );
     lineage.capture = Some(kind);
     Ok(Some(lineage))

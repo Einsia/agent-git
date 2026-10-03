@@ -8,6 +8,19 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-10-04
+
+### Fixed
+
+- Background remote-control archive recovery allows long commits and uploads to
+  finish instead of interrupting them after a fixed request timeout. Recovery
+  remains cancellable on shutdown and retains its pending publication receipts.
+- Opening a saved conversation reads its verified archive boundary without
+  waiting for the next turn's settlement locks. Native claim and publication
+  checks continue to prevent a stale boundary from hiding uncached messages.
+- Local daemon diagnostics include bounded failure details for archive landing,
+  commits, and publication so a repository problem can be diagnosed directly.
+
 ## [0.2.18] - 2026-10-03
 
 ### Changed
