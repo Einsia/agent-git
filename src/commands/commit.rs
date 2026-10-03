@@ -1078,6 +1078,8 @@ struct SettleOpts {
 struct Chunk {
     /// The byte offset inside the settlement region that this turn's end covers.
     end_byte: usize,
+    /// Native completions can share a user turn without changing its public ordinal.
+    user_turn: Option<u32>,
     /// The first line of the user prompt (truncated to 72).
     gist: String,
     events: usize,
@@ -1239,6 +1241,7 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
                 .unwrap_or_default();
             Chunk {
                 end_byte: e,
+                user_turn: None,
                 gist,
                 events,
                 dropped,
@@ -1262,6 +1265,7 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         }
         out.push(Chunk {
             end_byte: c.end_byte,
+            user_turn: None,
             gist: c.gist.clone(),
             events: c.events,
             dropped: c.dropped,
@@ -1274,6 +1278,84 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         out.pop();
     }
     out
+}
+
+/// Native completions remain separate snapshots even when recovery collects them together.
+fn completed_turn_chunks(
+    region: &str,
+    ir: &Session,
+    open: &[OpenCall],
+    retained_user_turn: bool,
+) -> Vec<Chunk> {
+    let user_chunks = turn_chunks(region, ir, open);
+    let mut offset = 0;
+    let line_ends: Vec<_> = region
+        .split_inclusive('\n')
+        .map(|line| {
+            offset += line.len();
+            offset
+        })
+        .collect();
+    let mut boundaries: Vec<_> = ir
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::TurnEnd)
+        .filter_map(|event| event.line.and_then(|line| line_ends.get(line).copied()))
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut completed = Vec::new();
+    let mut previous = 0;
+    let mut terminal = boundaries.into_iter().peekable();
+    if retained_user_turn {
+        let preamble_end = ir
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::UserPrompt)
+            .and_then(|event| event.line)
+            .map_or(region.len(), |line| {
+                line.checked_sub(1)
+                    .and_then(|previous| line_ends.get(previous).copied())
+                    .unwrap_or(0)
+            });
+        while terminal.peek().is_some_and(|&end| end <= preamble_end) {
+            completed.push(Chunk {
+                end_byte: terminal.next().unwrap(),
+                user_turn: Some(0),
+                gist: String::new(),
+                events: 0,
+                dropped: 0,
+            });
+        }
+    }
+    for (index, chunk) in user_chunks.into_iter().enumerate() {
+        let mut ends = Vec::new();
+        while let Some(&end) = terminal.peek() {
+            if end > chunk.end_byte {
+                break;
+            }
+            terminal.next();
+            if end > previous {
+                ends.push(end);
+            }
+        }
+        // Only legacy groups need an implicit end. Bookkeeping after a native completion
+        // belongs to a later snapshot, not another completion of the same user turn.
+        if ends.is_empty() {
+            ends.push(chunk.end_byte);
+        }
+        for end_byte in ends {
+            completed.push(Chunk {
+                end_byte,
+                user_turn: Some(index as u32 + 1),
+                gist: chunk.gist.clone(),
+                events: chunk.events,
+                dropped: chunk.dropped,
+            });
+        }
+        previous = chunk.end_byte;
+    }
+    completed
 }
 
 /// Extend a committed snapshot with bytes written after a materialized runtime baseline.
@@ -1996,10 +2078,9 @@ fn settle_bytes(
         service as privacy,
     };
     let mut native_prefix = (0usize, String::new());
-    let mut verified_native_checkpoint = false;
 
     // ── Materialized baseline or native continuation ──
-    let (region_start, region, mut head_turn_base) = if let Some(base) = lk.baseline_bytes {
+    let (region_start, region, head_turn_base) = if let Some(base) = lk.baseline_bytes {
         let base = base as usize;
         if bytes.len() < base {
             ui::error(
@@ -2053,7 +2134,6 @@ fn settle_bytes(
                         hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256
                     })
         });
-        verified_native_checkpoint = checkpoint_verified;
         let comparable = if !checkpoint_verified
             && transcript::continuity(&committed, &text) == Continuity::Diverged
         {
@@ -2167,36 +2247,27 @@ fn settle_bytes(
         let completed = &region[..end];
         let adapter = crate::adapter::get(&runtime)?;
         let completed_ir = adapter.parse(completed)?;
-        let completed_chunks = turn_chunks(
+        completed_turn_chunks(
             completed,
             &completed_ir,
             &adapter.open_tool_calls(completed),
-        );
-        if verified_native_checkpoint
-            && head_turn_base > 0
-            && let Some(checkpoint) = &lk.native_checkpoint
-            && completed_chunks
-                .get(head_turn_base as usize - 1)
-                .is_some_and(|chunk| chunk.end_byte as u64 > checkpoint.bytes)
-        {
-            // A retained user turn can grow through partial capture or autonomous continuation.
-            head_turn_base -= 1;
-        }
-        completed_chunks
+            materialized_mode && head_turn_base > 0,
+        )
     } else {
         turn_chunks(&region, &ir, &open_calls)
     };
 
-    let new_chunks: Vec<&Chunk> = if region_start == 0 && head_turn_base == 0 {
-        chunks.iter().collect()
+    let new_chunks: Vec<&Chunk> = if opts.completed_only && !materialized_mode {
+        // The retained prefix proves exact content, including a partially captured user turn.
+        // Ordinals cannot skip continuations because several native turns can share one prompt.
+        chunks
+            .iter()
+            .filter(|chunk| chunk.end_byte > native_prefix.0)
+            .collect()
+    } else if !materialized_mode && region_start == 0 && head_turn_base > 0 {
+        chunks.iter().skip(head_turn_base as usize).collect()
     } else {
-        // Native mode: `chunks` is the full chain, so skip what already settled. Materialized
-        // mode: `head_turn_base` is the base ordinal and every chunk is new.
-        if region_start == 0 {
-            chunks.iter().skip(head_turn_base as usize).collect()
-        } else {
-            chunks.iter().collect()
-        }
+        chunks.iter().collect()
     };
 
     if new_chunks.is_empty() {
@@ -2508,7 +2579,13 @@ fn settle_bytes(
     // can run. Memory collection is a separate file commit and cannot advance this boundary.
     record_supervisor_prepared()?;
     for (i, c) in new_chunks.iter().enumerate() {
-        let turn_no = head_turn_base + 1 + i as u32;
+        let turn_no = c.user_turn.map_or(head_turn_base + 1 + i as u32, |turn| {
+            if materialized_mode {
+                head_turn_base + turn
+            } else {
+                turn
+            }
+        });
         let absolute_end = region_start + c.end_byte;
         if !quiet && total > 1 {
             ui::progress(format_args!("  building turn {}/{}", i + 1, total));
@@ -4197,6 +4274,76 @@ mod tests {
         assert_eq!(
             repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
             continued_tip
+        );
+
+        // Catch-up keeps each native completion addressable, including goal continuations.
+        let phase_a = format!("{still_running}{}{end}", codex_asst("phase A complete"));
+        let phase_b = format!("{phase_a}{}{end}", codex_asst("phase B complete"));
+        let bookkeeping = "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo/one\",\"model\":\"fixture\"}}\n";
+        let next_user = format!(
+            "{phase_b}{bookkeeping}{}{}{end}",
+            codex_user("third"),
+            codex_asst("third complete")
+        );
+        let pending = format!("{next_user}{}", codex_asst("uncompleted continuation"));
+        // Losing the acceleration checkpoint cannot merge or duplicate retained native turns.
+        let mut claim = link::get(&store, "codex", "AB").unwrap();
+        claim.native_checkpoint = None;
+        link::write(&store, &claim).unwrap();
+        settle(&pending, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD~3"]).unwrap().trim(),
+            continued_tip
+        );
+        for (revision, boundary, ordinal) in [
+            ("HEAD~2", phase_a.len(), 2),
+            ("HEAD~1", phase_b.len(), 2),
+            ("HEAD", next_user.len(), 3),
+        ] {
+            let metadata = meta::read_at_ref(&repo, revision).unwrap();
+            assert_eq!(metadata.turn, Some(ordinal));
+            assert_eq!(metadata.baseline_bytes, Some(boundary as u64));
+            let (_, view) = storage::materialize_pair_at(repo.root(), revision).unwrap();
+            assert!(view.contains("phase A complete"));
+            assert_eq!(view.contains("phase B complete"), revision != "HEAD~2");
+            assert_eq!(view.contains("third complete"), revision == "HEAD");
+            assert_eq!(view.contains("turn_context"), revision == "HEAD");
+            assert!(!view.contains("uncompleted continuation"));
+        }
+        let caught_up = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        settle(&pending, true, false);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), caught_up);
+
+        // A materialized resume can continue its retained user turn without another prompt.
+        use sha2::Digest as _;
+        let mut claim = link::get(&store, "codex", "AB").unwrap();
+        claim.baseline_bytes = Some(next_user.len() as u64);
+        claim.baseline_hash = Some(hex::encode(sha2::Sha256::digest(next_user.as_bytes())));
+        claim.materialized_from = Some(caught_up.clone());
+        link::write(&store, &claim).unwrap();
+        let resumed_a = format!("{next_user}{}{end}", codex_asst("resumed phase A"));
+        let resumed_b = format!("{resumed_a}{}{end}", codex_asst("resumed phase B"));
+        let resumed_active = format!("{resumed_b}{}", codex_asst("resumed active phase"));
+        settle(&resumed_active, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD~2"]).unwrap().trim(),
+            caught_up
+        );
+        for (revision, boundary) in [("HEAD~1", resumed_a.len()), ("HEAD", resumed_b.len())] {
+            let metadata = meta::read_at_ref(&repo, revision).unwrap();
+            assert_eq!(metadata.turn, Some(3));
+            assert_eq!(metadata.baseline_bytes, Some(boundary as u64));
+            let (_, view) = storage::materialize_pair_at(repo.root(), revision).unwrap();
+            assert!(view.contains("third complete"));
+            assert!(view.contains("resumed phase A"));
+            assert_eq!(view.contains("resumed phase B"), revision == "HEAD");
+            assert!(!view.contains("resumed active phase"));
+        }
+        let resumed_tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        settle(&resumed_active, true, false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
+            resumed_tip
         );
     }
 
