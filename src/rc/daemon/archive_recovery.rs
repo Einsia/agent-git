@@ -10,6 +10,19 @@ impl Drop for Worker {
     }
 }
 
+// Recovery keeps its admission until completion or shutdown. A wall-clock cutoff can kill Git
+// while it owns the index, leaving the durable retry unable to acquire repository locks.
+async fn until_stopped<T>(
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|stopped| *stopped) => None,
+        result = work => Some(result),
+    }
+}
+
 pub(super) fn start(
     daemon: Arc<Mutex<Daemon>>,
     admission: crate::rc::admission::Admission,
@@ -51,26 +64,25 @@ pub(super) fn start(
                     }
                     state.settlement.subscribe()
                 };
-                let prepared = tokio::select! {
-                    biased;
-                    _ = stop.wait_for(|stopped| *stopped) => None,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(60),
-                        crate::rc::supervisor::archive_recovery::prepare(job.clone(), authority)) => Some(result),
-                };
+                let prepared = until_stopped(
+                    &mut stop,
+                    crate::rc::supervisor::archive_recovery::prepare(job.clone(), authority),
+                )
+                .await;
                 daemon.lock().await.archive_recovering.remove(&job.logical);
                 let completed = match prepared {
-                    Some(Ok(Ok(prepared))) => tokio::select! {
-                        biased;
-                        _ = stop.wait_for(|stopped| *stopped) => None,
-                        result = tokio::time::timeout(std::time::Duration::from_secs(60),
-                            crate::rc::supervisor::archive_recovery::publish(prepared)) => Some(result),
-                    },
-                    Some(Ok(Err(error))) => Some(Ok(Err(error))),
+                    Some(Ok(prepared)) => {
+                        until_stopped(
+                            &mut stop,
+                            crate::rc::supervisor::archive_recovery::publish(prepared),
+                        )
+                        .await
+                    }
                     Some(Err(error)) => Some(Err(error)),
                     None => None,
                 };
                 match completed {
-                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(())) => {}
                     Some(result) => eprintln!(
                         "agitd: completed turn archive remains pending ({}): {result:?}",
                         job.logical
@@ -143,6 +155,36 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Long local transactions keep restart admission until completion; shutdown still cancels.
+    #[tokio::test(start_paused = true)]
+    async fn archive_completion_outlives_request_budgets_but_observes_shutdown() {
+        let admission = crate::rc::admission::Admission::default();
+        let work = admission.enter().unwrap();
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let running = tokio::spawn(async move {
+            let _work = work;
+            until_stopped(&mut stopped, async {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                "committed"
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert!(!running.is_finished());
+        assert!(admission.freeze().is_err());
+        assert_eq!(running.await.unwrap(), Some("committed"));
+        assert!(admission.freeze().is_ok());
+
+        let mut stopped = stop.subscribe();
+        let running =
+            tokio::spawn(
+                async move { until_stopped(&mut stopped, std::future::pending::<()>()).await },
+            );
+        stop.send(true).unwrap();
+        assert_eq!(running.await.unwrap(), None);
+    }
 
     /// Recovery and a native attachment cannot hold the same capture writer concurrently.
     #[tokio::test]

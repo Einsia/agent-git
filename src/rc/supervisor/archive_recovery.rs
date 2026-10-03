@@ -93,7 +93,7 @@ pub(crate) async fn prepare(
     let landed = guarded_output(&mut state, lease, land)
         .await
         .context("archive landing was cancelled")?;
-    ensure!(landed.status.success(), "archive landing failed");
+    require_success(&landed, "landing")?;
     let handoffs: Vec<_> = String::from_utf8_lossy(&landed.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix(crate::commands::commit::archive::RC_PREFIX))
@@ -155,6 +155,7 @@ pub(crate) async fn prepare(
     .run()
     .await
     .context("archive settlement did not return a verified result")?;
+    require_success(&committed.output, "commit")?;
     strict_settlement_candidate(
         &committed.before,
         &committed.output,
@@ -239,10 +240,7 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
         let output = guarded_output(&mut state, lease, push)
             .await
             .context("archive publication was cancelled")?;
-        ensure!(
-            output.status.success(),
-            "automatic archive publication did not complete"
-        );
+        require_success(&output, "publication")?;
         local_publication::result_receipt(&repo, &request, result.path())?;
     }
     ensure!(
@@ -251,6 +249,20 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
     );
     verify_native(&job, &lineage)?;
     crate::rc::archive_jobs::publication_confirmed(&repo, &request)
+}
+
+fn require_success(output: &std::process::Output, stage: &str) -> crate::Result<()> {
+    ensure!(
+        output.status.success(),
+        "archive {stage} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(4096)
+            .collect::<String>()
+    );
+    Ok(())
 }
 
 fn command(
