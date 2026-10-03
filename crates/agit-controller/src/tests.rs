@@ -284,32 +284,46 @@ async fn dropping_the_controller_closes_transport_without_a_ui_owner() {
 }
 
 #[tokio::test]
-async fn read_requests_retry_once_after_reconnect_with_a_fresh_wire_identity() {
-    let controller = controller();
-    let (config, mut incoming, server) = endpoint().await;
-    controller.connect("a".into(), config, None).unwrap();
-    let mut socket = handshake(&mut incoming, "host").await;
-    controller.ready("a", WAIT).await.unwrap();
-    let client = controller.clone();
-    let read_request = tokio::spawn(async move {
-        client
-            .request("a", "session.list".into(), json!({}), WAIT)
-            .await
-    });
-    let first = read(&mut socket).await;
-    drop(socket);
-    let mut socket = handshake(&mut incoming, "host").await;
-    let retry = read(&mut socket).await;
-    assert_eq!(retry["method"], first["method"]);
-    assert_eq!(retry["params"], first["params"]);
-    assert_ne!(retry["id"], first["id"]);
-    response(&mut socket, &retry["id"], json!({"sessions":[]})).await;
-    assert_eq!(
-        read_request.await.unwrap().unwrap()["result"],
-        json!({"sessions":[]})
-    );
-    drop(controller);
-    server.abort();
+async fn settings_reads_recover_after_reconnect_but_changes_are_never_replayed() {
+    for method in ["session.model", "session.setModel"] {
+        let controller = controller();
+        let (config, mut incoming, server) = endpoint().await;
+        controller.connect("a".into(), config, None).unwrap();
+        let mut socket = handshake(&mut incoming, "host").await;
+        controller.ready("a", WAIT).await.unwrap();
+        let client = controller.clone();
+        let params = if method == "session.model" {
+            json!({"session_id":"conversation"})
+        } else {
+            json!({"session_id":"conversation", "model":"selected"})
+        };
+        let operation =
+            tokio::spawn(async move { client.request("a", method.into(), params, WAIT).await });
+        let first = read(&mut socket).await;
+        assert_eq!(first["method"], method);
+        drop(socket);
+        let mut socket = handshake(&mut incoming, "host").await;
+        if method == "session.model" {
+            let retry = read(&mut socket).await;
+            assert_eq!(retry["method"], first["method"]);
+            assert_eq!(retry["params"], first["params"]);
+            assert_ne!(retry["id"], first["id"]);
+            response(&mut socket, &retry["id"], json!({"model":"selected"})).await;
+            assert_eq!(
+                operation.await.unwrap().unwrap()["result"]["model"],
+                "selected"
+            );
+        } else {
+            assert_eq!(operation.await.unwrap().unwrap_err().outcome, "unknown");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+        }
+        controller.disconnect("a");
+        server.abort();
+    }
 }
 
 #[tokio::test]
