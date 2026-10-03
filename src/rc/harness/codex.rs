@@ -986,12 +986,17 @@ impl CodexDriver {
             .or(self.model.as_deref());
         let selected = super::models::selected(&self.model_catalog, desired);
         let efforts = super::models::efforts(selected);
+        let default_model = self
+            .default_model
+            .as_deref()
+            .and_then(|id| super::models::selected(&self.model_catalog, Some(id)))
+            .and_then(|entry| entry["id"].as_str());
         Ok(
-            json!({"control":self.control_snapshot(),"model":self.model,"effort":self.effort,"effort_known":self.effort.is_some(),"settings_unknown":self.native_model_unknown,
+            json!({"control":self.control_snapshot(),"model":self.model,"default_model":default_model,"effort":self.effort,"effort_known":self.effort.is_some(),"settings_unknown":self.native_model_unknown,
             "pending":self.pending_model.as_ref().map(|p| json!({"model":p.0,"effort":p.1})),
             "models":self.model_catalog,"efforts":efforts,"applied":if self.pending_model.is_some() || (self.proc.shared() && self.current_turn.is_some()) {"next_turn"} else {"immediate"},
             "capabilities":{"model":true,"effort":efforts.as_array().is_some_and(|v| !v.is_empty()),
-                "reset_model":self.default_model.as_deref().is_some_and(|id| super::models::selected(&self.model_catalog, Some(id)).is_some()),
+                "reset_model":default_model.is_some(),
                 "reset_effort":selected.is_some_and(|v| v["default_effort"].is_string())}}),
         )
     }
@@ -2506,6 +2511,30 @@ mod tests {
             matches!(driver.classify(json!({
             "method": "turn/completed", "params": {"turn": {"id":"next-turn", "status":"completed"}}
         })).await, Some(HarnessEvent::TurnCompleted { outcome: TurnOutcome::Ok, error: None, .. }))
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_reset_confirmation_uses_the_device_default_instead_of_the_catalog_default() {
+        let mut driver = CodexDriver::test_responder(
+            Some("thread"),
+            &[
+                json!({"id":1,"result":{"data":[
+                    {"model":"recommended","isDefault":true,"defaultReasoningEffort":"medium"},
+                    {"model":"configured","isDefault":false,"defaultReasoningEffort":"high"}
+                ],"nextCursor":null}}),
+                json!({"id":2,"result":{"config":{"model":"configured"}}}),
+            ],
+        );
+        let settings = driver.model_control(None).await.unwrap();
+        assert_eq!(settings["default_model"], "configured");
+        let patch = super::super::models::ModelPatch::parse(&json!({"model":null})).unwrap();
+        let settings = driver.model_control(Some(&patch)).await.unwrap();
+        assert_eq!(settings["pending"]["model"], settings["default_model"]);
+        assert_eq!(
+            driver.model_control(None).await.unwrap()["default_model"],
+            "configured"
         );
         driver.shutdown().await.unwrap();
     }

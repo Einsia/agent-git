@@ -10,6 +10,11 @@ native writer.
 Capabilities explicitly advertise model/effort writes and each reset operation.
 An absent effort value with `effort_known: false` means unknown, not default.
 `settings_unknown: true` means a native acknowledgement is still outstanding.
+Codex also returns `default_model`, the normalized model that a reset selects
+from the device's project configuration. The catalog's `is_default` does not
+override that configuration. Claude confirms a model reset with
+`selected_model: "default"`. If `pending` supplies next-turn settings, those
+values are confirmed independently of the current turn's `effort_known` flag.
 
 `session.setModel` accepts `session_id` and optional `model` and `effort` fields.
 An omitted field remains unchanged. Null restores an advertised default; an
