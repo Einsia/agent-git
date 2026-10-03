@@ -232,6 +232,7 @@ pub fn authorize(
                             | "session.subscribe"
                             | "session.model"
                             | "session.commands"
+                            | "session.command"
                             | "session.enqueue"
                             | "turn.start"
                             | "turn.steer"
@@ -408,7 +409,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn managed_source_turns_require_control_and_use_executor_identity() {
+    fn managed_source_operations_preserve_executor_identity_and_access() {
         let principal = Principal {
             issuer: "https://cloud.example".into(),
             account_id: "operator".into(),
@@ -521,6 +522,54 @@ mod tests {
                 .is_err()
             );
         }
+        let command = Frame::request(
+            "session.command",
+            json!({
+                "session_id":"agit-managed", "name":"compact", "arguments":{},
+                "source_id":"forged", "source_generation":1,
+                "native_session_id":"foreign", "expected_cwd":"/private"
+            }),
+        );
+        let (admitted, permit) = authorize(
+            command.clone(),
+            &principal,
+            &policy(Access::Admin),
+            &mut resources,
+        )
+        .unwrap();
+        let params = admitted.params.unwrap();
+        assert_eq!(params["session_id"], "agit-managed");
+        assert_eq!(params["source_id"], "source-a");
+        assert_eq!(params["source_generation"], 3);
+        assert_eq!(params["native_session_id"], "native");
+        assert_eq!(params["expected_cwd"], "/project");
+        assert!(!permit.authority_matches(
+            &resources,
+            &policy(Access::Control),
+            &principal,
+            "operator"
+        ));
+        assert!(
+            authorize(
+                command,
+                &principal,
+                &policy(Access::Control),
+                &mut resources
+            )
+            .is_err()
+        );
+        assert!(
+            authorize(
+                Frame::request(
+                    "session.command",
+                    json!({"session_id":reference, "name":"compact"})
+                ),
+                &principal,
+                &policy(Access::Admin),
+                &mut resources,
+            )
+            .is_err()
+        );
     }
 
     #[test]
