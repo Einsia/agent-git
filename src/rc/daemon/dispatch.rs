@@ -375,6 +375,19 @@ impl Daemon {
                 Ok(serde_json::json!({}))
             }
 
+            method::SESSION_PERMISSIONS => {
+                let p: SessionSubscribe = f.params_as()?;
+                self.session_channel(&p.session_id, &caller, Need::Read)?;
+                let live = &self.sessions[&p.session_id];
+                Ok(serde_json::to_value(crate::protocol::SessionPermissionsResult {
+                    mode: live.info.permission_mode,
+                    pending_mode: live.pending_mode,
+                    changing: live.rpc_gate.try_lock().is_err(),
+                    last_seq: self.journal.last_seq(&p.session_id),
+                })
+                .unwrap())
+            }
+
             method::SESSION_SUBSCRIBE => {
                 let p: SessionSubscribe = f.params_as()?;
                 // **Subscribing is an ownership check too.**

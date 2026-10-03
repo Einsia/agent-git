@@ -99,11 +99,33 @@ async fn viewers_read_metadata_while_writer_control_is_guarded() {
     let mut live = rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Bypass);
     live.info.dangerous = true;
     live.restart_guard_attempts.insert("pending-restart".into());
+    live.pending_mode = Some(crate::protocol::PermissionMode::Plan);
+    let serial = live.rpc_gate.clone().lock_owned().await;
     let daemon = rpc_test_daemon(
         [("session-a".into(), live)].into_iter().collect(),
         Roster::default(),
     );
     let mut state = daemon.lock().await;
+    let (frames, _received) = mpsc::channel(1);
+    let mut permissions = Frame::request(
+        method::SESSION_PERMISSIONS,
+        serde_json::json!({"session_id":"session-a"}),
+    );
+    permissions.caller = Some(claim("viewer", "ws-a"));
+    assert_eq!(
+        state.dispatch(&permissions, &frames).await.unwrap(),
+        serde_json::json!({
+            "mode":"bypass", "pending_mode":"plan", "changing":true, "last_seq":0
+        })
+    );
+    assert!(state.sessions["session-a"].rpc_gate.try_lock().is_err());
+    drop(serial);
+    assert_eq!(
+        state.dispatch(&permissions, &frames).await.unwrap()["changing"],
+        false
+    );
+    permissions.caller = Some(claim("viewer", "another-workspace"));
+    assert!(state.dispatch(&permissions, &frames).await.is_err());
     for method_name in [method::SESSION_COMMANDS, method::SESSION_MODEL] {
         let mut frame = Frame::request(method_name, serde_json::json!({"session_id":"session-a"}));
         frame.caller = Some(claim("viewer", "ws-a"));

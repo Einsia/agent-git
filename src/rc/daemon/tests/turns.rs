@@ -23,6 +23,8 @@ fn shared_permission_receipts_do_not_reapply_stale_defaults_or_claim_a_stopped_t
         if let Ok(reply) = reply {
             assert_eq!(reply["native_default"], true);
             assert_eq!(reply["applied"], "next_turn");
+        } else {
+            assert_eq!(reply.unwrap_err().data.unwrap()["outcome"], "unknown");
         }
     }
 }

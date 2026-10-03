@@ -1327,8 +1327,11 @@ fn project_permission_mode_outcome(
         ),
         PermissionModeOutcome::SharedUnknown { message } => (
             SessionRpcCompletion::None,
-            Err(RpcError::new(ErrorCode::RuntimeUnavailable, message)
-                .with_hint("native defaults are unconfirmed; the shared task continues and output remains subscribed")),
+            Err(RpcError {
+                code: ErrorCode::RuntimeUnavailable.code(),
+                message,
+                data: Some(serde_json::json!({"outcome":"unknown", "retryable":false})),
+            }),
         ),
         PermissionModeOutcome::Applied { applied } => (
             SessionRpcCompletion::PermissionMode {
@@ -1352,9 +1355,11 @@ fn project_permission_mode_outcome(
                 recovery_token: None,
                 retire_generation: false,
             },
-            Err(RpcError::new(ErrorCode::RuntimeUnavailable, message).with_hint(
-                "the harness explicitly refused the mode change; its native policy was not changed",
-            )),
+            Err(RpcError {
+                code: ErrorCode::RuntimeUnavailable.code(),
+                message,
+                data: Some(serde_json::json!({"retryable":false})),
+            }),
         ),
         PermissionModeOutcome::Unknown { message } => (
             SessionRpcCompletion::PermissionMode {
@@ -1589,7 +1594,8 @@ fn min_role(method_name: &str) -> Role {
         | method::SESSION_CATALOG_SETTINGS
         | method::SESSION_SUBSCRIBE
         | method::SESSION_COMMANDS
-        | method::SESSION_MODEL => Role::Viewer,
+        | method::SESSION_MODEL
+        | method::SESSION_PERMISSIONS => Role::Viewer,
         // A read-only watch **is a read**: it tails a transcript and writes back not one byte.
         // The hub deliberately keeps these two verbs outside the operator gate (its comment says
         // that blocking a viewer only turns "that session is open" into a guessing game). Calling

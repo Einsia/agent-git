@@ -190,6 +190,15 @@ so other subscribers see the same defaults. During an active turn these defaults
 apply to subsequent turns; the existing turn continues under its original
 settings. Private runtimes retain their driver-specific update behavior.
 
+Executors advertising `session-permissions-v1` also accept the read-only
+`session.permissions` request with `session_id`. Its `mode` and `pending_mode`
+describe the current policy and the queued next-turn selection; null means unknown
+or no queued selection respectively. `changing` reports an outstanding writer,
+and `last_seq` bounds the observation in the session event stream. This read does
+not wait for, release, or bypass a writer's authorization guard. After losing a
+permission-change reply, clients reconcile this state instead of replaying the
+mutation. A different observed value is not proof that an uncertain write failed.
+
 `session.setPermissionMode` updates shared native defaults directly. It does not
 wait for another RC-submitted turn: subsequent native CLI turns and queued inputs
 use those defaults. An active turn retains the policy captured when it started.

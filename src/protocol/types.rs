@@ -892,6 +892,16 @@ pub struct SessionSetPermissionModeResult {
     pub applied: PermissionApply,
 }
 
+/// Read-only permission state at the session event watermark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPermissionsResult {
+    pub mode: Option<PermissionMode>,
+    pub pending_mode: Option<PermissionMode>,
+    /// A writer may still change the observed policy after this snapshot.
+    pub changing: bool,
+    pub last_seq: u64,
+}
+
 /// `session.permissionMode` carries the latest permission observation.
 ///
 /// Sent to every viewer, not just the one who asked: two people watching one

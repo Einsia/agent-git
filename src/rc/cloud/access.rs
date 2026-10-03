@@ -188,6 +188,7 @@ pub fn authorize(
         | "session.unwatch"
         | "session.commands"
         | "session.model"
+        | "session.permissions"
         | "session.resume"
         | "session.enqueue"
         | "turn.start"
@@ -231,6 +232,7 @@ pub fn authorize(
                         "session.history"
                             | "session.subscribe"
                             | "session.model"
+                            | "session.permissions"
                             | "session.commands"
                             | "session.command"
                             | "session.enqueue"
@@ -299,6 +301,7 @@ pub fn authorize(
                     | "session.unwatch"
                     | "session.commands"
                     | "session.model"
+                    | "session.permissions"
                     | "session.catalog.settings"
             ) {
                 Need::Read
@@ -477,6 +480,19 @@ mod tests {
             "operator"
         ));
         assert!(authorize(delivery, &principal, &policy(Access::Read), &mut resources).is_err());
+        let (permissions, permit) = authorize(
+            Frame::request("session.permissions", json!({"session_id":"agit-managed"})),
+            &principal,
+            &policy(Access::Read),
+            &mut resources,
+        )
+        .unwrap();
+        assert_eq!(
+            permissions.params.as_ref().unwrap()["session_id"],
+            "agit-managed"
+        );
+        assert!(permit.authority_matches(&resources, &policy(Access::Read), &principal, "viewer"));
+        assert!(!permit.authority_matches(&resources, &Policy::default(), &principal, "viewer"));
         for method in ["turn.start", "turn.steer"] {
             let request = Frame::request(
                 method,

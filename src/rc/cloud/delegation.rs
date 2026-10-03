@@ -353,6 +353,7 @@ impl Controller {
                         | "session.unwatch"
                         | "session.commands"
                         | "session.model"
+                        | "session.permissions"
                         | "session.catalog.settings"
                 ),
                 "controller mutations require an authenticated actor"
@@ -781,7 +782,7 @@ mod tests {
         let mut replacement = controller.clone();
         replacement.owner.generation += 1;
         assert_ne!(watch_owner, replacement.watch_owner().unwrap());
-        for method in ["session.watch", "session.unwatch"] {
+        for method in ["session.watch", "session.unwatch", "session.permissions"] {
             let (mut frame, _) = access::authorize(
                 Frame::request(method, json!({"session_id":"shared"})),
                 &principal,
