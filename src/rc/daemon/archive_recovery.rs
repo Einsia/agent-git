@@ -17,6 +17,7 @@ pub(super) fn start(
 ) -> Worker {
     Worker(tokio::spawn(async move {
         let mut cursor = 0usize;
+        let mut observed = super::observed_capture::Collector::default();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -25,6 +26,7 @@ pub(super) fn start(
                 _ = stop.wait_for(|stopped| *stopped) => break,
                 _ = interval.tick() => {}
             }
+            observed.reconcile(&daemon, &admission, &mut stop).await;
             let mut jobs = match tokio::task::spawn_blocking(crate::rc::archive_jobs::pending).await
             {
                 Ok(Ok(jobs)) => jobs,

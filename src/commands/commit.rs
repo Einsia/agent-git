@@ -1100,13 +1100,20 @@ enum InFlight {
 /// finds the count unchanged and reports "nothing new". Once half a turn lands as a commit, that
 /// turn's second half can only ever hang off the next turn.
 ///
-/// Pairing is therefore a hard test: any open tool call ([`OpenCall`]) that falls inside the
-/// trailing turn means the turn has not ended. A call left open in an earlier turn does not count
+/// Without a terminal native record, any open tool call ([`OpenCall`]) inside the trailing turn
+/// means the turn has not ended. A call left open in an earlier turn does not count
 /// — a later user prompt already closed that turn, and [`crate::domain::install`] fills in a
 /// placeholder output for it when the transcript goes back into a runtime.
 fn in_flight_tail(ir: &Session, open: &[OpenCall]) -> Option<InFlight> {
     let groups = crate::domain::turn::groups_of(ir);
     let last_g = groups.last()?;
+    // A terminal native record closes canceled tools as well as successful replies.
+    if last_g
+        .iter()
+        .any(|&index| ir.events[index].kind == EventKind::TurnEnd)
+    {
+        return None;
+    }
     let answered = last_g.iter().any(|&j| {
         matches!(
             ir.events[j].kind,
@@ -1139,8 +1146,30 @@ pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<boo
 
 #[cfg(feature = "rc")]
 pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Result<Option<u64>> {
+    if runtime == "claude-code" {
+        return Ok(crate::adapter::claude_code::completed_turn_boundary(text)
+            .map(|boundary| boundary as u64));
+    }
     let adapter = crate::adapter::get(runtime)?;
     let session = adapter.parse(text)?;
+    if adapter.requires_turn_end() {
+        // A returned tool or commentary message does not close the native user turn.
+        let Some(line) = session
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == EventKind::TurnEnd)
+            .and_then(|event| event.line)
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            text.split_inclusive('\n')
+                .take(line + 1)
+                .map(str::len)
+                .sum::<usize>() as u64,
+        ));
+    }
     Ok(turn_chunks(text, &session, &adapter.open_tool_calls(text))
         .last()
         .map(|chunk| chunk.end_byte as u64))
@@ -3999,6 +4028,59 @@ mod tests {
         format!(
             "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{t}\"}}]}}}}\n"
         )
+    }
+
+    #[cfg(feature = "rc")]
+    #[test]
+    fn native_archive_waits_for_turn_end_after_tool_results_and_commentary() {
+        let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+        let first = format!("{META}\n{}{}", codex_user("first"), codex_asst("ready"));
+        assert_eq!(completed_native_boundary("codex", &first).unwrap(), None);
+        let settled = format!("{first}{end}");
+        let mut active = format!(
+            "{settled}{}{}{}{}",
+            codex_user("continue"),
+            codex_asst("Working"),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec\",\"call_id\":\"call\",\"arguments\":\"{}\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call\",\"output\":\"done\"}}\n",
+        );
+        for suffix in [codex_asst("More work"), codex_asst("Final answer")] {
+            active.push_str(&suffix);
+            assert_eq!(
+                completed_native_boundary("codex", &active).unwrap(),
+                Some(settled.len() as u64)
+            );
+        }
+        active.push_str(end);
+        assert_eq!(
+            completed_native_boundary("codex", &active).unwrap(),
+            Some(active.len() as u64)
+        );
+        let aborted = format!(
+            "{active}{}{}{}{}",
+            codex_user("cancel this turn"),
+            codex_asst("Starting the requested work"),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec\",\"call_id\":\"pending\",\"arguments\":\"{}\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"reason\":\"interrupted\"}}\n",
+        );
+        assert_eq!(
+            completed_native_boundary("codex", &aborted).unwrap(),
+            Some(aborted.len() as u64)
+        );
+        let ir = crate::adapter::get("codex")
+            .unwrap()
+            .parse(&aborted)
+            .unwrap();
+        assert_eq!(crate::domain::turn::completed_count(&ir), 3);
+        assert!(!has_in_flight_turn("codex", &aborted).unwrap());
+        let adapter = crate::adapter::get("codex").unwrap();
+        assert_eq!(
+            turn_chunks(&aborted, &ir, &adapter.open_tool_calls(&aborted))
+                .last()
+                .unwrap()
+                .end_byte,
+            aborted.len()
+        );
     }
 
     fn opts() -> SettleOpts {

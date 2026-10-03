@@ -389,7 +389,11 @@ impl Daemon {
             .and_then(|projects| {
                 projects
                     .iter()
-                    .find(|(_, root)| cwd.starts_with(Path::new(root)))
+                    .filter(|(id, root)| {
+                        cwd.starts_with(Path::new(root))
+                            && frame.authority.check_project(id, Path::new(root)).is_ok()
+                    })
+                    .max_by_key(|(_, root)| Path::new(root).components().count())
                     .map(|(id, _)| id.clone())
             });
         // The stream id comes from the thread id — several people watching the same
@@ -732,7 +736,14 @@ impl Daemon {
             }
         }
 
-        Ok(serde_json::to_value(SessionWatchResult {
+        let (archive_session, archive_error) =
+            match self.retain_observed_capture(&info, &current_cwd) {
+                Ok(session) => (session, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        let result = serde_json::to_value(SessionWatchResult {
+            archive_session,
+            archive_error,
             before_cursor,
             history_error,
             session: self.stamped(
@@ -748,7 +759,8 @@ impl Daemon {
             native_inbox,
             model_settings,
         })
-        .unwrap())
+        .unwrap();
+        Ok(result)
     }
 }
 
@@ -1110,7 +1122,8 @@ mod watch_activity_tests {
                 "item.completed",
                 "turn.started",
                 "item.completed",
-                "turn.completed"
+                "turn.completed",
+                "item.completed"
             ]
         );
         assert_eq!(
@@ -1129,6 +1142,11 @@ mod watch_activity_tests {
         );
         assert_eq!(frames[5].params.as_ref().unwrap()["line"], 29);
         assert_eq!(frames[6].params.as_ref().unwrap()["outcome"], "interrupted");
+        assert_eq!(frames[7].params.as_ref().unwrap()["line"], 31);
+        assert_eq!(
+            frames[7].params.as_ref().unwrap()["event"]["kind"],
+            "turn_end"
+        );
     }
 
     #[test]

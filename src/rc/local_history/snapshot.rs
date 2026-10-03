@@ -21,6 +21,8 @@ const MAX_SNAPSHOTS: usize = 8;
 const LIFETIME: Duration = Duration::from_secs(600);
 
 struct Snapshot {
+    archive: Option<archive::Anchor>,
+    floor: u64,
     parts: Vec<Segment>,
     native_items: Option<Vec<Value>>,
     bytes: u64,
@@ -248,10 +250,21 @@ pub(super) fn read(
         .context
         .as_ref()
         .map(|context| (&context.source.source_id, context.source.generation));
-    let scope = json!([runtime, native, cwd, source]).to_string();
+    let anchor = archive::Anchor::parse(params)?;
+    let scope = json!([runtime, native, cwd, source, anchor]).to_string();
     let cache = SNAPSHOTS.get_or_init(Default::default);
     let (token, snapshot) = timings.measure("snapshot_ms", || {
-        cache.snapshot(scope, token, || capture(target, cache))
+        cache.snapshot(scope, token, || {
+            let mut snapshot = capture(target, cache)?;
+            if let Some(anchor) = anchor {
+                // Missing or changed evidence falls back to a complete native page.
+                if let Ok(floor) = anchor.floor(target, &mut snapshot.parts) {
+                    snapshot.floor = floor;
+                    snapshot.archive = Some(anchor);
+                }
+            }
+            Ok(snapshot)
+        })
     })?;
     // Only readers of the same immutable snapshot share file cursor positions.
     let mut entry = timings
@@ -287,7 +300,10 @@ pub(super) fn read(
         }
     } else {
         let redactor = timings.measure("protection_context_ms", || target.redactor())?;
-        let mut cursor = before;
+        let floor = entry.floor;
+        let mut cursor = before
+            .map(|before| before.checked_add(floor).context(Failure::InvalidCursor))
+            .transpose()?;
         let mut skipped = 0;
         // Metadata-only tails must not cost another network round trip. Bound the scan
         // so transcripts without presentable records cannot monopolize the history worker.
@@ -295,6 +311,8 @@ pub(super) fn read(
             let (lines, next, mode, context) =
                 timings.measure("page_ms", || -> crate::Result<_> {
                     let (mut lines, next, mode) = page_segments(&mut entry.parts, cursor)?;
+                    lines.retain(|line| line.lineno >= floor);
+                    let next = next.max(floor);
                     validate_records(runtime, &lines)?;
                     let context = select_view(&mut lines, runtime, params);
                     Ok((lines, next, mode, context))
@@ -331,8 +349,8 @@ pub(super) fn read(
             for (name, elapsed) in projection_phases {
                 *timings.0.entry(name).or_default() += elapsed;
             }
-            if !items.is_empty() || next == 0 || skipped == 7 {
-                break (items, next);
+            if !items.is_empty() || next == floor || skipped == 7 {
+                break (items, next - floor);
             }
             ensure!(
                 cursor.is_none_or(|before| next < before),
@@ -342,8 +360,17 @@ pub(super) fn read(
             skipped += 1;
         }
     };
-    let result =
-        json!({"items":items,"before":next,"has_more":next>0,"snapshot":token,"status":"complete"});
+    let mut remaining = entry.floor;
+    let archived_sources: Vec<_> = entry.parts.iter().filter_map(|part| {
+        let before = remaining.min(part.end);
+        remaining -= before;
+        (before > 0).then(|| {
+            let identity = super::super::tail::record_source(&part.source, 0);
+            json!({"prefix":identity.strip_suffix('0').expect("zero byte coordinate"),"before":before})
+        })
+    }).collect();
+    let result = json!({"items":items,"before":next,"has_more":next>0,"snapshot":token,
+        "status":"complete","after_archive":entry.archive,"archived_sources":archived_sources});
     ensure!(
         timings
             .measure("size_check_ms", || serde_json::to_vec(&result))?
@@ -362,6 +389,8 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
         ..
     } = target;
     let mut snapshot = Snapshot {
+        archive: None,
+        floor: 0,
         _budget: cache.reserve(0)?,
         _file_budget: None,
         parts: vec![],
@@ -584,6 +613,8 @@ mod tests {
         let cache = Cache::default();
         let make = || {
             Ok(Snapshot {
+                archive: None,
+                floor: 0,
                 parts: vec![],
                 native_items: None,
                 bytes: 1,
@@ -643,6 +674,8 @@ mod tests {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(Snapshot {
+                    archive: None,
+                    floor: 0,
                     parts: vec![],
                     native_items: None,
                     bytes: 1,
@@ -661,6 +694,8 @@ mod tests {
             follower_cache.snapshot("scope".into(), None, || {
                 follower_captures.fetch_add(1, Ordering::Relaxed);
                 Ok(Snapshot {
+                    archive: None,
+                    floor: 0,
                     parts: vec![],
                     native_items: None,
                     bytes: 1,

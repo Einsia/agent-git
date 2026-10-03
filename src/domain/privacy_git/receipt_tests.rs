@@ -13,6 +13,26 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[test]
 fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence() {
     use agit_peer::publication::Receipt;
+    const CHILD: &str = "AGIT_RECEIPT_RECLAMATION_FIXTURE";
+    if std::env::var_os(CHILD).is_none() {
+        // Concurrent test forks can temporarily inherit a publication lock before exec closes it.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "domain::privacy_git::receipt_tests::receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated receipt reclamation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let source = Repo::init(&directory.path().join("source")).unwrap();
     source.git(&["config", "user.name", "Fixture"]).unwrap();

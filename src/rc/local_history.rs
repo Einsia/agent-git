@@ -1,4 +1,5 @@
 //! Read-only pages addressed by native transcript byte boundaries.
+mod archive;
 mod snapshot;
 mod transfer;
 

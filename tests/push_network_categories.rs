@@ -150,7 +150,7 @@ impl Lab {
                 .output()
                 .unwrap();
             assert!(scan.status.success(), "{scan:?}");
-            self.no_requests();
+            self.no_publication_requests();
         }
         path
     }
@@ -235,11 +235,37 @@ impl Lab {
             .collect()
     }
 
-    fn no_requests(&self) {
-        assert_eq!(
-            self.hub.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+    fn no_publication_requests(&self) {
+        loop {
+            let mut stream = match self.hub.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("loopback accept failed: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                header.push(byte[0]);
+                assert!(header.len() <= 65536, "request header exceeded its bound");
+            }
+            let header = String::from_utf8(header).unwrap();
+            let first = header.lines().next().unwrap();
+            // Declaration synchronization can outlive the publication command it accompanies.
+            assert!(
+                first.starts_with("GET /api/me/privacy/"),
+                "unexpected publication request: {first}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        }
     }
 }
 
@@ -508,7 +534,7 @@ fn dry_run_reads_destination_mode_without_pinning_or_publishing() {
     server.finish();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(lab.state(), before);
-    lab.no_requests();
+    lab.no_publication_requests();
 }
 
 #[test]
@@ -553,7 +579,7 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
                     ],
                 );
             }
-            lab.no_requests();
+            lab.no_publication_requests();
             let before = lab.state();
             let refs = lab.git(&path, &["show-ref"]);
             let get = format!("GET /api/agents/{target}");
@@ -586,7 +612,7 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
             if owner == "other" {
                 assert!(!lab.home.join("repos/alice/qa").exists());
             }
-            lab.no_requests();
+            lab.no_publication_requests();
         }
     }
 }
@@ -602,7 +628,7 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
             for rejection in [428, 503] {
                 let lab = Lab::new();
                 let path = lab.seed("team", "qa", true);
-                lab.no_requests();
+                lab.no_publication_requests();
                 let before = lab.state();
                 let refs = lab.git(&path, &["show-ref"]);
                 let server = Server::start(
@@ -627,7 +653,7 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
                 assert_eq!(lab.state(), before, "{mode}/{visibility:?}/{rejection}");
                 assert_eq!(lab.git(&path, &["show-ref"]), refs);
                 assert!(!lab.home.join("repos/alice/qa").exists());
-                lab.no_requests();
+                lab.no_publication_requests();
             }
         }
     }
@@ -648,7 +674,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
     ] {
         let lab = Lab::new();
         let path = lab.seed("team", "qa", true);
-        lab.no_requests();
+        lab.no_publication_requests();
         let before = lab.state();
         let refs = lab.git(&path, &["show-ref"]);
         let confirmed = case == "confirmed-private";
@@ -754,7 +780,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
         );
         assert_eq!(lab.git(&path, &["show-ref"]), refs);
         assert!(!lab.home.join("repos/alice/qa").exists());
-        lab.no_requests();
+        lab.no_publication_requests();
     }
 }
 
@@ -782,7 +808,7 @@ fn identity_constraints_and_invalid_remote_ids_refuse_without_writes() {
                 )
                 .unwrap();
             }
-            lab.no_requests();
+            lab.no_publication_requests();
             let before = lab.state();
             let reply = match case {
                 "pinned-404" => Reply::Status(404),
@@ -805,7 +831,7 @@ fn identity_constraints_and_invalid_remote_ids_refuse_without_writes() {
             let message = assert_failure(&output, mode, code);
             assert!(!message.contains("publishing qa"));
             assert_eq!(lab.state(), before, "{case}: {mode} changed local files");
-            lab.no_requests();
+            lab.no_publication_requests();
         }
     }
 }
@@ -829,7 +855,7 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
             &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
         )
         .unwrap();
-        lab.no_requests();
+        lab.no_publication_requests();
         let before = lab.state();
         let refs = lab.git(&path, &["show-ref"]);
         let url = format!("{}/alice/qa.git", lab.base);
@@ -886,7 +912,7 @@ fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_rep
             "HTTP {status}: {mode} changed publication state"
         );
         assert!(!lab.home.join("repos/alice/qa-2").exists());
-        lab.no_requests();
+        lab.no_publication_requests();
     }
 }
 
@@ -940,7 +966,7 @@ fn separate_destination_of_an_encrypted_source_stays_encrypted_by_default() {
         let text = assert_failure(&output, "json2", code);
         assert!(text.contains(message), "{output:?}");
         assert_eq!(lab.state(), before);
-        lab.no_requests();
+        lab.no_publication_requests();
     }
 }
 
@@ -1036,7 +1062,7 @@ fn rc_land_local_recovery_and_reused_identity_fail_before_history_mutation() {
             assert!(!lab.home.join("repos").exists());
             assert!(!lab.home.join("store").exists());
             assert!(!lab.home.join("rc/agitd.pid").exists());
-            lab.no_requests();
+            lab.no_publication_requests();
         }
     }
 }
@@ -1122,7 +1148,7 @@ fn rc_land_clone_outcomes_keep_known_categories_and_retain_recovery_evidence() {
                 "{text}"
             );
             assert_rc_clone_recovery(&lab, before, true);
-            lab.no_requests();
+            lab.no_publication_requests();
         }
     }
 }
@@ -1145,6 +1171,6 @@ fn rc_land_invalid_remote_urls_stay_unclassified_and_do_not_reach_git_transport(
         assert!(text.contains("encoded path separator"), "{text}");
         assert!(!text.contains("could not clone alice/qa for RC settlement"));
         assert_rc_clone_recovery(&lab, before, false);
-        lab.no_requests();
+        lab.no_publication_requests();
     }
 }

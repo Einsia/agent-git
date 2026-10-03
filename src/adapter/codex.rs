@@ -1160,9 +1160,11 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
             }
             "event_msg" => {
                 let Some(p) = payload else { continue };
-                // This turn is done. There is one per human turn (a turn still running has
-                // none), so it is a reliable close signal.
-                if p.get("type").and_then(|x| x.as_str()) == Some("task_complete") {
+                // Completion and cancellation both close the native turn without adding content.
+                if matches!(
+                    p.get("type").and_then(|x| x.as_str()),
+                    Some("task_complete" | "turn_aborted")
+                ) {
                     events.push(Event {
                         kind: EventKind::TurnEnd,
                         text: None,

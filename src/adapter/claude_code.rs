@@ -32,6 +32,33 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
+/// Tool results and intermediate assistant records cannot settle an observed user turn.
+#[cfg(feature = "rc")]
+pub(crate) fn completed_turn_boundary(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut completed = None;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["isSidechain"] == true || record["isMeta"] == true {
+            continue;
+        }
+        let terminal_reply = record["type"] == "assistant"
+            && matches!(
+                record
+                    .pointer("/message/stop_reason")
+                    .and_then(|v| v.as_str()),
+                Some("end_turn" | "stop_sequence" | "max_tokens")
+            );
+        if terminal_reply || (record["type"] == "system" && record["subtype"] == "turn_duration") {
+            completed = Some(offset);
+        }
+    }
+    completed
+}
+
 /// A generated assistant without a source model must not select a model on resume.
 pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 
@@ -1144,6 +1171,32 @@ fn extract_paths(input: Option<&serde_json::Value>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rc")]
+    #[test]
+    fn observed_capture_requires_a_terminal_reply_or_turn_duration() {
+        let progress = concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"done\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":null,\"content\":[{\"type\":\"text\",\"text\":\"Working\"}]}}\n",
+        );
+        assert_eq!(super::completed_turn_boundary(progress), None);
+        for terminal in [
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\"}}\n",
+            "{\"type\":\"system\",\"subtype\":\"turn_duration\"}\n",
+        ] {
+            let complete = format!("{progress}{terminal}");
+            assert_eq!(
+                super::completed_turn_boundary(&complete),
+                Some(complete.len())
+            );
+            assert_eq!(
+                super::completed_turn_boundary(&format!("{complete}{progress}")),
+                Some(complete.len())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

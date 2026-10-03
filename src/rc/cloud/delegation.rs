@@ -649,11 +649,14 @@ mod tests {
             }
             let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
             let roots = mirror.roots(crate::rc::endpoint::WORKSPACE);
-            for _ in &sources {
+            // Default native homes share the incremental discovery queue with registered homes.
+            for _ in registry.list().unwrap() {
                 catalog.reconcile(&roots).unwrap();
             }
             let reference = sources[0].session_ref("copied");
             let other = sources[1].session_ref("copied");
+            assert!(catalog.lookup(&reference).unwrap().is_some());
+            assert!(catalog.lookup(&other).unwrap().is_some());
             let mut resources = Resources::load().unwrap();
             let session = resources.prepare_controller_source(&reference).unwrap();
             let pin = resources.pin_controller_source(session).unwrap();

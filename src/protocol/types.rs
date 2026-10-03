@@ -791,10 +791,8 @@ pub struct SessionSubscribeResult {
 
 /// Follow a session that is live in someone's terminal, read-only.
 ///
-/// Watching starts no process and writes nothing — it tails the transcript the
-/// harness is already appending to. That is why it is safe on a session that
-/// would be refused by `session.resume` (a second writer corrupts both
-/// histories; a reader corrupts nothing).
+/// Watching acquires no native input ownership. Completed turns enter ordinary
+/// Agit archives while the runtime remains the sole writer of its native transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWatch {
     pub workspace_id: String,
@@ -804,6 +802,11 @@ pub struct SessionWatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWatchResult {
+    /// Canonical archive identity is separate from the read-only stream alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_session: Option<SessionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_error: Option<String>,
     /// History paging can be unavailable while the live transcript remains readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_error: Option<String>,

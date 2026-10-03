@@ -310,8 +310,8 @@ pub enum EventKind {
 
     /// The runtime declaring "this turn is done".
     ///
-    /// Codex writes one `event_msg/task_complete` at the end of every turn — a turn still
-    /// running has none yet. **Claude Code has no equivalent**: its `system/turn_duration` does
+    /// Codex writes `event_msg/task_complete` or `event_msg/turn_aborted` when a turn ends — a
+    /// turn still running has neither. **Claude Code has no equivalent**: its `system/turn_duration` does
     /// not line up with the human turn count, in either direction, and it also fires for
     /// interruptions and system turns.
     ///

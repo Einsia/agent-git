@@ -54,6 +54,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 mod archive_recovery;
+mod capture_binding;
 /// The monotonic danger bit's tests plus its credential. **Every path that hands a harness
 /// transcript over has to collect a slip from here.**
 ///
@@ -65,6 +66,7 @@ mod catalog;
 mod danger;
 mod dispatch;
 mod guard;
+mod observed_capture;
 mod opening;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 pub(in crate::rc) mod project_publication;

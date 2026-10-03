@@ -916,7 +916,7 @@ async fn local_settlement_reports_persistence_without_a_private_sha() {
     }));
 }
 
-/// Local turns keep settling while published notifications remain unacknowledged on disk.
+/// Resumed history publishes without another turn, and later turns retain independent receipts.
 #[cfg(unix)]
 #[test]
 fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
@@ -1001,7 +1001,35 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 state.local_owner = true;
                 state.agent_identity_v1 = false;
             });
-            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            session.resuming = true;
+            session
+                .on_harness_event(HarnessEvent::Ready {
+                    runtime_thread_id: session.runtime_thread_id().unwrap(),
+                    transcript_path: None,
+                })
+                .await;
+            assert!(
+                session.idle_settlement_ready(),
+                "adopting existing history must schedule publication without a new turn"
+            );
+            let (_commands, mut commands) = mpsc::channel(1);
+            let mut frames = Vec::new();
+            {
+                let settle = async {
+                    assert!(session.settle_until_command(&mut commands).await.is_none());
+                    session.finish_local_settlement(true).await;
+                    session.finish_publication(true).await;
+                };
+                tokio::pin!(settle);
+                loop {
+                    tokio::select! {
+                        () = &mut settle => break,
+                        Some(frame) = out.recv() => frames.push(frame),
+                    }
+                }
+            }
+            frames.extend(std::iter::from_fn(|| out.try_recv().ok()));
+            assert!(!session.settlement_due);
             let first_source = fixture.head();
             let hints: Vec<_> = frames
                 .iter()

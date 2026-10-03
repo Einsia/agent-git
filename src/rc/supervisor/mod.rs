@@ -2735,9 +2735,8 @@ impl Session {
                     // Losing that prompt is what leaves a session nameless.
                     let same = self.tailer.as_ref().is_some_and(|t| t.path() == p);
                     if !same {
-                        // Start at the end when resuming an existing transcript:
-                        // the history is already in the repo, only new lines are
-                        // news. A fresh session must read from the start — see `resuming`.
+                        // Resume streams only new lines; saved history is reconciled
+                        // separately by settlement and need not exist in the repo yet.
                         self.tailer = Some(Tailer::new(p, !self.resuming));
                     }
                 }
@@ -2750,6 +2749,9 @@ impl Session {
                     self.sync_turn_guard(TurnGuardBarrier::Ready).await;
                 }
                 self.drain_transcript().await;
+                // Adopting native history creates a capture branch before it contains any
+                // turns. Queue settlement even if this attachment never receives new input.
+                self.settlement_due |= self.resuming && self.agit_session.is_some();
                 self.flush_initial_turn_if_ready().await;
             }
             HarnessEvent::TurnStartResolved(outcome) => {

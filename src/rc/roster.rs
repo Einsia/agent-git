@@ -187,6 +187,9 @@ pub enum StartClaim {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
+    /// Explicitly observed native sessions retain collection after their viewers disconnect.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) observed: BTreeSet<String>,
     /// Capture kind is independent of the current controller and survives native aliases.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) captures: BTreeMap<String, crate::rc::capture::RepositoryKind>,
@@ -340,6 +343,7 @@ pub(crate) fn fail_next_fallback_removals(count: usize) {
 impl Roster {
     fn unusable() -> Roster {
         Roster {
+            observed: BTreeSet::new(),
             captures: BTreeMap::new(),
             sessions: BTreeMap::new(),
             history_lost: true,
