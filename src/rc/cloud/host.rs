@@ -271,6 +271,7 @@ async fn run_executor(
                                 let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
                                 phase = "admission";
                                 let config = api.data_config(&enrollment.credential)?;
+                                let inline_grant = grant.is_some();
                                 let verification_source = if grant.is_some() { "presence" } else { "http" };
                                 let verification = async {
                                     let started = Instant::now();
@@ -278,13 +279,19 @@ async fn run_executor(
                                     ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
                                     Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
                                 };
-                                let transport = || async {
+                                let transport = |config| async {
                                     let started = Instant::now();
-                                    let raw = worker.open(config.clone()).await?;
+                                    let raw = worker.open(config).await?;
                                     Ok::<_, anyhow::Error>((raw, started.elapsed().as_secs_f64() * 1000.0))
                                 };
-                                // Raw transport carries no executor authority before grant validation and endpoint TLS.
-                                let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = verified_transport(verification, transport).await?;
+                                // A join-bearing upgrade must follow admission; speculative sockets carry no ticket.
+                                let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = if inline_grant {
+                                    let grant = verification.await?;
+                                    let config = api.admitted_data_config(&enrollment.credential, &grant.0, &ticket)?;
+                                    (grant, transport(config).await?, false)
+                                } else {
+                                    verified_transport(verification, || transport(config.clone())).await?
+                                };
                                 let transport_timing = raw.connect_timing;
                                 phase = "relay_pair";
                                 let paired = Instant::now();

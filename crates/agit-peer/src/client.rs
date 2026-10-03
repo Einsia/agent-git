@@ -534,6 +534,21 @@ impl Client {
     pub fn data_config(&self, device: &DeviceCredential) -> anyhow::Result<Config> {
         self.socket_config(device, "/api/peer/data")
     }
+
+    /// An admitted offer may join during upgrade; the ordinary join frame preserves older relays.
+    pub fn admitted_data_config(
+        &self,
+        device: &DeviceCredential,
+        grant: &ConnectionGrant,
+        ticket: &Secret,
+    ) -> anyhow::Result<Config> {
+        self.validate_executor_grant(device, grant)?;
+        let mut config = self.data_config(device)?;
+        if let Config::WebSocket { headers, .. } = &mut config {
+            headers.push(("X-Agit-Peer-Join".into(), ticket.expose().into()));
+        }
+        Ok(config)
+    }
 }
 
 fn same_endpoint(left: &Device, right: &Device) -> bool {
@@ -744,6 +759,18 @@ mod tests {
             grant.id
         );
         let serialized = serde_json::to_value(&grant).unwrap();
+        let Config::WebSocket { url, headers, .. } = client
+            .admitted_data_config(&executor, &grant, &Secret::new("join-ticket".into()))
+            .unwrap()
+        else {
+            panic!("cloud transport must remain a WebSocket");
+        };
+        assert_eq!(url, "ws://127.0.0.1:0/api/peer/data");
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "X-Agit-Peer-Join" && value == "join-ticket")
+        );
         assert!(serialized.get("session_controller").is_none());
         assert!(serialized.get("project_controller").is_none());
         assert!(
@@ -774,6 +801,11 @@ mod tests {
         assert!(client.validate_grant(&project).is_err());
         let mut stale = grant;
         stale.target.credential_epoch += 1;
+        assert!(
+            client
+                .admitted_data_config(&executor, &stale, &token)
+                .is_err()
+        );
         assert!(
             client
                 .offered_grant(&executor, &token, Some(stale))

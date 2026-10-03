@@ -40,6 +40,8 @@ for line in sys.stdin:
         transcript = directory / ("rollout-2026-09-15T00-00-00-" + native + ".jsonl")
         record("session_meta", {"id":native,"cwd":os.getcwd(),"originator":"codex_cli_rs","cli_version":"0.0.0-test"})
         result = {"thread":{"id":native}}
+    elif method == "thread/metadata/update":
+        result = {"thread":{"id":native}}
     elif method == "turn/start":
         turn = str(uuid.uuid4())
         emit({"id":request["id"],"result":{"turn":{"id":turn}}})
@@ -173,7 +175,9 @@ async def run(binary, hub, account, token):
         target = await executor.rpc("machine.describe")
         source_status = await controller.rpc("peer.cloud", operation="status", hub=hub)
         assert source_status["device"] is None
-        device = (await executor.rpc("peer.cloud", operation="status", hub=hub))["device"]
+        async def enrolled():
+            return (await executor.rpc("peer.cloud", operation="status", hub=hub))["device"]
+        device = await eventually(enrolled, "outbound executor enrollment did not complete")
         async def online():
             page = await controller.rpc("peer.cloud", operation="devices", hub=hub)
             return any(row["device"]["id"] == device["id"] and row["online"] for row in page["devices"])
@@ -184,6 +188,10 @@ async def run(binary, hub, account, token):
         assert connected["description"]["authority"] == "cloud-principal"
         assert "diagnostic_log" not in connected["description"]
         assert local["instance_id"] != target["instance_id"]
+        await executor.rpc("project.bind", workspace_id="local-owner", project_id="fixture", local_path=str(project))
+        async def project_visible():
+            return "fixture" in json.dumps(await controller.peer("workspace.list"))
+        await eventually(project_visible, "enrolled owner policy did not admit the fixture project")
         await controller.peer("project.bind", project_id="fixture", local_path=str(project))
         assert "fixture" in json.dumps(await controller.peer("workspace.list"))
         start = dict(project_id="fixture", runtime="codex", start_id=str(uuid.uuid4()))
