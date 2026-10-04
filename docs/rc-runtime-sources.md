@@ -330,3 +330,16 @@ not-sent refusal releases its claim so the same operation can be retried. Receip
 files contain the request digest and result, not the prompt. Cloud identities are
 scoped to the authenticated principal. Storage work runs outside the routing loop
 so pending writes do not stall other clients' reads or model output.
+
+### Turn-fenced Codex interrupts
+
+Executors advertising `codex-turn-interrupt-fence-v1` accept an optional
+`expected_turn_id` on `turn.interrupt` for Codex sessions. The identifier must be
+from the native `turn.started` event. Each retry must retain the same identifier;
+it must never select a newer turn. A completed or superseded turn is a successful
+no-op and does not abandon approvals belonging to the current turn.
+
+The shared source reads current native turn state before dispatch and addresses
+the interrupt to that exact native turn. Other runtimes reject the fence because
+their native cancellation interfaces do not enforce a turn identifier. Clients
+must negotiate support before retrying an uncertain stop automatically.

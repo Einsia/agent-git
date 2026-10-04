@@ -83,7 +83,7 @@ impl Session {
             Command::Model { reply, .. }
             | Command::Runtime { reply, .. }
             | Command::Enqueue { reply, .. } => reply.check_control(requires_owner),
-            Command::Interrupt { reply } => reply.check_control(false),
+            Command::Interrupt { reply, .. } => reply.check_control(false),
             Command::Approve { reply, .. } => reply.check_control(false),
             Command::SetPermissionMode { reply, mode, .. } => {
                 reply.check_control(mode.loosens_from(self.driver.permission_mode()))
@@ -171,7 +171,7 @@ impl Session {
                 }))
             }
             Command::Steer { reply, .. } => reply.finish(Err(error)),
-            Command::Interrupt { reply } => reply.finish(Err(error)),
+            Command::Interrupt { reply, .. } => reply.finish(Err(error)),
             Command::Approve { reply, .. } => reply.finish(Err(error)),
             Command::SetPermissionMode { reply, .. } => reply.finish(Err(error)),
             Command::Model { reply, .. }
@@ -439,6 +439,7 @@ mod tests {
         session.info.dangerous = true;
         assert!(session.check_control_instruction(&turn).is_err());
         let brake = Command::Interrupt {
+            expected_turn_id: None,
             reply: crate::rc::ticket::ticket().0.with_control_ceiling(false),
         };
         session.check_control_instruction(&brake).unwrap();

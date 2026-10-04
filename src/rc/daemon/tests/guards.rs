@@ -568,6 +568,7 @@ fn restart_ready_clears_only_its_spawn_snapshot_after_a_durable_save() {
                 let mut interrupt = Frame::request(
                     method::TURN_INTERRUPT,
                     TurnInterrupt {
+                        expected_turn_id: None,
                         session_id: "session-a".into(),
                         by: Some("operator".into()),
                     },

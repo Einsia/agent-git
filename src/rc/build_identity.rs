@@ -13,6 +13,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "publication-delivery-v1",
     "session-publication-status-v1",
     "session-permissions-v1",
+    "codex-turn-interrupt-fence-v1",
     "project-publication-bind-v1",
     "source-catalog-v1",
     "source-catalog-resolve-v1",

@@ -1044,6 +1044,7 @@ pub enum Command {
         reply: Ticket<Delivery>,
     },
     Interrupt {
+        expected_turn_id: Option<String>,
         reply: Ticket<()>,
     },
     Approve {
@@ -1096,7 +1097,7 @@ fn accept(c: &Command) -> bool {
         | Command::Enqueue { reply, .. } => reply.accept(),
         Command::Turn { reply, .. } => reply.accept(),
         Command::Steer { reply, .. } => reply.accept(),
-        Command::Interrupt { reply } => reply.accept(),
+        Command::Interrupt { reply, .. } => reply.accept(),
         Command::Approve { reply, .. } => reply.accept(),
         Command::SetPermissionMode { reply, .. } => reply.accept(),
         Command::Shutdown => true,
@@ -2278,8 +2279,8 @@ impl Session {
                             }
                             reply.finish(result);
                         }
-                        Some(Command::Interrupt { reply }) => {
-                            let r = self.driver.interrupt().await;
+                        Some(Command::Interrupt { expected_turn_id, reply }) => {
+                            let r = self.driver.interrupt(expected_turn_id.as_deref()).await;
                             if let Some(message) = r
                                 .as_ref()
                                 .err()
@@ -2289,10 +2290,11 @@ impl Session {
                                 .map(ToString::to_string)
                             {
                                 self.handle_protocol_invariant(message, None, None).await;
-                                reply.finish(r);
+                                reply.finish(r.map(|_| ()));
                                 return;
                             }
-                            let abandoned = r.is_ok() && self.abandon_pending_approvals();
+                            let abandoned = matches!(r, Ok(crate::rc::harness::InterruptOutcome::Requested))
+                                && self.abandon_pending_approvals();
                             if let Some(status) =
                                 status_after_approval_interrupt(self.info.status, abandoned)
                             {
@@ -2301,7 +2303,7 @@ impl Session {
                                 // composer gated until a later completion echo.
                                 self.set_status(status).await;
                             }
-                            reply.finish(r);
+                            reply.finish(r.map(|_| ()));
                         }
                         Some(Command::Approve {
                             mut response,

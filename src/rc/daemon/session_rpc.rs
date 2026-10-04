@@ -329,7 +329,10 @@ impl Daemon {
                 (
                     SessionRpcOperation::Interrupt {
                         tx: d.tx,
-                        command: Command::Interrupt { reply: ticket },
+                        command: Command::Interrupt {
+                            expected_turn_id: p.expected_turn_id,
+                            reply: ticket,
+                        },
                         reply: SessionReceipt(reply),
                     },
                     false,

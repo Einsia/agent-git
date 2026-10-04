@@ -1725,6 +1725,55 @@ fn fatal_prewrite_exhaustion_retires_the_generation_before_releasing_its_ticket(
 }
 
 #[tokio::test]
+async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
+    let mut driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+    driver.set_test_current_turn("next-turn");
+    let (mut session, mut out, _notes) = harness_test_session_with_channels(
+        AnyDriver::Codex(Box::new(driver)),
+        "codex",
+        SessionStatus::AwaitingApproval,
+    );
+    session.pending.insert(
+        "current-approval".into(),
+        PendingApproval {
+            tool: "shell".into(),
+            input: serde_json::json!({}),
+            suggested_permission_mode: None,
+        },
+    );
+    let (commands, mut command_rx) = mpsc::channel(1);
+    let (ticket, mut receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Interrupt {
+            expected_turn_id: Some("selected-turn".into()),
+            reply: ticket,
+        })
+        .await
+        .unwrap();
+    let worker = tokio::spawn(async move {
+        session.run_inner(&mut command_rx).await;
+        session
+    });
+    receipt
+        .wait(std::time::Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        out.try_recv().is_err(),
+        "a stale stop cannot resolve a newer approval or change status"
+    );
+    drop(commands);
+    let mut session = worker.await.unwrap();
+    let frames: Vec<_> = std::iter::from_fn(|| out.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].method(), method::SESSION_STATUS);
+    assert_eq!(frames[0].params.as_ref().unwrap()["status"], "ended");
+    session.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn exhausted_steer_and_interrupt_each_retire_the_generation() {
     for interrupt in [false, true] {
         let mut driver =
@@ -1745,7 +1794,10 @@ async fn exhausted_steer_and_interrupt_each_retire_the_generation() {
         if interrupt {
             let (ticket, mut receipt) = crate::rc::ticket::ticket();
             commands
-                .send(Command::Interrupt { reply: ticket })
+                .send(Command::Interrupt {
+                    expected_turn_id: None,
+                    reply: ticket,
+                })
                 .await
                 .expect("queue interrupt");
             let error = receipt

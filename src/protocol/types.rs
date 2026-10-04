@@ -962,6 +962,9 @@ pub struct TurnSteerResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnInterrupt {
     pub session_id: String,
+    /// A fenced stop must never target a different turn after reconnecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
 }

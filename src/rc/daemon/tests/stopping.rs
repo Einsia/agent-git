@@ -38,6 +38,7 @@ async fn prepared_session_rpc_uses_the_central_role_gate() {
     let mut frame = Frame::request(
         method::TURN_INTERRUPT,
         TurnInterrupt {
+            expected_turn_id: None,
             session_id: "session-a".into(),
             by: Some("viewer".into()),
         },

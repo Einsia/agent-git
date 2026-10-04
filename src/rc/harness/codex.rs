@@ -1182,9 +1182,20 @@ impl CodexDriver {
         }
     }
 
+    #[cfg(test)]
     pub async fn interrupt(&mut self) -> crate::Result<()> {
+        self.interrupt_fenced(None).await.map(|_| ())
+    }
+
+    pub async fn interrupt_fenced(
+        &mut self,
+        expected_turn_id: Option<&str>,
+    ) -> crate::Result<super::InterruptOutcome> {
+        if let Some(expected) = expected_turn_id {
+            validate_native_turn_id(expected).map_err(anyhow::Error::msg)?;
+        }
         if self.proc.shared() {
-            return self.interrupt_shared().await;
+            return self.interrupt_shared(expected_turn_id).await;
         }
         // `current_turn == None` does not always mean "nothing is running": in the window
         // where `turn/start` has been written to native stdin and its response has not come
@@ -1203,14 +1214,21 @@ impl CodexDriver {
             );
         }
         let (Some(tid), Some(turn)) = (self.thread_id.clone(), self.current_turn.clone()) else {
-            return Ok(()); // nothing running: interrupting is a no-op, not an error
+            return Ok(super::InterruptOutcome::NoLongerActive);
         };
+        if expected_turn_id.is_some_and(|expected| expected != turn) {
+            return Ok(super::InterruptOutcome::NoLongerActive);
+        }
         let id = self.alloc_id()?;
         self.send(&json!({"id": id, "method":"turn/interrupt","params":{"threadId": tid, "turnId": turn}}))
-            .await
+            .await?;
+        Ok(super::InterruptOutcome::Requested)
     }
 
-    async fn interrupt_shared(&mut self) -> crate::Result<()> {
+    async fn interrupt_shared(
+        &mut self,
+        expected_turn_id: Option<&str>,
+    ) -> crate::Result<super::InterruptOutcome> {
         let thread = self
             .thread_id
             .clone()
@@ -1233,10 +1251,12 @@ impl CodexDriver {
             "Codex returned ambiguous current turn state"
         );
         let Some(turn) = turns.first() else {
-            return Ok(());
+            return Ok(super::InterruptOutcome::NoLongerActive);
         };
         match turn["status"].as_str() {
-            Some("completed" | "interrupted" | "failed") => return Ok(()),
+            Some("completed" | "interrupted" | "failed") => {
+                return Ok(super::InterruptOutcome::NoLongerActive);
+            }
             Some("inProgress") => {}
             _ => anyhow::bail!("Codex returned unknown current turn state; interrupt was not sent"),
         }
@@ -1244,12 +1264,15 @@ impl CodexDriver {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Codex omitted its current turn identity"))?;
         validate_native_turn_id(turn_id).map_err(anyhow::Error::msg)?;
+        if expected_turn_id.is_some_and(|expected| expected != turn_id) {
+            return Ok(super::InterruptOutcome::NoLongerActive);
+        }
         self.command_request(
             "turn/interrupt",
             json!({"threadId":thread,"turnId":turn_id}),
         )
         .await?;
-        Ok(())
+        Ok(super::InterruptOutcome::Requested)
     }
 
     pub fn abandon_pending_approvals(&mut self) -> usize {
@@ -2176,7 +2199,7 @@ mod tests {
                 ],
             );
             assert!(driver.current_turn.is_none());
-            let outcome = driver.interrupt_shared().await;
+            let outcome = driver.interrupt_shared(None).await;
             assert_eq!(outcome.is_ok(), reply.get("result").is_some());
             assert_eq!(driver.next_id, Some(3));
             driver.shutdown().await.unwrap();
@@ -2186,11 +2209,40 @@ mod tests {
             &[json!({"id":1,"result":{"data":[{"id":"finished","status":"completed"}]}})],
         );
         driver.current_turn = Some("stale-turn".into());
-        driver.interrupt_shared().await.unwrap();
+        driver.interrupt_shared(None).await.unwrap();
         assert_eq!(
             driver.next_id,
             Some(2),
             "a finished turn receives no interrupt"
+        );
+        driver.shutdown().await.unwrap();
+
+        let mut driver = CodexDriver::test_responder(
+            Some("thread"),
+            &[
+                json!({"id":1,"result":{"data":[{"id":"selected-turn","status":"inProgress"}]}}),
+                json!({"id":2,"result":{}}),
+                json!({"id":3,"result":{"data":[{"id":"next-turn","status":"inProgress"}]}}),
+            ],
+        );
+        assert_eq!(
+            driver
+                .interrupt_shared(Some("selected-turn"))
+                .await
+                .unwrap(),
+            super::super::InterruptOutcome::Requested
+        );
+        assert_eq!(
+            driver
+                .interrupt_shared(Some("selected-turn"))
+                .await
+                .unwrap(),
+            super::super::InterruptOutcome::NoLongerActive
+        );
+        assert_eq!(
+            driver.next_id,
+            Some(4),
+            "a replay cannot interrupt the next turn"
         );
         driver.shutdown().await.unwrap();
     }

@@ -560,6 +560,12 @@ macro_rules! dispatch {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    Requested,
+    NoLongerActive,
+}
+
 impl AnyDriver {
     /// Launch a harness. `runtime` must be one of [`drivable`].
     ///
@@ -670,8 +676,23 @@ impl AnyDriver {
         dispatch!(self, steer, message)
     }
 
-    pub async fn interrupt(&mut self) -> crate::Result<()> {
-        dispatch!(self, interrupt)
+    pub async fn interrupt(
+        &mut self,
+        expected_turn_id: Option<&str>,
+    ) -> crate::Result<InterruptOutcome> {
+        if let Self::Codex(driver) = self {
+            return driver.interrupt_fenced(expected_turn_id).await;
+        }
+        anyhow::ensure!(
+            expected_turn_id.is_none(),
+            "this runtime does not support turn-fenced interrupts"
+        );
+        match self {
+            Self::ClaudeCode(driver) => driver.interrupt().await?,
+            Self::OpenCode(driver) => driver.interrupt().await?,
+            Self::Codex(_) => unreachable!("Codex interrupts use the native turn fence"),
+        }
+        Ok(InterruptOutcome::Requested)
     }
 
     pub async fn answer_approval(&mut self, response: &ApprovalResponse) -> ApprovalOutcome {

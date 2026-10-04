@@ -109,6 +109,7 @@ async fn one_sessions_unanswered_rpc_does_not_block_another_session() {
         let mut frame = Frame::request(
             method::TURN_INTERRUPT,
             TurnInterrupt {
+                expected_turn_id: None,
                 session_id: id.into(),
                 by: Some("operator".into()),
             },
@@ -165,7 +166,7 @@ async fn one_sessions_unanswered_rpc_does_not_block_another_session() {
         .expect("B command is queued")
         .expect("B queue stays open");
     match command_b {
-        Command::Interrupt { reply } => {
+        Command::Interrupt { reply, .. } => {
             assert!(reply.accept());
             reply.finish(Ok(()));
         }
@@ -271,6 +272,7 @@ async fn prepared_session_rpc_serializes_declared_turn_results() {
     let mut interrupt = Frame::request(
         method::TURN_INTERRUPT,
         TurnInterrupt {
+            expected_turn_id: None,
             session_id: "session-a".into(),
             by: Some("operator".into()),
         },
@@ -287,7 +289,7 @@ async fn prepared_session_rpc_serializes_declared_turn_results() {
         prepared.execute(worker_daemon, &mut stop).await
     });
     match rx.recv().await.expect("interrupt command is queued") {
-        Command::Interrupt { reply } => {
+        Command::Interrupt { reply, .. } => {
             assert!(reply.accept());
             reply.finish(Ok(()));
         }
