@@ -285,7 +285,12 @@ async fn dropping_the_controller_closes_transport_without_a_ui_owner() {
 
 #[tokio::test]
 async fn settings_reads_recover_after_reconnect_but_changes_are_never_replayed() {
-    for method in ["session.model", "session.permissions", "session.setModel"] {
+    for method in [
+        "session.model",
+        "session.permissions",
+        "session.approvals",
+        "session.setModel",
+    ] {
         let controller = controller();
         let (config, mut incoming, server) = endpoint().await;
         controller.connect("a".into(), config, None).unwrap();

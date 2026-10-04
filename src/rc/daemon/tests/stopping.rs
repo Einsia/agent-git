@@ -1070,6 +1070,7 @@ async fn an_instruction_nobody_picked_up_is_withdrawn_not_left_pending() {
         .await
         .expect_err("the reply must time out");
     assert_eq!(err.code, ErrorCode::SessionBusy as i32);
+    assert_eq!(err.data.as_ref().unwrap()["outcome"], "not_sent");
     let hint = err
         .data
         .as_ref()
@@ -1099,6 +1100,16 @@ async fn an_instruction_already_taken_is_awaited_not_declared_failed() {
     assert_eq!(reply_within(&mut r).await.expect("the result arrives"), 9);
 }
 
+#[tokio::test]
+async fn native_prewrite_refusal_survives_a_taken_ticket() {
+    let (ticket, mut receipt) = crate::rc::ticket::ticket::<()>();
+    assert!(ticket.accept());
+    ticket.finish(Err(crate::rc::harness::TurnNotRunning.into()));
+    let error = reply_within(&mut receipt).await.unwrap_err();
+    assert_eq!(error.data.as_ref().unwrap()["outcome"], "not_sent");
+    assert_ne!(error.data.as_ref().unwrap()["retryable"], false);
+}
+
 /// A taken instruction that then goes silent is reported as it is — "started, outcome unknown" —
 /// never as `SessionBusy`.
 #[tokio::test(start_paused = true)]
@@ -1109,6 +1120,8 @@ async fn a_taken_instruction_that_never_answers_is_not_reported_as_retryable() {
     let err = reply_within(&mut r)
         .await
         .expect_err("the reply must time out");
+    assert_eq!(err.data.as_ref().unwrap()["outcome"], "unknown");
+    assert_eq!(err.data.as_ref().unwrap()["retryable"], false);
     assert_ne!(
         err.code,
         ErrorCode::SessionBusy as i32,

@@ -551,7 +551,7 @@ impl Daemon {
                 task,
                 danger_arm: 0,
                 pending_mode: None,
-                approval_session_modes: HashMap::new(),
+                approval_requests: HashMap::new(),
                 rpc_gate: Arc::new(Mutex::new(())),
                 rpc_guard_sensitive: false,
                 confirmed_turn_guards: Default::default(),

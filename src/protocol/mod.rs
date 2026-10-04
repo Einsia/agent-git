@@ -573,6 +573,7 @@ pub mod method {
     pub const SESSION_COMMAND: &str = "session.command";
     pub const SESSION_MODEL: &str = "session.model";
     pub const SESSION_PERMISSIONS: &str = "session.permissions";
+    pub const SESSION_APPROVALS: &str = "session.approvals";
     pub const SESSION_SET_MODEL: &str = "session.setModel";
     pub const SESSION_SET_PERMISSION_MODE: &str = "session.setPermissionMode";
     pub const APPROVAL_DECIDE: &str = "approval.decide";

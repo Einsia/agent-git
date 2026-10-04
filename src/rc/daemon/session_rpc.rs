@@ -35,8 +35,11 @@ impl Daemon {
         &mut self,
         f: &Frame,
     ) -> Result<SessionRpcPreparation, RpcError> {
-        let lease = self.acquire_session_rpc_lease(f)?;
+        let lease = self
+            .acquire_session_rpc_lease(f)
+            .map_err(instruction_not_sent)?;
         self.prepare_session_rpc_with_lease(f, lease)
+            .map_err(instruction_not_sent)
     }
 
     /// Test/internal convenience for callers that deliberately do not own the
@@ -356,7 +359,10 @@ impl Daemon {
                 let suggested_mode = changes_session_policy
                     .then(|| {
                         self.sessions.get(&p.session_id).and_then(|live| {
-                            live.approval_session_modes.get(&p.approval_id).copied()
+                            live.approval_requests
+                                .get(&p.approval_id)
+                                .copied()
+                                .flatten()
                         })
                     })
                     .flatten();
@@ -685,7 +691,7 @@ impl Daemon {
                 }
                 if let Some(live) = self.sessions.get_mut(session_id) {
                     if *resolved {
-                        live.approval_session_modes.remove(approval_id);
+                        live.approval_requests.remove(approval_id);
                     }
                     if *fail_closed {
                         // The supervisor releases Unknown only after proving
@@ -995,7 +1001,7 @@ impl SessionRpcLease {
                     if let Some(lease) = lease.take() {
                         release_unprepared_session_rpc(daemon.clone(), lease).await;
                     }
-                    let _ = outbound.send(Frame::error_response(id, error));
+                    let _ = outbound.send(Frame::error_response(id, instruction_not_sent(error)));
                     return;
                 }
                 None => {}
@@ -1013,7 +1019,7 @@ impl SessionRpcLease {
                 if let Some(lease) = lease.take() {
                     release_unprepared_session_rpc(daemon.clone(), lease).await;
                 }
-                let _ = outbound.send(Frame::error_response(id, error));
+                let _ = outbound.send(Frame::error_response(id, instruction_not_sent(error)));
                 return;
             }
             let pause = DURABLE_GUARD_BIND_POLL.min(deadline.saturating_duration_since(now));
@@ -1027,7 +1033,7 @@ impl SessionRpcLease {
                     if let Some(lease) = lease.take() {
                         release_unprepared_session_rpc(daemon.clone(), lease).await;
                     }
-                    let _ = outbound.send(Frame::error_response(id, error));
+                    let _ = outbound.send(Frame::error_response(id, instruction_not_sent(error)));
                     return;
                 }
                 _ = tokio::time::sleep(pause) => {}

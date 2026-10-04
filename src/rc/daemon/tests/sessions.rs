@@ -1782,7 +1782,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         task: tokio::spawn(async {}),
         danger_arm: 0,
         pending_mode: Some(crate::protocol::PermissionMode::Plan),
-        approval_session_modes: HashMap::new(),
+        approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),
         rpc_guard_sensitive: false,
         confirmed_turn_guards: Default::default(),
@@ -2129,8 +2129,8 @@ async fn stale_generation_is_dropped_before_every_session_projection_side_effect
 
     let (command_tx, _command_rx) = mpsc::channel(1);
     let mut live = rpc_test_live("session-a", 2, command_tx, PermissionMode::Auto);
-    live.approval_session_modes
-        .insert("keep".into(), PermissionMode::Plan);
+    live.approval_requests
+        .insert("keep".into(), Some(PermissionMode::Plan));
     let daemon = rpc_test_daemon(
         [("session-a".into(), live)].into_iter().collect(),
         Roster::default(),
@@ -2207,8 +2207,8 @@ async fn stale_generation_is_dropped_before_every_session_projection_side_effect
     assert_eq!(live.info.permission_mode, Some(PermissionMode::Auto));
     assert_eq!(live.info.status, SessionStatus::Running);
     assert_eq!(
-        live.approval_session_modes,
-        [("keep".into(), PermissionMode::Plan)]
+        live.approval_requests,
+        [("keep".into(), Some(PermissionMode::Plan))]
             .into_iter()
             .collect()
     );
@@ -2276,10 +2276,8 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
     );
     assert!(state.project_session_frame(approval).is_some());
     assert_eq!(
-        state.sessions["session-a"]
-            .approval_session_modes
-            .get("fresh"),
-        Some(&PermissionMode::Bypass)
+        state.sessions["session-a"].approval_requests.get("fresh"),
+        Some(&Some(PermissionMode::Bypass))
     );
 
     let resolved = tagged_test_notification(
@@ -2293,14 +2291,29 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
     assert!(state.project_session_frame(stale).is_none());
     assert!(
         state.sessions["session-a"]
-            .approval_session_modes
+            .approval_requests
             .contains_key("fresh")
     );
     assert!(state.project_session_frame(resolved).is_some());
+    assert!(state.sessions["session-a"].approval_requests.is_empty());
+
+    let mut one_shot = test_approval("one-shot");
+    one_shot.suggested_permission_mode = None;
     assert!(
+        state
+            .project_session_frame(tagged_test_notification(
+                "session-a",
+                2,
+                method::APPROVAL_REQUEST,
+                serde_json::to_value(one_shot).unwrap(),
+            ))
+            .is_some()
+    );
+    assert_eq!(
         state.sessions["session-a"]
-            .approval_session_modes
-            .is_empty()
+            .approval_requests
+            .get("one-shot"),
+        Some(&None)
     );
 
     let completion = tagged_test_notification(
@@ -2310,11 +2323,7 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
         serde_json::json!({"turn_id":"turn-a","outcome":"ok"}),
     );
     assert!(state.project_session_frame(completion).is_some());
-    assert!(
-        state.sessions["session-a"]
-            .approval_session_modes
-            .is_empty()
-    );
+    assert!(state.sessions["session-a"].approval_requests.is_empty());
 
     let status = tagged_test_notification(
         "session-a",
@@ -2337,6 +2346,7 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
         7,
         crate::protocol::ConnectionFeature::AgentIdentityV1,
     );
+    let through_seq = state.journal.last_seq("session-a");
     let mut commit = tagged_test_notification(
         "session-a",
         2,
@@ -2347,8 +2357,8 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
     let commit = state
         .project_session_frame(commit)
         .expect("a current connection-bound commit survives both fences");
-    assert_eq!(commit.params.unwrap()["through_seq"], 6);
-    assert_eq!(commit.seq, Some(7));
+    assert_eq!(commit.params.unwrap()["through_seq"], through_seq);
+    assert_eq!(commit.seq, Some(through_seq + 1));
     assert_eq!(delivery.status(), crate::protocol::DeliveryStatus::Pending);
 }
 

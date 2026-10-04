@@ -289,9 +289,9 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     task: tokio::spawn(async {}),
                     danger_arm: 0,
                     pending_mode: None,
-                    approval_session_modes: [(
+                    approval_requests: [(
                         "approval-1".to_string(),
-                        crate::protocol::PermissionMode::Bypass,
+                        Some(crate::protocol::PermissionMode::Bypass),
                     )]
                     .into_iter()
                     .collect(),

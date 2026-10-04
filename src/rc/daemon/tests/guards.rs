@@ -36,8 +36,8 @@ async fn guard_sensitive_commands_defer_until_a_durable_bound_row() {
     let mut approval_live = rpc_test_live("session-a", 1, approval_tx, PermissionMode::Default);
     approval_live.info.runtime = "claude-code".into();
     approval_live
-        .approval_session_modes
-        .insert("approval-1".into(), PermissionMode::AcceptEdits);
+        .approval_requests
+        .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
     let approval_daemon = rpc_test_daemon(
         [("session-a".into(), approval_live)].into_iter().collect(),
         Roster::default(),

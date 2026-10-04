@@ -343,3 +343,19 @@ The shared source reads current native turn state before dispatch and addresses
 the interrupt to that exact native turn. Other runtimes reject the fence because
 their native cancellation interfaces do not enforce a turn identifier. Clients
 must negotiate support before retrying an uncertain stop automatically.
+
+### Approval receipt reconciliation
+
+`session-approvals-v1` adds the read-only `session.approvals` method. It returns
+`pending` approval IDs, `changing` while a session instruction owns the writer
+gate, and `last_seq` for the observed session journal. A snapshot older than the
+request event cannot establish that its approval has resolved. Pending one-shot
+requests and requests with a session permission effect share the same metadata;
+there is no separate persistent approval cache.
+
+A missing native decision receipt reports `outcome: "unknown"` and is observed
+without replaying the decision. Admission and queue withdrawal report
+`outcome: "not_sent"` only when the instruction cannot run. A client may retry
+that decision after confirming that the same request remains pending. Native
+resolution can come from another controller and does not prove which decision
+won. The browser keeps immediate pending feedback until the request resolves.

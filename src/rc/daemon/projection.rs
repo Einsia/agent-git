@@ -81,21 +81,15 @@ impl Daemon {
             && let Ok(p) = frame.params_as::<crate::protocol::ApprovalRequest>()
             && let Some(live) = self.sessions.get_mut(&stream)
         {
-            match p.suggested_permission_mode {
-                Some(mode) => {
-                    live.approval_session_modes.insert(p.approval_id, mode);
-                }
-                None => {
-                    live.approval_session_modes.remove(&p.approval_id);
-                }
-            }
+            live.approval_requests
+                .insert(p.approval_id, p.suggested_permission_mode);
         }
         if frame.method() == method::APPROVAL_RESOLVED
             && let Ok(p) = frame.params_as::<crate::protocol::ApprovalResolved>()
             && p.session_id == stream
             && let Some(live) = self.sessions.get_mut(&stream)
         {
-            live.approval_session_modes.remove(&p.approval_id);
+            live.approval_requests.remove(&p.approval_id);
         }
         if frame.method() == method::TURN_COMPLETED
             && let Some(live) = self.sessions.get_mut(&stream)
@@ -103,7 +97,7 @@ impl Daemon {
             // The supervisor has expired both halves at this authoritative
             // boundary; daemon-side preflight metadata must not make an old
             // card look armable.
-            live.approval_session_modes.clear();
+            live.approval_requests.clear();
         }
         // `stamped()` promises that `Live.info.status` reflects every event up
         // through its watermark, so project the authoritative status event.
@@ -112,6 +106,9 @@ impl Daemon {
             && let Some(live) = self.sessions.get_mut(&stream)
         {
             live.info.status = p.status;
+            if p.status != SessionStatus::AwaitingApproval {
+                live.approval_requests.clear();
+            }
         }
         if frame.method() == method::SESSION_PUBLICATION_CHANGED
             && let Some(status) = frame
@@ -866,7 +863,7 @@ mod bound_lineage_tests {
                         task: tokio::spawn(async {}),
                         danger_arm: 0,
                         pending_mode: None,
-                        approval_session_modes: HashMap::new(),
+                        approval_requests: HashMap::new(),
                         rpc_gate: Arc::new(Mutex::new(())),
                         rpc_guard_sensitive: false,
                         confirmed_turn_guards: Default::default(),

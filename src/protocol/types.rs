@@ -902,6 +902,15 @@ pub struct SessionPermissionsResult {
     pub last_seq: u64,
 }
 
+/// Pending approval identities at the session event watermark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionApprovalsResult {
+    pub pending: Vec<String>,
+    /// A decision may still resolve after this observation.
+    pub changing: bool,
+    pub last_seq: u64,
+}
+
 /// `session.permissionMode` carries the latest permission observation.
 ///
 /// Sent to every viewer, not just the one who asked: two people watching one

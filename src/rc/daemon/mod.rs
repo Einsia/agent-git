@@ -524,10 +524,10 @@ struct Live {
     ///
     /// So the baseline is the **stricter** of the two, see `authorization_baseline`.
     pending_mode: Option<crate::protocol::PermissionMode>,
-    /// Approval id → the global mode a Claude "allow for session" answer
-    /// would apply. Populated only from machine-originated approval events;
-    /// viewer responses cannot choose or forge the mode being authorized.
-    approval_session_modes: HashMap<String, crate::protocol::PermissionMode>,
+    /// Pending approval id → optional global mode for a session-scoped answer.
+    /// Machine-originated events own both presence and policy; viewer responses
+    /// cannot invent a pending request or its permission effect.
+    approval_requests: HashMap<String, Option<crate::protocol::PermissionMode>>,
     /// At most one viewer-originated command may be in flight for this live
     /// session. The guard is acquired with `try_lock_owned` while the daemon's
     /// global mutex is held, then carried by [`PreparedSessionRpc`] across the
@@ -1379,9 +1379,9 @@ fn project_permission_mode_outcome(
 fn map_approval_reply(result: Result<(), RpcError>) -> Result<serde_json::Value, RpcError> {
     match result {
         Ok(()) => Ok(serde_json::json!({})),
-        Err(error) if error.code == ErrorCode::Internal as i32 => {
-            Err(RpcError::new(ErrorCode::ApprovalExpired, error.message)
-                .with_hint("it may have timed out or already been answered"))
+        Err(mut error) if error.code == ErrorCode::Internal as i32 => {
+            error.code = ErrorCode::ApprovalExpired.code();
+            Err(error.with_hint("it may have timed out or already been answered"))
         }
         Err(error) => Err(error),
     }
@@ -1408,8 +1408,10 @@ fn project_approval_outcome(
                 approval_id, resolved: false, effective_mode: None, fail_closed: false,
                 rollback_arm: None, retire_generation: false,
             },
-            Err(RpcError::new(ErrorCode::SessionBusy, message)
-                .with_hint("the decision is not resent; the native service may still resolve this request")),
+            Err(RpcError {
+                code: ErrorCode::SessionBusy.code(), message,
+                data: Some(serde_json::json!({"outcome":"unknown","retryable":false})),
+            }),
         )),
         ApprovalOutcome::Applied { effective_mode } => {
             // Both values originate on the machine but travel through
@@ -1440,8 +1442,10 @@ fn project_approval_outcome(
                 rollback_arm: danger.arm(),
                 retire_generation: false,
             },
-            Err(RpcError::new(ErrorCode::ApprovalExpired, message)
-                .with_hint("it may have timed out or already been answered")),
+            Err(RpcError {
+                code: ErrorCode::ApprovalExpired.code(), message,
+                data: Some(serde_json::json!({"outcome":"not_sent","retryable":false,"resolved":!retained})),
+            }),
         )),
         ApprovalOutcome::Unknown {
             message,
@@ -1455,7 +1459,10 @@ fn project_approval_outcome(
                 rollback_arm: None,
                 retire_generation: true,
             },
-            Err(RpcError::new(ErrorCode::Internal, message).with_hint(
+            Err(RpcError {
+                code: ErrorCode::Internal.code(), message,
+                data: Some(serde_json::json!({"outcome":"unknown","retryable":false})),
+            }.with_hint(
                 if trusted_mode.is_some() || attempted_mode.is_some() {
                     "the live harness was terminated and will resume in Plan because its session policy may already have changed"
                 } else {
@@ -1595,7 +1602,8 @@ fn min_role(method_name: &str) -> Role {
         | method::SESSION_SUBSCRIBE
         | method::SESSION_COMMANDS
         | method::SESSION_MODEL
-        | method::SESSION_PERMISSIONS => Role::Viewer,
+        | method::SESSION_PERMISSIONS
+        | method::SESSION_APPROVALS => Role::Viewer,
         // A read-only watch **is a read**: it tails a transcript and writes back not one byte.
         // The hub deliberately keeps these two verbs outside the operator gate (its comment says
         // that blocking a viewer only turns "that session is open" into a guessing game). Calling
@@ -1702,6 +1710,38 @@ fn require_role(caller: &crate::protocol::CallerClaim, method_name: &str) -> Res
     ))
 }
 
+fn instruction_not_sent(error: RpcError) -> RpcError {
+    instruction_outcome(error, false)
+}
+
+fn instruction_unknown(error: RpcError) -> RpcError {
+    instruction_outcome(error, true)
+}
+
+fn instruction_outcome(mut error: RpcError, taken: bool) -> RpcError {
+    if error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("outcome"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|outcome| matches!(outcome, "not_sent" | "unknown"))
+    {
+        return error;
+    }
+    let mut data = error.data.take().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "outcome".into(),
+            serde_json::json!(if taken { "unknown" } else { "not_sent" }),
+        );
+        if taken {
+            fields.insert("retryable".into(), serde_json::json!(false));
+        }
+    }
+    error.data = Some(data);
+    error
+}
+
 /// Queue an instruction onto a session's queue **without waiting indefinitely**.
 ///
 /// # Why not just `send().await`
@@ -1752,6 +1792,7 @@ async fn enqueue_within(
         )
         .with_hint("nothing was queued, so it is safe to try again")),
     }
+    .map_err(instruction_not_sent)
 }
 
 /// Wait for a session to answer, **but not forever**.
@@ -1838,19 +1879,23 @@ async fn receipt_phase<T>(
 }
 
 fn stopped_before_accept_error() -> RpcError {
-    RpcError::new(
-        ErrorCode::SessionBusy,
-        "this daemon is stopping and the session had not taken the instruction",
+    instruction_not_sent(
+        RpcError::new(
+            ErrorCode::SessionBusy,
+            "this daemon is stopping and the session had not taken the instruction",
+        )
+        .with_hint("nothing happened — the instruction was withdrawn before shutdown"),
     )
-    .with_hint("nothing happened — the instruction was withdrawn before shutdown")
 }
 
 fn taken_during_stop_error() -> RpcError {
-    RpcError::new(
-        ErrorCode::Internal,
-        "this daemon is stopping after the session took the instruction",
+    instruction_unknown(
+        RpcError::new(
+            ErrorCode::Internal,
+            "this daemon is stopping after the session took the instruction",
+        )
+        .with_hint("it may still take effect — check the session state before retrying"),
     )
-    .with_hint("it may still take effect — check the session state before retrying")
 }
 
 async fn reply_within_state<T>(
@@ -1859,7 +1904,12 @@ async fn reply_within_state<T>(
 ) -> ReplyWait<T> {
     // First leg: wait for it to be **taken**.
     match receipt_phase(r, stop).await {
-        ReceiptPhase::Reply(result) => return ReplyWait::Done(result),
+        ReceiptPhase::Reply(result) => {
+            return ReplyWait::Done(result.map_err(|error| match r.abandon() {
+                crate::rc::ticket::Abandon::NeverRan => instruction_not_sent(error),
+                crate::rc::ticket::Abandon::AlreadyTaken => instruction_unknown(error),
+            }));
+        }
         ReceiptPhase::Stopping => {
             return match r.abandon() {
                 crate::rc::ticket::Abandon::NeverRan => {
@@ -1876,26 +1926,26 @@ async fn reply_within_state<T>(
     // Timed out. Withdraw first — **only a withdrawal that succeeds earns the right to say
     // "nothing happened"**.
     match r.abandon() {
-        crate::rc::ticket::Abandon::NeverRan => ReplyWait::Done(Err(RpcError::new(
+        crate::rc::ticket::Abandon::NeverRan => ReplyWait::Done(Err(instruction_not_sent(RpcError::new(
             ErrorCode::SessionBusy,
             "that session is finishing a turn and did not pick this up in time",
         )
         .with_hint(
             "nothing happened — the instruction was withdrawn before the session took it, so it is safe to try again",
-        ))),
+        )))),
         // Cannot withdraw: it has been taken, its side effects are on their way, and withdrawal
         // no longer applies. Wait one more leg; if that also runs out, **say so plainly** — an
         // answer of "safe to retry" makes the caller redo a mode change that already started.
         crate::rc::ticket::Abandon::AlreadyTaken => match receipt_phase(r, stop).await {
-            ReceiptPhase::Reply(result) => ReplyWait::Done(result),
+            ReceiptPhase::Reply(result) => ReplyWait::Done(result.map_err(instruction_unknown)),
             ReceiptPhase::Stopping => ReplyWait::InFlight(taken_during_stop_error()),
-            ReceiptPhase::Timeout => ReplyWait::InFlight(RpcError::new(
+            ReceiptPhase::Timeout => ReplyWait::InFlight(instruction_unknown(RpcError::new(
                 ErrorCode::Internal,
                 "that session took the instruction but has not answered",
             )
             .with_hint(
                 "it may still take effect — check the session's current state before retrying",
-            )),
+            ))),
         },
     }
 }

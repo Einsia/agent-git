@@ -60,7 +60,12 @@ fn shared_approval_receipts_distinguish_resolution_from_an_unconfirmed_decision(
         DangerAuthorization::NotRequired,
     )
     .unwrap();
-    assert!(reply.unwrap_err().is(ErrorCode::SessionBusy));
+    let error = reply.unwrap_err();
+    assert!(error.is(ErrorCode::SessionBusy));
+    assert_eq!(
+        error.data.unwrap(),
+        serde_json::json!({"outcome":"unknown","retryable":false})
+    );
     assert!(matches!(
         completion,
         SessionRpcCompletion::Approval {
@@ -1397,8 +1402,8 @@ fn successful_session_approval_persists_its_trusted_mode_before_ack() {
                 let (tx, mut rx) = mpsc::channel(1);
                 let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
                 live.info.runtime = "claude-code".into();
-                live.approval_session_modes
-                    .insert("approval-1".into(), PermissionMode::AcceptEdits);
+                live.approval_requests
+                    .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
                 let gate = live.rpc_gate.clone();
                 let mut roster = Roster::default();
                 roster.sessions.insert(
@@ -1454,7 +1459,7 @@ fn successful_session_approval_persists_its_trusted_mode_before_ack() {
                 );
                 assert!(
                     !state.sessions["session-a"]
-                        .approval_session_modes
+                        .approval_requests
                         .contains_key("approval-1")
                 );
                 drop(state);
@@ -1482,8 +1487,8 @@ fn explicit_session_approval_refusal_retains_the_card_and_rolls_back_its_arm() {
                 let (tx, mut rx) = mpsc::channel(1);
                 let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
                 live.info.runtime = "claude-code".into();
-                live.approval_session_modes
-                    .insert("approval-1".into(), PermissionMode::Bypass);
+                live.approval_requests
+                    .insert("approval-1".into(), Some(PermissionMode::Bypass));
                 let mut roster = Roster::default();
                 roster.sessions.insert(
                     "session-a".into(),
@@ -1533,7 +1538,7 @@ fn explicit_session_approval_refusal_retains_the_card_and_rolls_back_its_arm() {
                 let live = &state.sessions["session-a"];
                 assert!(!live.info.dangerous);
                 assert_eq!(live.info.permission_mode, Some(PermissionMode::Default));
-                assert!(live.approval_session_modes.contains_key("approval-1"));
+                assert!(live.approval_requests.contains_key("approval-1"));
                 drop(state);
                 let persisted = Roster::load();
                 assert!(!persisted.sessions["session-a"].ever_dangerous);
@@ -1558,8 +1563,8 @@ fn unknown_session_approval_waits_for_late_receipt_and_durable_plan() {
                 let (tx, mut rx) = mpsc::channel(1);
                 let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
                 live.info.runtime = "claude-code".into();
-                live.approval_session_modes
-                    .insert("approval-1".into(), PermissionMode::AcceptEdits);
+                live.approval_requests
+                    .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
                 let gate = live.rpc_gate.clone();
                 let mut roster = Roster::default();
                 roster.sessions.insert(
@@ -1695,8 +1700,8 @@ fn an_applied_approval_mode_must_match_the_trusted_suggestion_exactly() {
                 let (tx, mut rx) = mpsc::channel(1);
                 let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
                 live.info.runtime = "claude-code".into();
-                live.approval_session_modes
-                    .insert("approval-1".into(), PermissionMode::AcceptEdits);
+                live.approval_requests
+                    .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
                 let gate = live.rpc_gate.clone();
                 let mut roster = Roster::default();
                 roster.sessions.insert(
