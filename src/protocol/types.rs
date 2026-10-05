@@ -396,6 +396,11 @@ pub const FILE_PREVIEW_CAP: u64 = 2 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalOpen {
     pub workspace_id: String,
+    /// Replays the same shell creation only within the named daemon instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// Which project directory to open in. Omitted = the workspace's first
     /// project.
     #[serde(default, skip_serializing_if = "Option::is_none")]

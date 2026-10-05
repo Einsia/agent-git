@@ -4,6 +4,8 @@ mod metadata;
 mod publication;
 mod sessions;
 mod stopping;
+#[cfg(unix)]
+mod terminals;
 mod turns;
 
 pub(super) fn rpc_test_live(

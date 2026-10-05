@@ -68,6 +68,7 @@ mod dispatch;
 mod guard;
 mod observed_capture;
 mod opening;
+mod terminal_open;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 pub(in crate::rc) mod project_publication;
 mod projection;

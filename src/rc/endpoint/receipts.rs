@@ -15,14 +15,14 @@ use std::fs::File;
 const MAX_RECEIPT: usize = 64 * 1024;
 
 #[derive(Clone)]
-pub(super) struct Store {
+pub(crate) struct Store {
     path: PathBuf,
     #[cfg(test)]
     gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct Receipt {
+pub(crate) struct Receipt {
     pub digest: Vec<u8>,
     pub response: Option<Frame>,
 }
@@ -102,6 +102,11 @@ impl Store {
         let receipt: Receipt = serde_json::from_slice(&bytes)?;
         ensure!(receipt.digest.len() == 32, "invalid message receipt digest");
         Ok(Some(receipt))
+    }
+
+    pub async fn lookup(&self, key: String) -> crate::Result<Option<Receipt>> {
+        let path = self.path(&key);
+        tokio::task::spawn_blocking(move || Self::read(&path)).await?
     }
 
     pub async fn claim(&self, key: String, digest: Vec<u8>) -> crate::Result<(Receipt, bool)> {

@@ -606,6 +606,23 @@ impl Terminal {
         .map_err(|e| anyhow::anyhow!("resize failed: {e}"))
     }
 
+    /// Closing and reaped shells remain owned for cleanup but cannot accept new operations.
+    pub(crate) fn is_running(&self) -> bool {
+        if self.terminator.started.load(Ordering::Acquire) {
+            return false;
+        }
+        matches!(
+            *self
+                .terminator
+                .lifecycle
+                .state
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            ChildPhase::Running
+        )
+    }
+
     pub fn kill(&self) {
         self.terminator.start();
     }

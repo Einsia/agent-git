@@ -120,13 +120,39 @@ impl Daemon {
 
             method::TERMINAL_OPEN => {
                 let p: TerminalOpen = f.params_as()?;
+                let roots = self.mirror.roots(&p.workspace_id);
+                let cwd = match &p.project_id {
+                    Some(pid) => self.mirror.project_path(&p.workspace_id, pid),
+                    None => roots.first().cloned(),
+                }
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::PathNotAllowed,
+                        "this workspace has no bound folder to open a terminal in",
+                    )
+                    .with_hint("bind a project folder first")
+                })?;
+                let cwd = policy::require_within(&cwd, &roots)
+                    .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))?;
+                let claim = terminal_open::OpenClaim::prepare(&p, &self.identity.instance_id, &cwd)?;
+                if let Some(claim) = &claim
+                    && claim.exists().await?
+                {
+                    let terminal = self.terminal_owned_by(&claim.id, &caller)?;
+                    return Ok(serde_json::to_value(TerminalOpenResult {
+                        terminal_id: claim.id.clone(),
+                        cwd: terminal.cwd.clone(),
+                        shell: terminal.shell.clone(),
+                    }).unwrap());
+                }
+
                 // While a gap or exit waits on the event FIFO, the terminals already open fill
                 // the structural memory budget of that path. Allowing the open/exit loop on top
                 // of that manufactures unbounded "must never be dropped" final states while the
                 // link is down; admission recovers on its own once every tail is queued.
                 if terminal_delivery_blocked(&self.terminal_delivery_blockers) {
                     return Err(RpcError::new(
-                        ErrorCode::QuotaExceeded,
+                        ErrorCode::SessionBusy,
                         "terminal delivery is backed up on this machine",
                     )
                     .with_hint("retry after the hub link drains pending terminal state"));
@@ -150,20 +176,6 @@ impl Daemon {
                     )
                     .with_hint("close one before opening another"));
                 }
-                let roots = self.mirror.roots(&p.workspace_id);
-                let cwd = match &p.project_id {
-                    Some(pid) => self.mirror.project_path(&p.workspace_id, pid),
-                    None => roots.first().cloned(),
-                }
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::PathNotAllowed,
-                        "this workspace has no bound folder to open a terminal in",
-                    )
-                    .with_hint("bind a project folder first")
-                })?;
-                let cwd = policy::require_within(&cwd, &roots)
-                    .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))?;
 
                 // Terminal bytes and session events share one return path (the same outbound
                 // queue, the same WSS). **The backfill half does not hold for them** — terminal
@@ -268,16 +280,31 @@ impl Daemon {
                     }
                 };
 
-                let id = format!("t-{}", uuid::Uuid::new_v4().simple());
-                let t = Terminal::open(
+                let id = claim.as_ref().map_or_else(
+                    || format!("t-{}", uuid::Uuid::new_v4().simple()),
+                    |claim| claim.id.clone(),
+                );
+                if let Some(claim) = &claim {
+                    // Persist before spawning; a missing live terminal never authorizes replay.
+                    claim.claim().await?;
+                }
+                let t = match Terminal::open(
                     id.clone(),
                     caller.workspace_id.clone(),
                     &cwd,
                     p.cols,
                     p.rows,
                     tx,
-                )
-                .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
+                ) {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        // Terminal::open returns an error only before a shell is owned.
+                        if let Some(claim) = &claim {
+                            claim.refuse().await?;
+                        }
+                        return Err(RpcError::new(ErrorCode::Internal, error.to_string()));
+                    }
+                };
                 let res = TerminalOpenResult {
                     terminal_id: id.clone(),
                     cwd: t.cwd.clone(),

@@ -2,7 +2,7 @@
 
 mod cloud;
 mod output;
-mod receipts;
+pub(crate) mod receipts;
 
 use output::ClientOutput;
 

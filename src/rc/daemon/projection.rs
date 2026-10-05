@@ -566,7 +566,7 @@ impl Daemon {
         let t = self
             .terminals
             .get(terminal_id)
-            .filter(|t| t.workspace_id == caller.workspace_id)
+            .filter(|t| t.workspace_id == caller.workspace_id && t.term.is_running())
             .ok_or_else(|| RpcError::new(ErrorCode::SessionNotFound, "that terminal is gone"))?;
         Ok(&t.term)
     }
