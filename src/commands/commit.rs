@@ -2241,6 +2241,11 @@ fn settle_bytes(
         .map(|a| a.open_tool_calls(&region))
         .unwrap_or_default();
     let in_flight = in_flight_tail(&ir, &open_calls);
+    let native_completions = opts.completed_only
+        || ir
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::TurnEnd);
     let chunks = if opts.completed_only {
         // Recovery can read a newer native snapshot than the completed turn that queued it.
         let end = completed_native_boundary(&runtime, &region)?.unwrap_or(0) as usize;
@@ -2253,11 +2258,18 @@ fn settle_bytes(
             &adapter.open_tool_calls(completed),
             materialized_mode && head_turn_base > 0,
         )
+    } else if native_completions {
+        completed_turn_chunks(
+            &region,
+            &ir,
+            &open_calls,
+            materialized_mode && head_turn_base > 0,
+        )
     } else {
         turn_chunks(&region, &ir, &open_calls)
     };
 
-    let new_chunks: Vec<&Chunk> = if opts.completed_only && !materialized_mode {
+    let new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
         // The retained prefix proves exact content, including a partially captured user turn.
         // Ordinals cannot skip continuations because several native turns can share one prompt.
         chunks
@@ -4203,7 +4215,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_settlement_waits_for_completion_and_extends_a_retained_partial_turn() {
+    fn settlement_keeps_native_completions_and_extends_a_retained_partial_turn() {
         let (_directory, store) = store();
         let (_repository, repo) = setup_repo();
         let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
@@ -4261,7 +4273,7 @@ mod tests {
         // Goal continuations can complete without another user prompt opening a new ordinal.
         let continued = format!("{finished}{}{end}", codex_asst("goal phase complete"));
         let still_running = format!("{continued}{}", codex_asst("next phase in progress"));
-        settle(&still_running, true, false);
+        settle(&still_running, false, false);
         let continuation = meta::read_at_ref(&repo, "HEAD").unwrap();
         assert_eq!(continuation.turn, Some(2));
         assert_eq!(continuation.baseline_bytes, Some(continued.len() as u64));
@@ -4290,7 +4302,7 @@ mod tests {
         let mut claim = link::get(&store, "codex", "AB").unwrap();
         claim.native_checkpoint = None;
         link::write(&store, &claim).unwrap();
-        settle(&pending, true, false);
+        settle(&pending, false, false);
         assert_eq!(
             repo.git(&["rev-parse", "HEAD~3"]).unwrap().trim(),
             continued_tip
