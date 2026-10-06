@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-10-06
+
+### Fixed
+
+- Manual milestones and runtime stop hooks preserve each completed native
+  continuation when a long-running goal reuses the same user prompt. Settlement
+  extends a retained partial turn without skipping later completions or saving
+  an already retained completion twice.
+
 ## [0.2.20] - 2026-10-06
 
 ### Fixed
