@@ -430,6 +430,16 @@ pub struct TerminalInput {
     pub terminal_id: String,
     /// Raw bytes the user typed (control characters included).
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<TerminalInputDelivery>,
+}
+
+/// A controller advances its sequence only after the preceding input is acknowledged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalInputDelivery {
+    pub instance_id: String,
+    pub client_id: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

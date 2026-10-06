@@ -68,6 +68,7 @@ mod dispatch;
 mod guard;
 mod observed_capture;
 mod opening;
+mod terminal_input;
 mod terminal_open;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 pub(in crate::rc) mod project_publication;
@@ -446,6 +447,7 @@ struct WatchLive {
 struct TermLive {
     workspace_id: String,
     term: Terminal,
+    inputs: terminal_input::Receipts,
 }
 
 /// What comes out of the session gate: the instruction channel, plus the few facts each verb

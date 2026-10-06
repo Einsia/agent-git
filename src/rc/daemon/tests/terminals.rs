@@ -1,9 +1,9 @@
 use super::*;
 
 #[test]
-fn terminal_open_replays_only_the_same_live_shell_and_instance() {
+fn terminal_replays_preserve_one_shell_and_ordered_input() {
     if crate::rc::in_isolated_test(
-        "rc::daemon::tests::terminals::terminal_open_replays_only_the_same_live_shell_and_instance",
+        "rc::daemon::tests::terminals::terminal_replays_preserve_one_shell_and_ordered_input",
     ) {
         return;
     }
@@ -68,6 +68,36 @@ fn terminal_open_replays_only_the_same_live_shell_and_instance() {
                 let mut outsider = request(params.clone());
                 outsider.caller = Some(claim("owner", "ws-b"));
                 assert!(daemon.dispatch(&outsider, &frames).await.is_err());
+                let client = uuid::Uuid::new_v4().to_string();
+                let input = |sequence, data: &str| {
+                    let mut frame = Frame::request(method::TERMINAL_INPUT, serde_json::json!({
+                        "terminal_id":id, "data":data, "delivery":{
+                            "instance_id":params["instance_id"], "client_id":client, "sequence":sequence,
+                        },
+                    }));
+                    frame.caller = Some(claim("owner", "ws-a"));
+                    frame
+                };
+                let first_input = input(1, "printf x >> receipt-count\n");
+                let accepted = daemon.dispatch(&first_input, &frames).await.unwrap();
+                assert_eq!(accepted, serde_json::json!({"sequence":1}));
+                assert_eq!(daemon.dispatch(&first_input, &frames).await.unwrap(), accepted);
+                for refused in [input(1, "printf wrong >> receipt-count\n"), input(3, "printf gap >> receipt-count\n")] {
+                    assert!(daemon.dispatch(&refused, &frames).await.unwrap_err().is(ErrorCode::MalformedFrame));
+                }
+                let mut outsider = input(2, "printf outside >> receipt-count\n");
+                outsider.caller = Some(claim("owner", "ws-b"));
+                assert!(daemon.dispatch(&outsider, &frames).await.is_err());
+                let mut obsolete = input(2, "printf obsolete >> receipt-count\n");
+                obsolete.params.as_mut().unwrap()["delivery"]["instance_id"] = serde_json::json!("replaced");
+                assert!(daemon.dispatch(&obsolete, &frames).await.unwrap_err().is(ErrorCode::SessionNotFound));
+                daemon.dispatch(&input(2, "printf y >> receipt-count\n"), &frames).await.unwrap();
+                assert!(daemon.dispatch(&first_input, &frames).await.unwrap_err().is(ErrorCode::MalformedFrame));
+                let mut second_client = input(1, "printf z >> receipt-count\n");
+                second_client.params.as_mut().unwrap()["delivery"]["client_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+                daemon.dispatch(&second_client, &frames).await.unwrap();
+                assert_eq!(shell_pid(&daemon, id, &mut rx).await, original_pid);
+                assert_eq!(std::fs::read_to_string(project.path().join("receipt-count")).unwrap(), "xyz");
                 let mut close = Frame::request(
                     method::TERMINAL_CLOSE,
                     serde_json::json!({"terminal_id":id}),
@@ -75,6 +105,7 @@ fn terminal_open_replays_only_the_same_live_shell_and_instance() {
                 close.caller = Some(claim("owner", "ws-a"));
                 daemon.dispatch(&close, &frames).await.unwrap();
                 assert!(daemon.terminals.contains_key(id));
+                assert!(daemon.dispatch(&first_input, &frames).await.unwrap_err().is(ErrorCode::SessionNotFound));
                 assert!(
                     daemon
                         .terminal_owned_by(id, &claim("owner", "ws-a"))

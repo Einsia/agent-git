@@ -7,6 +7,7 @@ pub const BUILD_ID: &str = env!("AGIT_BUILD_ID");
 pub const RPC_FEATURES: &[&str] = &[
     "peer-control-v1",
     "terminal-open-idempotency-v1",
+    "terminal-input-idempotency-v1",
     "history-v2",
     "archive-history-tail-v1",
     "safe-restart-v1",

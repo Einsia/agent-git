@@ -315,6 +315,7 @@ impl Daemon {
                     TermLive {
                         workspace_id: caller.workspace_id.clone(),
                         term: t,
+                        inputs: terminal_input::Receipts::default(),
                     },
                 );
                 Ok(serde_json::to_value(res).unwrap())
@@ -322,10 +323,11 @@ impl Daemon {
 
             method::TERMINAL_INPUT => {
                 let p: TerminalInput = f.params_as()?;
-                let t = self.terminal_owned_by(&p.terminal_id, &caller)?;
-                t.write(&p.data)
-                    .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
-                Ok(serde_json::json!({}))
+                self.terminal_owned_by(&p.terminal_id, &caller)?;
+                let live = self.terminals.get_mut(&p.terminal_id).unwrap();
+                live.inputs.deliver(&p, &self.identity.instance_id, |data| {
+                    live.term.write(data)
+                })
             }
 
             method::TERMINAL_RESIZE => {
