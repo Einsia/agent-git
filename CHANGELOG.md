@@ -8,6 +8,22 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-10-06
+
+### Fixed
+
+- Remote terminal creation and input carry replayable receipts. A matching web
+  client can recover a lost response without opening another shell or executing
+  typed input again, while preserving input order and workspace isolation.
+- Remote approval recovery reads authoritative pending requests so a lost reply
+  does not apply the same decision twice. Codex stop retries target the selected
+  native turn and cannot interrupt a later turn.
+- Remote model settings recover across controller reconnects and expose the
+  effective Codex reset model. Sequenced permission state allows controllers to
+  reconcile a settings change without repeating an uncertain mutation.
+- Steering rejected while a conversation is idle is distinguished from an
+  uncertain delivery so the client can safely send it as a new turn.
+
 ## [0.2.19] - 2026-10-04
 
 ### Fixed
