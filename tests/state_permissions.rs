@@ -311,7 +311,10 @@ async fn sticky_shared_home_allows_settlement_and_watch_skips_unsafe_privacy_con
 
 #[test]
 fn fresh_import_and_strict_settlement_are_umask_safe() {
-    let lab = Lab::new(0o002);
+    let mut lab = Lab::new(0o002);
+    lab.state = lab
+        .root
+        .join("state with 'quotes' $(no-command) `no-command`");
     lab.prepare();
     lab.import(NATIVE, "work");
     lab.append_turn(NATIVE, 2);
@@ -332,6 +335,9 @@ fn fresh_import_and_strict_settlement_are_umask_safe() {
     }
     let link = lab.state.join(format!("store/codex/{NATIVE}.json"));
     assert_eq!(mode(&link) & 0o077, 0);
+    for file in ["config", "HEAD", "index"] {
+        assert_eq!(mode(&lab.state.join("repos/me/qa/.git").join(file)), 0o600);
+    }
     for entry in walkdir::WalkDir::new(lab.state.join("store")) {
         let entry = entry.unwrap();
         if entry.path().extension().is_some_and(|ext| ext == "lock") {

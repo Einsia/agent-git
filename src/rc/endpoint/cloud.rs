@@ -79,6 +79,15 @@ pub(super) fn attach(
         let write = async {
             let mut first_response = true;
             while let Some(message) = messages.next().await? {
+                let super::output::Next::Write(message) = message else {
+                    if let super::output::Next::Recover(frame) = message {
+                        if let Some(log) = &log {
+                            log.record("cloud.event_recovery_requested", serde_json::json!({"client_id":client,"stream":frame.params.as_ref().and_then(|p|p.get("session_id")),"after_seq":frame.params.as_ref().and_then(|p|p.get("after_seq"))}));
+                        }
+                        input.send(Incoming::Request(client, frame)).await?;
+                    }
+                    continue;
+                };
                 let opening = first_response;
                 first_response = false;
                 let projecting = std::time::Instant::now();

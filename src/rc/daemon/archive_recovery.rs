@@ -53,7 +53,7 @@ pub(super) fn start(
                 jobs.rotate_left(offset);
                 cursor = cursor.wrapping_add(16);
             }
-            for job in jobs.into_iter().take(16) {
+            for job in recovery_batch(jobs) {
                 let Some(_work) = admission.enter() else {
                     return;
                 };
@@ -90,8 +90,23 @@ pub(super) fn start(
                     None => return,
                 }
             }
+            interval.reset();
         }
     }))
+}
+
+fn recovery_batch(jobs: Vec<Job>) -> Vec<Job> {
+    let mut captures: Vec<Job> = Vec::new();
+    for job in jobs {
+        if captures.iter().any(|capture| capture.same_capture(&job)) {
+            continue;
+        }
+        captures.push(job);
+        if captures.len() == 16 {
+            break;
+        }
+    }
+    captures
 }
 
 impl Daemon {
@@ -155,6 +170,20 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpublished_turns_share_a_recovery_attempt_without_excluding_other_captures() {
+        let root = tempfile::tempdir().unwrap();
+        let first = crate::rc::archive_jobs::tests::fixture(root.path());
+        let mut next_turn = first.clone();
+        next_turn.turn_id = "next-turn".into();
+        let mut other = first.clone();
+        other.native = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            recovery_batch(vec![first.clone(), next_turn, other.clone()]),
+            vec![first, other]
+        );
+    }
 
     /// Long local transactions keep restart admission until completion; shutdown still cancels.
     #[tokio::test(start_paused = true)]
@@ -234,7 +263,10 @@ mod tests {
             dangerous: false,
             permission_mode: None,
         };
-        assert!(state.require_launch_slot(&alias.info, &spec).is_err());
+        let refused = state.require_launch_slot(&alias.info, &spec).unwrap_err();
+        assert_eq!(refused.error.data.as_ref().unwrap()["retryable"], true);
+        assert_eq!(refused.error.data.as_ref().unwrap()["outcome"], "not_sent");
+        assert!(!refused.reached_launch);
         state.archive_recovering.clear();
         assert!(state.require_launch_slot(&alias.info, &spec).is_ok());
         state.sessions.insert("alias".into(), alias);

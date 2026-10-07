@@ -158,7 +158,22 @@ async fn deliver_response(
         if let Some(cloud) = &peer.cloud {
             cloud.observe_response(&frame);
         }
-        let result = if let Some(replay) = replay {
+        let result = if peer.output.is_recovery(&frame) {
+            // Internal replay uses the same authority admission and projection as a client RPC.
+            // Its receipt is consumed here; only recovered stream frames go to the transport.
+            if peer
+                .cloud
+                .as_ref()
+                .is_some_and(|cloud| !matches!(cloud.project(&frame.to_json()), Ok(Some(_))))
+            {
+                clients.remove(&client);
+                return;
+            }
+            if let Some(log) = diagnostics {
+                log.record("executor.event_recovery_response", serde_json::json!({"client_id":client,"frames":replay.as_ref().map(|batch|batch.frames.len()),"error_code":frame.error.as_ref().map(|error|error.code)}));
+            }
+            peer.output.recover(&frame, replay, work)
+        } else if let Some(replay) = replay {
             let frames = replay.frames.len();
             let result = peer.output.send_replay(frame.to_json(), replay, work);
             if let Some(log) = diagnostics {
@@ -229,6 +244,12 @@ fn attach(
         };
         let write = async {
             while let Some(message) = messages.next().await? {
+                let output::Next::Write(message) = message else {
+                    if let output::Next::Recover(frame) = message {
+                        input.send(Incoming::Request(client, frame)).await?;
+                    }
+                    continue;
+                };
                 writer.write_all(message.record.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
             }
@@ -608,7 +629,16 @@ async fn serve_described(
                             events.send(super::link::LinkEvent::Frame { epoch: 1, frame: Box::new(frame) }).await?;
                         }
                         Err(error) => {
-                            if peer.output.send_work(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
+                            let response = Frame::error_response(original_id, error);
+                            let result = if peer.output.is_recovery(&response) {
+                                if let Some(cloud) = &peer.cloud {
+                                    let _ = cloud.project(&response.to_json());
+                                }
+                                peer.output.recover(&response, None, work)
+                            } else {
+                                peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await
+                            };
+                            if result.is_err() { clients.remove(&client); }
                         }
                     }
                 }
@@ -660,7 +690,7 @@ async fn serve_described(
                         }
                         // Subscription replay stays in its requester's writer. Only live
                         // notifications consume each client's event queue here.
-                        if peer.output.send_timeout(record.clone(), std::time::Duration::from_secs(2)).await.is_err() {
+                        if peer.output.send_event(&frame, &record).await.is_err() {
                             if let Some(log) = &diagnostics {
                                 log.record("executor.client_closed", serde_json::json!({"client_id":id,"reason":"event_output_capacity","stream":frame.stream,"seq":frame.seq}));
                             }

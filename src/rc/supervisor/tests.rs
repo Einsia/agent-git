@@ -75,6 +75,7 @@ pub(super) fn harness_test_session_with_channels(
     let session = Session {
         publication_incarnation: None,
         info: SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: "session-turn-test".into(),
             native_source: None,
@@ -121,6 +122,8 @@ pub(super) fn harness_test_session_with_channels(
         settlement_child: None,
         queued_initial_turn: None,
         pending_turn_command: None,
+        pending_steer_command: None,
+        pending_interrupt_command: None,
         resolved_initial_turn: None,
         announced_turn_ids: Default::default(),
         delta_streams: Default::default(),
@@ -374,6 +377,8 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
     match &mut session.driver {
         AnyDriver::Codex(driver) => driver.set_test_thread_id("thread-1"),
         AnyDriver::ClaudeCode(_) | AnyDriver::OpenCode(_) => unreachable!(),
+        #[cfg(unix)]
+        AnyDriver::ClaudeNative(_) => unreachable!(),
     }
     session.flush_initial_turn_if_ready().await;
     assert!(session.queued_initial_turn.is_none());
@@ -1580,6 +1585,8 @@ fn unknown_without_a_mode_never_releases_a_still_unproven_harness() {
             let failures = match &mut session.driver {
                 AnyDriver::Codex(driver) => driver.fail_test_shutdowns(usize::MAX),
                 AnyDriver::ClaudeCode(_) | AnyDriver::OpenCode(_) => unreachable!(),
+                #[cfg(unix)]
+                AnyDriver::ClaudeNative(_) => unreachable!(),
             };
             let (ticket, mut receipt) = crate::rc::ticket::ticket();
             assert!(ticket.accept());
@@ -1767,9 +1774,14 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
     drop(commands);
     let mut session = worker.await.unwrap();
     let frames: Vec<_> = std::iter::from_fn(|| out.try_recv().ok()).collect();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].method(), method::SESSION_STATUS);
-    assert_eq!(frames[0].params.as_ref().unwrap()["status"], "ended");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].method(), method::APPROVAL_RESOLVED);
+    assert_eq!(
+        frames[0].params.as_ref().unwrap()["approval_id"],
+        "current-approval"
+    );
+    assert_eq!(frames[1].method(), method::SESSION_STATUS);
+    assert_eq!(frames[1].params.as_ref().unwrap()["status"], "ended");
     session.driver.shutdown().await.unwrap();
 }
 
@@ -2533,6 +2545,43 @@ async fn steering_publishes_attributed_redacted_history_only_after_native_accept
         }
         drop(commands);
         let mut session = worker.await.unwrap();
+        let (ticket, mut late_receipt) = crate::rc::ticket::ticket();
+        assert!(ticket.accept());
+        session.pending_steer_command = Some(PendingSteerCommand {
+            message: expected_message.clone(),
+            attribution: MessageAttribution {
+                client_msg_id: Some("late-steer".into()),
+                ..MessageAttribution::default()
+            },
+            reply: ticket,
+        });
+        assert!(late_receipt.wait(std::time::Duration::ZERO).await.is_none());
+        session
+            .on_harness_event(HarnessEvent::SteerResolved(if accepted {
+                Ok(Delivery::WhenIdle)
+            } else {
+                Err("Native delivery was refused".into())
+            }))
+            .await;
+        assert_eq!(
+            late_receipt
+                .wait(std::time::Duration::from_secs(2))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok(),
+            accepted
+        );
+        let frames: Vec<_> = std::iter::from_fn(|| out.try_recv().ok())
+            .filter(|frame| frame.method() == method::TURN_STEERED)
+            .collect();
+        assert_eq!(frames.len(), usize::from(accepted));
+        if accepted {
+            let event: crate::protocol::TurnSteered = frames[0].params_as().unwrap();
+            assert_eq!(event.client_msg_id.as_deref(), Some("late-steer"));
+            assert_eq!(event.delivery, Delivery::WhenIdle);
+            assert_eq!(event.message, expected_message);
+        }
         session
             .driver
             .shutdown()

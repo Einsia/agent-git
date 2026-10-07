@@ -1,0 +1,6 @@
+{
+  "name": "agit-native-control",
+  "version": "0.1.0",
+  "description": "Remote control of the existing Claude Code session through AgentGit",
+  "author": { "name": "AgentGit" }
+}

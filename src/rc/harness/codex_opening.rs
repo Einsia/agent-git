@@ -55,13 +55,17 @@ impl CodexDriver {
                         message == format!("thread {native} already has an active writer")
                     });
                 let error = anyhow::anyhow!("Codex refused {method}: {message}");
-                if conflict {
+                if method == "thread/resume" {
                     self.shutdown().await.map_err(|cleanup| {
                         LaunchError::spawned(anyhow::anyhow!(
                             "{error}; child shutdown is unknown: {cleanup}"
                         ))
                     })?;
-                    return Err(LaunchError::external_writer(error));
+                    return Err(if conflict {
+                        LaunchError::external_writer(error)
+                    } else {
+                        LaunchError::resume_rejected(error)
+                    });
                 }
                 return Err(LaunchError::spawned(error));
             }
@@ -337,14 +341,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_different_native_error_does_not_release_the_reservation() {
+    async fn an_explicit_resume_refusal_releases_only_its_opening_reservation() {
         let mut driver = driver(Some("native"), &[
             json!({"id":1,"result":{}}),
-            json!({"id":2,"error":{"code":-32600,"message":"thread another already has an active writer"}}),
+            json!({"id":2,"error":{"code":-32600,"message":"failed to load configuration: Model provider `custom` not found"}}),
         ]).await;
         let failure = driver.confirm_opening().await.unwrap_err();
         assert!(failure.reached_spawn());
         assert!(!failure.is_external_writer());
+        assert!(failure.is_resume_rejected());
+        assert_eq!(driver.runtime_thread_id(), None);
         driver.shutdown().await.unwrap();
     }
 
@@ -358,6 +364,7 @@ mod tests {
         let failure = driver.confirm_opening().await.unwrap_err();
         assert!(failure.reached_spawn());
         assert!(!failure.is_external_writer());
+        assert!(!failure.is_resume_rejected());
         driver.shutdown().await.unwrap();
     }
     #[tokio::test]

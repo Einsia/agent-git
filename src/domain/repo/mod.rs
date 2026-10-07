@@ -153,20 +153,9 @@ pub fn valid_branch_name(name: &str) -> Result<()> {
 /// letter of the variable name → silently ignored, green as usual, which is the shape of this bug
 /// itself. A gate must fail toward "blocked", never toward "allowed".
 fn git_command() -> Command {
-    let mut cmd = crate::infra::git_runtime::command();
+    let mut cmd = crate::infra::git_runtime::private_command();
     // Global option slot — must come **before** the subcommand; git rejects it after.
     cmd.arg("--no-replace-objects");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Git creates authority files inside Agit repositories; harness subprocesses keep their own umask.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::umask(0o077);
-                Ok(())
-            });
-        }
-    }
     // Checkout preserves pointers; explicit LFS reads choose and authenticate their remote.
     cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
 
@@ -3997,7 +3986,10 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
             .split_once("\n#[cfg(test)]")
             .expect("this file must contain a test module");
 
-        let n = prod.matches("crate::infra::git_runtime::command()").count();
+        let n = prod.matches("crate::infra::git_runtime::command()").count()
+            + prod
+                .matches("crate::infra::git_runtime::private_command()")
+                .count();
         assert_eq!(
             n, 1,
             "exactly one place in production code builds a git command (`git_command`); got {n}\n\
@@ -4010,7 +4002,7 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         // That one place has to actually turn replace resolution off — "exactly one" alone does
         // not guarantee it.
         let after = &prod[prod
-            .find("crate::infra::git_runtime::command()")
+            .find("crate::infra::git_runtime::private_command()")
             .expect("the count above found it")..];
         assert!(
             after

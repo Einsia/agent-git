@@ -92,6 +92,8 @@ pub mod local_goal;
 pub mod local_history;
 pub mod local_repository;
 pub mod mirror;
+#[cfg(unix)]
+pub mod native_claude;
 pub mod native_codex;
 pub(crate) mod native_inbox;
 pub(crate) mod native_queue;

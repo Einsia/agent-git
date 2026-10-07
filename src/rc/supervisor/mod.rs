@@ -53,8 +53,8 @@ use crate::protocol::{
     TurnStarted, method,
 };
 use crate::rc::harness::{
-    AnyDriver, ApprovalOutcome, BoundedTurnIds, HarnessEvent, LaunchSpec,
-    PermissionModeChangeError, PermissionModeOutcome, TurnGuardAttempt, TurnOutcome,
+    AnyDriver, ApprovalOutcome, BoundedTurnIds, HarnessEvent, InterruptDispatch, LaunchSpec,
+    PermissionModeChangeError, PermissionModeOutcome, SteerDispatch, TurnGuardAttempt, TurnOutcome,
     TurnStartDispatch, TurnStartOutcome,
 };
 use crate::rc::tail::Tailer;
@@ -698,6 +698,12 @@ struct PendingTurnCommand {
     guard_attempt: Option<crate::rc::harness::TurnGuardAttempt>,
 }
 
+struct PendingSteerCommand {
+    message: String,
+    attribution: MessageAttribution,
+    reply: Ticket<Delivery>,
+}
+
 enum PendingInitialReply {
     Attached,
     Blocked(Ticket<TurnStartOutcome>),
@@ -838,6 +844,8 @@ pub struct Session {
     /// Metadata and optional viewer receipt for the one native `turn/start`
     /// currently awaiting its exact response.
     pending_turn_command: Option<PendingTurnCommand>,
+    pending_steer_command: Option<PendingSteerCommand>,
+    pending_interrupt_command: Option<Ticket<()>>,
     /// The creation prompt has no original RPC receipt. Keep its authoritative
     /// result until the first viewer retry (or a different prompt) so a select
     /// race after native resolution cannot submit the same prompt twice.
@@ -1224,11 +1232,22 @@ impl Session {
     /// driver copy is the native request id/suggestion needed to write the
     /// answer. They form one lifecycle even though their payloads differ, so a
     /// turn boundary must clear both in the same production function.
-    fn abandon_pending_approvals(&mut self) -> bool {
-        let supervisor = self.pending.len();
-        self.pending.clear();
+    async fn abandon_pending_approvals(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.pending);
         let driver = self.driver.abandon_pending_approvals();
-        supervisor != 0 || driver != 0
+        let abandoned = !pending.is_empty() || driver != 0;
+        // Every viewer must retire the same cards when native requests become unanswerable.
+        for approval_id in pending.into_keys() {
+            self.emit(
+                method::APPROVAL_RESOLVED,
+                crate::protocol::ApprovalResolved {
+                    session_id: self.info.session_id.clone(),
+                    approval_id,
+                },
+            )
+            .await;
+        }
+        abandoned
     }
 
     /// Start a session.
@@ -1348,6 +1367,7 @@ impl Session {
                 return Err(crate::rc::harness::proc::LaunchError::spawned(error));
             }
         }
+        info.interrupt_fenced = Some(driver.interrupt_fenced());
         info.permission_mode = driver
             .permission_mode_known()
             .then(|| driver.permission_mode());
@@ -1383,6 +1403,8 @@ impl Session {
             settlement_child: None,
             queued_initial_turn: None,
             pending_turn_command: None,
+            pending_steer_command: None,
+            pending_interrupt_command: None,
             resolved_initial_turn: None,
             announced_turn_ids: Default::default(),
             delta_streams: Default::default(),
@@ -1513,7 +1535,7 @@ impl Session {
                 }
             }
         }
-        self.abandon_pending_approvals();
+        self.abandon_pending_approvals().await;
     }
 
     async fn terminate_after_unknown_native_write(&mut self, message: &str) {
@@ -1709,6 +1731,16 @@ impl Session {
             TurnStartOutcome::Unknown { .. } | TurnStartOutcome::FatalNotAccepted { .. }
         );
         match &outcome {
+            TurnStartOutcome::NativeSubmission {
+                operation_id,
+                delivery,
+            } => {
+                self.emit(
+                    "session.messageAccepted",
+                    serde_json::json!({"operation_id":operation_id,"client_msg_id":pending.attribution.client_msg_id,"delivery":delivery}),
+                )
+                .await;
+            }
             TurnStartOutcome::Accepted { .. } => {
                 self.announce_mode(pending.attribution.by.clone()).await;
                 if let Some(prepared) = prepared_turn_started {
@@ -1765,6 +1797,45 @@ impl Session {
         if ends_session {
             self.set_status(SessionStatus::Ended).await;
         }
+    }
+
+    async fn resolve_steer(
+        &mut self,
+        pending: PendingSteerCommand,
+        result: crate::Result<Delivery>,
+    ) {
+        if let Some(message) = result
+            .as_ref()
+            .err()
+            .filter(|error| crate::rc::harness::is_request_id_exhaustion(error))
+            .map(ToString::to_string)
+        {
+            self.handle_protocol_invariant(message, None, None).await;
+        } else if let Ok(delivery) = result.as_ref() {
+            if !self.driver.correlates_pending_prompt() {
+                self.emit(
+                    "session.messageAccepted",
+                    serde_json::json!({
+                        "client_msg_id":pending.attribution.client_msg_id,"delivery":delivery,
+                    }),
+                )
+                .await;
+            } else {
+                self.emit(
+                    method::TURN_STEERED,
+                    crate::protocol::TurnSteered {
+                        message: pending.message,
+                        delivery: *delivery,
+                        by: pending.attribution.by,
+                        sender: pending.attribution.sender,
+                        client_msg_id: pending.attribution.client_msg_id,
+                        native_prompt_id: pending.attribution.native_prompt_id,
+                    },
+                )
+                .await;
+            }
+        }
+        pending.reply.finish(result);
     }
 
     async fn begin_turn_start(&mut self, mut pending: PendingTurnCommand) {
@@ -1970,7 +2041,11 @@ impl Session {
         let (attribution, command_prompt) =
             if let Some((attribution, prompt)) = resolved_attribution {
                 (attribution, Some(prompt))
-            } else if let Some(pending) = self.pending_turn_command.as_ref() {
+            } else if let Some(pending) = self
+                .pending_turn_command
+                .as_ref()
+                .filter(|_| self.driver.correlates_pending_prompt())
+            {
                 (pending.attribution.clone(), Some(pending.message.clone()))
             } else {
                 (MessageAttribution::default(), None)
@@ -2055,7 +2130,7 @@ impl Session {
         self.run_inner(&mut commands).await;
         // Final safety net for EOF/command-channel shutdown paths. The maps are
         // about native requests owned by this process; none survive its exit.
-        self.abandon_pending_approvals();
+        self.abandon_pending_approvals().await;
         // **The reason for exiting does not decide whether the process tree is reaped.**
         //
         // An exit path that returns directly — the harness's own EOF/Exited, a closed command
@@ -2142,7 +2217,7 @@ impl Session {
                         }
                     match cmd {
                         None | Some(Command::Shutdown) => {
-                            self.abandon_pending_approvals();
+                            self.abandon_pending_approvals().await;
                             self.set_status(SessionStatus::Ended).await;
                             return;
                         }
@@ -2242,68 +2317,31 @@ impl Session {
                                 return;
                             }
                         }
-                        Some(Command::Steer { message, attribution, reply }) => {
-                            // The steer reaches the local harness unchanged — redaction is
-                            // only for the copy that leaves the machine. The hit is still
-                            // reported: a registered secret that enters this session through a
-                            // steer is redacted **silently** when the harness repeats it.
+                        Some(Command::Steer { message, mut attribution, reply }) => {
                             let report = self.redactor.scrub(&message);
                             self.alert_registered(report.registered_ids, "turn_steer").await;
-                            let native_prompt_id = self.driver.reserve_prompt_identity();
-                            let result = self.driver.steer(&message).await;
-                            if let Some(message) = result
-                                .as_ref()
-                                .err()
-                                .filter(|error| {
-                                    crate::rc::harness::is_request_id_exhaustion(error)
-                                })
-                                .map(ToString::to_string)
-                            {
-                                self.handle_protocol_invariant(message, None, None).await;
-                                reply.finish(result);
-                                return;
+                            if self.pending_steer_command.is_some() {
+                                reply.finish(Err(anyhow::anyhow!("a native submission is awaiting its receipt")));
+                                continue;
                             }
-                            if let Ok(delivery) = result.as_ref() {
-                                self.emit(
-                                    method::TURN_STEERED,
-                                    crate::protocol::TurnSteered {
-                                        message: report.text,
-                                        delivery: *delivery,
-                                        by: attribution.by,
-                                        sender: attribution.sender,
-                                        client_msg_id: attribution.client_msg_id,
-                                        native_prompt_id,
-                                    },
-                                )
-                                .await;
+                            attribution.native_prompt_id = self.driver.reserve_prompt_identity();
+                            let pending = PendingSteerCommand { message: report.text, attribution, reply };
+                            match self.driver.steer(&message).await {
+                                SteerDispatch::Resolved(result) => self.resolve_steer(pending, result).await,
+                                SteerDispatch::Awaiting => self.pending_steer_command = Some(pending),
                             }
-                            reply.finish(result);
+                            if self.info.status == SessionStatus::Ended { return; }
                         }
                         Some(Command::Interrupt { expected_turn_id, reply }) => {
-                            let r = self.driver.interrupt(expected_turn_id.as_deref()).await;
-                            if let Some(message) = r
-                                .as_ref()
-                                .err()
-                                .filter(|error| {
-                                    crate::rc::harness::is_request_id_exhaustion(error)
-                                })
-                                .map(ToString::to_string)
-                            {
-                                self.handle_protocol_invariant(message, None, None).await;
-                                reply.finish(r.map(|_| ()));
-                                return;
+                            if self.pending_interrupt_command.is_some() {
+                                reply.finish(Err(anyhow::anyhow!("a native stop is awaiting its receipt")));
+                                continue;
                             }
-                            let abandoned = matches!(r, Ok(crate::rc::harness::InterruptOutcome::Requested))
-                                && self.abandon_pending_approvals();
-                            if let Some(status) =
-                                status_after_approval_interrupt(self.info.status, abandoned)
-                            {
-                                // The approval card is dead as soon as the
-                                // interrupt is accepted. Do not leave the
-                                // composer gated until a later completion echo.
-                                self.set_status(status).await;
+                            match self.driver.interrupt(expected_turn_id.as_deref()).await {
+                                InterruptDispatch::Resolved(result) => self.resolve_interrupt(reply, result).await,
+                                InterruptDispatch::Awaiting => self.pending_interrupt_command = Some(reply),
                             }
-                            reply.finish(r.map(|_| ()));
+                            if self.info.status == SessionStatus::Ended { return; }
                         }
                         Some(Command::Approve {
                             mut response,
@@ -2571,12 +2609,12 @@ impl Session {
                 ev = self.driver.next_event() => {
                     match ev {
                         None => {
-                            self.abandon_pending_approvals();
+                            self.abandon_pending_approvals().await;
                             self.set_status(SessionStatus::Ended).await;
                             return;
                         }
                         Some(HarnessEvent::Exited { code }) => {
-                            self.abandon_pending_approvals();
+                            self.abandon_pending_approvals().await;
                             // Drain whatever the harness wrote on its way out.
                             // The held-back delta tails go first, ahead of the
                             // transcript's authoritative items for the same text.
@@ -2637,6 +2675,29 @@ impl Session {
         }
     }
 
+    async fn resolve_interrupt(
+        &mut self,
+        reply: Ticket<()>,
+        result: crate::Result<crate::rc::harness::InterruptOutcome>,
+    ) {
+        if let Some(message) = result
+            .as_ref()
+            .err()
+            .filter(|error| crate::rc::harness::is_request_id_exhaustion(error))
+            .map(ToString::to_string)
+        {
+            self.handle_protocol_invariant(message, None, None).await;
+            reply.finish(result.map(|_| ()));
+            return;
+        }
+        let abandoned = matches!(result, Ok(crate::rc::harness::InterruptOutcome::Requested))
+            && self.abandon_pending_approvals().await;
+        if let Some(status) = status_after_approval_interrupt(self.info.status, abandoned) {
+            self.set_status(status).await;
+        }
+        reply.finish(result.map(|_| ()));
+    }
+
     async fn handle_protocol_invariant(
         &mut self,
         message: String,
@@ -2689,6 +2750,13 @@ impl Session {
     ) -> Option<Option<Command>> {
         let mut deferred_command = None;
         match ev {
+            HarnessEvent::ModelUpdated => {
+                self.emit(
+                    method::SESSION_MODEL,
+                    serde_json::json!({"session_id":self.info.session_id}),
+                )
+                .await;
+            }
             HarnessEvent::SettingsUpdated { mode, applied } => {
                 self.sync_turn_guard(TurnGuardBarrier::NativeSettings { mode })
                     .await;
@@ -2755,6 +2823,18 @@ impl Session {
                 // turns. Queue settlement even if this attachment never receives new input.
                 self.settlement_due |= self.resuming && self.agit_session.is_some();
                 self.flush_initial_turn_if_ready().await;
+            }
+            HarnessEvent::InterruptResolved(result) => {
+                if let Some(reply) = self.pending_interrupt_command.take() {
+                    self.resolve_interrupt(reply, result.map_err(anyhow::Error::msg))
+                        .await;
+                }
+            }
+            HarnessEvent::SteerResolved(result) => {
+                if let Some(pending) = self.pending_steer_command.take() {
+                    self.resolve_steer(pending, result.map_err(anyhow::Error::msg))
+                        .await;
+                }
             }
             HarnessEvent::TurnStartResolved(outcome) => {
                 let Some(pending) = self.pending_turn_command.take() else {
@@ -2849,7 +2929,7 @@ impl Session {
                 // sending an explicit expiry (interrupt and failed turns both
                 // do this). A turn boundary is authoritative: no approval from
                 // that turn can still be answered.
-                self.abandon_pending_approvals();
+                self.abandon_pending_approvals().await;
                 // Release the held-back delta tails before the turn boundary: `item.completed`
                 // is about to come out of the transcript, and the streaming form of the same
                 // text has to go ahead of it.
@@ -2969,7 +3049,11 @@ impl Session {
                     // comparison computed from that base is wrong.
                     &self.cwd,
                     &conf.operator_heads,
-                );
+                )
+                .or_else(|| {
+                    (!self.driver.permission_mode_known())
+                        .then_some(crate::protocol::OwnerReason::Unprovable)
+                });
                 req.requires_owner = reason.is_some();
                 req.owner_reason = reason;
                 // The verdict **stays on the machine**; sending it out is not enough.
@@ -3067,6 +3151,7 @@ impl Session {
             && self.publication.is_none()
             && self.info.status == SessionStatus::Idle
             && self.pending_turn_command.is_none()
+            && self.pending_steer_command.is_none()
             && settlement_lease(&self.settlement).is_some()
     }
 

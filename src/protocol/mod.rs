@@ -783,6 +783,7 @@ mod tests {
         );
 
         let session = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: "agit-one".into(),
             native_source: None,
@@ -813,14 +814,15 @@ mod tests {
         .unwrap();
         assert!(old_result.start_id.is_none());
         assert!(old_result.session.runtime_session_id.is_none());
-        let keyed = SessionStartResult {
+        assert!(old_result.session.interrupt_fenced.is_none());
+        let mut keyed = SessionStartResult {
             start_id: Some("018f47cb-60ff-7e31-aec9-02d2e39d3114".into()),
             session: old_result.session,
         };
-        assert_eq!(
-            serde_json::to_value(keyed).unwrap()["start_id"],
-            "018f47cb-60ff-7e31-aec9-02d2e39d3114"
-        );
+        keyed.session.interrupt_fenced = Some(true);
+        let value = serde_json::to_value(keyed).unwrap();
+        assert_eq!(value["session"]["interrupt_fenced"], true);
+        assert_eq!(value["start_id"], "018f47cb-60ff-7e31-aec9-02d2e39d3114");
     }
 
     #[test]

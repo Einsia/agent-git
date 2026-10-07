@@ -141,6 +141,16 @@ fn capture_boundary(
     let store = Store::open()?.context("Observed capture store is missing")?;
     let claim = link::get_checked(&store, &entry.runtime, &key)?
         .context("Observed capture claim is missing")?;
+    #[cfg(unix)]
+    if entry.runtime == "claude-code"
+        && crate::rc::native_claude::Client::unwritten_transcript(
+            &entry.thread_id,
+            std::path::Path::new(&entry.cwd),
+        )
+        .is_some()
+    {
+        return Ok(None);
+    }
     let path = claim
         .resolve()
         .context("Observed native transcript is missing")?;
@@ -156,8 +166,19 @@ fn capture_boundary(
         return Ok(None);
     };
     let text = std::str::from_utf8(&bytes[..=end])?;
-    let Some(boundary) = crate::commands::commit::completed_native_boundary(&entry.runtime, text)?
-    else {
+    let boundary = crate::commands::commit::completed_native_boundary(&entry.runtime, text)?;
+    #[cfg(unix)]
+    let boundary = if entry.runtime == "claude-code" {
+        let completed = crate::rc::native_claude::completion::boundaries(
+            &entry.thread_id,
+            &path,
+            text.as_bytes(),
+        )?;
+        boundary.max(completed.last().map(|end| *end as u64))
+    } else {
+        boundary
+    };
+    let Some(boundary) = boundary else {
         return Ok(None);
     };
     let digest = format!("{:x}", Sha256::digest(&bytes[..boundary as usize]));
@@ -397,6 +418,22 @@ mod tests {
             state.sessions.clear();
             assert!(state.reserve_observed_capture(&first.session_id).is_some());
             assert!(state.reserve_observed_capture(&first.session_id).is_none());
+            let failure = state
+                .require_launch_slot(
+                    &first,
+                    &LaunchSpec {
+                        cwd: project.clone(),
+                        resume_from: Some("native".into()),
+                        agit_session: None,
+                        model: None,
+                        dangerous: false,
+                        permission_mode: None,
+                    },
+                )
+                .err()
+                .unwrap();
+            assert_eq!(failure.error.data.as_ref().unwrap()["retryable"], true);
+            assert_eq!(failure.error.data.as_ref().unwrap()["outcome"], "not_sent");
             state.opening_sessions.clear();
             state
                 .mirror

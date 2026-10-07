@@ -40,6 +40,20 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    /// Completed prefixes of one capture settle and publish through the same canonical branch.
+    pub(crate) fn same_capture(&self, other: &Self) -> bool {
+        self.logical == other.logical
+            && self.native == other.native
+            && self.runtime == other.runtime
+            && self.native_source == other.native_source
+            && self.cwd == other.cwd
+            && self.lineage == other.lineage
+            && self.repository_id == other.repository_id
+            && self.capture == other.capture
+            && self.transcript == other.transcript
+            && self.archive_handoff == other.archive_handoff
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture(
         logical: &str,
@@ -54,8 +68,6 @@ impl Job {
         archive_handoff: Option<crate::commands::commit::archive::RcHandoff>,
     ) -> crate::Result<Self> {
         let text = prefix(transcript, prefix_bytes)?;
-        let required_bytes = crate::commands::commit::completed_native_boundary(runtime, &text)?
-            .context("completed native turn has no archive boundary")?;
         let job = Self {
             version: 1,
             logical: logical.into(),
@@ -70,7 +82,7 @@ impl Job {
             transcript: transcript.canonicalize()?,
             prefix_bytes,
             prefix_hash: format!("{:x}", Sha256::digest(text.as_bytes())),
-            required_bytes,
+            required_bytes: prefix_bytes,
             archive_handoff,
         };
         job.validate()?;
@@ -186,7 +198,7 @@ impl Job {
         let meta: meta::Meta = serde_json::from_str(&text)?;
         Ok(meta
             .baseline_bytes
-            .is_some_and(|bytes| bytes >= self.required_bytes)
+            .is_some_and(|bytes| bytes >= self.prefix_bytes)
             && meta.runtime == self.runtime
             && meta.line == meta::Line::Session)
     }
@@ -383,6 +395,41 @@ pub(crate) mod tests {
                 "invalid replay must retain the original pending work"
             );
         });
+    }
+
+    #[test]
+    fn a_native_completion_cannot_inherit_an_older_turns_publication_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let earlier = fixture(root.path());
+        let text = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":\"Interrupted before any model output\"}}\n",
+        );
+        fs::write(&earlier.transcript, text).unwrap();
+        let job = Job::capture(
+            &earlier.logical,
+            &earlier.native,
+            "claude-code",
+            None,
+            root.path(),
+            &earlier.session().unwrap(),
+            "interrupted-turn",
+            &earlier.transcript,
+            text.len() as u64,
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::commands::commit::completed_native_boundary("claude-code", text)
+                .unwrap()
+                .unwrap()
+                < job.required_bytes
+        );
+        assert_eq!(
+            job.required_bytes,
+            text.len() as u64,
+            "publishing an earlier reply cannot acknowledge the interrupted prompt"
+        );
     }
 
     /// Corrupt evidence cannot be converted into an empty archive queue or overwritten by replay.

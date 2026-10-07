@@ -1790,7 +1790,7 @@ fn with_native_classification(mut output: Value, source: &Value, internal: bool)
         fields.insert("isMeta".into(), json!(true));
     } else if native_compact {
         fields.insert("isCompactSummary".into(), json!(true));
-    } else if source["promptSource"] == "system" {
+    } else if crate::adapter::claude_code::has_system_prompt_source(source) {
         fields.insert("promptSource".into(), json!("system"));
     }
     output
@@ -2685,7 +2685,7 @@ mod tests {
             json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"native-call","name":"Read","input":{"file_path":"src/main.rs"}}]}}),
             json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"native-call","content":result}]}}),
             json!({"type":"user","isMeta":true,"message":{"role":"user","content":format!("internal note {secret} {}", source.display())}}),
-            json!({"type":"user","cwd":temp.path(),"message":{"role":"user","content":format!("second prompt {secret} {}", source.display())}}),
+            json!({"type":"user","cwd":temp.path(),"promptSource":"system","origin":{"kind":"plugin","asUser":true},"message":{"role":"user","content":format!("second prompt {secret} {}", source.display())}}),
             json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}),
         ]
         .into_iter()

@@ -25,6 +25,14 @@ fn report(label: &str, result: crate::Result<()>) -> SetupReport {
     }
 }
 
+#[cfg(unix)]
+pub(super) fn claude() -> SetupReport {
+    report(
+        "Claude native shared control",
+        crate::rc::native_claude::install_plugin(),
+    )
+}
+
 pub(super) fn hermes(exe: &str, kind: &str) -> SetupReport {
     let result = (|| {
         let python = crate::adapter::hermes::python()

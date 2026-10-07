@@ -36,6 +36,28 @@ pub fn command() -> Command {
     super::background::command("git")
 }
 
+/// Repository writes use a child-local umask without forking the daemon's address space.
+pub(crate) fn private_command() -> Command {
+    let git = command();
+    #[cfg(unix)]
+    {
+        let mut command = super::background::command("/bin/sh");
+        // Arguments remain data, including the bundled executable path and repository names.
+        command
+            .args(["-c", "umask 077; exec \"$@\"", "agit-git"])
+            .arg(git.get_program());
+        for (key, value) in git.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+    }
+    #[cfg(not(unix))]
+    git
+}
+
 /// Git for Windows maps `/dev/null` to its null device; an empty filename is not portable.
 /// Apply before the subcommand so the empty graft file's advice override is a global option.
 pub(crate) fn disable_grafts(command: &mut Command) {

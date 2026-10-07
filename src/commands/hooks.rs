@@ -83,6 +83,44 @@ pub enum Action {
         #[arg(long, value_name = "id")]
         session: String,
     },
+    /// Register the calling native Claude Code process for shared control.
+    #[command(hide = true)]
+    NativeControl {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        generation: String,
+    },
+    /// Wait for a shared approval without charging the native hook's execution budget.
+    #[command(hide = true)]
+    NativeApproval {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Spool native lifecycle metadata while its control channel is disconnected.
+    #[command(hide = true)]
+    NativeEvents {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        generation: String,
+    },
+    /// Retain an exact completion boundary from the calling native writer.
+    #[command(hide = true)]
+    NativeComplete {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        turn: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -94,6 +132,72 @@ pub fn run(args: Args) -> CmdResult {
             // The relay has no audience; it ends quietly when it cannot or need not run.
             let _ = crate::rc::claude_inbox::run_relay(&session);
             Ok(ExitCode::Ok)
+        }
+        #[cfg(unix)]
+        Action::NativeControl {
+            session,
+            generation,
+        } => {
+            let registration = crate::rc::native_claude::register(&session, &generation)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "registration": registration,
+                    "descriptor": registration.descriptor,
+                })
+            );
+            Ok(ExitCode::Ok)
+        }
+        #[cfg(not(unix))]
+        Action::NativeControl { .. } => {
+            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
+        }
+        #[cfg(unix)]
+        Action::NativeApproval {
+            session,
+            generation,
+            id,
+        } => {
+            let reply = crate::rc::native_claude::wait_approval(&session, &generation, &id)?;
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(ExitCode::Ok)
+        }
+        #[cfg(not(unix))]
+        Action::NativeApproval { .. } => {
+            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
+        }
+        #[cfg(unix)]
+        Action::NativeEvents {
+            session,
+            generation,
+        } => {
+            let reply = crate::rc::native_claude::event_queue::exchange(&session, &generation)?;
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(ExitCode::Ok)
+        }
+        #[cfg(not(unix))]
+        Action::NativeEvents { .. } => {
+            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
+        }
+        #[cfg(unix)]
+        Action::NativeComplete {
+            session,
+            generation,
+            turn,
+            reason,
+        } => {
+            let receipt = crate::rc::native_claude::completion::record(
+                &session,
+                &generation,
+                &turn,
+                &reason,
+            )?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(ExitCode::Ok)
+        }
+        #[cfg(not(unix))]
+        Action::NativeComplete { .. } => {
+            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
         }
     }
 }

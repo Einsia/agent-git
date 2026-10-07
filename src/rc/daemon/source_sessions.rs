@@ -60,6 +60,11 @@ impl Daemon {
             .get(&p.workspace_id)
             .into_iter()
             .flat_map(|projects| projects.keys())
+            .filter(|id| {
+                p.project_id
+                    .as_ref()
+                    .is_none_or(|requested| requested == *id)
+            })
             .filter_map(|id| {
                 self.mirror
                     .project_path(&p.workspace_id, id)
@@ -146,6 +151,7 @@ impl Daemon {
         };
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: logical,
             native_source: Some(source),
@@ -233,6 +239,7 @@ mod tests {
                 workspace_id: "ws".into(),
             };
             let request = |source: &crate::rc::runtime_sources::RuntimeSource| SessionResume {
+                project_id: None,
                 workspace_id: "ws".into(),
                 session_id: source.session_ref(&native),
                 prompt: None,

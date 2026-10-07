@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         runtime: runtime.clone(),
         runtime_session_id: None,
         native_source: None,
+        interrupt_fenced: None,
         agent: None,
         branch: None,
         status: SessionStatus::Idle,

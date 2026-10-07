@@ -25,6 +25,18 @@ impl Session {
             .tailer
             .as_ref()
             .context("archive native transcript is unavailable")?;
+        let boundary = tailer.consumed();
+        #[cfg(unix)]
+        let boundary = if matches!(self.driver, AnyDriver::ClaudeNative(_)) {
+            crate::rc::native_claude::completion::turn_boundary(&native, tailer.path(), turn_id)?
+                .unwrap_or(boundary)
+        } else {
+            boundary
+        };
+        ensure!(
+            boundary <= tailer.consumed(),
+            "native completion has not reached the transcript reader"
+        );
         Job::capture(
             &self.info.session_id,
             &native,
@@ -34,7 +46,7 @@ impl Session {
             lineage,
             turn_id,
             tailer.path(),
-            tailer.consumed(),
+            boundary,
             self.archive_handoff.clone(),
         )?
         .record()

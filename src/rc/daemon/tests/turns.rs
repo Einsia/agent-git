@@ -675,6 +675,7 @@ fn an_unknown_mode_change_persists_a_stable_plan_floor_before_reply() {
                     let error = state
                         .resume_session(
                             SessionResume {
+                                project_id: None,
                                 workspace_id: "ws-a".into(),
                                 session_id: "session-a".into(),
                                 prompt: None,
@@ -725,6 +726,7 @@ fn an_unknown_mode_change_persists_a_stable_plan_floor_before_reply() {
                     let error = state
                         .resume_session(
                             SessionResume {
+                                project_id: None,
                                 workspace_id: "ws-a".into(),
                                 session_id: "session-a".into(),
                                 prompt: None,
@@ -1860,6 +1862,49 @@ fn unknown_shared_turn_receipt_keeps_observation_and_forbids_automatic_resubmiss
 }
 
 #[test]
+fn native_queue_acceptance_does_not_invent_a_turn_or_confirm_permission_changes() {
+    let outcome = TurnStartOutcome::NativeSubmission {
+        operation_id: "native-operation".into(),
+        delivery: crate::protocol::Delivery::WhenIdle,
+    };
+    let (completion, reply) = project_turn_start_outcome(outcome.clone(), None);
+    assert!(matches!(completion, SessionRpcCompletion::None));
+    let reply = reply.unwrap();
+    assert_eq!(reply["operation_id"], "native-operation");
+    assert_eq!(reply["delivery"], "when_idle");
+    assert!(
+        reply.get("turn_id").is_none(),
+        "queue acceptance cannot attribute another client's native turn to this prompt"
+    );
+    let (completion, completed) = project_turn_start_outcome(
+        TurnStartOutcome::NativeSubmission {
+            operation_id: "native-command".into(),
+            delivery: crate::protocol::Delivery::CommandCompleted,
+        },
+        None,
+    );
+    assert!(matches!(completion, SessionRpcCompletion::None));
+    let completed = completed.unwrap();
+    assert_eq!(completed["delivery"], "command_completed");
+    assert!(completed.get("turn_id").is_none());
+    let (completion, reply) = project_turn_start_outcome(
+        outcome,
+        Some(crate::rc::harness::TurnGuardAttempt {
+            token: "permission-attempt".into(),
+            expected_mode: crate::protocol::PermissionMode::Bypass,
+        }),
+    );
+    assert!(reply.is_err());
+    assert!(matches!(
+        completion,
+        SessionRpcCompletion::Turn {
+            fail_closed: true,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn only_a_typed_idle_steer_refusal_authorizes_resubmitting_input() {
     let error = super::super::map_receipt::<()>(Ok(Err(crate::rc::harness::TurnNotRunning.into())))
         .unwrap_err();
@@ -1871,4 +1916,130 @@ fn only_a_typed_idle_steer_refusal_authorizes_resubmitting_input() {
     .unwrap_err();
     assert!(uncertain.is(crate::protocol::ErrorCode::Internal));
     assert!(uncertain.data.is_none());
+}
+
+// Input can wait for a tool decision. Its receipt must not prevent that decision
+// or a stop, and completing either must not release the input's restart guard.
+#[tokio::test]
+async fn pending_input_remains_stoppable_and_approvable_without_losing_its_guard() {
+    use crate::protocol::{ApprovalDecision, ApprovalResponse, ApprovalScope, PermissionMode};
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
+    live.approval_requests.insert("approval-a".into(), None);
+    let daemon = rpc_test_daemon(
+        [("session-a".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+    let input = daemon
+        .lock()
+        .await
+        .prepare_session_rpc(&rpc_turn_frame("session-a"))
+        .unwrap();
+    let d = daemon.clone();
+    let mut input_stop = stop.clone();
+    let input_task = tokio::spawn(async move { input.execute(d, &mut input_stop).await });
+    let Command::Turn {
+        reply: input_reply, ..
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("input must reach the runtime")
+    };
+    assert!(input_reply.accept());
+    let mut approval = Frame::request(
+        method::APPROVAL_DECIDE,
+        ApprovalResponse {
+            approval_id: "approval-a".into(),
+            session_id: "session-a".into(),
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+            message: None,
+            answers: None,
+            by: None,
+        },
+    );
+    approval.caller = Some(claim("owner", "ws-a"));
+    let prepared = daemon.lock().await.prepare_session_rpc(&approval).unwrap();
+    let d = daemon.clone();
+    let mut approval_stop = stop.clone();
+    let approval_task = tokio::spawn(async move { prepared.execute(d, &mut approval_stop).await });
+    let Command::Approve {
+        reply: approval_reply,
+        ..
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("approval must reach the runtime while input waits")
+    };
+    assert!(approval_reply.accept());
+    let mut interrupt = Frame::request(
+        method::TURN_INTERRUPT,
+        TurnInterrupt {
+            session_id: "session-a".into(),
+            expected_turn_id: Some("active-turn".into()),
+            by: None,
+        },
+    );
+    interrupt.caller = Some(claim("operator", "ws-a"));
+    let prepared = {
+        let mut state = daemon.lock().await;
+        assert!(
+            state
+                .prepare_session_rpc(&rpc_turn_frame("session-a"))
+                .is_err()
+        );
+        approval.params.as_mut().unwrap()["scope"] = serde_json::json!("session");
+        assert!(state.prepare_session_rpc(&approval).is_err());
+        state
+            .sessions
+            .get_mut("session-a")
+            .unwrap()
+            .rpc_guard_sensitive = true;
+        state.prepare_session_rpc(&interrupt).unwrap()
+    };
+    let d = daemon.clone();
+    let mut interrupt_stop = stop.clone();
+    let interrupt_task =
+        tokio::spawn(async move { prepared.execute(d, &mut interrupt_stop).await });
+    let Command::Interrupt {
+        expected_turn_id,
+        reply,
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("stop must reach the runtime while approval waits")
+    };
+    assert_eq!(expected_turn_id.as_deref(), Some("active-turn"));
+    assert!(reply.accept());
+    reply.finish(Ok(()));
+    assert!(interrupt_task.await.unwrap().response.is_ok());
+    {
+        let mut state = daemon.lock().await;
+        assert!(state.sessions["session-a"].rpc_guard_sensitive);
+        assert!(state.sessions["session-a"].rpc_gate.try_lock().is_err());
+        interrupt.caller = Some(claim("viewer", "ws-a"));
+        assert!(state.prepare_session_rpc(&interrupt).is_err());
+        interrupt.caller = Some(claim("operator", "another-workspace"));
+        assert!(state.prepare_session_rpc(&interrupt).is_err());
+        state.on_session_note(SessionNote::Ended {
+            session_id: "session-a".into(),
+            generation: 1,
+        });
+    }
+    approval_reply.finish(Ok(ApprovalOutcome::Applied {
+        effective_mode: None,
+    }));
+    assert!(approval_task.await.unwrap().response.is_ok());
+    {
+        let state = daemon.lock().await;
+        let live = &state.sessions["session-a"];
+        assert!(live.ended && live.rpc_guard_sensitive);
+        assert!(!live.approval_requests.contains_key("approval-a"));
+    }
+    input_reply.finish(Ok(TurnStartOutcome::Accepted {
+        turn_id: "active-turn".into(),
+        still_running: false,
+        consumed_mode: None,
+        confirmation: TurnStartConfirmation::Exact,
+    }));
+    assert!(input_task.await.unwrap().response.is_ok());
+    assert!(!daemon.lock().await.sessions.contains_key("session-a"));
 }

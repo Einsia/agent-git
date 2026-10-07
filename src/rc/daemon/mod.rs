@@ -465,6 +465,30 @@ struct Driving {
     runtime: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionRpcLane {
+    Instruction,
+    Interrupt,
+    Approval,
+    SessionApproval,
+}
+
+impl SessionRpcLane {
+    fn owns_instruction(self) -> bool {
+        matches!(self, Self::Instruction | Self::SessionApproval)
+    }
+
+    fn owns_approval(self) -> bool {
+        matches!(self, Self::Approval | Self::SessionApproval)
+    }
+}
+
+struct SessionRpcSerial {
+    lane: SessionRpcLane,
+    _primary: tokio::sync::OwnedMutexGuard<()>,
+    _policy: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
 /// The per-session ordering lease acquired before a queued viewer RPC is
 /// prepared. A freshly launched harness may not have reported its native
 /// thread id yet; in that one case the lease crosses the short `Bound` wait so
@@ -472,7 +496,7 @@ struct Driving {
 struct SessionRpcLease {
     session_id: String,
     generation: u64,
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: SessionRpcSerial,
 }
 
 enum SessionRpcPreparation {
@@ -531,14 +555,12 @@ struct Live {
     /// Machine-originated events own both presence and policy; viewer responses
     /// cannot invent a pending request or its permission effect.
     approval_requests: HashMap<String, Option<crate::protocol::PermissionMode>>,
-    /// At most one viewer-originated command may be in flight for this live
-    /// session. The guard is acquired with `try_lock_owned` while the daemon's
-    /// global mutex is held, then carried by [`PreparedSessionRpc`] across the
-    /// queue/reply waits **after** that global mutex has been released.
-    ///
-    /// This preserves the old per-session ordering/state assumptions without
-    /// letting a slow session freeze unrelated sessions or the frame pump.
+    /// Input and policy mutations remain ordered until their receipts are projected.
     rpc_gate: Arc<Mutex<()>>,
+    /// Stops and approval responses must reach a runtime whose input receipt is
+    /// waiting for the current turn or a tool decision.
+    interrupt_gate: Arc<Mutex<()>>,
+    approval_gate: Arc<Mutex<()>>,
     /// The RPC currently owning `rpc_gate` can change the durable permission
     /// guard. Used only at the hard shutdown boundary: an unresolved outcome
     /// must restart as Plan, while a stuck turn/steer/interrupt must not
@@ -562,14 +584,19 @@ struct Live {
     /// promote this snapshot—not a mutable later `SessionInfo` projection—to
     /// the durable baseline when it clears inherited attempts.
     restart_guard_mode: Option<crate::protocol::PermissionMode>,
-    /// The supervisor has ended, but an accepted RPC still owns `rpc_gate` and
-    /// may need to project its result (or roll back a never-run danger arm).
-    /// Keep this generation until that RPC finishes; then remove it exactly as
-    /// the ordinary `SessionNote::Ended` path would.
+    /// Ended generations remain until every accepted RPC projects its result,
+    /// including any rollback of a never-run permission change.
     ended: bool,
 }
 
 impl Live {
+    fn rpc_lanes_idle_except(&self, owner: Option<SessionRpcLane>) -> bool {
+        (owner.is_some_and(SessionRpcLane::owns_instruction) || self.rpc_gate.try_lock().is_ok())
+            && (owner == Some(SessionRpcLane::Interrupt) || self.interrupt_gate.try_lock().is_ok())
+            && (owner.is_some_and(SessionRpcLane::owns_approval)
+                || self.approval_gate.try_lock().is_ok())
+    }
+
     fn authorization_baseline(&self) -> crate::protocol::PermissionMode {
         authorization_baseline(self.info.permission_mode, self.pending_mode)
     }
@@ -597,14 +624,12 @@ impl Live {
 /// A session command prepared under the daemon mutex and executed after that
 /// mutex has been released.
 ///
-/// `serial` is intentionally owned by the request: while it lives, no second
-/// command can prepare against stale permission/danger state for the same live
-/// generation. Different sessions have different guards and therefore remain
-/// independent.
+/// The request retains its lane through receipt projection. Policy changes also
+/// own the instruction lane so later input cannot use an unconfirmed mode.
 struct PreparedSessionRpc {
     session_id: String,
     generation: u64,
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: SessionRpcSerial,
     operation: SessionRpcOperation,
 }
 
@@ -743,7 +768,7 @@ struct ExecutedSessionRpc {
 struct PendingSessionRpc {
     session_id: String,
     generation: u64,
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: SessionRpcSerial,
     operation: PendingSessionRpcOperation,
 }
 
@@ -1140,17 +1165,29 @@ async fn complete_prepared_session_rpc(
     daemon: Arc<Mutex<Daemon>>,
     session_id: String,
     generation: u64,
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: SessionRpcSerial,
     completion: SessionRpcCompletion,
 ) {
     let mut retry = FAIL_CLOSED_PERSIST_RETRY_MIN;
     loop {
         let result = {
             let mut daemon = daemon.lock().await;
-            daemon.complete_session_rpc(&session_id, generation, &completion)
+            let result = daemon.complete_session_rpc_on_lane(
+                &session_id,
+                generation,
+                &completion,
+                serial.lane,
+            );
+            if result.is_ok() {
+                // Release under the state mutex so another lane's finalizer
+                // cannot leave an Ended generation waiting on a finished RPC.
+                drop(serial);
+                return;
+            }
+            result
         };
         match result {
-            Ok(()) => break,
+            Ok(()) => unreachable!("successful projection returns while releasing its lane"),
             Err(error) => {
                 eprintln!(
                     "agitd: could not durably project a completed session guard; retaining its RPC gate and retrying: {error:#}"
@@ -1163,10 +1200,6 @@ async fn complete_prepared_session_rpc(
             }
         }
     }
-    // Keep the per-session gate through the state projection and any deferred
-    // Ended cleanup. Releasing it sooner lets a new request prepare against
-    // stale state or lets Ended delete the Live before completion can fence it.
-    drop(serial);
 }
 
 async fn release_unprepared_session_rpc(daemon: Arc<Mutex<Daemon>>, lease: SessionRpcLease) {
@@ -1184,7 +1217,7 @@ async fn finish_prepared_session_rpc(
     daemon: Arc<Mutex<Daemon>>,
     session_id: String,
     generation: u64,
-    serial: tokio::sync::OwnedMutexGuard<()>,
+    serial: SessionRpcSerial,
     completion: SessionRpcCompletion,
     response: Result<serde_json::Value, RpcError>,
 ) -> ExecutedSessionRpc {
@@ -1200,6 +1233,23 @@ fn project_turn_start_outcome(
     guard_attempt: Option<crate::rc::harness::TurnGuardAttempt>,
 ) -> (SessionRpcCompletion, Result<serde_json::Value, RpcError>) {
     match outcome {
+        TurnStartOutcome::NativeSubmission { operation_id, delivery } if guard_attempt.is_none() => (
+            SessionRpcCompletion::None,
+            Ok(serde_json::to_value(crate::protocol::TurnQueuedResult {
+                operation_id,
+                delivery,
+            }).unwrap()),
+        ),
+        TurnStartOutcome::NativeSubmission { .. } => (
+            SessionRpcCompletion::Turn {
+                guard_attempt,
+                accepted_mode: None,
+                confirmation: None,
+                fail_closed: true,
+                retire_generation: false,
+            },
+            Err(RpcError::new(ErrorCode::Internal, "queued native acceptance cannot confirm a permission override")),
+        ),
         TurnStartOutcome::Accepted {
             turn_id,
             consumed_mode,

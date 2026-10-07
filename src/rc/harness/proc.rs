@@ -41,6 +41,7 @@ pub struct LaunchError {
     error: anyhow::Error,
     spawned: bool,
     external_writer: bool,
+    resume_rejected: bool,
 }
 
 impl LaunchError {
@@ -54,6 +55,7 @@ impl LaunchError {
             error,
             spawned: false,
             external_writer: false,
+            resume_rejected: false,
         }
     }
 
@@ -67,6 +69,7 @@ impl LaunchError {
             error,
             spawned: true,
             external_writer: false,
+            resume_rejected: false,
         }
     }
 
@@ -77,7 +80,22 @@ impl LaunchError {
             error,
             spawned: true,
             external_writer: true,
+            resume_rejected: true,
         }
+    }
+
+    /// A native resume was explicitly refused and the driver connection is closed.
+    pub(super) fn resume_rejected(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            spawned: true,
+            external_writer: false,
+            resume_rejected: true,
+        }
+    }
+
+    pub fn is_resume_rejected(&self) -> bool {
+        self.resume_rejected
     }
 
     pub fn is_external_writer(&self) -> bool {

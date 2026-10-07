@@ -199,6 +199,13 @@ not wait for, release, or bypass a writer's authorization guard. After losing a
 permission-change reply, clients reconcile this state instead of replaying the
 mutation. A different observed value is not proof that an uncertain write failed.
 
+With `session-permission-capabilities-v1`, the same response can include
+`available_modes`, overriding the runtime-wide permission choices for that session.
+An empty list means switching is unsupported and clients omit the control. An
+absent override preserves the runtime catalog. Native Claude attachments report
+an empty list: the native configuration row changes a future session's default,
+not the running session's permission policy.
+
 `session.setPermissionMode` updates shared native defaults directly. It does not
 wait for another RC-submitted turn: subsequent native CLI turns and queued inputs
 use those defaults. An active turn retains the policy captured when it started.
@@ -359,3 +366,40 @@ without replaying the decision. Admission and queue withdrawal report
 that decision after confirming that the same request remains pending. Native
 resolution can come from another controller and does not prove which decision
 won. The browser keeps immediate pending feedback until the request resolves.
+
+
+## Native Claude command receipts
+
+Native Claude `session.commands` returns `authoritative: true`. Its command list
+contains the text commands the active native runtime can execute through the web
+composer. Clients must not merge managed-runtime defaults into that list or send
+an unsupported permission command through a different control method.
+
+The composer sends a listed slash command through the same idempotent message
+path as ordinary input. The native module invokes `command.run` instead of
+`prompt.submit`; command output stays in the native transcript and follows the
+canonical history reader. Durable receipts contain operation metadata only.
+Compaction start and completion events continue to reach all attached clients
+while the original request waits for native completion.
+
+A completed native command returns `delivery: "command_completed"` and an
+`operation_id`, without inventing a model turn ID. Clients clear their action
+indicator without waiting for a subsequent model response. Ordinary queued
+prompts retain `delivery: "when_idle"`. Deploy support for the completed-command
+receipt in the web client before enabling native commands in the executor.
+
+## Native Claude stop receipts
+
+The shared native controller queues a stop for the observed turn and resolves it
+from the native receipt stream. Waiting for that receipt does not block the
+supervisor's event loop, history tail, or metadata reads. An unconfirmed stop
+retains its pending approvals. If the observed turn changes before the receipt
+arrives, the stop resolves as no longer active and cannot retire approvals for
+the newer turn. Detaching control leaves the native writer running.
+
+`SessionInfo.interrupt_fenced` reports whether the attached controller accepts
+`expected_turn_id`. The capability is true for Codex and shared native Claude,
+false for managed Claude and OpenCode, and absent when no controller has
+confirmed it. Clients preserve the selected turn identifier across retries and
+cancel recovery when the selected conversation, executor or native turn changes.
+Older Codex executors can retain their machine-level feature negotiation.

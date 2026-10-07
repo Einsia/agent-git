@@ -31,6 +31,8 @@
 //! the committed history can never disagree.
 
 pub mod claude_code;
+#[cfg(unix)]
+pub mod claude_native;
 pub mod codex;
 pub mod models;
 pub mod opencode;
@@ -306,6 +308,8 @@ pub enum HarnessEvent {
     /// supervisor process everything that preceded the response before it
     /// closes the viewer RPC receipt.
     TurnStartResolved(TurnStartOutcome),
+    SteerResolved(Result<Delivery, String>),
+    InterruptResolved(Result<InterruptOutcome, String>),
     /// An exact response arrived after a notification-only acceptance was
     /// already returned. The daemon may clear its durable Plan restart
     /// override only when this opaque token matches the outstanding one.
@@ -323,6 +327,8 @@ pub enum HarnessEvent {
         mode: Option<PermissionMode>,
         applied: PermissionApply,
     },
+    /// Model metadata changed without changing the native permission authority.
+    ModelUpdated,
     GoalUpdated {
         goal: Value,
     },
@@ -368,6 +374,10 @@ pub enum TurnOutcome {
 /// while an unknown outcome may already have consumed the prompt and mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnStartOutcome {
+    NativeSubmission {
+        operation_id: String,
+        delivery: Delivery,
+    },
     Accepted {
         turn_id: String,
         /// False when native `turn/completed` preceded this exact response.
@@ -431,6 +441,11 @@ pub enum TurnStartDispatch {
     Resolved(TurnStartOutcome),
     /// Codex wrote `turn/start`; its exact response will arrive as
     /// [`HarnessEvent::TurnStartResolved`] in native wire order.
+    Awaiting,
+}
+
+pub enum SteerDispatch {
+    Resolved(crate::Result<Delivery>),
     Awaiting,
 }
 
@@ -546,6 +561,8 @@ pub enum PermissionModeOutcome {
 /// Explicit variants keep protocol-specific capabilities attached to their drivers.
 pub enum AnyDriver {
     ClaudeCode(Box<claude_code::ClaudeCodeDriver>),
+    #[cfg(unix)]
+    ClaudeNative(Box<claude_native::ClaudeNativeDriver>),
     Codex(Box<codex::CodexDriver>),
     OpenCode(Box<opencode::OpenCodeDriver>),
 }
@@ -554,10 +571,17 @@ macro_rules! dispatch {
     ($self:expr, $m:ident $(, $a:expr)*) => {
         match $self {
             AnyDriver::ClaudeCode(d) => d.$m($($a),*).await,
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.$m($($a),*).await,
             AnyDriver::Codex(d) => d.$m($($a),*).await,
             AnyDriver::OpenCode(d) => d.$m($($a),*).await,
         }
     };
+}
+
+pub enum InterruptDispatch {
+    Resolved(crate::Result<InterruptOutcome>),
+    Awaiting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +597,21 @@ impl AnyDriver {
     /// actually calls `Command::spawn` knows whether a process was created; no
     /// layer in between may guess.
     pub async fn launch(runtime: &str, spec: LaunchSpec) -> Result<AnyDriver, proc::LaunchError> {
+        #[cfg(unix)]
+        if runtime == "claude-code"
+            && let Some(session) = spec.resume_from.as_deref()
+        {
+            if crate::rc::native_claude::Client::available(session, &spec.cwd) {
+                return Ok(Self::ClaudeNative(Box::new(
+                    claude_native::ClaudeNativeDriver::attach(spec)?,
+                )));
+            }
+            if crate::rc::claude_inbox::session_is_live(session) {
+                return Err(proc::LaunchError::not_spawned(anyhow::anyhow!(
+                    "native Claude control is still attaching"
+                )));
+            }
+        }
         match runtime {
             "claude-code" => Ok(AnyDriver::ClaudeCode(Box::new(
                 claude_code::ClaudeCodeDriver::launch(spec).await?,
@@ -594,6 +633,8 @@ impl AnyDriver {
     pub fn runtime(&self) -> &'static str {
         match self {
             AnyDriver::ClaudeCode(_) => "claude-code",
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(_) => "claude-code",
             AnyDriver::Codex(_) => "codex",
             AnyDriver::OpenCode(_) => "opencode",
         }
@@ -606,16 +647,28 @@ impl AnyDriver {
     /// (we suppress the `--replay-user-messages` echo of our own message), so
     /// there the supervisor is the only source.
     pub fn emits_turn_started(&self) -> bool {
-        matches!(self, AnyDriver::Codex(_))
+        match self {
+            Self::Codex(_) => true,
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn has_active_turn(&self) -> bool {
-        matches!(self, Self::Codex(driver) if driver.has_active_turn())
+        match self {
+            Self::Codex(driver) => driver.has_active_turn(),
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.has_active_turn(),
+            _ => false,
+        }
     }
 
     pub fn runtime_thread_id(&self) -> Option<String> {
         match self {
             AnyDriver::ClaudeCode(d) => d.runtime_thread_id().map(String::from),
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.runtime_thread_id(),
             AnyDriver::Codex(d) => d.runtime_thread_id().map(String::from),
             AnyDriver::OpenCode(d) => d.runtime_thread_id(),
         }
@@ -624,6 +677,8 @@ impl AnyDriver {
     pub fn transcript_path(&self) -> Option<PathBuf> {
         match self {
             AnyDriver::ClaudeCode(d) => d.transcript_path(),
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.transcript_path(),
             AnyDriver::Codex(d) => d.transcript_path(),
             AnyDriver::OpenCode(d) => d.transcript_path(),
         }
@@ -643,6 +698,8 @@ impl AnyDriver {
                 Some(id)
             }
             AnyDriver::OpenCode(_) => None,
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(_) => None,
         }
     }
 
@@ -654,6 +711,8 @@ impl AnyDriver {
     ) -> TurnStartDispatch {
         match self {
             AnyDriver::ClaudeCode(d) => TurnStartDispatch::Resolved(d.start_turn(message).await),
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.start_turn(message, guard_attempt).await,
             AnyDriver::OpenCode(d) => d.start_turn(message).await,
             AnyDriver::Codex(d) => {
                 d.start_turn(message, consume_pending_mode, guard_attempt)
@@ -672,11 +731,34 @@ impl AnyDriver {
         }
     }
 
-    pub async fn steer(&mut self, message: &str) -> crate::Result<Delivery> {
-        dispatch!(self, steer, message)
+    pub async fn steer(&mut self, message: &str) -> SteerDispatch {
+        match self {
+            Self::Codex(driver) => SteerDispatch::Resolved(driver.steer(message).await),
+            Self::ClaudeCode(driver) => SteerDispatch::Resolved(driver.steer(message).await),
+            Self::OpenCode(driver) => SteerDispatch::Resolved(driver.steer(message).await),
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.steer(message),
+        }
     }
 
-    pub async fn interrupt(
+    pub fn interrupt_fenced(&self) -> bool {
+        match self {
+            Self::Codex(_) => true,
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => true,
+            Self::ClaudeCode(_) | Self::OpenCode(_) => false,
+        }
+    }
+
+    pub async fn interrupt(&mut self, expected_turn_id: Option<&str>) -> InterruptDispatch {
+        #[cfg(unix)]
+        if let Self::ClaudeNative(driver) = self {
+            return driver.interrupt(expected_turn_id);
+        }
+        InterruptDispatch::Resolved(self.interrupt_managed(expected_turn_id).await)
+    }
+
+    async fn interrupt_managed(
         &mut self,
         expected_turn_id: Option<&str>,
     ) -> crate::Result<InterruptOutcome> {
@@ -691,6 +773,10 @@ impl AnyDriver {
             Self::ClaudeCode(driver) => driver.interrupt().await?,
             Self::OpenCode(driver) => driver.interrupt().await?,
             Self::Codex(_) => unreachable!("Codex interrupts use the native turn fence"),
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => {
+                unreachable!("native Claude interrupts use the native turn fence")
+            }
         }
         Ok(InterruptOutcome::Requested)
     }
@@ -708,6 +794,8 @@ impl AnyDriver {
     pub fn abandon_pending_approvals(&mut self) -> usize {
         match self {
             AnyDriver::ClaudeCode(d) => d.abandon_pending_approvals(),
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.abandon_pending_approvals(),
             AnyDriver::Codex(d) => d.abandon_pending_approvals(),
             AnyDriver::OpenCode(d) => d.abandon_pending_approvals(),
         }
@@ -719,6 +807,8 @@ impl AnyDriver {
         match self {
             Self::Codex(driver) => driver.runtime_command(name, arguments).await,
             Self::ClaudeCode(driver) => driver.runtime_command(name, arguments).await,
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.runtime_command(name, arguments).await,
             _ => anyhow::bail!("This command is not available through the runtime control channel"),
         }
     }
@@ -730,6 +820,8 @@ impl AnyDriver {
         match self {
             Self::Codex(d) => d.model_control(model).await,
             Self::ClaudeCode(d) => d.model_control(model).await,
+            #[cfg(unix)]
+            Self::ClaudeNative(d) => d.model_control(model).await,
             Self::OpenCode(d) => d.model_control(model).await,
         }
     }
@@ -744,16 +836,36 @@ impl AnyDriver {
     pub fn permission_mode(&self) -> PermissionMode {
         match self {
             AnyDriver::ClaudeCode(d) => d.permission_mode(),
+            #[cfg(unix)]
+            AnyDriver::ClaudeNative(d) => d.permission_mode(),
             AnyDriver::Codex(d) => d.permission_mode(),
             AnyDriver::OpenCode(d) => d.permission_mode(),
         }
     }
 
     pub fn shared_executor(&self) -> bool {
-        matches!(self, Self::Codex(driver) if driver.shared_executor())
+        match self {
+            Self::Codex(driver) => driver.shared_executor(),
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn correlates_pending_prompt(&self) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Self::ClaudeNative(_)) {
+            return false;
+        }
+        true
     }
 
     pub fn permission_mode_known(&self) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Self::ClaudeNative(_)) {
+            // SessionStart observations do not cover every local permission change.
+            return false;
+        }
         !matches!(self, Self::Codex(driver) if !driver.permission_mode_known())
     }
 

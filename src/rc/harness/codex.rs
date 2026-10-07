@@ -1538,7 +1538,8 @@ impl CodexDriver {
                 | TurnStartOutcome::ConcurrentNotAccepted { .. }
                 | TurnStartOutcome::FatalNotAccepted { .. }
                 | TurnStartOutcome::Unknown { .. }
-                | TurnStartOutcome::SharedUnknown { .. } => {}
+                | TurnStartOutcome::SharedUnknown { .. }
+                | TurnStartOutcome::NativeSubmission { .. } => {}
             }
             return Some(HarnessEvent::TurnStartResolved(outcome));
         }
@@ -2758,7 +2759,11 @@ mod tests {
                 );
             } else {
                 assert_eq!(
-                    driver.steer("same user message").await.unwrap(),
+                    match driver.steer("same user message").await {
+                        crate::rc::harness::SteerDispatch::Resolved(result) => result.unwrap(),
+                        crate::rc::harness::SteerDispatch::Awaiting =>
+                            panic!("Codex must return its native receipt"),
+                    },
                     Delivery::Immediate
                 );
             }

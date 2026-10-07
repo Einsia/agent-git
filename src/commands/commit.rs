@@ -370,6 +370,7 @@ fn run_inner(args: Args) -> CmdResult {
         tag: args.tag,
         code: args.code,
         completed_only: args.from_supervisor,
+        native_completions: Vec::new(),
         historical: false,
         message: args.message,
         paths: args.paths,
@@ -665,6 +666,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             tag: None,
             code: false,
             completed_only: false,
+            native_completions: Vec::new(),
             historical: false,
             message: None,
             paths: Vec::new(),
@@ -1068,6 +1070,7 @@ struct SettleOpts {
     tag: Option<String>,
     code: bool,
     completed_only: bool,
+    native_completions: Vec<usize>,
     historical: bool,
     message: Option<String>,
     paths: Vec<String>,
@@ -1278,6 +1281,32 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         out.pop();
     }
     out
+}
+
+/// Completion receipts affect settlement only; stored native evidence is never synthesized.
+fn annotate_completed_boundaries(
+    region: &str,
+    ir: &mut Session,
+    boundaries: &[usize],
+) -> crate::Result<()> {
+    let mut offset = 0;
+    let line_ends: Vec<_> = region
+        .split_inclusive('\n')
+        .map(|line| {
+            offset += line.len();
+            offset
+        })
+        .collect();
+    for boundary in boundaries {
+        let line = line_ends
+            .binary_search(boundary)
+            .map_err(|_| anyhow::anyhow!("native completion does not end at a frozen record"))?;
+        ir.events.push(
+            crate::adapter::Event::text(EventKind::TurnEnd, String::new(), None).at_line(line),
+        );
+    }
+    ir.events.sort_by_key(|event| event.line);
+    Ok(())
 }
 
 /// Native completions remain separate snapshots even when recovery collects them together.
@@ -1695,6 +1724,21 @@ fn settle_local_telemetry_inner(
             e
         }
     })?;
+    #[cfg(unix)]
+    let opts = {
+        let mut opts = opts;
+        if lk.source == "claude-code" && opts.completed_only {
+            let path = lk
+                .resolve()
+                .context("native completion transcript is unavailable")?;
+            opts.native_completions = crate::rc::native_claude::completion::boundaries(
+                lk.native_thread_id(),
+                &path,
+                &bytes,
+            )?;
+        }
+        opts
+    };
     let memory_link = lk.clone();
     let milestone = opts.milestone.is_some();
     let code = settle_bytes(
@@ -2248,10 +2292,28 @@ fn settle_bytes(
             .any(|event| event.kind == EventKind::TurnEnd);
     let chunks = if opts.completed_only {
         // Recovery can read a newer native snapshot than the completed turn that queued it.
-        let end = completed_native_boundary(&runtime, &region)?.unwrap_or(0) as usize;
+        let mut boundaries: Vec<_> = opts
+            .native_completions
+            .iter()
+            .filter_map(|end| end.checked_sub(region_start).filter(|end| *end > 0))
+            .collect();
+        if runtime == "claude-code" {
+            boundaries.extend(crate::adapter::claude_code::completed_turn_boundaries(
+                &region,
+            ));
+            boundaries.sort_unstable();
+            boundaries.dedup();
+        }
+        let end = (completed_native_boundary(&runtime, &region)?.unwrap_or(0) as usize)
+            .max(boundaries.last().copied().unwrap_or(0));
+        anyhow::ensure!(
+            end <= region.len(),
+            "native completion exceeds the frozen transcript"
+        );
         let completed = &region[..end];
         let adapter = crate::adapter::get(&runtime)?;
-        let completed_ir = adapter.parse(completed)?;
+        let mut completed_ir = adapter.parse(completed)?;
+        annotate_completed_boundaries(completed, &mut completed_ir, &boundaries)?;
         completed_turn_chunks(
             completed,
             &completed_ir,
@@ -4083,6 +4145,7 @@ pub(super) fn record_at(
         tag: None,
         code: false,
         completed_only: false,
+        native_completions: Vec::new(),
         historical: true,
         message: None,
         paths: vec![],
@@ -4207,11 +4270,107 @@ mod tests {
             tag: None,
             code: false,
             completed_only: false,
+            native_completions: Vec::new(),
             historical: false,
             message: None,
             paths: vec![],
             quiet: false,
         }
+    }
+
+    #[test]
+    fn native_completion_receipts_settle_an_unanswered_turn_and_its_continuation_separately() {
+        let (_directory, store) = store();
+        let (_repository, repo) = setup_repo();
+        let records = |text: &str| {
+            text.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let stopped = "{\"type\":\"user\",\"sessionId\":\"AB\",\"message\":{\"role\":\"user\",\"content\":\"stopped before any reply\"}}\n";
+        let continuation = format!(
+            "{stopped}{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"continued without another prompt\",\"stop_reason\":\"end_turn\"}}}}\n"
+        );
+        let running = format!(
+            "{continuation}{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"still in flight\"}}}}\n"
+        );
+        let settle = |text: &str, boundaries: Vec<usize>, fresh| {
+            let mut options = opts();
+            options.completed_only = true;
+            options.native_completions = boundaries;
+            let claim = link::get(&store, "claude-code", "AB").unwrap_or_else(|| {
+                let mut claim = link();
+                claim.source = "claude-code".into();
+                claim
+            });
+            assert_eq!(
+                settle_bytes(
+                    &store,
+                    &repo,
+                    "alice/photo",
+                    "main",
+                    claim,
+                    text.as_bytes(),
+                    "alice",
+                    options,
+                    fresh,
+                    true
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+        };
+        settle(stopped, vec![stopped.len()], true);
+        let stopped_tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        assert_eq!(
+            meta::read_at_ref(&repo, "HEAD").unwrap().baseline_bytes,
+            Some(stopped.len() as u64)
+        );
+        let (log, _) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        assert_eq!(
+            records(&transcript::unwrap_strict(&log).unwrap()),
+            records(stopped)
+        );
+
+        settle(&running, vec![stopped.len()], false);
+        let snapshot = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(snapshot.turn, Some(1));
+        assert_eq!(snapshot.baseline_bytes, Some(continuation.len() as u64));
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(),
+            stopped_tip
+        );
+        let (log, view) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        assert_eq!(
+            records(&transcript::unwrap_strict(&log).unwrap()),
+            records(&continuation)
+        );
+        assert!(!view.contains("still in flight"));
+        let caught_up = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        settle(&running, vec![stopped.len()], false);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), caught_up);
+        let finished = format!(
+            "{running}{{\"type\":\"assistant\",\"message\":{{\"content\":\"done\",\"stop_reason\":\"end_turn\"}}}}\n{{\"type\":\"system\",\"subtype\":\"turn_duration\"}}\n"
+        );
+        let queued = "{\"type\":\"queue-operation\",\"operation\":\"enqueue\"}\n";
+        let following = format!(
+            "{finished}{queued}{{\"type\":\"user\",\"message\":{{\"content\":\"next prompt\"}}}}\n"
+        );
+        settle(&following, vec![stopped.len()], false);
+        assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), caught_up);
+        assert_eq!(
+            meta::read_at_ref(&repo, "HEAD").unwrap().baseline_bytes,
+            Some(finished.len() as u64)
+        );
+        let finished_tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let next = format!(
+            "{following}{{\"type\":\"assistant\",\"message\":{{\"content\":\"next done\",\"stop_reason\":\"end_turn\"}}}}\n{{\"type\":\"system\",\"subtype\":\"turn_duration\"}}\n"
+        );
+        settle(&next, vec![stopped.len()], false);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(),
+            finished_tip
+        );
     }
 
     #[test]
@@ -6509,7 +6668,7 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             &repo,
             "alice/photo",
             "main",
-            lk,
+            lk.clone(),
             full.as_bytes(),
             "alice",
             opts(),
@@ -6520,6 +6679,47 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         assert_eq!(repo.commit_count(), 2);
         let t2 = repo.show("HEAD", meta::LOG_FILE).unwrap();
         assert!(t2.contains("pushed"), "{t2}");
+
+        let interrupted_result = cc_result
+            .replace("\"u5\"", "\"cancelled-result\"")
+            .replace(
+                "\"type\":\"user\"",
+                "\"type\":\"user\",\"toolDenialKind\":\"interrupted\"",
+            )
+            .replace(
+                "\"content\":\"ok\"",
+                "\"is_error\":true,\"content\":\"interrupted\"",
+            );
+        let stopped = format!(
+            "{full}{}{}{interrupted_result}",
+            cc_user("cancelled-prompt", "cancel this write"),
+            cc_call.replace("\"u4\"", "\"cancelled-call\"")
+        );
+        let mut completed_only = opts();
+        completed_only.completed_only = true;
+        settle_bytes(
+            &s,
+            &repo,
+            "alice/photo",
+            "main",
+            lk,
+            stopped.as_bytes(),
+            "alice",
+            completed_only,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(repo.commit_count(), 3);
+        assert_eq!(
+            meta::read_at_ref(&repo, "HEAD").unwrap().baseline_bytes,
+            Some(stopped.len() as u64)
+        );
+        assert!(
+            repo.show("HEAD", meta::LOG_FILE)
+                .unwrap()
+                .contains("cancel this write")
+        );
     }
 
     #[test]

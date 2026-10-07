@@ -205,6 +205,96 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     }
     assert_eq!(slots.available_permits(), 1);
 
+    // Native watch backfill arrives as live frames. A blocked reader must catch up
+    // through the journal while owner traffic and remote receipts continue independently.
+    let first = replay_count as u64 + 2;
+    let last = first + super::super::CLIENT_QUEUE as u64 * 2;
+    let retained: Vec<_> = (first..=last)
+        .map(|seq| {
+            let mut event =
+                Frame::notification("item.completed", json!({"text":"x".repeat(40 * 1024)}));
+            event.stream = Some("visible".into());
+            event.seq = Some(seq);
+            event
+        })
+        .collect();
+    let owner_id = describe.id.clone();
+    let owner_reader = tokio::spawn(async move {
+        owner
+            .get_mut()
+            .write_all(format!("{}\n", describe.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let mut received_last = false;
+        let mut replied = false;
+        while !received_last || !replied {
+            let mut record = String::new();
+            owner.read_line(&mut record).await.unwrap();
+            let frame: Frame = serde_json::from_str(&record).unwrap();
+            received_last |= frame.seq == Some(last);
+            replied |= frame.id == owner_id;
+        }
+        owner
+    });
+    for frame in &retained {
+        out.send(frame.clone());
+    }
+    let mut owner = tokio::time::timeout(Duration::from_secs(5), owner_reader)
+        .await
+        .unwrap()
+        .unwrap();
+    let describe = Frame::request("machine.describe", json!({}));
+    sink.send(Packet::Text(describe.to_json())).await.unwrap();
+    let mut next_seq = first;
+    let mut replied = false;
+    let mut recovered = 0;
+    let mut final_event = Frame::notification("turn.completed", json!({"outcome":"completed"}));
+    final_event.stream = Some("visible".into());
+    final_event.seq = Some(last + 1);
+    let catch_up = async {
+        while next_seq <= last + 1 || !replied {
+            tokio::select! {
+                frame = receive(&mut source) => {
+                    if frame.id == describe.id {
+                        assert!(next_seq <= last, "control receipt waited behind the backfill");
+                        replied = true;
+                    } else {
+                        assert_eq!(frame.seq, Some(next_seq));
+                        next_seq += 1;
+                    }
+                }
+                request = requests.recv() => {
+                    let Some(crate::rc::link::LinkEvent::Frame { frame, .. }) = request else { panic!("missing journal recovery") };
+                    assert_eq!(frame.method(), "session.subscribe");
+                    assert_eq!(frame.params.as_ref().unwrap()["session_id"], "visible");
+                    let after = frame.params.as_ref().unwrap()["after_seq"].as_u64().unwrap();
+                    assert!(after >= first && after <= last);
+                    let mut frames: Vec<_> = retained.iter().filter(|frame| frame.seq.unwrap() > after).cloned().collect();
+                    if recovered > 0 { frames.push(final_event.clone()); }
+                    let through = if recovered > 0 { last + 1 } else { last };
+                    out.send_replay_response(
+                        Frame::response(frame.id.clone().unwrap(), json!({"session":{"last_seq":through},"from_seq":after+1})),
+                        frames,
+                        slots.clone().try_acquire_owned().unwrap(),
+                    );
+                    if recovered == 0 { out.send(final_event.clone()); }
+                    recovered += 1;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), catch_up)
+        .await
+        .unwrap();
+    assert!(recovered >= 1, "burst must exercise journal recovery");
+    // The owner already received the terminal turn event through normal fanout.
+    response.clear();
+    owner.read_line(&mut response).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Frame>(&response).unwrap().seq,
+        Some(last + 1)
+    );
+
     for (method, params) in [
         ("session.history", json!({"session_id":"hidden"})),
         ("peer.list", json!({})),

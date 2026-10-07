@@ -280,16 +280,12 @@ impl Daemon {
                 // freshly launched harness process is orphaned, and every web
                 // operation on it answers "no live session", with no way back.
                 // `WatchEnded` compares generations for the same reason.
-                let gate = self
+                if let Some(live) = self
                     .sessions
                     .get(&session_id)
                     .filter(|live| live.generation == generation)
-                    .map(|live| live.rpc_gate.clone());
-                if let Some(gate) = gate {
-                    // Never await this per-session gate while holding the
-                    // daemon mutex. A command completion owns the gate and
-                    // must reacquire this mutex to project/roll back state.
-                    if gate.try_lock_owned().is_ok() {
+                {
+                    if live.rpc_lanes_idle_except(None) {
                         self.remove_session_generation(&session_id, generation);
                     } else if let Some(live) = self.sessions.get_mut(&session_id) {
                         live.ended = true;
@@ -606,6 +602,7 @@ impl Daemon {
         }
         info.last_seq = self.journal.last_seq(&info.session_id);
         if let Some(live) = self.sessions.get(&info.session_id) {
+            info.interrupt_fenced = live.info.interrupt_fenced;
             info.runtime_session_id = live.runtime_thread_id.clone();
             info.native_source = live.info.native_source.clone();
         } else if let Some(entry) = self.roster.get(&info.session_id)
@@ -834,6 +831,7 @@ mod bound_lineage_tests {
                 .block_on(async {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
+                        interrupt_fenced: None,
                         publication: None,
                         session_id: "agit-S".into(),
                         native_source: None,
@@ -865,6 +863,8 @@ mod bound_lineage_tests {
                         pending_mode: None,
                         approval_requests: HashMap::new(),
                         rpc_gate: Arc::new(Mutex::new(())),
+                        interrupt_gate: Arc::new(Mutex::new(())),
+                        approval_gate: Arc::new(Mutex::new(())),
                         rpc_guard_sensitive: false,
                         confirmed_turn_guards: Default::default(),
                         inflight_turn_guard: None,

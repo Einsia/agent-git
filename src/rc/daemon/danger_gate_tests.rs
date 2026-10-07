@@ -244,6 +244,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
             .block_on(async {
                 let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
                 let info = SessionInfo {
+                    interrupt_fenced: None,
                     publication: None,
                     session_id: "session-1".into(),
                     native_source: None,
@@ -296,6 +297,8 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     .into_iter()
                     .collect(),
                     rpc_gate: Arc::new(Mutex::new(())),
+                    interrupt_gate: Arc::new(Mutex::new(())),
+                    approval_gate: Arc::new(Mutex::new(())),
                     rpc_guard_sensitive: false,
                     confirmed_turn_guards: Default::default(),
                     inflight_turn_guard: None,

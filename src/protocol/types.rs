@@ -17,18 +17,16 @@ pub use crate::adapter::{Event as IrEvent, EventKind as IrEventKind};
 // Capabilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When a `turn.steer` message actually reaches the model.
-///
-/// Measured, not assumed (PRD §3.5): claude-code's stream-json channel accepts a
-/// second user message immediately but only *delivers* it when the in-flight
-/// tool call returns (31 s in the test). codex's `turn/steer` is a protocol verb
-/// and lands at once. The difference is user-visible, so it is on the wire and
-/// the UI must show "queued — delivered after the current tool finishes".
+/// Native delivery distinguishes pending model input from a completed local command.
+/// A completed command must not leave the client waiting for an invented model turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
+    /// A native slash command completed without promising another model turn.
+    CommandCompleted,
     Immediate,
     AtToolBoundary,
+    WhenIdle,
 }
 
 /// How much the agent may do without asking.
@@ -532,6 +530,9 @@ pub struct SessionStartResult {
 pub struct SessionResume {
     pub workspace_id: String,
     pub session_id: String,
+    /// Select the authorized project when several bindings contain this conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,6 +672,9 @@ impl NativeSourceRef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    /// This attached controller accepts stops fenced to the original native turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_fenced: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication: Option<SessionPublicationStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -912,6 +916,9 @@ pub struct SessionSetPermissionModeResult {
 pub struct SessionPermissionsResult {
     pub mode: Option<PermissionMode>,
     pub pending_mode: Option<PermissionMode>,
+    /// A session-specific override of the runtime's permission choices; empty disables switching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_modes: Option<Vec<PermissionMode>>,
     /// A writer may still change the observed policy after this snapshot.
     pub changing: bool,
     pub last_seq: u64,
@@ -962,6 +969,13 @@ pub struct TurnStart {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnStartResult {
     pub turn_id: String,
+}
+
+/// Native submission receipts carry no inferred model-turn identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnQueuedResult {
+    pub operation_id: String,
+    pub delivery: Delivery,
 }
 
 /// Add to the *current* turn without stopping it. Distinct verb from interrupt

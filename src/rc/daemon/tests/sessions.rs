@@ -190,6 +190,7 @@ fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
                     likely_active: false,
                 };
                 let takeover = |workspace: &str| SessionResume {
+                    project_id: None,
                     workspace_id: workspace.into(),
                     session_id: "native-nobody-knows".into(),
                     prompt: None,
@@ -295,6 +296,7 @@ fn a_bound_dangerous_transcript_stays_owner_only_from_a_second_workspace_sharing
                     likely_active: false,
                 };
                 let takeover = |workspace: &str| SessionResume {
+                    project_id: None,
                     workspace_id: workspace.into(),
                     session_id: "native-1".into(),
                     prompt: None,
@@ -409,6 +411,7 @@ fn resuming_by_logical_id_judges_the_transcript_not_just_its_own_roster_row() {
                 let (frames, _frames_rx) = mpsc::channel(1);
 
                 let resume = || SessionResume {
+                    project_id: None,
                     workspace_id: "ws-b".into(),
                     session_id: "agit-clean".into(),
                     prompt: None,
@@ -486,6 +489,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
+                    interrupt_fenced: None,
                     publication: None,
                     session_id: "agit-danger-start".into(),
                     native_source: None,
@@ -570,6 +574,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let mut state = daemon.lock().await;
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
+                    interrupt_fenced: None,
                     publication: None,
                     session_id: "agit-unjudged".into(),
                     native_source: None,
@@ -636,6 +641,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 // it the one the next resume path picks up by hand; what it bypasses is the
                 // owner-only gate.
                 let info = SessionInfo {
+                    interrupt_fenced: None,
                     publication: None,
                     session_id: "agit-unauthorized".into(),
                     native_source: None,
@@ -712,6 +718,7 @@ fn a_session_that_crashed_before_binding_cannot_be_resumed_by_logical_id() {
                 let error = state
                     .resume_session(
                         SessionResume {
+                            project_id: None,
                             workspace_id: "ws-a".into(),
                             session_id: "agit-crashed".into(),
                             prompt: None,
@@ -764,6 +771,7 @@ fn session_start_idempotency_is_an_explicit_per_socket_feature() {
 async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
+        interrupt_fenced: None,
         publication: None,
         session_id: "agit-existing".into(),
         native_source: None,
@@ -1759,6 +1767,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         generation: 1,
         shared_executor: false,
         info: SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: "s-1".into(),
             native_source: None,
@@ -1784,6 +1793,8 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         pending_mode: Some(crate::protocol::PermissionMode::Plan),
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),
+        interrupt_gate: Arc::new(Mutex::new(())),
+        approval_gate: Arc::new(Mutex::new(())),
         rpc_guard_sensitive: false,
         confirmed_turn_guards: Default::default(),
         inflight_turn_guard: None,
@@ -1981,6 +1992,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
 
     let mk = |last_active: u64| WatchLive {
         info: SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: "s".into(),
             native_source: None,
@@ -2540,6 +2552,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         .latest_session_generations
         .insert("session-a".into(), 1);
     let info = SessionInfo {
+        interrupt_fenced: None,
         publication: None,
         session_id: "session-a".into(),
         native_source: None,
@@ -2960,6 +2973,7 @@ fn resumed_launch_does_not_replay_the_initial_model() {
             state.mirror.bind("ws", "project", &cwd).unwrap();
             let (frames, _receiver) = mpsc::channel(1);
             let opening = state.prepare_resume_session(SessionResume {
+                project_id: None,
                 workspace_id:"ws".into(), session_id:"logical".into(), prompt:None,
                 by:None, agent:None, expected_agent_id:None, branch:None,
             }, &claim("owner", "ws"), &frames, &Default::default()).unwrap();
@@ -3026,4 +3040,90 @@ async fn dormant_capture_is_discoverable_with_its_native_identity() {
         .finish_session_list(&frame, &snapshot.roots, vec![foreign])
         .unwrap();
     assert!(listed["sessions"].as_array().unwrap().is_empty());
+}
+
+// Equivalent folder aliases must reconnect to the same writer and archive.
+// Selecting an unrelated folder or workspace must never move that conversation.
+#[test]
+fn owner_resume_reconciles_project_aliases_without_retargeting_the_session() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cwd = home.path().join("project");
+                let other = home.path().join("other");
+                std::fs::create_dir_all(&cwd).unwrap();
+                std::fs::create_dir_all(&other).unwrap();
+                let (tx, _rx) = mpsc::channel(1);
+                let mut live =
+                    rpc_test_live("logical", 7, tx, crate::protocol::PermissionMode::Default);
+                live.info.project_id = Some("local-alias".into());
+                live.runtime_thread_id = Some("native".into());
+                let mut entry =
+                    rpc_test_roster_entry("logical", crate::protocol::PermissionMode::Default);
+                entry.cwd = cwd.canonicalize().unwrap().to_string_lossy().into();
+                entry.thread_id = "native".into();
+                entry.project_id = Some("local-alias".into());
+                let mut roster = Roster::default();
+                roster.record("logical", entry.clone()).unwrap();
+                let daemon =
+                    rpc_test_daemon([("logical".into(), live)].into_iter().collect(), roster);
+                let mut state = daemon.lock().await;
+                for alias in ["local-alias", "web-alias"] {
+                    state.mirror.bind("ws-a", alias, &cwd).unwrap();
+                }
+                state.mirror.bind("ws-a", "other", &other).unwrap();
+                state.mirror.bind("ws-b", "foreign", &cwd).unwrap();
+                let request = |workspace: &str, project: &str| {
+                    serde_json::from_value::<SessionResume>(serde_json::json!({
+                        "workspace_id":workspace,"project_id":project,"session_id":"logical"
+                    }))
+                    .unwrap()
+                };
+                let (frames, _received) = mpsc::channel(1);
+                for (role, workspace, project) in [
+                    ("operator", "ws-a", "web-alias"),
+                    ("owner", "ws-a", "other"),
+                    ("owner", "ws-b", "foreign"),
+                ] {
+                    assert!(
+                        state
+                            .prepare_resume_session(
+                                request(workspace, project),
+                                &claim(role, workspace),
+                                &frames,
+                                &Default::default()
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(
+                        state.sessions["logical"].info.project_id.as_deref(),
+                        Some("local-alias")
+                    );
+                }
+                let SessionOpening::Ready(reply) = state
+                    .prepare_resume_session(
+                        request("ws-a", "web-alias"),
+                        &claim("owner", "ws-a"),
+                        &frames,
+                        &Default::default(),
+                    )
+                    .unwrap()
+                else {
+                    panic!("an existing writer must not be relaunched");
+                };
+                assert_eq!(reply["session"]["project_id"], "web-alias");
+                assert_eq!(reply["session"]["session_id"], "logical");
+                assert_eq!(state.sessions["logical"].generation, 7);
+                let persisted = Roster::try_load().unwrap();
+                let current = &persisted.sessions["logical"];
+                assert_eq!(current.project_id.as_deref(), Some("web-alias"));
+                assert_eq!(current.thread_id, entry.thread_id);
+                assert_eq!(current.agit_session, entry.agit_session);
+                assert_eq!(current.expected_agent_id, entry.expected_agent_id);
+            });
+    });
 }

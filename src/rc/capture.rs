@@ -161,7 +161,13 @@ fn select(
             == cwd.canonicalize()?,
         "capture claim belongs to another workspace"
     );
-    ensure!(claim.resolve().is_some(), "capture transcript is missing");
+    let transcript_available = claim.resolve().is_some();
+    // An authenticated native writer can own a capture route before its first message exists.
+    #[cfg(unix)]
+    let transcript_available = transcript_available
+        || (runtime == "claude-code"
+            && super::native_claude::Client::unwritten_transcript(native, cwd).is_some());
+    ensure!(transcript_available, "capture transcript is missing");
     let repo = Repo::open(&probe.repo_dir()?).context("capture repository is missing")?;
     ensure!(
         repo.has_ref(&format!("refs/heads/{branch}")),

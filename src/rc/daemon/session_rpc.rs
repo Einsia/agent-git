@@ -5,30 +5,70 @@ impl Daemon {
         let caller = caller_scope(f)?;
         require_role(&caller, f.method())?;
         let session_id = queued_session_id(f)?;
-        let (generation, gate) = {
-            let live = self
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| no_such_session(&session_id))?;
-            require_same_workspace(&caller, &session_id, &live.info.workspace_id)?;
-            if live.ended {
-                return Err(no_such_session(&session_id));
+        let live = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| no_such_session(&session_id))?;
+        require_same_workspace(&caller, &session_id, &live.info.workspace_id)?;
+        if live.ended {
+            return Err(no_such_session(&session_id));
+        }
+        let lane = match f.method() {
+            method::TURN_INTERRUPT => SessionRpcLane::Interrupt,
+            method::APPROVAL_DECIDE => {
+                let approval: crate::protocol::ApprovalResponse = f.params_as()?;
+                match (approval.decision, approval.scope) {
+                    (
+                        crate::protocol::ApprovalDecision::Allow,
+                        crate::protocol::ApprovalScope::Session,
+                    ) => SessionRpcLane::SessionApproval,
+                    (crate::protocol::ApprovalDecision::Allow, _) if live.rpc_guard_sensitive => {
+                        return Err(Self::session_rpc_busy());
+                    }
+                    _ => SessionRpcLane::Approval,
+                }
             }
-            (live.generation, live.rpc_gate.clone())
+            _ => SessionRpcLane::Instruction,
         };
-        let serial = gate.try_lock_owned().map_err(|_| {
-            RpcError::new(
-                ErrorCode::SessionBusy,
-                "that session is already handling another instruction",
+        let gate = match lane {
+            SessionRpcLane::Instruction => &live.rpc_gate,
+            SessionRpcLane::Interrupt => &live.interrupt_gate,
+            SessionRpcLane::Approval | SessionRpcLane::SessionApproval => &live.approval_gate,
+        };
+        let primary = gate
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Self::session_rpc_busy())?;
+        let policy = if lane == SessionRpcLane::SessionApproval {
+            Some(
+                live.rpc_gate
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| Self::session_rpc_busy())?,
             )
-            .with_hint("nothing was queued for this request; retry after the earlier reply arrives")
-        })?;
+        } else {
+            None
+        };
+        let generation = live.generation;
+        let serial = SessionRpcSerial {
+            lane,
+            _primary: primary,
+            _policy: policy,
+        };
 
         Ok(SessionRpcLease {
             session_id,
             generation,
             serial,
         })
+    }
+
+    fn session_rpc_busy() -> RpcError {
+        RpcError::new(
+            ErrorCode::SessionBusy,
+            "that session is already handling another instruction",
+        )
+        .with_hint("nothing was queued for this request; retry after the earlier reply arrives")
     }
 
     pub(super) fn prepare_session_rpc_or_wait(
@@ -89,6 +129,17 @@ impl Daemon {
         require_same_workspace(&caller, &session_id, &live.info.workspace_id)?;
         if live.ended || live.generation != generation {
             return Err(no_such_session(&session_id));
+        }
+
+        // A policy mutation cannot overtake an approval already accepted under
+        // its predecessor. Plain input may wait independently of that approval.
+        if serial.lane.owns_instruction()
+            && !serial.lane.owns_approval()
+            && (f.method() == method::SESSION_SET_PERMISSION_MODE
+                || (f.method() == method::TURN_START && live.pending_mode.is_some()))
+            && live.approval_gate.try_lock().is_err()
+        {
+            return Err(Self::session_rpc_busy());
         }
 
         let (operation, guard_sensitive) = match f.method() {
@@ -419,10 +470,11 @@ impl Daemon {
             }
         };
 
-        if let Some(live) = self
-            .sessions
-            .get_mut(&session_id)
-            .filter(|live| live.generation == generation)
+        if serial.lane.owns_instruction()
+            && let Some(live) = self
+                .sessions
+                .get_mut(&session_id)
+                .filter(|live| live.generation == generation)
         {
             live.rpc_guard_sensitive = guard_sensitive;
         }
@@ -435,15 +487,29 @@ impl Daemon {
         })))
     }
 
-    /// Project one completed command back into daemon/roster state, fenced to
-    /// the exact live generation that was prepared. The caller still owns that
-    /// generation's `rpc_gate`, so this is also the last point before an Ended
-    /// tombstone may be removed.
+    #[cfg(test)]
     pub(super) fn complete_session_rpc(
         &mut self,
         session_id: &str,
         generation: u64,
         completion: &SessionRpcCompletion,
+    ) -> crate::Result<()> {
+        self.complete_session_rpc_on_lane(
+            session_id,
+            generation,
+            completion,
+            SessionRpcLane::Instruction,
+        )
+    }
+
+    /// Project only into the generation that accepted this command. Other lanes
+    /// retain their own guards and keep an Ended generation until they finish.
+    pub(super) fn complete_session_rpc_on_lane(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        completion: &SessionRpcCompletion,
+        lane: SessionRpcLane,
     ) -> crate::Result<()> {
         if self
             .sessions
@@ -732,14 +798,14 @@ impl Daemon {
         // A known successful guard mutation is not eligible for an ACK until
         // the exact restart state above is durable. Keep this flag and the
         // caller-owned rpc_gate armed across any failed save/retry.
-        if let Some(live) = self.sessions.get_mut(session_id) {
+        if lane.owns_instruction()
+            && let Some(live) = self.sessions.get_mut(session_id)
+        {
             live.rpc_guard_sensitive = false;
         }
-        if self
-            .sessions
-            .get(session_id)
-            .is_some_and(|live| live.generation == generation && live.ended)
-        {
+        if self.sessions.get(session_id).is_some_and(|live| {
+            live.generation == generation && live.ended && live.rpc_lanes_idle_except(Some(lane))
+        }) {
             self.remove_session_generation(session_id, generation);
         }
         Ok(())
@@ -1106,14 +1172,9 @@ impl PreparedSessionRpc {
                         .await
                     }
                     ReplyWait::InFlight(_error) => {
-                        // A taken turn is never safe to answer with the generic
-                        // early outcome-unknown path: it may carry a sticky mode
-                        // whose Plan fallback must become durable first. The
-                        // driver itself has a bounded native deadline and an
-                        // Unknown path that kills the harness tree, so retain
-                        // this worker/gate until the typed receipt arrives. At
-                        // daemon hard-stop the existing deadline code persists
-                        // Plan before aborting this worker.
+                        // A taken turn may carry a sticky permission override. Retain its
+                        // gate until a typed native outcome or proven shutdown; elapsed
+                        // time alone cannot prove refusal or authorize another write.
                         let outcome = match reply.wait_until_closed().await {
                             Ok(Ok(outcome)) => outcome,
                             Ok(Err(error)) => TurnStartOutcome::Unknown {

@@ -17,6 +17,7 @@ pub(super) fn rpc_test_live(
     Live {
         generation,
         info: SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: session_id.into(),
             native_source: None,
@@ -43,6 +44,8 @@ pub(super) fn rpc_test_live(
         pending_mode: None,
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),
+        interrupt_gate: Arc::new(Mutex::new(())),
+        approval_gate: Arc::new(Mutex::new(())),
         rpc_guard_sensitive: false,
         confirmed_turn_guards: Default::default(),
         inflight_turn_guard: None,

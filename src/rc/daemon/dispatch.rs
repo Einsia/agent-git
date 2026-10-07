@@ -412,7 +412,7 @@ impl Daemon {
                 pending.sort();
                 Ok(serde_json::to_value(crate::protocol::SessionApprovalsResult {
                     pending,
-                    changing: live.rpc_gate.try_lock().is_err(),
+                    changing: live.rpc_guard_sensitive || live.approval_gate.try_lock().is_err(),
                     last_seq: self.journal.last_seq(&p.session_id),
                 }).unwrap())
             }
@@ -424,6 +424,8 @@ impl Daemon {
                 Ok(serde_json::to_value(crate::protocol::SessionPermissionsResult {
                     mode: live.info.permission_mode,
                     pending_mode: live.pending_mode,
+                    available_modes: (live.shared_executor && live.info.runtime == "claude-code")
+                        .then(Vec::new),
                     changing: live.rpc_gate.try_lock().is_err(),
                     last_seq: self.journal.last_seq(&p.session_id),
                 })
@@ -644,6 +646,7 @@ mod tests {
     fn watching_tail(stream: &str) -> WatchLive {
         WatchLive {
             info: SessionInfo {
+                interrupt_fenced: None,
                 publication: None,
                 session_id: stream.into(),
                 native_source: None,

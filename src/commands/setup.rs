@@ -258,13 +258,21 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
     let exe = exe_str();
 
     if wants(runtime, "claude-code") {
-        match home().map(|h| h.join(".claude/settings.json")) {
+        match crate::adapter::claude_code::projects_dir()
+            .ok()
+            .and_then(|projects| {
+                projects
+                    .parent()
+                    .map(|profile| profile.join("settings.json"))
+            }) {
             Some(path) => report.merge(install_hook_file(&path, "Claude Code", &exe, None)),
             None => {
                 ui::warning("cannot install Claude Code hooks: HOME is not set");
                 report.merge(SetupReport::failure());
             }
         }
+        #[cfg(unix)]
+        report.merge(native::claude());
     }
 
     if wants(runtime, "codex") {

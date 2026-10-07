@@ -397,6 +397,14 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
         native_items: None,
         bytes: 0,
     };
+    #[cfg(unix)]
+    if *runtime == "claude-code"
+        && crate::rc::native_claude::Client::unwritten_transcript(native, std::path::Path::new(cwd))
+            .is_some()
+    {
+        snapshot.native_items = Some(vec![]);
+        return Ok(snapshot);
+    }
     if *runtime == "opencode" {
         snapshot._budget.merge(cache.reserve(MAX_BYTES as u32)?);
         use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};

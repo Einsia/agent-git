@@ -2,6 +2,48 @@ use super::*;
 use std::io::Read;
 use std::path::Path;
 
+fn shared_claude_available(
+    runtime: &str,
+    session: &str,
+    cwd: &Path,
+    caller: &crate::protocol::CallerClaim,
+) -> bool {
+    #[cfg(unix)]
+    {
+        runtime == "claude-code"
+            && caller.is_owner()
+            && crate::rc::native_claude::Client::available(session, cwd)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (runtime, session, cwd, caller);
+        false
+    }
+}
+
+fn active_writer_error(
+    runtime: &str,
+    session: &str,
+    cwd: &Path,
+    caller: &crate::protocol::CallerClaim,
+) -> RpcError {
+    let mut error = busy_error();
+    #[cfg(unix)]
+    if runtime == "claude-code"
+        && caller.is_owner()
+        && crate::rc::native_claude::Client::reconnecting(session, cwd)
+    {
+        error.data = Some(serde_json::json!({
+            "retryable": true,
+            "outcome": "not_sent",
+            "reason": "native_control_reconnecting"
+        }));
+    }
+    #[cfg(not(unix))]
+    let _ = (runtime, session, cwd, caller, &mut error);
+    error
+}
+
 impl Daemon {
     /// Local sessions on this machine that can be taken over.
     ///
@@ -108,6 +150,7 @@ impl Daemon {
                     crate::rc::lineage::AgitSession::parse(route, identity).ok()
                 });
             dormant.push(self.stamped(SessionInfo {
+                interrupt_fenced: None,
                 publication: None,
                 native_source: None,
                 session_id: id.clone(),
@@ -166,6 +209,13 @@ impl Daemon {
                 format!("workspace {} is not bound on this machine", p.workspace_id),
             ));
         }
+        if let Some(project) = p.project_id.as_deref() {
+            let root = self
+                .mirror
+                .project_path(&p.workspace_id, project)
+                .ok_or_else(|| source_sessions::unavailable("requested project is not bound"))?;
+            authority.check_project(project, &root)?;
+        }
         // Already supervised: hand it straight back rather than starting a second process to
         // fight over the same transcript file.
         //
@@ -189,7 +239,13 @@ impl Daemon {
                 "wait for the outstanding instruction to resolve before resuming this conversation",
             ));
         }
-        if let Some(info) = self.supervised_in(&p.session_id, caller) {
+        if let Some(mut info) = self.supervised_in(&p.session_id, caller) {
+            if let Some(project) = p.project_id.as_deref()
+                && info.project_id.as_deref() != Some(project)
+            {
+                self.align_resume_project(&info.session_id, project, caller)?;
+                info.project_id = Some(project.to_owned());
+            }
             if info.native_source.is_some() {
                 self.session_channel(&info.session_id, caller, Need::Brake)?;
                 let project = info.project_id.as_deref().ok_or_else(|| {
@@ -215,6 +271,11 @@ impl Daemon {
         // stores the `agit-...` id while the harness only knows its own thread id. The roster
         // joins the two ids back together and the session keeps one logical identity — for the
         // web, "the daemon restarted" does not exist.
+        if let Some(project) = p.project_id.as_deref()
+            && self.roster.get(&p.session_id).is_some()
+        {
+            self.align_resume_project(&p.session_id, project, caller)?;
+        }
         if let Some(entry) = self.roster.get(&p.session_id).cloned() {
             if let Some(source) = &entry.native_source {
                 return self.prepare_source_resume(
@@ -284,8 +345,15 @@ impl Daemon {
                         "that session's working directory is outside this workspace's bound folders",
                     )
                 })?;
-            if transcript_likely_active(&entry.runtime, &entry.thread_id, &cwd) {
-                return Err(busy_error());
+            if transcript_likely_active(&entry.runtime, &entry.thread_id, &cwd)
+                && !shared_claude_available(&entry.runtime, &entry.thread_id, &cwd, caller)
+            {
+                return Err(active_writer_error(
+                    &entry.runtime,
+                    &entry.thread_id,
+                    &cwd,
+                    caller,
+                ));
             }
             // The cell in the roster may hold legacy lineage that does not pass today's test.
             //
@@ -316,6 +384,7 @@ impl Daemon {
             };
             let now = chrono::Utc::now().to_rfc3339();
             let info = SessionInfo {
+                interrupt_fenced: None,
                 publication: None,
                 session_id: p.session_id.clone(),
                 native_source: None,
@@ -377,8 +446,66 @@ impl Daemon {
                 authority,
             );
         }
-        let local = self.locate_local(&p.workspace_id, &p.session_id)?;
+        let mut local = self.locate_local(&p.workspace_id, &p.session_id)?;
+        if let Some(project) = p.project_id.as_deref() {
+            let root = self
+                .mirror
+                .project_path(&p.workspace_id, project)
+                .ok_or_else(|| source_sessions::unavailable("requested project is not bound"))?;
+            if !local.cwd.starts_with(&root) {
+                return Err(RpcError::new(
+                    ErrorCode::PathNotAllowed,
+                    "conversation is outside the requested project",
+                ));
+            }
+            local.project_id = Some(project.to_owned());
+        }
         self.prepare_local_takeover(local, p, caller, frames)
+    }
+
+    fn align_resume_project(
+        &mut self,
+        session: &str,
+        project: &str,
+        caller: &crate::protocol::CallerClaim,
+    ) -> Result<(), RpcError> {
+        let Some(entry) = self.roster.get(session) else {
+            return Err(source_sessions::unavailable(
+                "conversation binding is not durable yet",
+            ));
+        };
+        require_same_workspace(caller, session, &entry.workspace_id)?;
+        if entry.project_id.as_deref() == Some(project) {
+            return Ok(());
+        }
+        let old_root = entry
+            .project_id
+            .as_deref()
+            .and_then(|id| self.mirror.project_path(&entry.workspace_id, id));
+        let new_root = self.mirror.project_path(&entry.workspace_id, project);
+        let within_project = new_root.as_ref().is_some_and(|root| {
+            std::fs::canonicalize(&entry.cwd).is_ok_and(|cwd| cwd.starts_with(root))
+        });
+        if !caller.is_owner() || old_root.is_none() || old_root != new_root || !within_project {
+            return Err(RpcError::new(
+                ErrorCode::PathNotAllowed,
+                "conversation belongs to a different project",
+            ));
+        }
+        let previous = self.roster.clone();
+        self.roster
+            .sessions
+            .get_mut(session)
+            .expect("binding was checked")
+            .project_id = Some(project.to_owned());
+        if let Err(error) = self.roster.save() {
+            self.roster = previous;
+            return Err(RpcError::new(ErrorCode::Internal, error.to_string()));
+        }
+        if let Some(live) = self.sessions.get_mut(session) {
+            live.info.project_id = Some(project.to_owned());
+        }
+        Ok(())
     }
 
     /// Take over a session on this machine that was **opened in a terminal** — the half
@@ -401,12 +528,16 @@ impl Daemon {
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
     ) -> Result<SessionOpening, RpcError> {
-        // A live session cannot be taken over: `--resume` opens a second writer on the same
-        // transcript file, and once the two streams of appends interleave both histories are
-        // destroyed. This is data corruption, not an experience problem, so it is blocked here
-        // instead of only hinted at in the UI.
-        if local.likely_active {
-            return Err(busy_error());
+        // An active transcript may be controlled only through its existing native writer.
+        if local.likely_active
+            && !shared_claude_available(&local.runtime, &p.session_id, &local.cwd, caller)
+        {
+            return Err(active_writer_error(
+                &local.runtime,
+                &p.session_id,
+                &local.cwd,
+                caller,
+            ));
         }
 
         // Find which project this session belongs to — the cwd must land inside the allowlist,
@@ -516,6 +647,7 @@ impl Daemon {
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: logical,
             native_source: None,
@@ -897,6 +1029,7 @@ impl Daemon {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: session_id.clone(),
             native_source: if p.runtime == "codex" {
@@ -1368,6 +1501,37 @@ impl LocalSessionSnapshot {
                     });
                 }
             }
+        }
+
+        #[cfg(unix)]
+        for registration in crate::rc::native_claude::Client::registered_sessions() {
+            if !policy::is_within(&registration.cwd, &roots)
+                || (purpose == LocalSessionScan::Locate
+                    && self.supervised.contains(&registration.session))
+                || out.iter().any(|session| {
+                    session.runtime == "claude-code"
+                        && session.runtime_session_id == registration.session
+                })
+            {
+                continue;
+            }
+            let link = store.as_ref().and_then(|store| {
+                crate::domain::link::get(store, "claude-code", &registration.session)
+            });
+            if link.as_ref().is_some_and(|link| !link.is_active()) {
+                continue;
+            }
+            out.push(LocalSession {
+                title: None,
+                runtime_session_id: registration.session,
+                runtime: "claude-code".into(),
+                cwd: registration.cwd.to_string_lossy().into_owned(),
+                modified_at: rfc3339(std::time::SystemTime::now()),
+                gist: None,
+                adopted: link.is_some(),
+                agent: link.and_then(|link| link.agent),
+                likely_active: true,
+            });
         }
 
         finish_local_sessions(out, purpose, local_gist_preview)

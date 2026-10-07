@@ -277,6 +277,13 @@ impl PreparedSpawn {
                     release_reservation: true,
                 };
             }
+            if self.spec.resume_from.is_some() && failure.is_resume_rejected() {
+                return SpawnFailure {
+                    error: RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string()),
+                    reached_launch: true,
+                    release_reservation: true,
+                };
+            }
             let reached_spawn = failure.reached_spawn();
             let error = RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string());
             if reached_spawn {
@@ -437,12 +444,23 @@ impl Daemon {
                     .as_deref()
                     .is_some_and(|wanted| Some(wanted) == native)
         };
-        if self.sessions.contains_key(&info.session_id)
-            || self.opening_sessions.contains_key(&info.session_id)
-            || self.archive_recovering.contains_key(&info.session_id)
+        let archive_busy = self.archive_recovering.contains_key(&info.session_id)
             || self.archive_recovering.values().any(|job| {
                 native_conflict(&job.runtime, job.native_source.as_ref(), Some(&job.native))
-            })
+            });
+        let observation_busy = self.opening_sessions.iter().any(|(logical, opening)| {
+            opening.generation == 0
+                && self.roster.observed.contains(logical)
+                && (logical == &info.session_id
+                    || native_conflict(
+                        &opening.runtime,
+                        opening.native_source.as_ref(),
+                        opening.native_id.as_deref(),
+                    ))
+        });
+        if self.sessions.contains_key(&info.session_id)
+            || self.opening_sessions.contains_key(&info.session_id)
+            || archive_busy
             || self.sessions.values().any(|live| {
                 native_conflict(
                     &live.info.runtime,
@@ -458,10 +476,18 @@ impl Daemon {
                 )
             })
         {
-            return Err(SpawnFailure::before_launch(RpcError::new(
+            let mut error = RpcError::new(
                 ErrorCode::SessionBusy,
                 "this conversation already has a live or unresolved harness launch",
-            )));
+            );
+            if archive_busy || observation_busy {
+                error.data = Some(serde_json::json!({
+                    "retryable": true,
+                    "outcome": "not_sent",
+                    "reason": "archive_settlement"
+                }));
+            }
+            return Err(SpawnFailure::before_launch(error));
         }
         Ok(())
     }
@@ -553,6 +579,8 @@ impl Daemon {
                 pending_mode: None,
                 approval_requests: HashMap::new(),
                 rpc_gate: Arc::new(Mutex::new(())),
+                interrupt_gate: Arc::new(Mutex::new(())),
+                approval_gate: Arc::new(Mutex::new(())),
                 rpc_guard_sensitive: false,
                 confirmed_turn_guards: Default::default(),
                 inflight_turn_guard: None,
@@ -639,6 +667,7 @@ mod tests {
         let mut state = daemon.lock().await;
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: "agit-opening".into(),
             native_source: None,

@@ -1967,7 +1967,10 @@ for line in sys.stdin:
                     )
                 ));
             } else {
-                driver.steer("continue").await.unwrap();
+                assert!(matches!(
+                    driver.steer("continue").await,
+                    crate::rc::harness::SteerDispatch::Resolved(Ok(_))
+                ));
             }
             let crate::rc::harness::AnyDriver::ClaudeCode(ref mut native) = driver else {
                 unreachable!()

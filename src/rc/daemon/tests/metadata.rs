@@ -100,6 +100,7 @@ async fn viewers_read_metadata_while_writer_control_is_guarded() {
     live.info.dangerous = true;
     live.restart_guard_attempts.insert("pending-restart".into());
     live.pending_mode = Some(crate::protocol::PermissionMode::Plan);
+    live.rpc_guard_sensitive = true;
     live.approval_requests.insert("approval".into(), None);
     let serial = live.rpc_gate.clone().lock_owned().await;
     let daemon = rpc_test_daemon(
@@ -129,7 +130,29 @@ async fn viewers_read_metadata_while_writer_control_is_guarded() {
         request.caller = Some(claim("viewer", "another-workspace"));
         assert!(state.dispatch(&request, &frames).await.is_err());
     }
+    let native = state.sessions.get_mut("session-a").unwrap();
+    native.info.runtime = "claude-code".into();
+    native.shared_executor = true;
+    native.info.interrupt_fenced = Some(true);
+    let mut stale = native.info.clone();
+    stale.interrupt_fenced = None;
+    assert_eq!(state.stamped(stale).interrupt_fenced, Some(true));
+    let mut permissions = Frame::request(
+        method::SESSION_PERMISSIONS,
+        serde_json::json!({"session_id":"session-a"}),
+    );
+    permissions.caller = Some(claim("viewer", "ws-a"));
+    assert_eq!(
+        state.dispatch(&permissions, &frames).await.unwrap()["available_modes"],
+        serde_json::json!([]),
+        "a shared native writer cannot offer managed-process permission controls"
+    );
     drop(serial);
+    state
+        .sessions
+        .get_mut("session-a")
+        .unwrap()
+        .rpc_guard_sensitive = false;
     let mut approvals = Frame::request(
         method::SESSION_APPROVALS,
         serde_json::json!({"session_id":"session-a"}),

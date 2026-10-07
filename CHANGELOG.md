@@ -8,6 +8,40 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-10-07
+
+### Added
+
+- Remote control can attach to a supported native Claude Code conversation so
+  multiple clients can send and steer messages, answer tool approvals and
+  questions, stop the current turn, and change supported models while the native
+  process remains the only transcript writer. The integration is installed by
+  daemon startup and setup. A native process started before installation may
+  need `/reload-plugins` before it accepts remote controls.
+- Fresh native Claude conversations accept remote attachment before their first
+  message. Native tool activity, compaction, questions and supported commands
+  remain visible across reconnects. Only controls confirmed by the runtime are
+  advertised; changing an active permission mode or answering an effort
+  confirmation dialog is not supported by the native integration.
+
+### Fixed
+
+- Bursts of remote conversation events recover from the session journal without
+  closing the control connection or leaving the composer stuck restoring.
+  Operation receipts retain an independent output budget while history catches up.
+- An explicitly refused Codex resume releases its opening reservation after
+  cleanup, so subsequent attachment attempts do not remain permanently busy.
+- Pending remote input cannot block tool approval or interruption. Ordered model
+  changes, process and turn checks, and replayable receipts preserve operation
+  order without repeating a prompt or stopping a later turn after reconnecting.
+- Completed and interrupted native Claude turns are archived into ordinary Agit
+  session history. Upload recovery retains pending publication through daemon
+  replacement and waits until the complete captured prefix is published.
+- Resuming a native conversation honors the explicitly requested authorized
+  project and preserves its existing archive identity.
+- Starting private Git commands from a large resident daemon preserves private
+  file permissions without copying the daemon's memory into each child process.
+
 ## [0.2.21] - 2026-10-06
 
 ### Fixed

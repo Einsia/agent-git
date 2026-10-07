@@ -62,6 +62,14 @@ impl Daemon {
         // Control socket on a blocking thread: `agit rc status` must work even
         // if the async side is wedged talking to an unreachable hub.
         let ctl = control::listen()?;
+        #[cfg(unix)]
+        let _native_claude = crate::rc::native_claude::Endpoint::start()?;
+        #[cfg(unix)]
+        if crate::adapter::get("claude-code").is_ok_and(|adapter| adapter.available())
+            && let Err(error) = crate::rc::native_claude::install_plugin()
+        {
+            eprintln!("agitd: native Claude integration is unavailable: {error:#}");
+        }
         if let Err(error) = crate::rc::runtime_sources::Registry::open()
             .and_then(|registry| registry.enroll_default())
         {

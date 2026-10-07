@@ -168,12 +168,25 @@ impl WatchScan {
                 true,
             )
         } else {
+            let unwritten: Option<PathBuf> = None;
+            #[cfg(unix)]
+            let unwritten = unwritten.or_else(|| {
+                (runtime == "claude-code")
+                    .then(|| {
+                        crate::rc::native_claude::Client::unwritten_transcript(
+                            &request.session_id,
+                            &cwd,
+                        )
+                    })
+                    .flatten()
+            });
             let adapter = crate::adapter::get(&runtime)
                 .map_err(|error| RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string()))?;
             let path = enrolled
                 .as_ref()
                 .map(|watch| watch.path.clone())
                 .or_else(|| adapter.resolve(&request.session_id, Some(&cwd)))
+                .or_else(|| unwritten.clone())
                 .ok_or_else(|| {
                     RpcError::new(
                         ErrorCode::SessionNotFound,
@@ -181,7 +194,7 @@ impl WatchScan {
                     )
                 })?;
             let (offset, from, total, absolute, handle) = tail_window(&path, WATCH_BACKFILL_LINES);
-            if handle.is_none() {
+            if handle.is_none() && unwritten.as_ref() != Some(&path) {
                 return Err(RpcError::new(
                     ErrorCode::RuntimeUnavailable,
                     "Native history cannot be read",
@@ -406,6 +419,7 @@ impl Daemon {
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
+            interrupt_fenced: None,
             publication: None,
             session_id: watch_id.clone(),
             native_source: enrolled.as_ref().map(|watch| watch.identity()),

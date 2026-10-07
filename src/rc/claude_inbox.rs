@@ -124,6 +124,11 @@ impl std::fmt::Debug for Live {
 }
 
 impl Live {
+    #[cfg(unix)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// The directory the process reported when it registered.
     pub(crate) fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
@@ -142,7 +147,29 @@ impl Live {
 /// physical folder; a second copy under the lexical spelling leaves the written file unknown, so
 /// neither is chosen.
 pub(crate) fn live_transcript(live: &Live, cwd: &Path) -> crate::Result<PathBuf> {
-    use crate::adapter::claude_code::{canonical_cwd, projects_dir, slug_for};
+    live_transcript_in(live, cwd, &crate::adapter::claude_code::projects_dir()?)
+}
+
+pub(crate) fn live_transcript_in(
+    live: &Live,
+    cwd: &Path,
+    projects: &Path,
+) -> crate::Result<PathBuf> {
+    let path = live_transcript_target_in(live, cwd, projects)?;
+    ensure!(
+        path.try_exists()?,
+        "cannot locate the transcript this Claude Code process writes"
+    );
+    Ok(path)
+}
+
+/// Native control can precede the first message; only its writer creates the transcript.
+pub(crate) fn live_transcript_target_in(
+    live: &Live,
+    cwd: &Path,
+    projects: &Path,
+) -> crate::Result<PathBuf> {
+    use crate::adapter::claude_code::{canonical_cwd, slug_for};
     let process = live
         .cwd()
         .context("the Claude Code process did not register its folder")?;
@@ -150,22 +177,28 @@ pub(crate) fn live_transcript(live: &Live, cwd: &Path) -> crate::Result<PathBuf>
         canonical_cwd(process) == canonical_cwd(cwd),
         "the Claude Code process runs this session from another folder"
     );
-    let projects = projects_dir()?;
     let name = format!("{}.jsonl", live.session_id);
+    let target = projects.join(slug_for(process)).join(&name);
     let mut found: Option<PathBuf> = None;
     for slug in [slug_for(process), crate::domain::store::slug_for(process)] {
         let path = projects.join(slug).join(&name);
-        if found.as_ref() == Some(&path)
-            || !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
-        {
+        if found.as_ref() == Some(&path) {
             continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_file(),
+                "native transcript is not a regular file"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
         ensure!(
             found.replace(path).is_none(),
             "two copies of this Claude Code transcript leave the one its process writes unknown"
         );
     }
-    found.context("cannot locate the transcript this Claude Code process writes")
+    Ok(found.unwrap_or(target))
 }
 
 fn read_bounded(path: &Path, limit: u64) -> crate::Result<Vec<u8>> {

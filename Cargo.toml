@@ -13,7 +13,7 @@ name = "agit"
 # @einsia/agent-git and @einsia/agentgit are independent package lines. This
 # version follows this CLI's own lifecycle rather than trying to outrank the
 # other package; that the two are incompatible is said by the package name.
-version = "0.2.21"
+version = "0.2.22"
 edition = "2024"
 # The observed floor, not a guess: on 1.85.1 cargo rejects `cargo check --locked`
 # outright, because the locked darling 0.23 and instability 0.3.12 (a ratatui
@@ -98,6 +98,9 @@ cli = [
 # The protocol *types* (`crate::protocol`) are deliberately NOT gated — the hub
 # compiles against them.
 rc = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
     "dep:flate2",
     "dep:agit-peer",
     "dep:agit-controller",
@@ -128,6 +131,9 @@ secret-vault = [
 ]
 
 [dependencies]
+hyper = { version = "1", features = ["http1", "server", "client"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 agit-peer = { path = "crates/agit-peer", optional = true, features = ["cloud-client"] }
