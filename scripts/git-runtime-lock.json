@@ -53,11 +53,11 @@
       },
       {
         "name": "libcrypto3",
-        "version": "3.5.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.8-r0.apk",
-        "sha256": "161223a16f042b8e469e9441291e071464fd91d4f4bbe6f496ee8d0abd4e0701",
+        "version": "3.5.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r0.apk",
+        "sha256": "6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/013edf8b29199933e8ea34dde460b5584b979042/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
       },
       {
         "name": "libcurl",
@@ -69,11 +69,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.8.4-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.8.4-r0.apk",
-        "sha256": "34fa41e3994d9a844f50a7c01cb40bb2e272fa7f506b96e92a2b4a20b23a81bc",
+        "version": "2.8.5-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.8.5-r0.apk",
+        "sha256": "2e56946bc495cbed9eb1ad70859a79cba9db6420016453e065a0628848b32c7e",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/08d1eb8641965d3807628f6a4ff15914be5b79ae/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/41a9605db84bb52cd65c6349e5e087c2c7fe9efb/main/expat"
       },
       {
         "name": "libidn2",
@@ -93,11 +93,11 @@
       },
       {
         "name": "libssl3",
-        "version": "3.5.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.8-r0.apk",
-        "sha256": "aca521e5ae4a321322a9d47ed64a1775f5ab1ffd215d1e9fc0433c58f7bfd037",
+        "version": "3.5.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r0.apk",
+        "sha256": "05e3393fb95aa5751ca2f9d242f659f6cff82c1cc7767cc2df4a086f7ad01877",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/013edf8b29199933e8ea34dde460b5584b979042/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
       },
       {
         "name": "libunistring",
@@ -117,27 +117,27 @@
       },
       {
         "name": "nghttp2-libs",
-        "version": "1.69.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/nghttp2-libs-1.69.0-r0.apk",
-        "sha256": "7d7705cea464389989d3ca6b9505dbfce3cf25cfca1eeb06709a9909f93f4f11",
+        "version": "1.70.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/nghttp2-libs-1.70.0-r0.apk",
+        "sha256": "f0c4014eb2f10308dcdfd84cd49c121673c7b78cb8182b6e7a1388d8ae112a3b",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/2f3038c86a2a055b2becb5a8c4fd86365f77347a/main/nghttp2"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/d5a34efc88bbe8d18737fda28125071c4aef8517/main/nghttp2"
       },
       {
         "name": "pcre2",
-        "version": "10.48-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/pcre2-10.48-r0.apk",
-        "sha256": "cffaedb6cf404647619a8b0323958d293d9cd240e8f887c16bdf4b0a039f993a",
+        "version": "10.49-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/pcre2-10.49-r0.apk",
+        "sha256": "2919897914820f42a17a8d7d37df310d2dfad1c82ebe5f539cc5c765f916752a",
         "license": "BSD-3-Clause",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/abc383a51f67922cd61e338b1461cddaa1814b28/main/pcre2"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3d497cbb3217749c4fb85f90f3b6f7908b0c1f95/main/pcre2"
       },
       {
         "name": "zlib",
-        "version": "1.3.2-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.3.2-r0.apk",
-        "sha256": "b636306cbf8a0c15493b38de608ba11605fd8f11ade631f5ece6f7fdf5a1e09e",
+        "version": "1.3.2-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.3.2-r1.apk",
+        "sha256": "63aeea03c15a2f9018f81805cfc8aa926bdf5cd68921f22149c2fbb5d0ee9f47",
         "license": "Zlib",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/f248b33b5943c7dc69bf691031d7612ab2e8ed93/main/zlib"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0afa2da0e8c8051c6f8f64a7a388e5a259904245/main/zlib"
       },
       {
         "name": "zstd-libs",
@@ -183,11 +183,11 @@
       },
       {
         "name": "libcrypto3",
-        "version": "3.5.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcrypto3-3.5.8-r0.apk",
-        "sha256": "35b892813c23664a3592e4fc8c12a03538a22c579057655361c7043305272a9a",
+        "version": "3.5.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcrypto3-3.5.9-r0.apk",
+        "sha256": "2676a2b0b6e23ea2edccf3ee982b9842a665d52603d047de3d0a185dc316d983",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/013edf8b29199933e8ea34dde460b5584b979042/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
       },
       {
         "name": "libcurl",
@@ -199,11 +199,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.8.4-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.8.4-r0.apk",
-        "sha256": "ca1be5be36985a8370f4a8e9e33a25788ac95260295718e1b0b721a16bb2aa61",
+        "version": "2.8.5-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.8.5-r0.apk",
+        "sha256": "568a12a4889a00711d1c80c197a5540ee1cdec26c1c59da38f8342ad69e7eff9",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/08d1eb8641965d3807628f6a4ff15914be5b79ae/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/41a9605db84bb52cd65c6349e5e087c2c7fe9efb/main/expat"
       },
       {
         "name": "libidn2",
@@ -223,11 +223,11 @@
       },
       {
         "name": "libssl3",
-        "version": "3.5.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libssl3-3.5.8-r0.apk",
-        "sha256": "d6ec970cc10e01539e41626f720c4e0ac69016eaa2079a10ef776ffd3243db5b",
+        "version": "3.5.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libssl3-3.5.9-r0.apk",
+        "sha256": "20ac252b276d73f2c69c1d25f84537c7fba81caefc026c6be1094b394af2082e",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/013edf8b29199933e8ea34dde460b5584b979042/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
       },
       {
         "name": "libunistring",
@@ -247,27 +247,27 @@
       },
       {
         "name": "nghttp2-libs",
-        "version": "1.69.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/nghttp2-libs-1.69.0-r0.apk",
-        "sha256": "10ec950fca526db87bbdc0702ba623fca6639df15abb48229f548d6812563b33",
+        "version": "1.70.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/nghttp2-libs-1.70.0-r0.apk",
+        "sha256": "7ef451f4dcdc065aa872c2f3c78b9d9bb4348caa5bcc70dee0c9e1fcf8e4c1fd",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/2f3038c86a2a055b2becb5a8c4fd86365f77347a/main/nghttp2"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/d5a34efc88bbe8d18737fda28125071c4aef8517/main/nghttp2"
       },
       {
         "name": "pcre2",
-        "version": "10.48-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/pcre2-10.48-r0.apk",
-        "sha256": "0e8a425ec23fca1b549e83758b385e7186a070597e8dc014163462f960079167",
+        "version": "10.49-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/pcre2-10.49-r0.apk",
+        "sha256": "03efd0b29f7f38deb10a9ccb54f56e19683eb7ac27eb1f347e6dbd2e59ea000d",
         "license": "BSD-3-Clause",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/abc383a51f67922cd61e338b1461cddaa1814b28/main/pcre2"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3d497cbb3217749c4fb85f90f3b6f7908b0c1f95/main/pcre2"
       },
       {
         "name": "zlib",
-        "version": "1.3.2-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zlib-1.3.2-r0.apk",
-        "sha256": "a535991af7c9e8369ebbf33c1e388c1bc63c87ead5142eddaee71f65836c33e3",
+        "version": "1.3.2-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zlib-1.3.2-r1.apk",
+        "sha256": "1f77a542ac6634761b9fe38d8bdca19b154071dcfa25432e73f2bc8a0740a33f",
         "license": "Zlib",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/f248b33b5943c7dc69bf691031d7612ab2e8ed93/main/zlib"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0afa2da0e8c8051c6f8f64a7a388e5a259904245/main/zlib"
       },
       {
         "name": "zstd-libs",
