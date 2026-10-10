@@ -14,6 +14,7 @@ use std::{
 const SID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const HUB: &str = "http://127.0.0.1:1";
 const PRIVATE: &str = "SYNTHETIC-PRIVATE-CONFIG-MUST-NOT-ESCAPE";
+const CALL: &str = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("app-server") {
@@ -29,6 +30,10 @@ fn main() {
         (
             "materialized provider and immutable source",
             materialized_provider_is_local,
+        ),
+        (
+            "legacy protocol IDs and prepared reuse",
+            legacy_call_ids_are_repaired_on_resume,
         ),
         (
             "indexed resume and index precedence",
@@ -336,6 +341,10 @@ struct Lab {
 
 impl Lab {
     fn new(provider: &str, response: Value) -> Self {
+        Self::with_call_id(provider, response, CALL)
+    }
+
+    fn with_call_id(provider: &str, response: Value, call_id: &str) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let root = ordinary_path(&temporary.path().canonicalize().unwrap());
         let home = root.join("home");
@@ -359,6 +368,10 @@ impl Lab {
                 "content":[{"type":"input_text","text":"SYNTHETIC-PROVIDER-QUESTION"}]}}),
             json!({"type":"response_item","payload":{"type":"reasoning",
                 "encrypted_content":"opaque-native-evidence","summary":[]}}),
+            json!({"type":"response_item","payload":{"type":"function_call",
+                "call_id":call_id,"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output",
+                "call_id":call_id,"output":"/workspace"}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant",
                 "content":[{"type":"output_text","text":"SYNTHETIC-PROVIDER-ANSWER"}]}}),
         ];
@@ -799,6 +812,11 @@ fn materialized_provider_is_local() {
             .iter()
             .any(|record| record["payload"]["encrypted_content"] == "opaque-native-evidence")
     );
+    let calls: Vec<_> = materialized
+        .iter()
+        .filter_map(|record| record["payload"]["call_id"].as_str())
+        .collect();
+    assert_eq!(calls, [CALL, CALL]);
     assert_eq!(claim["baseline_bytes"], installed_bytes.len() as u64);
     assert_eq!(
         claim["baseline_hash"],
@@ -819,6 +837,83 @@ fn materialized_provider_is_local() {
     assert_eq!(snapshot(&lab.codex_home), native_before);
     assert_eq!(lab.claim("portable"), (id, claim));
     lab.assert_rpc(true);
+}
+
+/// Missing dictionaries cannot make saved tool calls unusable. A cached materialization with
+/// invalid IDs must be replaced without changing source history or discarding appended work.
+fn legacy_call_ids_are_repaired_on_resume() {
+    let token = "{{AGIT_SECRET_V2:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222}}";
+    let lab = Lab::with_call_id("openai", absent_registry(), token);
+    let original = fs::read(&lab.native).unwrap();
+    let source_head = lab.git(&["rev-parse", "refs/heads/work"]);
+    lab.success(&[
+        "fork",
+        "me/qa@work",
+        "-b",
+        "portable",
+        "--resume",
+        "--no-launch",
+    ]);
+    let (first_id, mut claim) = lab.claim("portable");
+    let installed = lab.rollout(&first_id);
+    let first = records(&installed);
+    let call_ids: Vec<_> = first
+        .iter()
+        .filter_map(|record| record["payload"]["call_id"].as_str())
+        .collect();
+    assert_eq!(call_ids.len(), 2);
+    assert_eq!(call_ids[0], call_ids[1]);
+    assert!(call_ids[0].len() <= 64);
+    assert_ne!(call_ids[0], token);
+
+    let mut damaged = first;
+    for record in &mut damaged {
+        if record["payload"]["call_id"].is_string() {
+            record["payload"]["call_id"] = json!(token);
+        }
+    }
+    let damaged: String = damaged.iter().map(|record| format!("{record}\n")).collect();
+    fs::write(&installed, &damaged).unwrap();
+    claim["baseline_bytes"] = json!(damaged.len());
+    claim["baseline_hash"] = json!(hex::encode(sha2::Sha256::digest(damaged.as_bytes())));
+    let claim_path = lab
+        .store
+        .join("store/codex")
+        .join(format!("{first_id}.json"));
+    fs::write(&claim_path, claim.to_string()).unwrap();
+
+    let appended = format!(
+        "{damaged}{}\n",
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep my new prompt"}]}})
+    );
+    fs::write(&installed, &appended).unwrap();
+    let mut command = lab.command(env!("CARGO_BIN_EXE_agit"));
+    command.args(["resume", "me/qa@portable", "--no-launch"]);
+    let refused = bounded_output(command);
+    assert!(!refused.status.success(), "{}", output_text(&refused));
+    assert!(output_text(&refused).contains("unsettled content"));
+    assert_eq!(fs::read_to_string(&installed).unwrap(), appended);
+    assert_eq!(lab.claim("portable").0, first_id);
+    fs::write(&installed, &damaged).unwrap();
+
+    let resumed = lab.success(&["resume", "me/qa@portable", "--no-launch"]);
+    assert!(!output_text(&resumed).contains("reusing the prepared runtime session"));
+    let (repaired_id, repaired_claim) = lab.claim("portable");
+    assert_ne!(repaired_id, first_id);
+    let repaired = records(&lab.rollout(&repaired_id));
+    let call_ids: Vec<_> = repaired
+        .iter()
+        .filter_map(|record| record["payload"]["call_id"].as_str())
+        .collect();
+    assert_eq!(call_ids.len(), 2);
+    assert_eq!(call_ids[0], call_ids[1]);
+    assert!(call_ids[0].len() <= 64);
+    assert_eq!(fs::read(&installed).unwrap(), damaged.as_bytes());
+    assert_eq!(fs::read(&lab.native).unwrap(), original);
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), source_head);
+    let repeated = lab.success(&["resume", "me/qa@portable", "--no-launch"]);
+    assert!(output_text(&repeated).contains("reusing the prepared runtime session"));
+    assert_eq!(lab.claim("portable"), (repaired_id, repaired_claim));
 }
 
 fn indexed_resume_is_read_only() {

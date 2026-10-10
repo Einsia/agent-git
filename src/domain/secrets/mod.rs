@@ -2989,17 +2989,22 @@ fn mask_valid_envelope_stream(
             .is_some_and(|runtimes| runtimes.contains(&envelope.source));
         let mut masked = String::new();
         append_masked_envelope_identity_fields(&mut masked, line, &envelope, session_is_trusted)?;
-        if session_is_trusted
-            && let Some(mask) = trusted_identities.content.get(&(
-                envelope.session_id,
-                envelope.source,
-                envelope.object_hash,
-            ))
-        {
+        let mask = trusted_identities.content.get(&(
+            envelope.session_id,
+            envelope.source,
+            envelope.object_hash,
+        ));
+        let verified_event = crate::domain::storage::event_id(line)
+            .is_ok_and(|id| trusted_identities.events.contains(&id));
+        if session_is_trusted && (mask.is_some() || verified_event) {
             let mut value: serde_json::Value = serde_json::from_str(&masked).ok()?;
-            mask.apply(value.get_mut("content")?, |identity| {
-                "0".repeat(identity.len())
-            });
+            let content = value.get_mut("content")?;
+            if let Some(mask) = mask {
+                mask.apply(content, |identity| "0".repeat(identity.len()));
+            }
+            if verified_event {
+                crate::adapter::protocol_ids::mask_entropy(content);
+            }
             masked = serde_json::to_string(&value).ok()?;
             masked.push('\n');
         }
@@ -5284,6 +5289,69 @@ mod tests {
             scanned.hits
         );
         assert!(!scanned.truncated);
+    }
+
+    /// Native entropy exemptions require a verified event and stay at the protocol field.
+    /// Forged envelopes, payload copies and provider credentials must remain visible to scanning.
+    #[test]
+    fn verified_protocol_ids_do_not_block_publication_or_exempt_tool_contents() {
+        let call = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
+        let content = serde_json::json!({"type":"response_item","payload":{
+            "type":"function_call","call_id":call,"name":"exec_command","arguments":"{}"
+        }});
+        for (value, verified, expected) in [
+            (content.clone(), false, Some(call)),
+            (content.clone(), true, None),
+            (
+                {
+                    let mut value = content.clone();
+                    value["payload"]["arguments"] =
+                        serde_json::json!({"call_id":call}).to_string().into();
+                    value
+                },
+                true,
+                Some(call),
+            ),
+            (
+                {
+                    let mut value = content;
+                    value["payload"]["call_id"] = AWS.into();
+                    value
+                },
+                true,
+                Some(AWS),
+            ),
+        ] {
+            let envelope = agent_envelope(value);
+            let line = crate::domain::storage::envelope_line(&envelope);
+            let mut trusted = trust(&envelope);
+            if verified {
+                trusted
+                    .events
+                    .insert(crate::domain::storage::event_id(&line).unwrap());
+            }
+            let report = scan_repository_payload_capped(
+                &line,
+                &none(),
+                &trusted,
+                Policy::STRICT,
+                50,
+                &RegisteredMatcher::default(),
+            );
+            assert!(!report.truncated);
+            if let Some(value) = expected {
+                assert!(
+                    report
+                        .hits
+                        .iter()
+                        .any(|hit| hit.fingerprint == fingerprint(value)),
+                    "{:?}",
+                    report.hits
+                );
+            } else {
+                assert!(report.hits.is_empty(), "{:?}", report.hits);
+            }
+        }
     }
 
     /// Verified identities cannot override an explicit secret registration, even at the identity field.

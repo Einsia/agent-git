@@ -707,8 +707,9 @@ impl Adapter for OpenClaw {
     }
     fn localize(&self, raw: &str, id: &str, cwd: &Path) -> Result<String> {
         native::validate_id(id, Limits::default())?;
-        let parsed = parse(raw)?;
-        let mut rows = records(raw)?;
+        let raw = crate::domain::install::repair_protocol_ids(raw)?;
+        let parsed = parse(&raw)?;
+        let mut rows = records(&raw)?;
         if rows.first().is_none_or(|value| value["type"] != "session") {
             rows.insert(0, json!({"type":"session","version":4,"id":id,"cwd":cwd.to_string_lossy(),"timestamp":"2026-01-01T00:00:00.000Z"}));
         }

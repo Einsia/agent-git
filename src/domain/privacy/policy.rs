@@ -101,7 +101,7 @@ impl Snapshot {
             .is_some_and(|blocks| blocks.is_match(text))
     }
 
-    pub fn scan(&self, text: &str, limit: usize) -> Batch {
+    pub(crate) fn explicit_findings(&self, text: &str, limit: usize) -> Batch {
         let mut findings = Vec::new();
         let mut complete = limit > 0;
         if let Some(blocks) = &self.blocks {
@@ -118,6 +118,14 @@ impl Snapshot {
                 });
             }
         }
+        Batch { findings, complete }
+    }
+
+    pub fn scan(&self, text: &str, limit: usize) -> Batch {
+        let Batch {
+            mut findings,
+            mut complete,
+        } = self.explicit_findings(text, limit);
         let lines = (self.inline_allow && text.contains("agit:allow-secret"))
             .then(|| detector::Lines::new(text));
         let heuristics = detector::scan_filtered(

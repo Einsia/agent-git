@@ -7,7 +7,8 @@
 //! additionally drops compact boundaries.
 //!
 //! So installing back into its own runtime rewrites line by line, and what may move is a
-//! **closed set** (see [`localize_same_format`]): identity keys, placeholders for open calls, the
+//! **closed set** (see [`localize_same_format`]): identity keys, repaired protocol IDs,
+//! placeholders for open calls, the
 //! Codex bootstrap, and visible-event localization — the last two are deliberate conversions: the
 //! writing machine's paginated store does not sync with the repo, and unlocalized this file does
 //! not open on this machine. Outside the closed set the semantics are unchanged (lines are
@@ -27,6 +28,13 @@
 use crate::Result;
 use crate::adapter::{self, Installed};
 use std::path::Path;
+
+mod protocol_ids;
+pub(crate) use protocol_ids::repair as repair_protocol_ids;
+#[cfg(feature = "cli")]
+pub(crate) use protocol_ids::{
+    needs_repair as protocol_ids_need_repair, repair_saved as repair_saved_protocol_ids,
+};
 
 /// Install a copy into the target runtime.
 ///
@@ -334,8 +342,8 @@ fn ensure_codex_visible_history(content: &str, format: &str) -> Result<String> {
 /// Every rewrite a same-format install performs, in order, in one pass.
 ///
 /// What this path may move is a **closed set**: identity keys (id / session_id / cwd), placeholder
-/// outputs for open calls, the Codex bootstrap line (fill in / synthesize / localize
-/// `history_mode`), and Codex visible-event mirrors. Outside the closed set the **semantics are
+/// outputs for open calls, repaired protocol identifiers, the Codex bootstrap line (including
+/// `history_mode` localization), and Codex visible-event mirrors. Outside the closed set the **semantics are
 /// unchanged** — lines are rewritten through canonical serialization, key order and whitespace
 /// are not preserved (the same stance as the envelope hash normalization);
 /// `only_the_closed_set_of_localizations_applies` pins this closed set.
@@ -345,7 +353,8 @@ pub(crate) fn localize_same_format(
     new_id: &str,
     cwd: &Path,
 ) -> Result<String> {
-    let rewritten = rewrite_identity(content, format, new_id, cwd)?;
+    let repaired = repair_protocol_ids(content)?;
+    let rewritten = rewrite_identity(&repaired, format, new_id, cwd)?;
     let closed = close_open_calls(&rewritten, format, new_id, cwd)?;
     let bootstrapped = ensure_codex_bootstrap(&closed, format, new_id, cwd)?;
     ensure_codex_visible_history(&bootstrapped, format)

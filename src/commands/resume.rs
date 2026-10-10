@@ -1123,6 +1123,7 @@ fn resume_branch_for(
         // Native reuse requires both saved VIEW equality and a native LOG prefix. History
         // overlays cannot authorize replaying evidence excluded from the current snapshot.
         if let Ok(live) = lk.read()
+            && !crate::domain::install::protocol_ids_need_repair(&live)
             && matches!(
                 crate::domain::privacy::service::native_continuity(
                     repo.root(),
@@ -1277,9 +1278,7 @@ fn claude_session_is_in_project(existing: &Link, cwd: &Path) -> bool {
 }
 
 fn prepared_recovery_is_loadable(existing: &Link) -> bool {
-    if !matches!(existing.source.as_str(), "claude-code" | "claude-desktop") {
-        return true;
-    }
+    let claude = matches!(existing.source.as_str(), "claude-code" | "claude-desktop");
     let Some(cwd) = existing.cwd.as_deref() else {
         return false;
     };
@@ -1298,6 +1297,12 @@ fn prepared_recovery_is_loadable(existing: &Link) -> bool {
     let Ok(raw) = std::str::from_utf8(bytes) else {
         return false;
     };
+    if crate::domain::install::protocol_ids_need_repair(raw) {
+        return false;
+    }
+    if !claude {
+        return true;
+    }
     let cwd = adapter::claude_code::canonical_cwd(Path::new(cwd));
     crate::domain::transcript::recovery::validate_claude(raw, &existing.session_id, &cwd).is_ok()
 }
@@ -2052,6 +2057,7 @@ fn materialize_and_resume(
         let bootstrap = &text[..text.len() - raw_bytes];
         saved.insert_str(0, &transcript::wrap_lines(bootstrap, from, &snap.session));
     }
+    let saved = crate::domain::install::repair_saved_protocol_ids(&saved)?;
     let hydrated = crate::domain::privacy::service::transform(
         Some(repo.root()),
         &saved,
@@ -2066,7 +2072,10 @@ fn materialize_and_resume(
             "encrypted dictionaries synchronize independently; retry restoration after synchronization",
         );
     }
-    let saved = hydrated.content;
+    // A carrier may hide a protocol placeholder until its outer mapping is hydrated. Re-run
+    // alias repair after expansion so hidden call IDs receive the same deterministic alias as
+    // their visible results before the native runtime sees the transcript.
+    let saved = crate::domain::install::repair_saved_protocol_ids(&hydrated.content)?;
 
     let mut locked_supersede = Vec::with_capacity(supersede.len());
     for previous in &supersede {

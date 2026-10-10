@@ -511,8 +511,9 @@ impl Adapter for Hermes {
     }
     fn localize(&self, raw: &str, id: &str, cwd: &Path) -> Result<String> {
         native::validate_id(id, Limits::default())?;
-        self.parse(raw)?;
-        let mut values = records(raw)?;
+        let raw = crate::domain::install::repair_protocol_ids(raw)?;
+        self.parse(&raw)?;
+        let mut values = records(&raw)?;
         if values
             .first()
             .is_none_or(|value| value["type"] != "hermes_session")
