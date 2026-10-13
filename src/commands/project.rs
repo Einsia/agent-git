@@ -185,7 +185,7 @@ fn candidates(project: &Project) -> Result<Vec<Candidate>> {
         for session in adapter.all_session_choices()? {
             let cwd = session
                 .cwd
-                .or_else(|| crate::tui::screens::selector::preview(runtime, &session.path).cwd);
+                .or_else(|| crate::tui::screens::selector::recorded_cwd(&session.path));
             let Some(cwd) = cwd.and_then(|p| PathBuf::from(p).canonicalize().ok()) else {
                 continue;
             };
@@ -453,6 +453,26 @@ pub fn run(args: Args) -> CmdResult {
     }
 }
 
+/// A directory routes to one repository: its workspace binding and any existing project policy
+/// must already name the requested one. Returns that existing policy.
+fn assignable(root: &Path, repository: &str) -> Result<Option<Project>> {
+    if let Some(binding) = workspace::read(root) {
+        ensure!(
+            binding.repo == repository,
+            "directory is bound to {}; rebind it explicitly first",
+            binding.repo
+        );
+    }
+    let existing = read(root)?;
+    if let Some(existing) = &existing {
+        ensure!(
+            existing.repository == repository,
+            "project is already assigned to another repository"
+        );
+    }
+    Ok(existing)
+}
+
 fn bind(
     path: &Path,
     repository: &str,
@@ -485,6 +505,8 @@ fn bind(
         last_result: None,
     };
     let rows = candidates(&project)?;
+    // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
+    assignable(&root, repository)?;
     if dry_run {
         println!(
             "{}",
@@ -497,18 +519,7 @@ fn bind(
         "configure project capture in a device terminal outside the RC supervisor"
     );
     let _guard = lock(&root)?;
-    if let Some(binding) = workspace::read(&root) {
-        ensure!(
-            binding.repo == repository,
-            "directory is bound to {}; rebind it explicitly first",
-            binding.repo
-        );
-    }
-    if let Some(existing) = read(&root)? {
-        ensure!(
-            existing.repository == repository,
-            "project is already assigned to another repository"
-        );
+    if let Some(existing) = assignable(&root, repository)? {
         project.last_result = existing.last_result;
         if history == History::None {
             project.excluded = existing.excluded;
@@ -835,6 +846,9 @@ mod tests {
             ])
             .env(CHILD, "1")
             .env("AGIT_HOME", home.path())
+            // Candidate discovery never reads the developer's own transcripts.
+            .env("CLAUDE_CONFIG_DIR", home.path().join("claude"))
+            .env("CODEX_HOME", home.path().join("codex"))
             .output()
             .unwrap();
         assert!(
@@ -911,6 +925,84 @@ mod tests {
         let error = publication(&project, &candidate(fresh)).unwrap_err();
         assert!(error.to_string().contains("preserved source authority"));
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// A Claude Code session is a candidate for its directory when its first directory-bearing
+    /// record runs past the preview window, including when that record is too long to buffer and
+    /// a later record names the same directory. Discovery that parses only the preview window
+    /// drops both sessions, and discovery that stops at an unbuffered record drops the second;
+    /// either way binding with history or syncing never imports them.
+    #[test]
+    fn claude_session_opening_with_a_long_prompt_is_a_candidate() {
+        if !isolated("claude_session_opening_with_a_long_prompt_is_a_candidate") {
+            return;
+        }
+        use crate::tui::screens::selector::{CWD_RECORD_BYTES, PREVIEW_BYTES};
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        let native = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+            .join("projects")
+            .join(adapter::claude_code::slug_for(&project.root));
+        fs::create_dir_all(&native).unwrap();
+        let write = |id: &str, pasted: usize| {
+            let queued = serde_json::json!({"type": "queue-operation",
+                "operation": "enqueue", "sessionId": id});
+            let prompt = serde_json::json!({"type": "user", "isSidechain": false,
+                "sessionId": id, "cwd": project.root,
+                "message": {"role": "user", "content": [{"type": "image",
+                    "source": {"type": "base64", "data": "A".repeat(pasted)}}]}});
+            let attachment = serde_json::json!({"type": "attachment", "isSidechain": false,
+                "sessionId": id, "cwd": project.root});
+            fs::write(
+                native.join(format!("{id}.jsonl")),
+                format!("{queued}\n{prompt}\n{attachment}\n"),
+            )
+            .unwrap();
+        };
+        let beyond_preview = "aaaaaaaa-0000-4000-8000-000000000011";
+        write(beyond_preview, 2 * PREVIEW_BYTES as usize);
+        let beyond_buffer = "bbbbbbbb-0000-4000-8000-000000000012";
+        write(beyond_buffer, CWD_RECORD_BYTES + 1);
+        let mut found: Vec<_> = candidates(&project)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| (candidate.runtime, candidate.session_id, candidate.cwd))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [beyond_preview, beyond_buffer].map(|id| (
+                "claude-code".to_owned(),
+                id.to_owned(),
+                project.root.clone()
+            ))
+        );
+    }
+
+    /// A dry run refuses what the bind refuses: a directory its workspace binding or an existing
+    /// project policy already routes to another repository. A dry run that lists candidates
+    /// before these checks reports a bind that cannot happen.
+    #[test]
+    fn dry_run_refuses_a_directory_routed_to_another_repository() {
+        if !isolated("dry_run_refuses_a_directory_routed_to_another_repository") {
+            return;
+        }
+        let bound = tempfile::tempdir().unwrap();
+        workspace::bind(bound.path(), "alice/other", false).unwrap();
+        let error = bind(bound.path(), "alice/app", History::None, false, true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("rebind it explicitly first"),
+            "{error:#}"
+        );
+
+        let enrolled = tempfile::tempdir().unwrap();
+        save(&project(enrolled.path())).unwrap();
+        let error = bind(enrolled.path(), "alice/other", History::None, false, true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already assigned to another repository"),
+            "{error:#}"
+        );
+        assert!(bind(enrolled.path(), "alice/app", History::None, false, true).is_ok());
     }
 
     #[test]

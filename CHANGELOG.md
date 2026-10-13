@@ -16,6 +16,12 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   `agit fetch <owner/repo>` likewise offers the grant hint only when the Hub
   refuses access. A reader who already had access was sent to check
   collaborator grants after an interrupted transfer.
+- `agit project bind --history all`, its `--dry-run` preview and `agit project sync`
+  include Claude Code conversations that open with a large prompt, such as a pasted
+  screenshot, instead of silently leaving them out of the project.
+- `agit project bind --dry-run` refuses a directory that is already bound to
+  another repository, as the bind itself does, instead of previewing a bind that
+  would fail.
 
 ## [0.2.22] - 2026-10-07
 

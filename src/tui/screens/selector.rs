@@ -133,7 +133,7 @@ pub(super) fn project_label(cwd: Option<&str>) -> String {
         .collect()
 }
 
-const PREVIEW_BYTES: u64 = 32 * 1024;
+pub(crate) const PREVIEW_BYTES: u64 = 32 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Preview {
@@ -202,12 +202,7 @@ pub(crate) fn preview(runtime: &str, path: &std::path::Path) -> Preview {
             continue;
         };
         if result.cwd.is_none() {
-            result.cwd = value
-                .get("cwd")
-                .or_else(|| value.get("payload")?.get("cwd"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|cwd| std::path::Path::new(cwd).is_absolute())
-                .map(str::to_owned);
+            result.cwd = record_cwd(&value);
         }
     }
     if let Ok(adapter) = crate::adapter::get(runtime)
@@ -217,6 +212,81 @@ pub(crate) fn preview(runtime: &str, path: &std::path::Path) -> Preview {
         result.cwd = session.cwd.or(result.cwd);
     }
     result
+}
+
+/// A record names its directory at top level (Claude Code) or in its payload (Codex). A relative
+/// path names none: resolving it against the reader's own directory would attribute the session
+/// to wherever agit happens to run.
+fn record_cwd(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("cwd")
+        .or_else(|| record.get("payload")?.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+        .map(str::to_owned)
+}
+
+/// A record is buffered whole only up to this size; a longer one is read past unparsed, so
+/// memory stays bounded whatever an inline attachment weighs.
+pub(crate) const CWD_RECORD_BYTES: usize = 1024 * 1024;
+/// A transcript that never names an absolute directory is read no further than this.
+const CWD_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The directory named by the first complete record that carries an absolute `cwd`.
+///
+/// Discovery that selects sessions by directory reads this rather than [`preview`]: a transcript
+/// can open with records that name no directory followed by a prompt longer than the preview
+/// window, and the preview then finds no directory in a session that has one. Records stream one
+/// at a time and reading stops at the first directory, so the cost follows where that record
+/// sits rather than how long the transcript has grown. A record too long to buffer is skipped,
+/// since the records that follow it name the directory too. A record cut by the end of the file
+/// or of the scan budget provides nothing.
+pub(crate) fn recorded_cwd(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let file = opening_file(path)?;
+    let mut reader = std::io::BufReader::new(file.take(CWD_SCAN_BYTES));
+    let mut record = Vec::new();
+    while let Some(buffered) = next_record(&mut reader, &mut record).ok()? {
+        if buffered
+            && let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&record)
+                .ok()
+                .as_ref()
+                .and_then(record_cwd)
+        {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+/// Consume the next newline-terminated record. `Some(true)` means `record` holds all of it,
+/// `Some(false)` that it outgrew [`CWD_RECORD_BYTES`] and `record` holds nothing, and `None`
+/// that the input ended; trailing bytes without a newline are a cut record and end the input.
+fn next_record(
+    reader: &mut impl std::io::BufRead,
+    record: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    record.clear();
+    let mut buffered = true;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk = &available[..newline.unwrap_or(available.len())];
+        if buffered && record.len() + chunk.len() <= CWD_RECORD_BYTES {
+            record.extend_from_slice(chunk);
+        } else {
+            buffered = false;
+            record.clear();
+        }
+        let consumed = chunk.len() + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(buffered));
+        }
+    }
 }
 
 #[cfg(test)]
