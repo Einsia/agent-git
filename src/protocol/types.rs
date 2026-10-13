@@ -285,6 +285,17 @@ pub struct ProjectPublicationBind {
     pub local_path: String,
     pub repository: String,
     pub repository_id: String,
+    /// Archived repository encryption mode, sent by Hubs that still serve clients predating
+    /// session receipts. Only an ordinary repository can be bound: `true` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_enabled: Option<bool>,
+}
+
+impl ProjectPublicationBind {
+    /// Session publication cannot write into an archived encrypted repository.
+    pub fn ordinary_destination(&self) -> bool {
+        self.encryption_enabled != Some(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

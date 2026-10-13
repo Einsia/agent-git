@@ -187,6 +187,10 @@ fn check_owned_binding(
         request.workspace_id == crate::rc::endpoint::WORKSPACE,
         "publication plan addresses another local authority"
     );
+    ensure!(
+        request.ordinary_destination(),
+        "an archived encrypted repository cannot receive project publications"
+    );
     let enrollment = store::load_in(credential_dir, &device.owner.issuer)?
         .context("device enrollment is missing")?;
     ensure!(
@@ -217,6 +221,12 @@ impl Prepared {
         let caller = caller_scope(frame)?;
         require_role(&caller, frame.method())?;
         let request: ProjectPublicationBind = frame.params_as()?;
+        if !request.ordinary_destination() {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "an archived encrypted repository cannot receive project publications",
+            ));
+        }
         let grant = frame.authority.owned_machine_grant()?;
         if !daemon.opts.local_owner || caller.workspace_id != crate::rc::endpoint::WORKSPACE {
             return Err(forbidden());
@@ -448,7 +458,8 @@ fn unavailable() -> RpcError {
 mod tests {
     use super::*;
 
-    /// A background plan cannot outlive local folder, enrollment, or owner authority.
+    /// A background plan cannot outlive local folder, enrollment, or owner authority, and cannot
+    /// bind an archived encrypted repository while accepting the ordinary mode a Hub reports.
     #[test]
     fn unattended_reconciliation_checks_live_device_and_local_folder_authority() {
         if crate::rc::in_isolated_test(
@@ -495,11 +506,20 @@ mod tests {
             local_path: project.to_str().unwrap().into(),
             repository: "owner/project".into(),
             repository_id: "00000000-0000-0000-0000-000000000001".into(),
+            encryption_enabled: None,
         };
         let canceled = AtomicBool::new(false);
         let directory = store::directory().unwrap();
         let device = &enrollment.credential.device;
         check_owned_binding(&directory, device, &request, &canceled).unwrap();
+        // Hubs serving released clients send the archived repository mode in the same request.
+        let mut wire = serde_json::to_value(&request).unwrap();
+        wire["encryption_enabled"] = false.into();
+        let ordinary: ProjectPublicationBind = serde_json::from_value(wire.clone()).unwrap();
+        check_owned_binding(&directory, device, &ordinary, &canceled).unwrap();
+        wire["encryption_enabled"] = true.into();
+        let archived: ProjectPublicationBind = serde_json::from_value(wire).unwrap();
+        assert!(check_owned_binding(&directory, device, &archived, &canceled).is_err());
         canceled.store(true, Ordering::Release);
         assert!(check_owned_binding(&directory, device, &request, &canceled).is_err());
         canceled.store(false, Ordering::Release);
