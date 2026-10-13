@@ -109,9 +109,11 @@ fn fetch_slug(slug: &str) -> CmdResult {
             Err(e) => {
                 super::fix::register_terminal_api_error(&e);
                 ui::error(&format!("can’t fetch {slug}: {e:#}"));
-                ui::hint(
-                    "a private agent needs the owner’s grant — check who you are with `agit whoami`",
-                );
+                if hub_refused_access(&e) {
+                    ui::hint(
+                        "a private agent needs the owner’s grant — check who you are with `agit whoami`",
+                    );
+                }
                 ui::hint(&format!(
                     "want a working checkout instead? `agit clone {slug}`"
                 ));
@@ -176,6 +178,18 @@ fn adopt_peer(owner: &str, name: &str, dir: &Path) -> crate::Result<Repo> {
     ));
     let identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
     init_peer(dir, &remote.clone_url, &identity)
+}
+
+/// Whether the hub declined to show this agent to the caller, the only failure the grant hint
+/// explains. The hub answers a reader without access the way it answers a missing agent (404).
+/// An unreachable hub or a local failure is not one: a grant hint there sends the reader to ask
+/// for access they may already hold.
+fn hub_refused_access(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::hub::client::ApiError>()
+            .is_some_and(|api| matches!(api.status, 401 | 403 | 404))
+    })
 }
 
 /// The shape a peer repo lands in: an empty repo plus an `origin`, nothing else.

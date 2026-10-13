@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed `agit clone` suggests asking for the owner's grant only when Git
+  reports an authentication failure; any other failed transfer suggests
+  retrying and, if it fails the same way again, reporting it with the output.
+  `agit fetch <owner/repo>` likewise offers the grant hint only when the Hub
+  refuses access. A reader who already had access was sent to check
+  collaborator grants after an interrupted transfer.
+
 ## [0.2.22] - 2026-10-07
 
 ### Added

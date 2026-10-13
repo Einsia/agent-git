@@ -340,7 +340,7 @@ fn inventory(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         .collect()
 }
 
-fn assert_output(output: &Output, mode: &str, code: i32, diagnostic: Option<&str>) {
+fn assert_output(output: &Output, mode: &str, code: i32, diagnostic: Option<&str>) -> String {
     assert_eq!(output.status.code(), Some(code), "{mode}: {output:?}");
     let text = if let Some(version) = mode.strip_prefix("json") {
         assert!(output.stderr.is_empty(), "{output:?}");
@@ -361,6 +361,7 @@ fn assert_output(output: &Output, mode: &str, code: i32, diagnostic: Option<&str
     if let Some(diagnostic) = diagnostic {
         assert!(text.contains(diagnostic), "{mode}: {text}");
     }
+    text
 }
 
 #[test]
@@ -475,17 +476,27 @@ fn clone_client_failures_use_transport_types_and_do_not_replay_or_create_identit
     }
 }
 
+/// Real Git HTTP refusals keep their exit category, leave nothing behind, and get the hint that
+/// matches that category: an implementation that offers the owner's-grant hint after every
+/// failed transfer sends a reader who already has access after a grant, and one whose other hint
+/// stops at retrying leaves a Hub that fails every attempt with no next step.
 #[test]
 fn actual_git_http_failures_preserve_authentication_and_the_fixed_repository_identity() {
     for mode in ["human", "quiet", "json1", "json2"] {
         for (status, code) in [(401, 5), (403, 5), (404, 6), (500, 6)] {
             let mut lab = Lab::with_git_status(200, Some(status));
             let before = inventory(&lab.source);
-            assert_output(
+            let text = assert_output(
                 &lab.clone_ref("main", mode),
                 mode,
                 code,
                 Some("clone failed"),
+            );
+            assert_eq!(text.contains("grant"), code == 5, "{mode}/{status}: {text}");
+            assert_eq!(
+                text.contains("report it with the output above"),
+                code == 6,
+                "{mode}/{status}: {text}"
             );
             lab.hub.finish();
             assert_eq!(inventory(&lab.source), before);

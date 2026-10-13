@@ -428,21 +428,28 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Err(error) => return local_transport_failure(error),
         };
         if !outcome.ok() {
+            // The hint names the cause the exit code reports: a grant hint after a transfer that
+            // broke off for another reason sends the reader to ask for access they already hold.
+            // Any other failure covers a missing repository, a Hub error and a dropped connection
+            // alike, so its hint names no mechanism; and a Hub that fails a request
+            // deterministically fails every retry the same way, so the hint does not stop at
+            // retrying.
+            let auth = crate::hub::git::looks_like_auth_failure(&outcome.stderr);
             ui::error("clone failed.");
-            ui::hint(
-                "private agents need the owner’s grant — check the account used with `agit login`",
-            );
+            ui::hint(if auth {
+                "private agents need the owner’s grant — check the account used with `agit login`"
+            } else {
+                "the transfer did not complete — retry; if it fails the same way again, report it with the output above"
+            });
             ui::hint(&format!(
                 "remote: {}",
                 crate::hub::git::redact_url(&clone_url)
             ));
-            return Ok(
-                if crate::hub::git::looks_like_auth_failure(&outcome.stderr) {
-                    ExitCode::Auth
-                } else {
-                    ExitCode::Network
-                },
-            );
+            return Ok(if auth {
+                ExitCode::Auth
+            } else {
+                ExitCode::Network
+            });
         }
         plan.apply_remotes(&Repo::at(&dest), false, None)?;
     }
