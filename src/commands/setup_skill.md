@@ -73,11 +73,12 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
 - For an authorized explicit push, first run `agit push <owner/repo>@<branch>
   --dry-run`. Check the destination, visibility and snapshot summary,
   then run `agit push <owner/repo>@<branch> --yes` with the same target and options
-  after the preview succeeds. If dry-run reports that a new destination needs an
-  immutable repository identity before a session publication preview, also continue
-  with the same `push --yes`; it creates the destination and registers sessions.
-  Stop on any other dry-run error. Read [push](references/commands/push.md) for the
-  exact diagnostic and audit mode.
+  after the preview succeeds. Also continue with the same `push --yes` if dry-run
+  reports either documented first-publication diagnostic: a new destination needs
+  an immutable repository identity, or a saved session must be registered before
+  a dry-run publication. Ordinary push creates the destination or registers the
+  session, then prepares its preview. Stop on any other dry-run error. Read
+  [push](references/commands/push.md) for the exact diagnostics and audit mode.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
   two writers in at once. `was already adopted` is informational; the import
@@ -152,7 +153,7 @@ session and records its claim; it is not a read-only preview.
 | Open a branch or saved point | `agit run <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points |
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
-| Publish local history | `agit push <owner/repo>@<branch> --dry-run`, then `agit push <owner/repo>@<branch> --yes` | Continue after a successful preview or the documented new-destination identity error |
+| Publish local history | `agit push <owner/repo>@<branch> --dry-run`, then `agit push <owner/repo>@<branch> --yes` | Continue after a successful preview or a documented first-publication diagnostic |
 
 ## Deliver files at completed milestones
 

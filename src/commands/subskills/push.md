@@ -47,7 +47,7 @@ agit push <owner/repo>@<branch> --private --dry-run
 
 Check the destination, visibility and snapshot summary. Keep the default summary output;
 the complete preview remains in the JSON file at the reported path. After the dry-run
-succeeds, or if it fails with the exact new-destination diagnostic below, publish with
+succeeds, or if it fails with either exact first-publication diagnostic below, publish with
 confirmation supplied by `--yes`:
 
 ```bash
@@ -66,12 +66,22 @@ For a new destination, dry-run stops with:
 a new destination needs an immutable repository identity before a session publication preview; publish without --dry-run to confirm its creation
 ```
 
-This diagnostic permits continuing the authorized publication with `push --yes` without
-another confirmation. The ordinary push creates the destination, registers sessions and
-prepares its preview before uploading. Match this diagnostic, not just a nonzero exit code.
-Stop and report any other dry-run error, including an unregistered session in an existing
-repository, permission denial, network failure or content validation failure. If the
-subsequent push fails, report that failure instead of retrying this exception.
+For an existing destination with a saved session that has not been registered, dry-run
+stops with:
+
+```text
+session SESSION must be registered before a dry-run publication
+```
+
+`SESSION` is the saved session's AgentGit ID. This diagnostic is emitted only after the
+Hub explicitly identifies that session as unregistered; a failed lookup is not equivalent.
+
+Either diagnostic permits continuing the authorized publication with `push --yes` without
+another confirmation. The ordinary push creates the destination or registers the session,
+then prepares its preview before uploading. Match these diagnostics, not just a nonzero
+exit code. Stop and report any other dry-run error, including permission denial, network
+failure or content validation failure. If the subsequent push fails, report that failure
+instead of retrying this exception.
 
 `--audit` is a separate interactive workflow; even `--audit --dry-run` requires a person
 at the terminal, and `--yes` cannot replace its review or final confirmation.
