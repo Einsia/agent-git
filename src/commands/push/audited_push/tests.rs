@@ -94,7 +94,6 @@ fn audit_json_is_rejected_without_changing_ordinary_push_json() {
 fn remote() -> RemoteAgent {
     RemoteAgent {
         agent_id: "11111111-1111-4111-8111-111111111111".into(),
-        encryption_enabled: Some(true),
         owner: "me".into(),
         name: "qa".into(),
         clone_url: "https://hub.example/me/qa.git".into(),
@@ -114,10 +113,8 @@ fn intent() -> Intent {
         name: remote.name.clone(),
         url: remote.clone_url.clone(),
         visibility: remote.visibility.clone(),
-        encryption_enabled: true,
         accept_secret_findings: false,
         action: Action::Existing(remote),
-        separate_target: None,
     }
 }
 
@@ -125,19 +122,6 @@ fn intent() -> Intent {
 fn reviewed_destination_rejects_identity_audience_namespace_and_url_drift() {
     let intent = intent();
     let original = remote();
-    for encryption_enabled in [None, Some(false)] {
-        assert!(
-            intent
-                .verify_observed(
-                    &RemoteAgent {
-                        encryption_enabled,
-                        ..original.clone()
-                    },
-                    Some(&original.agent_id)
-                )
-                .is_err()
-        );
-    }
     intent
         .verify_observed(&original, Some(&original.agent_id))
         .unwrap();
@@ -183,24 +167,13 @@ fn reviewed_destination_rejects_identity_audience_namespace_and_url_drift() {
 }
 
 #[test]
-fn create_and_copy_intents_bind_their_audience_and_source() {
+fn creation_intent_retains_its_audience_before_repository_registration() {
     let mut intent = intent();
     intent.action = Action::Create;
     assert_eq!(intent.json()["action"], "ensure");
     assert!(intent.json()["agent_id"].is_null());
-    let source = RemoteAgent {
-        owner: "alice".into(),
-        clone_url: "https://hub.example/alice/qa.git".into(),
-        ..remote()
-    };
-    intent.action = Action::Copy(source.clone());
-    let json = intent.json();
-    assert_eq!(json["action"], "ensure_and_relocate");
-    assert_eq!(json["source"]["agent_id"], source.agent_id);
-    assert_eq!(json["source"]["owner"], "alice");
-    assert_eq!(json["visibility"], "private");
-    assert!(intent.confirmation().contains("no server history copy"));
-    assert_eq!(json["repo_origins"], json!([]));
+    assert_eq!(intent.json()["visibility"], "private");
+    assert_eq!(intent.json()["repo_origins"], json!([]));
 }
 
 #[test]
@@ -321,11 +294,6 @@ fn ensured_destinations_accept_a_fresh_same_target_id_but_existing_targets_do_no
     };
     intent.action = Action::Create;
     intent.verify_observed(&concurrent, None).unwrap();
-    assert!(
-        intent
-            .confirmation()
-            .contains("Ensure the destination exists with this audience")
-    );
     assert_eq!(intent.json()["repo_origins"], json!([]));
     assert!(
         intent
@@ -350,13 +318,13 @@ use crate::publication_test_process as process;
 
 /// Local relocation preserves every ref and claim field without reading or copying remote history.
 #[test]
-fn prepared_copy_relocates_only_local_content_and_exact_source_claims() {
+fn copy_promotion_preserves_local_content_and_exact_source_claims() {
     use crate::domain::{link, store::Store};
     use std::process::Command;
     use std::time::Instant;
 
     const CHILD: &str = "AGIT_AUDITED_LOCAL_PROMOTION_FIXTURE";
-    const COMPLETE: &str = "prepared local promotion verified";
+    const COMPLETE: &str = "local promotion verified";
     let Some(root) = std::env::var_os(CHILD) else {
         let root = tempfile::tempdir().unwrap();
         for name in ["home", "agit", "tmp", "templates"] {
@@ -374,7 +342,7 @@ fn prepared_copy_relocates_only_local_content_and_exact_source_claims() {
             .args([
                 "--exact",
                 &format!(
-                    "{module}::prepared_copy_relocates_only_local_content_and_exact_source_claims"
+                    "{module}::copy_promotion_preserves_local_content_and_exact_source_claims"
                 ),
                 "--nocapture",
             ])
@@ -454,16 +422,19 @@ fn prepared_copy_relocates_only_local_content_and_exact_source_claims() {
     link::write(&store, &legacy).unwrap();
     let legacy_before = legacy.to_json().unwrap();
 
-    Repo::init(&destination_path).unwrap();
-    assert!(
-        super::super::super::clone::promote_to_prepared_destination(
-            &source_path,
-            &source,
-            &destination,
-            &hub
+    let promote = |source: &RemoteAgent| {
+        super::super::super::clone::relocate_promoted_checkout(
+            &Repo::at(&source_path),
+            source,
+            &RemoteIdentity::new(&hub, &source.agent_id).unwrap(),
+            &destination_identity,
+            &destination.owner,
+            &destination.name,
+            &destination.clone_url,
         )
-        .is_err()
-    );
+    };
+    Repo::init(&destination_path).unwrap();
+    assert!(promote(&source).is_err());
     assert_eq!(
         std::fs::read(source_path.join(".git/config")).unwrap(),
         original_config
@@ -482,28 +453,12 @@ fn prepared_copy_relocates_only_local_content_and_exact_source_claims() {
         agent_id: "33333333-3333-4333-8333-333333333333".into(),
         ..source.clone()
     };
-    assert!(
-        super::super::super::clone::promote_to_prepared_destination(
-            &source_path,
-            &changed_source,
-            &destination,
-            &hub
-        )
-        .is_err()
-    );
+    assert!(promote(&changed_source).is_err());
     assert_eq!(
         std::fs::read(source_path.join(".git/config")).unwrap(),
         original_config
     );
-    let plan = super::super::super::clone::promote_to_prepared_destination(
-        &source_path,
-        &source,
-        &destination,
-        &hub,
-    )
-    .unwrap();
-    assert!(plan.writable && plan.promoted_in_place);
-    assert_eq!(plan.identity, destination_identity);
+    promote(&source).unwrap();
     assert!(!source_path.exists());
     let moved = Repo::open(&destination_path).unwrap();
     assert_eq!(moved.git(&["show-ref"]).unwrap(), refs);
@@ -576,12 +531,6 @@ fn audit_and_new_destinations_require_full_inspection() {
         panic!("push command");
     };
     destination.action = Action::Create;
-    assert!(
-        inspection_destination(&args, &destination)
-            .unwrap()
-            .is_none()
-    );
-    destination.action = Action::Copy(remote());
     assert!(
         inspection_destination(&args, &destination)
             .unwrap()

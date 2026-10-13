@@ -211,6 +211,8 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
 
     let target_head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
     let mut target_head = target_head.trim().to_string();
+    require_merge_input(&repo, &target_head)?;
+    require_merge_input(&base.repo, &base.resolved.sha)?;
     let mut reconnaissance =
         Reconnaissance::read(&repo, &base.repo, &target_head, &base.resolved.sha)?;
     let mut archive_runtime = None;
@@ -1136,6 +1138,10 @@ fn merge_tree(
         resolved.is_empty() || (target_is_file_line && tx.generation.is_some()),
         "--resolved requires a generated file-line merge transaction"
     );
+    if target_is_file_line {
+        require_merge_input(repo, &tx.target_head)?;
+        require_merge_input(source_repo, src_head)?;
+    }
     if !target_is_file_line {
         let Some(prepared) = prepare_session_merge(repo, source_repo, tx, src_head, None)? else {
             return Ok(None);
@@ -1163,6 +1169,7 @@ fn merge_tree(
     // downstream back to guessing).
     let file_meta = {
         let mut m = meta::Meta::new_file_line();
+        m.committer_account = crate::infra::credentials::current_account()?;
         m.kind = meta::Kind::Merge;
         m.milestone = Some(format!("merge {}", tx.source));
         meta::to_text(&m)?
@@ -1200,6 +1207,11 @@ struct PreparedSessionMerge {
     files: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
+/// A published envelope authenticates its exact projection and cannot accompany edited content.
+fn require_merge_input(repo: &Repo, commit: &str) -> crate::Result<()> {
+    super::privacy::require_native_edit(repo, commit)
+}
+
 fn prepare_session_merge(
     target_repo: &Repo,
     source_repo: &Repo,
@@ -1207,6 +1219,8 @@ fn prepare_session_merge(
     src_head: &str,
     frozen_source: Option<&crate::domain::archive_history::FrozenSourceLog>,
 ) -> crate::Result<Option<PreparedSessionMerge>> {
+    require_merge_input(target_repo, &tx.target_head)?;
+    require_merge_input(source_repo, src_head)?;
     let snap = meta::read_at_ref(target_repo, &tx.target_head)
         .ok_or_else(|| anyhow::anyhow!("the target head is missing {}", meta::FILE))?;
     let a_log = storage::materialize_at(target_repo.root(), &tx.target_head, meta::LOG_FILE)?;
@@ -1335,9 +1349,10 @@ fn prepare_session_merge(
 fn land_session_merge(
     target_repo: &Repo,
     tx: &Tx,
-    prepared: PreparedSessionMerge,
+    mut prepared: PreparedSessionMerge,
     base_tree: &str,
 ) -> crate::Result<(String, String)> {
+    prepared.metadata.committer_account = crate::infra::credentials::current_account()?;
     let snap_text = meta::to_text(&prepared.metadata)?;
     let existing_attributes =
         super::plumbing::regular_blob_text_at(target_repo, base_tree, meta::ATTRS_FILE)?;
@@ -2067,7 +2082,8 @@ mod tests {
     /// Two parents record ancestry only; the other parent's tree is not folded into the result
     /// automatically. Across repos the source event has to be written into the result tree
     /// explicitly, and the complete source parent DAG has to be imported into the target object
-    /// database first.
+    /// database first. Published envelopes cannot accompany newly merged content; refusing
+    /// either encrypted input leaves target refs and the worktree untouched.
     #[test]
     fn cross_repo_merge_copies_source_only_event_and_materializes_it() {
         let target_dir = tempfile::tempdir().unwrap();
@@ -2180,6 +2196,57 @@ mod tests {
         target
             .git(&["fsck", "--connectivity-only", "--no-dangling", &commit])
             .unwrap();
+        for encrypted_target in [false, true] {
+            let (selected, head) = if encrypted_target {
+                (&target, &target_head)
+            } else {
+                (&source, &source_head)
+            };
+            let tree = super::super::plumbing::tree_apply_owned(
+                selected,
+                head,
+                vec![(
+                    "privacy/envelope.json".into(),
+                    Some(br#"{"format_version":1}"#.to_vec()),
+                )],
+            )
+            .unwrap();
+            let encrypted = super::super::plumbing::commit_tree(
+                selected,
+                &tree,
+                &[head],
+                "Unsupported published merge input",
+            )
+            .unwrap();
+            let mut blocked = tx.clone();
+            if encrypted_target {
+                blocked.target_head = encrypted.clone();
+            } else {
+                blocked.source_head = encrypted.clone();
+            }
+            let source_head = if encrypted_target {
+                &source_head
+            } else {
+                &encrypted
+            };
+            let error =
+                merge_tree(&target, &source, &blocked, source_head, &[], false, &[]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("native continuation or an independent fork")
+            );
+            assert_eq!(
+                target
+                    .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .unwrap(),
+                refs_before
+            );
+            assert_eq!(
+                target.git(&["status", "--porcelain=v1"]).unwrap(),
+                status_before
+            );
+        }
     }
 
     // ─────── Shared files into the tree ───────

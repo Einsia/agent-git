@@ -185,7 +185,7 @@ impl Lab {
         if let Some(version) = mode.strip_prefix("json") {
             command.args(["--json", "--json-version", version]);
         }
-        command.args(["--yes", "push", target, "-b", "main", "--encryption=false"]);
+        command.args(["--yes", "push", target, "-b", "main"]);
         if let Some(flag) = visibility {
             command.arg(flag);
         }
@@ -193,16 +193,6 @@ impl Lab {
             command.arg("--dry-run");
         }
         command
-    }
-
-    /// Create the repository lock a publish takes to change `origin`; returns the store root,
-    /// which the fixture does not otherwise have.
-    fn repository_lock(&self, slug: &str) -> PathBuf {
-        let root = self.home.join("store");
-        assert!(!root.exists());
-        agit::domain::link::lock_repository_for_write(&agit::domain::store::Store::at(&root), slug)
-            .unwrap();
-        root
     }
 
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -477,7 +467,6 @@ impl Drop for Server {
 
 fn remote(lab: &Lab, owner: &str, id: &str) -> Value {
     json!({"agent_id":id, "owner":owner, "name":"qa", "visibility":"private",
-        "encryption_enabled":false,
         "clone_url":format!("{}/{owner}/qa.git", lab.base)})
 }
 
@@ -517,10 +506,11 @@ fn assert_command_failure(output: &Output, mode: &str, code: i32, command: &str)
 }
 
 #[test]
-fn dry_run_reads_destination_mode_without_pinning_or_publishing() {
+fn dry_run_reads_registered_history_without_pinning_or_publishing() {
     let lab = Lab::new();
-    lab.seed("alice", "qa", true);
-    let before = lab.state();
+    let path = lab.seed("alice", "qa", true);
+    let config = fs::read(path.join(".git/config")).unwrap();
+    let refs = lab.git(&path, &["show-ref"]);
     let server = Server::start(
         &lab,
         vec![
@@ -528,13 +518,23 @@ fn dry_run_reads_destination_mode_without_pinning_or_publishing() {
                 "GET /api/agents/alice/qa",
                 Reply::Json(remote(&lab, "alice", AGENT_ID)),
             ),
+            Step::new(
+                "GET /api/agents/alice/qa",
+                Reply::Json(remote(&lab, "alice", AGENT_ID)),
+            ),
+            Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                Reply::Status(200),
+            ),
+            Step::inspection_refs("alice/qa", AGENT_ID),
             Step::inspection_refs("alice/qa", AGENT_ID),
         ],
     );
     let output = lab.push("alice/qa", "human", true);
     server.finish();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(lab.state(), before);
+    assert_eq!(fs::read(path.join(".git/config")).unwrap(), config);
+    assert_eq!(lab.git(&path, &["show-ref"]), refs);
     lab.no_publication_requests();
 }
 
@@ -644,7 +644,7 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
                         Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                         Step::new("POST /api/agents", Reply::Status(rejection)).with_body(json!({
                             "name":"qa", "owner":"team", "public":public,
-                            "encryption_enabled":false, "repo_origins":[]
+                            "repo_origins":[]
                         })),
                     ],
                 );
@@ -671,40 +671,12 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
         ("post-owner", "quiet"),
         ("confirmation-auth", "json1"),
         ("confirmation-unavailable", "json2"),
-        ("confirmed-private", "json2"),
     ] {
         let lab = Lab::new();
         let path = lab.seed("team", "qa", true);
         lab.no_publication_requests();
         let before = lab.state();
         let refs = lab.git(&path, &["show-ref"]);
-        let confirmed = case == "confirmed-private";
-        let expected = if confirmed {
-            let config = path.join(".git/config");
-            let original = fs::read(&config).unwrap();
-            identity::pin(
-                &Repo::at(&path),
-                &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-            )
-            .unwrap();
-            lab.git(
-                &path,
-                &[
-                    "remote",
-                    "add",
-                    "origin",
-                    &format!("{}/team/qa.git", lab.base),
-                ],
-            );
-            let store = lab.repository_lock("team/qa");
-            let expected = lab.state();
-            fs::write(config, original).unwrap();
-            fs::remove_dir_all(store).unwrap();
-            assert_eq!(lab.state(), before);
-            expected
-        } else {
-            before
-        };
         let mut response = remote(&lab, "team", AGENT_ID);
         match case {
             "default-public-race" | "explicit-public-race" => {
@@ -718,8 +690,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
         let (confirmation, code) = match case {
             "confirmation-auth" => (Reply::Status(401), 5),
             "confirmation-unavailable" => (Reply::Status(503), 6),
-            "confirmed-private" => (Reply::Json(response), 6),
-            _ => (Reply::Json(response), 4),
+            _ => (Reply::Json(response), 1),
         };
         let mut steps = vec![
             Step::new("GET /api/agents/team/qa", Reply::Status(404)),
@@ -735,50 +706,24 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
                     "agent_id":AGENT_ID,
                     "owner":if case == "post-owner" { "other" } else { "team" },
                     "name":"qa",
-                    "encryption_enabled":false,
                     "push_url":format!("{}/team/qa.git", lab.base),
                     "web_url":format!("{}/team/qa", lab.base)
                 })),
             )
             .with_body(json!({
                 "name":"qa", "owner":"team", "public":false,
-                "encryption_enabled":false, "repo_origins":[]
+                "repo_origins":[]
             })),
-            Step::new("GET /api/agents/team/qa", confirmation),
         ];
-        if confirmed {
-            steps.extend([
-                Step::new(
-                    "GET /team/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
-                Step::new(
-                    "GET /api/agents/team/qa",
-                    Reply::Json(remote(&lab, "team", AGENT_ID)),
-                ),
-                Step::new(
-                    "GET /team/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
-            ]);
-            steps.push(Step::new(
-                "GET /team/qa.git/info/refs?service=git-receive-pack",
-                Reply::Status(503),
-            ));
+        if case != "post-owner" {
+            steps.push(Step::new("GET /api/agents/team/qa", confirmation));
         }
         let server = Server::start(&lab, steps);
         let visibility = (case != "default-public-race").then_some("--private");
         let output = lab.push_with_visibility("team/qa", mode, false, visibility);
         server.finish();
-        let message = assert_failure(&output, mode, code);
-        if code == 4 {
-            assert!(message.contains("nothing was uploaded"), "{message}");
-        }
-        assert_eq!(
-            lab.state(),
-            expected,
-            "{case}/{mode} changed local evidence"
-        );
+        assert_failure(&output, mode, code);
+        assert_eq!(lab.state(), before, "{case}/{mode} changed local evidence");
         assert_eq!(lab.git(&path, &["show-ref"]), refs);
         assert!(!lab.home.join("repos/alice/qa").exists());
         lab.no_publication_requests();
@@ -838,137 +783,81 @@ fn identity_constraints_and_invalid_remote_ids_refuse_without_writes() {
 }
 
 #[test]
-fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_repositories() {
-    for (status, code, mode) in [
-        (401, 5, "human"),
-        (403, 7, "quiet"),
-        (409, 7, "json1"),
-        (412, 4, "json2"),
-        (413, 7, "human"),
-        (422, 7, "quiet"),
-        (428, 4, "json1"),
-        (503, 6, "json2"),
-    ] {
-        let lab = Lab::new();
-        let path = lab.seed("alice", "qa", true);
-        identity::pin(
-            &Repo::at(&path),
-            &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-        )
-        .unwrap();
-        lab.no_publication_requests();
-        let before = lab.state();
-        let refs = lab.git(&path, &["show-ref"]);
-        let url = format!("{}/alice/qa.git", lab.base);
-        // A successful identity lookup records origin before the transport runs; only that
-        // known config change, and the repository lock taken to write it, belong in the failed
-        // publication's expected inventory.
-        lab.git(&path, &["remote", "add", "origin", &url]);
-        let store = lab.repository_lock("alice/qa");
-        let expected = lab.state();
-        lab.git(&path, &["remote", "remove", "origin"]);
-        fs::remove_dir_all(store).unwrap();
-        assert_eq!(lab.state(), before);
-        let server = Server::start(
-            &lab,
-            vec![
-                Step::new(
-                    "GET /api/agents/alice/qa",
-                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
-                ),
-                Step::inspection_refs("alice/qa", AGENT_ID),
-                Step::new(
-                    "GET /api/agents/alice/qa",
-                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
-                ),
-                Step::new(
-                    "GET /api/agents/alice/qa",
-                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
-                ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
-                Step::new(
-                    "GET /api/agents/alice/qa",
-                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
-                ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(200),
-                ),
-                Step::new(
-                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(status),
-                ),
-            ],
-        );
-        let output = lab.push("alice/qa", mode, false);
-        server.finish();
-        assert_failure(&output, mode, code);
-        assert_eq!(lab.git(&path, &["show-ref"]), refs);
-        assert_eq!(
-            lab.state(),
-            expected,
-            "HTTP {status}: {mode} changed publication state"
-        );
-        assert!(!lab.home.join("repos/alice/qa-2").exists());
-        lab.no_publication_requests();
-    }
-}
+fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
+    use sha2::{Digest, Sha256};
 
-/// Without `--encryption` or a stored preference, a separate destination created from a source
-/// bound to an encrypted Hub repository is encrypted too, so an unattended `--to` takes the
-/// encrypted path, which refuses this file line before creating anything. Applying the ordinary
-/// creation default here would create an ordinary repository and publish the source's original
-/// history in plaintext.
-#[test]
-fn separate_destination_of_an_encrypted_source_stays_encrypted_by_default() {
     let lab = Lab::new();
     let path = lab.seed("alice", "qa", true);
-    identity::pin(
-        &Repo::at(&path),
-        &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-    )
-    .unwrap();
-    let mut encrypted = remote(&lab, "alice", AGENT_ID);
-    encrypted["encryption_enabled"] = json!(true);
-    let mut unreported = remote(&lab, "alice", AGENT_ID);
-    unreported
-        .as_object_mut()
-        .unwrap()
-        .remove("encryption_enabled");
-    // An encrypted source keeps the destination encrypted; a source the Hub cannot show, or
-    // shows without a mode, refuses rather than being read as ordinary.
-    for (source, code, message) in [
-        (Reply::Json(encrypted), 4, "encrypted session publication"),
-        (Reply::Status(404), 1, "encryption mode is unknown"),
-        (
-            Reply::Json(unreported),
-            1,
-            "did not return encryption_enabled",
-        ),
-    ] {
-        let before = lab.state();
-        let server = Server::start(
-            &lab,
-            vec![
-                Step::new("GET /api/agents/alice/copy", Reply::Status(404)),
-                Step::new("GET /api/agents/alice/qa", source),
-            ],
+    if let Err(error) =
+        agit::domain::lfs::local::require_client(&agit::domain::repo::Repo::at(&path))
+    {
+        assert!(
+            std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+            "{error:#}"
         );
-        let output = lab
-            .command(env!("CARGO_BIN_EXE_agit"))
-            .args(["--json", "--json-version", "2", "push", "alice/qa"])
-            .args(["-b", "main", "--private", "--to", "alice/copy"])
-            .output()
-            .unwrap();
-        server.finish();
-        let text = assert_failure(&output, "json2", code);
-        assert!(text.contains(message), "{output:?}");
-        assert_eq!(lab.state(), before);
-        lab.no_publication_requests();
+        return;
     }
+    let mut encoded = Vec::new();
+    for payload in [
+        "a safe artifact\n",
+        "access_token = agit_at_9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb37d40928ef15b6a3c8d072e94\n",
+    ] {
+        let oid = hex::encode(Sha256::digest(payload.as_bytes()));
+        let cache = path
+            .join(".git/lfs/objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(cache, payload).unwrap();
+        encoded.push(format!(
+            "version {}\noid sha256:{oid}\nsize {}\n",
+            agit::domain::lfs::VERSION,
+            payload.len()
+        ));
+    }
+    fs::write(path.join("safe.txt"), &encoded[0]).unwrap();
+    fs::write(path.join("sensitive.txt"), format!("\n{}", encoded[1])).unwrap();
+    lab.git(
+        &path,
+        &["lfs", "pointer", "--check", "--file=sensitive.txt"],
+    );
+    lab.git(&path, &["add", "."]);
+    lab.git(&path, &["commit", "-m", "Record mixed pointer forms"]);
+    lab.git(&path, &["rm", "sensitive.txt"]);
+    lab.git(
+        &path,
+        &["commit", "-m", "Remove sensitive pointer from tip"],
+    );
+    let refs = lab.git(&path, &["show-ref"]);
+    let server = Server::start(
+        &lab,
+        vec![
+            Step::new(
+                "GET /api/agents/alice/qa",
+                Reply::Json(remote(&lab, "alice", AGENT_ID)),
+            ),
+            Step::new(
+                "GET /api/agents/alice/qa",
+                Reply::Json(remote(&lab, "alice", AGENT_ID)),
+            ),
+            Step::new(
+                "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                Reply::Status(200),
+            ),
+            Step::inspection_refs("alice/qa", AGENT_ID),
+            Step::inspection_refs("alice/qa", AGENT_ID),
+        ],
+    );
+    let output = lab.push("alice/qa", "human", false);
+    server.finish();
+    let message = assert_failure(&output, "human", 1);
+    assert!(
+        message.contains("unsupported Git LFS pointer version"),
+        "{message}"
+    );
+    assert_eq!(lab.git(&path, &["show-ref"]), refs);
+    lab.no_publication_requests();
 }
 
 fn rc_land(lab: &Lab, mode: &str, stage: &str) -> Output {

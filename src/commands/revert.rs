@@ -182,6 +182,7 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint("review the current branch again before applying its new remedy");
         return Ok(ExitCode::Precondition);
     }
+    super::privacy::require_native_edit(&read_repo, &head)?;
     let guarded_log = if args.expected_head.is_some() {
         match super::scan::freeze_review_log(&read_repo, &head) {
             Ok(proof) => Some(proof),
@@ -313,6 +314,7 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     let mut s = snap.clone();
+    s.committer_account = crate::infra::credentials::current_account()?;
     s.kind = meta::Kind::View;
     s.layout = meta::LayoutVersion::CURRENT;
     let snap_text = meta::to_text(&s)?;

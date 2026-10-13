@@ -13,7 +13,6 @@ pub(crate) struct Target {
     pub local_path: String,
     pub repository: String,
     pub repository_id: String,
-    pub encryption_enabled: bool,
 }
 
 impl Target {
@@ -24,7 +23,6 @@ impl Target {
             local_path: self.local_path.clone(),
             repository: self.repository.clone(),
             repository_id: self.repository_id.clone(),
-            encryption_enabled: self.encryption_enabled,
         }
     }
 }

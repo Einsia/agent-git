@@ -337,15 +337,28 @@ impl FrozenPublication {
         self.push_refs_confirmed(None)
     }
 
-    pub(super) fn privacy_policy(
+    pub(super) fn session_privacy_policy(
         &self,
         policy_digest: &str,
-        recipient: &str,
+        manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
     ) -> Result<crate::hub::privacy::publication::PublicationPolicy> {
+        manifest.validate()?;
+        let declared = manifest
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.commit())
+            .chain(manifest.preserved_commits.iter().map(String::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        let captured = self
+            .plan
+            .commit_objects()
+            .iter()
+            .map(String::as_str)
+            .collect();
         ensure!(
-            self.lfs_inventory.is_empty(),
-            "session publication cannot carry LFS payloads"
+            declared == captured && manifest.repository_id == self.identity.agent_id,
+            "session manifest differs from the inspected publication"
         );
         self.verify_privacy_ref_updates()?;
         let client = self
@@ -358,12 +371,12 @@ impl FrozenPublication {
             .strip_prefix(&format!("{}/", self.identity.hub))
             .and_then(|url| url.strip_suffix(".git"))
             .context("publication destination is not a repository URL")?;
-        crate::hub::privacy::publication::PublicationPolicy::register(
+        crate::hub::privacy::publication::PublicationPolicy::register_sessions(
             client,
             repository,
-            &self.identity.agent_id,
+            &self.identity,
             policy_digest,
-            recipient,
+            manifest,
             visibility,
         )
     }

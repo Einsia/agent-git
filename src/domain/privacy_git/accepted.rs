@@ -97,43 +97,6 @@ impl Ledger {
         self.branches.get(branch)?.accepted.get(source)
     }
 
-    pub fn inherited(
-        &self,
-        branch: &str,
-        source: &str,
-        policy: &PrivacyPolicy,
-    ) -> Result<Option<&Mapping>> {
-        if let Some(entry) = self.get(branch, source) {
-            return Ok(Some(entry));
-        }
-        let mut matches = self
-            .branches
-            .iter()
-            .filter_map(|(name, state)| state.accepted.get(source).map(|entry| (name, entry)));
-        let Some((origin, selected)) = matches.next() else {
-            return Ok(None);
-        };
-        let origins = std::iter::once((origin, selected)).chain(matches);
-        let target_restrictions = policy.branches.get(branch).cloned().unwrap_or_default();
-        let policy_digest = policy.digest()?;
-        for (origin, entry) in origins {
-            ensure!(
-                entry.public == selected.public
-                    && entry.source_parents == selected.source_parents
-                    && entry.public_parents == selected.public_parents
-                    && compatible_recipient(entry, selected),
-                "this ancestor has ambiguous accepted publications; continue from an explicit accepted public commit"
-            );
-            ensure!(
-                (entry.source == entry.public || entry.policy == policy_digest)
-                    && policy.branches.get(origin).cloned().unwrap_or_default()
-                        == target_restrictions,
-                "accepted ancestor has incompatible branch privacy restrictions; reconcile the policy before publishing the fork"
-            );
-        }
-        Ok(Some(selected))
-    }
-
     pub fn selected(&self, branch: Option<&str>, source: &str) -> Result<Option<&Mapping>> {
         if let Some(branch) = branch {
             return Ok(self.get(branch, source));
@@ -148,6 +111,29 @@ impl Ledger {
                 matches.all(|entry| entry.public == selected.public
                     && compatible_recipient(entry, selected)),
                 "this source has different accepted publications on multiple branches; select an explicit branch"
+            );
+        }
+        Ok(selected)
+    }
+
+    pub fn inherited_immutable(&self, branch: &str, source: &str) -> Result<Option<&Mapping>> {
+        if let Some(entry) = self.get(branch, source) {
+            return Ok(Some(entry));
+        }
+        let mut entries = self
+            .branches
+            .values()
+            .filter_map(|state| state.accepted.get(source));
+        let selected = entries.next();
+        if let Some(selected) = selected {
+            ensure!(
+                entries.all(|entry| entry.public == selected.public
+                    && entry.public_parents == selected.public_parents
+                    && entry.source_parents == selected.source_parents
+                    && entry.source_session == selected.source_session
+                    && entry.public_session == selected.public_session
+                    && compatible_recipient(entry, selected)),
+                "this source has ambiguous accepted publications; continue from an explicit public commit"
             );
         }
         Ok(selected)
@@ -176,8 +162,9 @@ impl Ledger {
         };
         ensure!(
             receipt.mode.is_encrypted()
-                && Some(entry.policy.as_str()) == receipt.policy_digest.as_deref()
-                && entry.recipient.as_deref() == receipt.recipient.as_deref(),
+                && ((Some(entry.policy.as_str()) == receipt.policy_digest.as_deref()
+                    && entry.recipient.as_deref() == receipt.recipient.as_deref())
+                    || (receipt.session_snapshot.is_some() && entry.source == entry.public)),
             "retained publication scope differs from its authenticated mapping"
         );
         Ok(Some(&entry.store))
@@ -200,29 +187,6 @@ impl Ledger {
             }
         }
         self.save()
-    }
-
-    pub fn verify_remote_prefix(
-        &self,
-        branch: &str,
-        remote_head: Option<&String>,
-        source_parents: &BTreeMap<String, Vec<String>>,
-    ) -> Result<()> {
-        let Some(head) = remote_head else {
-            return Ok(());
-        };
-        if source_parents.contains_key(head) {
-            return Ok(());
-        }
-        ensure!(
-            self.branches
-                .get(branch)
-                .is_some_and(|state| state.accepted.values().any(
-                    |entry| &entry.public == head && source_parents.contains_key(&entry.source)
-                )),
-            "{RECOVERY}"
-        );
-        Ok(())
     }
 
     pub fn prepare(&mut self, candidates: &BTreeMap<String, Candidate>) -> Result<()> {

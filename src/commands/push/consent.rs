@@ -1,8 +1,7 @@
-//! Unattended publication needs device-local consent for the current policy and destination.
+//! Project enrollment binds an account and destination; snapshots retain their own privacy modes.
 
-use crate::domain::privacy_receipt::PublicationMode;
 use crate::domain::repo::Repo;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write};
 
@@ -10,18 +9,12 @@ use std::{fs, io::Write};
 #[serde(deny_unknown_fields)]
 pub(crate) struct AutoConsent {
     pub version: u32,
-    #[serde(default, skip_serializing_if = "PublicationMode::is_encrypted")]
-    pub mode: PublicationMode,
     pub hub: String,
     pub account: String,
-    pub account_id: Option<String>,
+    pub account_id: String,
     pub agent_id: String,
     pub url: String,
     pub visibility: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
 }
 
 impl AutoConsent {
@@ -53,11 +46,23 @@ impl AutoConsent {
     }
 
     fn validate(&self) -> Result<()> {
-        self.mode.validate_bindings(
-            self.version,
-            self.policy_digest.as_deref(),
-            self.recipient.as_deref(),
-        )
+        ensure!(self.version == 3, "unsupported publication enrollment");
+        let identity = crate::hub::identity::RemoteIdentity::new(&self.hub, &self.agent_id)?;
+        ensure!(
+            identity.hub == self.hub && identity.agent_id == self.agent_id,
+            "noncanonical publication enrollment"
+        );
+        crate::domain::session_privacy::AccountIdentity::new(&self.hub, &self.account_id)?;
+        ensure!(
+            !self.account.is_empty() && matches!(self.visibility.as_str(), "public" | "private"),
+            "invalid publication enrollment"
+        );
+        let (hub, _) = super::super::privacy::sources::remote_scope(&self.url)?;
+        ensure!(
+            hub == self.hub,
+            "publication enrollment belongs to another Hub"
+        );
+        Ok(())
     }
 }
 
@@ -65,30 +70,32 @@ impl AutoConsent {
 mod tests {
     use super::*;
 
+    /// A saved enrollment cannot authorize another account, repository or audience.
     #[test]
-    fn consent_keeps_legacy_encrypted_bindings_and_separates_ordinary_destinations() {
-        let legacy = serde_json::json!({"version":1,"hub":"https://hub.example","account":"alice",
-            "account_id":"account-1","agent_id":"repository-1","url":"https://hub.example/alice/demo.git",
-            "visibility":"private","policy_digest":"policy","recipient":"recipient"});
-        let encrypted: AutoConsent = serde_json::from_value(legacy.clone()).unwrap();
+    fn enrollment_retains_the_exact_account_and_destination() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repo::init(dir.path()).unwrap();
-        encrypted.save(&repo).unwrap();
-        assert!(encrypted.matches(&repo).unwrap());
-        assert_eq!(serde_json::to_value(&encrypted).unwrap(), legacy);
-        let mut ordinary = AutoConsent {
-            version: 2,
-            mode: PublicationMode::Ordinary,
-            policy_digest: None,
-            recipient: None,
-            ..encrypted
+        let mut consent = AutoConsent {
+            version: 3,
+            hub: "https://hub.example".into(),
+            account: "alice".into(),
+            account_id: "account-1".into(),
+            agent_id: "00000000-0000-0000-0000-000000000001".into(),
+            url: "https://hub.example/alice/demo.git".into(),
+            visibility: "private".into(),
         };
-        assert!(!ordinary.matches(&repo).unwrap());
-        ordinary.save(&repo).unwrap();
-        assert!(ordinary.matches(&repo).unwrap());
-        ordinary.agent_id = "another-repository".into();
-        assert!(!ordinary.matches(&repo).unwrap());
-        ordinary.recipient = Some("invented-recipient".into());
-        assert!(ordinary.save(&repo).is_err());
+        assert!(!consent.matches(&repo).unwrap());
+        consent.save(&repo).unwrap();
+        assert!(consent.matches(&repo).unwrap());
+        consent.account_id = "account-2".into();
+        assert!(!consent.matches(&repo).unwrap());
+        consent.save(&repo).unwrap();
+        consent.agent_id = "00000000-0000-0000-0000-000000000002".into();
+        assert!(!consent.matches(&repo).unwrap());
+        consent.save(&repo).unwrap();
+        consent.visibility = "public".into();
+        assert!(!consent.matches(&repo).unwrap());
+        consent.hub = "https://other.example".into();
+        assert!(consent.save(&repo).is_err());
     }
 }

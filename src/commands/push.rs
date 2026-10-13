@@ -1,4 +1,4 @@
-//! Publish inspected history in the destination's fixed encryption mode.
+//! Publish inspected history using registered session privacy settings.
 //!
 //! Selected session branches retain their ancestry. Generated commits and version tags live
 //! in isolated storage so native Git metadata and source objects cannot enter the outgoing pack.
@@ -36,19 +36,15 @@ pub struct Args {
     #[arg(value_name = "owner/repo@branch")]
     pub agent: Option<String>,
 
-    /// Publish to a separate repository without rebinding the source; local RC retains its confirmed target.
+    /// Select the retained Hub publication target for a device-local RC repository.
     #[arg(long, value_name = "owner/repo")]
     pub to: Option<String>,
-
-    /// Publish a separate copy from local RC without replacing its confirmed publication target.
-    #[arg(long, requires = "to")]
-    pub separate: bool,
 
     /// Branch to publish (repeatable). Default: the context branch.
     #[arg(short = 'b', long, value_name = "branch")]
     pub branch: Vec<String>,
 
-    /// Publish every settled local branch; encrypted mode selects session branches only.
+    /// Publish every settled local branch using its registered session settings.
     #[arg(long, conflicts_with = "branch")]
     pub all: bool,
 
@@ -64,11 +60,6 @@ pub struct Args {
     /// First publish only: anyone can read the published content.
     #[arg(long)]
     pub public: bool,
-
-    /// Encryption for a new destination (omitted: ordinary publication unless a creation
-    /// preference selects encryption); an existing repository's mode is fixed.
-    #[arg(long, require_equals = true, value_name = "true|false")]
-    pub encryption: Option<bool>,
 
     /// Compatibility flag for older servers; local privacy never requires approval.
     #[arg(long)]
@@ -239,15 +230,6 @@ pub fn run(mut args: Args) -> CmdResult {
             return Ok(r.code);
         }
     };
-    let selection_source = match (
-        args.agent.is_some(),
-        !explicit_branches.is_empty() || args.all,
-    ) {
-        (true, false) if ctx_branch.is_some() => super::echo::Source::Mixed,
-        (true, _) => super::echo::Source::Explicit,
-        (false, true) => super::echo::Source::Mixed,
-        (false, false) => super::echo::Source::Environment,
-    };
     // A branch that was born but has not settled a single turn is not published. See
     // [`has_settled_turns`].
     //
@@ -286,15 +268,7 @@ pub fn run(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    audited_push::run(
-        &args,
-        client,
-        &me,
-        checkout,
-        repo,
-        &branches,
-        selection_source,
-    )
+    audited_push::run(&args, client, &me, checkout, repo, &branches)
 }
 
 /// Normalize the unified human-facing target.  The old bare repo spelling is
@@ -499,154 +473,6 @@ struct Remote {
     identity: RemoteIdentity,
     /// Visibility as the server records it: `public` or `private`.
     visibility: String,
-    encryption_enabled: bool,
-    /// A first-publication target is verified against the requested visibility before pinning.
-    first_publish: bool,
-}
-
-#[derive(Debug)]
-pub(super) struct FirstPublicationRefusal;
-
-impl std::fmt::Display for FirstPublicationRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("the first-publication destination could not be confirmed")
-    }
-}
-
-impl std::error::Error for FirstPublicationRefusal {}
-
-struct RemotePreparation {
-    pin_identity: bool,
-    own_namespace: Option<bool>,
-    encryption_enabled: bool,
-}
-
-fn ensure_remote_with_options(
-    client: &crate::hub::Client,
-    owner: &str,
-    agent: &str,
-    want: Option<bool>,
-    snap: &meta::Meta,
-    repo: &Repo,
-    preparation: RemotePreparation,
-) -> crate::Result<Remote> {
-    let expected = identity::expected_for_transport(repo, client.base())?;
-    match super::remote_request(client.get_agent(owner, agent)) {
-        Ok(remote) => {
-            let encryption_enabled = remote.require_encryption_enabled()?;
-            anyhow::ensure!(
-                encryption_enabled == preparation.encryption_enabled,
-                "repository encryption mode is fixed at creation; create a different repository for the requested mode"
-            );
-            let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
-            identity::verify_transport_target(repo, &observed)?;
-            return Ok(Remote {
-                owner: remote.owner,
-                name: remote.name,
-                push_url: remote.clone_url,
-                identity: observed,
-                visibility: remote.visibility,
-                encryption_enabled,
-                first_publish: false,
-            });
-        }
-        Err(e)
-            if e.downcast_ref::<crate::hub::client::ApiError>()
-                .is_some_and(|api| api.status == 404) =>
-        {
-            if expected.is_some() || (preparation.pin_identity && identity::read(repo)?.is_some()) {
-                return Err(
-                    e.context("the RC remote is unavailable; refusing to create a replacement")
-                );
-            }
-        }
-        Err(e) => return Err(e),
-    }
-
-    // Visibility is chosen only for creation; the namespace cannot override a private choice.
-    let mine = preparation
-        .own_namespace
-        .unwrap_or_else(|| crate::infra::credentials::current_user().as_deref() == Some(owner));
-    let public = match want {
-        Some(value) => value,
-        None => first_visibility(None, ask_visibility(agent)?),
-    };
-    // The repo origin lets the server look up "which agents have worked in this repo".
-    let origins: Vec<String> = snap
-        .code
-        .as_deref()
-        .and_then(code_origin)
-        .into_iter()
-        .collect();
-
-    ui::info(format_args!(
-        "publishing {} to {}…",
-        ui::bold(agent),
-        ui::accent(client.base())
-    ));
-    // An organization repo names the organization to create it under; your own passes nothing,
-    // and the server defaults to the caller.
-    let resp = super::remote_request(client.publish(&PublishRequest {
-        name: agent.to_string(),
-        owner: (!mine).then(|| owner.to_string()),
-        public,
-        encryption_enabled: preparation.encryption_enabled,
-        repo_origins: origins,
-    }))?;
-    let remote_identity = RemoteIdentity::new(client.base(), &resp.agent_id)?;
-    let observed = super::remote_request(client.get_agent(owner, agent))?;
-    let encryption_enabled = observed.require_encryption_enabled()?;
-    anyhow::ensure!(
-        encryption_enabled == preparation.encryption_enabled,
-        "repository encryption mode is fixed at creation; create a different repository for the requested mode"
-    );
-    anyhow::ensure!(
-        resp.push_url == observed.clone_url
-            && observed.clone_url == format!("{}/{owner}/{agent}.git", remote_identity.hub),
-        "created repository URL differs from the confirmed destination"
-    );
-    // A creation response may name a concurrently created repository. Its current audience and
-    // immutable identity must agree with this publication before any identity pin or upload.
-    if resp.owner != owner
-        || resp.name != agent
-        || observed.owner != owner
-        || observed.name != agent
-        || observed.agent_id != remote_identity.agent_id
-    {
-        return Err(anyhow::anyhow!(
-            "{owner}/{agent} changed identity while preparing its first publication; nothing was uploaded"
-        )
-        .context(FirstPublicationRefusal));
-    }
-    if observed.visibility != visibility_word(public) {
-        return Err(anyhow::anyhow!(
-            "{owner}/{agent} is {} on the Hub, but this first publication requested {}; nothing was uploaded",
-            observed.visibility,
-            visibility_word(public)
-        )
-        .context(FirstPublicationRefusal));
-    }
-    // Retained pins belong to supervised work and cannot be rewritten by an ordinary push.
-    if preparation.pin_identity && matches!(identity::read(repo), Ok(None)) {
-        write_checkout_config(&format!("{owner}/{agent}"), || {
-            identity::pin(repo, &remote_identity)
-        })?;
-    }
-    Ok(Remote {
-        owner: observed.owner,
-        name: observed.name,
-        push_url: observed.clone_url,
-        identity: remote_identity,
-        visibility: observed.visibility,
-        encryption_enabled,
-        first_publish: true,
-    })
-}
-
-/// The human-facing spelling of visibility. Another level from the server (organization-visible,
-/// say) passes through unchanged rather than being guessed at.
-fn visibility_label(visibility: &str) -> &str {
-    visibility
 }
 
 /// What to tell the user when this cannot go on.
@@ -832,15 +658,6 @@ pub(crate) fn push_tags_for_test(
     push_tags(repo, tags, identity, allow_secrets)
 }
 
-/// Recover the origin from `<origin>@<short-sha>`.
-///
-/// Split from the right: an origin holds an `@` itself (`git@github.com:o/r.git` is the most
-/// common form).
-fn code_origin(code: &str) -> Option<String> {
-    let (origin, _) = code.rsplit_once('@')?;
-    (!origin.is_empty()).then(|| origin.to_string())
-}
-
 #[cfg(test)]
 mod publication_tests;
 
@@ -900,8 +717,6 @@ mod tests {
     #[test]
     fn visibility_flags_are_read_from_the_args() {
         let base = || Args {
-            separate: false,
-            encryption: None,
             to: None,
             agent: None,
             branch: vec![],
@@ -971,15 +786,6 @@ mod tests {
         );
         assert_eq!(Wanted::Ask.value(), None);
         assert_eq!(Wanted::Repo(false).value(), Some(false));
-    }
-
-    #[test]
-    fn visibility_labels_are_not_guessed() {
-        assert_eq!(visibility_label("public"), "public");
-        assert_eq!(visibility_label("private"), "private");
-        // Another level from the server passes through unchanged instead of being folded into
-        // "private".
-        assert_eq!(visibility_label("internal"), "internal");
     }
 
     /// The positional argument accepts the spelling its own ambiguity hint asks for.
@@ -1074,20 +880,6 @@ mod tests {
         got.sort();
         assert_eq!(got, ["ghost", "main", "refund-fix"]);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn code_origin_splits_from_the_right() {
-        // An ssh-form origin holds an `@` itself; splitting from the left yields "git".
-        assert_eq!(
-            code_origin("git@github.com:nana/OpenPad.git@1839e61").as_deref(),
-            Some("git@github.com:nana/OpenPad.git")
-        );
-        assert_eq!(
-            code_origin("https://github.com/nana/x.git@abc1234").as_deref(),
-            Some("https://github.com/nana/x.git")
-        );
-        assert!(code_origin("no-at-sign").is_none());
     }
 
     /// The test for "can this be pushed at all".

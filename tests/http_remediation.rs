@@ -1583,7 +1583,7 @@ mod unix {
                         target: "/api/agents/me/qa".into(),
                         bearer: Some(OLD_ACCESS),
                         status: 200,
-                        response: json!({"agent_id":"22222222-2222-4222-8222-222222222222", "owner":"me", "name":"qa", "visibility":"private", "encryption_enabled":false, "clone_url":format!("{base}/me/qa.git")}),
+                        response: json!({"agent_id":"22222222-2222-4222-8222-222222222222", "owner":"me", "name":"qa", "visibility":"private", "clone_url":format!("{base}/me/qa.git")}),
                         after_response: None,
                     }]
                 }

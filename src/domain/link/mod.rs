@@ -97,6 +97,8 @@ pub struct Link {
     /// Local evidence for the "one branch, one session" invariant: settle uses it to find the
     /// branch to advance.
     pub branch: Option<String>,
+    /// First-import ownership survives account changes before a branch snapshot exists.
+    pub session_privacy: Option<super::session_privacy::SessionPrivacy>,
     /// Byte boundary of a VIEW installed into a runtime. Appends are read after this boundary;
     /// reminted runtime identifiers cannot be compared to the original committed envelopes.
     pub baseline_bytes: Option<u64>,
@@ -149,6 +151,8 @@ struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_privacy: Option<super::session_privacy::SessionPrivacy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_hash: Option<String>,
@@ -182,6 +186,7 @@ impl Link {
             agent: None,
             owner: None,
             branch: None,
+            session_privacy: None,
             baseline_bytes: None,
             baseline_hash: None,
             native_checkpoint: None,
@@ -203,7 +208,7 @@ impl Link {
         );
         let body: Body = serde_json::from_slice(bytes).context("invalid session link fields")?;
         let link = from_body(source.to_owned(), session_id.to_owned(), body);
-        link.validate_native_binding()?;
+        link.validate()?;
         Ok(link)
     }
 
@@ -214,6 +219,7 @@ impl Link {
             agent: self.agent.clone(),
             owner: self.owner.clone(),
             branch: self.branch.clone(),
+            session_privacy: self.session_privacy.clone(),
             baseline_bytes: self.baseline_bytes,
             baseline_hash: self.baseline_hash.clone(),
             native_checkpoint: self
@@ -271,8 +277,16 @@ impl Link {
 
     /// The on-disk JSON. Shared by the tests and `write`, so what you see is what is written.
     pub fn to_json(&self) -> Result<String> {
-        self.validate_native_binding()?;
+        self.validate()?;
         Ok(serde_json::to_string_pretty(&self.body())?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_native_binding()?;
+        if let Some(privacy) = &self.session_privacy {
+            privacy.validate()?;
+        }
+        Ok(())
     }
 
     /// Look up the real transcript file.
@@ -377,7 +391,7 @@ fn open_lock_file(dir: &Path, path: &Path) -> Result<std::fs::File> {
 }
 
 pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
-    link.validate_native_binding()?;
+    link.validate()?;
     let dir = store.root().join(&link.source);
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
@@ -496,7 +510,7 @@ pub(crate) fn parse_archive_link_image(
     crate::domain::metadata_facts::JsonFacts::parse(&json)?;
     let body: Body = serde_json::from_str(&json).context("archive Link image is unreadable")?;
     let link = from_body(source.to_owned(), session_id.to_owned(), body);
-    link.validate_native_binding()?;
+    link.validate()?;
     Ok(ArchiveLinkSnapshot { link, json })
 }
 
@@ -560,6 +574,7 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         agent: body.agent,
         owner: body.owner,
         branch: body.branch,
+        session_privacy: body.session_privacy,
         baseline_bytes: body.baseline_bytes,
         baseline_hash: body.baseline_hash,
         native_checkpoint: body
@@ -587,7 +602,7 @@ fn link_from_body(path: &Path, body: Body) -> Option<Link> {
     let source = path.parent()?.file_name()?.to_str()?.to_string();
     let session_id = path.file_stem()?.to_str()?.to_string();
     let link = from_body(source, session_id, body);
-    link.validate_native_binding().ok()?;
+    link.validate().ok()?;
     Some(link)
 }
 

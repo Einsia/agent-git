@@ -101,6 +101,10 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Policy);
     }
 
+    let head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
+    let head = head.trim().to_string();
+    super::privacy::require_native_edit(&repo, &head)?;
+
     // Gather the envelope lines to pick.
     let mut lines: Vec<String> = vec![];
     let mut selections =
@@ -119,8 +123,6 @@ pub fn run(args: Args) -> CmdResult {
     // VIEW. snapshot_files encodes the full envelope into an id sequence plus events/ objects,
     // so a cross-repo source never depends on a blob that happens to already sit in the target
     // object database.
-    let head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
-    let head = head.trim().to_string();
     let Some(snap) = meta::read_at_ref(&repo, &head) else {
         ui::error(&format!(
             "`{target}` carries no {} — its line was never declared.",
@@ -140,6 +142,7 @@ pub fn run(args: Args) -> CmdResult {
     let (log, view) = picked_snapshot(log, view, &lines, &snap.runtime, &snap.session, &what)?;
 
     let mut s = snap.clone();
+    s.committer_account = crate::infra::credentials::current_account()?;
     s.kind = meta::Kind::View;
     s.layout = meta::LayoutVersion::CURRENT;
     let snap_text = meta::to_text(&s)?;

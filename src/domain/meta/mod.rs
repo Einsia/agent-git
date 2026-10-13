@@ -372,6 +372,15 @@ pub struct Meta {
     /// `hash(cwd + transcript bytes)`, and there is no transcript yet.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session: String,
+    /// Absence identifies unregistered legacy metadata; only registration selects cloud mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_privacy: Option<super::session_privacy::SessionPrivacy>,
+    /// The active account at settlement, independent of the pusher and projected Git headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committer_account: Option<super::session_privacy::AccountIdentity>,
+    /// Independent forks retain which exact source context was copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_origin: Option<super::session_privacy::ForkOrigin>,
     /// The runtime that produced this session: `codex` / `claude-code`.
     ///
     /// Required once a session line has claimed an identity: the envelope's `_source` and VIEW
@@ -429,6 +438,9 @@ impl Meta {
             layout: LayoutVersion::CURRENT,
             line: Line::Session,
             session,
+            session_privacy: None,
+            committer_account: None,
+            fork_origin: None,
             runtime,
             cwd,
             code: None,
@@ -444,17 +456,8 @@ impl Meta {
         }
     }
 
-    /// The **birth** meta of a session line: the shape is fixed on the spot, the identity is left
-    /// to the first turn commit.
-    ///
-    /// import / fork / new / run write it when they create the branch. The identity cannot be
-    /// computed yet (`session_hash` needs transcript bytes, and a branch is born before its first
-    /// settlement), but the shape has to be fixed now — otherwise the decision falls back to
-    /// inferring it from which files exist.
-    ///
-    /// `kind` is `File` rather than the default `Turn`: a birth commit holds not one word of
-    /// conversation, and marking it a turn makes `agit log` display a settlement that never
-    /// happened.
+    /// An unclaimed session declaration awaits its first settled logical identity.
+    /// Its file kind keeps the empty declaration out of the conversation's turn timeline.
     pub fn new_session_line(runtime: String, cwd: String) -> Self {
         Meta {
             runtime,
@@ -591,6 +594,23 @@ fn ensure_real_directory(path: &Path, create_if_missing: bool) -> Result<()> {
 /// The meta invariants. Both the write-to-disk path and the tree-building (plumbing) path go
 /// through here.
 pub fn validate(meta: &Meta) -> Result<()> {
+    if let Some(privacy) = &meta.session_privacy {
+        anyhow::ensure!(
+            meta.is_session_line(),
+            "file lines cannot own session privacy"
+        );
+        privacy.validate()?;
+    }
+    if let Some(committer) = &meta.committer_account {
+        committer.validate()?;
+    }
+    if let Some(origin) = &meta.fork_origin {
+        anyhow::ensure!(
+            meta.is_session_line(),
+            "file lines cannot carry fork context"
+        );
+        origin.validate()?;
+    }
     if meta.kind == Kind::Archive {
         anyhow::ensure!(
             meta.is_session_line() && !meta.session.is_empty() && meta.layout == LayoutVersion::V1,

@@ -3593,6 +3593,40 @@ pub fn tree_overlay_worktree(repo: &Repo, base_treeish: &str, paths: &[String]) 
     result
 }
 
+/// Retaining a snapshot's contents does not retain its previous writer's account.
+pub(crate) fn tree_with_current_committer(repo: &Repo, tree: &str) -> Result<String> {
+    use crate::domain::metadata_facts::JsonFacts;
+    let Some(text) = regular_blob_text_at(repo, tree, meta::FILE)? else {
+        return Ok(tree.to_owned());
+    };
+    let mut facts = JsonFacts::parse(&text)?;
+    let JsonFacts::Object(fields) = &mut facts else {
+        anyhow::bail!("authored session metadata must be an object");
+    };
+    let account = crate::infra::credentials::current_account()?
+        .map(|account| JsonFacts::parse(&serde_json::to_string(&account)?))
+        .transpose()?;
+    if fields.get("committer_account") == account.as_ref() {
+        return Ok(tree.to_owned());
+    }
+    match account {
+        Some(account) => {
+            fields.insert("committer_account".into(), account);
+        }
+        None => {
+            fields.remove("committer_account");
+        }
+    }
+    let mut updated = String::new();
+    facts.write_json(&mut updated)?;
+    updated.push('\n');
+    tree_apply_owned(
+        repo,
+        tree,
+        vec![(meta::FILE.into(), Some(updated.into_bytes()))],
+    )
+}
+
 /// Build a commit from a tree (one parent, or two for a merge) without touching any ref.
 pub fn commit_tree(repo: &Repo, tree: &str, parents: &[&str], message: &str) -> Result<String> {
     // plumbing does not go through Repo::commit and must supply the fallback committer

@@ -187,6 +187,7 @@ pub fn run(args: Args) -> CmdResult {
             // may be checked out right now.
             let head = repo.git(&["rev-parse", &format!("refs/heads/{name}")])?;
             let head = head.trim().to_string();
+            super::privacy::require_native_edit(&repo, &head)?;
             let blob = raw_git(
                 &repo,
                 &["hash-object", "-w", "--stdin"],
@@ -195,6 +196,7 @@ pub fn run(args: Args) -> CmdResult {
                 ),
             )?;
             let new_tree = with_temp_index(&repo, &head, blob.trim())?;
+            let new_tree = super::plumbing::tree_with_current_committer(&repo, new_tree.trim())?;
             let commit = raw_git(
                 &repo,
                 &[

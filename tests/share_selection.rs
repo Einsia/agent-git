@@ -2,16 +2,14 @@
 
 #![cfg(unix)]
 
-use agit::domain::privacy_envelope::PrivacyEnvelope;
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
-use crypto_box::SecretKey;
 use serde_json::{Value, json};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -25,7 +23,6 @@ struct Hub {
     requests: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    rotate_key: Arc<AtomicBool>,
     legacy: Arc<AtomicBool>,
 }
 
@@ -38,13 +35,10 @@ impl Hub {
         let captured = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
-        let rotate_key = Arc::new(AtomicBool::new(false));
-        let rotation = rotate_key.clone();
         let legacy = Arc::new(AtomicBool::new(false));
         let old_protocol = legacy.clone();
         let policy_hub = url.clone();
         let worker = std::thread::spawn(move || {
-            let key_reads = AtomicUsize::new(0);
             while !stopping.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -94,33 +88,6 @@ impl Hub {
                                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                                 break None;
                             }
-                            if target.starts_with("/api/agents/me/paper/privacy/keys/") {
-                                let (recipient, commit) = target
-                                    .strip_prefix("/api/agents/me/paper/privacy/keys/")
-                                    .unwrap()
-                                    .split_once("?ref=")
-                                    .unwrap();
-                                let fixture: Value = serde_json::from_str(include_str!(
-                                    "fixtures/privacy-web-key.json"
-                                ))
-                                .unwrap();
-                                let mut record = fixture["record"].clone();
-                                use base64::Engine;
-                                let public = base64::engine::general_purpose::STANDARD
-                                    .encode(SecretKey::from([31; 32]).public_key().as_bytes());
-                                record["public_key"] = json!(public);
-                                record["recipient"] =
-                                    json!(agit::domain::privacy_key::recipient_id(&public));
-                                assert_eq!(recipient, record["recipient"].as_str().unwrap());
-                                if key_reads.fetch_add(1, Ordering::SeqCst) > 0
-                                    && rotation.load(Ordering::SeqCst)
-                                {
-                                    record["recipient"] = json!("changed-recipient");
-                                }
-                                let body = json!({"agent_id":"00000000-0000-0000-0000-000000000001","commit":commit,"session_id":format!("agit-{}","b".repeat(40)),"key":record}).to_string();
-                                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                                break None;
-                            }
                             assert!(header.starts_with("POST /api/shares/privacy "));
                             if old_protocol.load(Ordering::SeqCst) {
                                 write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
@@ -155,7 +122,6 @@ impl Hub {
             requests,
             stop,
             worker: Some(worker),
-            rotate_key,
             legacy,
         }
     }
@@ -193,7 +159,7 @@ mod privacy_input_budget;
 mod startup_cache;
 
 #[test]
-fn shared_text_fixture_preserves_public_text_and_recovers_selected_originals() {
+fn public_and_encrypted_shares_contain_the_same_sanitized_records() {
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
     use agit::domain::privacy::PrivacyPolicy;
     use base64::Engine;
@@ -224,7 +190,6 @@ fn shared_text_fixture_preserves_public_text_and_recovers_selected_originals() {
     let public: Value = serde_json::from_str(request["payload"].as_str().unwrap()).unwrap();
     publication_text::assert_public(&public, f.home());
 
-    f.accept_current();
     let output = f.success(&["me/paper@chosen"], None);
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -247,12 +212,8 @@ fn shared_text_fixture_preserves_public_text_and_recovers_selected_originals() {
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
         .unwrap();
-    let envelope = PrivacyEnvelope::parse(&plaintext).unwrap();
-    assert_eq!(envelope.public_projection, public);
-    let recovered = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
-    let (original_log, original_view) = recovered.session_bytes().unwrap();
-    assert_eq!(original_log.as_str(), log);
-    assert_eq!(original_view.as_str(), log);
+    let encrypted_public: Value = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(encrypted_public, public);
 }
 
 #[test]
@@ -336,57 +297,6 @@ impl Fixture {
             repo,
             sha,
         }
-    }
-
-    fn accept_current(&self) {
-        use base64::Engine;
-        let branch = self.repo.current_branch().unwrap();
-        let log = storage::materialize_at(self.repo.root(), "HEAD", meta::LOG_FILE).unwrap();
-        let view = storage::materialize_at(self.repo.root(), "HEAD", meta::VIEW_FILE).unwrap();
-        let metadata = meta::read(self.repo.root()).unwrap();
-        let key = SecretKey::from([31; 32]);
-        let public = base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes());
-        let layer = agit::domain::privacy_layer::PrivateLayer::new(
-            &log,
-            &view,
-            serde_json::to_value(&metadata).unwrap(),
-            Default::default(),
-        )
-        .unwrap();
-        let envelope = PrivacyEnvelope::seal_layer(
-            agit::domain::privacy_envelope::digest_bytes(b"policy"),
-            agit::domain::privacy_envelope::digest_bytes(b"snapshot"),
-            json!({"metadata":{"session":metadata.session}}),
-            &layer,
-            &agit::domain::privacy_envelope::ViewingRecipient::from_base64(
-                agit::domain::privacy_key::recipient_id(&public),
-                &public,
-            )
-            .unwrap(),
-            vec![],
-        )
-        .unwrap();
-        std::fs::create_dir_all(self.repo.root().join("privacy")).unwrap();
-        std::fs::write(
-            self.repo.root().join("privacy/envelope.json"),
-            serde_json::to_vec(&envelope).unwrap(),
-        )
-        .unwrap();
-        self.repo.add_all().unwrap();
-        self.repo.commit("Accepted publication fixture").unwrap();
-        self.repo
-            .set_remote(&format!("{}/me/paper.git", self.hub.url))
-            .unwrap();
-        agit::hub::identity::pin(
-            &self.repo,
-            &agit::hub::identity::RemoteIdentity::new(
-                &self.hub.url,
-                "00000000-0000-0000-0000-000000000001",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(self.repo.current_branch().unwrap(), branch);
     }
 
     fn home(&self) -> &Path {
@@ -613,14 +523,11 @@ fn encrypted_shares_keep_the_key_out_of_the_request_and_preserve_limits() {
     use base64::Engine;
     let f = Fixture::new("EXCLUDED-LOG");
     f.repo.git(&["checkout", "chosen"]).unwrap();
-    f.accept_current();
     let output = f.success(
         &["me/paper@chosen", "--expire", "24h", "--views", "3"],
         None,
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("recover the selected original records")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("original records are not included"));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let key = stdout
         .split("#k=")
@@ -645,116 +552,18 @@ fn encrypted_shares_keep_the_key_out_of_the_request_and_preserve_limits() {
     )
     .unwrap();
     assert_eq!(request["format_version"], 2);
-    let envelope = PrivacyEnvelope::parse(plaintext.as_bytes()).unwrap();
-    assert_eq!(envelope.public_projection["kind"], "share");
-    let visible = f
-        .repo
-        .show_result(&f.sha, meta::VIEW_FILE)
-        .unwrap()
-        .unwrap();
-    let recovered = envelope.open_layer(&SecretKey::from([31; 32])).unwrap();
-    let (private_log, private_view) = recovered.session_bytes().unwrap();
-    assert_eq!(private_log.as_str(), visible);
-    assert_eq!(private_view.as_str(), visible);
-    assert!(
-        !serde_json::to_string(&recovered)
-            .unwrap()
-            .contains("EXCLUDED-LOG")
-    );
-    assert!(envelope.open_layer(&SecretKey::from([32; 32])).is_err());
+    let public: Value = serde_json::from_str(&plaintext).unwrap();
+    assert_eq!(public["kind"], "share");
     assert!(plaintext.contains("VISIBLE-SAVED"));
     assert!(!plaintext.contains("EXCLUDED-LOG"));
-    let mut tampered = envelope;
-    tampered.public_projection["presentation"] = json!("changed presentation");
-    assert!(tampered.open_layer(&SecretKey::from([31; 32])).is_err());
     assert!(stdout.contains("VIEW of me/paper@"));
 }
 
 #[test]
-fn privacy_shares_refuse_recipient_drift_and_do_not_fall_back_to_legacy_writes() {
+fn shares_require_the_versioned_privacy_endpoint() {
     let f = Fixture::new("EXCLUDED-LOG");
-    f.repo.git(&["checkout", "chosen"]).unwrap();
-    f.accept_current();
-    let exported = f.run_command(
-        "export",
-        &["me/paper@chosen", "--format", "privacy-envelope"],
-        None,
-    );
-    assert!(exported.status.success(), "{exported:?}");
-    let exported = PrivacyEnvelope::parse(&exported.stdout).unwrap();
-    let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/privacy-repository-key.json")).unwrap();
-    let record: agit::domain::privacy_key::KeyRecord =
-        serde_json::from_value(fixture["record"].clone()).unwrap();
-    let private = record
-        .unlock(&zeroize::Zeroizing::new(
-            fixture["password"].as_str().unwrap().into(),
-        ))
-        .unwrap();
-    assert!(
-        exported
-            .open_layer(&SecretKey::from_slice(private.as_ref()).unwrap())
-            .is_ok()
-    );
-    let f = Fixture::new("EXCLUDED-LOG");
-    f.repo.git(&["checkout", "chosen"]).unwrap();
-    f.accept_current();
-    f.hub.rotate_key.store(true, Ordering::SeqCst);
-    let output = f.run(&["me/paper@chosen"], None);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("does not match the selected publication")
-    );
-    assert!(f.hub.payloads().is_empty());
-    let f = Fixture::new("EXCLUDED-LOG");
-    f.repo.git(&["checkout", "chosen"]).unwrap();
-    f.accept_current();
     f.hub.legacy.store(true, Ordering::SeqCst);
     f.refuse_without_upload(&["me/paper@chosen"], None);
-}
-
-#[test]
-fn unbound_live_encrypted_shares_refuse_before_upload() {
-    let f = Fixture::new("EXCLUDED-LOG");
-    f.native("unbound-native");
-    let output = f.run(&["unbound-native"], None);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("standalone encrypted sharing"),
-        "{output:?}"
-    );
-    assert!(f.hub.payloads().is_empty());
-}
-
-#[test]
-fn privacy_exports_preserve_output_when_the_recipient_changes() {
-    let f = Fixture::new("EXCLUDED-LOG");
-    f.repo.git(&["checkout", "chosen"]).unwrap();
-    f.accept_current();
-    let output_path = f.home().join("export.json");
-    std::fs::write(&output_path, "UNCHANGED_OUTPUT").unwrap();
-    f.hub.rotate_key.store(true, Ordering::SeqCst);
-    let result = f.run_command(
-        "export",
-        &[
-            "me/paper@chosen",
-            "--format",
-            "privacy-envelope",
-            "--out",
-            output_path.to_str().unwrap(),
-        ],
-        None,
-    );
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("does not match the selected publication"),
-        "{result:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(output_path).unwrap(),
-        "UNCHANGED_OUTPUT"
-    );
-    assert!(f.hub.payloads().is_empty());
 }
 
 #[test]

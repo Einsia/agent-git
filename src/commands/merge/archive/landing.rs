@@ -393,6 +393,11 @@ fn land_with_resolved(
     );
     require_selection_graph(request.repo)?;
     require_selection_graph(request.source_repo)?;
+    merge::require_merge_input(request.repo, &role.origin_head)?;
+    merge::require_merge_input(request.source_repo, &binding.source.head)?;
+    if let Some(target) = &binding.file_target {
+        merge::require_merge_input(request.repo, &target.head)?;
+    }
     archive_history::verify_archive_append_target(
         request.repo,
         &role.origin_head,
@@ -489,6 +494,7 @@ fn land_with_resolved(
                 "--verify",
                 &format!("{}^{{tree}}", role.origin_head),
             ])?;
+            let tree = plumbing::tree_with_current_committer(request.repo, tree.trim())?;
             let commit = plumbing::commit_tree(
                 request.repo,
                 &tree,
@@ -595,6 +601,10 @@ fn verify_publication(repo: &Repo, journal: &ArchiveJournal) -> Result<usize> {
         .landing
         .as_ref()
         .context("retained ordinary merge result is missing")?;
+    merge::require_merge_input(repo, &publication.candidate)?;
+    if let Some(main) = &landing.file_commit {
+        merge::require_merge_input(repo, main)?;
+    }
     ensure!(
         publication.kind
             == (ArchivePublicationKind::MergeLanding {

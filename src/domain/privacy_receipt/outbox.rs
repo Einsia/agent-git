@@ -153,10 +153,6 @@ impl Entry {
             .or(saved.prepared.as_ref())
             .context("publication has no generated candidate")?;
         ensure!(
-            !publication.mode.is_encrypted() || publication.source != publication.published,
-            "private source commits cannot be notified"
-        );
-        ensure!(
             publication.destination.hub == executor.owner.issuer,
             "publication executor belongs to another Hub"
         );
@@ -387,9 +383,7 @@ impl Entry {
                     && notification.branch == publication.branch
                     && notification.public_commit == publication.published
                     && publication.projected_session_id.as_ref()
-                        == Some(&notification.projected_session_id)
-                    && (!publication.mode.is_encrypted()
-                        || notification.public_commit != publication.source),
+                        == Some(&notification.projected_session_id),
                 "notification differs from the saved publication"
             );
         }
@@ -508,7 +502,9 @@ mod tests {
     /// Advancing a branch cannot erase an older notification or give its ID different content.
     #[test]
     fn publication_outbox_retains_history_and_refuses_conflicting_evidence() {
-        publication_outbox_lifecycle(crate::domain::privacy_receipt::PublicationMode::Encrypted);
+        publication_outbox_lifecycle(
+            crate::domain::privacy_receipt::PublicationMode::SessionOwnerV2,
+        );
     }
 
     #[test]
@@ -541,8 +537,16 @@ mod tests {
             notification_id: None,
         };
         let first = Entry::begin(&repo, &mut request, capture.clone()).unwrap();
-        let receipt = PublicationReceipt {
-            version: if mode.is_encrypted() { 1 } else { 2 },
+        let bind_snapshot = |receipt: PublicationReceipt| {
+            if mode.is_encrypted() {
+                crate::domain::privacy_receipt::bind_session_fixture(receipt)
+            } else {
+                receipt
+            }
+        };
+        let receipt = bind_snapshot(PublicationReceipt {
+            session_snapshot: None,
+            version: if mode.is_encrypted() { 3 } else { 2 },
             mode,
             repository: request.repository.clone(),
             branch: request.branch.clone(),
@@ -557,7 +561,7 @@ mod tests {
             url: "https://hub.example/owner/project.git".into(),
             policy_digest: mode.is_encrypted().then(|| "policy".into()),
             recipient: mode.is_encrypted().then(|| "recipient".into()),
-        };
+        });
         Entry::prepare(&repo, &request, &receipt).unwrap();
         let interrupted = Entry::load(&repo, &request).unwrap().unwrap();
         assert_eq!(interrupted.prepared.as_ref(), Some(&receipt));
@@ -625,7 +629,7 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].notification_id, second.notification_id);
 
-        let next_receipt = PublicationReceipt {
+        let next_receipt = bind_snapshot(PublicationReceipt {
             source: next.source.clone(),
             published: if mode.is_encrypted() {
                 "d".repeat(40)
@@ -633,7 +637,7 @@ mod tests {
                 next.source.clone()
             },
             ..receipt.clone()
-        };
+        });
         Entry::prepare(&repo, &next, &next_receipt).unwrap();
         let source = crate::protocol::NativeSourceRef {
             source_id: "registered-source".into(),

@@ -1,9 +1,73 @@
-//! Parse repository locations for viewing-key authentication.
+//! Parse repository locations for original-access authentication.
 
-use crate::hub::identity;
+use crate::domain::repo::Repo;
+use crate::hub::identity::{self, RemoteIdentity};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use std::io::Write;
 
-pub(super) fn remote_scope(url: &str) -> Result<(String, String)> {
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Source {
+    version: u32,
+    identity: RemoteIdentity,
+    repository: String,
+}
+
+/// A verified copy retains its source route independently of mutable upstream configuration.
+pub(crate) fn retain(repo: &Repo, source: &RemoteIdentity, url: &str) -> Result<()> {
+    let (hub, repository) = remote_scope(url)?;
+    ensure!(
+        RemoteIdentity::new(&source.hub, &source.agent_id)? == *source && hub == source.hub,
+        "copy source route differs from its immutable identity"
+    );
+    let pin = identity::read(repo)?.context("copy checkout has no immutable identity")?;
+    ensure!(pin.hub == hub, "copy source belongs to another Hub");
+    let parent = repo.common_dir()?.join("agit/privacy-sources");
+    crate::infra::config::create_state_dir(&parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&parent)?;
+    staged.write_all(&serde_json::to_vec(&Source {
+        version: 1,
+        identity: source.clone(),
+        repository,
+    })?)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(parent.join(format!("{}.json", source.agent_id)))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+pub(crate) fn retained(repo: &Repo, source: &RemoteIdentity) -> Result<Option<String>> {
+    ensure!(
+        RemoteIdentity::new(&source.hub, &source.agent_id)? == *source,
+        "invalid source publication identity"
+    );
+    let path = repo
+        .common_dir()?
+        .join("agit/privacy-sources")
+        .join(format!("{}.json", source.agent_id));
+    let bytes = match crate::domain::storage::read_bytes_capped(&path, 4096) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let saved: Source = serde_json::from_slice(&bytes)?;
+    ensure!(
+        saved.version == 1 && saved.identity == *source,
+        "retained publication source differs from the snapshot authority"
+    );
+    checked_slug(&saved.repository)?;
+    Ok(Some(saved.repository))
+}
+
+pub(crate) fn remote_scope(url: &str) -> Result<(String, String)> {
     let url = identity::normalize_hub(url)?;
     let (base, name) = url
         .rsplit_once('/')

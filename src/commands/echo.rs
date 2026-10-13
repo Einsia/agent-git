@@ -120,7 +120,6 @@ fn human_output(command: &Commands) -> bool {
         | Commands::Merge(_)
         | Commands::CherryPick(_)
         | Commands::Revert(_)
-        | Commands::Push(_)
         | Commands::Pull(_)
         | Commands::Fetch(_)
         | Commands::Share(_)

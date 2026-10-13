@@ -1,0 +1,88 @@
+{
+  "aad_base64": "YWdpdC1wcml2YWN5LWVudmVsb3BlLXYyAHNoYTI1NjpmZjk3Y2FmNWVkMmRiNGFiNjIyMjljNTcyMmUxZTlmZWMyZWM1ZmY2N2ZhYjk1MDllMjVjYWVhN2QzZDVhYTMz",
+  "config": {
+    "created_at": "2026-01-01T00:00:00Z",
+    "privacy": {
+      "creator": "account-alice",
+      "hub": "https://hub.test",
+      "owner": {
+        "id": "account-alice",
+        "kind": "user"
+      },
+      "owner_source": "creator",
+      "scheme": "session_owner_v2"
+    },
+    "repository_id": "00000000-0000-0000-0000-000000000001",
+    "revision": 1,
+    "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "content_key_response": {
+    "content_key": "gUk8QhRzPo6pUE3Pqi8o5ntntROp2TuFwbeY5jsCC1I=",
+    "snapshot": {
+      "binding": {
+        "committer": {
+          "account_id": "account-bob",
+          "kind": "account"
+        },
+        "owner_key": {
+          "account_id": "account-alice",
+          "key_version": 1
+        },
+        "published_session_id": "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "repository_id": "00000000-0000-0000-0000-000000000001",
+        "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+      },
+      "envelope_digest": "sha256:55accf0bc9dc3b9c40ec5da1b74d6ef3e4dbdeb1fb642195510d8cf12f24553c",
+      "published_commit": "dddddddddddddddddddddddddddddddddddddddd",
+      "version": 2
+    }
+  },
+  "envelope": {
+    "attachments": [],
+    "format_version": 2,
+    "policy_digest": "sha256:585be8baf92682c15da67e8c328a4eb8ddc8eec2f5555311539adc31c18e458c",
+    "private_payload": {
+      "algorithm": "aes-256-gcm",
+      "ciphertext": "wPa/CuaLPwCDt1VEBaIr18StZs/jnibsufSbtI/1HG1jgs6Gorvj51eoJWYROAvPfzWDrM0dv3OkPLSJ1g==",
+      "nonce": "uAeSr84ea4sTmSzB",
+      "wrapped_keys": [
+        {
+          "algorithm": "x25519-sealed-box",
+          "ciphertext": "hVBeD4XVs3ahvF9eyxe7gnE6NX8DG0cciAAtE+DcOXBZmxkYB209Dp+YNSB1K6D5vbESuMwvKVV3Ae2FPFdVUzE4F/yEeIXKF+L22ciO2Vw=",
+          "recipient": "session-owner-3756e41e9ef1783659089aed049402a574e02994f4a1c422299db7c32daa81e9"
+        }
+      ]
+    },
+    "public_projection": {
+      "canonical_order": {
+        "10": "ten",
+        "2": "two",
+        "": "bmp",
+        "😀": "astral"
+      },
+      "content": "safe synthetic session",
+      "logical_path": "<workspace>/src/main.rs",
+      "runtime": "codex"
+    },
+    "session_binding": {
+      "committer": {
+        "account_id": "account-bob",
+        "kind": "account"
+      },
+      "owner_key": {
+        "account_id": "account-alice",
+        "key_version": 1
+      },
+      "published_session_id": "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "repository_id": "00000000-0000-0000-0000-000000000001",
+      "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "snapshot_digest": "sha256:7786343b1961ca1298bc2b0c30e86e7bf0c14c6f8a1b5a00f1609fb6bcd19693"
+  },
+  "envelope_bytes": "{\"format_version\":2,\"session_binding\":{\"repository_id\":\"00000000-0000-0000-0000-000000000001\",\"session_id\":\"agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"published_session_id\":\"agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_key\":{\"account_id\":\"account-alice\",\"key_version\":1},\"committer\":{\"kind\":\"account\",\"account_id\":\"account-bob\"},\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"policy_digest\":\"sha256:585be8baf92682c15da67e8c328a4eb8ddc8eec2f5555311539adc31c18e458c\",\"snapshot_digest\":\"sha256:7786343b1961ca1298bc2b0c30e86e7bf0c14c6f8a1b5a00f1609fb6bcd19693\",\"public_projection\":{\"canonical_order\":{\"10\":\"ten\",\"2\":\"two\",\"\":\"bmp\",\"😀\":\"astral\"},\"content\":\"safe synthetic session\",\"logical_path\":\"<workspace>/src/main.rs\",\"runtime\":\"codex\"},\"private_payload\":{\"algorithm\":\"aes-256-gcm\",\"nonce\":\"uAeSr84ea4sTmSzB\",\"ciphertext\":\"wPa/CuaLPwCDt1VEBaIr18StZs/jnibsufSbtI/1HG1jgs6Gorvj51eoJWYROAvPfzWDrM0dv3OkPLSJ1g==\",\"wrapped_keys\":[{\"recipient\":\"session-owner-3756e41e9ef1783659089aed049402a574e02994f4a1c422299db7c32daa81e9\",\"algorithm\":\"x25519-sealed-box\",\"ciphertext\":\"hVBeD4XVs3ahvF9eyxe7gnE6NX8DG0cciAAtE+DcOXBZmxkYB209Dp+YNSB1K6D5vbESuMwvKVV3Ae2FPFdVUzE4F/yEeIXKF+L22ciO2Vw=\"}]},\"attachments\":[]}",
+  "private_payload_base64": "c3ludGhldGljIG9yaWdpbmFsIHNlc3Npb24gYW5kIG1ldGFkYXRhIGJ5dGVz",
+  "test_only_viewing_private_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "viewing_public_key": "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ+xnTzf3/pe20="
+}

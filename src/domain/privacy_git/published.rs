@@ -21,12 +21,47 @@ struct PublicSession {
 }
 
 pub(super) struct Reused {
-    #[cfg(test)]
-    pub envelope_oid: String,
     pub inspection: String,
     pub report: ProjectionReport,
     pub session_id: String,
     pub policy_digest: String,
+}
+
+pub(super) fn is_legacy_envelope(bytes: &[u8]) -> Result<bool> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    Ok(value.get("format_version").and_then(Value::as_u64) == Some(1))
+}
+
+/// Authenticated mappings allow legacy ciphertext to remain opaque while preserving its graph.
+pub(super) fn retain_accepted(
+    source: &Repo,
+    destination: &Repo,
+    oid: &str,
+    parents: &[String],
+) -> Result<Option<Reused>> {
+    let bytes = read(
+        source,
+        &["cat-file", "blob", &format!("{oid}:privacy/envelope.json")],
+        super::super::privacy_envelope::MAX_ENVELOPE_BYTES,
+    )?;
+    if !is_legacy_envelope(&bytes)? {
+        return reuse(source, destination, oid, parents)?
+            .context(accepted::RECOVERY)
+            .map(Some);
+    }
+    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+    ensure!(
+        commit_parents(&original)? == parents
+            && input(
+                source,
+                &["hash-object", "-t", "commit", "--stdin"],
+                &original
+            )? == oid,
+        "{}",
+        accepted::RECOVERY
+    );
+    crate::commands::plumbing::import_commit_graph(destination, source, oid)?;
+    Ok(None)
 }
 
 pub(super) fn reuse(
@@ -56,6 +91,12 @@ pub(super) fn reuse(
     public.report.validate(&envelope.policy_digest)?;
     let metadata: Meta = serde_json::from_value(public.metadata.clone())?;
     meta::validate(&metadata)?;
+    if let Some(binding) = &envelope.session_binding {
+        ensure!(
+            metadata.is_session_line() && metadata.session == binding.published_session_id,
+            "published session differs from its authenticated mapping"
+        );
+    }
     let expected = if metadata.is_file_line() {
         ensure!(
             public.session.log.is_empty() && public.session.view.is_empty(),
@@ -106,8 +147,6 @@ pub(super) fn reuse(
         &public.session.view,
         &envelope.policy_digest,
     )?;
-    #[cfg(test)]
-    let envelope_oid = write_object(destination, "blob", &bytes)?;
     files.insert("privacy/envelope.json".into(), bytes);
     let tree = write_tree(destination, files)?;
     let body = commit_body(&tree, parents);
@@ -121,8 +160,6 @@ pub(super) fn reuse(
         "published ancestry changed object identity"
     );
     Ok(Some(Reused {
-        #[cfg(test)]
-        envelope_oid,
         inspection,
         report: public.report,
         session_id: metadata.session,

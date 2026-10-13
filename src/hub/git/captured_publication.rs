@@ -194,13 +194,16 @@ impl CapturedPublication {
         policy_repo: &Repo,
         target: Option<(&str, &RemoteIdentity)>,
     ) -> Result<Self> {
-        let _ = policy_repo;
-        Self::capture_inner(
-            projected.repo(),
+        let source = Source::new(projected.repo())?;
+        let mut git = GitContent::capture_for(&source, projected.plan(), target)?;
+        git.lfs_objects = super::lfs_cache::capture(&Source::new(policy_repo)?);
+        Self::stage(
+            policy_repo,
             projected.plan(),
             byte_budget,
             false,
-            target,
+            source,
+            git,
         )
     }
 
@@ -316,6 +319,11 @@ impl CapturedPublication {
 
     pub fn pointers(&self) -> &[Pointer] {
         &self.git.lfs_inventory
+    }
+
+    /// Accepted objects are bound to the same destination advertisement as this capture.
+    pub(crate) fn preserves_object(&self, oid: &str) -> bool {
+        self.git.scope.excluded.contains(oid)
     }
 
     /// Read-only consumers may map this private bare directory into an isolated checkout.

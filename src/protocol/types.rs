@@ -285,7 +285,6 @@ pub struct ProjectPublicationBind {
     pub local_path: String,
     pub repository: String,
     pub repository_id: String,
-    pub encryption_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

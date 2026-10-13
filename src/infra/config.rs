@@ -373,24 +373,6 @@ pub fn auto_push_default() -> Result<bool> {
     }
 }
 
-/// The stored user choice of a new Hub identity's mode; `None` when the user chose nothing.
-pub fn encryption_preference() -> Result<Option<bool>> {
-    match get_global("privacy.encryption")?.as_deref() {
-        None => Ok(None),
-        Some("true") => Ok(Some(true)),
-        Some("false") => Ok(Some(false)),
-        Some(_) => anyhow::bail!(
-            "invalid user privacy.encryption preference; set it to true or false with agit config"
-        ),
-    }
-}
-
-/// This preference selects a new Hub identity's mode; existing identities use Hub authority.
-/// Encryption is an explicit opt-in: without a choice a new repository uses ordinary publication.
-pub fn encryption_default() -> Result<bool> {
-    Ok(encryption_preference()?.unwrap_or(false))
-}
-
 /// List every global config key and value.
 pub fn list_global() -> Result<std::collections::BTreeMap<String, String>> {
     let path = global_config_path()?;

@@ -19,18 +19,18 @@ impl CompleteInspection {
         self.publish_confirmed(acceptance, None)
     }
 
-    /// Call after reviewing the immutable public objects and confirming their destination.
-    /// The Hub must issue a matching receipt before any Git receive request is sent.
-    pub fn publish_with_privacy_receipts(
+    /// Every receive batch binds the same reviewed session manifest and its exact ref transition.
+    pub fn publish_with_session_receipts(
         self,
         policy_digest: &str,
-        recipient: &str,
+        manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
     ) -> Result<PublicationReport> {
-        let policy =
-            self.prepared
-                .publication
-                .privacy_policy(policy_digest, recipient, visibility)?;
+        let policy = self.prepared.publication.session_privacy_policy(
+            policy_digest,
+            manifest,
+            visibility,
+        )?;
         Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy)))
     }
 

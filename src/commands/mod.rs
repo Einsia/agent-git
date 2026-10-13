@@ -233,8 +233,6 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         ExitCode::Usage
     } else if error.is::<RemoteRequest>() {
         ExitCode::Network
-    } else if error.is::<push::FirstPublicationRefusal>() {
-        ExitCode::Precondition
     } else if error.is::<InteractionRequired>() {
         ExitCode::Interactive
     } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {

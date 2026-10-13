@@ -19,16 +19,13 @@ Replace the uppercase names with actual account names. Repeat the grant for each
 The current `repo create` creates under the signed-in account; select an existing organization
 repository through the website instead of passing an organization-qualified creation name.
 
-For an encrypted repository, initialize its viewing key before developers publish:
-
-```sh
-agit privacy init MANAGER/project-name --browser --json
-```
-
-Open the returned setup URL, set the viewing password yourself, then repeat the command
-to confirm readiness. Do not send the password or your login credentials to an agent.
-Developers publish using their own accounts and the repository's public publishing key;
-reading original private context may separately require the viewing password.
+Developers publish using their own accounts. New sessions default to encryption for the session
+creator's account. Repository membership permits published-content access; original content also
+requires eligible default or explicit access. New sessions use session-level grants: the
+session owner can authorize current members
+access with `agit privacy access grant MANAGER/project-name@SESSION_BRANCH` after reviewing the
+session scope and frozen member list. This covers existing and future commits until
+`agit privacy access disable-session` switches future explicit grants to individual commits.
 
 ## Developer: enroll an existing project
 
@@ -47,8 +44,8 @@ files need not be stored inside the project. Each developer/machine can use a di
 
 Confirm the destination, independent import of unclaimed histories, and publication policy.
 Existing claims in the same repository keep their branch. A session claimed by another
-repository, including a desktop RC project, keeps that claim; sync publishes a separate copy
-of its branch to this repository (status `copied`), and later syncs refresh the copy.
+repository, including a desktop RC project, keeps its source authority; sync reports a refusal
+before importing or publishing it elsewhere. Publish that session from its source repository.
 Archived or superseded instances are not published; inspect reported failures.
 
 `--auto-upload` uses the existing repository-wide `push.auto` preference. Other managed
@@ -86,20 +83,18 @@ Check that the Manager can open each developer's sessions in the shared reposito
 Repeat sync to verify that no duplicate branches appear. The last result distinguishes
 successful pushes and failures; a push does not prove that Hub search indexing has finished.
 
-Uploads preserve identity and authorization checks. Local privacy processing is best effort:
-scanner, dictionary and synchronization failures never block publication. A failed upload
+Uploads preserve identity and authorization checks. Dictionary synchronization is best effort;
+publication still validates source integrity and the snapshot privacy contract. A failed upload
 retains the local imported history. There is no resident retry service in this minimal
 version: fix access or connectivity and rerun sync. The Stop hook starts the upload in a
 background process and returns at once; `agit project status` shows its last result.
-For an encrypted repository, an account, repository identity, policy or recipient change
-requires renewed explicit consent; an ordinary repository's automatic uploads follow `push.auto`
-alone.
+Automatic uploads recheck account, immutable destination, write access and registered session
+settings. Changing the project's selected account or destination requires renewed binding.
 
 Unbind stops this project's hook capture and automatic pushing, without deleting existing
 history or resetting repository preferences. Explicit manual push is still possible. Nested
 project bindings are independent. Already in-flight operations finish before unbind obtains
 the project lock; the command reports a lock error if they do not finish in time.
 
-RC retains its own supervisor and publishing lifecycle. This command does not migrate or
-take over RC-owned sessions; it publishes copies of them, refreshed by each sync. It also does not add project question-answering, a dashboard,
-or a new web interface.
+RC retains its own supervisor and publishing lifecycle. RC-owned sessions keep their claims and
+source publication authority.

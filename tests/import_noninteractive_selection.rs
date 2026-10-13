@@ -1545,13 +1545,53 @@ fn device_policy_precedence_applies_during_import() {
     assert!(log.contains("AGIT_SECRET_V2"));
 }
 
-/// Generated observations must use the same secret projection as the imported transcript.
+/// Creator authority survives link-only adoption and later committers while observations are protected.
 #[test]
 fn imported_and_live_metadata_remain_publishable() {
     use std::io::Write;
     use std::process::Stdio;
 
     let lab = Lab::new(1);
+    let select_account = |account: &str| {
+        let path = lab.store.join("credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(HUB).unwrap()
+        ));
+        let mut credential = agit::infra::credentials::load_at(&path).unwrap();
+        credential.account_id = Some(account.into());
+        agit::infra::credentials::save_at(&path, &credential).unwrap();
+    };
+    select_account("creator-a");
+    let adopt = || {
+        let adopted = lab
+            .command()
+            .args([
+                "import",
+                &lab.sources[0].0,
+                "--from",
+                "claude-code",
+                "--link-only",
+            ])
+            .output()
+            .unwrap();
+        assert!(adopted.status.success(), "{adopted:?}");
+        agit::domain::link::get(
+            &agit::domain::store::Store::at(lab.store.join("store")),
+            "claude-code",
+            &lab.sources[0].0,
+        )
+        .unwrap()
+        .session_privacy
+        .unwrap()
+    };
+    let ownership = adopt();
+    assert_eq!(ownership.creator.as_deref(), Some("creator-a"));
+    assert_eq!(
+        ownership.scheme,
+        agit::domain::session_privacy::SessionScheme::SessionOwnerV2
+    );
+    select_account("committer-b");
+    assert_eq!(adopt(), ownership);
     let secret = "SYNTHETIC-PRIVATE-ORIGIN";
     let add_rule = |name: &str, value: &str| {
         let mut child = lab
@@ -1634,6 +1674,19 @@ fn imported_and_live_metadata_remain_publishable() {
     );
     let snapshot: agit::domain::meta::Meta = serde_json::from_str(&metadata).unwrap();
     agit::domain::meta::validate(&snapshot).unwrap();
+    assert_eq!(snapshot.session_privacy.as_ref(), Some(&ownership));
+    assert_eq!(
+        snapshot.committer_account.as_ref().unwrap().account_id,
+        "committer-b"
+    );
+    let birth: agit::domain::meta::Meta = serde_json::from_str(&target_git(
+        &lab,
+        &repo,
+        &["show", "metadata^:session/meta.json"],
+    ))
+    .unwrap();
+    assert_eq!(birth.session, snapshot.session);
+    assert_eq!(birth.session_privacy.as_ref(), Some(&ownership));
     assert!(!snapshot.cwd.contains(lab.work.to_str().unwrap()));
     assert_eq!(snapshot.runtime, "claude-code");
     assert_eq!(snapshot.turn, Some(1));
@@ -1656,6 +1709,9 @@ fn imported_and_live_metadata_remain_publishable() {
     let live_bytes = fs::read(source).unwrap();
     let milestone_secret = "AKIA4X7QZ2M5RT6VW3JH";
     let milestone = format!("{secret} {milestone_secret}");
+    select_account("committer-c");
+    add_rule("origin", secret);
+    add_rule("workspace", workspace_fragment.to_str().unwrap());
     let committed = lab
         .command()
         .args(["commit", "me/qa@metadata", "--milestone", &milestone])
@@ -1670,6 +1726,11 @@ fn imported_and_live_metadata_remain_publishable() {
     );
     let snapshot: agit::domain::meta::Meta = serde_json::from_str(&metadata).unwrap();
     agit::domain::meta::validate(&snapshot).unwrap();
+    assert_eq!(snapshot.session_privacy.as_ref(), Some(&ownership));
+    assert_eq!(
+        snapshot.committer_account.as_ref().unwrap().account_id,
+        "committer-c"
+    );
     assert!(!metadata.contains(milestone_secret));
     assert_eq!(snapshot.turn, Some(2));
     assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V2"));
@@ -1684,6 +1745,56 @@ fn imported_and_live_metadata_remain_publishable() {
             .branch
             .unwrap()
             .contains("AGIT_SECRET_V2")
+    );
+    let repeated = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@metadata",
+            "--independent",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated: agit::domain::meta::Meta = serde_json::from_str(&target_git(
+        &lab,
+        &repo,
+        &["show", "metadata:session/meta.json"],
+    ))
+    .unwrap();
+    assert_eq!(repeated.session_privacy.as_ref(), Some(&ownership));
+    let fresh_work = lab.home.join("fresh-work");
+    fs::create_dir_all(&fresh_work).unwrap();
+    let fresh = lab
+        .command()
+        .args([
+            "new",
+            "me/qa",
+            "-b",
+            "fresh-owner",
+            "--as",
+            "claude-code",
+            "--no-launch",
+            "--directory",
+            fresh_work.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(fresh.status.success(), "{fresh:?}");
+    let fresh: agit::domain::meta::Meta = serde_json::from_str(&target_git(
+        &lab,
+        &repo,
+        &["show", "fresh-owner:session/meta.json"],
+    ))
+    .unwrap();
+    assert_ne!(fresh.session, repeated.session);
+    assert_eq!(
+        fresh.session_privacy.unwrap().creator.as_deref(),
+        Some("committer-c")
     );
     let resumed = lab
         .command()

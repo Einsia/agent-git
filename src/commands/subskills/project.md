@@ -29,8 +29,8 @@ publication policy before confirming; unattended use requires explicit `--yes`.
 under the directory, including subdirectories without their own binding. Unclaimed
 sessions start independent histories; existing claims in the same repository retain
 their branch. A session claimed by another repository, including a desktop RC project,
-keeps that claim: `sync` publishes a separate copy of its branch to the project repository
-(status `copied`) and refreshes it on later syncs. Archived or superseded claims are reported
+keeps its source authority: `sync` reports a refusal before importing or publishing it elsewhere.
+Publish those sessions from their source repository. Archived or superseded claims are reported
 as failures. `--history none` excludes sessions already present at enrollment unless this
 repository claims them; it does not silently publish their old content when they are
 resumed. Rebind with `--history all` to include them.
@@ -38,22 +38,20 @@ resumed. Rebind with `--history all` to include them.
 `--auto-upload` installs available runtime hooks, confirms the current publication policy,
 and enables the existing **repository-wide** `push.auto` preference. Other managed
 sessions in that local repository inherit that preference. Global preferences are not
-changed. An encrypted repository must have its viewing key initialized by its owner;
-never request the viewing password in chat. Codex hooks must be supported, enabled and
-trusted in the installed runtime; a Codex without it does not block Claude Code capture,
+changed. New imports record the importing account as creator and default to session-owner encryption.
+Existing claims retain their session owner and registered settings. Codex hooks must be supported,
+enabled and trusted in the installed runtime; a Codex without it does not block Claude Code capture,
 and its sessions are published by `project sync`. Binding fails only when no runtime can
 provide hooks.
 
 The Stop hook hands the completed conversation to a background process and returns, so the
 turn is not held by import or upload. That process imports/saves it through the ordinary
-import path, then publishes with identity and authorization checks, plus consent for an
-encrypted repository. Local privacy processing and dictionary synchronization are best
-effort and never gate publication. There is no resident retry queue. A failed push keeps
+import path, then publishes with account, destination and registered-session authorization checks.
+Dictionary synchronization is best effort; publication still validates source integrity and the
+snapshot privacy contract. There is no resident retry queue. A failed push keeps
 local history, and `status` shows the last result. Retry with `project sync`.
-For an encrypted repository, policy, account, recipient or destination changes require review
-and renewed binding consent; an ordinary repository's automatic uploads follow `push.auto` alone.
-RC-owned sessions keep their supervisor lifecycle and are not taken over by this command;
-their copies refresh only on `project sync`, not from hooks.
+Changing the selected account or destination requires renewed project binding. RC-owned sessions
+retain their supervisor lifecycle and source publication authority.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is
 complete. `unbind` pauses project hook capture and automatic publication for the selected

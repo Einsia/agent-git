@@ -2,8 +2,15 @@
 
 use anyhow::{Result, ensure};
 
+pub mod grants;
+pub(crate) mod location;
+pub mod policy;
 pub(crate) mod publication;
-pub mod repository_keys;
+pub mod sessions;
+pub mod status;
+
+#[cfg(test)]
+mod test_server;
 
 fn repository_path(repository: &str) -> Result<String> {
     let (owner, name) = crate::commands::parse_slug(repository)?;

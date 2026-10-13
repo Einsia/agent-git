@@ -256,8 +256,10 @@ fn commit_memory_at(
             "`{branch}` moved while the change was being prepared; run the command again"
         );
     }
+    super::privacy::require_native_edit(primary, &tip)?;
     let mut snap = meta::read_at_ref(primary, &tip)
         .ok_or_else(|| anyhow::anyhow!("`{branch}` carries no {}", meta::FILE))?;
+    snap.committer_account = crate::infra::credentials::current_account()?;
     snap.kind = Kind::File;
     snap.milestone = None;
     let mut all: Vec<(String, Option<Vec<u8>>)> = edits
@@ -1572,7 +1574,49 @@ mod tests {
                 .unwrap(),
             b"selected version"
         );
-        assert_eq!(std::fs::read(artifact).unwrap(), b"later draft");
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"later draft");
+
+        // An encrypted tip cannot absorb memory edits; refusal preserves their baseline for retry.
+        let head = primary.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+        let tree = super::super::plumbing::tree_apply(
+            &primary,
+            &head,
+            &[("privacy/envelope.json", Some("{\"format_version\":2}\n"))],
+        )
+        .unwrap();
+        let encrypted = super::super::plumbing::commit_tree(
+            &primary,
+            &tree,
+            &[&head],
+            "Synthetic encrypted publication",
+        )
+        .unwrap();
+        primary
+            .git(&["update-ref", "refs/heads/s1", &encrypted, &head])
+            .unwrap();
+        let baseline = std::fs::read(baseline_path(&checkout).unwrap()).unwrap();
+        let staged = checkout.git(&["write-tree"]).unwrap();
+        std::fs::write(mirror(&mem).join("team.md"), "pending memory\n").unwrap();
+        let error = collect_with(&primary, "s1", SLUG, &mem, ON).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native continuation or an independent fork")
+        );
+        assert_eq!(
+            primary.git(&["rev-parse", "refs/heads/s1"]).unwrap(),
+            encrypted
+        );
+        assert_eq!(checkout.git(&["write-tree"]).unwrap(), staged);
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"later draft");
+        assert_eq!(
+            std::fs::read(baseline_path(&checkout).unwrap()).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            std::fs::read(mirror(&mem).join("team.md")).unwrap(),
+            b"pending memory\n"
+        );
     }
 
     #[test]

@@ -47,16 +47,18 @@ agit clone alice/notes --no-bind
 
 `clone` fetches and optionally binds. Use `run` or `resume` to run a ref.
 
-For an encrypted clone, continuing from original private context requires recovery on the
-execution machine. Follow [privacy](privacy.md#guide-the-user-through-password-operations):
-explain what the repository viewing password means, who can provide it, and give the user
-the exact terminal unlock command. A successful clone alone does not decrypt the session.
+An encrypted clone contains sanitized context and immutable ciphertext. Original recovery on the
+execution machine uses the signed-in account's access to the exact source snapshot:
+`agit privacy unlock alice/notes@work --workspace /work/notes`. See [privacy](privacy.md).
 
-A normal clone retains the Hub repository identity and its fixed encryption mode.
-The user creation default does not change that mode. To publish available original
-history in another mode, select a new destination with `push SOURCE --to TARGET`.
-Encrypted history requires valid recovery access, and unlocking one snapshot does
-not supply every historical original for a complete ordinary copy. See `agit help push`.
+Clone preserves session identity and ownership, including inherited history in a `--mine` copy.
+Copies retain the verified source repository ID and route locally for original recovery,
+status and grant requests. Changing `upstream` does not redirect those requests. If a fresh
+checkout lacks the original source binding, use a verified checkout of that source repository;
+the copy's account and destination do not substitute for source authority.
+An independent `fork` records the forking account as owner and uses authorized original context
+or, when access is absent, sanitized context. Cross-repository publication requires preserved
+source authority and is refused when that authority cannot be established.
 
 ## Automatic publishing preference
 

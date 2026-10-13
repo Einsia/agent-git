@@ -7,6 +7,10 @@ use agit::domain::{
     privacy_envelope::{PrivacyEnvelope, ViewingRecipient, digest_bytes},
     privacy_layer::PrivateLayer,
     repo::Repo,
+    session_privacy::{
+        AcceptedSnapshot, AccountIdentity, CommitterAttribution, OwnerKeyBinding, SessionPrivacy,
+        SessionSnapshotBinding, SourceCommitter,
+    },
     storage, transcript,
 };
 use agit::infra::{
@@ -31,21 +35,20 @@ use std::{
 #[cfg(unix)]
 #[path = "support/claude_recovery_terminal.rs"]
 mod claude_recovery_terminal;
-#[path = "support/privacy_password_terminal.rs"]
-mod privacy_password_terminal;
+#[path = "support/original_access.rs"]
+mod original_access;
 #[path = "support/publication_identity.rs"]
 mod publication_identity;
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
-use privacy_password_terminal::terminal_password;
 
 #[test]
-fn anonymous_password_unlock_preserves_native_codex_history_through_settlement() {
+fn authorized_resume_recovers_original_codex_history_through_settlement() {
     recovery_roundtrip("codex", "codex", false);
 }
 
 #[test]
-fn claude_unlock_resume_preserves_native_history_and_upgrades_legacy_baselines() {
+fn account_unlock_resume_preserves_native_history_and_upgrades_legacy_baselines() {
     recovery_roundtrip("claude-code", "claude-code", false);
 }
 
@@ -140,25 +143,47 @@ fn prepare_real_claude_recovery(
         ),
     )
     .unwrap();
-    let layer = PrivateLayer::new(
+    let account = AccountIdentity::new("http://127.0.0.1:1", "account-alice").unwrap();
+    let mut metadata = meta::read(repo.root()).unwrap();
+    metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+    metadata.committer_account = Some(account.clone());
+    let mut layer = PrivateLayer::new(
         &saved,
         &saved,
-        serde_json::to_value(meta::read(repo.root()).unwrap()).unwrap(),
+        serde_json::to_value(&metadata).unwrap(),
         BTreeMap::new(),
     )
     .unwrap();
+    layer.source_committer = Some(
+        SourceCommitter::from_commit(
+            b"committer Alice <alice@example.invalid> 1 +0000\n\nOriginal session\n",
+            Some(account),
+        )
+        .unwrap(),
+    );
     let key = SecretKey::from([13; 32]);
     let public = STANDARD.encode(key.public_key().as_bytes());
+    let owner_key = OwnerKeyBinding {
+        account_id: "account-alice".into(),
+        key_version: 1,
+    };
     let recipient =
-        ViewingRecipient::from_base64(agit::domain::privacy_key::recipient_id(&public), &public)
-            .unwrap();
-    let envelope = PrivacyEnvelope::seal_layer(
+        ViewingRecipient::from_base64(owner_key.recipient_id().unwrap(), &public).unwrap();
+    let envelope = PrivacyEnvelope::seal_session(
         digest_bytes(b"policy"),
-        digest_bytes(b"snapshot"),
         json!({}),
-        &layer,
+        &serde_json::to_vec(&layer).unwrap(),
         &recipient,
-        Vec::new(),
+        SessionSnapshotBinding {
+            repository_id: "00000000-0000-0000-0000-000000000001".into(),
+            session_id: metadata.session.clone(),
+            published_session_id: format!("agit-{}", "b".repeat(40)),
+            owner_key,
+            committer: CommitterAttribution::Account {
+                account_id: "account-alice".into(),
+            },
+            source_commit: "c".repeat(40),
+        },
     )
     .unwrap();
     let publication = serde_json::to_vec(&envelope).unwrap();
@@ -234,6 +259,14 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     repo.git(&["config", "user.email", "synthetic@example.invalid"])
         .unwrap();
     repo.git(&["checkout", "-b", "encrypted"]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let identity =
+        agit::hub::identity::RemoteIdentity::new(&base, "00000000-0000-0000-0000-000000000001")
+            .unwrap();
+    agit::hub::identity::pin(&repo, &identity).unwrap();
+    repo.set_remote(&format!("{base}/alice/app.git")).unwrap();
     let raw = if source == "claude-code" {
         claude_history("glm-5.3")
     } else {
@@ -266,11 +299,20 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             &format!("agit-{}", "a".repeat(40))
         )
     );
-    let metadata = meta::Meta::new(
+    let mut metadata = meta::Meta::new(
         format!("agit-{}", "a".repeat(40)),
         source.into(),
         "/source/workspace".into(),
     );
+    let ownership =
+        SessionPrivacy::new(Some(AccountIdentity::new(&base, "account-alice").unwrap())).unwrap();
+    metadata.session_privacy = Some(ownership.clone());
+    metadata.committer_account = Some(AccountIdentity::new(&base, "account-bob").unwrap());
+    let source_committer = SourceCommitter::from_commit(
+        b"committer Bob <bob@example.invalid> 1 +0000\n\nOriginal session\n",
+        metadata.committer_account.clone(),
+    )
+    .unwrap();
     let mut layer = PrivateLayer::new(
         &log,
         &view,
@@ -278,6 +320,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         BTreeMap::new(),
     )
     .unwrap();
+    layer.source_committer = Some(source_committer);
     layer
         .protected_values
         .insert("synthetic private session".into());
@@ -286,28 +329,39 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         "SYNTHETIC_OLD_TOOL".into(),
         "SYNTHETIC_OLD_SHELL_OUTPUT".into(),
     ]);
-    let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/privacy-web-key.json")).unwrap();
-    let record = fixture["record"].clone();
-    let key = SecretKey::from_slice(
-        &STANDARD
-            .decode(fixture["private_key"].as_str().unwrap())
-            .unwrap(),
-    )
-    .unwrap();
+    let key = SecretKey::from([13; 32]);
     let public = STANDARD.encode(key.public_key().as_bytes());
+    let owner_key = OwnerKeyBinding {
+        account_id: "account-alice".into(),
+        key_version: 1,
+    };
     let recipient =
-        ViewingRecipient::from_base64(agit::domain::privacy_key::recipient_id(&public), &public)
-            .unwrap();
-    let envelope = PrivacyEnvelope::seal_layer(
+        ViewingRecipient::from_base64(owner_key.recipient_id().unwrap(), &public).unwrap();
+    let envelope = PrivacyEnvelope::seal_session(
         digest_bytes(b"policy"),
-        digest_bytes(b"snapshot"),
         json!({"content":"sanitized", "metadata":{"session":format!("agit-{}", "b".repeat(40))}}),
-        &layer,
+        &serde_json::to_vec(&layer).unwrap(),
         &recipient,
-        Vec::new(),
+        SessionSnapshotBinding {
+            repository_id: identity.agent_id.clone(),
+            session_id: format!("agit-{}", "a".repeat(40)),
+            published_session_id: format!("agit-{}", "b".repeat(40)),
+            owner_key,
+            committer: CommitterAttribution::Account {
+                account_id: "account-bob".into(),
+            },
+            source_commit: "c".repeat(40),
+        },
     )
     .unwrap();
+    let content_key = STANDARD.encode(
+        key.unseal(
+            &STANDARD
+                .decode(&envelope.private_payload.wrapped_keys[0].ciphertext)
+                .unwrap(),
+        )
+        .unwrap(),
+    );
     std::fs::create_dir_all(repo.root().join("privacy")).unwrap();
     std::fs::write(
         repo.root().join("privacy/envelope.json"),
@@ -331,21 +385,28 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         .unwrap();
     let before = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let identity =
-        agit::hub::identity::RemoteIdentity::new(&base, "00000000-0000-0000-0000-000000000001")
-            .unwrap();
-    agit::hub::identity::pin(&repo, &identity).unwrap();
-    repo.set_remote(&format!("{base}/alice/app.git")).unwrap();
-    let expected_commit = before.clone();
+    let expected = AcceptedSnapshot {
+        version: 2,
+        binding: envelope.session_binding.clone().unwrap(),
+        published_commit: before.clone(),
+        envelope_digest: digest_bytes(&serde_json::to_vec(&envelope).unwrap()),
+    };
+    let key_response = json!({"snapshot": expected, "content_key": content_key});
+    let automatic_recovery = source == "codex" && runtime == "codex";
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
+    let fork_access = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_access = Arc::clone(&fork_access);
+    let source_route = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_route = Arc::clone(&source_route);
     let response_hub = base.clone();
+    let response_envelope = serde_json::to_string(&envelope).unwrap();
     let server = std::thread::spawn(move || {
+        let mut grants = original_access::Fixture::new(expected.clone());
         let started = Instant::now();
         let mut requests = Vec::new();
+        let mut key_requests = 0;
+        let mut status_requests = 0;
         while !stopped.load(Ordering::Relaxed) && started.elapsed().as_secs() < 90 {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
@@ -377,6 +438,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             let path = request.split_whitespace().nth(1).unwrap().to_owned();
             let mut length = 0;
             let mut authenticated = false;
+            let mut expected_ids = Vec::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -390,23 +452,138 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
                 if header.trim() == "authorization: bearer synthetic-access" {
                     authenticated = true;
                 }
+                if let Some(value) = header.strip_prefix("x-agentgit-expected-agent-id:") {
+                    expected_ids.push(value.trim().to_owned());
+                }
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             requests.push(path.clone());
-            let (status, response) = if path.contains("/privacy/keys/") {
-                assert!(!authenticated, "public password unlock must be anonymous");
+            let route = served_route.load(Ordering::Acquire);
+            if path.contains("/sessions/") || path.contains("/location") {
+                assert_eq!(
+                    expected_ids,
+                    std::slice::from_ref(&expected.binding.repository_id)
+                );
+            }
+            let canonical = path.replace("/alice/renamed/", "/alice/app/");
+            let (status, response) = if path.ends_with("/location") {
+                assert!(authenticated);
                 assert_eq!(
                     path,
                     format!(
-                        "/api/agents/alice/app/privacy/keys/{}?ref={expected_commit}",
-                        record["recipient"].as_str().unwrap()
+                        "/api/repositories/{}/location",
+                        expected.binding.repository_id
                     )
                 );
+                match route {
+                    2 => (
+                        503,
+                        json!({"kind":"repository_unavailable","error":"location temporarily unavailable"}),
+                    ),
+                    3 => (
+                        404,
+                        json!({"kind":"not_found","error":"source unavailable"}),
+                    ),
+                    _ => {
+                        let name = if route == 1 { "renamed" } else { "app" };
+                        (
+                            200,
+                            json!({"agent_id":expected.binding.repository_id,"owner":"alice","name":name,
+                            "clone_url":format!("{response_hub}/alice/{name}.git")}),
+                        )
+                    }
+                }
+            } else if route == 1 && path.starts_with("/api/agents/alice/app/sessions/") {
+                if path.contains("/privacy?ref=") {
+                    (
+                        200,
+                        json!({"agent_id":"00000000-0000-0000-0000-000000000002",
+                        "session_id":expected.binding.session_id,"commit":expected.published_commit,"scheme":"plain"}),
+                    )
+                } else {
+                    (
+                        412,
+                        json!({"kind":"precondition_failed","error":"repository name now belongs to another identity"}),
+                    )
+                }
+            } else if path.contains("/privacy?ref=") {
+                assert!(authenticated);
+                assert_eq!(
+                    canonical,
+                    format!(
+                        "/api/agents/alice/app/sessions/{}/privacy?ref={}",
+                        expected.binding.session_id, expected.published_commit
+                    )
+                );
+                status_requests += 1;
                 (
                     200,
-                    json!({"agent_id":identity.agent_id,"commit":expected_commit,"session_id":format!("agit-{}", "b".repeat(40)),"key":record}),
+                    json!({
+                        "agent_id":expected.binding.repository_id,"session_id":expected.binding.session_id,
+                        "commit":expected.published_commit,"scheme":"session_owner_v2",
+                        "snapshot":expected,"envelope_bytes":response_envelope,
+                        "original_status":"saved_encrypted",
+                        "grant_policy":grants.policy(),
+                        "display_status":if status_requests == 1 { "pending" } else { "ready" },
+                        "capabilities":{"can_read_original":false,"can_manage_original_grants":false,
+                            "reader":{"current_member":true,"owner_default":false,"committer_default":false,
+                                "explicit_grant":false,"session_explicit_grant":false,"session_revoked":false,
+                                "default_suppressed":false,"session_membership_invalidated":false,"revoked":false,"membership_invalidated":false}}
+                    }),
                 )
+            } else if path.contains("/original-grant") {
+                assert!(authenticated);
+                grants.route(
+                    request.split_whitespace().next().unwrap(),
+                    &canonical,
+                    &body,
+                )
+            } else if path.ends_with("/original-key") {
+                assert!(
+                    authenticated,
+                    "original recovery requires the active account"
+                );
+                assert_eq!(
+                    canonical,
+                    format!(
+                        "/api/agents/alice/app/sessions/{}/original-key",
+                        expected.binding.session_id
+                    )
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({"snapshot": expected})
+                );
+                key_requests += 1;
+                match (
+                    source_access.load(Ordering::Acquire),
+                    automatic_recovery,
+                    key_requests,
+                ) {
+                    (1, _, _) => (
+                        403,
+                        json!({"kind": "original_access_denied", "error": "source grant revoked"}),
+                    ),
+                    (2, _, _) => (
+                        503,
+                        json!({"kind": "key_service_unavailable", "error": "try later"}),
+                    ),
+                    (_, true, 1) => (
+                        403,
+                        json!({"kind": "original_access_denied", "error": "no snapshot entitlement"}),
+                    ),
+                    (_, true, 2) => (
+                        503,
+                        json!({"kind": "key_service_unavailable", "error": "try later"}),
+                    ),
+                    (_, true, 3) => {
+                        let mut mismatched = key_response.clone();
+                        mismatched["snapshot"]["published_commit"] = "f".repeat(40).into();
+                        (200, mismatched)
+                    }
+                    _ => (200, key_response.clone()),
+                }
             } else {
                 assert!(
                     authenticated,
@@ -422,9 +599,9 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
                 .expect("known policy route")
             };
             let response = response.to_string();
-            write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nCache-Control: private, no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         }
-        requests
+        (requests, key_requests)
     });
     let run = |args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
@@ -455,44 +632,90 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         "--workspace",
         workspace.to_str().unwrap(),
     ];
-    let noninteractive = run(&unlock_args);
-    assert!(!noninteractive.status.success());
-    assert!(String::from_utf8_lossy(&noninteractive.stderr).contains("interactive terminal"));
-    let (status, output) = terminal_password(
-        &home,
-        temp.path(),
-        &workspace,
-        &base,
-        &unlock_args,
-        fixture["password"].as_str().unwrap(),
-    );
-    assert!(status.success(), "{output}");
-    assert!(!output.contains(fixture["password"].as_str().unwrap()));
-    assert!(!output.contains("browser"));
-    assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
-    let restored = repo
-        .common_dir()
-        .unwrap()
-        .join("agit/privacy-recovery")
-        .join(&before);
-    assert_eq!(
-        storage::materialize_worktree(&restored, meta::VIEW_FILE).unwrap(),
-        view
-    );
-    assert_eq!(
-        meta::read(&restored).unwrap().cwd,
-        workspace.canonicalize().unwrap().to_string_lossy()
-    );
-    let key_text = fixture["private_key"].as_str().unwrap();
-    for file in walkdir::WalkDir::new(&restored) {
-        let file = file.unwrap();
-        if file.file_type().is_file() {
-            assert!(
-                !String::from_utf8_lossy(&std::fs::read(file.path()).unwrap()).contains(key_text)
-            );
-        }
+    let anonymous = run(&unlock_args);
+    assert!(!anonymous.status.success());
+    assert!(String::from_utf8_lossy(&anonymous.stderr).contains("signed-in account"));
+    let copy_identity =
+        agit::hub::identity::RemoteIdentity::new(&base, "00000000-0000-0000-0000-000000000002")
+            .unwrap();
+    if automatic_recovery {
+        // A signed-out fork consumes only published context, even when inherited original routing is absent.
+        agit::hub::identity::rebind(&repo, &identity, &copy_identity).unwrap();
+        repo.set_remote(&format!("{base}/bob/copy.git")).unwrap();
+        let forked = run(&["fork", "alice/app@encrypted", "-b", "anonymous-copy"]);
+        assert!(forked.status.success(), "{forked:?}");
+        let copied = meta::read_at_ref(&repo, "anonymous-copy").unwrap();
+        let origin = copied.fork_origin.unwrap();
+        assert_eq!(
+            origin.context,
+            agit::domain::session_privacy::ForkContext::Sanitized
+        );
+        assert_eq!(
+            origin.snapshot.unwrap().binding.repository_id,
+            identity.agent_id
+        );
+        assert!(copied.session_privacy.unwrap().creator.is_none());
+        assert_eq!(
+            storage::materialize_at(repo.root(), "anonymous-copy", meta::LOG_FILE).unwrap(),
+            public_log
+        );
+        assert!(
+            repo.show_result("anonymous-copy", "privacy/envelope.json")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+        agit::hub::identity::rebind(&repo, &copy_identity, &identity).unwrap();
+        repo.set_remote(&format!("{base}/alice/app.git")).unwrap();
     }
-
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-bob".into()),
+            username: "bob".into(),
+            email: None,
+            hub: Some(base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    if automatic_recovery {
+        // Local edits cannot carry a parent's envelope into a different snapshot or alter staging on refusal.
+        let draft = repo.root().join("draft.md");
+        std::fs::write(&draft, "Selected draft\n").unwrap();
+        repo.git(&["add", "draft.md"]).unwrap();
+        std::fs::write(&draft, "Working draft\n").unwrap();
+        let staged = repo.git(&["write-tree"]).unwrap();
+        for args in [
+            vec![
+                "cherry-pick",
+                "alice/app@encrypted#1",
+                "--into",
+                "alice/app@encrypted",
+            ],
+            vec!["revert", "alice/app@encrypted#1"],
+            vec!["branch", "--repo", "alice/app", "seal", "encrypted"],
+        ] {
+            let refused = run(&args);
+            assert!(!refused.status.success(), "{args:?}: {refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("native continuation or an independent fork"),
+                "{args:?}: {refused:?}"
+            );
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+            assert_eq!(repo.git(&["write-tree"]).unwrap(), staged);
+            assert_eq!(std::fs::read(&draft).unwrap(), b"Working draft\n");
+        }
+        repo.git(&["rm", "--cached", "--force", "draft.md"])
+            .unwrap();
+        std::fs::remove_file(draft).unwrap();
+    }
     let resume_args = [
         "resume",
         "alice/app@encrypted",
@@ -502,12 +725,118 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         "--cwd",
         workspace.to_str().unwrap(),
     ];
+    let restored = repo
+        .common_dir()
+        .unwrap()
+        .join("agit/privacy-recovery")
+        .join(&before);
+    if automatic_recovery {
+        // Inherited ciphertext keeps source authority when the checkout publishes elsewhere.
+        agit::hub::identity::rebind(&repo, &identity, &copy_identity).unwrap();
+        repo.set_remote(&format!("{base}/bob/copy.git")).unwrap();
+        source_route.store(2, Ordering::Release);
+        let refused = run(&["fork", "alice/app@encrypted", "-b", "unresolved-copy"]);
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("location temporarily unavailable"),
+            "{refused:?}"
+        );
+        assert!(!repo.has_ref("refs/heads/unresolved-copy"));
+        source_route.store(3, Ordering::Release);
+        let sanitized = run(&["fork", "alice/app@encrypted", "-b", "inaccessible-source"]);
+        assert!(sanitized.status.success(), "{sanitized:?}");
+        assert_eq!(
+            meta::read_at_ref(&repo, "inaccessible-source")
+                .unwrap()
+                .fork_origin
+                .unwrap()
+                .context,
+            agit::domain::session_privacy::ForkContext::Sanitized
+        );
+        assert!(!restored.exists());
+        source_route.store(0, Ordering::Release);
+        let nested_identity =
+            agit::hub::identity::RemoteIdentity::new(&base, "00000000-0000-0000-0000-000000000003")
+                .unwrap();
+        for display in ["pending", "ready"] {
+            if display == "ready" {
+                agit::hub::identity::rebind(&repo, &copy_identity, &nested_identity).unwrap();
+                repo.set_remote(&format!("{base}/carol/nested.git"))
+                    .unwrap();
+            }
+            let status = run(&["privacy", "status", &format!("alice/app@{before}")]);
+            assert!(status.status.success(), "{status:?}");
+            let text = String::from_utf8_lossy(&status.stdout);
+            assert!(
+                text.contains(&format!(
+                    "Original saved encrypted; sanitized view {display}."
+                )),
+                "{status:?}"
+            );
+            assert!(text.contains("Original access: unavailable"), "{status:?}");
+            assert!(!restored.exists());
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+        }
+        agit::hub::identity::rebind(&repo, &nested_identity, &copy_identity).unwrap();
+        repo.set_remote(&format!("{base}/bob/copy.git")).unwrap();
+        let sources = repo.common_dir().unwrap().join("agit/privacy-sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::write(
+            sources.join(format!("{}.json", identity.agent_id)),
+            serde_json::to_vec(&json!({"version":1,"identity":identity,"repository":"alice/app"}))
+                .unwrap(),
+        )
+        .unwrap();
+        source_route.store(1, Ordering::Release);
+        let renamed = run(&["privacy", "status", &format!("alice/app@{before}")]);
+        assert!(renamed.status.success(), "{renamed:?}");
+        assert!(String::from_utf8_lossy(&renamed.stdout).contains("Original saved encrypted"));
+        for reason in [
+            "no snapshot entitlement",
+            "try later",
+            "differs from the requested snapshot",
+        ] {
+            let refused = run(&resume_args);
+            assert!(!refused.status.success(), "{refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains(reason),
+                "{refused:?}"
+            );
+            assert!(!restored.exists());
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+        }
+    } else {
+        let unlocked = run(&unlock_args);
+        assert!(unlocked.status.success(), "{unlocked:?}");
+        assert!(!String::from_utf8_lossy(&unlocked.stdout).contains(&content_key));
+    }
     let resumed = run(&resume_args);
-    assert!(
-        resumed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&resumed.stderr)
+    assert!(resumed.status.success(), "{resumed:?}");
+    if automatic_recovery {
+        source_route.store(0, Ordering::Release);
+        agit::hub::identity::rebind(&repo, &copy_identity, &identity).unwrap();
+        repo.set_remote(&format!("{base}/alice/app.git")).unwrap();
+    }
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+    assert_eq!(
+        storage::materialize_worktree(&restored, meta::VIEW_FILE).unwrap(),
+        view
     );
+    assert_eq!(
+        meta::read(&restored).unwrap().cwd,
+        workspace.canonicalize().unwrap().to_string_lossy()
+    );
+    let key_text = STANDARD.encode(key.to_bytes());
+    for file in walkdir::WalkDir::new(&restored) {
+        let file = file.unwrap();
+        if file.file_type().is_file() {
+            let bytes = std::fs::read(file.path()).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(&key_text));
+            assert!(!text.contains(&content_key));
+        }
+    }
+
     assert!(
         String::from_utf8_lossy(&resumed.stdout).contains("Restoring private history"),
         "{}",
@@ -721,44 +1050,30 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     if legacy_commit {
         install_legacy_baseline(&repo, &before, &home, &runtime_file, &workspace);
     }
-    let anonymous_commit = run(&["commit", "alice/app@encrypted"]);
-    assert!(!anonymous_commit.status.success());
-    assert!(
-        String::from_utf8_lossy(&anonymous_commit.stderr).contains("sign in"),
-        "{anonymous_commit:?}"
-    );
-    save_at(
-        &home
-            .join("credentials")
-            .join(format!("{}.json", config::hub_host_key(&base).unwrap())),
-        &HubCredential {
-            account_id: Some("account-1".into()),
-            username: "alice".into(),
-            email: None,
-            hub: Some(base.clone()),
-            access_token: "synthetic-access".into(),
-            refresh_token: "synthetic-refresh".into(),
-            access_expires_at: "2099-01-01T00:00:00Z".into(),
-            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
-        },
-    )
-    .unwrap();
     std::fs::write(repo.root().join("README.md"), "Local continuation notes\n").unwrap();
-    let files = run(&[
+    let file_args = [
         "commit",
         "alice/app@encrypted",
         "-m",
         "Add local notes",
         "--",
         "README.md",
-    ]);
+    ];
+    let staged = repo.git(&["write-tree"]).unwrap();
+    let files = run(&file_args);
+    assert!(!files.status.success(), "{files:?}");
     assert!(
-        files.status.success(),
-        "{}",
         String::from_utf8_lossy(&files.stderr)
+            .contains("native continuation or an independent fork"),
+        "{files:?}"
+    );
+    assert_eq!(repo.git(&["write-tree"]).unwrap(), staged);
+    assert_eq!(
+        std::fs::read(repo.root().join("README.md")).unwrap(),
+        b"Local continuation notes\n"
     );
     let settlement_before = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
-    assert_ne!(settlement_before, before);
+    assert_eq!(settlement_before, before);
     if !legacy_commit {
         let resumed_again = run(&resume_args);
         assert!(resumed_again.status.success(), "{resumed_again:?}");
@@ -866,6 +1181,8 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         String::from_utf8_lossy(&committed.stdout),
         String::from_utf8_lossy(&committed.stderr)
     );
+    let files = run(&file_args);
+    assert!(files.status.success(), "{files:?}");
     let after = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
     assert_ne!(
         after,
@@ -873,6 +1190,14 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&committed.stdout),
         String::from_utf8_lossy(&committed.stderr)
+    );
+    assert_eq!(
+        meta::read_at_ref(&repo, &after).unwrap().session_privacy,
+        Some(ownership)
+    );
+    assert_eq!(
+        meta::read_at_ref(&repo, &after).unwrap().committer_account,
+        Some(AccountIdentity::new(&base, "account-bob").unwrap())
     );
     let committed_log = storage::materialize_at(repo.root(), &after, meta::LOG_FILE).unwrap();
     assert!(committed_log.starts_with(&log));
@@ -972,49 +1297,117 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             "public export disclosed {omitted}"
         );
     }
-    let viewing = SecretKey::from([13; 32]);
-    let sealed = run(&[
-        "export",
-        "alice/app@encrypted",
-        "--format",
-        "privacy-envelope",
-        "--viewing-public-key",
-        &STANDARD.encode(viewing.public_key().as_bytes()),
-    ]);
-    assert!(
-        sealed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&sealed.stderr)
-    );
-    let sealed = PrivacyEnvelope::parse(&sealed.stdout).unwrap();
-    let recovered = sealed.open_layer(&viewing).unwrap();
-    let (private_log, private_view) = recovered.session_bytes().unwrap();
-    let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-    let local_log = dictionary
-        .hydrate_envelopes_readonly(&committed_log)
-        .unwrap()
-        .text;
-    let local_view = dictionary
-        .hydrate_envelopes_readonly(&committed_view)
-        .unwrap()
-        .text;
-    assert!(private_log.starts_with(&log));
-    assert_eq!(private_log.as_str(), local_log);
-    assert!(private_view.contains("synthetic private session"));
-    assert_eq!(private_view.as_str(), local_view);
-    assert_eq!(
-        transcript::unwrap_strict(sealed.public_projection["session"]["log"].as_str().unwrap())
-            .unwrap(),
-        public_export
-    );
+    if automatic_recovery {
+        use agit::domain::session_privacy::ForkContext;
+        let fork =
+            |point: &str, branch: &str| run(&["fork", &format!("alice/app@{point}"), "-b", branch]);
+        fork_access.store(2, Ordering::Release);
+        let failed = fork(&before, "unavailable-original");
+        assert!(!failed.status.success(), "{failed:?}");
+        assert!(!repo.has_ref("refs/heads/unavailable-original"));
+        fork_access.store(1, Ordering::Release);
+        let sanitized = fork(&before, "sanitized-copy");
+        assert!(sanitized.status.success(), "{sanitized:?}");
+        let sanitized_meta = meta::read_at_ref(&repo, "sanitized-copy").unwrap();
+        assert_eq!(
+            sanitized_meta.fork_origin.as_ref().unwrap().context,
+            ForkContext::Sanitized
+        );
+        assert_eq!(
+            sanitized_meta
+                .session_privacy
+                .as_ref()
+                .unwrap()
+                .creator
+                .as_deref(),
+            Some("account-bob")
+        );
+        assert_eq!(
+            storage::materialize_at(repo.root(), "sanitized-copy", meta::LOG_FILE).unwrap(),
+            public_log
+        );
+        assert!(
+            repo.show("sanitized-copy", "privacy/envelope.json")
+                .is_none()
+        );
+
+        fork_access.store(0, Ordering::Release);
+        let original_copy = fork(&before, "original-copy");
+        assert!(original_copy.status.success(), "{original_copy:?}");
+        let copied = meta::read_at_ref(&repo, "original-copy").unwrap();
+        assert_ne!(copied.session, sanitized_meta.session);
+        assert_eq!(
+            copied.session_privacy.as_ref().unwrap().creator.as_deref(),
+            Some("account-bob")
+        );
+        let provenance = copied.fork_origin.as_ref().unwrap();
+        assert_ne!(
+            copied.session,
+            provenance.snapshot.as_ref().unwrap().binding.session_id
+        );
+        assert_ne!(
+            copied.session,
+            provenance
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .binding
+                .published_session_id
+        );
+        assert_eq!(provenance.context, ForkContext::Original);
+        assert_eq!(provenance.commit, before);
+        assert_eq!(
+            provenance
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .binding
+                .owner_key
+                .account_id,
+            "account-alice"
+        );
+        assert_eq!(
+            storage::materialize_at(repo.root(), "original-copy", meta::LOG_FILE).unwrap(),
+            log
+        );
+        assert_eq!(
+            storage::materialize_at(repo.root(), "original-copy", meta::VIEW_FILE).unwrap(),
+            view
+        );
+        assert!(
+            repo.show("original-copy", "privacy/envelope.json")
+                .is_none()
+        );
+        assert!(copied.runtime_instances.is_empty() && copied.baseline_bytes.is_none());
+        fork_access.store(1, Ordering::Release);
+        let independent = fork("original-copy", "independent-copy");
+        assert!(independent.status.success(), "{independent:?}");
+        assert_eq!(
+            storage::materialize_at(repo.root(), "independent-copy", meta::LOG_FILE).unwrap(),
+            log
+        );
+    }
+    if automatic_recovery {
+        agit::hub::identity::rebind(&repo, &identity, &copy_identity).unwrap();
+        repo.set_remote(&format!("{base}/bob/copy.git")).unwrap();
+        std::fs::remove_file(
+            repo.common_dir()
+                .unwrap()
+                .join("agit/privacy-sources")
+                .join(format!("{}.json", identity.agent_id)),
+        )
+        .unwrap();
+        original_access::exercise(run, &repo, &home, &base, &before, || {
+            source_route.store(1, Ordering::Release)
+        });
+    }
     stop.store(true, Ordering::Relaxed);
-    let requests = server.join().unwrap();
-    assert_eq!(
+    let (requests, key_requests) = server.join().unwrap();
+    assert_eq!(key_requests, if automatic_recovery { 7 } else { 1 });
+    assert!(
         requests
             .iter()
-            .filter(|path| path.contains("/privacy/keys/"))
-            .count(),
-        2
+            .all(|path| !path.contains("/bob/copy/") && !path.contains("/carol/nested/"))
     );
 }
 
@@ -1136,5 +1529,7 @@ fn install_legacy_baseline(
     );
     std::fs::write(file, &legacy).unwrap();
     std::fs::write(&path, claim.to_string()).unwrap();
+    let link = agit::domain::link::read(&path).unwrap();
+    std::fs::write(&path, format!("{}\n", link.to_json().unwrap())).unwrap();
     (path, claim, legacy)
 }

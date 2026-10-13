@@ -236,6 +236,8 @@ pub struct EvidenceSeed {
     pub cwd: String,
     pub tree: String,
     pub transaction_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committer_account: Option<crate::domain::session_privacy::AccountIdentity>,
 }
 
 impl EvidenceSeed {
@@ -279,6 +281,7 @@ impl EvidenceSeed {
             self.runtime.clone(),
             self.cwd.clone(),
         );
+        metadata.committer_account = self.committer_account.clone();
         metadata.kind = meta::Kind::File;
         metadata.milestone = Some(format!("file merge exploration for {}", self.target));
         meta::to_text(&metadata)
@@ -409,6 +412,7 @@ fn prepare_seed_with(
         cwd,
         tree: String::new(),
         transaction_json: request.transaction_json.to_owned(),
+        committer_account: None,
     };
     selection.transaction()?;
     super::require_destination_routing(request.repo, &tx.target)?;
@@ -471,6 +475,7 @@ fn prepare_seed_with(
             status == Some(1),
             "file exploration branch already exists or cannot be inspected"
         );
+        selection.committer_account = crate::infra::credentials::current_account()?;
         selection.tree =
             new::fresh_session_tree(request.repo, &tx.target_head, &selection.metadata()?)?;
         selection.role.origin_head = plumbing::commit_tree(

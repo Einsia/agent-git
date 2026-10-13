@@ -300,9 +300,15 @@ impl PathAliasStore {
         self.entries.is_empty() && self.private_entries.is_empty()
     }
 
-    #[cfg(feature = "secret-vault")]
-    pub(crate) fn reservation_boundary(&self) -> u64 {
-        self.next_private
+    /// Stored logical roots remain recognizable when the current policy no longer names them.
+    #[cfg(feature = "cli")]
+    pub(crate) fn logical_root_labels(&self) -> impl Iterator<Item = &str> {
+        self.entries.values().filter_map(|alias| {
+            alias
+                .strip_prefix('<')?
+                .split_once('>')
+                .map(|(label, _)| label)
+        })
     }
 
     /// Return the reverse mapping for the encrypted publication layer.

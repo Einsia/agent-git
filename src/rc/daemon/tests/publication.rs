@@ -72,7 +72,7 @@ fn ordinary_publication_delivery_retries_and_recovers_without_repository_keys() 
         .block_on(exercise(home.path(), false));
 }
 
-async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
+async fn exercise(home: &std::path::Path, session_encrypted: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let owner = Principal {
@@ -127,9 +127,9 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
         lineage.branch(),
         destination.clone(),
         &home.join("received.git"),
-        encryption_enabled,
+        session_encrypted,
     );
-    eligibility::configure(&repo, &hub, &published);
+    eligibility::configure(&repo, &hub);
     let mut first = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -150,28 +150,19 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
     let mut unavailable = first.clone();
     unavailable.source = "e".repeat(40);
     Entry::begin(&repo, &mut unavailable, capture.clone()).unwrap();
-    Entry::prepare(
-        &repo,
-        &unavailable,
-        &PublicationReceipt {
-            version: if encryption_enabled { 1 } else { 2 },
-            mode: published.mode,
-            repository: unavailable.repository.clone(),
-            branch: unavailable.branch.clone(),
-            source: unavailable.source.clone(),
-            published: if encryption_enabled {
-                "f".repeat(40)
-            } else {
-                unavailable.source.clone()
-            },
-            projected_session_id: None,
-            destination: unavailable.destination.clone(),
-            url: format!("{hub}/owner/project.git"),
-            policy_digest: encryption_enabled.then(|| "policy".into()),
-            recipient: encryption_enabled.then(|| "recipient".into()),
-        },
-    )
-    .unwrap();
+    // An unresolved plain receipt needs local metadata; it cannot stall other retained snapshots.
+    let missing = PublicationReceipt {
+        version: 2,
+        mode: crate::domain::privacy_receipt::PublicationMode::Ordinary,
+        source: unavailable.source.clone(),
+        published: unavailable.source.clone(),
+        projected_session_id: None,
+        session_snapshot: None,
+        policy_digest: None,
+        recipient: None,
+        ..published.clone()
+    };
+    Entry::prepare(&repo, &unavailable, &missing).unwrap();
     Entry::begin(&repo, &mut first, capture.clone()).unwrap();
     Entry::prepare(&repo, &first, &published).unwrap();
     let mut later = first.clone();
@@ -215,8 +206,6 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
     let (release_tx, mut release) = mpsc::channel(1);
     let expected_public = published.published.clone();
     let private_source = first.source.clone();
-    let current_key = Arc::new(std::sync::atomic::AtomicU8::new(23));
-    let served_key = current_key.clone();
     let server_hub = hub.clone();
     let server = tokio::spawn(async move {
         let mut original = None;
@@ -249,35 +238,18 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
             assert!(length <= agit_peer::publication::MAX_NOTIFICATION_BYTES);
             let mut body = vec![0; length];
             stream.read_exact(&mut body).await.unwrap();
-            if !encryption_enabled {
-                assert!(!request_line.contains("/privacy/"));
-            }
-            if let Some(mut response) =
-                eligibility::response(&server_hub, &request_line, encryption_enabled)
-            {
-                if request_line.contains("/privacy/publishing-key ") {
-                    use base64::Engine;
-                    let public = base64::engine::general_purpose::STANDARD.encode(
-                        crypto_box::SecretKey::from(
-                            [served_key.load(std::sync::atomic::Ordering::Acquire); 32],
-                        )
-                        .public_key()
-                        .as_bytes(),
-                    );
-                    response["current"]["public_key"] = json!(public);
-                    response["current"]["recipient"] =
-                        json!(crate::domain::privacy_key::recipient_id(&public));
-                }
+            assert!(!request_line.contains("/privacy/"));
+            if let Some(response) = eligibility::response(&server_hub, &request_line) {
                 respond(&mut stream, &response).await;
                 continue;
             }
             assert_eq!(request_line, "POST /api/peer/publications/confirm HTTP/1.1");
             assert!(authorized);
-            if encryption_enabled {
+            if session_encrypted {
                 assert!(!String::from_utf8_lossy(&body).contains(&private_source));
             }
             let delivery: Delivery = serde_json::from_slice(&body).unwrap();
-            git::verify(&remote, &delivery, encryption_enabled);
+            git::verify(&remote, &delivery, session_encrypted);
             assert_eq!(delivery.notification.public_commit, expected_public);
             if let Some(ref original) = original {
                 assert_eq!(&delivery.notification, original);
@@ -379,40 +351,7 @@ async fn exercise(home: &std::path::Path, encryption_enabled: bool) {
         .common_dir()
         .unwrap()
         .join("agit/privacy-auto-consent.json");
-    // An ordinary destination delivers without any saved consent; an encrypted one requires
-    // consent matching its current account, policy and recipient.
-    assert_eq!(consent_path.exists(), encryption_enabled);
-    if encryption_enabled {
-        let consent = std::fs::read(&consent_path).unwrap();
-        let mut changed: serde_json::Value = serde_json::from_slice(&consent).unwrap();
-        changed["account_id"] = json!("another-account");
-        std::fs::write(&consent_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-        let required = connection.call(request()).await.unwrap();
-        assert_eq!(
-            required["publication"]["reason"], "consent_required",
-            "{required}"
-        );
-        assert_ne!(required["publication"]["stage"], "receiver");
-        std::fs::write(&consent_path, &consent).unwrap();
-        current_key.store(24, std::sync::atomic::Ordering::Release);
-        let rotated = connection.call(request()).await.unwrap();
-        assert_eq!(rotated["publication"]["reason"], "consent_required");
-        assert!(rotated["items"].as_array().unwrap().is_empty());
-        let mut renewed: serde_json::Value = serde_json::from_slice(&consent).unwrap();
-        use base64::Engine;
-        let public = base64::engine::general_purpose::STANDARD.encode(
-            crypto_box::SecretKey::from([24; 32])
-                .public_key()
-                .as_bytes(),
-        );
-        let recipient = crate::domain::privacy_envelope::ViewingRecipient::from_base64(
-            crate::domain::privacy_key::recipient_id(&public),
-            &public,
-        )
-        .unwrap();
-        renewed["recipient"] = json!(recipient.fingerprint().unwrap());
-        std::fs::write(&consent_path, serde_json::to_vec(&renewed).unwrap()).unwrap();
-    }
+    assert!(!consent_path.exists());
     let result = connection.call(request()).await.unwrap();
     assert_eq!(result["items"][1]["status"], "retry", "{result}");
     assert_eq!(result["items"][2]["status"], "awaiting_publication");

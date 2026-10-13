@@ -4,9 +4,9 @@ use super::consent::AutoConsent;
 use super::*;
 use crate::commands::clone::Checkout;
 use crate::domain::privacy_git::ProjectedHistory;
-use crate::domain::privacy_receipt::{PublicationMode, PublicationReceipt, SupervisorReply};
+use crate::domain::privacy_receipt::{PublicationReceipt, SupervisorReply};
 use crate::hub::git::{
-    CapturedPublication, ContentInspection, FrozenPublication, InspectionFailure, InspectionReport,
+    CapturedPublication, ContentInspection, FrozenPublication, InspectionFailure,
     PublicationReport, PublicationStatus,
 };
 use crate::hub::identity::RemoteIdentity;
@@ -14,8 +14,7 @@ use crate::hub::{Client, RemoteAgent};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
-mod ordinary;
-mod separate;
+mod sessions;
 
 struct Destination {
     intent: Intent,
@@ -62,428 +61,37 @@ pub(super) fn run(
     checkout: Checkout,
     repo: Repo,
     branches: &[String],
-    selection_source: super::super::echo::Source,
 ) -> CmdResult {
     ensure!(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing publication"
     );
-    let device_local = crate::rc::local_repository::publication::is_device_local(&repo)?;
-    let separate_target = if let Some(requested) = args.to.as_deref()
-        && (args.separate || !device_local)
-    {
-        Some(separate::Selection::prepare(
-            &repo,
-            &checkout.slug(),
-            requested,
-            client.base(),
-        )?)
-    } else {
-        None
-    };
-    let local_target = if separate_target.is_some() {
-        None
-    } else {
-        crate::rc::local_repository::publication::Selection::prepare(
-            &repo,
-            args.to.as_deref(),
-            client.base(),
-        )?
-    };
+    let local_target = crate::rc::local_repository::publication::Selection::prepare(
+        &repo,
+        args.to.as_deref(),
+        client.base(),
+    )?;
     let destination_checkout = local_target
         .as_ref()
         .map(|selection| selection.checkout(&checkout.path))
-        .transpose()?
-        .or(separate_target
-            .as_ref()
-            .map(|selection| selection.checkout(&checkout.path))
-            .transpose()?);
+        .transpose()?;
     let intent = Intent::resolve(
         args,
         &client,
         me,
         destination_checkout.as_ref().unwrap_or(&checkout),
         &repo,
-        separate_target,
     )?;
-    ensure!(
-        local_target.is_none() || !matches!(&intent.action, Action::Copy(_)),
-        "a local RC publication requires a writable destination"
-    );
-    if !intent.encryption_enabled {
-        return ordinary::run(
-            args,
-            client,
-            checkout,
-            repo,
-            branches,
-            selection_source,
-            Destination {
-                intent,
-                local_target,
-            },
-        );
-    }
-    if intent.separate_target.is_some() {
-        let original =
-            crate::domain::repo::publication::PublicationPlan::freeze_selected(&repo, branches)?;
-        ordinary::require_original_history(&repo, &original)?;
-    }
-    println!("Destination encryption: enabled (repository viewing key required).");
-    let mut session_branches = Vec::new();
-    for branch in branches {
-        if meta::read_at_ref_result(&repo, &format!("refs/heads/{branch}"))?
-            .is_some_and(|metadata| metadata.is_file_line())
-        {
-            if !args.all {
-                ui::error(
-                    "encrypted session publication excludes repository file lines; select a session branch",
-                );
-                return Ok(ExitCode::Precondition);
-            }
-            ui::info(format_args!("Skipping repository file line: {branch}"));
-        } else {
-            session_branches.push(branch.clone());
-        }
-    }
-    if session_branches.is_empty() {
-        ui::info("No session branches selected for encrypted publication.");
-        return Ok(ExitCode::Ok);
-    }
-    let branches = session_branches.as_slice();
-    let target = format!("{}/{}", intent.owner, intent.name);
-    let target_id = match &intent.action {
-        Action::Existing(remote) => Some(remote.agent_id.clone()),
-        Action::Create => anyhow::bail!(
-            "repository viewing key is not configured; run `agit privacy init {target}` before encrypted publication, or push with --encryption=false to create an ordinary repository"
-        ),
-        Action::Copy(_) => anyhow::bail!(
-            "encrypted repository promotion requires a supported historical-key delivery contract; publish available original history with --to owner/new-repository while retaining the source identity"
-        ),
-    };
-    let destination_identity = RemoteIdentity::new(
-        client.base(),
-        target_id.as_deref().expect("existing destination"),
-    )?;
-    let mut supervisor = SupervisorReply::from_env()?;
-    let viewing = client
-        .repository_publishing_key(&target, &destination_identity)?
-        .require_current(&target)?;
-    let recipient = viewing.viewing_recipient()?;
-    let mut projected = ProjectedHistory::prepare_with_sources(
-        &repo,
-        branches,
-        &recipient,
-        &intent.url,
-        &[],
-        &destination_identity,
-    )?;
-    let existing_receipts = match &intent.action {
-        Action::Existing(remote) => Some(publication_receipts(
-            &projected,
-            &intent,
-            &RemoteIdentity::new(&intent.hub, &remote.agent_id)?,
-        )?),
-        Action::Create | Action::Copy(_) => None,
-    };
-    if let Some(reply) = &supervisor {
-        let Some(receipts) = &existing_receipts else {
-            anyhow::bail!("supervised publication requires an existing destination");
-        };
-        ensure!(
-            projected.source_heads().len() == 1 && receipts.len() == 1,
-            "supervised publication requires one session branch"
-        );
-        reply.request.verify(&receipts[0])?;
-        if reply.request.notification_id.is_some() {
-            crate::domain::privacy_receipt::outbox::Entry::load(&repo, &reply.request)?
-                .context("publication intent is missing")?;
-        }
-    }
-    let automatic = std::env::var_os(super::super::auto_push::AUTOMATIC_ENV).is_some();
-    ensure!(
-        !automatic || !args.audit,
-        "automatic publication cannot replace an interactive audit decision"
-    );
-    let auto_enabled = intent.separate_target.is_none() && repo.auto_push_enabled()?;
-    let consent = |agent_id: &str| -> Result<AutoConsent> {
-        let credential = credentials::load_checked(&intent.hub)?
-            .context("the selected account is no longer signed in")?;
-        Ok(AutoConsent {
-            version: 1,
-            mode: Default::default(),
-            hub: intent.hub.clone(),
-            account: intent.account.clone(),
-            account_id: credential.account_id,
-            agent_id: agent_id.into(),
-            url: intent.url.clone(),
-            visibility: intent.visibility.clone(),
-            policy_digest: Some(projected.policy_digest().into()),
-            recipient: Some(recipient.fingerprint()?),
-        })
-    };
-    let automatic_consent = if automatic {
-        let expected = match &intent.action {
-            Action::Existing(remote) if auto_enabled => consent(&remote.agent_id)?,
-            _ => return Err(super::super::InteractionRequired(
-                "automatic privacy publication requires an enabled policy and a confirmed existing destination; run an explicit push first".into(),
-            ).into()),
-        };
-        if !expected.matches(&repo)? {
-            return Err(super::super::InteractionRequired(
-                "automatic privacy publication requires renewed confirmation of its policy, recipient and destination; run an explicit push first".into(),
-            ).into());
-        }
-        Some(expected)
-    } else {
-        None
-    };
-    let manual_auto_consent = if !automatic && auto_enabled {
-        match &intent.action {
-            Action::Existing(remote) => consent(&remote.agent_id)?.matches(&repo)?,
-            _ => false,
-        }
-    } else {
-        true
-    };
-
-    projected.verify_accepted_policy()?;
-    let limits = secrets::ScanLimits::DEFAULT;
-    let spinner = ui::spinner("inspecting privacy-projected outgoing history…");
-    let baseline = inspection_destination(args, &intent)?;
-    let captured = CapturedPublication::capture_projected_for(
-        &projected,
-        limits.budget_bytes,
-        &repo,
-        baseline
-            .as_ref()
-            .map(|identity| (intent.url.as_str(), identity)),
-    )?;
-    let inspected = captured.inspect(limits);
-    spinner.finish_and_clear();
-    let complete = match inspected {
-        ContentInspection::Complete(complete) => complete,
-        ContentInspection::Blocked(blocked) => {
-            emit_push_target(&checkout, branches, selection_source);
-            show_inspection(blocked.report());
-            ui::error(&blocked.reason().to_string());
-            return Ok(inspection_failure_code(blocked.reason()));
-        }
-    };
-
-    let skip_allowed = !args.dry_run
-        && !args.show_preview
-        && !args.audit
-        && manual_auto_consent
-        && matches!(&intent.action, Action::Existing(_));
-    if skip_allowed
-        && projected.verify_source(&repo).is_ok()
-        && complete.verify_source(projected.repo()).is_ok()
-        && complete.captured().pointers().is_empty()
-        && existing_receipts.as_ref().is_some_and(|receipts| {
-            receipts_match_current(&repo, receipts, &intent).unwrap_or(false)
-        })
-        && existing_receipts.as_ref().is_some_and(|receipts| {
-            supervisor.is_some()
-                || no_pending_publication_receipts(&repo, receipts).unwrap_or(false)
-        })
-        && current_publication_state_matches(
-            &repo,
-            &projected,
-            &intent,
-            (&client, &viewing),
-            local_target.as_ref(),
-        )?
-    {
-        if let Some(mut reply) = supervisor {
-            let receipt = existing_receipts
-                .as_ref()
-                .and_then(|receipts| receipts.first())
-                .context("supervised publication has no candidate")?;
-            reply.prepare(&repo, receipt)?;
-            reply.complete(&repo, receipt.clone())?;
-        }
-        let display_target = if let [branch] = branches {
-            format!("{target}@{branch}")
-        } else {
-            target.clone()
-        };
-        ui::info(format_args!(
-            "{display_target} ({}): already up to date.",
-            intent.visibility
-        ));
-        return Ok(ExitCode::Ok);
-    }
-
-    emit_push_target(&checkout, branches, selection_source);
-    show_inspection(complete.report());
-    let mut destination = intent.json();
-    destination["authorize_automatic_policy"] = json!(auto_enabled && !automatic);
-    destination["recipient_fingerprint"] = json!(recipient.fingerprint()?);
-    println!(
-        "Publication destination: {}",
-        serde_json::to_string(&destination)?
-    );
-    println!(
-        "Publication target: {}/{} ({})",
-        intent.owner, intent.name, intent.visibility
-    );
-    let preview = projected.write_preview(&destination, &repo)?;
-    println!("Privacy preview: {}", preview.display());
-    println!(
-        "Publication scope: session records and metadata; repository files and standalone attachments are excluded."
-    );
-    println!(
-        "Privacy processing: {} snapshots; {} omitted items.",
-        projected.reports().len(),
-        projected
-            .reports()
-            .iter()
-            .map(|r| r.omissions.len())
-            .sum::<usize>()
-    );
-    if auto_enabled && !automatic {
-        ui::info(
-            "Confirmation also authorizes future automatic pushes under this repository policy, recipient and destination.",
-        );
-    }
-    if !automatic {
-        super::preview::show(&projected, &preview, args.show_preview)?;
-    }
-    // This owner retains the readable report through confirmation and publication.
-    let reviewed = if args.audit {
-        Some(super::audit::review(complete.captured(), &destination)?)
-    } else {
-        None
-    };
-    let decision = confirm_publication(
-        reviewed.as_ref().is_none_or(|review| review.complete()),
-        args.dry_run,
-        || {
-            if automatic_consent.is_some() {
-                return Ok(Some(true));
-            }
-            if !args.audit && std::env::var_os("AGIT_YES").is_some() {
-                return Ok(Some(true));
-            }
-            let answer = ui::prompt::confirm(&intent.confirmation(), false)?;
-            if answer.is_none() && !args.audit {
-                return Err(super::super::InteractionRequired("privacy publication requires confirmation of the generated preview; use --yes or an interactive terminal".into()).into());
-            }
-            Ok(answer)
-        },
-    )?;
-    match decision {
-        Decision::ReviewedOnly => {
-            ui::info("Privacy preview complete; nothing was published.");
-            return Ok(ExitCode::Ok);
-        }
-        Decision::Declined => {
-            ui::info("Publication cancelled.");
-            return Ok(ExitCode::Ok);
-        }
-        Decision::Incomplete => {
-            ui::error("audit review was not complete; publication is blocked");
-            return Ok(ExitCode::Policy);
-        }
-        Decision::Publish => {}
-    }
-
-    // Review and consent do not authorize a different account, source or destination.
-    projected.verify_source(&repo)?;
-    complete.verify_source(projected.repo())?;
-    intent.verify_account(&client)?;
-    intent.verify_before_mutation(&client, &repo)?;
-    if let Some(local_target) = &local_target {
-        local_target.verify(&repo)?;
-    }
-    if let Some(expected) = &automatic_consent {
-        ensure!(
-            repo.auto_push_enabled()?
-                && expected.matches(&repo)?
-                && consent(&expected.agent_id)? == *expected,
-            "automatic publication consent changed after preview"
-        );
-    }
-    // The concrete destination ID is installed only after creation has been confirmed.
-    let mut accepted = consent("")?;
-    let (repo, remote) = intent.materialize(&client, &checkout, repo)?;
-    projected.relocate(&repo)?;
-    complete.verify_source(projected.repo())?;
-    intent.verify_remote(&remote)?;
-    let observed = lookup(&client, &intent.owner, &intent.name)?
-        .context("the confirmed publication destination is unavailable")?;
-    intent.verify_observed(&observed, Some(&remote.identity.agent_id))?;
-    intent.verify_write_access(&client, &remote.identity.agent_id)?;
-    projected.verify_source(&repo)?;
-    intent.verify_source_binding(&repo)?;
-    let current_key = client
-        .repository_publishing_key(&target, &remote.identity)?
-        .require_current(&target)?;
-    ensure!(
-        current_key.public_key == viewing.public_key && current_key.recipient == viewing.recipient,
-        "viewing recipient changed after preview"
-    );
-    if let Some(local_target) = &local_target {
-        local_target.bind(&repo, &remote.identity)?;
-    }
-    projected.repo().set_remote(&remote.push_url)?;
-    identity::pin(projected.repo(), &remote.identity)?;
-    let receipts = publication_receipts(&projected, &intent, &remote.identity)?;
-    let prepared = complete.bind_destination_with_client(
-        projected.repo(),
-        &remote.push_url,
-        &remote.identity,
+    sessions::run(
+        args,
         client,
-    )?;
-    projected.prepare_acceptance()?;
-    if let Some(reply) = &mut supervisor {
-        reply.prepare(
-            &repo,
-            receipts
-                .first()
-                .context("supervised publication has no candidate")?,
-        )?;
-    }
-    let report = prepared.publish_with_privacy_receipts(
-        projected.policy_digest(),
-        &recipient.fingerprint()?,
-        &intent.visibility,
-    )?;
-    projected.confirm_acceptance(&report)?;
-    show_publication(&report);
-    if report.ok() {
-        verify_receipt_acknowledgements(&report, &receipts)?;
-        for receipt in &receipts {
-            intent.save_receipt(&repo, receipt)?;
-        }
-        if let Some(reply) = supervisor {
-            reply.complete(
-                &repo,
-                receipts
-                    .into_iter()
-                    .next()
-                    .context("supervised publication has no result")?,
-            )?;
-        }
-        if auto_enabled && !automatic {
-            accepted.agent_id = remote.identity.agent_id.clone();
-            accepted.save(&repo)?;
-        }
-        if remote.first_publish {
-            println!("Visibility: {}", visibility_label(&remote.visibility));
-        }
-        ui::info(format_args!("Published the reviewed snapshot to {target}."));
-        ui::info(
-            "Local branch tracking was not updated; the remote publication result is shown above.",
-        );
-        Ok(ExitCode::Ok)
-    } else {
-        ui::error(
-            "publication did not complete; some content may already be published and unconfirmed attempts may have taken effect",
-        );
-        Ok(publication_failure_code(&report))
-    }
+        repo,
+        branches,
+        Destination {
+            intent,
+            local_target,
+        },
+    )
 }
 
 fn verify_receipt_acknowledgements(
@@ -519,78 +127,13 @@ fn inspection_destination(args: &Args, intent: &Intent) -> Result<Option<RemoteI
     }
     match &intent.action {
         Action::Existing(remote) => Ok(Some(RemoteIdentity::new(&intent.hub, &remote.agent_id)?)),
-        Action::Create | Action::Copy(_) => Ok(None),
+        Action::Create => Ok(None),
     }
 }
 
-fn publication_receipts(
-    projected: &ProjectedHistory,
-    intent: &Intent,
-    destination: &RemoteIdentity,
-) -> Result<Vec<PublicationReceipt>> {
-    projected
-        .source_heads()
-        .iter()
-        .map(|source| {
-            let published = projected
-                .plan()
-                .heads()
-                .iter()
-                .find(|head| head.name() == source.name())
-                .context("generated publication is missing a selected branch")?;
-            let branch = source
-                .name()
-                .strip_prefix("refs/heads/")
-                .context("invalid publication branch")?;
-            let Some((policy_digest, receipt_recipient)) = projected.receipt_binding(branch)?
-            else {
-                return Ok(None);
-            };
-            let receipt = PublicationReceipt {
-                version: 1,
-                mode: Default::default(),
-                repository: format!("{}/{}", intent.owner, intent.name),
-                branch: source
-                    .name()
-                    .strip_prefix("refs/heads/")
-                    .context("invalid publication branch")?
-                    .into(),
-                source: source.oid().into(),
-                published: published.oid().into(),
-                projected_session_id: Some(
-                    crate::domain::storage::metadata_local(
-                        projected.repo().root(),
-                        published.oid(),
-                    )?
-                    .session,
-                ),
-                destination: destination.clone(),
-                url: intent.url.clone(),
-                policy_digest: Some(policy_digest.into()),
-                recipient: Some(receipt_recipient.into()),
-            };
-            receipt.validate()?;
-            Ok(Some(receipt))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(|receipts| receipts.into_iter().flatten().collect())
-}
-
-fn receipts_match_current(
-    repo: &Repo,
-    expected: &[PublicationReceipt],
-    intent: &Intent,
-) -> Result<bool> {
+fn receipts_match_current(repo: &Repo, expected: &[PublicationReceipt]) -> Result<bool> {
     for candidate in expected {
-        let saved = if intent.separate_target.is_some() {
-            PublicationReceipt::load_for_destination(
-                repo,
-                &candidate.branch,
-                &candidate.destination,
-            )?
-        } else {
-            PublicationReceipt::load(repo, &candidate.branch)?
-        };
+        let saved = PublicationReceipt::load(repo, &candidate.branch)?;
         let Some(saved) = saved else {
             return Ok(false);
         };
@@ -606,58 +149,6 @@ fn no_pending_publication_receipts(repo: &Repo, receipts: &[PublicationReceipt])
         !crate::domain::privacy_receipt::outbox::Entry::pending_for_publication(repo, receipt)
             .unwrap_or(true)
     }))
-}
-
-fn current_publication_state_matches(
-    repo: &Repo,
-    projected: &ProjectedHistory,
-    intent: &Intent,
-    key_check: (
-        &Client,
-        &crate::hub::privacy::repository_keys::PublishingKey,
-    ),
-    local_target: Option<&crate::rc::local_repository::publication::Selection>,
-) -> Result<bool> {
-    let (client, viewing) = key_check;
-    let Action::Existing(remote) = &intent.action else {
-        return Ok(false);
-    };
-    intent.verify_account(client)?;
-    intent.verify_before_mutation(client, repo)?;
-    intent.verify_write_access(client, &remote.agent_id)?;
-    if let Some(local_target) = local_target {
-        local_target.verify(repo)?;
-    }
-    let identity = RemoteIdentity::new(&intent.hub, &remote.agent_id)?;
-    let current = client
-        .repository_publishing_key(&format!("{}/{}", intent.owner, intent.name), &identity)?
-        .require_current(&format!("{}/{}", intent.owner, intent.name))?;
-    ensure!(
-        current.public_key == viewing.public_key && current.recipient == viewing.recipient,
-        "viewing recipient changed after preview"
-    );
-    Ok(
-        FrozenPublication::advertised_refs_match(repo, projected.plan(), &intent.url, &identity)
-            .unwrap_or(false),
-    )
-}
-
-fn emit_push_target(checkout: &Checkout, branches: &[String], source: super::super::echo::Source) {
-    let selections: Vec<_> = branches
-        .iter()
-        .map(|branch| {
-            super::super::echo::Selection::new(format!("{}@{branch}", checkout.slug()), source)
-                .role("source")
-        })
-        .collect();
-    super::super::echo::emit("push", &selections);
-}
-
-fn show_inspection(report: &InspectionReport) {
-    println!(
-        "Publication integrity: {} owned LFS payloads verified.",
-        report.binary_lfs().len()
-    );
 }
 
 fn inspection_failure_code(reason: InspectionFailure) -> ExitCode {
@@ -698,7 +189,6 @@ fn confirm_publication(
 enum Action {
     Existing(RemoteAgent),
     Create,
-    Copy(RemoteAgent),
 }
 
 #[derive(Debug)]
@@ -709,10 +199,8 @@ struct Intent {
     name: String,
     url: String,
     visibility: String,
-    encryption_enabled: bool,
     accept_secret_findings: bool,
     action: Action,
-    separate_target: Option<separate::Selection>,
 }
 
 impl Intent {
@@ -722,12 +210,10 @@ impl Intent {
         me: &str,
         checkout: &Checkout,
         repo: &Repo,
-        separate_target: Option<separate::Selection>,
     ) -> Result<Self> {
         let hub = identity::normalize_hub(client.base())?;
         let expected = identity::expected_for_transport(repo, client.base())?;
-        let requires_existing =
-            expected.is_some() || (separate_target.is_none() && identity::read(repo)?.is_some());
+        let requires_existing = expected.is_some() || identity::read(repo)?.is_some();
         let source = if requires_existing {
             Some(super::super::remote_request(
                 client.get_agent(&checkout.owner, &checkout.name),
@@ -735,20 +221,17 @@ impl Intent {
         } else {
             lookup(client, &checkout.owner, &checkout.name)?
         };
-        if let Some(selected) = &separate_target {
-            selected.verify_lookup(source.as_ref())?;
-        }
         let accept_secret_findings = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV)
             .is_none()
             && (args.allow_secrets || config::allow_secrets());
-        let copy = if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
+        let write_denied = if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
             match &source {
                 Some(remote) => !matches!(
                     super::super::remote_request(client.push_access_with_secret_acceptance(
                         &checkout.owner,
                         &checkout.name,
                         &remote.agent_id,
-                        accept_secret_findings && !remote.require_encryption_enabled()?,
+                        accept_secret_findings,
                     ))?,
                     crate::hub::PushAccess::Writable
                 ),
@@ -765,35 +248,10 @@ impl Intent {
             false
         };
         ensure!(
-            separate_target.is_none() || !copy,
-            "the explicit publication destination requires write access; refusing to choose another repository"
+            !write_denied,
+            "the selected account cannot publish to this repository; cross-repository publication requires preserved source authority"
         );
-        let (owner, visibility, url, action) = if copy {
-            let source = source.context("the source repository is unavailable")?;
-            verify_agent_location(&hub, &checkout.owner, &checkout.name, &source)?;
-            identity::verify_transport_target(repo, &RemoteIdentity::new(&hub, &source.agent_id)?)?;
-            if let Some(pinned) = identity::read(repo)? {
-                ensure!(
-                    pinned == RemoteIdentity::new(&hub, &source.agent_id)?,
-                    "the source identity changed"
-                );
-            }
-            ensure!(
-                lookup(client, me, &checkout.name)?.is_none(),
-                "the intended copy already exists on the Hub"
-            );
-            let local = config::repo_dir(me, &checkout.name)?;
-            ensure!(
-                !local.exists(),
-                "the intended copy already has a local checkout"
-            );
-            (
-                me.to_owned(),
-                source.visibility.clone(),
-                format!("{hub}/{me}/{}.git", checkout.name),
-                Action::Copy(source),
-            )
-        } else if let Some(remote) = source {
+        let (owner, visibility, url, action) = if let Some(remote) = source {
             verify_agent_location(&hub, &checkout.owner, &checkout.name, &remote)?;
             identity::verify_transport_target(repo, &RemoteIdentity::new(&hub, &remote.agent_id)?)?;
             (
@@ -804,8 +262,7 @@ impl Intent {
             )
         } else {
             ensure!(
-                expected.is_none()
-                    && (separate_target.is_some() || identity::read(repo)?.is_none()),
+                expected.is_none() && identity::read(repo)?.is_none(),
                 "the pinned remote is unavailable; refusing to create a replacement"
             );
             let public = match wanted_visibility(args, repo).value() {
@@ -824,47 +281,14 @@ impl Intent {
             "the publication audience is unsupported"
         );
         verify_url(&hub, &url)?;
-        let encryption_enabled = match &action {
-            Action::Existing(remote) => {
-                let enabled = remote.require_encryption_enabled()?;
-                ensure!(
-                    args.encryption.is_none_or(|selected| selected == enabled),
-                    "repository encryption mode is fixed at creation; create a different repository for the requested mode"
-                );
-                let pinned = match &separate_target {
-                    Some(_) => None,
-                    None => identity::read(repo)?,
-                };
-                if let Some(pinned) = &pinned {
-                    ensure!(
-                        *pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
-                        "the publication destination differs from the pinned repository identity"
-                    );
-                }
-                // A checkout initialized for encryption never sends original history to an
-                // ordinary repository on its first publication unless the command line says so:
-                // the Hub's mode may come from a default the owner never chose.
-                ensure!(
-                    enabled
-                        || args.encryption.is_some()
-                        || separate_target.is_some()
-                        || pinned.is_some()
-                        || expected.is_some()
-                        || repo.creation_encryption()? != Some(true),
-                    "this checkout was initialized for an encrypted repository, but {}/{} uses ordinary publication; pass --encryption=false to publish ordinary history there, or push to a new repository name to create an encrypted one",
-                    checkout.owner,
-                    checkout.name
-                );
-                enabled
-            }
-            Action::Create | Action::Copy(_) => {
-                if let Some(selected) = &separate_target {
-                    selected.encryption_for_creation(repo, client, args.encryption)?
-                } else {
-                    repo.encryption_for_creation(args.encryption)?
-                }
-            }
-        };
+        if let Action::Existing(remote) = &action
+            && let Some(pinned) = identity::read(repo)?
+        {
+            ensure!(
+                pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
+                "the publication destination differs from the pinned repository identity"
+            );
+        }
         if !matches!(action, Action::Create) && (args.private || args.public) {
             ui::warning(
                 "visibility flags only affect creation; the publication destination retains its existing audience",
@@ -877,54 +301,19 @@ impl Intent {
             name: checkout.name.clone(),
             url,
             visibility,
-            encryption_enabled,
-            accept_secret_findings: accept_secret_findings && !encryption_enabled,
+            accept_secret_findings,
             action,
-            separate_target,
         };
         intent.verify_account(client)?;
         Ok(intent)
     }
 
     fn json(&self) -> Value {
-        let (action, source, identity) = match &self.action {
-            Action::Create => ("ensure", Value::Null, Value::Null),
-            Action::Existing(remote) => ("publish", Value::Null, json!(remote.agent_id)),
-            Action::Copy(source) => (
-                "ensure_and_relocate",
-                json!({"owner":source.owner,"name":source.name,"agent_id":source.agent_id,"url":source.clone_url,"visibility":source.visibility}),
-                Value::Null,
-            ),
+        let (action, identity) = match &self.action {
+            Action::Create => ("ensure", Value::Null),
+            Action::Existing(remote) => ("publish", json!(remote.agent_id)),
         };
-        json!({"hub":self.hub,"account":self.account,"owner":self.owner,"name":self.name,"url":self.url,"visibility":self.visibility,"encryption_enabled":self.encryption_enabled,"separate_destination":self.separate_target.is_some(),"action":action,"agent_id":identity,"source":source,"repo_origins":[],"publication":if self.encryption_enabled { "reviewed session history and encrypted originals" } else { "ordinary source history, shared files, tags and LFS" }})
-    }
-
-    fn confirmation(&self) -> String {
-        let action = if self.separate_target.is_some() {
-            "Publish a separate copy of the reviewed refs"
-        } else {
-            match &self.action {
-                Action::Existing(_) => "Publish only the reviewed refs",
-                Action::Create => {
-                    "Ensure the destination exists with this audience, then publish only the reviewed refs"
-                }
-                Action::Copy(_) => {
-                    "Ensure the destination exists with this audience, relocate this local checkout, then publish only the reviewed refs (no server history copy)"
-                }
-            }
-        };
-        format!(
-            "{action} to {}/{} on {} ({}, encryption {})?",
-            self.owner,
-            self.name,
-            self.hub,
-            self.visibility,
-            if self.encryption_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        )
+        json!({"hub":self.hub,"account":self.account,"owner":self.owner,"name":self.name,"url":self.url,"visibility":self.visibility,"action":action,"agent_id":identity,"repo_origins":[],"publication":"registered session modes with immutable accepted ancestry"})
     }
 
     fn verify_account(&self, client: &Client) -> Result<()> {
@@ -946,10 +335,6 @@ impl Intent {
     fn verify_observed(&self, remote: &RemoteAgent, expected_id: Option<&str>) -> Result<()> {
         verify_agent_location(&self.hub, &self.owner, &self.name, remote)?;
         ensure!(
-            remote.require_encryption_enabled()? == self.encryption_enabled,
-            "the publication encryption mode changed; repository mode is fixed at creation"
-        );
-        ensure!(
             remote.clone_url == self.url && remote.visibility == self.visibility,
             "the publication endpoint or audience changed during publication"
         );
@@ -961,9 +346,6 @@ impl Intent {
     }
 
     fn verify_before_mutation(&self, client: &Client, repo: &Repo) -> Result<()> {
-        if let Some(selected) = &self.separate_target {
-            selected.verify(repo)?;
-        }
         match &self.action {
             Action::Existing(expected) => {
                 let observed = lookup(client, &self.owner, &self.name)?
@@ -984,136 +366,35 @@ impl Intent {
                     "the RC identity forbids creating a replacement"
                 );
             }
-            Action::Copy(source) => {
-                let observed = lookup(client, &source.owner, &source.name)?
-                    .context("the copy source disappeared")?;
-                ensure!(
-                    observed.agent_id == source.agent_id
-                        && observed.owner == source.owner
-                        && observed.name == source.name
-                        && observed.clone_url == source.clone_url
-                        && observed.visibility == source.visibility,
-                    "the copy source changed during publication"
-                );
-                if let Some(observed) = lookup(client, &self.owner, &self.name)? {
-                    self.verify_observed(&observed, None)?;
-                    self.verify_write_access(client, &observed.agent_id)?;
-                }
-                ensure!(
-                    !config::repo_dir(&self.owner, &self.name)?.exists(),
-                    "the intended copy already has a local checkout"
-                );
-                if let Some(pinned) = identity::read(repo)? {
-                    ensure!(
-                        pinned == RemoteIdentity::new(&self.hub, &source.agent_id)?,
-                        "the pinned copy source changed during publication"
-                    );
-                }
-            }
         }
         Ok(())
     }
 
-    fn materialize(
-        &self,
-        client: &Client,
-        checkout: &Checkout,
-        repo: Repo,
-    ) -> Result<(Repo, Remote)> {
-        if let Action::Copy(source) = &self.action {
-            let remote = self.ensure_destination(client, &repo, false)?;
-            self.verify_remote(&remote)?;
-            self.verify_write_access(client, &remote.identity.agent_id)?;
-            let observed = lookup(client, &self.owner, &self.name)?
-                .context("the prepared copy destination is unavailable")?;
-            self.verify_observed(&observed, Some(&remote.identity.agent_id))?;
-            let plan = super::super::clone::promote_to_prepared_destination(
-                &checkout.path,
-                source,
-                &observed,
-                &self.hub,
-            )?;
-            ensure!(
-                plan.owner == self.owner
-                    && plan.name == self.name
-                    && plan.origin == self.url
-                    && plan.identity == remote.identity,
-                "the local promotion does not match the reviewed destination"
-            );
-            let repo = Repo::open(&config::repo_dir(&plan.owner, &plan.name)?)
-                .context("the promoted checkout is unavailable")?;
-            return Ok((repo, remote));
-        }
-        let remote = match &self.action {
-            Action::Existing(expected) => {
-                let observed = lookup(client, &self.owner, &self.name)?.context(
-                    "the publication destination disappeared; refusing to create a replacement",
-                )?;
-                self.verify_observed(&observed, Some(&expected.agent_id))?;
-                let identity = RemoteIdentity::new(&self.hub, &observed.agent_id)?;
-                identity::verify_transport_target(&repo, &identity)?;
-                Remote {
-                    owner: observed.owner,
-                    name: observed.name,
-                    push_url: observed.clone_url,
-                    identity,
-                    visibility: observed.visibility,
-                    encryption_enabled: self.encryption_enabled,
-                    first_publish: false,
-                }
-            }
-            Action::Create => {
-                self.ensure_destination(client, &repo, self.separate_target.is_none())?
-            }
-            Action::Copy(_) => {
-                unreachable!("copy materialization returns before existing or new publication")
-            }
+    fn materialize(&self, client: &Client, repo: Repo) -> Result<(Repo, Remote)> {
+        let Action::Existing(expected) = &self.action else {
+            anyhow::bail!("session publication destination was not registered before preparation");
+        };
+        let observed = lookup(client, &self.owner, &self.name)?
+            .context("the publication destination disappeared; refusing to create a replacement")?;
+        self.verify_observed(&observed, Some(&expected.agent_id))?;
+        let identity = RemoteIdentity::new(&self.hub, &observed.agent_id)?;
+        identity::verify_transport_target(&repo, &identity)?;
+        let remote = Remote {
+            owner: observed.owner,
+            name: observed.name,
+            push_url: observed.clone_url,
+            identity,
+            visibility: observed.visibility,
         };
         self.verify_remote(&remote)?;
         self.verify_write_access(client, &remote.identity.agent_id)?;
-        if let Some(selected) = &self.separate_target {
-            selected.bind(&repo, &remote)?;
-        } else {
-            bind_publication_origin(
-                &repo,
-                &format!("{}/{}", self.owner, self.name),
-                &remote.identity,
-                &remote.push_url,
-            )?;
-        }
+        bind_publication_origin(
+            &repo,
+            &format!("{}/{}", self.owner, self.name),
+            &remote.identity,
+            &remote.push_url,
+        )?;
         Ok((repo, remote))
-    }
-
-    fn ensure_destination(&self, client: &Client, repo: &Repo, pin_first: bool) -> Result<Remote> {
-        // Live worktree origins are outside the captured publication and are never submitted.
-        ensure_remote_with_options(
-            client,
-            &self.owner,
-            &self.name,
-            Some(self.visibility == "public"),
-            &meta::Meta::new_file_line(),
-            repo,
-            RemotePreparation {
-                pin_identity: pin_first,
-                own_namespace: Some(self.account == self.owner),
-                encryption_enabled: self.encryption_enabled,
-            },
-        )
-    }
-
-    fn verify_source_binding(&self, repo: &Repo) -> Result<()> {
-        if let Some(selected) = &self.separate_target {
-            selected.verify_source(repo)?;
-        }
-        Ok(())
-    }
-
-    fn save_receipt(&self, repo: &Repo, receipt: &PublicationReceipt) -> Result<()> {
-        if self.separate_target.is_some() {
-            receipt.save_for_destination(repo)
-        } else {
-            receipt.save(repo)
-        }
     }
 
     fn verify_write_access(&self, client: &Client, agent_id: &str) -> Result<()> {
@@ -1138,7 +419,6 @@ impl Intent {
                 && remote.name == self.name
                 && remote.push_url == self.url
                 && remote.visibility == self.visibility
-                && remote.encryption_enabled == self.encryption_enabled
                 && remote.identity.hub == self.hub,
             "the actual destination does not match the reviewed publication"
         );
@@ -1175,9 +455,7 @@ fn verify_agent_location(hub: &str, owner: &str, name: &str, remote: &RemoteAgen
     verify_url(hub, &remote.clone_url)
 }
 
-/// Readiness uses the same account, recipient, policy and endpoint inputs as protected push.
-/// An ordinary destination is ready once its identity and write access check out, because
-/// automatic ordinary publication needs no saved consent; an encrypted one also needs its consent.
+/// Unattended delivery rechecks account and destination authority; push validates each snapshot.
 pub(crate) fn automatic_publication_consent(
     repo: &Repo,
     repository: &str,
@@ -1196,14 +474,11 @@ pub(crate) fn automatic_publication_consent_with_client(
     if !repo.auto_push_enabled()? {
         return Ok(false);
     }
-    let current = publication_consent_with_client(repo, repository, expected, client)?;
-    if !current.mode.is_encrypted() {
-        return Ok(true);
-    }
-    current.matches(repo)
+    publication_consent_with_client(repo, repository, expected, client)?;
+    Ok(true)
 }
 
-/// Explicit project enrollment reviews the same policy that unattended push later rechecks.
+/// Explicit enrollment binds a destination without choosing a repository-wide session mode.
 pub(crate) fn publication_consent(
     repo: &Repo,
     repository: &str,
@@ -1214,7 +489,7 @@ pub(crate) fn publication_consent(
 }
 
 pub(crate) fn publication_consent_with_client(
-    repo: &Repo,
+    _repo: &Repo,
     repository: &str,
     expected: &RemoteIdentity,
     client: &Client,
@@ -1239,31 +514,23 @@ pub(crate) fn publication_consent_with_client(
     );
     let credential =
         credentials::load_checked(&expected.hub)?.context("publication account is unavailable")?;
-    if !remote.require_encryption_enabled()? {
-        return Ok(ordinary::consent(
-            &expected.hub,
-            &credential,
-            &remote.agent_id,
-            &remote.clone_url,
-            &remote.visibility,
-        ));
-    }
-    let policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap_or_default();
-    let viewing = client
-        .repository_publishing_key(repository, expected)?
-        .require_current(repository)?;
-    let recipient = viewing.viewing_recipient()?;
+    let account = client.session_account()?;
+    ensure!(
+        client.credential_username().as_deref() == Some(credential.username.as_str())
+            && credential
+                .account_id
+                .as_ref()
+                .is_none_or(|id| id == &account.account_id),
+        "publication account changed"
+    );
     Ok(AutoConsent {
-        version: 1,
-        mode: Default::default(),
+        version: 3,
         hub: expected.hub.clone(),
         account: credential.username,
-        account_id: credential.account_id,
+        account_id: account.account_id,
         agent_id: expected.agent_id.clone(),
         url: remote.clone_url,
         visibility: remote.visibility,
-        policy_digest: Some(policy.digest()?),
-        recipient: Some(recipient.fingerprint()?),
     })
 }
 

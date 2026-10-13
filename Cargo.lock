@@ -53,7 +53,6 @@ dependencies = [
  "agit-tunnel",
  "aho-corasick",
  "anyhow",
- "argon2",
  "base64",
  "blake3",
  "chrono",
@@ -62,7 +61,6 @@ dependencies = [
  "comfy-table",
  "crossterm 0.29.0",
  "crypto_box",
- "crypto_secretbox",
  "dialoguer",
  "ed25519-dalek",
  "flate2",
@@ -288,18 +286,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
-]
-
-[[package]]
-name = "argon2"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
-dependencies = [
- "base64ct",
- "blake2",
- "cpufeatures 0.2.17",
- "zeroize",
 ]
 
 [[package]]

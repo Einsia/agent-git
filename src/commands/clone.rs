@@ -795,11 +795,12 @@ impl Plan {
         }
         repo.set_remote(&self.origin)?;
         if let Some(u) = &self.upstream {
-            repo.set_upstream(u)?;
             let source = self
                 .upstream_identity
                 .as_ref()
                 .context("copy source identity is missing")?;
+            crate::commands::privacy::sources::retain(repo, source, u)?;
+            repo.set_upstream(u)?;
             preserve_source_tracking(repo, false)?;
             let result = crate::hub::git::run_for_remote(
                 repo,
@@ -1111,52 +1112,8 @@ fn promote_with_progress(
     })
 }
 
-/// Attach a selected local checkout to an already validated destination without copying remote refs.
-/// The caller obtains publication consent and verifies the target identity and audience first.
-pub(crate) fn promote_to_prepared_destination(
-    checkout: &Path,
-    source: &RemoteAgent,
-    destination: &RemoteAgent,
-    hub: &str,
-) -> crate::Result<Plan> {
-    let source_identity = RemoteIdentity::new(hub, &source.agent_id)?;
-    let copy_identity = RemoteIdentity::new(hub, &destination.agent_id)?;
-    anyhow::ensure!(
-        source_identity != copy_identity,
-        "the prepared destination is the source repository"
-    );
-    let repo = Repo::at(checkout).exact_root_inspection();
-    identity::verify_transport_target(&repo, &source_identity)?;
-    match identity::read(&repo)? {
-        Some(pinned) => anyhow::ensure!(
-            pinned == source_identity,
-            "the selected copy source identity changed"
-        ),
-        None => identity::pin(&repo, &source_identity)?,
-    }
-    relocate_promoted_checkout(
-        &repo,
-        source,
-        &source_identity,
-        &copy_identity,
-        &destination.owner,
-        &destination.name,
-        &destination.clone_url,
-    )?;
-    Ok(Plan {
-        owner: destination.owner.clone(),
-        name: destination.name.clone(),
-        origin: destination.clone_url.clone(),
-        identity: copy_identity,
-        upstream: Some(source.clone_url.clone()),
-        upstream_identity: Some(source_identity),
-        writable: true,
-        promoted_in_place: true,
-    })
-}
-
 /// Local promotion retains repository and claim locks regardless of how the remote was prepared.
-fn relocate_promoted_checkout(
+pub(crate) fn relocate_promoted_checkout(
     repo: &Repo,
     source: &RemoteAgent,
     source_identity: &RemoteIdentity,
@@ -1165,6 +1122,14 @@ fn relocate_promoted_checkout(
     name: &str,
     push_url: &str,
 ) -> crate::Result<()> {
+    anyhow::ensure!(
+        identity::require_current(repo, &source_identity.hub)? == *source_identity
+            && source_identity.agent_id == source.agent_id
+            && source_identity != copy_identity
+            && source_identity.hub == copy_identity.hub,
+        "the selected copy source or destination identity changed"
+    );
+    identity::verify_transport_target(repo, source_identity)?;
     let checkout = repo.root();
     let store = Store::open_or_init()?;
     let source_slug = source.slug();
@@ -1201,6 +1166,7 @@ fn relocate_promoted_checkout(
         repo,
         repo.remote_is(crate::domain::repo::ORIGIN, &source.clone_url),
     )?;
+    crate::commands::privacy::sources::retain(repo, source_identity, &source.clone_url)?;
     identity::rebind(repo, source_identity, copy_identity)?;
     repo.set_remote(push_url)?;
     repo.set_upstream(&source.clone_url)?;
@@ -1670,7 +1636,16 @@ mod tests {
             let repo = if promote {
                 repo.set_remote(&source.clone_url).unwrap();
                 identity::pin(&repo, &RemoteIdentity::new(hub, &source.agent_id).unwrap()).unwrap();
-                super::promote_to_prepared_destination(&path, &source, &destination, hub).unwrap();
+                super::relocate_promoted_checkout(
+                    &repo,
+                    &source,
+                    &RemoteIdentity::new(hub, &source.agent_id).unwrap(),
+                    &RemoteIdentity::new(hub, &destination.agent_id).unwrap(),
+                    &destination.owner,
+                    &destination.name,
+                    &destination.clone_url,
+                )
+                .unwrap();
                 crate::domain::repo::Repo::at(
                     crate::infra::config::repo_dir("bob", "notes").unwrap(),
                 )
@@ -1706,6 +1681,25 @@ mod tests {
                 );
                 repo
             };
+            let retained_source = RemoteIdentity::new(hub, &source.agent_id).unwrap();
+            assert_eq!(
+                crate::commands::privacy::sources::retained(&repo, &retained_source).unwrap(),
+                Some("alice/notes".into())
+            );
+            repo.set_upstream(&format!("{hub}/unrelated/route.git"))
+                .unwrap();
+            let (_, repository, authority) =
+                crate::commands::privacy::unlock::source_context(&repo, &source.agent_id).unwrap();
+            assert_eq!(repository, "alice/notes");
+            assert_eq!(authority, retained_source);
+            assert!(
+                crate::commands::privacy::unlock::source_context(
+                    &repo,
+                    "00000000-0000-0000-0000-000000000003",
+                )
+                .is_err()
+            );
+            repo.set_upstream(&source.clone_url).unwrap();
             let receipt = |point| {
                 crate::commands::run::reuse_receipt(
                     &repo,
@@ -2056,7 +2050,6 @@ mod tests {
         let source = RemoteIdentity::new(hub, "00000000-0000-0000-0000-000000000001").unwrap();
         let response = |forked_from: Option<&str>, agent_id: &str| crate::hub::PublishResponse {
             agent_id: agent_id.into(),
-            encryption_enabled: Some(true),
             forked_from: forked_from.map(str::to_string),
             owner: "me".into(),
             name: "photo".into(),

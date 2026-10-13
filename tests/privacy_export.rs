@@ -1,13 +1,8 @@
 #![cfg(feature = "cli")]
 
-//! Public export and encrypted export consume the same policy-projected snapshot.
+//! Privacy export projects the selected snapshot before rendering or writing output.
 
-use agit::domain::{
-    meta, privacy::PrivacyPolicy, privacy_envelope::PrivacyEnvelope, repo::Repo, storage,
-    transcript,
-};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use crypto_box::SecretKey;
+use agit::domain::{meta, privacy::PrivacyPolicy, repo::Repo, storage, transcript};
 use serde_json::json;
 use std::process::Command;
 
@@ -19,7 +14,7 @@ mod publication_text;
 mod startup_cache;
 
 #[test]
-fn cli_export_projects_content_and_seals_recoverable_snapshot() {
+fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget_failure() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -52,7 +47,6 @@ fn cli_export_projects_content_and_seals_recoverable_snapshot() {
         .protect_envelopes(&log, &agit::domain::secret_filter::Matcher::empty())
         .unwrap()
         .text;
-    let view = log.split_inclusive('\n').next_back().unwrap();
     let saved_view = saved.split_inclusive('\n').next_back().unwrap();
     storage::write_snapshot(repo.root(), &saved, saved_view).unwrap();
     let metadata = meta::Meta::new(
@@ -107,7 +101,6 @@ fn cli_export_projects_content_and_seals_recoverable_snapshot() {
             .output()
             .unwrap()
     };
-    let key = SecretKey::from([21; 32]);
     let candidate_path = workspace.join("src/main.rs");
     let preview = run(&[
         "--json",
@@ -127,24 +120,20 @@ fn cli_export_projects_content_and_seals_recoverable_snapshot() {
         preview["result"]["value"]["report"]["candidates"][0]["rule"],
         "repository.include[0]"
     );
-    let public = STANDARD.encode(key.public_key().as_bytes());
-    let exported = run(&[
-        "export",
-        "alice/app@work",
-        "--format",
-        "privacy-envelope",
-        "--viewing-public-key",
-        &public,
-    ]);
+    let exported = run(&["export", "alice/app@work", "--privacy"]);
     assert!(
         exported.status.success(),
         "{}",
         String::from_utf8_lossy(&exported.stderr)
     );
-    let envelope = PrivacyEnvelope::parse(&exported.stdout).unwrap();
-    publication_text::assert_public(&envelope.public_projection, &workspace);
+    let public_log = transcript::wrap_lines(
+        &String::from_utf8(exported.stdout.clone()).unwrap(),
+        "claude-code",
+        &metadata.session,
+    );
+    publication_text::assert_public(&json!({"session":{"log":public_log}}), &workspace);
     let report = String::from_utf8_lossy(&exported.stderr);
-    assert!(report.contains("complete original LOG and VIEW"));
+    assert!(report.contains("original records are not included"));
     assert!(report.contains("Source LOG record 2: omitted from public content"));
     assert!(report.contains("tool source is excluded, ambiguous, or unknown"));
     assert!(report.contains("Policy version 1: sha256:"));
@@ -153,31 +142,10 @@ fn cli_export_projects_content_and_seals_recoverable_snapshot() {
     assert!(!report.contains("EXCLUDED_FILE_BODY"));
     assert!(!report.contains("private.txt"));
     assert!(!report.contains(workspace.to_str().unwrap()));
-    let public_log = envelope.public_projection["session"]["log"]
-        .as_str()
-        .unwrap();
     assert!(public_log.contains("<workspace>/src/main.rs"));
     assert!(!public_log.contains("EXCLUDED_FILE_BODY"));
     assert!(!public_log.contains("Selected reply"));
     assert!(!String::from_utf8_lossy(&exported.stdout).contains(workspace.to_str().unwrap()));
-    let recovered = envelope.open_layer(&key).unwrap();
-    let (restored_log, restored_view) = recovered.session_bytes().unwrap();
-    assert_eq!(restored_log.as_str(), log);
-    assert_eq!(restored_view.as_str(), view);
-
-    let plaintext = run(&["export", "alice/app@work", "--privacy"]);
-    assert!(
-        plaintext.status.success(),
-        "{}",
-        String::from_utf8_lossy(&plaintext.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(plaintext.stdout).unwrap(),
-        transcript::unwrap_strict(public_log).unwrap()
-    );
-    assert!(
-        String::from_utf8_lossy(&plaintext.stderr).contains("original records are not included")
-    );
     let selected = run(&["export", "alice/app@work", "--privacy", "--view-only"]);
     assert!(
         selected.status.success(),
@@ -187,17 +155,6 @@ fn cli_export_projects_content_and_seals_recoverable_snapshot() {
     let selected = String::from_utf8(selected.stdout).unwrap();
     assert!(selected.contains("AGIT_SECRET_V1"));
     assert!(!selected.contains("Read"));
-    let refused = run(&[
-        "export",
-        "alice/app@work",
-        "--format",
-        "privacy-envelope",
-        "--view-only",
-        "--viewing-public-key",
-        &public,
-    ]);
-    assert!(!refused.status.success());
-    assert!(refused.stdout.is_empty());
     assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
     privacy_input_budget::commit_oversized_event(&repo);
     let output = temp.path().join("export.json");

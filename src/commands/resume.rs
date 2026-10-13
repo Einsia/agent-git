@@ -955,7 +955,7 @@ fn resume_branch_for(
             recovered = Some(pinned);
         }
     }
-    let Some(snap) = recovered
+    let Some(mut snap) = recovered
         .as_ref()
         .map(|snapshot| snapshot.metadata.clone())
         .or_else(|| meta::read_at_ref(repo, &head))
@@ -1015,6 +1015,13 @@ fn resume_branch_for(
         .canonicalize()
         .map(crate::infra::git_runtime::path_for_git)
         .unwrap_or(cwd);
+
+    if recovered.is_none()
+        && let Some(snapshot) = super::privacy::unlock::recover_session(repo, &head, &cwd)?
+    {
+        snap = snapshot.metadata.clone();
+        recovered = Some(snapshot);
+    }
 
     // `cwd_state` is an observation, not a checkout instruction. Compare it before either
     // native reuse or VIEW materialization so both resume paths receive the same context.
@@ -2102,6 +2109,7 @@ fn materialize_and_resume(
         None => lk.agent = Some(slug.to_string()),
     }
     lk.branch = Some(branch.to_string());
+    lk.session_privacy = snap.session_privacy.clone();
     lk.materialized_from = Some(head.to_string());
     lk.privacy_recovery = recovered.map(RecoveredSnapshot::binding);
     lk.privacy_recovery_format = recovered.map(|_| link::NATIVE_PRIVACY_RECOVERY_FORMAT.into());

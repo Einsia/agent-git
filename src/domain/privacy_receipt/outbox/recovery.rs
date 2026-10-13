@@ -137,6 +137,7 @@ mod tests {
         )
         .unwrap();
         let publication = PublicationReceipt {
+            session_snapshot: None,
             version: 2,
             mode: PublicationMode::Ordinary,
             repository: next.repository.clone(),

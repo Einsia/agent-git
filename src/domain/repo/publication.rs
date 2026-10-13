@@ -143,6 +143,47 @@ impl PublicationPlan {
         &self.commit_objects
     }
 
+    /// Only raw ancestry of live destination heads establishes accepted history. A head
+    /// outside the selected branch can still accept its ancestors; unavailable heads cannot.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn accepted_commits(
+        &self,
+        repo: &Repo,
+        advertised: &[String],
+    ) -> Result<BTreeSet<String>> {
+        let advertised: BTreeSet<_> = advertised.iter().cloned().collect();
+        ensure!(
+            advertised.len() <= MAX_REFS,
+            "advertised ref limit exceeded"
+        );
+        ensure!(
+            advertised.iter().all(|oid| valid_oid(oid)),
+            "invalid advertised object identity"
+        );
+        let mut reader = Reader::new(repo);
+        let mut roots = Vec::new();
+        reader.repo.git_cat_file_batch_check(
+            advertised.iter().cloned().collect(),
+            |oid, kind, _| {
+                ensure!(
+                    advertised.contains(oid),
+                    "unexpected advertised object identity"
+                );
+                if kind == "commit" {
+                    roots.push(oid.to_owned());
+                }
+                Ok(())
+            },
+        )?;
+        let accepted = reader.ancestry(roots)?;
+        Ok(self
+            .commit_objects
+            .iter()
+            .filter(|oid| accepted.contains(*oid))
+            .cloned()
+            .collect())
+    }
+
     /// Every annotated tag object in the selected chains, including unreferenced inner tags.
     pub fn tag_objects(&self) -> &[String] {
         &self.tag_objects
@@ -620,7 +661,7 @@ mod tests {
         assert!(plan.verify(&repo, &branches).is_err());
     }
 
-    /// A topology overlay cannot hide a raw ancestor or its publication tag.
+    /// A topology overlay cannot hide raw ancestry or make a local fork remotely accepted.
     #[test]
     fn raw_parent_selection_ignores_local_topology_overlays() {
         let (_directory, repo, base) = repository();
@@ -630,10 +671,26 @@ mod tests {
         let tip = git(root, &["rev-parse", "HEAD"]);
         let branches = vec!["main".to_owned()];
         let plan = PublicationPlan::freeze(&repo, &branches).unwrap();
+        git(root, &["checkout", "-qb", "historical-fork", &base]);
+        git(root, &["commit", "--allow-empty", "-qm", "local fork"]);
+        let fork = git(root, &["rev-parse", "HEAD"]);
+        let historical =
+            PublicationPlan::freeze_selected(&repo, &["historical-fork".into()]).unwrap();
+        git(root, &["replace", "--graft", &tip, &fork]);
         std::fs::write(root.join(".git/shallow"), format!("{tip}\n")).unwrap();
-        std::fs::write(root.join(".git/info/grafts"), format!("{tip}\n")).unwrap();
+        std::fs::write(root.join(".git/info/grafts"), format!("{tip} {fork}\n")).unwrap();
         assert_eq!(PublicationPlan::freeze(&repo, &branches).unwrap(), plan);
         assert_eq!(plan.tags[0].oid, base);
+        assert_eq!(
+            historical.accepted_commits(&repo, &[tip]).unwrap(),
+            BTreeSet::from([base])
+        );
+        assert!(
+            historical
+                .accepted_commits(&repo, &["f".repeat(40)])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Missing history is an incomplete audit, even when a local shallow boundary hides it.

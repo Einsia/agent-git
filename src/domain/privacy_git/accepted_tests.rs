@@ -1,35 +1,8 @@
 use super::*;
-use crate::domain::{
-    privacy_key::recipient_id, privacy_receipt::PublicationReceipt, storage, transcript,
-};
+use crate::domain::{storage, transcript};
 use crate::hub::{git::RemoteRefs, identity::RemoteIdentity};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crypto_box::SecretKey;
-
-fn recipient(seed: u8) -> (SecretKey, ViewingRecipient) {
-    let key = SecretKey::from([seed; 32]);
-    let public = STANDARD.encode(key.public_key().as_bytes());
-    let recipient = ViewingRecipient::from_base64(recipient_id(&public), &public).unwrap();
-    (key, recipient)
-}
-
-fn append(repo: &Repo, n: usize) -> String {
-    let session = format!("agit-{}", "b".repeat(40));
-    let raw = format!(
-        "{}\n",
-        json!({"type":"user","message":{"role":"user","content":format!("Synthetic turn {n}")}})
-    );
-    let log = transcript::wrap_lines(&raw, "claude-code", &session);
-    storage::write_snapshot(repo.root(), &log, &log).unwrap();
-    meta::write(
-        repo.root(),
-        &Meta::new(session, "claude-code".into(), String::new()),
-    )
-    .unwrap();
-    repo.add_all().unwrap();
-    repo.commit(&format!("Source {n}")).unwrap();
-    repo.git(&["rev-parse", "HEAD"]).unwrap()
-}
 
 fn remote(history: &ProjectedHistory) -> RemoteRefs {
     RemoteRefs {
@@ -55,849 +28,603 @@ fn remote(history: &ProjectedHistory) -> RemoteRefs {
     }
 }
 
+/// Mixed admission preserves accepted bytes and scopes each new ciphertext to its own session.
 #[test]
-fn accepted_ancestry_survives_rewrap_rotation_cache_rebuild_and_lost_response() {
+fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
+    use super::sessions::SessionPublicationPlan;
+    use crate::domain::session_privacy::{
+        AccountIdentity, OwnerResolution, PublishedSnapshot, SessionPrivacy, SessionPrivacyConfig,
+        SessionScheme,
+    };
+    use crate::hub::privacy::sessions::{AccountSessionKey, SessionPrivacyResponse};
+
     let temp = tempfile::tempdir().unwrap();
     let source = Repo::init(&temp.path().join("source")).unwrap();
+    source
+        .git(&["config", "user.name", "Original Writer"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "original@example.invalid"])
+        .unwrap();
     source.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    source.git(&["checkout", "-b", "work"]).unwrap();
-    let first_source = append(&source, 1);
-    PrivacyPolicy::default().save(&source).unwrap();
     let identity = RemoteIdentity::new(
         "https://hub.invalid",
         "00000000-0000-0000-0000-000000000001",
     )
     .unwrap();
-    let url = "https://hub.invalid/alice/app.git";
-    crate::hub::identity::pin(&source, &identity).unwrap();
-    source.set_remote(url).unwrap();
-    #[cfg(feature = "cli")]
-    let reuse = |point: &str| {
-        crate::commands::run::reuse_receipt(
-            &source,
-            &identity.hub,
-            ("alice", "app"),
-            None,
-            point,
-            crate::hub::reuse::ReuseMode::Continue,
-        )
+    let logical = |letter: char| format!("agit-{}", letter.to_string().repeat(40));
+    let account = |id: &str| AccountIdentity::new(&identity.hub, id).unwrap();
+    let save = |metadata: &Meta, content: &str| {
+        let text = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &metadata.session,
+        );
+        storage::write_snapshot(source.root(), &text, &text).unwrap();
+        meta::write(source.root(), metadata).unwrap();
+        source.add_all().unwrap();
+        source.commit("Source snapshot").unwrap();
+        source.git(&["rev-parse", "HEAD"]).unwrap()
     };
+    source.git(&["checkout", "-b", "legacy"]).unwrap();
+    let legacy = Meta::new(logical('a'), "claude-code".into(), String::new());
+    fs::write(source.root().join("README.md"), "Accepted plain file\n").unwrap();
+    let base = save(&legacy, "Accepted plain conversation");
+    let mut selected = SessionPublicationPlan {
+        identity: identity.clone(),
+        remote: RemoteRefs {
+            heads: vec![base.clone()],
+            refs: BTreeMap::from([("refs/heads/legacy".into(), base.clone())]),
+            ..Default::default()
+        },
+        configs: BTreeMap::new(),
+    };
+    let make_config = |metadata: &Meta, key: Option<AccountSessionKey>| SessionPrivacyResponse {
+        config: SessionPrivacyConfig {
+            repository_id: identity.agent_id.clone(),
+            session_id: metadata.session.clone(),
+            privacy: metadata.session_privacy.clone().unwrap_or(SessionPrivacy {
+                scheme: SessionScheme::Plain,
+                hub: None,
+                creator: None,
+                owner: None,
+                owner_source: OwnerResolution::Unresolved,
+            }),
+            revision: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        },
+        owner_key: key,
+    };
+    selected
+        .configs
+        .insert(legacy.session.clone(), make_config(&legacy, None));
+    use sha2::Digest;
+    let payload = b"Plain file payload\n";
+    let lfs_oid = hex::encode(sha2::Sha256::digest(payload));
+    let lfs_path = source
+        .common_dir()
+        .unwrap()
+        .join("lfs/objects")
+        .join(&lfs_oid[..2])
+        .join(&lfs_oid[2..4])
+        .join(&lfs_oid);
+    fs::create_dir_all(lfs_path.parent().unwrap()).unwrap();
+    fs::write(&lfs_path, payload).unwrap();
+    fs::write(source.root().join("binary.dat"), b"\0binary bytes").unwrap();
+    fs::write(
+        source.root().join("plain-lfs.bin"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {}\n",
+            payload.len()
+        ),
+    )
+    .unwrap();
+    let plain = save(&legacy, "New plain conversation");
+    source.git(&["checkout", "-b", "work", &base]).unwrap();
+    let mut unclaimed = Meta::new_session_line("claude-code".into(), String::new());
+    unclaimed.committer_account = Some(account("owner-alice"));
+    storage::write_snapshot(source.root(), "", "").unwrap();
+    meta::write(source.root(), &unclaimed).unwrap();
+    source.add_all().unwrap();
+    source.commit("Unclaimed session birth").unwrap();
+    let birth = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let mut owned = Meta::new(logical('b'), "claude-code".into(), String::new());
+    owned.session_privacy = Some(SessionPrivacy::new(Some(account("owner-alice"))).unwrap());
+    owned.committer_account = Some(account("writer-bob"));
+    fs::write(
+        source.root().join("private-original.txt"),
+        "Unpublished original file\n",
+    )
+    .unwrap();
+    let original = save(&owned, "Private session Alice");
+    source.git(&["branch", "alias", &original]).unwrap();
+    let key_a = SecretKey::from([41; 32]);
+    let session_key = |id: &str, key: &SecretKey, version| AccountSessionKey {
+        account_id: id.into(),
+        key_version: version,
+        public_key_algorithm: "x25519".into(),
+        public_key: STANDARD.encode(key.public_key().as_bytes()),
+    };
+    selected.configs.insert(
+        owned.session.clone(),
+        make_config(&owned, Some(session_key("owner-alice", &key_a, 1))),
+    );
+    source.git(&["checkout", "-b", "other", &base]).unwrap();
+    let mut other = Meta::new(logical('c'), "claude-code".into(), String::new());
+    other.session_privacy = Some(SessionPrivacy::new(Some(account("owner-carol"))).unwrap());
+    other.committer_account = Some(account("owner-carol"));
+    let other_source = save(&other, "Private session Carol");
+    let key_c = SecretKey::from([42; 32]);
+    selected.configs.insert(
+        other.session.clone(),
+        make_config(&other, Some(session_key("owner-carol", &key_c, 1))),
+    );
+    let branches = vec![
+        "work".into(),
+        "legacy".into(),
+        "other".into(),
+        "alias".into(),
+    ];
     let redactor = Redactor::new(Default::default());
-    let (old_key, old) = recipient(20);
-    let (new_key, new) = recipient(21);
-    let prepare = |repo: &Repo, recipient: &ViewingRecipient, remote: &RemoteRefs, url: &str| {
-        ProjectedHistory::prepare_with_rules(
-            repo,
-            &["work".into()],
-            recipient,
-            url,
-            &redactor,
+    let prepare = |branches: &[String], selected: &SessionPublicationPlan| {
+        ProjectedHistory::prepare_sessions_with_redactor(
+            &source,
+            branches,
+            selected,
             &[],
-            Some((&identity, remote)),
+            &redactor,
         )
-        .unwrap()
     };
-    let mut first = prepare(&source, &old, &RemoteRefs::default(), url);
-    let first_public = first.plan.heads()[0].oid().to_owned();
-    let public_session = storage::metadata_local(first.repo.root(), &first_public)
-        .unwrap()
-        .session;
-    let first_cache = first.repo.root().to_owned();
-    let first_remote = remote(&first);
-    let receipt = PublicationReceipt {
-        version: 1,
-        mode: Default::default(),
-        repository: "alice/app".into(),
-        branch: "work".into(),
-        source: first_source.clone(),
-        published: first_public.clone(),
-        projected_session_id: Some(public_session.clone()),
-        destination: identity.clone(),
-        url: url.into(),
-        policy_digest: Some(first.policy_digest.clone()),
-        recipient: Some(old.fingerprint().unwrap()),
-    };
-    first.prepare_acceptance().unwrap();
-    drop(first);
-    let ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    source
+        .git(&["checkout", "-b", "ambiguous", &birth])
+        .unwrap();
+    let mut conflicting = other.clone();
+    conflicting.session = logical('d');
+    save(&conflicting, "Another claim of the same empty birth");
+    selected.configs.insert(
+        conflicting.session.clone(),
+        make_config(&conflicting, Some(session_key("owner-carol", &key_c, 1))),
+    );
+    let mut ambiguous = branches.clone();
+    ambiguous.push("ambiguous".into());
+    let error = prepare(&ambiguous, &selected).err().unwrap();
     assert!(
-        ledger.get("work", &first_source).is_none(),
-        "prepared objects are not accepted"
+        format!("{error:#}").contains("unambiguous descendant"),
+        "{error:#}"
     );
-    assert_eq!(
-        accepted_session_identity(&source, None, &first_source, &identity).unwrap(),
-        None,
-        "a prepared projection cannot authorize a reuse notification"
-    );
-    #[cfg(feature = "cli")]
-    assert_eq!(reuse(&first_source), None);
-    // A matching authenticated advertisement reconciles a response lost after receive.
-    let same = prepare(&source, &old, &first_remote, url);
-    assert_eq!(same.plan.heads()[0].oid(), first_public);
-    assert_eq!(same.preparations, 0);
-    drop(same);
-    assert_ne!(public_session, format!("agit-{}", "b".repeat(40)));
-    assert_ne!(first_public, first_source);
-    assert_eq!(
-        accepted_session_identity(&source, None, &first_source, &identity).unwrap(),
-        Some((public_session.clone(), first_public.clone()))
-    );
-    #[cfg(feature = "cli")]
-    assert_eq!(
-        reuse(&first_source),
-        crate::hub::reuse::SessionReuse::new(
-            "alice",
-            "app",
-            &public_session,
-            &first_public,
-            crate::hub::reuse::ReuseMode::Continue,
+    let first = prepare(&branches, &selected).unwrap();
+    first.session_manifest().validate().unwrap();
+    assert!(
+        first.session_manifest().snapshots.iter().any(
+            |entry| matches!(entry, PublishedSnapshot::Plain { commit, .. } if commit == &plain)
         )
     );
-    let other_identity =
-        RemoteIdentity::new(&identity.hub, "00000000-0000-0000-0000-000000000002").unwrap();
     assert_eq!(
-        accepted_session_identity(&source, None, &first_source, &other_identity).unwrap(),
-        None,
-        "publication mappings cannot cross repository identities"
+        first.repo.git(&["cat-file", "commit", &base]).unwrap(),
+        source.git(&["cat-file", "commit", &base]).unwrap()
     );
-    let (selected, envelope) = accepted_envelope(&source, None, &first_source, &identity).unwrap();
-    assert_eq!(selected, first_public);
-    assert!(envelope.open_layer(&old_key).is_ok());
     assert_eq!(
-        receipt_session_id(&source, &receipt).unwrap(),
-        public_session
+        first.repo.git(&["rev-parse", "refs/heads/legacy"]).unwrap(),
+        plain
     );
-    fs::remove_dir_all(first_cache.join(".git/privacy-preparation")).unwrap();
-    let rotated = prepare(&source, &new, &first_remote, url);
-    assert_eq!(rotated.plan.heads()[0].oid(), first_public);
-    assert_eq!(remote(&rotated).tags, first_remote.tags);
-    assert_eq!(rotated.preparations, 0);
+    let published_a = first.repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
     assert_eq!(
-        rotated.receipt_binding("work").unwrap().unwrap().1,
-        receipt.recipient.as_deref().unwrap()
+        first.repo.git(&["rev-parse", "refs/heads/alias"]).unwrap(),
+        published_a
     );
-    drop(rotated);
+    let published_c = first.repo.git(&["rev-parse", "refs/heads/other"]).unwrap();
+    let envelope = |repo: &Repo, commit: &str| {
+        PrivacyEnvelope::parse(
+            repo.show_result(commit, "privacy/envelope.json")
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap()
+    };
+    let sealed_a = envelope(&first.repo, &published_a);
+    let sealed_c = envelope(&first.repo, &published_c);
+    let public_session = sealed_a
+        .session_binding
+        .as_ref()
+        .unwrap()
+        .published_session_id
+        .clone();
     assert_eq!(
-        receipt_session_id(&source, &receipt).unwrap(),
-        public_session
+        sealed_a.open_layer(&key_a).unwrap().metadata["session_privacy"],
+        serde_json::to_value(&owned.session_privacy).unwrap()
     );
-    let second_source = append(&source, 2);
-    #[cfg(feature = "cli")]
+    assert!(sealed_a.open_layer(&key_c).is_err());
+    assert!(sealed_c.open_layer(&key_c).is_ok());
     assert_eq!(
-        reuse(&second_source),
-        None,
-        "unpublished turns remain private"
+        sealed_a.session_binding.as_ref().unwrap().committer,
+        crate::domain::session_privacy::CommitterAttribution::Account {
+            account_id: "writer-bob".into()
+        }
     );
-    let mut appended = prepare(&source, &new, &first_remote, url);
-    assert_eq!(appended.preparations, 1);
-    let second_public = appended.plan.heads()[0].oid().to_owned();
-    assert_eq!(
-        appended
+    for original in [&original, &other_source, &birth] {
+        assert!(first.repo.git(&["cat-file", "-e", original]).is_err());
+    }
+    assert!(
+        first
             .repo
+            .show_result(&published_a, "private-original.txt")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        first
+            .repo
+            .show_result(&published_a, "README.md")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        first
+            .repo
+            .git(&["rev-parse", &format!("{published_a}^^")])
+            .unwrap(),
+        base
+    );
+    first.public_digest().unwrap();
+    let captured =
+        crate::hub::git::CapturedPublication::capture_projected(&first, 1024 * 1024, &source)
+            .unwrap();
+    assert_eq!(captured.pointers().len(), 1);
+    assert_eq!(captured.pointers()[0].oid, lfs_oid);
+    let mut retained = Vec::new();
+    use std::io::Read;
+    captured
+        .open_payload(&captured.pointers()[0])
+        .unwrap()
+        .read_to_end(&mut retained)
+        .unwrap();
+    assert_eq!(retained, payload);
+    fs::write(&lfs_path, b"Unreviewed live cache replacement").unwrap();
+    let preview = first
+        .write_preview(
+            &json!({"repository_id":identity.agent_id}),
+            &source,
+            &captured,
+        )
+        .unwrap();
+    let preview: serde_json::Value = serde_json::from_slice(&fs::read(preview).unwrap()).unwrap();
+    let files = preview["files"].as_array().unwrap();
+    let lfs = files
+        .iter()
+        .find(|file| file["path"] == "plain-lfs.bin")
+        .unwrap();
+    assert_eq!(lfs["text"], std::str::from_utf8(payload).unwrap());
+    assert_eq!(lfs["lfs"]["oid"], lfs_oid);
+    assert_eq!(lfs["commit"], plain);
+    let binary = files
+        .iter()
+        .find(|file| file["path"] == "binary.dat")
+        .unwrap();
+    assert_eq!(binary["binary_bytes"], b"\0binary bytes".len());
+    assert!(binary.get("text").is_none());
+    assert!(
+        !preview
+            .to_string()
+            .contains("Unreviewed live cache replacement")
+    );
+    assert!(!preview.to_string().contains("Unpublished original file"));
+    fs::write(&lfs_path, payload).unwrap();
+    let first_plan = first.plan.clone();
+    let store = first.repo.root().to_owned();
+    drop(first);
+
+    let removed = selected.configs.remove(&owned.session).unwrap();
+    assert!(
+        prepare(&branches, &selected)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("registered privacy configuration")
+    );
+    selected.configs.insert(owned.session.clone(), removed);
+    assert_eq!(
+        Repo::at(&store)
+            .git(&["rev-parse", "refs/heads/work"])
+            .unwrap(),
+        published_a
+    );
+    let rotated = SecretKey::from([43; 32]);
+    selected.configs.get_mut(&owned.session).unwrap().owner_key =
+        Some(session_key("owner-alice", &rotated, 2));
+    let mut retry = prepare(&branches, &selected).unwrap();
+    assert_eq!(retry.plan, first_plan);
+    assert_eq!(retry.preparations, 0);
+    retry.prepare_acceptance().unwrap();
+    selected.remote = remote(&retry);
+    let receipt = retry
+        .session_receipts("team/app", &identity, "https://hub.invalid/team/app.git")
+        .unwrap()
+        .into_iter()
+        .find(|receipt| receipt.branch == "work")
+        .unwrap();
+    drop(retry);
+    assert_eq!(
+        receipt.mode,
+        crate::domain::privacy_receipt::PublicationMode::SessionOwnerV2
+    );
+    receipt.save(&source).unwrap();
+    assert_eq!(
+        crate::domain::privacy_receipt::PublicationReceipt::load(&source, "work")
+            .unwrap()
+            .as_ref(),
+        Some(&receipt)
+    );
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["mode"],
+        "session_owner_v2"
+    );
+    assert_eq!(receipt.session_id(&source).unwrap(), public_session);
+    assert!(receipt.ancestors(&source).unwrap().contains(&base));
+    let mut altered = receipt.clone();
+    altered.session_snapshot.as_mut().unwrap().envelope_digest =
+        digest_json(&json!("different envelope")).unwrap();
+    assert!(altered.session_id(&source).is_err());
+    altered = receipt.clone();
+    altered.source = "f".repeat(40);
+    assert!(altered.validate().is_err());
+    source.git(&["checkout", "work"]).unwrap();
+    save(&owned, "Private continuation by Bob");
+    let mut next = prepare(&branches, &selected).unwrap();
+    let second_public = next.repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    assert_eq!(
+        next.repo
             .git(&["rev-parse", &format!("{second_public}^")])
             .unwrap(),
-        first_public
+        published_a
+    );
+    let sealed = envelope(&next.repo, &second_public);
+    assert_eq!(
+        sealed
+            .session_binding
+            .as_ref()
+            .unwrap()
+            .owner_key
+            .key_version,
+        2
     );
     assert_eq!(
-        storage::metadata_local(appended.repo.root(), &second_public)
+        sealed
+            .session_binding
+            .as_ref()
             .unwrap()
-            .session,
+            .published_session_id,
         public_session
     );
-    let envelope = PrivacyEnvelope::parse(
-        appended
-            .repo
-            .show_result(&second_public, "privacy/envelope.json")
-            .unwrap()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    assert_eq!(envelope.private_payload.wrapped_keys[0].recipient, new.id());
-    assert!(envelope.open_layer(&new_key).is_ok());
-    assert!(envelope.open_layer(&old_key).is_err());
-    let after = remote(&appended);
-    for (tag, oid) in &first_remote.tags {
-        assert_eq!(after.tags.get(tag), Some(oid));
-    }
-    appended.prepare_acceptance().unwrap();
-    drop(appended);
-    let repeated = prepare(&source, &new, &after, url);
-    assert_eq!(repeated.plan.heads()[0].oid(), second_public);
-    assert_eq!(repeated.preparations, 0);
-    drop(repeated);
+    assert!(sealed.open_layer(&rotated).is_ok());
     assert!(
-        accepted::Ledger::open(&source, &identity)
-            .unwrap()
-            .get("work", &second_source)
-            .is_some()
-    );
-    let renamed = prepare(
-        &source,
-        &new,
-        &after,
-        "https://hub.invalid/alice/renamed.git",
-    );
-    assert_eq!(renamed.plan.heads()[0].oid(), second_public);
-    assert_eq!(renamed.preparations, 0);
-    drop(renamed);
-    let another =
-        RemoteIdentity::new(&identity.hub, "00000000-0000-0000-0000-000000000002").unwrap();
-    assert!(
-        ProjectedHistory::prepare_with_rules(
-            &source,
-            &["work".into()],
-            &new,
-            url,
-            &redactor,
-            &[],
-            Some((&another, &after))
-        )
-        .is_err()
-    );
-    let mut policy = PrivacyPolicy::default();
-    policy.exclude.push("private/**".into());
-    policy.save(&source).unwrap();
-    let changed_policy = prepare(&source, &new, &after, url);
-    assert!(changed_policy.verify_accepted_policy().is_err());
-    drop(changed_policy);
-    let ledger_root = source.common_dir().unwrap().join("agit/privacy-accepted");
-    for entry in fs::read_dir(ledger_root).unwrap() {
-        let path = entry.unwrap().path().join("index.enc");
-        if path.is_file() {
-            fs::write(path, b"invalid authenticated mapping").unwrap();
-        }
-    }
-    assert!(
-        ProjectedHistory::prepare_with_rules(
-            &source,
-            &["work".into()],
-            &new,
-            url,
-            &redactor,
-            &[],
-            Some((&identity, &after))
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn interrupted_batch_needs_remote_reconciliation_before_acceptance() {
-    use crate::hub::git::{
-        Outcome, PublicationAttempt, PublicationPhase, PublicationReport, PublicationStatus,
-        PublishedRef,
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let source = Repo::init(&temp.path().join("source")).unwrap();
-    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    source.git(&["checkout", "-b", "work"]).unwrap();
-    let first = append(&source, 1);
-    let second = append(&source, 2);
-    let identity = RemoteIdentity::new(
-        "https://hub.invalid",
-        "00000000-0000-0000-0000-000000000001",
-    )
-    .unwrap();
-    let (_, key) = recipient(25);
-    let mut history = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["work".into()],
-        &key,
-        "https://hub.invalid/alice/app.git",
-        &Redactor::new(Default::default()),
-        &[],
-        Some((&identity, &RemoteRefs::default())),
-    )
-    .unwrap();
-    history.prepare_acceptance().unwrap();
-    let partial = PublicationReport {
-        lfs: None,
-        tags: None,
-        error: Some("lost response".into()),
-        heads: Some(PublicationPhase {
-            error: None,
-            unattempted: vec![],
-            attempts: vec![PublicationAttempt {
-                batch: 0,
-                outcome: Outcome {
-                    code: 1,
-                    stderr: "lost response".into(),
-                },
-                complete: false,
-                error: None,
-                refs: vec![PublishedRef {
-                    reference: history.plan.heads()[0].clone(),
-                    status: PublicationStatus::Updated,
-                    detail: None,
-                }],
-            }],
-        }),
-    };
-    history.confirm_acceptance(&partial).unwrap();
-    assert!(
-        history
-            .accepted_ledger
-            .as_ref()
-            .unwrap()
-            .get("work", &second)
-            .is_none()
-    );
-    let candidate = &history.candidates["work"];
-    let mut observed = RemoteRefs::default();
-    observed.refs.insert(
-        "refs/heads/work".into(),
-        candidate.mappings[&first].public.clone(),
-    );
-    history
-        .accepted_ledger
-        .as_mut()
-        .unwrap()
-        .reconcile(&observed)
-        .unwrap();
-    assert!(
-        history
-            .accepted_ledger
-            .as_ref()
-            .unwrap()
-            .get("work", &first)
-            .is_some()
-    );
-    assert!(
-        history
-            .accepted_ledger
-            .as_ref()
-            .unwrap()
-            .get("work", &second)
-            .is_none()
-    );
-    let observed = remote(&history);
-    history
-        .accepted_ledger
-        .as_mut()
-        .unwrap()
-        .reconcile(&observed)
-        .unwrap();
-    assert!(
-        history
-            .accepted_ledger
-            .as_ref()
-            .unwrap()
-            .get("work", &second)
-            .is_some()
-    );
-}
-
-#[test]
-fn fork_keeps_accepted_parent_and_its_own_session_after_rotation() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = Repo::init(&temp.path().join("source")).unwrap();
-    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    source.git(&["checkout", "-b", "work"]).unwrap();
-    let original = append(&source, 1);
-    let mut policy = PrivacyPolicy::default();
-    policy.branches.insert(
-        "restricted".into(),
-        super::super::privacy::BranchRestriction {
-            exclude: vec!["**".into()],
-            memory_exclude: vec![],
-        },
-    );
-    policy.save(&source).unwrap();
-    let identity = RemoteIdentity::new(
-        "https://hub.invalid",
-        "00000000-0000-0000-0000-000000000001",
-    )
-    .unwrap();
-    let url = "https://hub.invalid/alice/app.git";
-    let redactor = Redactor::new(Default::default());
-    let (old_key, old) = recipient(20);
-    let (new_key, new) = recipient(21);
-    let mut first = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["work".into()],
-        &old,
-        url,
-        &redactor,
-        &[],
-        Some((&identity, &RemoteRefs::default())),
-    )
-    .unwrap();
-    let first_public = first.plan.heads()[0].oid().to_owned();
-    let first_remote = remote(&first);
-    first.prepare_acceptance().unwrap();
-    drop(first);
-    let same = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["work".into()],
-        &old,
-        url,
-        &redactor,
-        &[],
-        Some((&identity, &first_remote)),
-    )
-    .unwrap();
-    drop(same);
-    let base = crate::commands::fork::ForkBase {
-        repo: source.clone(),
-        slug: "alice/app".into(),
-        resolved: crate::domain::refs::Resolved {
-            branch: Some("work".into()),
-            sha: original.clone(),
-            turn: None,
-            event_index: None,
-            range: None,
-            path: None,
-        },
-    };
-    crate::commands::fork::fork_branch(&base, "alice/app@work", "continuation")
-        .unwrap()
-        .unwrap();
-    let next = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["continuation".into()],
-        &new,
-        url,
-        &redactor,
-        &[],
-        Some((&identity, &first_remote)),
-    )
-    .unwrap();
-    let next_public = next.plan.heads()[0].oid();
-    let parent = next
-        .repo
-        .git(&["rev-parse", &format!("{next_public}^")])
-        .unwrap();
-    assert_eq!(
-        parent, first_public,
-        "Forking an already published source must retain its accepted public parent, including across key rotation"
-    );
-    assert_eq!(next.preparations, 1);
-    let original_session = storage::metadata_local(next.repo.root(), &first_public)
-        .unwrap()
-        .session;
-    let fork_session = storage::metadata_local(next.repo.root(), next_public)
-        .unwrap()
-        .session;
-    assert_ne!(original_session, fork_session);
-    let envelope = PrivacyEnvelope::parse(
-        next.repo
-            .show_result(next_public, "privacy/envelope.json")
-            .unwrap()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    assert!(envelope.open_layer(&new_key).is_ok());
-    assert!(envelope.open_layer(&old_key).is_err());
-    let inherited = PrivacyEnvelope::parse(
-        next.repo
-            .show_result(&first_public, "privacy/envelope.json")
-            .unwrap()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    assert!(inherited.open_layer(&old_key).is_ok());
-    drop(next);
-    crate::commands::fork::fork_branch(&base, "alice/app@work", "restricted")
-        .unwrap()
-        .unwrap();
-    let error = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["restricted".into()],
-        &new,
-        url,
-        &redactor,
-        &[],
-        Some((&identity, &first_remote)),
-    )
-    .err()
-    .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("incompatible branch privacy restrictions"),
-        "{error:#}"
-    );
-}
-
-#[test]
-fn fork_after_clone_continuation_keeps_original_public_policy() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = Repo::init(&temp.path().join("source")).unwrap();
-    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    source.git(&["checkout", "-b", "work"]).unwrap();
-    append(&source, 1);
-    let original_policy = PrivacyPolicy::default();
-    original_policy.save(&source).unwrap();
-    let identity = RemoteIdentity::new(
-        "https://hub.invalid",
-        "00000000-0000-0000-0000-000000000001",
-    )
-    .unwrap();
-    let url = "https://hub.invalid/alice/app.git";
-    let redactor = Redactor::new(Default::default());
-    let (_, old) = recipient(20);
-    let (new_key, new) = recipient(21);
-    let prepare = |repo: &Repo, branch: &str, key: &ViewingRecipient, remote: &RemoteRefs| {
-        ProjectedHistory::prepare_with_rules(
-            repo,
-            &[branch.into()],
-            key,
-            url,
-            &redactor,
-            &[],
-            Some((&identity, remote)),
-        )
-        .unwrap()
-    };
-    let first = prepare(&source, "work", &old, &RemoteRefs::default());
-    let first_public = first.plan.heads()[0].oid().to_owned();
-    let first_remote = remote(&first);
-    let cloned = Repo::init(&temp.path().join("clone")).unwrap();
-    cloned
-        .git(&[
-            "fetch",
-            first.repo.root().to_str().unwrap(),
-            "refs/heads/work:refs/heads/work",
-        ])
-        .unwrap();
-    cloned.git(&["checkout", "work"]).unwrap();
-    cloned.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    let mut local_policy = original_policy.clone();
-    local_policy.exclude.push("private/**".into());
-    local_policy.save(&cloned).unwrap();
-    let continuation = append(&cloned, 2);
-    let mut continued = prepare(&cloned, "work", &new, &first_remote);
-    continued.verify_accepted_policy().unwrap();
-    let accepted_parent = continued.plan.heads()[0].oid().to_owned();
-    let current_remote = remote(&continued);
-    continued.prepare_acceptance().unwrap();
-    drop(continued);
-    let reconciled = prepare(&cloned, "work", &new, &current_remote);
-    reconciled.verify_accepted_policy().unwrap();
-    drop(reconciled);
-    let base = crate::commands::fork::ForkBase {
-        repo: cloned.clone(),
-        slug: "alice/app".into(),
-        resolved: crate::domain::refs::Resolved {
-            branch: Some("work".into()),
-            sha: continuation.clone(),
-            turn: None,
-            event_index: None,
-            range: None,
-            path: None,
-        },
-    };
-    crate::commands::fork::fork_branch(&base, "alice/app@work", "continuation")
-        .unwrap()
-        .unwrap();
-    let forked = prepare(&cloned, "continuation", &new, &current_remote);
-    forked.verify_accepted_policy().unwrap();
-    let fork_tip = forked.plan.heads()[0].oid();
-    assert_eq!(
-        forked
-            .repo
-            .git(&["rev-parse", &format!("{fork_tip}^")])
-            .unwrap(),
-        accepted_parent
-    );
-    assert_eq!(
-        forked
-            .repo
-            .git(&["rev-parse", &format!("{fork_tip}^^")])
-            .unwrap(),
-        first_public
-    );
-    assert_eq!(forked.preparations, 1);
-    assert_ne!(
-        storage::metadata_local(forked.repo.root(), fork_tip)
-            .unwrap()
-            .session,
-        storage::metadata_local(forked.repo.root(), &accepted_parent)
-            .unwrap()
-            .session
-    );
-    let envelope = PrivacyEnvelope::parse(
-        forked
-            .repo
-            .show_result(fork_tip, "privacy/envelope.json")
-            .unwrap()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    assert_eq!(envelope.policy_digest, local_policy.digest().unwrap());
-    assert_eq!(envelope.private_payload.wrapped_keys[0].recipient, new.id());
-    assert!(envelope.open_layer(&new_key).is_ok());
-    let ledger = accepted::Ledger::open(&cloned, &identity).unwrap();
-    let inherited = ledger.get("work", &first_public).unwrap();
-    assert_eq!(inherited.source, inherited.public);
-    assert_eq!(inherited.policy, original_policy.digest().unwrap());
-    let mut changed_policy = local_policy.clone();
-    changed_policy.exclude.push("confidential/**".into());
-    assert!(
-        ledger
-            .inherited("continuation", &continuation, &changed_policy)
-            .is_err()
-    );
-    let mut restricted_policy = local_policy;
-    restricted_policy.branches.insert(
-        "continuation".into(),
-        super::super::privacy::BranchRestriction {
-            exclude: vec!["**".into()],
-            memory_exclude: vec![],
-        },
-    );
-    assert!(
-        ledger
-            .inherited("continuation", &first_public, &restricted_policy)
-            .is_err()
-    );
-}
-
-#[test]
-fn fork_refuses_ambiguous_accepted_ancestors() {
-    let temp = tempfile::tempdir().unwrap();
-    let source = Repo::init(&temp.path().join("source")).unwrap();
-    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    source.git(&["checkout", "-b", "work"]).unwrap();
-    let original = append(&source, 1);
-    source.git(&["branch", "other", &original]).unwrap();
-    PrivacyPolicy::default().save(&source).unwrap();
-    let identity = RemoteIdentity::new(
-        "https://hub.invalid",
-        "00000000-0000-0000-0000-000000000001",
-    )
-    .unwrap();
-    let (_, key) = recipient(20);
-    let redactor = Redactor::new(Default::default());
-    let mut history = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["work".into(), "other".into()],
-        &key,
-        "https://hub.invalid/alice/app.git",
-        &redactor,
-        &[],
-        Some((&identity, &RemoteRefs::default())),
-    )
-    .unwrap();
-    let accepted = remote(&history);
-    assert_ne!(
-        accepted.refs["refs/heads/work"],
-        accepted.refs["refs/heads/other"]
-    );
-    history.prepare_acceptance().unwrap();
-    drop(history);
-    let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
-    ledger.reconcile(&accepted).unwrap();
-    assert!(
-        ledger
-            .inherited("work", &original, &PrivacyPolicy::default())
+        envelope(&next.repo, &published_a)
+            .open_layer(&key_a)
             .is_ok()
     );
-    let error = ledger
-        .inherited("continuation", &original, &PrivacyPolicy::default())
-        .err()
-        .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("ambiguous accepted publications"),
-        "{error:#}"
+    next.prepare_acceptance().unwrap();
+    selected.remote = remote(&next);
+    drop(next);
+    assert_eq!(receipt.session_id(&source).unwrap(), public_session);
+    assert_eq!(receipt.published, published_a);
+    source.git(&["branch", "-m", "work", "renamed"]).unwrap();
+    let renamed = vec!["renamed".into()];
+    let same = prepare(&renamed, &selected).unwrap();
+    assert_eq!(
+        same.repo.git(&["rev-parse", "refs/heads/renamed"]).unwrap(),
+        second_public
     );
-    let base = crate::commands::fork::ForkBase {
-        repo: source.clone(),
-        slug: "alice/app".into(),
-        resolved: crate::domain::refs::Resolved {
-            branch: Some("work".into()),
-            sha: original,
-            turn: None,
-            event_index: None,
-            range: None,
-            path: None,
-        },
-    };
-    crate::commands::fork::fork_branch(&base, "alice/app@work", "continuation")
-        .unwrap()
+    drop(same);
+    fs::remove_dir_all(store.join(".git/session-candidates")).unwrap();
+    save(&owned, "Continuation after local candidate cache loss");
+    let restored = prepare(&renamed, &selected).unwrap();
+    let third = restored
+        .repo
+        .git(&["rev-parse", "refs/heads/renamed"])
         .unwrap();
+    assert_eq!(
+        envelope(&restored.repo, &third)
+            .session_binding
+            .unwrap()
+            .published_session_id,
+        public_session
+    );
+    drop(restored);
+    source.git(&["checkout", "-b", "plain-child"]).unwrap();
+    save(
+        &legacy,
+        "Plain child cannot expose encrypted original ancestry",
+    );
     assert!(
-        ProjectedHistory::prepare_with_rules(
-            &source,
-            &["continuation".into()],
-            &key,
-            "https://hub.invalid/alice/app.git",
-            &redactor,
-            &[],
-            Some((&identity, &accepted))
-        )
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("ambiguous accepted publications")
+        prepare(&["plain-child".into()], &selected)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unaccepted original ancestry")
     );
 }
 
+/// The original publisher retains opaque accepted ciphertext without a legacy decoder or key.
 #[test]
-fn cloned_accepted_history_does_not_need_retired_key_lookup() {
+fn legacy_accepted_mapping_preserves_public_objects_when_original_history_continues() {
+    use super::sessions::SessionPublicationPlan;
+    use crate::domain::session_privacy::{AccountIdentity, SessionPrivacy, SessionPrivacyConfig};
+    use crate::hub::privacy::sessions::{AccountSessionKey, SessionPrivacyResponse};
+
     let temp = tempfile::tempdir().unwrap();
     let source = Repo::init(&temp.path().join("source")).unwrap();
+    source
+        .git(&["config", "user.name", "Original Writer"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "writer@example.invalid"])
+        .unwrap();
     source.git(&["config", "commit.gpgsign", "false"]).unwrap();
     source.git(&["checkout", "-b", "work"]).unwrap();
-    append(&source, 1);
-    PrivacyPolicy::default().save(&source).unwrap();
+    let metadata = Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let save = |content: &str| {
+        let text = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &metadata.session,
+        );
+        storage::write_snapshot(source.root(), &text, &text).unwrap();
+        meta::write(source.root(), &metadata).unwrap();
+        source.add_all().unwrap();
+        source.commit("Original snapshot").unwrap();
+        source.git(&["rev-parse", "HEAD"]).unwrap()
+    };
+    let original = save("Private original conversation");
     let identity = RemoteIdentity::new(
         "https://hub.invalid",
         "00000000-0000-0000-0000-000000000001",
     )
     .unwrap();
-    let url = "https://hub.invalid/alice/app.git";
-    let redactor = Redactor::new(Default::default());
-    let (old_key, old) = recipient(20);
-    let (new_key, new) = recipient(21);
-    let first = ProjectedHistory::prepare_with_rules(
-        &source,
-        &["work".into()],
-        &old,
-        url,
-        &redactor,
-        &[],
-        Some((&identity, &RemoteRefs::default())),
-    )
-    .unwrap();
-    let first_public = first.plan.heads()[0].oid().to_owned();
-    let first_remote = remote(&first);
-    let original_envelope = first
-        .repo
-        .show_result(&first_public, "privacy/envelope.json")
+    let store = "c".repeat(64);
+    let parent = source
+        .common_dir()
         .unwrap()
+        .join("agit/privacy-publication");
+    fs::create_dir_all(&parent).unwrap();
+    let retained_root = parent.join(&store);
+    initialize_with_format(&retained_root, 40).unwrap();
+    let retained = Repo::at(retained_root).local_objects_only();
+    let legacy = include_bytes!("../../../tests/fixtures/privacy-accepted-v1-envelope.json");
+    assert!(PrivacyEnvelope::parse(legacy).is_err());
+    let public_metadata = Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let (_, metadata_text) =
+        crate::domain::privacy_metadata::git_metadata(&public_metadata, None).unwrap();
+    let mut files = storage::snapshot_files("", "").unwrap();
+    files.insert(meta::FILE.into(), metadata_text.into_bytes());
+    files.insert("privacy/envelope.json".into(), legacy.to_vec());
+    let tree = write_tree(&retained, files).unwrap();
+    let public_bytes = commit_body(&tree, &[]);
+    let public = write_object(&retained, "commit", public_bytes.as_bytes()).unwrap();
+    let policy = serde_json::from_slice::<serde_json::Value>(legacy).unwrap()["policy_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mapping = accepted::Mapping {
+        source: original.clone(),
+        public: public.clone(),
+        source_parents: vec![],
+        public_parents: vec![],
+        store,
+        source_session: metadata.session.clone(),
+        public_session: public_metadata.session,
+        policy,
+        recipient: Some(crate::domain::privacy_envelope::digest_bytes(
+            b"legacy recipient",
+        )),
+    };
+    let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    ledger
+        .prepare(&BTreeMap::from([(
+            "work".into(),
+            accepted::Candidate {
+                source_head: original.clone(),
+                public_head: public.clone(),
+                mappings: BTreeMap::from([(original.clone(), mapping)]),
+            },
+        )]))
         .unwrap();
-    let cloned = Repo::init(&temp.path().join("clone")).unwrap();
-    cloned
-        .git(&[
-            "fetch",
-            first.repo.root().to_str().unwrap(),
-            "refs/heads/work:refs/heads/work",
-        ])
-        .unwrap();
-    cloned.git(&["checkout", "work"]).unwrap();
-    PrivacyPolicy::default().save(&cloned).unwrap();
-    cloned.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let reader_hub = format!("http://{}", listener.local_addr().unwrap());
-    let reader_identity = RemoteIdentity::new(&reader_hub, &identity.agent_id).unwrap();
-    let reader_url = format!("{reader_hub}/alice/app.git");
-    let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let mut bytes = [0u8; 8192];
-                    stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                        .unwrap();
-                    let count = stream.read(&mut bytes).unwrap();
-                    let request = String::from_utf8_lossy(&bytes[..count]).into_owned();
-                    let body =
-                        r#"{"kind":"not_found","error":"publication viewing key not found"}"#;
-                    write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                    return Some(request);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(error) => panic!("{error}"),
-            }
-        }
-    });
-    let result = ProjectedHistory::prepare_with_rules(
-        &cloned,
-        &["work".into()],
-        &new,
-        &reader_url,
-        &redactor,
-        &[],
-        Some((&reader_identity, &first_remote)),
-    );
-    let mut prepared = result.unwrap();
-    assert_eq!(prepared.plan.heads()[0].oid(), first_public);
-    assert!(prepared.receipt_binding("work").unwrap().is_none());
-    assert_eq!(prepared.preparations, 0);
-    prepared.prepare_acceptance().unwrap();
-    drop(prepared);
-    let new_source = append(&cloned, 2);
-    let mut continued = ProjectedHistory::prepare_with_rules(
-        &cloned,
-        &["work".into()],
-        &new,
-        &reader_url,
-        &redactor,
-        &[],
-        Some((&reader_identity, &first_remote)),
-    )
-    .unwrap();
-    assert_eq!(continued.preparations, 1);
-    let head = continued.plan.heads()[0].oid().to_owned();
-    assert_eq!(
-        continued
-            .repo
-            .git(&["rev-parse", &format!("{head}^")])
-            .unwrap(),
-        first_public
-    );
-    assert_eq!(
-        continued
-            .repo
-            .show_result(&first_public, "privacy/envelope.json")
-            .unwrap()
-            .unwrap(),
-        original_envelope
-    );
-    assert_eq!(
-        continued.receipt_binding("work").unwrap().unwrap().1,
-        new.fingerprint().unwrap()
-    );
-    let envelope = PrivacyEnvelope::parse(
-        continued
-            .repo
-            .show_result(&head, "privacy/envelope.json")
-            .unwrap()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    assert!(envelope.open_layer(&new_key).is_ok());
-    assert!(envelope.open_layer(&old_key).is_err());
-    let observed = remote(&continued);
-    continued.prepare_acceptance().unwrap();
-    drop(continued);
-    let repeated = ProjectedHistory::prepare_with_rules(
-        &cloned,
-        &["work".into()],
-        &new,
-        &reader_url,
-        &redactor,
-        &[],
-        Some((&reader_identity, &observed)),
-    )
-    .unwrap();
-    assert_eq!(repeated.plan.heads()[0].oid(), head);
-    assert_eq!(repeated.preparations, 0);
+    let mut selected = SessionPublicationPlan {
+        identity: identity.clone(),
+        remote: RemoteRefs {
+            heads: vec![public.clone()],
+            refs: BTreeMap::from([("refs/heads/work".into(), public.clone())]),
+            ..Default::default()
+        },
+        configs: BTreeMap::new(),
+    };
+    let prepare = |selected: &SessionPublicationPlan| {
+        ProjectedHistory::prepare_sessions_with_redactor(
+            &source,
+            &["work".into()],
+            selected,
+            &[],
+            &Redactor::new(Default::default()),
+        )
+    };
+    let same = prepare(&selected).unwrap();
+    assert_eq!(same.plan.heads()[0].oid(), public);
+    assert!(same.session_manifest().snapshots.is_empty());
+    assert_eq!(same.session_manifest().preserved_commits, [public.clone()]);
     assert!(
-        accepted::Ledger::open(&cloned, &reader_identity)
+        same.session_receipts("team/app", &identity, "https://hub.invalid/team/app.git")
             .unwrap()
-            .get("work", &new_source)
-            .is_some()
+            .is_empty()
     );
     assert!(
-        server.join().unwrap().is_none(),
-        "publishing must not request reader-key material"
+        published::retain_accepted(&retained, same.repo(), &public, &["f".repeat(40)]).is_err()
     );
+    drop(same);
+
+    let key = SecretKey::from([44; 32]);
+    selected.configs.insert(
+        metadata.session.clone(),
+        SessionPrivacyResponse {
+            config: SessionPrivacyConfig {
+                repository_id: identity.agent_id.clone(),
+                session_id: metadata.session.clone(),
+                privacy: SessionPrivacy::new(Some(
+                    AccountIdentity::new(&identity.hub, "owner").unwrap(),
+                ))
+                .unwrap(),
+                revision: 1,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            owner_key: Some(AccountSessionKey {
+                account_id: "owner".into(),
+                key_version: 1,
+                public_key_algorithm: "x25519".into(),
+                public_key: STANDARD.encode(key.public_key().as_bytes()),
+            }),
+        },
+    );
+    let continuation = save("Private continuation under session ownership");
+    let next = prepare(&selected).unwrap();
+    let head = next.plan.heads()[0].oid();
+    assert_eq!(
+        next.repo.git(&["rev-parse", &format!("{head}^")]).unwrap(),
+        public
+    );
+    assert_eq!(
+        next.repo
+            .git_bytes_result(&["cat-file", "commit", &public])
+            .unwrap(),
+        public_bytes.as_bytes()
+    );
+    assert_eq!(
+        next.repo
+            .git_bytes_result(&[
+                "cat-file",
+                "blob",
+                &format!("{public}:privacy/envelope.json")
+            ])
+            .unwrap(),
+        legacy
+    );
+    assert!(next.repo.git(&["cat-file", "-e", &original]).is_err());
+    let receipts = next
+        .session_receipts("team/app", &identity, "https://hub.invalid/team/app.git")
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].source, continuation);
+    assert!(next.session_manifest().preserved_commits.contains(&public));
+    crate::hub::git::CapturedPublication::capture_projected(&next, 1024 * 1024, &source).unwrap();
 }

@@ -199,18 +199,6 @@ pub fn execute(
             "encrypted":projector.key.is_some(),"generation":projector.store.policy_generation()?}),
         );
     }
-    if command.action == "fingerprint" {
-        use sha2::{Digest, Sha256};
-        let mut records = projector.dictionary.records().collect::<Vec<_>>();
-        records.sort_by(|left, right| left.token.cmp(&right.token));
-        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&(
-            &projector.policy.fingerprint,
-            records,
-            &decisions,
-            projector.complete,
-        ))?);
-        return Ok(json!(hex::encode(Sha256::digest(&*bytes))));
-    }
     if command.action == "values" || command.action == "used_values" {
         return Ok(json!(
             projector

@@ -353,7 +353,12 @@ impl Client {
         self.with_retry(path, |t| {
             let mut req = self.agent.get(self.url(path));
             if let Some(id) = expected_agent_id {
-                req = req.header(super::identity::EXPECTED_AGENT_ID_HEADER, id);
+                req = req
+                    .config()
+                    .max_redirects(0)
+                    .build()
+                    .header(super::identity::EXPECTED_AGENT_ID_HEADER, id)
+                    .header("Cache-Control", "no-store");
             }
             if !path.trim_start_matches('/').starts_with("api/auth/") {
                 req = req.header("Accept-Encoding", "gzip");
@@ -370,13 +375,89 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        self.post_expected(path, body, None)
+    }
+
+    pub(super) fn post_expected<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        expected_agent_id: Option<&str>,
+    ) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.post(self.url(path));
+            if let Some(id) = expected_agent_id {
+                req = req
+                    .config()
+                    .max_redirects(0)
+                    .build()
+                    .header(super::identity::EXPECTED_AGENT_ID_HEADER, id);
+            }
             if let Some(t) = t {
                 req = req.header("Authorization", &format!("Bearer {t}"));
             }
             req.send_json(body)
         })
+    }
+
+    /// Content-key replies remain request-scoped and cannot opt into shared or persistent caches.
+    pub(super) fn post_private<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        expected_agent_id: &str,
+    ) -> Result<T> {
+        let uri: http::Uri = self
+            .base
+            .parse()
+            .context("invalid private request destination")?;
+        anyhow::ensure!(
+            uri.scheme_str() == Some("https")
+                || (uri.scheme_str() == Some("http")
+                    && uri.host().is_some_and(|host| host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback()))),
+            "content-key delivery requires HTTPS"
+        );
+        anyhow::ensure!(
+            self.has_token(),
+            "content-key delivery requires authentication"
+        );
+        self.with_retry_checked(
+            path,
+            |token| {
+                let mut request = self
+                    .agent
+                    .post(self.url(path))
+                    .config()
+                    .max_redirects(0)
+                    .build()
+                    .header(super::identity::EXPECTED_AGENT_ID_HEADER, expected_agent_id)
+                    .header("Cache-Control", "no-store");
+                if let Some(token) = token {
+                    request = request.header("Authorization", &format!("Bearer {token}"));
+                }
+                request.send_json(body)
+            },
+            |response| {
+                let directives: Vec<_> = response
+                    .headers()
+                    .get_all("Cache-Control")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .flat_map(|value| value.split(','))
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .collect();
+                anyhow::ensure!(
+                    directives.iter().any(|value| value == "private")
+                        && directives.iter().any(|value| value == "no-store")
+                        && !directives.iter().any(|value| value == "public"),
+                    "content-key response must declare private, no-store"
+                );
+                Ok(())
+            },
+        )
     }
 
     /// Retry an unauthorized request after renewing or adopting saved credentials.
@@ -387,16 +468,26 @@ impl Client {
         T: serde::de::DeserializeOwned,
         F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     {
-        crate::telemetry::allow_uploads();
-        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
-            self.with_retry_telemetry_inner(path, send)
-        })
+        self.with_retry_checked(path, send, |_| Ok(()))
     }
 
-    fn with_retry_telemetry_inner<T, F>(&self, path: &str, send: F) -> Result<T>
+    fn with_retry_checked<T, F, C>(&self, path: &str, send: F, check: C) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
         F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        C: Fn(&ureq::http::Response<ureq::Body>) -> Result<()>,
+    {
+        crate::telemetry::allow_uploads();
+        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+            self.with_retry_telemetry_inner(path, send, check)
+        })
+    }
+
+    fn with_retry_telemetry_inner<T, F, C>(&self, path: &str, send: F, check: C) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        C: Fn(&ureq::http::Response<ureq::Body>) -> Result<()>,
     {
         self.ensure_destination()?;
         let mut resp = {
@@ -412,6 +503,9 @@ impl Client {
             resp = send(t.as_deref()).map_err(|e| self.explain(e, path))?;
         }
 
+        if resp.status().is_success() {
+            check(&resp)?;
+        }
         self.decode(resp, path)
     }
 
@@ -1117,16 +1211,7 @@ impl Client {
 
     /// Publish: create the agent and get the push address.
     pub fn publish(&self, req: &PublishRequest) -> Result<PublishResponse> {
-        let response: PublishResponse = self.post("api/agents", req)?;
-        anyhow::ensure!(
-            response.encryption_enabled.is_some(),
-            "the Hub did not return encryption_enabled for the created repository; upgrade the Hub and inspect the destination before retrying"
-        );
-        anyhow::ensure!(
-            response.encryption_enabled == Some(req.encryption_enabled),
-            "repository encryption mode is fixed at creation; create a different repository for the requested mode"
-        );
-        Ok(response)
+        self.post("api/agents", req)
     }
 
     /// Copy an agent into your own namespace.
@@ -1937,7 +2022,7 @@ mod tests {
             "web_workspace_id":"workspace", "web_project_id":"project",
             "workspace_id":"local-owner", "project_id":"executor-project",
             "local_path":"/project", "repository":"owner/project",
-            "repository_id":"repository", "encryption_enabled":false,
+            "repository_id":"repository",
         });
         let (base, hub) = fake_hub(2, move |request| {
             assert!(request.contains("Bearer at-new"));

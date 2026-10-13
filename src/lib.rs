@@ -118,18 +118,12 @@ pub mod domain {
     pub mod native_archive;
     /// Device-local repository privacy policies and fail-closed candidate previews.
     pub mod privacy;
-    /// Opt-in, scoped operating-system storage for privacy unlock keys.
-    #[cfg(feature = "cli")]
-    pub mod privacy_credentials;
     /// Versioned public/private publication envelopes.
     #[cfg(feature = "secret-vault")]
     pub mod privacy_envelope;
     /// Isolated Git history containing only privacy-projected snapshots.
     #[cfg(feature = "cli")]
     pub mod privacy_git;
-    /// Password-wrapped repository viewing keys, independent of publication encryption.
-    #[cfg(feature = "secret-vault")]
-    pub mod privacy_key;
     /// Validated session data carried only inside an encrypted privacy envelope.
     #[cfg(feature = "secret-vault")]
     pub mod privacy_layer;
@@ -141,7 +135,7 @@ pub mod domain {
     #[cfg(feature = "secret-vault")]
     pub mod privacy_projection;
     /// Unified session projection used by privacy-aware publication entry points.
-    #[cfg(feature = "secret-vault")]
+    #[cfg(feature = "cli")]
     pub mod privacy_publication;
     /// Device-local acknowledgement of a private source's generated publication.
     #[cfg(feature = "cli")]
@@ -168,6 +162,8 @@ pub mod domain {
     pub mod secrets;
     /// Enumerating and selecting materialized content (the transcripts inside a repo).
     pub mod session;
+    pub mod session_grants;
+    pub mod session_privacy;
     /// Compatibility layer for reading legacy snapshot.json; the commit path uses
     /// `meta`/`storage`.
     pub mod snapshot;

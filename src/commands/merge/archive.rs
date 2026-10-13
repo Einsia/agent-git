@@ -453,6 +453,17 @@ fn build_candidate(
         anyhow::bail!("archive metadata must be an object")
     };
     fields.insert("kind".into(), JsonFacts::String("archive".into()));
+    match crate::infra::credentials::current_account()? {
+        Some(account) => {
+            fields.insert(
+                "committer_account".into(),
+                JsonFacts::parse(&serde_json::to_string(&account)?)?,
+            );
+        }
+        None => {
+            fields.remove("committer_account");
+        }
+    }
     let mut next_metadata = String::new();
     encode_facts(&facts, &mut next_metadata)?;
     next_metadata.push('\n');

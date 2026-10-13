@@ -16,8 +16,6 @@ pub struct Literal<'a> {
 }
 
 pub struct Snapshot {
-    #[cfg(feature = "secret-vault")]
-    pub(crate) fingerprint: String,
     blocks: Option<AhoCorasick>,
     block_sources: Vec<Source>,
     allows: Option<AhoCorasick>,
@@ -54,20 +52,7 @@ impl Snapshot {
             .filter(|value| !value.is_empty())
             .collect();
         let block_sources = blocks.iter().map(|rule| rule.source).collect();
-        #[cfg(feature = "secret-vault")]
-        use sha2::{Digest, Sha256};
-        #[cfg(feature = "secret-vault")]
-        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
-            blocks
-                .iter()
-                .map(|rule| (rule.value, rule.source as u8))
-                .collect::<Vec<_>>(),
-            &allows,
-            inline_allow,
-        ))?));
         Ok(Self {
-            #[cfg(feature = "secret-vault")]
-            fingerprint,
             max_literal_bytes: blocks
                 .iter()
                 .map(|rule| rule.value.len())

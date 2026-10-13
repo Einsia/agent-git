@@ -99,7 +99,6 @@ mod unix {
     /// resulting SHA through `AGIT_RC_SUPERVISOR_COMMIT_RESULT`.
     #[test]
     fn strict_supervisor_commit_writes_the_real_new_head_to_its_result_file() {
-        use base64::Engine as _;
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().canonicalize().unwrap().join("workspace");
         let agit_home = root.path().join("agit-home");
@@ -247,7 +246,7 @@ mod unix {
 
         let (log, view) = agit::domain::storage::materialize_pair_at(&repo, "HEAD").unwrap();
         assert!(!log.contains(secret));
-        let (restored_log, restored_view) = {
+        let (restored_log, _) = {
             use std::io::{Read, Write};
             use std::process::Stdio;
             let mut worker = base_command(root.path(), &["__privacy-worker-v1"])
@@ -291,26 +290,16 @@ mod unix {
             .collect();
         assert_eq!(restored, originals);
 
-        let key = crypto_box::SecretKey::from([29; 32]);
         let exported = base_command(
             root.path(),
-            &[
-                "export",
-                &format!("alice/photo@{branch}"),
-                "--format",
-                "privacy-envelope",
-                "--viewing-public-key",
-                &base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes()),
-            ],
+            &["export", &format!("alice/photo@{branch}"), "--privacy"],
         )
         .env("HOME", &runtime_home)
         .env("AGIT_HUB_URL", hub)
         .output()
         .unwrap();
         assert!(exported.status.success(), "{exported:?}");
-        let envelope =
-            agit::domain::privacy_envelope::PrivacyEnvelope::parse(&exported.stdout).unwrap();
-        let public = envelope.public_projection.to_string();
+        let public = String::from_utf8(exported.stdout).unwrap();
         for marker in ["settle this turn", "Readable reply", "done"] {
             assert!(
                 public.contains(marker),
@@ -323,9 +312,5 @@ mod unix {
         }
         assert!(!public.contains(secret));
         assert!(!public.contains("content unavailable"));
-        let private = envelope.open_layer(&key).unwrap();
-        let (original_log, original_view) = private.session_bytes().unwrap();
-        assert_eq!(original_log.as_str(), restored_log);
-        assert_eq!(original_view.as_str(), restored_view);
     }
 }

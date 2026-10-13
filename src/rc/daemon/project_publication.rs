@@ -125,8 +125,7 @@ pub(in crate::rc) async fn reconcile_owned(
             let repo = local_repository::require(&lineage).context(Stage::Repository)?;
             if local_repository::publication::Destination::load(&repo)?.is_some_and(|saved| {
                 saved.identity == destination && saved.repository == request.repository
-            }) && repo.creation_encryption()? == Some(request.encryption_enabled)
-                && repo.auto_push_enabled()?
+            }) && repo.auto_push_enabled()?
                 && crate::commands::push::automatic_publication_consent_with_client(
                     &repo,
                     &request.repository,
@@ -162,18 +161,11 @@ pub(in crate::rc) async fn reconcile_owned(
                 &request.repository,
                 &destination,
                 &device.owner.account_id,
-                request.encryption_enabled,
             )
             .context(Stage::Consent)?;
             current()?;
-            confirm_repository(
-                &repo,
-                &selection,
-                &destination,
-                &consent,
-                request.encryption_enabled,
-            )
-            .context(Stage::Confirmation)?;
+            confirm_repository(&repo, &selection, &destination, &consent)
+                .context(Stage::Confirmation)?;
             current()
         }),
     )
@@ -343,7 +335,6 @@ impl Prepared {
             &self.request.repository,
             &self.destination,
             &grant.target.owner.account_id,
-            self.request.encryption_enabled,
         )?;
         self.current_device(canceled)?;
         selection.verify(&repo)?;
@@ -368,7 +359,6 @@ impl Prepared {
             &verified.selection,
             &self.destination,
             &verified.consent,
-            self.request.encryption_enabled,
         )?;
         self.current_device(canceled)?;
         Ok(ProjectPublicationBindResult {
@@ -388,18 +378,14 @@ fn confirm_repository(
     selection: &local_repository::publication::Selection,
     destination: &RemoteIdentity,
     consent: &AutoConsent,
-    encryption_enabled: bool,
 ) -> crate::Result<()> {
     selection.verify(repo)?;
-    if let Some(mode) = repo.creation_encryption()? {
-        ensure!(
-            mode == encryption_enabled,
-            "local publication encryption mode changed"
-        );
-    }
+    ensure!(
+        consent.hub == destination.hub && consent.agent_id == destination.agent_id,
+        "publication enrollment names another destination"
+    );
     selection.bind(repo, destination)?;
     consent.save(repo)?;
-    repo.set_creation_encryption(encryption_enabled)?;
     repo.set_auto_push(Some(true))?;
     Ok(())
 }
@@ -423,7 +409,6 @@ fn prepare_project_publication_consent(
     repository: &str,
     expected: &RemoteIdentity,
     owner_account: &str,
-    encryption_enabled: bool,
 ) -> crate::Result<AutoConsent> {
     let client = crate::hub::Client::for_stored_hub_with_timeout(
         &expected.hub,
@@ -439,9 +424,8 @@ fn prepare_project_publication_consent(
         remote.agent_id == expected.agent_id
             && remote.owner == owner
             && remote.name == name
-            && remote.visibility == "private"
-            && remote.require_encryption_enabled()? == encryption_enabled,
-        "the private publication destination or encryption mode changed"
+            && remote.visibility == "private",
+        "the private publication destination changed"
     );
     crate::commands::push::publication_consent_with_client(repo, repository, expected, &client)
 }
@@ -463,7 +447,6 @@ fn unavailable() -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::privacy_receipt::PublicationMode;
 
     /// A background plan cannot outlive local folder, enrollment, or owner authority.
     #[test]
@@ -512,7 +495,6 @@ mod tests {
             local_path: project.to_str().unwrap().into(),
             repository: "owner/project".into(),
             repository_id: "00000000-0000-0000-0000-000000000001".into(),
-            encryption_enabled: false,
         };
         let canceled = AtomicBool::new(false);
         let directory = store::directory().unwrap();
@@ -561,16 +543,13 @@ mod tests {
         )
         .unwrap();
         let consent = AutoConsent {
-            version: 2,
-            mode: PublicationMode::Ordinary,
+            version: 3,
             hub: destination.hub.clone(),
             account: "owner".into(),
-            account_id: Some("owner-account".into()),
+            account_id: "owner-account".into(),
             agent_id: destination.agent_id.clone(),
             url: "https://hub.example/owner/project.git".into(),
             visibility: "private".into(),
-            policy_digest: None,
-            recipient: None,
         };
         let prepare = || {
             local_repository::publication::Selection::prepare(
@@ -581,10 +560,9 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        confirm_repository(&repo, &prepare(), &destination, &consent, false).unwrap();
+        confirm_repository(&repo, &prepare(), &destination, &consent).unwrap();
         assert!(repo.auto_push_enabled().unwrap());
         assert!(consent.matches(&repo).unwrap());
-        assert_eq!(repo.creation_encryption().unwrap(), Some(false));
         repo.set_auto_push(Some(false)).unwrap();
         std::fs::remove_file(
             repo.common_dir()
@@ -592,13 +570,12 @@ mod tests {
                 .join("agit/privacy-auto-consent.json"),
         )
         .unwrap();
-        confirm_repository(&repo, &prepare(), &destination, &consent, false).unwrap();
+        confirm_repository(&repo, &prepare(), &destination, &consent).unwrap();
         assert!(repo.auto_push_enabled().unwrap());
         assert!(consent.matches(&repo).unwrap());
         let mut replacement = destination.clone();
         replacement.agent_id = "00000000-0000-0000-0000-000000000002".into();
-        assert!(confirm_repository(&repo, &prepare(), &replacement, &consent, false).is_err());
-        assert!(confirm_repository(&repo, &prepare(), &destination, &consent, true).is_err());
+        assert!(confirm_repository(&repo, &prepare(), &replacement, &consent).is_err());
         assert_eq!(
             local_repository::publication::Destination::load(&repo)
                 .unwrap()
@@ -606,6 +583,5 @@ mod tests {
                 .identity,
             destination
         );
-        assert_eq!(repo.creation_encryption().unwrap(), Some(false));
     }
 }

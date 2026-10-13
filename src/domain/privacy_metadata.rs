@@ -206,7 +206,7 @@ mod tests {
                 .contains("private-status")
         );
         assert!(project_value.get("branch").is_none());
-        let synthetic = Meta::new(
+        let mut synthetic = Meta::new(
             "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             "claude-code".into(),
             String::new(),
@@ -218,6 +218,14 @@ mod tests {
         assert_eq!(
             git_metadata(&synthetic, None).unwrap().1,
             crate::domain::meta::to_text(&synthetic).unwrap()
+        );
+        synthetic.session_privacy =
+            Some(crate::domain::session_privacy::SessionPrivacy::new(None).unwrap());
+        let (public, text) = git_metadata(&synthetic, Some(&project_value)).unwrap();
+        assert_eq!(public["privacy"], project_value);
+        assert_eq!(
+            serde_json::from_str::<Meta>(&text).unwrap().session_privacy,
+            synthetic.session_privacy
         );
         let mut unrecognized = project_value;
         unrecognized["cwd"] = json!("/private/source");

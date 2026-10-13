@@ -30,10 +30,13 @@ function canonical(value) {
 function associatedData(envelope) {
   const { format_version, policy_digest, snapshot_digest, public_projection, attachments, private_payload } = envelope;
   const { algorithm, wrapped_keys } = private_payload;
-  const digest = createHash('sha256').update(canonical({
+  const authenticated = {
     algorithm, attachments, format_version, policy_digest, public_projection, snapshot_digest, wrapped_keys,
-  })).digest('hex');
-  return Buffer.from(`agit-privacy-envelope-v1\0sha256:${digest}`);
+  };
+  assert.equal(format_version, 2);
+  authenticated.session_binding = envelope.session_binding;
+  const digest = createHash('sha256').update(canonical(authenticated)).digest('hex');
+  return Buffer.from(`agit-privacy-envelope-v${format_version}\0sha256:${digest}`);
 }
 
 const envelope = fixture.envelope;
@@ -49,6 +52,17 @@ const plaintext = await webcrypto.subtle.decrypt({
   name: 'AES-GCM', iv: decode(envelope.private_payload.nonce), additionalData: aad,
 }, key, decode(envelope.private_payload.ciphertext));
 assert.equal(encode(plaintext), fixture.private_payload_base64);
+assert.equal(encode(objectKey), fixture.content_key_response.content_key);
+assert.deepEqual(JSON.parse(fixture.envelope_bytes), envelope);
+assert.equal(
+  `sha256:${createHash('sha256').update(fixture.envelope_bytes).digest('hex')}`,
+  fixture.content_key_response.snapshot.envelope_digest,
+);
+assert.deepEqual(fixture.content_key_response.snapshot.binding, envelope.session_binding);
+const receivedKey = await webcrypto.subtle.importKey('raw', decode(fixture.content_key_response.content_key), 'AES-GCM', false, ['decrypt']);
+assert.equal(encode(await webcrypto.subtle.decrypt({
+  name: 'AES-GCM', iv: decode(envelope.private_payload.nonce), additionalData: aad,
+}, receivedKey, decode(envelope.private_payload.ciphertext))), fixture.private_payload_base64);
 
 if (outputPath) {
   const browserKey = sodium.randombytes_buf(32);
@@ -61,6 +75,9 @@ if (outputPath) {
     name: 'AES-GCM', iv: nonce, additionalData: newAad,
   }, aes, decode(fixture.private_payload_base64)));
   fixture.aad_base64 = encode(newAad);
+  fixture.envelope_bytes = JSON.stringify(envelope);
+  fixture.content_key_response.content_key = encode(browserKey);
+  fixture.content_key_response.snapshot.envelope_digest = `sha256:${createHash('sha256').update(fixture.envelope_bytes).digest('hex')}`;
   writeFileSync(outputPath, `${JSON.stringify(fixture, null, 2)}\n`);
   sodium.memzero(browserKey);
 }

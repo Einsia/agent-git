@@ -623,27 +623,25 @@ impl SettlementFixture {
 
         let source = git(&["-C", &repo_s, "rev-parse", "HEAD"]);
         let domain_repo = crate::domain::repo::Repo::at(&repo);
-        let mut publication = PublicationReceipt {
-            version: 1,
-            mode: Default::default(),
-            repository: "alice/photo".into(),
-            branch: branch.clone(),
-            source: source.clone(),
-            published: source,
-            projected_session_id: None,
-            destination: crate::hub::identity::RemoteIdentity::new(
-                &crate::infra::config::hub_url(),
-                "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
-            )
-            .unwrap(),
-            url: bare_s,
-            policy_digest: Some(
-                crate::domain::privacy::PrivacyPolicy::default()
-                    .digest()
-                    .unwrap(),
-            ),
-            recipient: Some("synthetic-viewer".into()),
-        };
+        let mut publication =
+            crate::domain::privacy_receipt::bind_session_fixture(PublicationReceipt {
+                session_snapshot: None,
+                version: 3,
+                mode: crate::domain::privacy_receipt::PublicationMode::SessionOwnerV2,
+                repository: "alice/photo".into(),
+                branch: branch.clone(),
+                source: source.clone(),
+                published: source,
+                projected_session_id: Some(format!("agit-{}", "e".repeat(40))),
+                destination: crate::hub::identity::RemoteIdentity::new(
+                    &crate::infra::config::hub_url(),
+                    "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+                )
+                .unwrap(),
+                url: bare_s,
+                policy_digest: None,
+                recipient: None,
+            });
         crate::hub::identity::pin(&domain_repo, &publication.destination).unwrap();
         publication.save(&domain_repo).unwrap();
         let publication_path = std::fs::read_dir(repo.join(".git/agit/privacy-published"))
@@ -655,6 +653,9 @@ impl SettlementFixture {
         std::fs::remove_file(&publication_path).unwrap();
         publication.source = "__SOURCE__".into();
         publication.published = "__PUBLISHED__".into();
+        let snapshot = publication.session_snapshot.as_mut().unwrap();
+        snapshot.binding.source_commit = "__SOURCE__".into();
+        snapshot.published_commit = "__PUBLISHED__".into();
         let publication_json = serde_json::to_string(&publication).unwrap();
         let push_body = format!(
             "    test \"$AGIT_AUTO_PUSH\" = 1\n    test -z \"${{AGIT_YES+x}}\"\n    test \"$2\" = \"$AGIT_SESSION\"\n\

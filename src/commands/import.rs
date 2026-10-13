@@ -1477,11 +1477,8 @@ pub(super) fn create_main_file_line(repo: &Repo, owner: &str, lk: &Link) -> crat
 /// When the starting point is already a session line, **do nothing**: that is the lineage
 /// inheritance `--onto` means (identity is inherited, not claimed again).
 ///
-/// The identity is still empty at this moment — `session_hash` needs transcript bytes, and those
-/// only exist once the first turn settles. The shape lands first and the identity is claimed
-/// after; the two happen at different moments by construction. Returns the tip OID it actually
-/// published (None when no ref moved) — the expected OID for the rollback's ref deletion must
-/// come from the publisher itself, not from sampling again afterwards.
+/// A fresh logical identity and first-import owner bind the birth before settlement. Returns the
+/// published tip (None when no ref moved); rollback must use that exact OID rather than resample.
 pub(super) fn declare_session_line(
     repo: &Repo,
     branch: &str,
@@ -1499,7 +1496,19 @@ pub(super) fn declare_session_line(
     if meta::read_at_ref(repo, &head).is_some_and(|m| m.is_session_line()) {
         return Ok(None);
     }
-    let mut born = Meta::new_session_line(lk.source.clone(), lk.cwd.clone().unwrap_or_default());
+    let mut born = Meta::new(
+        super::fork::mint_claim(&head, branch),
+        lk.source.clone(),
+        lk.cwd.clone().unwrap_or_default(),
+    );
+    born.kind = meta::Kind::File;
+    born.committer_account = crate::infra::credentials::current_account()?;
+    born.session_privacy = Some(match &lk.session_privacy {
+        Some(privacy) => privacy.clone(),
+        None => {
+            crate::domain::session_privacy::SessionPrivacy::new(born.committer_account.clone())?
+        }
+    });
     // The birth metadata is already part of publishable history, so it must use the same
     // reversible projection as later settlement metadata. Leaving `cwd` in this commit gives the
     // publication scan an older cleartext object to inspect even when the first turn is protected.
@@ -1938,6 +1947,11 @@ fn attach(
     let was_tracked = current.is_some();
 
     let mut lk = current.unwrap_or_else(|| Link::new(found.runtime, &found.session_id, None));
+    if lk.session_privacy.is_none() && lk.branch.is_none() && lk.materialized_from.is_none() {
+        lk.session_privacy = Some(crate::domain::session_privacy::SessionPrivacy::new(
+            crate::infra::credentials::current_account()?,
+        )?);
+    }
     if lk.cwd.is_none() {
         lk.cwd = found.cwd.clone();
     }

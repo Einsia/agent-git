@@ -1,7 +1,6 @@
 use super::*;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-pub(super) fn configure(repo: &Repo, hub: &str, published: &PublicationReceipt) {
+pub(super) fn configure(repo: &Repo, hub: &str) {
     unsafe {
         std::env::set_var("AGIT_HUB_URL", hub);
     }
@@ -20,50 +19,18 @@ pub(super) fn configure(repo: &Repo, hub: &str, published: &PublicationReceipt) 
     )
     .unwrap();
     repo.set_auto_push(Some(true)).unwrap();
-    // Ordinary automatic publication needs no saved consent, so only encrypted fixtures write one.
-    if !published.mode.is_encrypted() {
-        return;
-    }
-    let directory = repo.common_dir().unwrap().join("agit");
-    std::fs::create_dir_all(&directory).unwrap();
-    let policy = crate::domain::privacy::PrivacyPolicy::load(repo).unwrap();
-    std::fs::write(
-        directory.join("privacy-auto-consent.json"),
-        serde_json::to_vec(&json!({
-            "version":1, "hub":hub, "account":"owner", "account_id":"account-1",
-            "agent_id":published.destination.agent_id, "url":published.url, "visibility":"private",
-            "policy_digest":policy.digest().unwrap(), "recipient":published.recipient,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
 }
 
-pub(super) fn response(
-    hub: &str,
-    request: &str,
-    encryption_enabled: bool,
-) -> Option<serde_json::Value> {
+pub(super) fn response(hub: &str, request: &str) -> Option<serde_json::Value> {
     let mut parts = request.split_whitespace();
     let (method, target) = (parts.next()?, parts.next()?);
     match (method, target) {
         ("GET", "/api/auth/me") => Some(json!({"account_id":"account-1", "username":"owner"})),
         ("GET", "/api/agents/owner/project") => Some(json!({
             "agent_id":"00000000-0000-0000-0000-000000000002", "owner":"owner", "name":"project",
-            "clone_url":format!("{hub}/owner/project.git"), "visibility":"private", "encryption_enabled":encryption_enabled,
+            "clone_url":format!("{hub}/owner/project.git"), "visibility":"private",
         })),
         ("GET", "/owner/project.git/info/refs?service=git-receive-pack") => Some(json!({})),
-        ("GET", "/api/agents/owner/project/privacy/publishing-key") => {
-            let public = STANDARD.encode(
-                crypto_box::SecretKey::from([23; 32])
-                    .public_key()
-                    .as_bytes(),
-            );
-            Some(
-                json!({"agent_id":"00000000-0000-0000-0000-000000000002", "config_version":1,
-                "current":{"recipient":crate::domain::privacy_key::recipient_id(&public), "public_key_algorithm":"x25519", "public_key":public}}),
-            )
-        }
         _ => None,
     }
 }

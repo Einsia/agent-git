@@ -2,10 +2,7 @@
 
 //! A real Git receiver must see projected ancestry while encrypted snapshots retain the originals.
 
-use agit::domain::{
-    meta, privacy::PrivacyPolicy, privacy_envelope::PrivacyEnvelope, repo::Repo, storage,
-    transcript,
-};
+use agit::domain::{meta, privacy_envelope::PrivacyEnvelope, repo::Repo, storage, transcript};
 use agit::infra::{
     config,
     credentials::{HubCredential, save_at},
@@ -27,32 +24,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "support/privacy_password_terminal.rs"]
-mod privacy_password_terminal;
 #[path = "support/publication_http.rs"]
 mod publication_http;
-#[path = "support/publication_text.rs"]
-mod publication_text;
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
 
 const AGENT_ID: &str = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7";
-const SOURCE_ID: &str = "3a48ec29-769e-449d-9593-ec777ea87fd7";
-const SESSION_SECRET: &str = "AKIA7F3X9Q2M8N5P6R4T";
 
 struct Hub {
     base: String,
     posts: Arc<AtomicUsize>,
     deny: Arc<AtomicBool>,
+    unsupported_policy: Arc<AtomicBool>,
     corrupt_receipt: Arc<AtomicBool>,
-    confirmations: Arc<AtomicUsize>,
     creations: Arc<AtomicUsize>,
-    strategies: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
     key_version: Arc<AtomicUsize>,
-    revoked_reader_key: Arc<AtomicBool>,
-    reader_requests: Arc<AtomicUsize>,
-    source_writable: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -61,21 +48,10 @@ impl Hub {
     fn start(root: &Path, viewing_key: [u8; 32]) -> Self {
         let key = SecretKey::from(viewing_key);
         let public = STANDARD.encode(key.public_key().as_bytes());
-        let wrapped = agit::domain::privacy_key::KeyInput::wrap(
-            &zeroize::Zeroizing::new(viewing_key),
-            &zeroize::Zeroizing::new("synthetic-repository-password".into()),
-        )
-        .unwrap();
         let viewing_public = Arc::new(Mutex::new(public.clone()));
         let served_public = Arc::clone(&viewing_public);
         let key_version = Arc::new(AtomicUsize::new(1));
         let served_version = Arc::clone(&key_version);
-        let revoked_reader_key = Arc::new(AtomicBool::new(false));
-        let revoked = Arc::clone(&revoked_reader_key);
-        let reader_requests = Arc::new(AtomicUsize::new(0));
-        let reader_count = Arc::clone(&reader_requests);
-        let source_writable = Arc::new(AtomicBool::new(false));
-        let source_write_access = source_writable.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -86,14 +62,14 @@ impl Hub {
         let received = Arc::clone(&posts);
         let deny = Arc::new(AtomicBool::new(false));
         let denied = Arc::clone(&deny);
+        let unsupported_policy = Arc::new(AtomicBool::new(false));
+        let unsupported = Arc::clone(&unsupported_policy);
         let corrupt_receipt = Arc::new(AtomicBool::new(false));
         let corrupting = Arc::clone(&corrupt_receipt);
         let confirmations = Arc::new(AtomicUsize::new(0));
         let confirmed = Arc::clone(&confirmations);
         let creations = Arc::new(AtomicUsize::new(0));
         let created = Arc::clone(&creations);
-        let strategies = Arc::new(AtomicUsize::new(0));
-        let registered = Arc::clone(&strategies);
         let resolver_hub = base.clone();
         let root = root.to_owned();
         let worker = thread::spawn(move || {
@@ -101,12 +77,14 @@ impl Hub {
             let mut strategy = serde_json::Value::Null;
             let mut preview = serde_json::Value::Null;
             let mut pending_receipt = None;
-            let content_digest = agit::domain::privacy_envelope::digest_bytes(b"client-only");
-            let mandatory = format!(
-                r#"{{"version":1,"source":"repository","require_envelope":true,"publication_format_version":1,"protected_paths":["session/log.jsonl","session/VIEW"],"content_policy_digest":"{content_digest}"}}"#
-            );
+            let mandatory = r#"{"version":1,"source":"repository","require_envelope":false,"require_session_config":true,"publication_format_version":2,"protected_paths":[]}"#;
             let mandatory_digest =
                 agit::domain::privacy_envelope::digest_bytes(mandatory.as_bytes());
+            let mut sessions = std::collections::BTreeMap::<String, serde_json::Value>::new();
+            let mut policies = std::collections::BTreeMap::<
+                String,
+                agit::domain::session_grants::SessionGrantPolicy,
+            >::new();
             let mut last_request = String::new();
             while !stopping.load(Ordering::Acquire) {
                 assert!(
@@ -176,21 +154,6 @@ impl Hub {
                     write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     continue;
                 }
-                if target.starts_with("/team/app.git/") {
-                    assert_eq!(method, "GET");
-                    assert!(target.ends_with("info/refs?service=git-receive-pack"));
-                    write!(
-                        stream,
-                        "HTTP/1.1 {} Reply\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        if source_write_access.load(Ordering::Acquire) {
-                            200
-                        } else {
-                            403
-                        }
-                    )
-                    .unwrap();
-                    continue;
-                }
                 if target.starts_with("/alice/app.git/") && denied.load(Ordering::Acquire) {
                     write!(
                         stream,
@@ -199,20 +162,94 @@ impl Hub {
                     .unwrap();
                     continue;
                 }
-                if method == "GET" && target.contains("/privacy/keys/") {
-                    reader_count.fetch_add(1, Ordering::AcqRel);
-                    if revoked.load(Ordering::Acquire) {
-                        let body =
-                            r#"{"kind":"not_found","error":"publication viewing key not found"}"#;
-                        write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                        continue;
-                    }
-                }
                 if target.starts_with("/api/me/privacy/") {
                     write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
                 }
                 let json = match (method, target) {
+                    (method, path)
+                        if path.starts_with("/api/agents/alice/app/sessions/")
+                            && path.ends_with("/privacy-config") =>
+                    {
+                        let session = path
+                            .strip_prefix("/api/agents/alice/app/sessions/")
+                            .unwrap()
+                            .strip_suffix("/privacy-config")
+                            .unwrap();
+                        if method == "POST" {
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(request["expected_repository_id"], AGENT_ID);
+                            let config = json!({"repository_id":AGENT_ID,"session_id":session,"privacy":request["privacy"],"revision":1,"created_at":"2026-01-01T00:00:00Z"});
+                            policies.entry(session.into()).or_insert_with(|| {
+                                agit::domain::session_grants::SessionGrantPolicy {
+                                    agent_id: AGENT_ID.into(),
+                                    session_id: session.into(),
+                                    grant_scope: agit::domain::session_grants::GrantScope::Session,
+                                    policy_revision: 1,
+                                    grant_revision: 1,
+                                }
+                            });
+                            if let Some(previous) = sessions.insert(session.into(), config.clone())
+                            {
+                                assert_eq!(previous, config);
+                            }
+                        }
+                        if session == format!("agit-{}", "b".repeat(40)) {
+                            sessions.entry(session.into()).or_insert_with(|| json!({"repository_id":AGENT_ID,"session_id":session,"privacy":{"scheme":"plain","hub":null,"creator":null,"owner":null,"owner_source":"unresolved"},"revision":1,"created_at":"2026-01-01T00:00:00Z"}));
+                        }
+                        let Some(config) = sessions.get(session) else {
+                            let body = r#"{"kind":"session_privacy_unregistered","error":"register this session"}"#;
+                            write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            continue;
+                        };
+                        let key = if config["privacy"]["scheme"] == "session_owner_v2" {
+                            json!({"account_id":config["privacy"]["owner"]["id"],"key_version":served_version.load(Ordering::Acquire),"public_key_algorithm":"x25519","public_key":served_public.lock().unwrap().clone()})
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        Some(json!({"config":config,"owner_key":key}))
+                    }
+                    (method, path)
+                        if path.starts_with("/api/agents/alice/app/sessions/")
+                            && path.ends_with("/original-grant-policy") =>
+                    {
+                        use agit::domain::session_grants::{GrantPolicyMutation, GrantScope};
+                        if method == "POST" && unsupported.load(Ordering::Acquire) {
+                            let body = r#"{"kind":"unsupported","error":"Enabling session-level authorization after disabling it is unsupported."}"#;
+                            write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            continue;
+                        }
+                        let session = path
+                            .strip_prefix("/api/agents/alice/app/sessions/")
+                            .unwrap()
+                            .strip_suffix("/original-grant-policy")
+                            .unwrap();
+                        let policy = policies
+                            .get_mut(session)
+                            .expect("policy requires registration");
+                        if method == "GET" {
+                            Some(json!(policy))
+                        } else {
+                            let request: GrantPolicyMutation =
+                                serde_json::from_slice(&body).unwrap();
+                            request.validate().unwrap();
+                            assert_eq!(request.target, policy.target().unwrap());
+                            assert_eq!(request.expected_policy_revision, policy.policy_revision);
+                            assert_eq!(request.expected_grant_revision, policy.grant_revision);
+                            assert_eq!(request.grant_scope, GrantScope::Commit);
+                            if policy.grant_scope == GrantScope::Session {
+                                policy.grant_scope = GrantScope::Commit;
+                                policy.policy_revision += 1;
+                                policy.grant_revision += 1;
+                            }
+                            Some(
+                                json!({"policy":policy,"converted_recipients":0,"converted_snapshots":0}),
+                            )
+                        }
+                    }
+                    ("POST", "/api/me/session-key/ensure") => Some(
+                        json!({"ready":true,"key":{"account_id":"account-1","key_version":served_version.load(Ordering::Acquire),"public_key_algorithm":"x25519","public_key":served_public.lock().unwrap().clone()}}),
+                    ),
                     ("POST", "/api/auth/refresh") => {
                         assert_eq!(
                             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["refresh_token"],
@@ -224,12 +261,6 @@ impl Hub {
                     }
                     ("GET", "/api/auth/me") => {
                         Some(json!({"account_id":"account-1","username":"alice"}))
-                    }
-                    ("GET", "/api/agents/alice/app/privacy/publishing-key") => {
-                        let current = served_public.lock().unwrap().clone();
-                        Some(
-                            json!({"agent_id":AGENT_ID,"config_version":served_version.load(Ordering::Acquire),"current":if current.is_empty() { serde_json::Value::Null } else { json!({"recipient":agit::domain::privacy_key::recipient_id(&current),"public_key_algorithm":"x25519","public_key":current}) }}),
-                        )
                     }
                     ("POST", "/api/agents") => {
                         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -244,18 +275,18 @@ impl Hub {
                         git(&destination, &["config", "http.receivepack", "true"]);
                         created.fetch_add(1, Ordering::Release);
                         Some(
-                            json!({"agent_id":AGENT_ID,"encryption_enabled":true,"owner":"alice","name":"app","push_url":url,"web_url":format!("{resolver_hub}/alice/app")}),
+                            json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","push_url":url,"web_url":format!("{resolver_hub}/alice/app")}),
                         )
                     }
-                    ("GET", "/api/agents/team/app") => Some(
-                        json!({"agent_id":SOURCE_ID,"encryption_enabled":false,"owner":"team","name":"app","clone_url":format!("{resolver_hub}/team/app.git"),"visibility":"private"}),
-                    ),
                     ("PUT", "/api/agents/alice/app/privacy/strategy") => {
-                        registered.fetch_add(1, Ordering::Release);
                         strategy = serde_json::from_slice(&body).unwrap();
-                        assert_eq!(strategy["summary"], json!({"session_only":true}));
+                        assert_eq!(strategy["publication_format_version"], 2);
+                        assert_eq!(
+                            strategy["summary"],
+                            json!({"session_modes":["plain","session_owner_v2"]})
+                        );
                         strategy["agent_id"] = json!(AGENT_ID);
-                        strategy["mandatory_policy"] = serde_json::from_str(&mandatory).unwrap();
+                        strategy["mandatory_policy"] = serde_json::from_str(mandatory).unwrap();
                         strategy["mandatory_policy_digest"] = json!(mandatory_digest);
                         Some(strategy.clone())
                     }
@@ -266,18 +297,19 @@ impl Hub {
                             preview["expected_refs_digest"],
                             remote_refs_digest(&root.join("alice/app.git"))
                         );
-                        assert_eq!(preview["snapshot_digest"], preview["target_refs_digest"]);
-                        let public = served_public.lock().unwrap().clone();
-                        let recipient =
-                            agit::domain::privacy_envelope::ViewingRecipient::from_base64(
-                                agit::domain::privacy_envelope::digest_bytes(public.as_bytes())
-                                    .replace(':', "-"),
-                                &public,
+                        assert_eq!(preview["envelope_format_version"], 2);
+                        let manifest: agit::domain::session_privacy::SessionPublicationManifest =
+                            serde_json::from_value(preview["manifest"].clone()).unwrap();
+                        manifest.validate().unwrap();
+                        assert_eq!(
+                            preview["snapshot_digest"],
+                            agit::domain::privacy_envelope::digest_bytes(
+                                &serde_json::to_vec(&manifest).unwrap()
                             )
-                            .unwrap();
+                        );
                         assert_eq!(
                             preview["receiver_scope"],
-                            format!("repository:private:{}", recipient.fingerprint().unwrap())
+                            format!("sessions:private:{AGENT_ID}")
                         );
                         preview["preview_id"] =
                             json!(format!("preview-{}", confirmed.load(Ordering::Acquire)));
@@ -302,28 +334,8 @@ impl Hub {
                         Some(request)
                     }
                     ("GET", "/api/agents/alice/app") => Some(
-                        json!({"agent_id":AGENT_ID,"encryption_enabled":true,"owner":"alice","name":"app","clone_url":url,"visibility":"private"}),
+                        json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url,"visibility":"private"}),
                     ),
-                    ("GET", path) if path.starts_with("/api/agents/alice/app/privacy/keys/") => {
-                        let (recipient, commit) = path
-                            .strip_prefix("/api/agents/alice/app/privacy/keys/")
-                            .unwrap()
-                            .split_once("?ref=")
-                            .unwrap();
-                        assert_eq!(recipient, agit::domain::privacy_key::recipient_id(&public));
-                        let metadata: meta::Meta = serde_json::from_str(&git(
-                            &root.join("alice/app.git"),
-                            &["show", &format!("{commit}:{}", meta::FILE)],
-                        ))
-                        .unwrap();
-                        let mut record = serde_json::to_value(&wrapped).unwrap();
-                        record["recipient"] = json!(recipient);
-                        record["current"] = json!(true);
-                        record["updated_at"] = json!("2026-09-26T00:00:00Z");
-                        Some(
-                            json!({"agent_id":AGENT_ID,"commit":commit,"session_id":metadata.session,"key":record}),
-                        )
-                    }
                     _ => None,
                 };
                 if let Some(json) = json {
@@ -402,15 +414,11 @@ impl Hub {
             base,
             posts,
             deny,
+            unsupported_policy,
             corrupt_receipt,
-            confirmations,
             creations,
-            strategies,
             viewing_public,
             key_version,
-            revoked_reader_key,
-            reader_requests,
-            source_writable,
             stop,
             worker: Some(worker),
         }
@@ -480,913 +488,15 @@ fn assert_success(out: &Output) {
     );
 }
 
+/// Creation and Git receive require consent and exact receipts; retries preserve session authority.
 #[test]
-fn first_publication_requires_configuration_and_read_only_copy_refuses() {
-    for copying in [false, true] {
-        check_first_publication(copying, false, false);
-    }
-}
-
-#[test]
-fn local_rc_publication_retains_local_identity_and_confirmed_destination() {
-    check_first_publication(false, true, false);
-}
-
-#[test]
-fn separate_encrypted_destination_keeps_source_state_and_requires_original_ancestry() {
-    check_first_publication(true, false, true);
-}
-
-fn check_first_publication(copying: bool, local_rc: bool, separate: bool) {
+fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retries() {
+    use agit::domain::session_privacy::{AccountIdentity, CommitterAttribution, SessionPrivacy};
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
-    let workspace = temp.path().join("workspace");
-    fs::create_dir_all(&workspace).unwrap();
-    let remote_root = temp.path().join("remote");
-    fs::create_dir_all(&remote_root).unwrap();
-    let key = SecretKey::from([25; 32]);
-    let hub = Hub::start(&remote_root, key.to_bytes());
-    save_at(
-        &home
-            .join("credentials")
-            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
-        &HubCredential {
-            account_id: Some("account-1".into()),
-            username: "alice".into(),
-            email: None,
-            hub: Some(hub.base.clone()),
-            access_token: "synthetic-access".into(),
-            refresh_token: "synthetic-refresh".into(),
-            access_expires_at: "2099-01-01T00:00:00Z".into(),
-            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
-        },
-    )
-    .unwrap();
-    let owner = if local_rc {
-        "desktop-machine"
-    } else if copying {
-        "team"
-    } else {
-        "alice"
-    };
-    let repo = Repo::init(&home.join(format!("repos/{owner}/app"))).unwrap();
-    repo.git(&["config", "user.name", "Synthetic source"])
-        .unwrap();
-    repo.git(&["config", "user.email", "source@example.invalid"])
-        .unwrap();
-    repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
-    if local_rc {
-        fs::create_dir_all(home.join("desktop-rc")).unwrap();
-        fs::write(
-            home.join("desktop-rc/identity.json"),
-            json!({
-                "machine_fingerprint":"machine", "display_name":"Synthetic executor",
-                "created_at":"2026-09-23T00:00:00Z"
-            })
-            .to_string(),
-        )
-        .unwrap();
-        repo.git(&["config", "agit.desktopIdentity", SOURCE_ID])
-            .unwrap();
-        repo.git(&["config", "agit.desktopAuthority", "local:machine"])
-            .unwrap();
-    }
-    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
-    fs::write(repo.root().join("private.txt"), "INDEPENDENT_SOURCE_FILE").unwrap();
-    repo.add_all().unwrap();
-    repo.commit("Source files").unwrap();
-    repo.git(&["checkout", "-b", "work"]).unwrap();
-    let mut raw = [
-            json!({"type":"assistant","message":{"role":"assistant","content":"Visible session reply"}}),
-        ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
-    if local_rc {
-        let native = "3f6b1c2a-8d40-4e7b-9a15-2c0de4f8b731";
-        for record in [
-            json!({"type":"assistant","sessionId":native,"uuid":"88bfaf5e-4107-4cf2-9038-a2a891d171f1","message":{"role":"assistant","content":[
-                {"type":"text","text":format!("Readable RC reply {native} {SESSION_SECRET}")},
-                {"type":"tool_use","id":"rc-shell","name":"Bash","input":{"command":format!("printf 'Readable RC command {SESSION_SECRET}'")}}
-            ]}}),
-            json!({"type":"user","sessionId":native,"uuid":"81567b2e-195a-4ed3-a180-06eca3efc210","parentUuid":"88bfaf5e-4107-4cf2-9038-a2a891d171f1","message":{"role":"user","content":[
-                {"type":"tool_result","tool_use_id":"rc-shell","content":format!("Readable RC output {SESSION_SECRET}"),"is_error":false}
-            ]}}),
-        ] {
-            raw.push_str(&format!("{record}\n"));
-        }
-    }
-    let session = format!("agit-{}", "c".repeat(40));
-    let log = transcript::wrap_lines(&raw, "claude-code", &session);
-    let saved = if local_rc {
-        let dictionary =
-            agit::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-        dictionary
-            .block_add("RC fixture", SESSION_SECRET.to_string().into(), false)
-            .unwrap();
-        dictionary
-            .protect_envelopes(&log, &agit::domain::secret_filter::Matcher::empty())
-            .unwrap()
-            .text
-    } else {
-        log.clone()
-    };
-    storage::write_snapshot(repo.root(), &saved, &saved).unwrap();
-    meta::write(
-        repo.root(),
-        &meta::Meta::new(
-            session.clone(),
-            "claude-code".into(),
-            workspace.to_string_lossy().into(),
-        ),
-    )
-    .unwrap();
-    repo.add_all().unwrap();
-    repo.commit("Captured session").unwrap();
-    let original = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    PrivacyPolicy {
-        workspace: Some(workspace.clone()),
-        ..Default::default()
-    }
-    .save(&repo)
-    .unwrap();
-    let source_remote = remote_root.join("team/app.git");
-    let source_refs = if copying {
-        fs::create_dir_all(&source_remote).unwrap();
-        git(&source_remote, &["init", "--bare", "--initial-branch=main"]);
-        git(
-            repo.root(),
-            &[
-                "push",
-                source_remote.to_str().unwrap(),
-                "HEAD:refs/heads/work",
-            ],
-        );
-        repo.set_remote(&format!("{}/team/app.git", hub.base))
-            .unwrap();
-        agit::hub::identity::pin(
-            &repo,
-            &agit::hub::identity::RemoteIdentity::new(&hub.base, SOURCE_ID).unwrap(),
-        )
-        .unwrap();
-        Some(git(&source_remote, &["for-each-ref"]))
-    } else {
-        None
-    };
-    let target = format!("{owner}/app@work");
-    if local_rc || separate {
-        repo.set_auto_push(Some(true)).unwrap();
-    }
-    let primary_receipt = if separate {
-        use agit::domain::privacy_receipt::{PublicationMode, PublicationReceipt};
-        let receipt = PublicationReceipt {
-            version: 2,
-            mode: PublicationMode::Ordinary,
-            repository: "team/app".into(),
-            branch: "work".into(),
-            source: original.clone(),
-            published: original.clone(),
-            projected_session_id: Some(session.clone()),
-            destination: agit::hub::identity::read(&repo).unwrap().unwrap(),
-            url: repo.remote_url().unwrap(),
-            policy_digest: None,
-            recipient: None,
-        };
-        receipt.save(&repo).unwrap();
-        fs::write(repo.common_dir().unwrap().join("agit/privacy-auto-consent.json"),
-            json!({"version":2,"mode":"ordinary","hub":hub.base,"account":"alice","account_id":"account-1", "agent_id":SOURCE_ID,"url":receipt.url,"visibility":"private"}).to_string()).unwrap();
-        Some(receipt)
-    } else {
-        None
-    };
-    let source_config = fs::read(repo.root().join(".git/config")).unwrap();
-    let source_local_refs = repo.git(&["for-each-ref"]).unwrap();
-    let command_with_destination =
-        |confirmed: bool, target: &str, destination: Option<&str>, automatic: bool| {
-            let mut cli = Command::new(env!("CARGO_BIN_EXE_agit"));
-            cli.env_clear();
-            for (name, value) in git_command(temp.path()).get_envs() {
-                if let Some(value) = value {
-                    cli.env(name, value);
-                }
-            }
-            if confirmed {
-                cli.arg("--yes");
-            }
-            if automatic {
-                cli.env("AGIT_AUTO_PUSH", "1");
-            }
-            cli.args(["push", target, "--private"]);
-            if let Some(destination) = destination {
-                cli.args(["--to", destination]);
-            }
-            cli.current_dir(&workspace)
-                .env("AGIT_HOME", &home)
-                .env("AGIT_HUB_URL", &hub.base)
-                .env("CI", "1")
-                .env("AGIT_TUI", "0")
-                .env("AGIT_USE_SYSTEM_GIT", "1")
-                .env(
-                    "AGIT_SECRETS_KEYSTORE",
-                    if cfg!(unix) { "file" } else { "os" },
-                )
-                .stdin(Stdio::null());
-            cli
-        };
-    let run_with_destination = |confirmed, target: &str, destination: Option<&str>, automatic| {
-        command_with_destination(confirmed, target, destination, automatic)
-            .output()
-            .unwrap()
-    };
-    let run = |confirmed, target: &str| {
-        run_with_destination(
-            confirmed,
-            target,
-            (local_rc || separate).then_some("alice/app"),
-            false,
-        )
-    };
-    // Encryption is opted into at creation; without the flag a first push creates an ordinary
-    // repository instead of reaching the viewing-key gate.
-    let missing = command_with_destination(
-        true,
-        &target,
-        (local_rc || separate).then_some("alice/app"),
-        false,
-    )
-    .arg("--encryption=true")
-    .output()
-    .unwrap();
-    assert!(!missing.status.success());
-    if copying && !separate {
-        assert!(
-            String::from_utf8_lossy(&missing.stderr).contains("historical-key delivery contract"),
-            "{missing:?}"
-        );
-        assert_eq!(hub.creations.load(Ordering::Acquire), 0);
-        assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-        assert_eq!(git(&source_remote, &["for-each-ref"]), source_refs.unwrap());
-        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), original);
-        return;
-    }
-    assert!(
-        String::from_utf8_lossy(&missing.stderr).contains("agit privacy init alice/app"),
-        "{missing:?}"
-    );
-    assert_eq!(hub.creations.load(Ordering::Acquire), 0);
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    let destination = remote_root.join("alice/app.git");
-    fs::create_dir_all(&destination).unwrap();
-    git(&destination, &["init", "--bare", "--initial-branch=main"]);
-    git(&destination, &["config", "http.receivepack", "true"]);
-    if separate {
-        fs::write(
-            home.join("config.json"),
-            json!({"privacy.encryption":"false"}).to_string(),
-        )
-        .unwrap();
-    }
-    let unconfirmed = run(false, &target);
-    assert!(!unconfirmed.status.success());
-    assert!(
-        String::from_utf8_lossy(&unconfirmed.stderr).contains("requires confirmation"),
-        "{unconfirmed:?}"
-    );
-    assert_eq!(hub.creations.load(Ordering::Acquire), 0);
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    assert_success(&run(true, &target));
-    assert_eq!(hub.creations.load(Ordering::Acquire), 0);
-    let destination = remote_root.join("alice/app.git");
-    let envelope = PrivacyEnvelope::parse(
-        git(
-            &destination,
-            &["show", "refs/heads/work:privacy/envelope.json"],
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-    let public = envelope.public_projection.to_string();
-    assert!(public.contains("Visible session reply"));
-    if local_rc {
-        assert!(public.contains("Readable RC reply"));
-        for marker in ["Readable RC command", "Readable RC output"] {
-            assert!(!public.contains(marker));
-        }
-        assert!(!public.contains(SESSION_SECRET));
-        assert!(!public.contains("content unavailable"));
-    }
-    let private = envelope.open_layer(&key).unwrap();
-    let (original_log, original_view) = private.session_bytes().unwrap();
-    assert_eq!(original_log.as_str(), log);
-    assert_eq!(original_view.as_str(), log);
-    assert!(!original_log.contains("INDEPENDENT_SOURCE_FILE"));
-    assert!(!git(&destination, &["rev-list", "--all"]).contains(original.trim()));
-    if separate {
-        use agit::domain::privacy_receipt::PublicationReceipt;
-        assert!(envelope.open_layer(&SecretKey::from([26; 32])).is_err());
-        assert_eq!(
-            fs::read(repo.root().join(".git/config")).unwrap(),
-            source_config
-        );
-        assert_eq!(repo.git(&["for-each-ref"]).unwrap(), source_local_refs);
-        assert_eq!(git(&source_remote, &["for-each-ref"]), source_refs.unwrap());
-        assert_eq!(
-            PublicationReceipt::load(&repo, "work").unwrap(),
-            primary_receipt
-        );
-        let auto_consent: serde_json::Value = serde_json::from_slice(
-            &fs::read(
-                repo.common_dir()
-                    .unwrap()
-                    .join("agit/privacy-auto-consent.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(auto_consent["agent_id"], SOURCE_ID);
-        let scoped: Vec<PublicationReceipt> = walkdir::WalkDir::new(
-            repo.common_dir()
-                .unwrap()
-                .join("agit/publication-destinations"),
-        )
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
-        .collect();
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].destination.agent_id, AGENT_ID);
-        assert_eq!(scoped[0].source, original);
-        assert_eq!(
-            scoped[0].published,
-            git(&destination, &["rev-parse", "work"])
-        );
-        assert_ne!(scoped[0].published, original);
-        assert!(scoped[0].mode.is_encrypted());
-        let public_key = STANDARD.encode(key.public_key().as_bytes());
-        let target_recipient = agit::domain::privacy_envelope::ViewingRecipient::from_base64(
-            agit::domain::privacy_key::recipient_id(&public_key),
-            &public_key,
-        )
-        .unwrap();
-        assert_eq!(
-            scoped[0].recipient.as_deref(),
-            Some(target_recipient.fingerprint().unwrap().as_str())
-        );
-        let published_refs = git(&destination, &["for-each-ref"]);
-        let confirmations = hub.confirmations.load(Ordering::Acquire);
-        let repeated = run(true, &target);
-        assert_success(&repeated);
-        assert!(String::from_utf8_lossy(&repeated.stdout).contains("already up to date"));
-        assert_eq!(hub.confirmations.load(Ordering::Acquire), confirmations);
-        assert_eq!(git(&destination, &["for-each-ref"]), published_refs);
-        let ciphertext_clone = home.join("repos/team/cipher");
-        git(
-            temp.path(),
-            &[
-                "clone",
-                "-b",
-                "work",
-                destination.to_str().unwrap(),
-                ciphertext_clone.to_str().unwrap(),
-            ],
-        );
-        let ciphertext_clone = Repo::at(ciphertext_clone);
-        agit::hub::identity::pin(
-            &ciphertext_clone,
-            &agit::hub::identity::RemoteIdentity::new(&hub.base, AGENT_ID).unwrap(),
-        )
-        .unwrap();
-        ciphertext_clone
-            .set_remote(&format!("{}/alice/app.git", hub.base))
-            .unwrap();
-        hub.source_writable.store(true, Ordering::Release);
-        let before = git(&source_remote, &["for-each-ref"]);
-        let denied = run_with_destination(true, "team/cipher@work", Some("team/app"), false);
-        assert!(!denied.status.success());
-        assert!(
-            String::from_utf8_lossy(&denied.stderr)
-                .contains("selected history contains encrypted snapshots"),
-            "{denied:?}"
-        );
-        assert_eq!(git(&source_remote, &["for-each-ref"]), before);
-        assert_eq!(hub.reader_requests.load(Ordering::Acquire), 0);
-        assert_eq!(
-            fs::read(repo.root().join(".git/config")).unwrap(),
-            source_config
-        );
-        assert_eq!(repo.git(&["for-each-ref"]).unwrap(), source_local_refs);
-        return;
-    }
-    let local_path = if local_rc {
-        repo.root().to_owned()
-    } else {
-        home.join("repos/alice/app")
-    };
-    let local = Repo::open(&local_path).unwrap();
-    assert_eq!(
-        agit::hub::identity::read(&local).unwrap().unwrap().agent_id,
-        AGENT_ID
-    );
-    if local_rc {
-        assert!(!home.join("repos/alice/app").exists());
-        assert_eq!(
-            local
-                .git(&["config", "agit.desktopIdentity"])
-                .unwrap()
-                .trim(),
-            SOURCE_ID
-        );
-        let binding: serde_json::Value =
-            serde_json::from_str(&local.git(&["config", "agit.desktopPublication"]).unwrap())
-                .unwrap();
-        assert_eq!(binding["repository"], "alice/app");
-        assert_eq!(binding["identity"]["agent_id"], AGENT_ID);
-        assert_eq!(binding["local_agent_id"], SOURCE_ID);
-        let rejected = run_with_destination(true, &target, Some("bob/replacement"), false);
-        assert!(!rejected.status.success());
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr).contains("cannot be replaced"),
-            "{rejected:?}"
-        );
-    }
-    assert_eq!(local.git(&["rev-parse", "HEAD"]).unwrap(), original);
-    assert_eq!(
-        fs::read_to_string(local.root().join("private.txt")).unwrap(),
-        "INDEPENDENT_SOURCE_FILE"
-    );
-    if let Some(before) = source_refs {
-        assert_eq!(git(&source_remote, &["for-each-ref"]), before);
-        assert_eq!(
-            local.upstream_url().unwrap(),
-            format!("{}/team/app.git", hub.base)
-        );
-    }
-    let mut before = git(&destination, &["for-each-ref"]);
-    let repeat_target = if local_rc {
-        target.as_str()
-    } else {
-        "alice/app@work"
-    };
-    let confirmations_before_repeat = hub.confirmations.load(Ordering::Acquire);
-    let posts_before_repeat = hub.posts.load(Ordering::Acquire);
-    let repeat = run_with_destination(true, repeat_target, None, false);
-    assert_success(&repeat);
-    let repeat_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&repeat.stdout),
-        String::from_utf8_lossy(&repeat.stderr)
-    );
-    assert!(
-        repeat_output.contains("already up to date."),
-        "repeat push did not report its no-op result: {repeat_output}"
-    );
-    assert!(
-        repeat_output.contains("alice/app@work (private): already up to date."),
-        "repeat push did not identify its branch: {repeat_output}"
-    );
-    for omitted in [
-        "target:",
-        "Deterministic inspection:",
-        "Privacy processing:",
-        "Privacy preview:",
-        "Publication destination:",
-        "Published the reviewed snapshot",
-        "requires confirmation",
-    ] {
-        assert!(
-            !repeat_output.contains(omitted),
-            "repeat push rendered {omitted}: {repeat_output}"
-        );
-    }
-    assert_eq!(
-        hub.confirmations.load(Ordering::Acquire),
-        confirmations_before_repeat
-    );
-    assert_eq!(hub.posts.load(Ordering::Acquire), posts_before_repeat);
-    let missing_tag = git(
-        &destination,
-        &["for-each-ref", "--format=%(refname)", "refs/tags"],
-    );
-    let missing_tag = missing_tag.lines().next().unwrap_or_default().to_owned();
-    assert!(
-        !missing_tag.is_empty(),
-        "the privacy publication has no tag"
-    );
-    git(&destination, &["update-ref", "-d", &missing_tag]);
-    let posts_before_tag_repair = hub.posts.load(Ordering::Acquire);
-    let tag_repair = run_with_destination(true, repeat_target, None, false);
-    assert_success(&tag_repair);
-    let tag_repair_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&tag_repair.stdout),
-        String::from_utf8_lossy(&tag_repair.stderr)
-    );
-    assert!(!tag_repair_output.contains("already up to date."));
-    assert!(hub.posts.load(Ordering::Acquire) > posts_before_tag_repair);
-    if !copying && !local_rc {
-        let mirror = temp.path().join("mirror.git");
-        git(
-            temp.path(),
-            &[
-                "clone",
-                "--mirror",
-                destination.to_str().unwrap(),
-                mirror.to_str().unwrap(),
-            ],
-        );
-        assert_eq!(git(&mirror, &["for-each-ref"]), before);
-        git(&destination, &["update-ref", "-d", "refs/heads/work"]);
-        assert!(git(&destination, &["for-each-ref", "refs/heads/work"]).is_empty());
-        git(local.root(), &["remote", "remove", "origin"]);
-        let url = format!("{}/alice/app.git", hub.base);
-        let rewrite = format!("url.{}.insteadOf", mirror.display());
-        git(local.root(), &["config", "--local", &rewrite, &url]);
-        assert!(git(local.root(), &["ls-remote", "--refs", &url]).contains("refs/heads/work"));
-
-        let confirmations = hub.confirmations.load(Ordering::Acquire);
-        let receives = hub.posts.load(Ordering::Acquire);
-        let unconfirmed = run_with_destination(false, repeat_target, None, false);
-        assert!(
-            !unconfirmed.status.success(),
-            "a local mirror cannot satisfy publication confirmation: {unconfirmed:?}"
-        );
-        let unconfirmed_output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&unconfirmed.stdout),
-            String::from_utf8_lossy(&unconfirmed.stderr)
-        );
-        assert!(unconfirmed_output.contains("requires confirmation"));
-        assert!(!unconfirmed_output.contains("already up to date."));
-        assert_eq!(hub.confirmations.load(Ordering::Acquire), confirmations);
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-
-        let repaired = run_with_destination(true, repeat_target, None, false);
-        assert_success(&repaired);
-        let repaired_output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&repaired.stdout),
-            String::from_utf8_lossy(&repaired.stderr)
-        );
-        assert!(!repaired_output.contains("already up to date."));
-        assert!(repaired_output.contains("Published the reviewed snapshot"));
-        assert!(hub.confirmations.load(Ordering::Acquire) > confirmations);
-        assert!(hub.posts.load(Ordering::Acquire) > receives);
-        assert_eq!(git(&destination, &["for-each-ref"]), before);
-        assert_eq!(git(&mirror, &["for-each-ref"]), before);
-        let confirmations = hub.confirmations.load(Ordering::Acquire);
-        let receives = hub.posts.load(Ordering::Acquire);
-        git(local.root(), &["remote", "remove", "origin"]);
-        let synchronized = run_with_destination(false, repeat_target, None, false);
-        assert_success(&synchronized);
-        assert!(
-            String::from_utf8_lossy(&synchronized.stdout)
-                .contains("alice/app@work (private): already up to date.")
-        );
-        assert_eq!(hub.confirmations.load(Ordering::Acquire), confirmations);
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-        git(local.root(), &["config", "--local", "--unset", &rewrite]);
-        local.set_remote(&url).unwrap();
-    }
-    if local_rc {
-        use agit::domain::privacy_receipt::{
-            SupervisorPushRequest,
-            outbox::{Capture, Entry},
-        };
-        let publication = agit::domain::privacy_receipt::PublicationReceipt::load(&local, "work")
-            .unwrap()
-            .unwrap();
-        let mut request = SupervisorPushRequest {
-            version: 1,
-            request_id: uuid::Uuid::new_v4().to_string(),
-            repository: "alice/app".into(),
-            branch: "work".into(),
-            source: publication.source.clone(),
-            destination: publication.destination.clone(),
-            notification_id: None,
-        };
-        Entry::begin(
-            &local,
-            &mut request,
-            Capture {
-                session_id: "local-stream".into(),
-                native_session_id: "native-session".into(),
-                runtime: "claude-code".into(),
-                generation: 1,
-                incarnation: None,
-                through_seq: None,
-            },
-        )
-        .unwrap();
-        // A retained uncertain projection cannot lend its notification ID to the generated result.
-        let uncertain = agit::domain::privacy_receipt::PublicationReceipt {
-            published: "f".repeat(40),
-            ..publication.clone()
-        };
-        assert_ne!(uncertain.published, publication.published);
-        Entry::prepare(&local, &request, &uncertain).unwrap();
-        let pending = Entry::load(&local, &request).unwrap().unwrap();
-        let result_file = tempfile::NamedTempFile::new_in(local.common_dir().unwrap()).unwrap();
-        let run_supervised = |request: &SupervisorPushRequest| {
-            fs::write(result_file.path(), serde_json::to_vec(request).unwrap()).unwrap();
-            let supervised = command_with_destination(false, repeat_target, None, true)
-                .env("AGIT_SESSION", repeat_target)
-                .env("AGIT_LOCAL_AGENT_ID", SOURCE_ID)
-                .env("AGIT_EXPECTED_AGENT_ID", AGENT_ID)
-                .env(
-                    agit::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
-                    result_file.path(),
-                )
-                .output()
-                .unwrap();
-            assert_success(&supervised);
-            request
-                .read_managed_result(&local, result_file.path())
-                .unwrap()
-        };
-        let (selected, result) = run_supervised(&request);
-        assert_eq!(result, publication);
-        assert_ne!(selected.notification_id, request.notification_id);
-        assert!(request.read_result(result_file.path()).is_err());
-        let saved = Entry::load(&local, &selected).unwrap().unwrap();
-        assert_eq!(saved.capture, pending.capture);
-        assert_eq!(saved.prepared.as_ref(), Some(&publication));
-        assert_eq!(saved.publication.as_ref(), Some(&publication));
-        assert_eq!(
-            Entry::load(&local, &request).unwrap(),
-            Some(pending.clone())
-        );
-
-        let retry = SupervisorPushRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            ..request.clone()
-        };
-        let (retried, result) = run_supervised(&retry);
-        assert_eq!(result, publication);
-        assert_eq!(retried.request_id, retry.request_id);
-        assert_eq!(retried.notification_id, selected.notification_id);
-        assert!(
-            request
-                .read_managed_result(&local, result_file.path())
-                .is_err()
-        );
-        assert_eq!(Entry::load(&local, &request).unwrap(), Some(pending));
-        assert_eq!(
-            Entry::pending(&local, "work", "native-session", "claude-code")
-                .unwrap()
-                .len(),
-            2
-        );
-        let reply: serde_json::Value =
-            serde_json::from_slice(&fs::read(result_file.path()).unwrap()).unwrap();
-        for field in ["request_id", "notification_id"] {
-            let mut forged = reply.clone();
-            forged["candidate"][field] = json!(uuid::Uuid::new_v4().to_string());
-            fs::write(result_file.path(), serde_json::to_vec(&forged).unwrap()).unwrap();
-            assert!(
-                retry
-                    .read_managed_result(&local, result_file.path())
-                    .is_err()
-            );
-        }
-        let prepared_only = agit::domain::privacy_receipt::PublicationReceipt {
-            published: "e".repeat(40),
-            ..publication.clone()
-        };
-        let other = Entry::prepare_candidate(&local, &retry, &prepared_only).unwrap();
-        let mut forged = reply;
-        forged["candidate"] = serde_json::to_value(other).unwrap();
-        forged["publication"] = serde_json::to_value(prepared_only).unwrap();
-        fs::write(result_file.path(), serde_json::to_vec(&forged).unwrap()).unwrap();
-        assert!(
-            retry
-                .read_managed_result(&local, result_file.path())
-                .is_err()
-        );
-        let public_records = agit::domain::storage::parse_envelopes(
-            envelope.public_projection["session"]["log"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(!public_records.is_empty());
-        assert!(public_records.iter().all(|record| Some(&record.session_id) == publication.projected_session_id.as_ref()));
-    }
-    assert_eq!(git(&destination, &["for-each-ref"]), before);
-    if !local_rc {
-        let old_receipt = agit::domain::privacy_receipt::PublicationReceipt::load(&local, "work")
-            .unwrap()
-            .unwrap();
-        let receives = hub.posts.load(Ordering::Acquire);
-        hub.key_version.store(2, Ordering::Release);
-        assert_success(&run_with_destination(true, repeat_target, None, false));
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-        assert_eq!(git(&destination, &["for-each-ref"]), before);
-        let rotated_key = SecretKey::from([26; 32]);
-        *hub.viewing_public.lock().unwrap() = STANDARD.encode(rotated_key.public_key().as_bytes());
-        hub.key_version.store(3, Ordering::Release);
-        assert_success(&run_with_destination(true, repeat_target, None, false));
-        assert_eq!(git(&destination, &["for-each-ref"]), before);
-        assert_eq!(
-            agit::domain::privacy_receipt::PublicationReceipt::load(&local, "work")
-                .unwrap()
-                .unwrap(),
-            old_receipt
-        );
-        hub.revoked_reader_key.store(true, Ordering::Release);
-        let fresh_home = temp.path().join("fresh-writer");
-        startup_cache::seed(&fresh_home);
-        let fresh_path = fresh_home.join("repos/alice/app");
-        fs::create_dir_all(fresh_path.parent().unwrap()).unwrap();
-        git(
-            temp.path(),
-            &[
-                "clone",
-                "--branch",
-                "work",
-                destination.to_str().unwrap(),
-                fresh_path.to_str().unwrap(),
-            ],
-        );
-        let fresh = Repo::at(&fresh_path);
-        fresh
-            .set_remote(&format!("{}/alice/app.git", hub.base))
-            .unwrap();
-        let identity = agit::hub::identity::RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
-        agit::hub::identity::pin(&fresh, &identity).unwrap();
-        fs::create_dir_all(fresh_home.join("credentials")).unwrap();
-        for entry in fs::read_dir(home.join("credentials")).unwrap() {
-            let entry = entry.unwrap();
-            fs::copy(
-                entry.path(),
-                fresh_home.join("credentials").join(entry.file_name()),
-            )
-            .unwrap();
-        }
-        PrivacyPolicy {
-            workspace: Some(workspace.clone()),
-            ..Default::default()
-        }
-        .save(&fresh)
-        .unwrap();
-        let reads = hub.reader_requests.load(Ordering::Acquire);
-        let receives = hub.posts.load(Ordering::Acquire);
-        let run_fresh = |args: &[&str]| {
-            let mut command = command_with_destination(true, "alice/app@work", None, false);
-            command.env("AGIT_HOME", &fresh_home);
-            if !args.is_empty() {
-                let mut selected = Command::new(env!("CARGO_BIN_EXE_agit"));
-                selected.env_clear();
-                for (name, value) in command.get_envs() {
-                    if let Some(value) = value {
-                        selected.env(name, value);
-                    }
-                }
-                selected
-                    .current_dir(&workspace)
-                    .stdin(Stdio::null())
-                    .args(args);
-                return selected.output().unwrap();
-            }
-            command.output().unwrap()
-        };
-        let repeat = run_fresh(&[]);
-        assert_success(&repeat);
-        assert!(String::from_utf8_lossy(&repeat.stdout).contains("already up to date."));
-        assert!(
-            agit::domain::privacy_receipt::PublicationReceipt::load(&fresh, "work")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-        assert_eq!(hub.reader_requests.load(Ordering::Acquire), reads);
-        let refused_unlock = run_fresh(&[
-            "privacy",
-            "unlock",
-            "alice/app@work",
-            "--workspace",
-            workspace.to_str().unwrap(),
-        ]);
-        assert!(!refused_unlock.status.success());
-        assert!(String::from_utf8_lossy(&refused_unlock.stderr).contains("viewing key not found"));
-        assert_eq!(hub.reader_requests.load(Ordering::Acquire), reads + 1);
-        let forked = run_fresh(&["fork", "alice/app@work", "-b", "collaborator"]);
-        assert_success(&forked);
-        let pushed = run_fresh(&["--yes", "push", "alice/app@collaborator"]);
-        assert_success(&pushed);
-        assert_eq!(hub.reader_requests.load(Ordering::Acquire), reads + 1);
-        assert_eq!(
-            git(&destination, &["rev-parse", "collaborator^"]),
-            old_receipt.published
-        );
-        let ciphertext = PrivacyEnvelope::parse(
-            git(
-                &destination,
-                &["show", "collaborator:privacy/envelope.json"],
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        assert!(ciphertext.open_layer(&rotated_key).is_ok());
-        assert!(ciphertext.open_layer(&key).is_err());
-        let fresh_receipt =
-            agit::domain::privacy_receipt::PublicationReceipt::load(&fresh, "collaborator")
-                .unwrap()
-                .unwrap();
-        assert_ne!(fresh_receipt.recipient, old_receipt.recipient);
-        let next = format!(
-            "{log}{}",
-            transcript::wrap_lines(
-                &format!(
-                    "{}\n",
-                    json!({"type":"user","message":{"role":"user","content":"A turn after repository key rotation"}})
-                ),
-                "claude-code",
-                &format!("agit-{}", "c".repeat(40))
-            )
-        );
-        storage::write_snapshot(local.root(), &next, &next).unwrap();
-        local.add_all().unwrap();
-        local.commit("Continue after rotation").unwrap();
-        assert_success(&run_with_destination(true, repeat_target, None, false));
-        let next_public = git(&destination, &["rev-parse", "work"]);
-        assert_eq!(
-            git(&destination, &["rev-parse", "work^"]),
-            old_receipt.published
-        );
-        let encrypted = PrivacyEnvelope::parse(
-            git(&destination, &["show", "work:privacy/envelope.json"]).as_bytes(),
-        )
-        .unwrap();
-        assert!(encrypted.open_layer(&rotated_key).is_ok());
-        assert!(encrypted.open_layer(&key).is_err());
-        assert_eq!(
-            serde_json::from_str::<meta::Meta>(&git(
-                &destination,
-                &["show", &format!("{next_public}:{}", meta::FILE)]
-            ))
-            .unwrap()
-            .session,
-            old_receipt.projected_session_id.unwrap()
-        );
-        for reference in before.lines() {
-            assert!(
-                git(&destination, &["for-each-ref", "refs/tags"]).contains(reference)
-                    || reference.ends_with("refs/heads/work")
-            );
-        }
-        before = git(&destination, &["for-each-ref"]);
-        let receives = hub.posts.load(Ordering::Acquire);
-        let repeat = run_with_destination(true, repeat_target, None, false);
-        assert_success(&repeat);
-        assert!(String::from_utf8_lossy(&repeat.stdout).contains("already up to date."));
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-        *hub.viewing_public.lock().unwrap() = String::new();
-        let missing = run_with_destination(true, repeat_target, None, false);
-        assert!(!missing.status.success());
-        assert!(String::from_utf8_lossy(&missing.stderr).contains("agit privacy init alice/app"));
-        assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-        *hub.viewing_public.lock().unwrap() = STANDARD.encode(rotated_key.public_key().as_bytes());
-    }
-    let mut policy = PrivacyPolicy::load(&local).unwrap();
-    policy.exclude.push("newly-private/**".into());
-    policy.save(&local).unwrap();
-    let strategies = hub.strategies.load(Ordering::Acquire);
-    let confirmations = hub.confirmations.load(Ordering::Acquire);
-    let receives = hub.posts.load(Ordering::Acquire);
-    let incompatible = run_with_destination(true, repeat_target, None, false);
-    assert!(!incompatible.status.success());
-    assert!(
-        String::from_utf8_lossy(&incompatible.stderr).contains("cannot fast-forward"),
-        "{incompatible:?}"
-    );
-    assert_eq!(hub.strategies.load(Ordering::Acquire), strategies);
-    assert_eq!(hub.confirmations.load(Ordering::Acquire), confirmations);
-    assert_eq!(hub.posts.load(Ordering::Acquire), receives);
-    assert_eq!(git(&destination, &["for-each-ref"]), before);
-}
-
-#[test]
-fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("agit");
-    startup_cache::seed(&home);
-    let mandatory_file = temp.path().join("organization-privacy.json");
-    let mandatory = json!({
-        "version":1, "id":"organization", "revision":"r1", "exclude":["src/managed/**"]
-    });
-    fs::write(&mandatory_file, mandatory.to_string()).unwrap();
-    fs::write(
-        home.join("privacy-policy-sources.json"),
-        json!({"version":1,"sources":[mandatory_file]}).to_string(),
-    )
-    .unwrap();
-    let workspace = temp.path().join("workspace");
-    fs::create_dir_all(workspace.join("src")).unwrap();
-    fs::create_dir_all(workspace.join("src/managed")).unwrap();
     let remote_root = temp.path().join("remote");
     let remote = remote_root.join("alice/app.git");
-    fs::create_dir_all(&remote).unwrap();
-    git(&remote, &["init", "--bare", "--initial-branch=main"]);
-    git(&remote, &["config", "http.receivepack", "true"]);
     let key = SecretKey::from([25; 32]);
     let hub = Hub::start(&remote_root, key.to_bytes());
     save_at(
@@ -1405,89 +515,17 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
         },
     )
     .unwrap();
-    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
-    repo.git(&["config", "user.name", "PRIVATE_AUTHOR_MARKER"])
-        .unwrap();
-    repo.git(&["config", "user.email", "private@example.invalid"])
-        .unwrap();
-    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
-    fs::write(
-        repo.root().join("private.txt"),
-        "PRIVATE_SHARED_FILE_MARKER",
-    )
-    .unwrap();
-    repo.git(&["add", "."]).unwrap();
-    repo.git(&["commit", "-m", "PRIVATE_COMMIT_MARKER"])
-        .unwrap();
-    repo.git(&["checkout", "-b", "work"]).unwrap();
-    let session = format!("agit-{}", "a".repeat(40));
-    let public_tool_output = format!(
-        "PUBLIC_TOOL_OUTPUT_START\n{}PUBLIC_TOOL_OUTPUT_END\n\u{1b}[2Jliteral terminal control",
-        "visible evidence ".repeat(160)
-    );
-    fs::write(workspace.join("src/main.rs"), "PRIVATE_SHARED_FILE_MARKER").unwrap();
-    let raw = [
-        json!({"type":"user", "cwd":workspace, "message":{"role":"user", "content":format!("Read {} with {SESSION_SECRET}", workspace.join("src/main.rs").display())}}),
-        json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"call", "name":"Read", "input":{"file_path":workspace.join("private.txt")}}]}}),
-        json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call", "content":"PRIVATE_TOOL_OUTPUT_MARKER"}]}}),
-        json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"allowed-call", "name":"Read", "input":{"file_path":workspace.join("src/main.rs")}}]}}),
-        json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"allowed-call", "content":public_tool_output}]}}),
-        json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"mandatory-call", "name":"Read", "input":{"file_path":workspace.join("src/managed/private.rs")}}]}}),
-        json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"mandatory-call", "content":"MANDATORY_TOOL_OUTPUT_MARKER"}]}}),
-    ].into_iter().chain(publication_text::records(&workspace)).map(|record| format!("{record}\n")).collect::<String>();
-    let log = transcript::wrap_lines(&raw, "claude-code", &session);
-    let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
-    dictionary
-        .block_add(
-            "Synthetic session value",
-            zeroize::Zeroizing::new(SESSION_SECRET.into()),
-            false,
-        )
-        .unwrap();
-    let saved = dictionary
-        .protect_envelopes(&log, &agit::domain::secret_filter::Matcher::empty())
-        .unwrap()
-        .text;
-    assert!(!saved.contains(SESSION_SECRET));
-    let selected = saved.split_inclusive('\n').take(1).collect::<String>();
-    storage::write_snapshot(repo.root(), &saved, &selected).unwrap();
-    meta::write(
-        repo.root(),
-        &meta::Meta::new(
-            session.clone(),
-            "claude-code".into(),
-            workspace.display().to_string(),
-        ),
-    )
-    .unwrap();
-    repo.git(&["add", "."]).unwrap();
-    repo.git(&["commit", "-m", "PRIVATE_SESSION_COMMIT"])
-        .unwrap();
-    let source_head = git(repo.root(), &["rev-parse", "HEAD"]);
-    PrivacyPolicy {
-        workspace: Some(workspace.clone()),
-        replacements: vec![publication_text::replacement()],
-        ..Default::default()
-    }
-    .save(&repo)
-    .unwrap();
-    let command = |args: &[&str], automatic: bool| {
-        let mut command = git_command(temp.path());
-        command = {
-            let mut cli = Command::new(env!("CARGO_BIN_EXE_agit"));
-            cli.env_clear();
-            for (name, value) in command.get_envs() {
-                if let Some(value) = value {
-                    cli.env(name, value);
-                }
+    let run = |args: &[&str], automatic: bool| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
             }
-            cli
-        };
-        if automatic {
-            command.env("AGIT_AUTO_PUSH", "1");
         }
         command
-            .current_dir(&workspace)
+            .current_dir(temp.path())
             .env("AGIT_HOME", &home)
             .env("AGIT_HUB_URL", &hub.base)
             .env("CI", "1")
@@ -1499,696 +537,401 @@ fn ordinary_push_confirms_projects_and_encrypts_complete_incremental_history() {
             )
             .stdin(Stdio::null())
             .args(args);
-        command
+        if automatic {
+            command.env("AGIT_AUTO_PUSH", "1");
+        }
+        command.output().unwrap()
     };
-    let invoke = |args: &[&str], automatic: bool| command(args, automatic).output().unwrap();
-    let run = |args: &[&str]| invoke(args, false);
-    let auto = || invoke(&["--yes", "push", "alice/app@work"], true);
-    assert_success(&run(&[
-        "privacy",
-        "policy",
-        "include",
-        "src/managed/**",
-        "--repo",
-        "alice/app",
-    ]));
-    assert!(
-        !fs::read_to_string(PrivacyPolicy::path(&repo).unwrap())
-            .unwrap()
-            .contains("mandatory")
-    );
-    repo.set_auto_push(Some(true)).unwrap();
-    let unconfirmed = auto();
-    assert!(!unconfirmed.status.success());
-    assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("renewed confirmation"));
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    let declined = run(&["push", "alice/app@work"]);
-    assert!(!declined.status.success());
-    assert!(
-        String::from_utf8_lossy(&declined.stderr).contains("requires confirmation"),
-        "{declined:?}"
-    );
-    let preview = String::from_utf8_lossy(&declined.stdout);
-    assert!(
-        preview.len() < 4096,
-        "default preview exceeds its terminal budget"
-    );
-    let preview_path = preview
-        .lines()
-        .find_map(|line| line.strip_prefix("Preview file: "))
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
         .unwrap();
-    let reviewed: serde_json::Value =
-        serde_json::from_slice(&fs::read(preview_path).unwrap()).unwrap();
-    let public_snapshots = reviewed["snapshots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|snapshot| snapshot["public"].clone())
-        .collect::<Vec<_>>();
-    let digest = agit::domain::privacy_envelope::digest_json(&json!(public_snapshots)).unwrap();
-    assert_eq!(reviewed["public_digest"], digest);
-    assert!(preview.contains(&format!("Public digest: {digest}")));
-    for visible in [
-        "Outgoing public session preview",
-        "Snapshots:",
-        "Records:",
-        "Privacy processing:",
-        "Public digest:",
-        "Preview file:",
-        "Private originals: recoverable",
-    ] {
-        assert!(preview.contains(visible), "preview is missing {visible}");
-    }
-    for hidden in [
-        "Complete public LOG:",
-        "Complete public VIEW:",
-        "PUBLIC_TOOL_OUTPUT_START",
-        "PUBLIC_TOOL_OUTPUT_END",
-        "\\u{1b}[2Jliteral terminal control",
-    ] {
-        assert!(
-            !preview.contains(hidden),
-            "summary preview expands {hidden}"
-        );
-    }
-    for private in [
-        SESSION_SECRET,
-        "PRIVATE_TOOL_OUTPUT_MARKER",
-        "PRIVATE_SHARED_FILE_MARKER",
-        "MANDATORY_TOOL_OUTPUT_MARKER",
-        "\u{1b}[2J",
-    ] {
-        assert!(!preview.contains(private), "preview exposes {private}");
-    }
+    repo.git(&["config", "tag.gpgsign", "false"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Accepted plain file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Accepted file line").unwrap();
+    let base = git(repo.root(), &["rev-parse", "HEAD"]);
+    git(repo.root(), &["tag", "file-release"]);
+    git(
+        repo.root(),
+        &["tag", "-a", "file-notes", "-m", "Reviewed file release"],
+    );
+    let file_tag = git(repo.root(), &["rev-parse", "refs/tags/file-notes"]);
+    let dry = run(&["push", "alice/app@main", "--dry-run"], false);
+    assert!(!dry.status.success(), "{dry:?}");
+    assert_eq!(hub.creations.load(Ordering::Acquire), 0);
+    assert!(!remote.exists());
+    let unconfirmed = run(&["push", "alice/app@main"], false);
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    assert_eq!(hub.creations.load(Ordering::Acquire), 0);
+    hub.corrupt_receipt.store(true, Ordering::Release);
+    let create = ["--yes", "push", "alice/app@main"];
+    let refused = run(&create, false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(hub.creations.load(Ordering::Acquire), 1);
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
     assert!(git(&remote, &["for-each-ref"]).is_empty());
-    let expanded = run(&["push", "alice/app@work", "--show-preview"]);
-    assert!(!expanded.status.success());
-    let expanded = String::from_utf8_lossy(&expanded.stdout);
-    fn assert_complete_text(value: &serde_json::Value, preview: &str) {
-        match value {
-            serde_json::Value::String(text) => {
-                for line in text.split('\n') {
-                    let escaped = line
-                        .chars()
-                        .flat_map(|character| {
-                            if character.is_control() {
-                                character.escape_default().collect::<Vec<_>>()
-                            } else {
-                                vec![character]
-                            }
-                        })
-                        .collect::<String>();
-                    assert!(
-                        preview.contains(&escaped),
-                        "expanded preview omits public text: {escaped}"
-                    );
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    assert_complete_text(value, preview);
-                }
-            }
-            serde_json::Value::Object(fields) => {
-                for value in fields.values() {
-                    assert_complete_text(value, preview);
-                }
-            }
-            _ => {}
-        }
-    }
-    for snapshot in reviewed["snapshots"].as_array().unwrap() {
-        for name in ["log", "view"] {
-            for record in
-                storage::parse_envelopes(snapshot["public"]["session"][name].as_str().unwrap())
-                    .unwrap()
-            {
-                assert_complete_text(&record.content, &expanded);
-            }
-        }
-    }
-    for visible in [
-        "Complete public LOG:",
-        "PUBLIC_TOOL_OUTPUT_START",
-        "PUBLIC_TOOL_OUTPUT_END",
-        "STRUCTURED_STDOUT",
-        "MIXED_TEXT_AFTER",
-    ] {
-        assert!(
-            expanded.contains(visible),
-            "expanded preview omits {visible}"
-        );
-    }
-    for hidden in [
-        "PRIVATE_VALUE",
-        "ATTACHMENT_SKILL_BODY",
-        "NESTED_IMAGE_BODY",
-        "MIXED_IMAGE_BODY",
-        SESSION_SECRET,
-    ] {
-        assert!(
-            !expanded.contains(hidden),
-            "expanded preview exposes {hidden}"
-        );
-    }
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    assert_success(&run(&["push", "alice/app@work", "--dry-run"]));
-    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    assert!(
-        agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "work")
-            .unwrap()
-            .is_none()
+    hub.corrupt_receipt.store(false, Ordering::Release);
+    assert_success(&run(&create, false));
+    assert_eq!(hub.creations.load(Ordering::Acquire), 1);
+    assert!(hub.posts.load(Ordering::Acquire) > 0);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), base);
+    assert_eq!(git(&remote, &["rev-parse", "refs/tags/file-release"]), base);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/tags/file-notes"]),
+        file_tag
     );
-    assert_eq!(hub.confirmations.load(Ordering::Acquire), 0);
+    git(repo.root(), &["tag", "-d", "file-release"]);
+    hub.posts.store(0, Ordering::Release);
+    let save = |metadata: &meta::Meta, content: &str| {
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &metadata.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), metadata).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Saved session snapshot").unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    repo.git(&["checkout", "-b", "legacy"]).unwrap();
+    let plain_meta = meta::Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let plain = save(&plain_meta, "Registered plain conversation");
+    git(repo.root(), &["tag", "plain-release"]);
+    git(
+        repo.root(),
+        &["tag", "-a", "inner", "-m", "Reviewed inner release"],
+    );
+    let inner = git(repo.root(), &["rev-parse", "refs/tags/inner"]);
+    git(
+        repo.root(),
+        &[
+            "tag",
+            "-a",
+            "release-1",
+            "inner",
+            "-m",
+            "Reviewed outer release",
+        ],
+    );
+    let outer = git(repo.root(), &["rev-parse", "refs/tags/release-1"]);
+    git(repo.root(), &["tag", "-d", "inner"]);
+    repo.git(&["checkout", "-b", "work", &base]).unwrap();
+    let mut metadata = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    metadata.session_privacy = Some(
+        SessionPrivacy::new(Some(
+            AccountIdentity::new(&hub.base, "session-owner").unwrap(),
+        ))
+        .unwrap(),
+    );
+    metadata.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
+    fs::write(
+        repo.root().join("native-private.txt"),
+        "PRIVATE_NATIVE_FILE",
+    )
+    .unwrap();
+    let original = save(&metadata, "Private transcript ORIGINAL_CONTEXT");
+    let args = ["--yes", "push", "alice/app", "-b", "work", "-b", "legacy"];
+    git(repo.root(), &["tag", &format!("agit-{original}")]);
+    hub.deny.store(true, Ordering::Release);
+    assert!(!run(&args, false).status.success());
+    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
+    hub.deny.store(false, Ordering::Release);
+    let dry = run(&["push", "alice/app@work", "--dry-run"], false);
+    assert!(!dry.status.success(), "{dry:?}");
+    assert!(
+        String::from_utf8_lossy(&dry.stderr).contains("registered before a dry-run"),
+        "{dry:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
+    git(repo.root(), &["tag", "private-release"]);
+    let refused_tag = run(&args, false);
+    assert!(!refused_tag.status.success(), "{refused_tag:?}");
+    assert!(
+        String::from_utf8_lossy(&refused_tag.stderr)
+            .contains("points to rewritten encrypted history"),
+        "{refused_tag:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
+    git(repo.root(), &["tag", "-d", "private-release"]);
     hub.corrupt_receipt.store(true, Ordering::Release);
-    let refused = run(&["--yes", "push", "alice/app@work"]);
-    assert!(!refused.status.success());
+    let mut reviewed_args = args.to_vec();
+    reviewed_args.push("--show-preview");
+    let refused = run(&reviewed_args, false);
+    assert!(!refused.status.success(), "{refused:?}");
+    let displayed = String::from_utf8_lossy(&refused.stdout);
+    assert!(displayed.contains("Registered plain conversation"));
+    assert!(!displayed.contains("PRIVATE_NATIVE_FILE"));
     assert!(
         String::from_utf8_lossy(&refused.stdout).contains("receipt differs"),
         "{refused:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
-    assert!(git(&remote, &["for-each-ref"]).is_empty());
-    hub.corrupt_receipt.store(false, Ordering::Release);
-    assert_success(&run(&["--yes", "push", "alice/app@work"]));
-    let receipt = repo
-        .common_dir()
-        .unwrap()
-        .join("agit/privacy-auto-consent.json");
-    assert!(receipt.is_file());
-    let published = git(&remote, &["rev-parse", "work"]);
-    assert_ne!(published, source_head);
-    let acknowledgment = agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "work")
-        .unwrap()
-        .unwrap();
-    assert_eq!(acknowledgment.source, source_head);
-    assert_eq!(acknowledgment.published, published);
-    assert_eq!(acknowledgment.destination.agent_id, AGENT_ID);
-    let result_file = tempfile::NamedTempFile::new_in(repo.common_dir().unwrap()).unwrap();
-    let mut request = agit::domain::privacy_receipt::SupervisorPushRequest {
-        version: 1,
-        request_id: uuid::Uuid::new_v4().to_string(),
-        repository: "alice/app".into(),
-        branch: "work".into(),
-        source: "0".repeat(40),
-        destination: acknowledgment.destination.clone(),
-        notification_id: None,
-    };
-    fs::write(result_file.path(), serde_json::to_vec(&request).unwrap()).unwrap();
-    let supervisor_push = || {
-        command(&["push", "alice/app@work"], true)
-            .env(
-                agit::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
-                result_file.path(),
-            )
-            .output()
-            .unwrap()
-    };
-    let before_posts = hub.posts.load(Ordering::Acquire);
-    let changed = supervisor_push();
-    assert!(!changed.status.success());
-    assert_eq!(hub.posts.load(Ordering::Acquire), before_posts);
-    assert!(request.read_result(result_file.path()).is_err());
-    request.source = source_head.clone();
-    use agit::domain::privacy_receipt::outbox::{Capture, Entry};
-    let capture = Capture {
-        session_id: "rc-logical-session".into(),
-        native_session_id: "native-session".into(),
-        runtime: "claude-code".into(),
-        generation: 1,
-        incarnation: None,
-        through_seq: None,
-    };
-    let intent = Entry::begin(&repo, &mut request, capture.clone()).unwrap();
-    assert!(intent.publication.is_none());
-    fs::write(result_file.path(), serde_json::to_vec(&request).unwrap()).unwrap();
-    assert_success(&supervisor_push());
-    assert_eq!(
-        request.read_result(result_file.path()).unwrap(),
-        acknowledgment
-    );
-    let restored = Entry::load(&repo, &request).unwrap().unwrap();
-    assert_eq!(restored.notification_id, intent.notification_id);
-    assert_eq!(restored.publication.as_ref(), Some(&acknowledgment));
-    let mut retry = request.clone();
-    retry.request_id = uuid::Uuid::new_v4().to_string();
-    retry.notification_id = None;
-    let restored = Entry::begin(
-        &repo,
-        &mut retry,
-        Capture {
-            generation: 2,
-            ..capture
-        },
-    )
-    .unwrap();
-    assert_eq!(restored.notification_id, intent.notification_id);
-    assert_eq!(restored.capture.generation, 1);
-    fs::write(result_file.path(), serde_json::to_vec(&retry).unwrap()).unwrap();
-    assert_success(&supervisor_push());
-    assert_eq!(
-        retry.read_result(result_file.path()).unwrap(),
-        acknowledgment
-    );
-    retry.notification_id = Some(uuid::Uuid::new_v4().to_string());
-    fs::write(result_file.path(), serde_json::to_vec(&retry).unwrap()).unwrap();
-    let posts = hub.posts.load(Ordering::Acquire);
-    assert!(!supervisor_push().status.success());
-    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
-    fs::write(result_file.path(), serde_json::to_vec(&request).unwrap()).unwrap();
-    assert_success(&supervisor_push());
-    let mut stale = request.clone();
-    stale.request_id = uuid::Uuid::new_v4().to_string();
-    assert!(stale.read_result(result_file.path()).is_err());
-    assert!(git(&remote, &["for-each-ref", "refs/heads/main"]).is_empty());
-    let file_line = run(&["--yes", "push", "alice/app@main"]);
-    assert!(!file_line.status.success());
-    assert!(String::from_utf8_lossy(&file_line.stderr).contains("excludes repository file lines"));
-    assert_success(&run(&["--yes", "push", "alice/app", "--all"]));
-    assert!(git(&remote, &["for-each-ref", "refs/heads/main"]).is_empty());
-    assert_eq!(git(&remote, &["rev-parse", "work"]), published);
-    let envelope = git(&remote, &["show", "work:privacy/envelope.json"]);
-    let envelope = PrivacyEnvelope::parse(envelope.as_bytes()).unwrap();
-    publication_text::assert_public(&envelope.public_projection, &workspace);
-    for snapshot in reviewed["snapshots"].as_array().unwrap() {
-        let remote_envelope = git(
-            &remote,
-            &[
-                "show",
-                &format!(
-                    "{}:privacy/envelope.json",
-                    snapshot["commit"].as_str().unwrap()
-                ),
-            ],
-        );
-        let remote_envelope = PrivacyEnvelope::parse(remote_envelope.as_bytes()).unwrap();
-        assert_eq!(snapshot["public"], remote_envelope.public_projection);
-        assert_eq!(snapshot["snapshot_digest"], remote_envelope.snapshot_digest);
-        assert_eq!(snapshot["policy_digest"], remote_envelope.policy_digest);
-    }
-    assert!(
-        envelope.public_projection["session"]["log"]
-            .as_str()
-            .unwrap()
-            .contains("<workspace>/src/main.rs")
-    );
-    assert_eq!(
-        envelope
-            .open_layer(&key)
-            .unwrap()
-            .session_bytes()
-            .unwrap()
-            .0
-            .as_str(),
-        log
-    );
-    assert_eq!(
-        envelope
-            .open_layer(&key)
-            .unwrap()
-            .session_bytes()
-            .unwrap()
-            .1
-            .as_str(),
-        log.split_inclusive('\n').next().unwrap()
-    );
-    let objects = git(&remote, &["rev-list", "--objects", "--all"]);
-    for line in objects.lines() {
-        let oid = line.split_whitespace().next().unwrap();
-        assert_ne!(oid, source_head);
-        let object = git(&remote, &["cat-file", "-p", oid]);
-        for forbidden in [
-            "PRIVATE_AUTHOR_MARKER",
-            "PRIVATE_SHARED_FILE_MARKER",
-            "PRIVATE_COMMIT_MARKER",
-            "PRIVATE_SESSION_COMMIT",
-            "PRIVATE_TOOL_OUTPUT_MARKER",
-            "MANDATORY_TOOL_OUTPUT_MARKER",
-            SESSION_SECRET,
-            workspace.to_str().unwrap(),
-        ] {
-            assert!(
-                !object.contains(forbidden),
-                "plaintext reached remote object {oid}: {forbidden}"
-            );
-        }
-    }
-    let automatic = auto();
-    assert_success(&automatic);
-    assert!(
-        !String::from_utf8_lossy(&automatic.stdout).contains("Outgoing public session preview")
-    );
-    assert_eq!(git(&remote, &["rev-parse", "work"]), published);
-    assert_eq!(git(repo.root(), &["rev-parse", "HEAD"]), source_head);
-    let extra = transcript::wrap_lines(
-        &[
-            json!({"type":"assistant","message":{"role":"assistant","content":"Incremental reply"}}),
-            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"continued-shell","name":"Bash","input":{"command":"CONTINUED_COMMAND"}}]}}),
-            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"continued-shell","content":{"stdout":"CONTINUED_STDOUT","exit_code":0}}]}}),
-        ].into_iter().map(|record| format!("{record}\n")).collect::<String>(),
-        "claude-code",
-        &session,
-    );
-    let continued = format!("{log}{extra}");
-    let saved = dictionary
-        .protect_envelopes(&continued, &agit::domain::secret_filter::Matcher::empty())
-        .unwrap()
-        .text;
-    storage::write_snapshot(repo.root(), &saved, &saved).unwrap();
-    repo.git(&["add", "."]).unwrap();
-    repo.git(&["commit", "-m", "PRIVATE_INCREMENTAL_COMMIT"])
-        .unwrap();
-    assert_success(&auto());
-    assert_eq!(git(&remote, &["rev-parse", "work^"]), published);
-    let envelope = git(&remote, &["show", "work:privacy/envelope.json"]);
-    let checked = PrivacyEnvelope::parse(envelope.as_bytes()).unwrap();
-    publication_text::assert_public(&checked.public_projection, &workspace);
-    let public_log = checked.public_projection["session"]["log"]
-        .as_str()
-        .unwrap();
-    assert!(public_log.contains("Incremental reply"));
-    assert!(!public_log.contains("CONTINUED_COMMAND"));
-    assert!(!public_log.contains("CONTINUED_STDOUT"));
-    let incremental_head = git(&remote, &["rev-parse", "work"]);
-    assert_success(&auto());
-    assert_eq!(git(&remote, &["rev-parse", "work"]), incremental_head);
-    assert_eq!(
-        checked
-            .open_layer(&key)
-            .unwrap()
-            .session_bytes()
-            .unwrap()
-            .1
-            .as_str(),
-        continued
-    );
-    assert_eq!(
-        PrivacyEnvelope::parse(envelope.as_bytes())
-            .unwrap()
-            .open_layer(&key)
-            .unwrap()
-            .session_bytes()
-            .unwrap()
-            .0
-            .as_str(),
-        continued
-    );
-
-    let native_id = "cccccccc-0000-4000-8000-000000000003";
-    let native = temp
-        .path()
-        .join(".claude/projects")
-        .join(agit::adapter::claude_code::slug_for(&workspace))
-        .join(format!("{native_id}.jsonl"));
-    fs::create_dir_all(native.parent().unwrap()).unwrap();
-    let append = |turn: usize| {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&native)
-            .unwrap();
-        for (role, suffix) in [("user", "u"), ("assistant", "a")] {
-            writeln!(
-                file,
-                "{}",
-                json!({
-                    "type":role,"sessionId":native_id,"cwd":workspace,
-                    "uuid":format!("{native_id}-{suffix}{turn}"),
-                    "timestamp":format!("2026-09-22T00:00:{turn:02}.000Z"),
-                    "message":{"role":role,"content":format!("Hook {role} turn {turn}")},
-                })
-            )
-            .unwrap();
-        }
-    };
-    append(1);
-    repo.set_auto_push(Some(false)).unwrap();
-    assert_success(&run(&[
-        "import",
-        native_id,
-        "--from",
-        "claude-code",
-        "--independent",
-        "--into",
-        "alice/app@hook",
-    ]));
-    repo.set_auto_push(Some(true)).unwrap();
-    let settle = || {
-        let mut child = command(&["hooks", "settle"], false)
-            .env("AGIT_SESSION", "alice/unrelated@other")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(json!({
-            "session_id":native_id,"cwd":workspace,"transcript_path":native,"hook_event_name":"Stop",
-        }).to_string().as_bytes()).unwrap();
-        child.wait_with_output().unwrap()
-    };
-    append(2);
-    let settled = settle();
-    assert_success(&settled);
-    assert!(
-        !String::from_utf8_lossy(&settled.stderr).contains("automatic push failed"),
-        "{settled:?}"
-    );
-    let hooked = git(&remote, &["rev-parse", "hook"]);
-    assert_ne!(hooked, git(repo.root(), &["rev-parse", "hook"]));
-    let envelope = git(&remote, &["show", "hook:privacy/envelope.json"]);
-    let layer = PrivacyEnvelope::parse(envelope.as_bytes())
-        .unwrap()
-        .open_layer(&key)
-        .unwrap();
-    assert!(
-        layer
-            .session_bytes()
-            .unwrap()
-            .0
-            .contains("Hook assistant turn 2")
-    );
-    let before_posts = hub.posts.load(Ordering::Acquire);
-    assert_success(&settle());
-    assert_eq!(hub.posts.load(Ordering::Acquire), before_posts);
-    hub.deny.store(true, Ordering::Release);
-    let local_before = git(repo.root(), &["rev-parse", "hook"]);
-    append(3);
-    let failed_upload = settle();
-    assert_success(&failed_upload);
-    assert!(String::from_utf8_lossy(&failed_upload.stderr).contains("automatic push failed"));
-    assert_ne!(git(repo.root(), &["rev-parse", "hook"]), local_before);
-    assert_eq!(git(&remote, &["rev-parse", "hook"]), hooked);
-    assert_eq!(
-        agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "hook")
-            .unwrap()
-            .unwrap()
-            .source,
-        local_before
-    );
-    hub.deny.store(false, Ordering::Release);
-    repo.set_auto_push(Some(false)).unwrap();
-    assert_success(&run(&["config", "push.auto", "true"]));
-    append(4);
-    assert_success(&settle());
-    assert_eq!(git(&remote, &["rev-parse", "hook"]), hooked);
-    repo.set_auto_push(None).unwrap();
-    append(5);
-    assert_success(&settle());
-    let inherited = git(&remote, &["rev-parse", "hook"]);
-    assert_ne!(inherited, hooked);
-    git(
-        &remote,
-        &["merge-base", "--is-ancestor", &hooked, &inherited],
-    );
-
-    let mut changed_mandatory = mandatory.clone();
-    changed_mandatory["revision"] = json!("r2");
-    fs::write(&mandatory_file, changed_mandatory.to_string()).unwrap();
-    let before_posts = hub.posts.load(Ordering::Acquire);
-    let before_refs = git(&remote, &["for-each-ref"]);
-    let stale = auto();
-    assert!(!stale.status.success());
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("renewed confirmation"));
-    assert_eq!(hub.posts.load(Ordering::Acquire), before_posts);
-    assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
-    fs::write(&mandatory_file, mandatory.to_string()).unwrap();
-
-    let mut policy = PrivacyPolicy::load(&repo).unwrap();
-    policy.exclude.push("new-private/**".into());
-    policy.save(&repo).unwrap();
-    let before_posts = hub.posts.load(Ordering::Acquire);
-    let before_refs = git(&remote, &["for-each-ref"]);
-    let stale = auto();
-    assert!(!stale.status.success());
-    assert!(
-        String::from_utf8_lossy(&stale.stderr).contains("renewed confirmation"),
-        "{stale:?}"
-    );
-    assert_eq!(hub.posts.load(Ordering::Acquire), before_posts);
-    assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
-
-    let new_home = temp.path().join("new-device");
-    let new_workspace = temp.path().join("new-workspace");
-    fs::create_dir_all(new_workspace.join("src")).unwrap();
-    startup_cache::seed(&new_home);
-    fs::create_dir_all(new_home.join("credentials")).unwrap();
-    let credential = format!("{}.json", config::hub_host_key(&hub.base).unwrap());
-    fs::copy(
-        home.join("credentials").join(&credential),
-        new_home.join("credentials").join(credential),
-    )
-    .unwrap();
-    let from_new_device = |args: &[&str]| {
-        command(args, false)
-            .env("AGIT_HOME", &new_home)
-            .env("HOME", &new_home)
-            .env("USERPROFILE", &new_home)
-            .current_dir(&new_workspace)
-            .output()
-            .unwrap()
-    };
-    assert_success(&from_new_device(&[
-        "--yes",
-        "clone",
-        "alice/app@work",
-        "--no-bind",
-    ]));
-    assert_success(&from_new_device(&["--yes", "push", "alice/app@work"]));
-    assert_eq!(git(&remote, &["for-each-ref"]), before_refs);
-
-    let clone = Repo::at(new_home.join("repos/alice/app"));
-    git(clone.root(), &["config", "user.name", "New Device"]);
-    git(
-        clone.root(),
-        &["config", "user.email", "device@example.invalid"],
-    );
-    assert_success(&from_new_device(&[
-        "privacy",
-        "policy",
-        "set-workspace",
-        new_workspace.to_str().unwrap(),
-        "--repo",
-        "alice/app",
-    ]));
-    let prior = git(clone.root(), &["rev-parse", "work"]);
-    let (status, output) = privacy_password_terminal::terminal_password(
-        &new_home,
-        &new_home,
-        &new_workspace,
-        &hub.base,
-        &[
-            "privacy",
-            "unlock",
-            "alice/app@work",
-            "--workspace",
-            new_workspace.to_str().unwrap(),
-        ],
-        "synthetic-repository-password",
-    );
-    assert!(status.success(), "{output}");
-    let cache = clone
-        .common_dir()
-        .unwrap()
-        .join("agit/privacy-recovery")
-        .join(&prior);
-    assert_eq!(
-        storage::materialize_worktree(&cache, meta::LOG_FILE).unwrap(),
-        continued
-    );
-    assert!(!cache.join("private.txt").exists());
-    assert_success(&from_new_device(&[
-        "resume",
-        "alice/app@work",
-        "--as",
-        "codex",
-        "--no-launch",
-        "--cwd",
-        new_workspace.to_str().unwrap(),
-    ]));
-    let runtime_file = walkdir::WalkDir::new(new_home.join(".codex/sessions"))
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .expect("recovery must prepare a runtime transcript")
-        .into_path();
-    let active = fs::read_to_string(&runtime_file).unwrap();
-    assert!(active.contains(SESSION_SECRET));
-    assert!(active.contains("PRIVATE_TOOL_OUTPUT_MARKER"));
-    let records: Vec<serde_json::Value> = active
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), base);
+    let path = String::from_utf8_lossy(&refused.stdout)
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let output = records
+        .find_map(|line| line.strip_prefix("Privacy preview: "))
+        .unwrap()
+        .to_owned();
+    let reviewed: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let tags = reviewed["plan"]["tags"].as_array().unwrap();
+    assert!(
+        tags.iter()
+            .all(|tag| tag["name"] != "refs/tags/file-release")
+    );
+    assert!(
+        tags.iter()
+            .any(|tag| tag["name"] == "refs/tags/plain-release" && tag["oid"] == plain)
+    );
+    assert!(
+        tags.iter()
+            .any(|tag| tag["name"] == "refs/tags/release-1" && tag["oid"] == outer)
+    );
+    let objects = reviewed["plan"]["tag_objects"].as_array().unwrap();
+    assert!(objects.contains(&json!(inner)));
+    assert!(objects.contains(&json!(outer)));
+    let planned = reviewed["plan"]["heads"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|record| {
-            record["payload"]["type"] == "function_call_output"
-                && record["payload"]["output"]
-                    .as_str()
-                    .is_some_and(|output| output.contains("PRIVATE_TOOL_OUTPUT_MARKER"))
-        })
-        .expect("recovery must retain the native tool output");
-    assert!(
-        records
-            .iter()
-            .any(|record| record["payload"]["type"] == "function_call"
-                && record["payload"]["call_id"] == output["payload"]["call_id"]
-                && record["payload"]["arguments"]
-                    .as_str()
-                    .is_some_and(|arguments| arguments.contains("private.txt"))),
-        "recovery must preserve the tool call paired with its original output"
+        .find(|head| head["name"] == "refs/heads/work")
+        .unwrap()["oid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rotated = SecretKey::from([26; 32]);
+    *hub.viewing_public.lock().unwrap() = STANDARD.encode(rotated.public_key().as_bytes());
+    hub.key_version.store(2, Ordering::Release);
+    hub.corrupt_receipt.store(false, Ordering::Release);
+    assert_success(&run(&args, false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), planned);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/legacy"]), plain);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/tags/plain-release"]),
+        plain
     );
-    let mut native = fs::OpenOptions::new()
-        .append(true)
-        .open(&runtime_file)
-        .unwrap();
-    for record in [
-        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("Continue with {SESSION_SECRET}")}]}}),
-        json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"New device reply"}]}}),
-    ] {
-        writeln!(native, "{record}").unwrap();
+    assert_eq!(git(&remote, &["rev-parse", "refs/tags/release-1"]), outer);
+    for oid in [&inner, &outer] {
+        assert_eq!(
+            git(&remote, &["cat-file", "tag", oid]),
+            git(repo.root(), &["cat-file", "tag", oid])
+        );
     }
-    drop(native);
-    assert_success(&from_new_device(&["commit", "alice/app@work"]));
-    let local = git(clone.root(), &["rev-parse", "work"]);
-    assert_ne!(local, prior);
-    assert_success(&from_new_device(&["--yes", "push", "alice/app@work"]));
-    let next = git(&remote, &["rev-parse", "work"]);
-    git(&remote, &["merge-base", "--is-ancestor", &prior, &next]);
-    let previous_metadata: meta::Meta =
-        serde_json::from_str(&git(&remote, &["show", &format!("{prior}:{}", meta::FILE)])).unwrap();
-    let next_metadata: meta::Meta =
-        serde_json::from_str(&git(&remote, &["show", &format!("{next}:{}", meta::FILE)])).unwrap();
-    assert_eq!(next_metadata.session, previous_metadata.session);
-    let envelope =
-        PrivacyEnvelope::parse(git(&remote, &["show", "work:privacy/envelope.json"]).as_bytes())
-            .unwrap();
-    let layer = envelope.open_layer(&key).unwrap();
-    let (private_log, _) = layer.session_bytes().unwrap();
-    assert!(private_log.starts_with(&continued));
-    assert!(private_log.contains("New device reply"));
-    assert!(layer.protected_values.contains(SESSION_SECRET));
     assert!(
-        envelope.public_projection["session"]["log"]
-            .as_str()
-            .unwrap()
-            .contains("New device reply")
+        git(
+            &remote,
+            &["for-each-ref", "--format=%(refname)", "refs/tags/"]
+        )
+        .lines()
+        .all(|name| name != format!("refs/tags/agit-{original}"))
     );
-    for line in git(&remote, &["rev-list", "--objects", "--all"]).lines() {
-        let oid = line.split_whitespace().next().unwrap();
-        let object = git(&remote, &["cat-file", "-p", oid]);
-        for forbidden in [
-            SESSION_SECRET,
-            "PRIVATE_TOOL_OUTPUT_MARKER",
-            "PRIVATE_SHARED_FILE_MARKER",
-            new_workspace.to_str().unwrap(),
-        ] {
-            assert!(
-                !object.contains(forbidden),
-                "plaintext reached remote object {oid}: {forbidden}"
-            );
+    assert_eq!(git(&remote, &["rev-parse", &format!("{planned}^")]), base);
+    let envelope = |commit: &str| {
+        PrivacyEnvelope::parse(
+            git(
+                &remote,
+                &["show", &format!("{commit}:privacy/envelope.json")],
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    };
+    let first = envelope(&planned);
+    assert!(first.open_layer(&key).is_ok());
+    assert!(first.open_layer(&rotated).is_err());
+    let binding = first.session_binding.as_ref().unwrap();
+    assert_eq!(binding.owner_key.account_id, "session-owner");
+    assert_eq!(
+        binding.committer,
+        CommitterAttribution::Account {
+            account_id: "account-1".into()
         }
-    }
-    assert_success(&from_new_device(&["--yes", "push", "alice/app@work"]));
-    assert_eq!(git(&remote, &["rev-parse", "work"]), next);
+    );
+    let tree = git(&remote, &["ls-tree", "-r", "--name-only", &planned]);
+    assert!(!tree.contains("native-private.txt"));
+    assert!(
+        !git_command(&remote)
+            .args(["cat-file", "-e", &original])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let pushed = hub.posts.load(Ordering::Acquire);
+    assert_success(&run(&args, false));
+    assert_eq!(hub.posts.load(Ordering::Acquire), pushed);
+    repo.set_auto_push(Some(true)).unwrap();
+    let continued = save(&metadata, "Private continuation COMPLETE_CONTEXT");
+    assert_success(&run(&["push", "alice/app@work"], true));
+    let next = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert_eq!(git(&remote, &["rev-parse", &format!("{next}^")]), planned);
+    let next_envelope = envelope(&next);
+    let next_binding = next_envelope.session_binding.as_ref().unwrap();
+    assert_eq!(next_binding.owner_key.account_id, "session-owner");
+    assert_eq!(next_binding.owner_key.key_version, 2);
+    assert_eq!(
+        next_binding.published_session_id,
+        binding.published_session_id
+    );
+    assert_eq!(next_binding.source_commit, continued);
+    assert!(next_envelope.open_layer(&rotated).is_ok());
+    let receipt = agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "work")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.session_snapshot.unwrap().binding, *next_binding);
+
+    // Policy configuration precedes publication without becoming immutable encryption metadata.
+    assert_success(&run(
+        &["new", "alice/app", "-b", "prepublish", "--no-launch"],
+        false,
+    ));
+    let before_policy = git(repo.root(), &["rev-parse", "refs/heads/prepublish"]);
+    let created = meta::read_at_ref_result(&repo, &before_policy)
+        .unwrap()
+        .unwrap();
+    let policy = run(
+        &[
+            "--json",
+            "privacy",
+            "access",
+            "policy",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert_success(&policy);
+    let policy: serde_json::Value = serde_json::from_slice(&policy.stdout).unwrap();
+    assert_eq!(
+        policy["result"]["value"]["policy"]["grant_scope"],
+        "session"
+    );
+    assert_eq!(
+        policy["result"]["value"]["policy"]["session_id"],
+        created.session
+    );
+    let disable = run(
+        &[
+            "--yes",
+            "--json",
+            "privacy",
+            "access",
+            "disable-session",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert_success(&disable);
+    let disable: serde_json::Value = serde_json::from_slice(&disable.stdout).unwrap();
+    assert_eq!(disable["result"]["value"]["converted_snapshots"], 0);
+    let disabled_policy = disable["result"]["value"]["policy"].clone();
+    assert_eq!(disabled_policy["grant_scope"], "commit");
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "refs/heads/prepublish"]),
+        before_policy
+    );
+    let unpublished = run(
+        &[
+            "--yes",
+            "privacy",
+            "access",
+            "grant",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert!(!unpublished.status.success(), "{unpublished:?}");
+    assert!(String::from_utf8_lossy(&unpublished.stderr).contains("requires an accepted snapshot"));
+    let partial = run(
+        &["privacy", "access", "policy", "alice/app@prepublish#1"],
+        false,
+    );
+    assert!(!partial.status.success(), "{partial:?}");
+    assert_success(&run(&["--yes", "push", "alice/app@prepublish"], false));
+    let published = git(&remote, &["rev-parse", "refs/heads/prepublish"]);
+    let publication = envelope(&published);
+    let authority = publication.session_binding.as_ref().unwrap();
+    assert_eq!(authority.session_id, created.session);
+    assert_eq!(authority.owner_key.account_id, "account-1");
+    assert_eq!(authority.source_commit, before_policy);
+    let policy_after = run(
+        &[
+            "--json",
+            "privacy",
+            "access",
+            "policy",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert_success(&policy_after);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&policy_after.stdout).unwrap()["result"]["value"]
+            ["policy"],
+        disabled_policy
+    );
+    let repeated = run(
+        &[
+            "--yes",
+            "privacy",
+            "access",
+            "disable-session",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert_success(&repeated);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/prepublish"]),
+        published
+    );
+    hub.unsupported_policy.store(true, Ordering::Release);
+    let unsupported = run(
+        &[
+            "--yes",
+            "--json",
+            "privacy",
+            "access",
+            "disable-session",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert!(!unsupported.status.success(), "{unsupported:?}");
+    let response = String::from_utf8_lossy(&unsupported.stdout);
+    assert!(
+        response
+            .contains("Enabling session-level authorization after disabling it is unsupported."),
+        "{unsupported:?}"
+    );
+    assert!(!response.contains("is retained"));
+    assert!(!response.contains("authorization is disabled"));
+    let policy_after = run(
+        &[
+            "--json",
+            "privacy",
+            "access",
+            "policy",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert_success(&policy_after);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&policy_after.stdout).unwrap()["result"]["value"]
+            ["policy"],
+        disabled_policy
+    );
 }

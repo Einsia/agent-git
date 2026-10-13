@@ -43,10 +43,10 @@ cross-runtime conversion uses the usual loss warnings. Uncontinued legacy quoted
 rebuilt from the verified cache, preserving the old transcript and recording its replacement.
 Legacy recoveries with new conversation must be committed before automatic replacement.
 
-If an encrypted snapshot needs recovery, follow the user handoff in
-[privacy](privacy.md#guide-the-user-through-password-operations). Explain the viewing password
-and provide the exact unlock command for the execution machine; wait for recovery before
-preparing continuation from original context.
+If an encrypted snapshot needs recovery, resume requests its exact content key using the signed-in
+account, verifies the publication bindings, and installs the original context locally. Access requires
+current membership and a snapshot entitlement. To recover separately, use `agit privacy unlock`
+on the execution machine as described in [privacy](privacy.md). Continuation retains the session owner.
 
 Instance ownership is scoped to the selected local AgentGit store (`AGIT_HOME`, default `~/.agit`). New claims in `store/<runtime>/<native-id>.json` bind the native session to its owner/repository and branch; materialized claims also record the baseline used to detect unsettled content. Resume rechecks active claims and the selected branch head under local locks. Separate stores have separate claims, even on the same machine. A serialized `runtime_instances` field is retained for compatibility, but is not populated as an active registry or consulted for ownership.
 

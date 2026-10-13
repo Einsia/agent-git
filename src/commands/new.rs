@@ -266,6 +266,10 @@ pub fn run(args: Args) -> CmdResult {
         runtime_of(&args),
         work_dir.to_string_lossy().to_string(),
     );
+    snap.committer_account = crate::infra::credentials::current_account()?;
+    snap.session_privacy = Some(crate::domain::session_privacy::SessionPrivacy::new(
+        snap.committer_account.clone(),
+    )?);
     snap.turn = None; // no turn yet; the first turn commit is #1
     // The birth commit holds no conversation; marking it as a turn makes `agit log` lay out a
     // settlement for a turn that never happened.

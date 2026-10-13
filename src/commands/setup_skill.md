@@ -64,9 +64,20 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   pushing needs an account: signed out, `--auto-push=true` prints a login link
   for the human and stops before creating anything. A first `agit push` without
   `--public` or `--private` publishes private when nobody can be asked. New
-  repositories use ordinary publication, with no viewing password and no `--yes`
-  needed off a terminal; encryption is an explicit opt-in at creation
-  (`--encryption=true`), after which `agit privacy init` sets its viewing password.
+  sessions record their creator and default to owner-account encryption. Existing
+  plain sessions retain their registered settings. First publication confirms
+  repository creation, then presents the prepared session preview; unattended
+  explicit publication requires `--yes`.
+- For a new repository's first push, explicitly pass `--public` or `--private`
+  according to the user's visibility instruction; if none is given, use `--private`.
+- For an authorized explicit push, first run `agit push <owner/repo>@<branch>
+  --dry-run`. Check the destination, visibility and snapshot summary,
+  then run `agit push <owner/repo>@<branch> --yes` with the same target and options
+  after the preview succeeds. If dry-run reports that a new destination needs an
+  immutable repository identity before a session publication preview, also continue
+  with the same `push --yes`; it creates the destination and registers sessions.
+  Stop on any other dry-run error. Read [push](references/commands/push.md) for the
+  exact diagnostic and audit mode.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
   two writers in at once. `was already adopted` is informational; the import
@@ -141,7 +152,7 @@ session and records its claim; it is not a read-only preview.
 | Open a branch or saved point | `agit run <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points |
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
-| Publish local history | `agit push <owner/repo>@<branch>` | Publishes existing refs and schedules encrypted dictionary synchronization |
+| Publish local history | `agit push <owner/repo>@<branch> --dry-run`, then `agit push <owner/repo>@<branch> --yes` | Continue after a successful preview or the documented new-destination identity error |
 
 ## Deliver files at completed milestones
 
@@ -206,7 +217,8 @@ LOG and Git history. Read [secrets](references/commands/secrets.md) for policy a
 cd "$(agit repo path <owner/repo>)"                  # the Agent repo checkout: a plain Git worktree
 $EDITOR README.md memory/decisions.md                  # edit or add shared files
 agit commit <owner/repo>@main -m "docs: describe the repo"
-agit push <owner/repo> -b main                         # publish the file line
+agit push <owner/repo> -b main --dry-run
+agit push <owner/repo> -b main --yes                    # follow the dry-run decision above
 ```
 
 - `-m` on the file line is always a pure file commit; `--milestone`, `--tag` and `--code` belong to turn commits.

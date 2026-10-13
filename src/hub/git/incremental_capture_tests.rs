@@ -121,6 +121,7 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     );
     std::fs::write(repo.root().join("payload"), &pointer_text).unwrap();
     let base = commit(&repo, "Base");
+    let pointer_blob = repo.git(&["rev-parse", "HEAD:payload"]).unwrap();
     let cache = repo
         .root()
         .join(".git/lfs/objects")
@@ -131,6 +132,7 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     std::fs::write(&cache, payload).unwrap();
     let first = inspect(capture(&repo, &[], pointer.size).unwrap());
     assert_eq!(first.captured().pointers(), std::slice::from_ref(&pointer));
+    assert!(!first.captured().preserves_object(&pointer_blob));
     let unavailable = inspect(capture(&repo, &["a".repeat(40)], pointer.size).unwrap());
     assert_eq!(
         unavailable.captured().pointers(),
@@ -148,6 +150,7 @@ fn incremental_scope_preserves_history_tags_and_payload_boundaries() {
     captured.git.baseline = Some((url.into(), identity.clone()));
     let repeat = inspect(captured);
     assert!(repeat.captured().pointers().is_empty());
+    assert!(repeat.captured().preserves_object(&pointer_blob));
     let other_identity =
         RemoteIdentity::new(&identity.hub, "00000000-0000-0000-0000-000000000002").unwrap();
     assert!(

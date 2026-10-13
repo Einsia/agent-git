@@ -6,7 +6,7 @@
 use super::{
     meta::{self, Meta},
     privacy::{CandidateAction, PrivacyPolicy},
-    privacy_envelope::{PrivacyEnvelope, ViewingRecipient, digest_json},
+    privacy_envelope::{PrivacyEnvelope, ViewingRecipient},
     privacy_layer::{EVIDENCE_FIELD, EVIDENCE_PREFIX, EvidenceReference, PrivateLayer},
     privacy_metadata,
     privacy_paths::{PathAliasStore, decode_file_uri, normalize_path},
@@ -159,7 +159,6 @@ pub struct SessionProjection {
     report: ProjectionReport,
     policy_digest: String,
     private: PrivateLayer,
-    dependencies: ProjectionDependencies,
 }
 
 mod private_text {
@@ -209,49 +208,15 @@ pub(crate) fn project_worker(
     })
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ProjectionDependencies {
-    paths: BTreeMap<String, String>,
-    aliases: BTreeMap<String, String>,
-    unstable: bool,
-    reserved_through: u64,
-}
-
-impl ProjectionDependencies {
-    pub(crate) fn matches(
-        &self,
-        policy: &PrivacyPolicy,
-        aliases: &PathAliasStore,
-        branch: &str,
-    ) -> Result<bool> {
-        if self.unstable || aliases.reservation_boundary() < self.reserved_through {
-            return Ok(false);
-        }
-        let current = aliases.private_mappings();
-        if self
-            .aliases
-            .iter()
-            .any(|(alias, source)| current.get(alias) != Some(source))
-        {
-            return Ok(false);
-        }
-        for (path, expected) in &self.paths {
-            if digest_json(&serde_json::to_value(
-                policy.evaluate_file(Path::new(path), Some(branch)),
-            )?)? != *expected
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
-
 impl SessionProjection {
-    pub(crate) fn dependencies(&self) -> &ProjectionDependencies {
-        &self.dependencies
+    pub(crate) fn retain_committer(
+        &mut self,
+        source: super::session_privacy::SourceCommitter,
+    ) -> Result<()> {
+        self.private.source_committer = Some(source);
+        self.private.validate()
     }
+
     pub fn log(&self) -> &str {
         &self.log
     }
@@ -357,77 +322,51 @@ impl SessionProjection {
         Ok(super::privacy_envelope::digest_bytes(&bytes))
     }
 
-    /// The digest commits to public bytes; plaintext hashes are not publication identifiers.
-    pub fn seal(&self, recipient: &ViewingRecipient) -> Result<PrivacyEnvelope> {
-        let public = self.public_value();
-        PrivacyEnvelope::seal_layer(
-            self.policy_digest.clone(),
-            digest_json(&public)?,
-            public,
-            &self.private,
-            recipient,
-            Vec::new(),
-        )
-    }
-
-    /// Selection limits both halves of a share. Full LOG provenance may authorize a selected
-    /// tool result, but unselected events and reverse mappings must not enter its private layer.
-    pub fn seal_share(
+    /// Registration and source evidence determine authority before any ciphertext is created.
+    pub fn seal_session(
         &self,
-        selected: &str,
-        protected: &str,
-        presentation: &str,
         recipient: &ViewingRecipient,
+        config: &super::session_privacy::SessionPrivacyConfig,
+        binding: super::session_privacy::SessionSnapshotBinding,
     ) -> Result<PrivacyEnvelope> {
-        self.select(selected)?;
-        storage::snapshot_files(protected, protected)?;
+        binding.verify_config(config)?;
+        let source = self
+            .private
+            .source_committer
+            .as_ref()
+            .context("session publication has no original committer evidence")?;
         ensure!(
-            selected.lines().count() == protected.lines().count(),
-            "share protection changed the selected event count"
+            binding.committer
+                == source.attribution(
+                    config
+                        .privacy
+                        .hub
+                        .as_deref()
+                        .context("registered session has no Hub")?
+                )?
+                && self.private.metadata.get("session").and_then(Value::as_str)
+                    == Some(&binding.session_id)
+                && self.metadata.get("session").and_then(Value::as_str)
+                    == Some(&binding.published_session_id),
+            "session projection differs from its immutable source binding"
         );
-        let aliases = self
-            .private
-            .path_aliases
-            .iter()
-            .filter(|(alias, _)| protected.contains(alias.as_str()))
-            .map(|(alias, source)| (alias.clone(), source.clone()))
-            .collect();
-        let (log, _) = self.private.session_bytes()?;
-        let mapped = self
-            .source_log
-            .split_inclusive('\n')
-            .zip(log.split_inclusive('\n'))
-            .collect::<BTreeMap<_, _>>();
-        let mut original = Zeroizing::new(String::new());
-        for line in selected.split_inclusive('\n') {
-            original.push_str(
-                mapped
-                    .get(line)
-                    .context("selection is outside the frozen LOG")?,
-            );
+        let mut private: PrivateLayer =
+            serde_json::from_slice(&Zeroizing::new(serde_json::to_vec(&self.private)?))?;
+        if let Some(local) = private.metadata.get("session_privacy") {
+            config.verify_registration(
+                &binding.repository_id,
+                &binding.session_id,
+                &serde_json::from_value(local.clone())?,
+            )?;
         }
-        let mut private =
-            PrivateLayer::new(&original, &original, self.private.metadata.clone(), aliases)?;
-        let values = storage::parse_envelopes(&original)?
-            .into_iter()
-            .map(|record| record.content)
-            .chain(std::iter::once(self.private.metadata.clone()))
-            .collect::<Vec<_>>();
-        private.protected_values = self
-            .private
-            .protected_values
-            .iter()
-            .filter(|secret| values.iter().any(|value| contains_value(value, secret)))
-            .cloned()
-            .collect();
-        let public = self.share_public_value(protected, presentation);
-        PrivacyEnvelope::seal_layer(
+        private.metadata["session_privacy"] = serde_json::to_value(&config.privacy)?;
+        private.validate()?;
+        PrivacyEnvelope::seal_session(
             self.policy_digest.clone(),
-            digest_json(&public)?,
-            public,
-            &private,
+            self.public_value(),
+            &Zeroizing::new(serde_json::to_vec(&private)?),
             recipient,
-            Vec::new(),
+            binding,
         )
     }
 }
@@ -593,13 +532,12 @@ struct Projector<'a> {
     branch: Option<&'a str>,
     redactor: &'a Redactor,
     replacements: Vec<Regex>,
-    paths: Regex,
+    path_tokens: Regex,
     report: ProjectionReport,
     record: Option<usize>,
     decisions: BTreeMap<DecisionKey, usize>,
     reporting: bool,
     used_aliases: BTreeSet<String>,
-    dependencies: ProjectionDependencies,
     /// OpenCode emits parts separately from their parent message.  Keep the native role
     /// association so a reasoning part cannot create a synthetic user turn.
     message_roles: BTreeMap<(String, String, String), String>,
@@ -727,8 +665,6 @@ pub fn project_session(
                 .any(|record| contains_value(&record.content, secret))
     })?;
     private.validate()?;
-    projector.dependencies.aliases = private.path_aliases.clone();
-    projector.dependencies.reserved_through = projector.aliases.reservation_boundary();
     Ok(SessionProjection {
         source_log: Zeroizing::new(log.to_owned()),
         log: public_log,
@@ -737,7 +673,6 @@ pub fn project_session(
         report: projector.report,
         policy_digest: policy.digest()?,
         private,
-        dependencies: projector.dependencies,
     })
 }
 
@@ -784,6 +719,14 @@ impl<'a> Projector<'a> {
         redactor: &'a Redactor,
         records: usize,
     ) -> Result<Self> {
+        let logical_roots = std::iter::once("workspace")
+            .chain(policy.external_roots.iter().map(|root| root.label.as_str()))
+            .chain(aliases.logical_root_labels())
+            .map(regex::escape)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("|");
         Ok(Self {
             policy,
             aliases,
@@ -804,9 +747,14 @@ impl<'a> Projector<'a> {
                     .context("invalid privacy replacement expression")
                 })
                 .collect::<Result<_>>()?,
-            paths: Regex::new(
-                r#"(?:file://[^\s<>\"'`]+|[A-Za-z]:[\\/][^\s<>\"'`]+|\\\\[^\s<>\"'`]+|/[^\s<>\"'`]+)"#,
-            )?,
+            path_tokens: Regex::new(&format!(
+                concat!(
+                    r"</[A-Za-z_][A-Za-z0-9_.:-]*[ \t\r\n]*>|",
+                    r#"<(?:{}|private-file-[1-9][0-9]*)>/[^\s<>\"'`]+|"#,
+                    r#"(?:file://[^\s<>\"'`]+|[A-Za-z]:[\\/][^\s<>\"'`]+|\\\\[^\s<>\"'`]+|/[^\s<>\"'`]+)"#,
+                ),
+                logical_roots,
+            ))?,
             report: ProjectionReport {
                 records,
                 ..Default::default()
@@ -815,7 +763,6 @@ impl<'a> Projector<'a> {
             decisions: BTreeMap::new(),
             reporting: true,
             used_aliases: BTreeSet::new(),
-            dependencies: ProjectionDependencies::default(),
             message_roles: BTreeMap::new(),
         })
     }
@@ -869,7 +816,6 @@ impl Projector<'_> {
         let (projection, decision) =
             self.aliases
                 .project_file_with_decision(self.policy, path, self.branch)?;
-        let fingerprint = digest_json(&serde_json::to_value(&decision)?)?;
         if self.reporting {
             if let Some(alias) = &projection.logical_path {
                 self.used_aliases.insert(alias.clone());
@@ -886,13 +832,6 @@ impl Projector<'_> {
                     },
                 ))
                 .or_insert(1);
-        }
-        if let Some(previous) = self
-            .dependencies
-            .paths
-            .insert(path.to_string_lossy().into_owned(), fingerprint.clone())
-        {
-            self.dependencies.unstable |= previous != fingerprint;
         }
         Ok(projection)
     }
@@ -1450,17 +1389,19 @@ impl Projector<'_> {
 
     fn rewrite_paths(&mut self, text: &str) -> Result<String> {
         let matches = self
-            .paths
+            .path_tokens
             .find_iter(text)
             .map(|m| (m.start(), m.end()))
             .collect::<Vec<_>>();
         let mut output = String::new();
         let mut start = 0;
         for (a, b) in matches {
-            // A URL or an existing logical path is not a local absolute path.
-            if a > 0
-                && (text[..a].ends_with([':', '>'])
-                    || text.as_bytes()[a - 1].is_ascii_alphanumeric())
+            // Closing tags and known logical paths are complete tokens, not local file locations.
+            if text[a..b].starts_with('<') {
+                continue;
+            }
+            // A URL is not a local absolute path.
+            if a > 0 && (text[..a].ends_with(':') || text.as_bytes()[a - 1].is_ascii_alphanumeric())
             {
                 continue;
             }
@@ -2052,6 +1993,10 @@ mod tests {
 
     #[test]
     fn complete_snapshot_projects_paths_and_recovers_original_layer() {
+        use crate::domain::session_privacy::{
+            AccountIdentity, OwnerKeyBinding, SessionPrivacy, SessionPrivacyConfig,
+            SessionSnapshotBinding, SourceCommitter,
+        };
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("src/main.rs");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -2068,10 +2013,18 @@ mod tests {
         .map(|value| format!("{value}\n"))
         .collect::<String>();
         let log = transcript::wrap_lines(&raw, "claude-code", &session_id);
-        let metadata = meta::Meta::new(
+        let mut metadata = meta::Meta::new(
             session_id,
             "claude-code".into(),
             temp.path().to_string_lossy().into_owned(),
+        );
+        metadata.committer_account =
+            Some(AccountIdentity::new("https://hub.test", "writer-bob").unwrap());
+        metadata.session_privacy = Some(
+            SessionPrivacy::new(Some(
+                AccountIdentity::new("https://hub.test", "owner-alice").unwrap(),
+            ))
+            .unwrap(),
         );
         let policy = PrivacyPolicy {
             workspace: Some(temp.path().to_path_buf()),
@@ -2093,7 +2046,7 @@ mod tests {
         let mut aliases = PathAliasStore::default();
         let redactor = Redactor::new(Default::default());
         let view = log.split_inclusive('\n').next_back().unwrap();
-        let projection = project_session(
+        let mut projection = project_session(
             &policy,
             &mut aliases,
             None,
@@ -2117,13 +2070,63 @@ mod tests {
         );
 
         let key = SecretKey::from([21; 32]);
+        let owner_key = OwnerKeyBinding {
+            account_id: "owner-alice".into(),
+            key_version: 1,
+        };
         let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
+            owner_key.recipient_id().unwrap(),
             &STANDARD.encode(key.public_key().as_bytes()),
         )
         .unwrap();
-        let envelope = projection.seal(&recipient).unwrap();
+        let source_committer = SourceCommitter::from_commit(
+            b"committer Bob <bob@example.invalid> 1 +0000\n\nOriginal source\n",
+            metadata.committer_account.clone(),
+        )
+        .unwrap();
+        projection
+            .retain_committer(source_committer.clone())
+            .unwrap();
+        let public_session = format!("agit-{}", "b".repeat(40));
+        projection.prepare_git(&public_session).unwrap();
+        let config = SessionPrivacyConfig {
+            repository_id: "00000000-0000-0000-0000-000000000001".into(),
+            session_id: metadata.session.clone(),
+            privacy: metadata.session_privacy.clone().unwrap(),
+            revision: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let binding = SessionSnapshotBinding {
+            repository_id: config.repository_id.clone(),
+            session_id: config.session_id.clone(),
+            published_session_id: public_session,
+            owner_key,
+            committer: source_committer.attribution("https://hub.test").unwrap(),
+            source_commit: "c".repeat(40),
+        };
+        let envelope = projection
+            .seal_session(&recipient, &config, binding.clone())
+            .unwrap();
+        let mut replaced = binding;
+        replaced.committer = super::super::session_privacy::CommitterAttribution::Account {
+            account_id: "pusher".into(),
+        };
+        assert!(
+            projection
+                .seal_session(&recipient, &config, replaced)
+                .is_err()
+        );
+        assert!(
+            !serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("bob@example.invalid")
+        );
         let layer = envelope.open_layer(&key).unwrap();
+        assert_eq!(layer.source_committer.as_ref(), Some(&source_committer));
+        assert_eq!(
+            layer.metadata["session_privacy"],
+            serde_json::to_value(&config.privacy).unwrap()
+        );
         let (private_log, private_view) = layer.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), view);
@@ -2627,11 +2630,23 @@ mod tests {
         );
     }
 
+    /// Environment markup stays intact without claiming file aliases; paths beside markup
+    /// stay private and the environment record does not become a conversational turn.
     #[test]
-    fn projected_codex_environment_context_does_not_open_a_turn() {
+    fn projected_codex_environment_preserves_markup_paths_and_turns() {
         let session = format!("agit-{}", "a".repeat(40));
+        let context = concat!(
+            "<environment_context>\n",
+            "  <cwd>/private/project</cwd>\n",
+            "  <filesystem><entry access=\"read\"><path>/private/project</path></entry></filesystem>\n",
+            "  <custom:tag-name.v2><_meta>ready</_meta></custom:tag-name.v2 \t>\n",
+            "  Paths: /cwd and </private/report.txt>.\n",
+            "  Logical paths: <workspace>/src/main.rs <docs>/guide.md <archive>/notes.md\n",
+            "  Incomplete tag: </unfinished\n",
+            "</environment_context>",
+        );
         let raw = [
-            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/workspace</cwd>\n</environment_context>"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":context}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the project"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}),
         ]
@@ -2641,9 +2656,25 @@ mod tests {
         let log = transcript::wrap_lines(&raw, "codex", &session);
         let metadata = Meta::new(session, "codex".into(), String::new());
         let original = transcript::display::parse(&log).unwrap();
+        let policy = PrivacyPolicy {
+            external_roots: vec![super::super::privacy::ExternalRoot {
+                label: "docs".into(),
+                path: "/external/docs".into(),
+                include: vec![],
+                exclude: vec![],
+            }],
+            ..PrivacyPolicy::default()
+        };
+        let mut aliases = PathAliasStore::default();
+        aliases
+            .alias_for(
+                "/former/root/notes.md",
+                &[super::super::privacy_paths::AliasRoot::new("archive", "/former/root").unwrap()],
+            )
+            .unwrap();
         let projection = project_session(
-            &PrivacyPolicy::default(),
-            &mut PathAliasStore::default(),
+            &policy,
+            &mut aliases,
             None,
             &log,
             &log,
@@ -2652,6 +2683,24 @@ mod tests {
         )
         .unwrap();
         let public = transcript::display::parse(projection.log()).unwrap();
+        let records = storage::parse_envelopes(projection.log()).unwrap();
+        assert_eq!(
+            records[0].content["message"]["content"][0]["text"],
+            context
+                .replace("/private/project", "<private-file-1>")
+                .replace("Paths: /cwd", "Paths: <private-file-2>")
+                .replace("</private/report.txt>", "<<private-file-3>>")
+                .replace("</unfinished\n", "<<private-file-4>\n")
+        );
+        assert_eq!(
+            projection.private.path_aliases,
+            BTreeMap::from([
+                ("<private-file-1>".into(), "/private/project".into()),
+                ("<private-file-2>".into(), "/cwd".into()),
+                ("<private-file-3>".into(), "/private/report.txt".into()),
+                ("<private-file-4>".into(), "/unfinished".into()),
+            ])
+        );
 
         assert_eq!(crate::domain::turn::groups_of(&original).len(), 1);
         assert_eq!(crate::domain::turn::groups_of(&public).len(), 1);
@@ -2754,24 +2803,14 @@ mod tests {
             .unwrap();
         assert_eq!(tool_id, result_id);
 
-        let key = SecretKey::from([24; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let layer = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
+        let layer = &projection.private;
         let (private_log, private_view) = layer.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
     }
 
     #[test]
-    fn cursor_roles_preserve_checked_text_and_encrypted_originals() {
+    fn cursor_roles_preserve_checked_text_and_retained_originals() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("src/main.rs");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2824,17 +2863,7 @@ mod tests {
             records[1].content["message"]["content"][1]["type"],
             "tool_use"
         );
-        let key = SecretKey::from([21; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let layer = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
+        let layer = &projection.private;
         let (private_log, private_view) = layer.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
@@ -2927,17 +2956,7 @@ mod tests {
             records[7].content["message"]["content"][0]["type"],
             "tool_result"
         );
-        let key = SecretKey::from([27; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let layer = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
+        let layer = &projection.private;
         let (private_log, private_view) = layer.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
@@ -3101,17 +3120,7 @@ mod tests {
                 "attachment body is excluded from public content"
             );
         }
-        let key = SecretKey::from([23; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let private = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
+        let private = &projection.private;
         let (private_log, private_view) = private.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
@@ -3209,17 +3218,7 @@ mod tests {
         assert_eq!(projection.report.omissions.len(), 3);
         assert!(transcript::display::parse(projection.log()).is_ok());
 
-        let key = SecretKey::from([22; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let layer = projection
-            .seal(&recipient)
-            .unwrap()
-            .open_layer(&key)
-            .unwrap();
+        let layer = &projection.private;
         assert_eq!(layer.session_bytes().unwrap().0.as_str(), log);
     }
 

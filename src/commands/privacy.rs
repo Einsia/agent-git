@@ -14,10 +14,19 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args as ClapArgs, Subcommand};
 use std::path::{Path, PathBuf};
 
-mod keys;
-pub(crate) mod publication_key;
+mod access;
 pub(crate) mod sources;
-mod unlock;
+mod status;
+pub(crate) mod unlock;
+
+/// A publication envelope binds its snapshot; local edits require native context first.
+pub(crate) fn require_native_edit(repo: &Repo, commit: &str) -> Result<()> {
+    ensure!(
+        unlock::envelope_bytes(repo, commit)?.is_none(),
+        "editing an encrypted publication requires a native continuation or an independent fork first"
+    );
+    Ok(())
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -27,52 +36,23 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
-    /// Initialize the repository viewing password (administrator access required).
-    Init {
-        /// Return browser setup or publishing readiness without prompting for a password.
-        #[arg(long)]
-        browser: bool,
-        #[arg(value_name = "OWNER/REPO")]
-        repository: String,
-        /// Create a missing repository with public visibility after confirmation.
-        #[arg(long, conflicts_with = "private")]
-        public: bool,
-        /// Create a missing repository privately (the default).
-        #[arg(long)]
-        private: bool,
-        /// Creation-time encryption selection; password setup requires true. Without this flag or
-        /// a stored preference, a repository this command creates is encrypted.
-        #[arg(long, require_equals = true, value_name = "true|false")]
-        encryption: Option<bool>,
+    /// Show original storage, sanitized display readiness and your exact-snapshot access.
+    Status {
+        #[arg(value_name = "OWNER/REPO@SNAPSHOT")]
+        target: String,
     },
-    /// Change the repository viewing password while retaining its current key.
-    ChangePassword {
-        #[arg(value_name = "OWNER/REPO")]
-        repository: String,
+    /// Manage session or commit original-read access and the session grant policy.
+    Access {
+        #[command(subcommand)]
+        command: access::Action,
     },
-    /// Generate a new viewing key for future publications; retain historical keys.
-    RotateKey {
-        #[arg(value_name = "OWNER/REPO")]
-        repository: String,
-    },
-    /// Recover an encrypted session using its repository password or an explicitly saved key.
+    /// Recover an encrypted session locally using the signed-in account's original access.
     Unlock {
         #[arg(value_name = "OWNER/REPO@REF")]
         target: String,
         /// Rebind recovery to this directory; otherwise use the configured local workspace.
         #[arg(long, value_name = "DIRECTORY")]
         workspace: Option<PathBuf>,
-        /// Save the viewing key in the OS credential store for this many hours (1-720).
-        #[arg(long, value_name = "HOURS", value_parser = clap::value_parser!(u16).range(1..=720), conflicts_with = "use_saved_key")]
-        remember_for: Option<u16>,
-        /// Reuse an unexpired OS key after checking repository read access and its recipient.
-        #[arg(long)]
-        use_saved_key: bool,
-    },
-    /// Remove a saved unlock key for the configured Hub, without contacting the server.
-    ForgetUnlock {
-        #[arg(value_name = "OWNER/REPO")]
-        repository: String,
     },
     /// Inspect or change the device-local policy.
     Policy {
@@ -189,35 +169,9 @@ pub enum PolicyAction {
 
 pub fn run(args: Args) -> CmdResult {
     match args.command {
-        Action::Init {
-            repository,
-            public,
-            encryption,
-            browser,
-            ..
-        } => keys::run(
-            &repository,
-            if browser {
-                keys::Operation::BrowserInitialize
-            } else {
-                keys::Operation::Initialize
-            },
-            public,
-            encryption,
-        ),
-        Action::ChangePassword { repository } => {
-            keys::run(&repository, keys::Operation::Rewrap, false, None)
-        }
-        Action::RotateKey { repository } => {
-            keys::run(&repository, keys::Operation::Rotate, false, None)
-        }
-        Action::Unlock {
-            target,
-            workspace,
-            remember_for,
-            use_saved_key,
-        } => unlock::run(&target, workspace.as_deref(), remember_for, use_saved_key),
-        Action::ForgetUnlock { repository } => unlock::forget(&repository),
+        Action::Status { target } => status::run(&target),
+        Action::Access { command } => access::run(command),
+        Action::Unlock { target, workspace } => unlock::run(&target, workspace.as_deref()),
         Action::Policy { command } => run_policy(command),
         Action::Preview {
             repo,
@@ -532,110 +486,6 @@ mod tests {
     struct Wrapper {
         #[command(flatten)]
         args: Args,
-    }
-
-    #[test]
-    fn repository_password_commands_require_explicit_repository_and_no_password_argument() {
-        for operation in ["init", "change-password", "rotate-key"] {
-            assert!(Wrapper::try_parse_from(["privacy", operation, "alice/app"]).is_ok());
-            assert!(Wrapper::try_parse_from(["privacy", operation]).is_err());
-            assert!(
-                Wrapper::try_parse_from([
-                    "privacy",
-                    operation,
-                    "alice/app",
-                    "--password",
-                    "secret"
-                ])
-                .is_err()
-            );
-        }
-        assert!(matches!(
-            Wrapper::try_parse_from(["privacy", "init", "alice/app", "--browser"])
-                .unwrap()
-                .args
-                .command,
-            Action::Init {
-                browser: true,
-                public: false,
-                ..
-            }
-        ));
-        for operation in ["change-password", "rotate-key"] {
-            assert!(
-                Wrapper::try_parse_from(["privacy", operation, "alice/app", "--browser"]).is_err()
-            );
-        }
-        assert!(
-            Wrapper::try_parse_from(["privacy", "init", "alice/app", "--public", "--private"])
-                .is_err()
-        );
-        assert!(matches!(
-            Wrapper::try_parse_from(["privacy", "init", "alice/app"])
-                .unwrap()
-                .args
-                .command,
-            Action::Init { public: false, .. }
-        ));
-    }
-
-    #[test]
-    fn unlock_storage_requires_explicit_lifetime_or_reuse() {
-        let parsed = Wrapper::try_parse_from(["privacy", "unlock", "me/app@work"]).unwrap();
-        assert!(matches!(
-            parsed.args.command,
-            Action::Unlock {
-                remember_for: None,
-                use_saved_key: false,
-                ..
-            }
-        ));
-        let parsed =
-            Wrapper::try_parse_from(["privacy", "unlock", "me/app@work", "--remember-for", "24"])
-                .unwrap();
-        assert!(matches!(
-            parsed.args.command,
-            Action::Unlock {
-                remember_for: Some(24),
-                ..
-            }
-        ));
-        let parsed =
-            Wrapper::try_parse_from(["privacy", "unlock", "me/app@work", "--use-saved-key"])
-                .unwrap();
-        assert!(matches!(
-            parsed.args.command,
-            Action::Unlock {
-                use_saved_key: true,
-                ..
-            }
-        ));
-        for args in [
-            vec!["--remember-for", "0"],
-            vec!["--remember-for", "721"],
-            vec!["--remember-for", "24", "--use-saved-key"],
-        ] {
-            assert!(
-                Wrapper::try_parse_from(
-                    ["privacy", "unlock", "me/app@work"].into_iter().chain(args)
-                )
-                .is_err()
-            );
-        }
-        assert!(Wrapper::try_parse_from(["privacy", "forget-unlock", "me/app"]).is_ok());
-        assert!(
-            Wrapper::try_parse_from([
-                "privacy",
-                "forget-unlock",
-                "me/app",
-                "--account",
-                "account-1"
-            ])
-            .is_err()
-        );
-        assert!(
-            Wrapper::try_parse_from(["privacy", "unlock", "me/app@work", "--no-browser"]).is_err()
-        );
     }
 
     #[test]

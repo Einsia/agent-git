@@ -2363,6 +2363,7 @@ fn settle_bytes(
                 "native capture identity changed"
             );
             let mut metadata = metadata.clone();
+            metadata.committer_account = credentials::current_account()?;
             metadata.runtime_instances.push(binding.thread_id.clone());
             metadata.kind = Kind::File;
             metadata.milestone = None;
@@ -2606,6 +2607,17 @@ fn settle_bytes(
         .map(|(code, _)| code.clone())
         .or_else(|| meta::code_of(Path::new(&cwd)));
     let mut observations = Meta::new(claim.clone(), source.to_string(), cwd.clone());
+    observations.committer_account = credentials::current_account()?;
+    observations.fork_origin = head_meta.as_ref().and_then(|head| head.fork_origin.clone());
+    observations.session_privacy = match head_meta.as_ref().filter(|head| head.is_session_line()) {
+        Some(head) => head.session_privacy.clone(),
+        None => Some(match &lk.session_privacy {
+            Some(privacy) => privacy.clone(),
+            None => crate::domain::session_privacy::SessionPrivacy::new(
+                observations.committer_account.clone(),
+            )?,
+        }),
+    };
     observations.runtime_instances.push(lk.session_id.clone());
     if lk.native_thread_id() != lk.session_id {
         observations
@@ -2948,6 +2960,11 @@ pub(super) fn commit_staged_files(repo: &Repo, slug: &str, branch: &str, msg: &s
     )
 }
 
+/// Envelopes are publication output; shared-file edits cannot restore or introduce them.
+fn is_managed_file_commit_path(layout: meta::LayoutVersion, path: &str) -> bool {
+    meta::is_storage_path_for(layout, path) || path == "privacy/envelope.json"
+}
+
 #[allow(clippy::too_many_arguments)]
 fn file_commit_with_staging(
     repo: &Repo,
@@ -2960,6 +2977,9 @@ fn file_commit_with_staging(
     quiet: bool,
     stage_worktree: bool,
 ) -> CmdResult {
+    if let Some(tip) = expected_tip {
+        super::privacy::require_native_edit(repo, tip)?;
+    }
     // Validate literal pathspecs before any normalization or staging. Ancestor pathspecs are
     // allowed and are sanitized after `git add`, just as ordinary `git commit` would stage them.
     let layout = head_meta
@@ -2967,7 +2987,7 @@ fn file_commit_with_staging(
         .map(|snapshot| snapshot.layout)
         .unwrap_or(meta::LayoutVersion::V0);
     for path in paths {
-        if meta::is_storage_path_for(layout, path) {
+        if is_managed_file_commit_path(layout, path) {
             ui::error(&format!(
                 "`{path}` is managed by the AgentGit storage format and cannot be included in a file commit."
             ));
@@ -3496,7 +3516,7 @@ fn validate_file_commit_tree(
         .iter()
         .map(String::as_str)
         .filter(|path| {
-            meta::is_storage_path_for(layout, path)
+            is_managed_file_commit_path(layout, path)
                 && !(expected_meta.is_some() && *path == meta::FILE)
         })
         .collect();
@@ -3611,6 +3631,7 @@ fn file_commit_inner(
     };
     let mut reset = vec!["reset", "-q", base, "--"];
     reset.extend_from_slice(managed);
+    reset.push("privacy/envelope.json");
     repo.git(&reset)?;
     if layout == meta::LayoutVersion::V1 {
         normalize_staged_file_commit_attributes(repo, base)?;
@@ -3619,7 +3640,7 @@ fn file_commit_inner(
     let leaked: Vec<&str> = staged
         .iter()
         .map(String::as_str)
-        .filter(|path| meta::is_storage_path_for(layout, path))
+        .filter(|path| is_managed_file_commit_path(layout, path))
         .collect();
     anyhow::ensure!(
         leaked.is_empty(),
@@ -3639,6 +3660,7 @@ fn file_commit_inner(
     // turn it into a file line (both forms are fixed at birth and never convert).
     let expected_meta = if let Some(tip) = head_meta {
         let mut m = tip.clone();
+        m.committer_account = credentials::current_account()?;
         m.kind = Kind::File;
         m.milestone = None;
         let expected = meta::to_text(&m)?.into_bytes();
@@ -3652,7 +3674,7 @@ fn file_commit_inner(
     let leaked: Vec<&str> = staged
         .iter()
         .map(String::as_str)
-        .filter(|path| meta::is_storage_path_for(layout, path) && *path != meta::FILE)
+        .filter(|path| is_managed_file_commit_path(layout, path) && *path != meta::FILE)
         .collect();
     anyhow::ensure!(
         leaked.is_empty(),
@@ -3726,7 +3748,7 @@ fn protect_file_commit_index(
     let mut edits = Vec::new();
     let mut worktree_updates = Vec::new();
     for path in file_commit_tree_paths(repo, base, tree)? {
-        if meta::is_storage_path_for(layout, &path) {
+        if is_managed_file_commit_path(layout, &path) {
             continue;
         }
         let Some(entry) = file_commit_tree_entry(repo, tree, &path)? else {
@@ -5966,6 +5988,13 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
                 "managed storage paths",
             ),
             (
+                "publication envelope",
+                r#"oid="$(printf '{"format_version":2}\n' | git hash-object -w --stdin)"
+git update-index --add --cacheinfo 100644 "$oid" privacy/envelope.json
+printf 'pre\n' >> .git/file-commit-hook-order"#,
+                "managed storage paths",
+            ),
+            (
                 "metadata mode",
                 r#"git update-index --chmod=+x -- session/meta.json
 printf 'pre\n' >> .git/file-commit-hook-order"#,
@@ -7307,6 +7336,21 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
 
         storage::write_snapshot(repo.root(), &old_log, &old_view).unwrap();
         let mut snapshot = Meta::new(branch_claim.clone(), "codex".into(), "/repo/one".into());
+        let ownership = crate::domain::session_privacy::SessionPrivacy::new(Some(
+            crate::domain::session_privacy::AccountIdentity::new(
+                "https://hub.test",
+                "original-owner",
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        snapshot.session_privacy = Some(ownership.clone());
+        let fork_origin = crate::domain::session_privacy::ForkOrigin {
+            commit: "f".repeat(40),
+            context: crate::domain::session_privacy::ForkContext::Original,
+            snapshot: None,
+        };
+        snapshot.fork_origin = Some(fork_origin.clone());
         snapshot.turn = Some(4);
         meta::write(repo.root(), &snapshot).unwrap();
         repo.add_all().unwrap();
@@ -7369,10 +7413,10 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             serde_json::from_str(new_log.lines().last().unwrap()).unwrap();
         assert_eq!(last.source, "claude-code");
         assert_eq!(last.session_id, branch_claim);
-        assert_eq!(
-            meta::read_at_ref(&repo, "HEAD").unwrap().runtime,
-            "claude-code"
-        );
+        let settled = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(settled.runtime, "claude-code");
+        assert_eq!(settled.session_privacy, Some(ownership));
+        assert_eq!(settled.fork_origin, Some(fork_origin));
     }
 
     /// The main that `agit init` creates: its meta says `line: file`, and transcript input is

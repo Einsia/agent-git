@@ -1,17 +1,14 @@
 ---
 name: agit-push
-description: Publish saved history using the Hub repository's fixed encryption mode.
+description: Publish saved history using registered session privacy settings and immutable destination authority.
 ---
 
 # agit push
 
-## Purpose
-
-Publish saved local history in the destination's authoritative mode. Ordinary
-repositories receive source history, shared-file branches, tags and LFS with their
-original commit IDs. Encrypted repositories receive a sanitized session projection
-and encrypted originals. `push` publishes existing branches; use `new`, `fork` or
-`import` to create a session.
+Publish existing saved branches with their registered privacy settings. Plain sessions and file
+lines retain their original Git objects. Encrypted sessions publish a sanitized projection and
+originals encrypted to the session owner's account key. Accepted ancestry remains unchanged, so
+a repository can contain both modes. Use `new`, `fork` or `import` to create a session.
 
 ## Synopsis
 
@@ -19,221 +16,136 @@ and encrypted originals. `push` publishes existing branches; use `new`, `fork` o
 agit push [owner/repo@branch] [options]
 ```
 
-## Options
-
 | Option | Meaning |
 |---|---|
 | `[owner/repo@branch]` | Explicit saved branch; a bare repo with `-b` is also accepted. An omitted target requires `AGIT_SESSION` outside the terminal picker |
 | `-b, --branch <branch>` | Branches to publish; repeatable |
-| `--all` | Publish all settled branches; encrypted mode skips repository file lines |
+| `--all` | Publish all settled local branches |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
-| `--encryption=true\|false` | Select a new repository's fixed mode; omission uses local creation intent or `privacy.encryption` (default `false`, ordinary) |
-| `--to <owner/repo>` | Publish original history to another repository; for device-local RC, select its retained primary target |
-| `--separate` | With `--to`, publish a separate copy from local RC while retaining its primary target |
-| `--allow-secrets` | Accepted for compatibility; privacy findings never gate publication |
-| `--audit` | Open an interactive sensitivity reviewer for the frozen outgoing publication, then ask separately before publishing |
-| `--dry-run` | Inspect the selected publication with Hub mode/identity lookups, without creating a repository or uploading history |
-| `--show-preview` | Expand readable snapshot content and summarize binary payloads |
+| `--to <owner/repo>` | Select the retained Hub publication target for a device-local RC repository |
+| `--allow-secrets` | Compatibility flag for servers that require secret-findings acceptance |
+| `--audit` | Review frozen outgoing content with an interactive agent, then confirm publication separately |
+| `--dry-run` | Inspect registered sessions without creating a repository, registering sessions, or uploading history |
+| `--show-preview` | Expand readable snapshots and captured plain file/LFS text; summarize binary bytes |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
-An existing repository's mode is fixed, even when empty, and does not follow later
-creation-preference changes. A conflicting flag is refused with guidance to create
-another repository. Missing mode fields, malformed replies and failed lookups are
-errors; they never authorize ordinary publication.
+A bare `agit push` in a human terminal selects a saved session in the TUI. The choice applies only
+to this invocation. Agents and scripts use an explicit target or `AGIT_SESSION`. `--yes` confirms
+publication but does not select a missing target or complete an audit review.
 
-New repositories use ordinary publication by default: the first push creates the
-repository and needs no viewing password. Encryption is an explicit opt-in chosen at
-creation with `--encryption=true` (or `agit init --encryption=true`, or the
-`privacy.encryption` preference). An encrypted destination needs its viewing key
-configured with `agit privacy init OWNER/REPO` before encrypted push or dry run. For
-agent-assisted setup, use `agit privacy init OWNER/REPO --browser --json --yes`, show its
-setup link, wait for the user's reply, and rerun against the same explicit Hub/repository
-until the API reports `ready`. See the privacy subskill for the output and onboarding
-contract.
+## Agent publication workflow
 
-Automatic ordinary publication follows `push.auto` alone; it needs no earlier explicit
-push and may create a missing destination with the non-interactive visibility default.
-Automatic encrypted publication requires an existing destination whose policy, recipient
-and audience an explicit push has confirmed.
+For a new repository's first push, explicitly pass `--public` or `--private` according to
+the user's visibility instruction; if none is given, use `--private`. Keep that flag in both
+the dry-run and publication commands below, which show the default private choice.
 
-Visibility is settled once, at first publish. Without `--private` / `--public`, push takes the repo preference recorded by `agit init --private`, then the global `push.visibility` (`public` or `private`; `ask` means ask), and otherwise asks a person at a terminal (non-interactive runs and agent sessions default to private). `--dry-run` prints which of these applies.
-
-A bare `agit push` in a human terminal selects a saved session in the TUI. The
-choice applies only to this invocation. Agent and script callers use a complete
-target or `AGIT_SESSION`; workspace bindings, native IDs, and the newest session
-do not choose what to publish. `--yes` does not select a missing target.
-
-## Automatic local privacy
-
-Secret processing runs locally when content is captured or explicitly projected. Accepted
-findings become reversible placeholders after their mappings are durable. The independent
-worker returns partial results or skips unavailable work; scanner, key, dictionary and
-synchronization failures never refuse a push. Existing committed history remains unchanged.
-
-Every push, including an up-to-date push, schedules dictionary synchronization independently.
-Account keys are generated automatically. Only encrypted packages are uploaded; unavailable
-cloud keys leave temporary private local records pending for retry. No acknowledgement or
-`--allow-secrets` flag is required before uploading conversation history. The Hub does not scan
-content or enforce secret decisions, and LFS payloads are excluded from privacy processing.
-
-Use `agit secrets review --repo <agent-repo-path> --json` and the explicit `agit scan` command
-when you want a diagnostic review. Correct confirmed false positives with local `allow`
-decisions. Diagnostics do not become prerequisites for another authorized operation.
-
-## Ordinary publication
-
-With encryption disabled, push freezes and inspects source commits, their ancestors,
-tags and LFS bytes. Selected file-line branches are supported, and an existing local
-`main` is included. Historical object IDs and original session identities are retained.
-The CLI prints the destination, mode and selected refs. A person at a terminal is asked
-to confirm, and declining or cancelling publishes nothing; without one (scripts, CI,
-agent sessions) ordinary publication proceeds without `--yes`. `--yes` skips the
-question and retains integrity, identity and access checks.
-Successful publication updates ordinary branch tracking and saves session receipts.
-No viewing key, generated projection or privacy strategy is requested.
-
-For pointers in the inspection scope, if an LFS payload is absent locally, push downloads it from the source
-repository's pinned Hub identity into private inspection storage. Its size and
-hash are verified even when the current version has
-deleted the file or the destination already stores it. Unavailable or corrupt
-content blocks publication; restore the original payload or retry when the source
-is available. This also applies to dry runs and separate destinations.
-
-Ordinary and encrypted pushes inspect objects absent from the destination's live
-advertised Git history. Encrypted pushes compute this scope after projection, using
-published object IDs. Local tracking refs and previous push receipts do not define
-this baseline. New commits, blobs and annotated tags are inspected, including files
-added and deleted between published tips. New pointer objects require verified LFS
-payloads even if the destination reports that it already has those payloads.
-
-First publication, an empty destination, a failed advertisement or an unverifiable
-baseline uses full inspection. Advertised objects unavailable locally cannot narrow
-the scope. Manual push, automatic push and dry runs share these rules. Use
---audit for complete history and payload review. Incremental push does not recheck
-remote history when scanner rules change. No scan-result cache is kept across pushes;
-the Hub's receive policy remains authoritative.
-
-An unchanged ordinary push still performs authenticated receive advertisement.
-The Hub validates and registers existing native history that lacks committed
-admission before responding, without moving refs. Failed reconciliation leaves
-the push unsuccessful and does not replace local publication receipts or confirm
-a supervisor result. This requires a Hub with ordinary-history reconciliation
-support. RC becomes synchronized only after its receiver returns a durable ACK;
-Git `UpToDate` and local publication receipts do not provide that acknowledgement.
-Secret-findings acceptance accompanies both ordinary push-access probes and native
-publication. A private ordinary destination always sends it; a public one sends it only
-for an explicit, non-automatic `--allow-secrets`.
-
-Ciphertext-only history cannot be published as unencrypted originals. If selected
-ancestry contains encrypted snapshots, push requires the original historical data;
-automatic bulk recovery and conversion of every historical version are not provided.
-
-## A separate destination
-
-Use an explicit target to publish available original history in another mode:
+For an authorized ordinary publication, run a dry-run before uploading:
 
 ```bash
-agit push alice/source@work --to alice/ordinary-copy --encryption=false
-agit privacy init alice/encrypted-copy --encryption=true
-agit push alice/source@work --to alice/encrypted-copy
+agit push <owner/repo>@<branch> --private --dry-run
 ```
 
-The source keeps its refs, remotes, identity, automatic consent and primary receipts.
-Source secret allowances do not authorize the separate destination; its own acknowledged
-allowances govern inspection without rebinding or synchronizing source declarations.
-The target gets its own immutable identity, fixed mode and publication state.
-Encrypted copies use the target's current key and both source and target restrictions.
-A missing target's creation mode uses `--encryption` first. An unpublished local
-source then uses its recorded `init` intent; otherwise the user creation default applies.
-A published source uses the `privacy.encryption` preference, and without one the
-target takes the source repository's Hub mode, so a copy of an encrypted repository
-stays encrypted unless `--encryption=false` is given.
-An existing target always uses its authoritative mode. Reusing a confirmed target
-name for another identity is refused.
-
-For a device-local RC source, plain `--to` retains its existing primary-binding
-semantics. Add `--separate` for an explicit copy without replacing that binding:
+Check the destination, visibility and snapshot summary. Keep the default summary output;
+the complete preview remains in the JSON file at the reported path. After the dry-run
+succeeds, or if it fails with the exact new-destination diagnostic below, publish with
+confirmation supplied by `--yes`:
 
 ```bash
-agit push desktop-machine/project@work --to alice/copy --separate --encryption=false
+agit push <owner/repo>@<branch> --private --yes
 ```
 
-Separate publication is an explicit unsupervised operation. It does not authorize
-automatic uploads to the additional target. A ciphertext-only clone requires the
-complete original data for the selected historical scope; unlocking one snapshot
-does not supply every version. Automatic bulk decryption and source-history rewriting
-are outside this workflow.
+Keep the same account, Hub, target, branch selection and publication options in both
+invocations; replace `--dry-run` with `--yes`. If those inputs or the
+saved history change, run the preview again before publishing.
 
-## Encrypted publication
+With an explicit target and registered destination and sessions, ordinary dry-run
+displays the summary without asking for publication confirmation or uploading history.
+For a new destination, dry-run stops with:
 
-Encrypted push fetches the destination repository's current viewing public key, generates isolated
-public Git history with encrypted originals, and scans the complete result. Writers need write
-access and the public key; they do not enter the repository password. The CLI prints the actual destination and a local JSON preview with public snapshots and
-omission reports. Confirm interactively or supply `--yes`; `--yes` still performs every check.
-Source refs remain private local history, while remote refs identify the generated public history.
-Only selected session branches are published; `main` is not implicitly added. Explicit file-line
-targets are refused while independent repository-file publication is deferred.
-When `push.auto` is enabled, confirmation also authorizes automatic incremental publication under
-the displayed repository policy, recipient and destination. The local receipt is saved only after
-a successful push. Changes to those conditions require another explicit confirmation.
-
-Add `--audit` to review disclosure
-risks that depend on meaning and context, such as private conversations or internal
-customer information. This review includes the generated public historical LOG, public
-metadata and encrypted envelopes in the selected publication. LOG content hidden from VIEW
-still undergoes the same privacy processing. Repository files and standalone attachments are excluded from session publication.
-
-```bash
-agit config runtime.default claude-code
-agit push alice/payments@session-1 --audit
+```text
+a new destination needs an immutable repository identity before a session publication preview; publish without --dry-run to confirm its creation
 ```
 
-The reviewer opens in the same terminal with visible progress and interactive
-questions. It uses immutable `agit show audit/source@<full-commit> --log-only --raw
---no-tui` reads in an isolated inspection store and bounded exports of the complete
-published carriers. The native runtime uses its configured model provider; the
-review can send the supplied content to that provider. It requires an installed
-Claude Code runtime with the required controls, and `runtime.default` must select
-`claude-code`. Other configured runtimes are refused explicitly.
+This diagnostic permits continuing the authorized publication with `push --yes` without
+another confirmation. The ordinary push creates the destination, registers sessions and
+prepares its preview before uploading. Match this diagnostic, not just a nonzero exit code.
+Stop and report any other dry-run error, including an unregistered session in an existing
+repository, permission denial, network failure or content validation failure. If the
+subsequent push fails, report that failure instead of retrying this exception.
 
-When the report is ready, exit the reviewer normally to return to push. Push checks
-the report and displays findings before asking for a separate publication decision.
-Answers inside the reviewer and global `--yes` do not replace that final decision.
-The complete JSON report remains available during this confirmation. Temporary
-inspection files are removed when the push command ends.
+`--audit` is a separate interactive workflow; even `--audit --dry-run` requires a person
+at the terminal, and `--yes` cannot replace its review or final confirmation.
 
-Incomplete review, unreadable evidence, unsupported decoding, exhausted budgets,
-unanswered required questions, or an interrupted reviewer stop the audited push.
-All LFS payloads are excluded from privacy review. Model findings are
-advisory; no deterministic privacy gate applies. The reviewer does not edit, redact, create repositories, or publish content.
+## Session authority and first publication
 
-Encrypted repository creation and password initialization precede publication review.
-Implicit promotion of a read-only checkout remains refused. Explicit separate publication
-uses available original data; it does not copy source ciphertext or its admissions.
-Ordinary clone retains the source repository identity.
+New sessions record their creator and default to session-owner encryption. Existing plain sessions
+retain their registered plain mode. Unknown local sessions require registration before a dry run;
+only the Hub's explicit unregistered-session response permits registration. Missing permissions,
+malformed responses and network failures never select a plaintext fallback.
 
-Password changes rewrap the same key and leave published Git objects unchanged. Key rotation
-retains accepted ancestors, tags and public session identities; only new snapshots use the new
-key. A repeat push after rotation preserves its original receipt binding. Automatic publication
-requires renewed consent for the new recipient. Missing or damaged accepted mappings require
-restoring local privacy state or continuing from a fresh clone; they never authorize rewriting
-remote ancestry. Changed policies still require review and may require a fresh clone before
-continuation. Retained old ciphertext stores remain available for pending receipt delivery.
-Fresh clones can publish new snapshots after a historical reading key is revoked: accepted
-ciphertext remains unchanged, and only new nodes need the current publishing key. This does not
-restore permission to unlock the revoked originals.
+A new destination requires confirmation before creation, because encryption binds its immutable
+repository ID. `--yes` or authorized automatic publication can supply that confirmation. The CLI
+then registers sessions, prepares immutable candidates and displays the publication preview before
+upload. The owner remains the original session owner when a different account commits or pushes.
+The snapshot's owner and mapped committer receive default original access subject to membership.
+Use `privacy access` to manage additional readers of each exact snapshot.
 
-`--audit --dry-run` performs the interactive review and prints its report without
-creating, promoting, or publishing a repository. Audited push requires terminal
-input and output and cannot run with `--json` or from an unattended script.
+Visibility is chosen at creation. Push uses an explicit flag, the preference recorded by
+`agit init --private`, then `push.visibility`; an interactive caller can choose when configured to
+ask. Noninteractive creation defaults to private. Existing repository visibility is preserved.
 
-## Examples
+## Review and publication
 
-```bash
-agit push szh/p1@feature-a
-agit push szh/p1 --all
-agit push szh/p1 -b feature-a --dry-run
-agit push szh/ordinary --all --encryption=false
-```
+The preview identifies the account, Hub, immutable destination, audience, registered modes and
+selected refs. Stored preview JSON contains public snapshots and plain file content. Encrypted
+snapshots exclude independent repository files and attachment bodies. Complete original LOG and
+VIEW records remain encrypted; reading them requires exact-snapshot account authorization.
 
-A secret scan runs before publishing. If `refs/heads/<branch>` is missing, create it with `new`, `import`, or `fork` and verify it first. A directory binding does not select a publication target. Share/export encryption selections are independent of this fixed repository setting.
+Objects absent from the destination's authenticated live advertisement are captured for inspection.
+Tracking refs and old local receipts cannot define that baseline. New commits, blobs, annotated
+tags and LFS pointers are included even when a later snapshot deletes them. New pointer objects
+require captured payload bytes with matching size and hash. Full preview displays captured LFS text;
+binary content is summarized, and unchanged accepted pointers outside the upload are marked preserved.
+A missing or unverifiable baseline requires full inspection. Unavailable payloads block publication.
+
+Local privacy processing applies path aliases, omissions, replacements and secret protection before
+encrypted public bytes are prepared. The processing worker can return partial results or skip
+unavailable work. Session authority, source identity, ciphertext integrity and publication receipts
+remain required independently of privacy findings. Dictionary synchronization runs independently.
+Use `agit secrets review` or `agit scan` for explicit diagnostics.
+
+Manual encrypted publication requires confirmation of the prepared preview; `--yes` supplies it
+for an unattended invocation. Plain-only publication can proceed without a prompt when no terminal
+is available. `--audit` requires its completed review and separate confirmation. Dry runs stop
+after inspection. Changes to account, source, destination, audience or registered
+session configuration invalidate the prepared publication before mutation.
+
+The Hub's versioned receipt binds the manifest and exact ref transitions. Local receipts retain
+source-to-public snapshot mappings and are saved only after verified Git acknowledgement. Retries
+reuse prepared ciphertext and accepted mappings instead of creating a new identity for the same
+snapshot. RC synchronization additionally requires its durable receiver acknowledgement.
+
+## Interactive sensitivity review
+
+`--audit` requires an interactive terminal and `runtime.default=claude-code` with an installed
+Claude Code runtime that supports the required controls. The reviewer reads frozen content from
+an isolated store and can send that content to its configured model provider. Exit the reviewer
+normally when its report is ready; push validates the report and asks for a separate publication
+decision. The report remains available during confirmation, and temporary review files are removed
+when push ends. Global `--yes` and answers inside the reviewer do not replace final confirmation.
+
+Incomplete review, unreadable evidence, unsupported decoding, exhausted budgets, unanswered required
+questions and interruption stop an audited push. LFS payloads are excluded from model privacy review;
+full terminal previews can still show captured LFS text. Model findings are advisory. The reviewer
+does not edit content or publish it. `--audit --dry-run` runs review without publication and requires
+an existing registered destination and sessions. Audited push cannot run with `--json`.
+
+## Automatic publication and local RC
+
+`push.auto` authorizes automatic publication. Enrollment binds the account, immutable repository,
+URL and audience; delivery rechecks current authority and each session's configuration. Automatic
+continuation retains the session owner and uses the same capture and receipt checks as manual push.
+
+A device-local RC repository can select its initial Hub destination with `--to owner/repo`. Later
+pushes retain that confirmed destination and the device's independent local identity. Cross-repository
+push copies require source-publication authority and are currently refused before mutation.

@@ -120,8 +120,6 @@ pub struct Redactor {
     persona: Persona,
     repo: Option<std::path::PathBuf>,
     preserve_device_identity: bool,
-    #[cfg(feature = "secret-vault")]
-    fallback_fingerprint: String,
     #[cfg(feature = "rc")]
     native: std::sync::Arc<std::sync::Mutex<(String, String)>>,
 }
@@ -232,8 +230,6 @@ impl Redactor {
             persona,
             repo: None,
             preserve_device_identity: false,
-            #[cfg(feature = "secret-vault")]
-            fallback_fingerprint: uuid::Uuid::new_v4().to_string(),
             #[cfg(feature = "rc")]
             native: Default::default(),
         }
@@ -304,20 +300,6 @@ impl Redactor {
             let _ = action;
             None
         }
-    }
-    #[cfg(feature = "secret-vault")]
-    pub(crate) fn publication_fingerprint(&self) -> crate::Result<String> {
-        let policy = self
-            .dictionary_query("fingerprint")
-            .unwrap_or_else(|| serde_json::json!(&self.fallback_fingerprint));
-        Ok(crate::domain::privacy_envelope::digest_bytes(
-            &serde_json::to_vec(&(
-                &self.persona.username,
-                &self.persona.home,
-                &self.persona.hostname,
-                policy,
-            ))?,
-        ))
     }
     #[cfg(feature = "secret-vault")]
     pub(crate) fn publication_values_matching(

@@ -473,33 +473,20 @@ old line stays exactly as it was.
 **Publish**:
 
 ```sh
-agit push --dry-run     # rehearsal: shows the selected publication without sending Git refs
-agit push
+agit push alice/payments@ratelimit           # review destination creation and the session preview
+agit push alice/payments@ratelimit --dry-run # inspect an already registered destination/session
 ```
 
-```
-dry run — nothing left this machine
-repo        alice/payments
-branches    ratelimit, main
-versions    1
-remote      none yet (a real push would create it)
-visibility  asked at first publish; unchanged after that
-```
-
-Four things worth knowing:
-
-- **New repositories are ordinary by default.** The first push creates the repository and
-  publishes original history with no viewing password; off a terminal it needs no `--yes`.
-  Encryption is an explicit opt-in chosen at creation (`--encryption=true` on `push`, `init` or
-  `repo create`, or `agit config privacy.encryption true`); set an encrypted repository's viewing
-  password with `agit privacy init alice/payments` before its first push. A repository's mode is
-  fixed once it exists.
+- **New sessions use owner-account encryption.** Existing plain sessions keep their registered
+  settings, so both schemes can coexist in one repository. First publication needs a registered
+  destination and session before a dry-run preview can be prepared. Explicit unattended
+  publication uses `--yes` to confirm creation and the prepared preview.
 - **Visibility is decided at the first push only.** On a TTY it asks; non-interactive defaults to
   private. Change it afterwards with `agit repo visibility alice/payments public`; `agit push`
   never touches it.
 - **Publishing is selective.** By default only the current session branch is pushed, `-b` can be
-  repeated, and `--all` is what pushes everything. The main file line comes along — that is where
-  the `ratelimit, main` in the fragment above comes from.
+  repeated, and `--all` selects all local branches. Accepted ancestors retain their commit identities;
+  newly introduced encrypted snapshots publish a sanitized projection and an authenticated original.
 - **There is no `--force`.** History only grows.
 
 **Pick up someone else's**:
@@ -607,10 +594,9 @@ agit share rm <slug>      # revoke one
 
 `--public` sends a structured public projection without private recovery data; `--password` adds
 a passphrase. Privacy rules rewrite or omit excluded content and secrets before publication.
-Default encrypted sharing applies to encrypted repositories and requires your configured viewing
-key: the link opens the checked presentation, while your viewing password can additionally
-recover the selected original records. An ordinary repository has no viewing key; share its
-history with `--public`, since without it the command refuses before uploading.
+Public and encrypted links contain the same sanitized selected records. The encrypted link key
+protects those records during sharing. Original recovery is separate and requires the signed-in
+account's membership and entitlement for the exact source snapshot.
 Creating links requires a Hub and viewer that support the versioned privacy share protocol.
 
 ### 4.2 Search for precedent
@@ -900,9 +886,8 @@ answers).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.
-`privacy.encryption` (default `false`) selects encryption for repositories created afterward;
-`--encryption=true|false` overrides it per repository, and an existing repository keeps the mode
-it was created with.
+Session encryption uses each session's registered settings. New sessions default to owner-account
+encryption; existing plain sessions retain their mode.
 Automatic settlement is enabled by default: `commit.auto = true`. Setting it to `false` disables
 hook and supervisor settlement; explicit `agit commit` remains available. Unsetting the key
 restores the enabled default. The config list and editor show this effective default separately

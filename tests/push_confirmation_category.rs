@@ -1,4 +1,4 @@
-//! Publication requires explicit confirmation before a foreign checkout becomes an owned copy.
+//! A read-only checkout cannot be published through an implicitly created destination.
 
 use agit::domain::meta;
 use serde_json::Value;
@@ -164,7 +164,7 @@ impl Lab {
         if let Some(version) = mode.strip_prefix("json") {
             command.args(["--json", "--json-version", version]);
         }
-        command.args(["push", "other/qa", "-b", "main", "--encryption=false"]);
+        command.args(["push", "other/qa", "-b", "main"]);
         if dry_run {
             command.arg("--dry-run");
         }
@@ -318,7 +318,7 @@ impl HttpWorker {
                             200,
                             serde_json::json!({
                                 "agent_id":"9f2c3b53-7fe0-412f-b62a-bf68a6845ce7",
-                                "owner":"other", "name":"qa", "visibility":"private", "encryption_enabled":false,
+                                "owner":"other", "name":"qa", "visibility":"private",
                                 "clone_url":format!("{base}/other/qa.git")
                             })
                             .to_string(),
@@ -337,10 +337,6 @@ impl HttpWorker {
                             })
                         }));
                         (403, "{}".to_owned())
-                    }
-                    2 => {
-                        assert_eq!(first, "GET /api/agents/alice/qa HTTP/1.1");
-                        (404, "{}".to_owned())
                     }
                     _ => panic!("confirmation refusal performed an additional request: {first}"),
                 };
@@ -408,15 +404,15 @@ fn assert_refusal(output: &Output, mode: &str) {
     } else {
         String::from_utf8(output.stderr.clone()).unwrap()
     };
-    assert!(text.contains("separate destination"), "{text}");
-    assert!(text.contains("--to owner/new-repository"), "{text}");
+    assert!(text.contains("cannot publish to this repository"), "{text}");
+    assert!(text.contains("preserved source authority"), "{text}");
     for stream in [&output.stdout, &output.stderr] {
         assert!(!String::from_utf8_lossy(stream).contains("synthetic-publication-token"));
     }
 }
 
 #[test]
-fn ordinary_copy_refusal_preserves_the_foreign_checkout() {
+fn read_only_publication_preserves_the_foreign_checkout() {
     for mode in ["human", "quiet", "json1", "json2"] {
         let lab = Lab::new(mode);
         let repo = lab.seed("other", "qa", true);
@@ -430,8 +426,8 @@ fn ordinary_copy_refusal_preserves_the_foreign_checkout() {
         assert_refusal(&output, mode);
         assert_eq!(
             requests.len(),
-            3,
-            "the read capability proof must precede confirmation"
+            2,
+            "the write-access refusal must not create or discover a replacement"
         );
         eprintln!("publication mode={mode} stage=postconditions start");
         assert_eq!(lab.state(), before, "{mode}: refusal changed local files");

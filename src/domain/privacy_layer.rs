@@ -14,6 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub const PRIVATE_LAYER_VERSION: u32 = 1;
 const MAX_LAYER_BYTES: usize = 4 * 1024 * 1024 - 16;
 
+#[cfg(feature = "cli")]
 pub(crate) use super::transcript::recovery::{EVIDENCE_FIELD, EVIDENCE_PREFIX, EvidenceReference};
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +31,8 @@ pub struct PrivateLayer {
     pub version: u32,
     pub session: PrivateSession,
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_committer: Option<super::session_privacy::SourceCommitter>,
     pub path_aliases: BTreeMap<String, String>,
     /// Literal values that must retain protection when original text moves to another device.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -47,6 +50,9 @@ impl Drop for PrivateLayer {
         self.session.log.zeroize();
         self.session.view.zeroize();
         erase_json(&mut self.metadata);
+        if let Some(committer) = &mut self.source_committer {
+            committer.git_identity.zeroize();
+        }
         for (mut alias, mut source) in std::mem::take(&mut self.path_aliases) {
             alias.zeroize();
             source.zeroize();
@@ -85,6 +91,7 @@ impl PrivateLayer {
                 view: STANDARD.encode(view),
             },
             metadata,
+            source_committer: None,
             path_aliases,
             protected_values: BTreeSet::new(),
         };
@@ -120,6 +127,13 @@ impl PrivateLayer {
             .map_err(|_| anyhow::anyhow!("invalid private session metadata"))?;
         meta::validate(&snapshot)
             .map_err(|_| anyhow::anyhow!("invalid private session metadata"))?;
+        if let Some(committer) = &self.source_committer {
+            committer.validate()?;
+            ensure!(
+                committer.account == snapshot.committer_account,
+                "private committer evidence differs from snapshot metadata"
+            );
+        }
         let (log, view) = self.session_bytes()?;
         storage::snapshot_files(&log, &view)
             .map_err(|_| anyhow::anyhow!("private LOG or VIEW is not a valid session snapshot"))?;
@@ -139,6 +153,7 @@ impl PrivateLayer {
         Ok(())
     }
 
+    #[cfg(feature = "cli")]
     pub(crate) fn import_protection(&self, repo: &super::repo::Repo) -> Result<()> {
         self.validate()?;
         let _ = super::privacy::service::manage(
@@ -256,11 +271,7 @@ fn erase_json(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        privacy_envelope::{PrivacyEnvelope, ViewingRecipient, digest_bytes},
-        transcript,
-    };
-    use crypto_box::SecretKey;
+    use crate::domain::transcript;
 
     /// Oversized input is rejected before Base64 copies or parsing an invalid session body.
     #[test]
@@ -276,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_layer_restores_a_readable_session_with_rebound_workspace() {
+    fn private_layer_restores_a_readable_session_with_rebound_workspace() {
         let session = format!("agit-{}", "a".repeat(40));
         let log = transcript::wrap_lines(
             "{\"type\":\"message\",\"content\":\"original evidence\"}\n",
@@ -296,22 +307,7 @@ mod tests {
         let mut layer =
             PrivateLayer::new(&log, &log, serde_json::to_value(metadata).unwrap(), aliases)
                 .unwrap();
-        let key = SecretKey::from([9; 32]);
-        let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
-            &STANDARD.encode(key.public_key().as_bytes()),
-        )
-        .unwrap();
-        let envelope = PrivacyEnvelope::seal_layer(
-            digest_bytes(b"policy"),
-            digest_bytes(b"snapshot"),
-            serde_json::json!({"safe": true}),
-            &layer,
-            &recipient,
-            Vec::new(),
-        )
-        .unwrap();
-        let restored = envelope.open_layer(&key).unwrap();
+        let restored = &layer;
         let parent = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let directory = restored.restore(parent.path(), workspace.path()).unwrap();

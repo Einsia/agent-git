@@ -470,19 +470,22 @@ so this design is not end-to-end encryption. Deploy the backend changes before
 releasing the CLI: an older server's privacy gates cannot be bypassed by the new
 client guarantee.
 
-### Integration with repository encryption and current runtime delivery
+### Integration with session encryption and runtime delivery
 
-Cloud policy-source resolution and administration are removed. Repository envelope receipts
-retain only authenticated recipient, immutable source/ref, schema, and client metadata bindings;
+Cloud policy-source resolution and administration are removed. Session publication receipts
+retain authenticated owner recipients, immutable source/ref, schema, and client metadata bindings;
 they do not evaluate secret findings or cloud content exclusions. Server summary/projection
 validation no longer rejects content because a field name resembles a secret or a value resembles
-a local path. Existing repository encryption remains an explicit transport mode separate from
-the automatic per-account dictionary key.
+a local path. Registered session encryption is separate from the automatic per-account dictionary
+key. New sessions default to owner-account encryption and accepted plain sessions retain their
+registered mode. Session authority and cryptographic validation remain required even when optional
+local privacy work is unavailable.
 
 Share and privacy export delegate optional local policy loading and path projection to the
 bounded worker. Nested secret operations execute inside that same disposable process rather
 than launching additional workers. A failed optional projection uses the default in-memory
-projection; selected private records remain in the encrypted envelope. Alias and encrypted
+projection. Shares and privacy exports contain sanitized selected records; original recovery uses
+account authorization for the exact source snapshot. Alias and encrypted
 publication cache locks use immediate acquisition so contention cannot wait indefinitely.
 
 Runtime fragment delivery consumes each successful streaming result immediately and flushes

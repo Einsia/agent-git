@@ -9,6 +9,10 @@ description: Reconcile the intent of two session branches through the merge-agen
 
 Merge is not text concatenation. It records a reconciliation around source and target VIEWs, selected turns/events, and shared-file intent. Nothing lands without a `summary`.
 
+Published encrypted trees are immutable inputs. Before merging one, resume and save a native
+continuation or create an independent fork with the intended original or sanitized context.
+Merge refuses direct edits to a published projection and its authenticated envelope.
+
 ## Synopsis
 
 ```bash

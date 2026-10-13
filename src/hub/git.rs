@@ -1040,7 +1040,10 @@ fn capture_transport(
         cmd.args(args);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         if let Some(transport) = transport {
-            for (k, v) in transport.environment().ok()? {
+            for (k, v) in transport
+                .environment_in(transport.execution.as_ref(), args.first() == Some(&"lfs"))
+                .ok()?
+            {
                 cmd.env(k, v);
             }
         }
@@ -3341,9 +3344,22 @@ mod git_credential_lifecycle_tests {
         }
         let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
         assert!(execute(EntryPoint::Capture, repo.root(), &url, &identity));
+        // Ref probes need Git authority even when the retained transport has prepared LFS.
+        let transport =
+            super::TransportIdentity::new(Some(repo.root()), &["lfs", "push", "origin"], &identity)
+                .unwrap();
+        let refs = super::capture_transport(
+            repo.root(),
+            &["ls-remote", "--refs", "--", &url],
+            Some(&transport),
+        )
+        .unwrap();
+        assert_eq!(refs.trim(), format!("{FAKE_OID}\trefs/heads/main"));
         let requests = hub.finish();
-        assert_eq!(requests.len(), 1);
-        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_git_request(request, Some("fake-alice-access"), true);
+        }
     }
 
     #[test]

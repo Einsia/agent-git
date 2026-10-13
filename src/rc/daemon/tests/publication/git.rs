@@ -2,18 +2,21 @@ use super::*;
 use crate::domain::{
     meta::{self, Meta},
     privacy::{PrivacyPolicy, ReplacementRule},
-    privacy_envelope::{PrivacyEnvelope, ViewingRecipient},
-    privacy_git::ProjectedHistory,
+    privacy_envelope::PrivacyEnvelope,
+    privacy_git::{ProjectedHistory, sessions::SessionPublicationPlan},
+    session_privacy::{AccountIdentity, SessionPrivacy, SessionPrivacyConfig},
     storage, transcript,
 };
+use crate::hub::privacy::sessions::{AccountSessionKey, SessionPrivacyResponse};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::collections::BTreeMap;
 
 pub(super) fn publication(
     repo: &Repo,
     branch: &str,
     destination: crate::hub::identity::RemoteIdentity,
     received: &std::path::Path,
-    encryption_enabled: bool,
+    session_encrypted: bool,
 ) -> (PublicationReceipt, Repo) {
     repo.git(&["config", "user.name", "Fixture"]).unwrap();
     repo.git(&["config", "user.email", "fixture@example.invalid"])
@@ -29,15 +32,17 @@ pub(super) fn publication(
     let session = format!("agit-{}", "a".repeat(40));
     let log = transcript::wrap_lines(&raw, "codex", &session);
     storage::write_snapshot(repo.root(), &log, &log).unwrap();
-    meta::write(
-        repo.root(),
-        &Meta::new(session.clone(), "codex".into(), String::new()),
-    )
-    .unwrap();
+    let mut metadata = Meta::new(session.clone(), "codex".into(), String::new());
+    if session_encrypted {
+        let account = AccountIdentity::new(&destination.hub, "account-1").unwrap();
+        metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+        metadata.committer_account = Some(account);
+    }
+    meta::write(repo.root(), &metadata).unwrap();
     repo.git(&["add", "."]).unwrap();
     repo.git(&["commit", "-m", "Source session"]).unwrap();
     let source = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    if !encryption_enabled {
+    if !session_encrypted {
         std::fs::create_dir_all(received).unwrap();
         let remote = Repo::at(received);
         remote.git(&["init", "--bare"]).unwrap();
@@ -48,6 +53,7 @@ pub(super) fn publication(
         ])
         .unwrap();
         let receipt = PublicationReceipt {
+            session_snapshot: None,
             version: 2,
             mode: crate::domain::privacy_receipt::PublicationMode::Ordinary,
             repository: "owner/project".into(),
@@ -92,17 +98,33 @@ pub(super) fn publication(
     .unwrap();
     let key = crypto_box::SecretKey::from([23; 32]);
     let public_key = STANDARD.encode(key.public_key().as_bytes());
-    let recipient = ViewingRecipient::from_base64(
-        crate::domain::privacy_envelope::digest_bytes(public_key.as_bytes()).replace(':', "-"),
-        &public_key,
-    )
-    .unwrap();
+    let mut selected = SessionPublicationPlan {
+        identity: destination.clone(),
+        remote: Default::default(),
+        configs: BTreeMap::from([(
+            session.clone(),
+            SessionPrivacyResponse {
+                config: SessionPrivacyConfig {
+                    repository_id: destination.agent_id.clone(),
+                    session_id: session.clone(),
+                    privacy: metadata.session_privacy.unwrap(),
+                    revision: 1,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                },
+                owner_key: Some(AccountSessionKey {
+                    account_id: "account-1".into(),
+                    key_version: 1,
+                    public_key_algorithm: "x25519".into(),
+                    public_key,
+                }),
+            },
+        )]),
+    };
     let url = format!("{}/owner/project.git", destination.hub);
-    let history = ProjectedHistory::prepare(repo, &[branch.into()], &recipient, &url).unwrap();
+    let mut history =
+        ProjectedHistory::prepare_sessions(repo, &[branch.into()], &selected, &[]).unwrap();
+    history.prepare_acceptance().unwrap();
     let published = history.plan().heads()[0].oid().to_owned();
-    let projected_session_id = storage::metadata_local(history.repo().root(), &published)
-        .unwrap()
-        .session;
     std::fs::create_dir_all(received).unwrap();
     let remote = Repo::at(received);
     remote.git(&["init", "--bare"]).unwrap();
@@ -129,18 +151,17 @@ pub(super) fn publication(
             .contains(private_text)
     );
     assert!(remote.git(&["cat-file", "-e", &source]).is_err());
-    let receipt = PublicationReceipt {
-        version: 1,
-        mode: Default::default(),
-        repository: "owner/project".into(),
-        branch: branch.into(),
-        source,
-        published,
-        projected_session_id: Some(projected_session_id),
-        destination,
-        url,
-        policy_digest: Some(history.policy_digest().into()),
-        recipient: Some(recipient.fingerprint().unwrap()),
+    let receipt = history
+        .session_receipts("owner/project", &destination, &url)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let reference = format!("refs/heads/{branch}");
+    let received_head = remote.git(&["rev-parse", &reference]).unwrap();
+    selected.remote = crate::hub::git::RemoteRefs {
+        heads: vec![received_head.clone()],
+        refs: BTreeMap::from([(reference, received_head)]),
+        ..Default::default()
     };
     drop(history);
     let next = format!("{raw}{}", raw.replace(private_text, "Later public turn"));
@@ -149,8 +170,9 @@ pub(super) fn publication(
     repo.git(&["add", "."]).unwrap();
     repo.git(&["commit", "-m", "Following session turn"])
         .unwrap();
-    let advanced =
-        ProjectedHistory::prepare(repo, &[branch.into()], &recipient, &receipt.url).unwrap();
+    let mut advanced =
+        ProjectedHistory::prepare_sessions(repo, &[branch.into()], &selected, &[]).unwrap();
+    advanced.prepare_acceptance().unwrap();
     assert_ne!(advanced.plan().heads()[0].oid(), receipt.published);
     push(&advanced, &remote, branch);
     (receipt, remote)
@@ -167,7 +189,7 @@ fn push(history: &ProjectedHistory, remote: &Repo, branch: &str) {
         .unwrap();
 }
 
-pub(super) fn verify(remote: &Repo, delivery: &Delivery, encryption_enabled: bool) {
+pub(super) fn verify(remote: &Repo, delivery: &Delivery, session_encrypted: bool) {
     let notification = &delivery.notification;
     remote
         .git(&[
@@ -182,8 +204,13 @@ pub(super) fn verify(remote: &Repo, delivery: &Delivery, encryption_enabled: boo
     let bytes = remote
         .show_result(&notification.public_commit, "privacy/envelope.json")
         .unwrap();
-    if encryption_enabled {
-        PrivacyEnvelope::parse(bytes.unwrap().as_bytes()).unwrap();
+    if session_encrypted {
+        assert_eq!(
+            PrivacyEnvelope::parse(bytes.unwrap().as_bytes())
+                .unwrap()
+                .format_version,
+            2
+        );
     } else {
         assert!(bytes.is_none());
     }

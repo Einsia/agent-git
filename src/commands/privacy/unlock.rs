@@ -1,42 +1,27 @@
-//! Unlock retains keys in memory unless the caller explicitly requests scoped OS storage.
+//! Recovery requests the exact publication and installs only authenticated original content.
 
 use super::super::CmdResult;
 use crate::domain::{
     privacy::PrivacyPolicy,
-    privacy_credentials::{self, CredentialStore, OsUnlockStore, Scope},
     privacy_envelope::{MAX_ENVELOPE_BYTES, PrivacyEnvelope, digest_bytes},
+    privacy_layer::PrivateLayer,
+    privacy_recovery::RecoveredSnapshot,
     refs,
+    repo::Repo,
+    session_privacy::{
+        AcceptedSnapshot, SESSION_ENVELOPE_VERSION, SessionOwner, SessionPrivacy, SessionScheme,
+    },
 };
-use crate::{ExitCode, hub::Client, infra::config, ui};
+use crate::{
+    ExitCode,
+    hub::{Client, identity::RemoteIdentity},
+    infra::config,
+    ui,
+};
 use anyhow::{Context, ensure};
-use chrono::Utc;
-use std::path::Path;
-use zeroize::Zeroizing;
+use std::path::{Path, PathBuf};
 
-pub(super) fn run(
-    target: &str,
-    workspace: Option<&Path>,
-    remember_for: Option<u16>,
-    use_saved_key: bool,
-) -> CmdResult {
-    run_with_store(
-        target,
-        workspace,
-        remember_for,
-        use_saved_key,
-        &OsUnlockStore,
-        || ui::prompt::repository_password("Repository viewing password", false),
-    )
-}
-
-fn run_with_store(
-    target: &str,
-    workspace: Option<&Path>,
-    remember_for: Option<u16>,
-    use_saved_key: bool,
-    store: &impl CredentialStore,
-    password: impl FnOnce() -> anyhow::Result<Zeroizing<String>>,
-) -> CmdResult {
+pub(super) fn run(target: &str, workspace: Option<&Path>) -> CmdResult {
     let spec =
         crate::commands::target::resolve_local_repo(crate::commands::target::parse_spec(target)?)?;
     let spec = crate::commands::context::substitute_at(spec)?;
@@ -59,17 +44,8 @@ fn run_with_store(
         .canonicalize()
         .context("recovery workspace is unavailable")?;
     ensure!(workspace.is_dir(), "recovery workspace must be a directory");
-    let object = format!("{}:privacy/envelope.json", resolved.sha);
-    let size: usize = repo
-        .git(&["cat-file", "-s", &object])
-        .context("this snapshot has no encrypted privacy envelope")?
-        .trim()
-        .parse()?;
-    ensure!(
-        size <= MAX_ENVELOPE_BYTES,
-        "privacy envelope exceeds the size limit"
-    );
-    let bytes = repo.git_bytes_result(&["cat-file", "blob", &object])?;
+    let bytes = envelope_bytes(&repo, &resolved.sha)?
+        .context("this snapshot has no encrypted privacy envelope")?;
     let envelope = PrivacyEnvelope::parse(&bytes)?;
     let cache = repo.common_dir()?.join("agit/privacy-recovery");
     let destination = cache.join(&resolved.sha);
@@ -79,99 +55,223 @@ fn run_with_store(
     );
 
     ensure!(
-        envelope.private_payload.wrapped_keys.len() == 1,
-        "repository unlock requires one viewing recipient"
+        envelope.format_version == SESSION_ENVELOPE_VERSION,
+        "unsupported obsolete encryption format; repository-password recovery is unavailable"
     );
-    let recipient = &envelope.private_payload.wrapped_keys[0].recipient;
-    let (client, repository, identity) = reader_context(&repo)?;
-    let record = client.publication_unlock_key(&repository, &identity, &resolved.sha, recipient)?;
-    let public_session = envelope
-        .public_projection
-        .pointer("/metadata/session")
-        .and_then(serde_json::Value::as_str)
-        .context("publication envelope has no public session identity")?;
+    recover_selected(&repo, &resolved.sha, &workspace, &bytes, &envelope)?;
+    report_recovery(&slug, &resolved.sha, &destination, &workspace);
+    Ok(ExitCode::Ok)
+}
+
+pub(crate) fn recover_session(
+    repo: &Repo,
+    commit: &str,
+    workspace: &Path,
+) -> anyhow::Result<Option<RecoveredSnapshot>> {
+    let Some(bytes) = envelope_bytes(repo, commit)? else {
+        return Ok(None);
+    };
+    let envelope = PrivacyEnvelope::parse(&bytes)?;
     ensure!(
-        record.session_id == public_session,
-        "repository key response does not match the selected session"
+        envelope.format_version == SESSION_ENVELOPE_VERSION,
+        "unsupported obsolete encryption format; repository-password recovery is unavailable"
     );
-    let scope = Scope {
-        hub: identity.hub.clone(),
-        agent_id: identity.agent_id.clone(),
-        recipient: recipient.clone(),
-        viewing_public_key: record.key.key.public_key.clone(),
+    recover_selected(repo, commit, workspace, &bytes, &envelope)?;
+    Ok(Some(RecoveredSnapshot::load(repo, commit)?.context(
+        "recovered original is unavailable after installation",
+    )?))
+}
+
+pub(crate) fn envelope_bytes(repo: &Repo, commit: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    crate::domain::session_privacy::validate_oid(commit)?;
+    let repo = repo.clone().local_objects_only();
+    let object = format!("{commit}:privacy/envelope.json");
+    let entry = repo.git_bytes_result(&[
+        "ls-tree",
+        "-z",
+        "--full-name",
+        commit,
+        "--",
+        "privacy/envelope.json",
+    ])?;
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        entry.starts_with(b"100644 blob "),
+        "privacy envelope must be a regular file"
+    );
+    let size: usize = repo.git(&["cat-file", "-s", &object])?.trim().parse()?;
+    ensure!(
+        size <= MAX_ENVELOPE_BYTES,
+        "privacy envelope exceeds the size limit"
+    );
+    Ok(Some(repo.git_bytes_result(&["cat-file", "blob", &object])?))
+}
+
+fn recover_selected(
+    repo: &Repo,
+    commit: &str,
+    workspace: &Path,
+    bytes: &[u8],
+    envelope: &PrivacyEnvelope,
+) -> anyhow::Result<()> {
+    let (_, layer) = open_session_original(repo, commit, bytes, envelope, false)?;
+    let layer = layer.context("original access is unavailable")?;
+    install_recovery(repo, commit, workspace, bytes, &layer)?;
+    Ok(())
+}
+
+/// Absent credentials or denied source access permits sanitized context; transient failures remain errors.
+pub(crate) fn open_session_original(
+    repo: &Repo,
+    commit: &str,
+    bytes: &[u8],
+    envelope: &PrivacyEnvelope,
+    allow_sanitized: bool,
+) -> anyhow::Result<(AcceptedSnapshot, Option<PrivateLayer>)> {
+    ensure!(
+        envelope.format_version == SESSION_ENVELOPE_VERSION,
+        "this encryption format cannot supply independent fork context"
+    );
+    let expected = AcceptedSnapshot {
+        version: SESSION_ENVELOPE_VERSION,
+        binding: envelope
+            .session_binding
+            .clone()
+            .context("missing session authority")?,
+        published_commit: commit.to_owned(),
+        envelope_digest: digest_bytes(bytes),
     };
-    scope.validate()?;
-    let key = if use_saved_key {
-        privacy_credentials::recall(store, &scope, Utc::now())?
-    } else {
-        record.key.unlock(&password()?)?
+    expected.validate()?;
+    let (client, repository, identity) = reader_context(repo)?;
+    if allow_sanitized && client.checked_access_token()?.is_none() {
+        return Ok((expected, None));
+    }
+    let source_identity = RemoteIdentity::new(&identity.hub, &expected.binding.repository_id)?;
+    let response = publication_source(
+        repo,
+        &client,
+        repository,
+        identity,
+        &expected.binding.repository_id,
+    )
+    .and_then(|(repository, identity)| {
+        client.session_original_key(&repository, &identity, &expected)
+    });
+    let response = match response {
+        Ok(response) => response,
+        Err(error)
+            if allow_sanitized
+                && (error.is::<crate::hub::privacy::location::SourceUnavailable>()
+                    || error
+                        .downcast_ref::<crate::hub::client::ApiError>()
+                        .is_some_and(|api| {
+                            api.status == 403 && api.kind == "original_access_denied"
+                        })) =>
+        {
+            return Ok((expected, None));
+        }
+        Err(error) => return Err(error),
     };
-    let secret = crypto_box::SecretKey::from_slice(key.as_ref())
-        .map_err(|_| anyhow::anyhow!("invalid repository viewing private key"))?;
-    let layer = envelope.open_layer(&secret)?;
-    drop(secret);
+    let layer = response.open_layer(&expected, bytes)?;
+    drop(response);
+    let ownership: SessionPrivacy = serde_json::from_value(
+        layer
+            .metadata
+            .get("session_privacy")
+            .cloned()
+            .context("session original has no ownership record")?,
+    )?;
+    ownership.validate()?;
+    ensure!(
+        ownership.scheme == SessionScheme::SessionOwnerV2
+            && ownership.hub.as_deref() == Some(source_identity.hub.as_str())
+            && ownership.owner
+                == Some(SessionOwner::User(
+                    expected.binding.owner_key.account_id.clone()
+                )),
+        "session original ownership differs from its publication authority"
+    );
+    Ok((expected, Some(layer)))
+}
+
+fn install_recovery(
+    repo: &Repo,
+    commit: &str,
+    workspace: &Path,
+    bytes: &[u8],
+    layer: &PrivateLayer,
+) -> anyhow::Result<PathBuf> {
+    let cache = repo.common_dir()?.join("agit/privacy-recovery");
+    let destination = cache.join(commit);
     config::create_state_dir(&cache)?;
-    let staging = layer.restore(&cache, &workspace)?;
-    layer.import_protection(&repo)?;
+    let staging = layer.restore(&cache, workspace)?;
+    layer.import_protection(repo)?;
     std::fs::write(
         staging.path().join("publication-digest"),
-        digest_bytes(&bytes),
+        digest_bytes(bytes),
     )?;
-    crate::domain::privacy_recovery::write_manifest(staging.path(), &bytes)?;
+    crate::domain::privacy_recovery::write_manifest(staging.path(), bytes)?;
     ensure!(
         !destination.exists(),
         "recovery data appeared while authorization was pending"
     );
-    if let Some(hours) = remember_for {
-        privacy_credentials::remember(store, &scope, &key, hours, Utc::now())?;
-    }
-    drop(key);
     std::fs::rename(staging.path(), &destination)
         .context("cannot install private recovery data")?;
+    Ok(destination)
+}
+
+fn report_recovery(slug: &str, commit: &str, destination: &Path, workspace: &Path) {
     if crate::commands::json::requested() {
         println!(
             "{}",
-            serde_json::json!({"operation": "privacy_unlock", "repository": slug, "snapshot": resolved.sha, "recovery_directory": destination, "workspace": workspace, "key_source": if use_saved_key { "os" } else { "password" }, "remembered_hours": remember_for})
+            serde_json::json!({"operation": "privacy_unlock", "repository": slug, "snapshot": commit, "recovery_directory": destination, "workspace": workspace, "key_source": "account"})
         );
     } else {
         ui::success("private session recovered locally");
         println!("recovery directory: {}", destination.display());
-        if let Some(hours) = remember_for {
-            println!("viewing key saved in the OS credential store for {hours} hours");
-        }
     }
-    Ok(ExitCode::Ok)
 }
 
-#[cfg(test)]
-mod tests;
-
-fn reader_context(
+pub(super) fn reader_context(
     repo: &crate::domain::repo::Repo,
-) -> anyhow::Result<(Client, String, crate::hub::identity::RemoteIdentity)> {
-    let identity = crate::hub::identity::read(repo)?.context("this checkout has no immutable source identity; clone the repository before password unlock")?;
-    let origin = repo.remote_url().context("this checkout has no source remote; restore its verified repository URL before password unlock")?;
+) -> anyhow::Result<(Client, String, RemoteIdentity)> {
+    let identity = crate::hub::identity::read(repo)?.context("this checkout has no immutable source identity; clone the repository before recovering originals")?;
+    let origin = repo.remote_url().context("this checkout has no source remote; restore its verified repository URL before recovering originals")?;
     let (hub, repository) = super::sources::remote_scope(&origin)?;
     ensure!(
         hub == identity.hub,
-        "the source remote belongs to another Hub; refusing repository key lookup"
+        "the source remote belongs to another Hub; refusing original access lookup"
     );
     let client = Client::for_stored_hub(&identity.hub);
     Ok((client, repository, identity))
 }
 
-pub(super) fn forget(repository: &str) -> CmdResult {
-    let (repo, repository) = super::resolve_repo(Some(repository))?;
-    let identity = crate::hub::identity::read(&repo)?
-        .context("this checkout has no immutable repository identity for its saved key")?;
-    privacy_credentials::forget(&OsUnlockStore, &identity.hub, &identity.agent_id)?;
-    if crate::commands::json::requested() {
-        println!(
-            "{}",
-            serde_json::json!({"operation":"privacy_forget_unlock", "hub":identity.hub, "agent_id":identity.agent_id, "repository":repository})
-        );
-    } else {
-        ui::success("saved unlock key removed; existing local recovery data is retained");
+pub(crate) fn source_context(
+    repo: &Repo,
+    repository_id: &str,
+) -> anyhow::Result<(Client, String, RemoteIdentity)> {
+    let (client, repository, identity) = reader_context(repo)?;
+    let (repository, identity) =
+        publication_source(repo, &client, repository, identity, repository_id)?;
+    Ok((client, repository, identity))
+}
+
+fn publication_source(
+    repo: &Repo,
+    client: &Client,
+    repository: String,
+    identity: RemoteIdentity,
+    repository_id: &str,
+) -> anyhow::Result<(String, RemoteIdentity)> {
+    if identity.agent_id == repository_id {
+        return Ok((repository, identity));
     }
-    Ok(ExitCode::Ok)
+    let source = RemoteIdentity::new(&identity.hub, repository_id)?;
+    let repository = match super::sources::retained(repo, &source)? {
+        Some(repository) => repository,
+        None => client.repository_location(&source)?,
+    };
+    Ok((repository, source))
 }

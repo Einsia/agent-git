@@ -4,6 +4,7 @@
 //! it does not establish that those bytes are appropriate for public disclosure.
 
 use super::privacy_layer::PrivateLayer;
+use super::session_privacy::{AcceptedSnapshot, SESSION_ENVELOPE_VERSION, SessionSnapshotBinding};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, ensure};
@@ -13,14 +14,11 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-pub const ENVELOPE_FORMAT_VERSION: u32 = 1;
 pub const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PUBLIC_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PRIVATE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const AES_ALGORITHM: &str = "aes-256-gcm";
 const WRAP_ALGORITHM: &str = "x25519-sealed-box";
 
@@ -39,22 +37,6 @@ pub struct EncryptedPrivatePayload {
     pub nonce: String,
     pub ciphertext: String,
     pub wrapped_keys: Vec<WrappedObjectKey>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Attachment {
-    pub id: String,
-    pub digest: String,
-    pub size: u64,
-    pub kind: AttachmentKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentKind {
-    Public,
-    PrivateEncrypted,
 }
 
 /// A recipient identifier selects the viewing public key; it never contains a secret.
@@ -96,24 +78,31 @@ impl ViewingRecipient {
 #[serde(deny_unknown_fields)]
 pub struct PrivacyEnvelope {
     pub format_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding: Option<SessionSnapshotBinding>,
     pub policy_digest: String,
     pub snapshot_digest: String,
     pub public_projection: Value,
     pub private_payload: EncryptedPrivatePayload,
     #[serde(default)]
-    pub attachments: Vec<Attachment>,
+    pub attachments: Vec<Value>,
 }
 
 impl PrivacyEnvelope {
-    /// Generate a fresh object key and wrap it for the selected viewing key.
-    pub fn seal(
+    /// Only the owner key wraps the content key; snapshot readers are server entitlements.
+    pub fn seal_session(
         policy_digest: String,
-        snapshot_digest: String,
         public_projection: Value,
         private_bytes: &[u8],
         recipient: &ViewingRecipient,
-        attachments: Vec<Attachment>,
+        binding: SessionSnapshotBinding,
     ) -> Result<Self> {
+        binding.validate()?;
+        ensure!(
+            recipient.id == binding.owner_key.recipient_id()?,
+            "viewing recipient differs from the session owner key"
+        );
+        let snapshot_digest = digest_json(&public_projection)?;
         validate_digest(&policy_digest)?;
         validate_digest(&snapshot_digest)?;
         ensure!(
@@ -133,7 +122,8 @@ impl PrivacyEnvelope {
             .seal(&mut OsRng, object_key.as_ref())
             .map_err(|_| anyhow::anyhow!("privacy object key wrapping failed"))?;
         let mut envelope = Self {
-            format_version: ENVELOPE_FORMAT_VERSION,
+            format_version: SESSION_ENVELOPE_VERSION,
+            session_binding: Some(binding),
             policy_digest,
             snapshot_digest,
             public_projection,
@@ -147,7 +137,7 @@ impl PrivacyEnvelope {
                     ciphertext: STANDARD.encode(wrapped),
                 }],
             },
-            attachments,
+            attachments: Vec::new(),
         };
         let aad = envelope.associated_data()?;
         let ciphertext = Aes256Gcm::new_from_slice(object_key.as_ref())?
@@ -180,10 +170,20 @@ impl PrivacyEnvelope {
                     .filter(|key| key.len() == 32)
             })
             .context("no privacy object key can be opened with this viewing key")?;
+        self.open_content_key(&object_key)
+    }
+
+    /// AEAD authenticates all immutable bindings even when the server unwraps the key.
+    pub fn open_content_key(&self, object_key: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        self.validate()?;
+        ensure!(
+            object_key.len() == 32,
+            "privacy content key has an invalid length"
+        );
         let nonce = STANDARD.decode(&self.private_payload.nonce)?;
         let ciphertext = STANDARD.decode(&self.private_payload.ciphertext)?;
         let aad = self.associated_data()?;
-        Aes256Gcm::new_from_slice(&object_key)?
+        Aes256Gcm::new_from_slice(object_key)?
             .decrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -195,35 +195,57 @@ impl PrivacyEnvelope {
             .map_err(|_| anyhow::anyhow!("privacy private payload authentication failed"))
     }
 
-    pub fn seal_layer(
-        policy_digest: String,
-        snapshot_digest: String,
-        public_projection: Value,
-        layer: &PrivateLayer,
-        recipient: &ViewingRecipient,
-        attachments: Vec<Attachment>,
-    ) -> Result<Self> {
-        layer.validate()?;
-        let bytes = Zeroizing::new(serde_json::to_vec(layer)?);
-        Self::seal(
-            policy_digest,
-            snapshot_digest,
-            public_projection,
-            &bytes,
-            recipient,
-            attachments,
-        )
+    pub fn open_layer(&self, viewing_key: &SecretKey) -> Result<PrivateLayer> {
+        self.parse_layer(&self.open(viewing_key)?)
     }
 
-    pub fn open_layer(&self, viewing_key: &SecretKey) -> Result<PrivateLayer> {
+    pub fn open_layer_with_content_key(&self, content_key: &[u8]) -> Result<PrivateLayer> {
+        self.parse_layer(&self.open_content_key(content_key)?)
+    }
+
+    fn parse_layer(&self, bytes: &[u8]) -> Result<PrivateLayer> {
         ensure!(
             self.attachments.is_empty(),
             "session recovery does not support standalone attachments"
         );
-        let bytes = self.open(viewing_key)?;
-        let layer: PrivateLayer = serde_json::from_slice(&bytes)
+        let layer: PrivateLayer = serde_json::from_slice(bytes)
             .map_err(|_| anyhow::anyhow!("privacy private payload is not a private layer"))?;
         layer.validate()?;
+        let binding = self
+            .session_binding
+            .as_ref()
+            .context("session-owner envelope has no snapshot binding")?;
+        ensure!(
+            layer.metadata.get("session").and_then(Value::as_str) == Some(&binding.session_id),
+            "private layer belongs to another logical session"
+        );
+        use super::session_privacy::{SessionOwner, SessionPrivacy, SessionScheme};
+        let privacy: SessionPrivacy = serde_json::from_value(
+            layer
+                .metadata
+                .get("session_privacy")
+                .cloned()
+                .context("session original has no ownership record")?,
+        )?;
+        privacy.validate()?;
+        ensure!(
+            privacy.scheme == SessionScheme::SessionOwnerV2
+                && privacy.owner == Some(SessionOwner::User(binding.owner_key.account_id.clone())),
+            "session original ownership differs from its publication authority"
+        );
+        let source = layer
+            .source_committer
+            .as_ref()
+            .context("session original has no committer evidence")?;
+        ensure!(
+            source.attribution(
+                privacy
+                    .hub
+                    .as_deref()
+                    .context("session original has no Hub")?
+            )? == binding.committer,
+            "session original committer differs from its publication authority"
+        );
         Ok(layer)
     }
 
@@ -240,8 +262,27 @@ impl PrivacyEnvelope {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.format_version == ENVELOPE_FORMAT_VERSION,
+            self.format_version == SESSION_ENVELOPE_VERSION,
             "unsupported privacy envelope format"
+        );
+        let binding = self
+            .session_binding
+            .as_ref()
+            .context("session-owner envelope has no snapshot binding")?;
+        binding.validate()?;
+        ensure!(
+            self.attachments.is_empty(),
+            "session-owner envelopes do not support standalone attachments"
+        );
+        ensure!(
+            self.snapshot_digest == self.public_digest()?,
+            "session snapshot digest differs from its public projection"
+        );
+        ensure!(
+            self.private_payload.wrapped_keys.len() == 1
+                && self.private_payload.wrapped_keys[0].recipient
+                    == binding.owner_key.recipient_id()?,
+            "session envelope must wrap only for its owner key"
         );
         ensure!(
             serde_json::to_vec(self)?.len() <= MAX_ENVELOPE_BYTES,
@@ -271,46 +312,15 @@ impl PrivacyEnvelope {
                 >= 16,
             "privacy ciphertext is truncated"
         );
+        let wrapped = &self.private_payload.wrapped_keys[0];
         ensure!(
-            !self.private_payload.wrapped_keys.is_empty()
-                && self.private_payload.wrapped_keys.len() <= 32,
-            "privacy payload has an invalid recipient count"
+            wrapped.algorithm == WRAP_ALGORITHM,
+            "unsupported privacy wrapping algorithm"
         );
-        let mut recipients = BTreeSet::new();
-        for wrapped in &self.private_payload.wrapped_keys {
-            ensure!(
-                valid_token(&wrapped.recipient) && recipients.insert(&wrapped.recipient),
-                "privacy recipients must be unique safe tokens"
-            );
-            ensure!(
-                wrapped.algorithm == WRAP_ALGORITHM,
-                "unsupported privacy wrapping algorithm"
-            );
-            ensure!(
-                decode_bounded(&wrapped.ciphertext, 80, "wrapped object key")?.len() == 80,
-                "wrapped object key has an invalid length"
-            );
-        }
         ensure!(
-            self.attachments.len() <= 4096,
-            "privacy envelope has too many attachments"
+            decode_bounded(&wrapped.ciphertext, 80, "wrapped object key")?.len() == 80,
+            "wrapped object key has an invalid length"
         );
-        let mut ids = BTreeSet::new();
-        for attachment in &self.attachments {
-            ensure!(
-                valid_token(&attachment.id) && ids.insert(&attachment.id),
-                "privacy attachment identifiers must be unique safe tokens"
-            );
-            validate_digest(&attachment.digest)?;
-            ensure!(
-                attachment.size <= MAX_ATTACHMENT_BYTES,
-                "privacy attachment exceeds the size limit"
-            );
-            ensure!(
-                attachment.kind != AttachmentKind::PrivateEncrypted || attachment.size >= 16,
-                "encrypted attachment is truncated"
-            );
-        }
         Ok(())
     }
 
@@ -318,6 +328,7 @@ impl PrivacyEnvelope {
     pub fn associated_data(&self) -> Result<Vec<u8>> {
         let authenticated = serde_json::json!({
             "format_version": self.format_version,
+            "session_binding": self.session_binding,
             "policy_digest": self.policy_digest,
             "snapshot_digest": self.snapshot_digest,
             "public_projection": self.public_projection,
@@ -326,11 +337,86 @@ impl PrivacyEnvelope {
             "algorithm": self.private_payload.algorithm,
         });
         let digest = digest_json(&authenticated)?;
-        Ok(format!("agit-privacy-envelope-v1\0{digest}").into_bytes())
+        Ok(format!("agit-privacy-envelope-v{}\0{digest}", self.format_version).into_bytes())
     }
 
     pub fn public_digest(&self) -> Result<String> {
         digest_json(&self.public_projection)
+    }
+}
+
+/// Request-scoped key delivery. Neither debug output nor serialization exposes the key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentKeyResponse {
+    pub snapshot: AcceptedSnapshot,
+    content_key: String,
+}
+
+impl std::fmt::Debug for ContentKeyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentKeyResponse")
+            .field("snapshot", &self.snapshot)
+            .field("content_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for ContentKeyResponse {
+    fn drop(&mut self) {
+        self.content_key.zeroize();
+    }
+}
+
+impl ContentKeyResponse {
+    /// The caller retains the expected publication across the network request.
+    pub fn open(
+        &self,
+        expected: &AcceptedSnapshot,
+        envelope_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let (envelope, key) = self.verify(expected, envelope_bytes)?;
+        envelope.open_content_key(&key)
+    }
+
+    pub fn open_layer(
+        &self,
+        expected: &AcceptedSnapshot,
+        envelope_bytes: &[u8],
+    ) -> Result<PrivateLayer> {
+        let (envelope, key) = self.verify(expected, envelope_bytes)?;
+        envelope.open_layer_with_content_key(&key)
+    }
+
+    fn verify(
+        &self,
+        expected: &AcceptedSnapshot,
+        envelope_bytes: &[u8],
+    ) -> Result<(PrivacyEnvelope, Zeroizing<Vec<u8>>)> {
+        expected.validate()?;
+        self.snapshot.validate()?;
+        ensure!(
+            self.snapshot == *expected,
+            "content-key response differs from the requested snapshot"
+        );
+        ensure!(
+            envelope_bytes.len() <= MAX_ENVELOPE_BYTES
+                && digest_bytes(envelope_bytes) == expected.envelope_digest,
+            "content-key response does not match the exact envelope bytes"
+        );
+        let envelope = PrivacyEnvelope::parse(envelope_bytes)?;
+        ensure!(
+            envelope.format_version == SESSION_ENVELOPE_VERSION
+                && envelope.session_binding.as_ref() == Some(&expected.binding),
+            "content-key response differs from the authenticated session binding"
+        );
+        let key = Zeroizing::new(decode_bounded(
+            &self.content_key,
+            32,
+            "privacy content key",
+        )?);
+        ensure!(key.len() == 32, "privacy content key has an invalid length");
+        Ok((envelope, key))
     }
 }
 
@@ -410,23 +496,23 @@ mod tests {
 
     fn sample() -> (PrivacyEnvelope, SecretKey) {
         let secret = SecretKey::from([7; 32]);
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/privacy-session-owner-envelope.json"
+        ))
+        .unwrap();
+        let binding: SessionSnapshotBinding =
+            serde_json::from_value(fixture["envelope"]["session_binding"].clone()).unwrap();
         let recipient = ViewingRecipient::from_base64(
-            "viewer".into(),
+            binding.owner_key.recipient_id().unwrap(),
             &STANDARD.encode(secret.public_key().as_bytes()),
         )
         .unwrap();
-        let envelope = PrivacyEnvelope::seal(
+        let envelope = PrivacyEnvelope::seal_session(
             digest_bytes(b"policy"),
-            digest_bytes(b"snapshot"),
             serde_json::json!({"session": "safe\ncontent", "path": "<workspace>/src/main.rs"}),
             b"/Users/alice/private transcript",
             &recipient,
-            vec![Attachment {
-                id: "attachment-1".into(),
-                digest: digest_bytes(b"public attachment"),
-                size: 17,
-                kind: AttachmentKind::Public,
-            }],
+            binding,
         )
         .unwrap();
         (envelope, secret)
@@ -448,7 +534,9 @@ mod tests {
         tampered.snapshot_digest = digest_bytes(b"another snapshot");
         assert!(tampered.open(&secret).is_err());
         tampered = parsed.clone();
-        tampered.attachments[0].digest = digest_bytes(b"changed attachment");
+        tampered
+            .attachments
+            .push(serde_json::json!({"id":"attachment"}));
         assert!(tampered.open(&secret).is_err());
         tampered = parsed;
         tampered.private_payload.wrapped_keys[0].recipient = "another-viewer".into();
@@ -469,10 +557,124 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 
+    /// A delivered key authorizes one immutable snapshot, while AEAD binds its source and owner.
+    #[test]
+    fn session_owner_delivery_requires_exact_snapshot_and_authenticated_bindings() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/privacy-session-owner-envelope.json"
+        ))
+        .unwrap();
+        let response: ContentKeyResponse =
+            serde_json::from_value(fixture["content_key_response"].clone()).unwrap();
+        let expected = response.snapshot.clone();
+        let bytes = fixture["envelope_bytes"].as_str().unwrap().as_bytes();
+        let envelope = PrivacyEnvelope::parse(bytes).unwrap();
+        let content_key = Zeroizing::new(
+            STANDARD
+                .decode(
+                    fixture["content_key_response"]["content_key"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            STANDARD.encode(response.open(&expected, bytes).unwrap()),
+            fixture["private_payload_base64"]
+        );
+        assert_eq!(
+            STANDARD.encode(envelope.associated_data().unwrap()),
+            fixture["aad_base64"]
+        );
+        assert!(
+            !format!("{response:?}").contains(
+                fixture["content_key_response"]["content_key"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
+        let mut other = expected.clone();
+        other.published_commit = "e".repeat(40);
+        assert!(response.open(&other, bytes).is_err());
+        let mut different_bytes = bytes.to_vec();
+        different_bytes.push(b'\n');
+        assert!(response.open(&expected, &different_bytes).is_err());
+
+        for (path, value) in [
+            (
+                "/session_binding/repository_id",
+                Value::String("00000000-0000-0000-0000-000000000002".into()),
+            ),
+            (
+                "/session_binding/session_id",
+                Value::String(format!("agit-{}", "e".repeat(40))),
+            ),
+            (
+                "/session_binding/published_session_id",
+                Value::String(format!("agit-{}", "f".repeat(40))),
+            ),
+            (
+                "/session_binding/source_commit",
+                Value::String("e".repeat(40)),
+            ),
+            (
+                "/session_binding/committer/account_id",
+                Value::String("another-committer".into()),
+            ),
+            (
+                "/session_binding/owner_key/account_id",
+                Value::String("another-owner".into()),
+            ),
+            ("/session_binding/owner_key/key_version", Value::from(2)),
+            (
+                "/policy_digest",
+                Value::String(digest_bytes(b"another policy")),
+            ),
+            (
+                "/public_projection/content",
+                Value::String("different public text".into()),
+            ),
+        ] {
+            let mut changed = serde_json::to_value(&envelope).unwrap();
+            *changed.pointer_mut(path).unwrap() = value;
+            let mut changed: PrivacyEnvelope = serde_json::from_value(changed).unwrap();
+            changed.private_payload.wrapped_keys[0].recipient = changed
+                .session_binding
+                .as_ref()
+                .unwrap()
+                .owner_key
+                .recipient_id()
+                .unwrap();
+            changed.snapshot_digest = changed.public_digest().unwrap();
+            changed.validate().unwrap();
+            assert!(
+                changed.open_content_key(&content_key).is_err(),
+                "unauthenticated binding: {path}"
+            );
+        }
+        let mut changed = envelope.clone();
+        let key = SecretKey::from([7; 32]);
+        changed.private_payload.wrapped_keys[0].ciphertext = STANDARD.encode(
+            key.public_key()
+                .seal(&mut OsRng, content_key.as_ref())
+                .unwrap(),
+        );
+        changed.validate().unwrap();
+        assert!(changed.open_content_key(&content_key).is_err());
+        let mut downgraded = envelope.clone();
+        downgraded.format_version = 1;
+        assert!(downgraded.validate().is_err());
+        downgraded.session_binding = None;
+        assert!(downgraded.open_content_key(&content_key).is_err());
+        let mut missing = envelope;
+        missing.session_binding = None;
+        assert!(missing.validate().is_err());
+    }
+
     #[test]
     fn opens_browser_sealed_box_and_webcrypto_fixture() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/privacy-browser-envelope.json"
+            "../../tests/fixtures/privacy-session-owner-browser-envelope.json"
         ))
         .unwrap();
         let private = STANDARD
@@ -487,6 +689,19 @@ mod tests {
         );
         assert_eq!(
             STANDARD.encode(envelope.open(&key).unwrap()),
+            fixture["private_payload_base64"]
+        );
+        let response: ContentKeyResponse =
+            serde_json::from_value(fixture["content_key_response"].clone()).unwrap();
+        assert_eq!(
+            STANDARD.encode(
+                response
+                    .open(
+                        &response.snapshot,
+                        fixture["envelope_bytes"].as_str().unwrap().as_bytes()
+                    )
+                    .unwrap()
+            ),
             fixture["private_payload_base64"]
         );
     }

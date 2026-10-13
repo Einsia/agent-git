@@ -390,10 +390,10 @@ mod tests {
                 "export",
                 "private-owner/repo@branch",
                 "--format",
-                "privacy-envelope",
+                "markdown",
                 "--privacy",
-                "--viewing-public-key",
-                "private-canary-key",
+                "--out",
+                "private-canary-path",
             ],
             vec![
                 "agit",
@@ -401,8 +401,7 @@ mod tests {
                 "private-owner/repo@branch",
                 "--to",
                 "private-canary/repo",
-                "--separate",
-                "--encryption=false",
+                "--show-preview",
             ],
             vec![
                 "agit",
@@ -480,17 +479,18 @@ mod tests {
         assert_eq!(value["arg_exclude"], "1");
         assert!(!value.to_string().contains("private-canary"));
 
-        let value = capture(&["agit", "privacy", "init", "private-canary/repo"]);
-        assert_eq!(value["command_path"], "privacy init");
-        assert!(value.get("arg_encryption").is_none());
         let value = capture(&[
             "agit",
             "privacy",
-            "init",
-            "private-canary/repo",
-            "--encryption=false",
+            "access",
+            "revoke",
+            "private-canary/repo@snapshot",
+            "--member",
+            "private-canary-account",
         ]);
-        assert_eq!(value["arg_encryption"], "false");
+        assert_eq!(value["command_path"], "privacy access revoke");
+        assert_eq!(value["arg_target"], true);
+        assert_eq!(value["arg_member"], true);
         assert!(!value.to_string().contains("private-canary"));
     }
 

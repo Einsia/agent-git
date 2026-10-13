@@ -7,8 +7,8 @@
 //! and decryption happens in the browser.
 //!
 //! AES-GCM and not XChaCha20 because browsers support the former natively through WebCrypto — the
-//! viewer decrypts the outer transport with WebCrypto. The inner privacy envelope retains
-//! selected original records encrypted to the accepted source publication's repository viewing key.
+//! viewer decrypts the sanitized selected records with WebCrypto. Original records are accessed
+//! through the source snapshot's account permissions.
 
 use super::{CmdResult, require_login};
 use crate::domain::link;
@@ -109,28 +109,6 @@ pub fn run(mut args: Args) -> CmdResult {
         )],
     );
 
-    let repo = source
-        .protection_repo
-        .as_ref()
-        .map(|root| Repo::open(root).context("the source repository is unavailable"))
-        .transpose()?;
-    // An encrypted link seals selected records to the viewing key of an encrypted repository's
-    // accepted publication. Ordinary history has no such key, so the default refuses before
-    // any prompt instead of asking for a publication that can never exist.
-    if !args.public
-        && let (Some(repo), Some(branch)) = (repo.as_ref(), source.branch.as_deref())
-        && crate::domain::privacy_receipt::PublicationReceipt::load(repo, branch)?
-            .is_some_and(|receipt| !receipt.mode.is_encrypted())
-    {
-        ui::error(&format!(
-            "{} uses ordinary publication; encrypted links require an encrypted repository, so no share was uploaded",
-            source.label
-        ));
-        ui::hint(
-            "rerun with --public for an unencrypted link anyone with the URL can fetch, or give readers access to the repository on the Hub",
-        );
-        return Ok(ExitCode::Precondition);
-    }
     let prepared = protected_readable(&source, &[])?;
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
@@ -151,40 +129,14 @@ pub fn run(mut args: Args) -> CmdResult {
         None
     };
 
-    let viewing = if args.public {
-        None
-    } else {
-        let repo = repo.as_ref().context("standalone encrypted sharing requires verified accepted repository context; no share was uploaded")?;
-        let commit = source.snapshot.as_deref().context("encrypted live sharing requires a saved accepted publication; save and push this snapshot first")?;
-        Some(super::privacy::publication_key::PublicationKey::resolve(
-            repo,
-            source.branch.as_deref(),
-            commit,
-        )?)
-    };
-
+    let public = prepared
+        .projection
+        .share_public_value(&prepared.protected, &prepared.text);
+    let serialized = serde_json::to_string(&public)?;
     let (payload, key) = if args.public {
-        (
-            serde_json::to_string(
-                &prepared
-                    .projection
-                    .share_public_value(&prepared.protected, &prepared.text),
-            )?,
-            None,
-        )
+        (serialized, None)
     } else {
-        let viewing = viewing
-            .as_ref()
-            .context("encrypted share has no viewing key")?;
-        let recipient = viewing.recipient()?;
-        let envelope = prepared.projection.seal_share(
-            &prepared.original,
-            &prepared.protected,
-            &prepared.text,
-            &recipient,
-        )?;
-        let envelope = serde_json::to_string(&envelope)?;
-        let (ct, k) = encrypt(envelope.as_bytes())?;
+        let (ct, k) = encrypt(serialized.as_bytes())?;
         (ct, Some(k))
     };
     anyhow::ensure!(
@@ -194,25 +146,11 @@ pub fn run(mut args: Args) -> CmdResult {
 
     {
         use std::io::Write;
-        use ui::privacy_preview::{self, Recovery};
+        use ui::privacy_preview;
         let mut output = std::io::stderr().lock();
-        privacy_preview::write_report(
-            &mut output,
-            &prepared.report,
-            if args.public {
-                Recovery::PublicOnly
-            } else {
-                Recovery::SelectedRecords
-            },
-        )?;
+        privacy_preview::write_report(&mut output, &prepared.report)?;
         writeln!(output, "Public metadata:")?;
-        privacy_preview::write_value(
-            &mut output,
-            &prepared
-                .projection
-                .share_public_value(&prepared.protected, &prepared.text)["metadata"],
-            2,
-        )?;
+        privacy_preview::write_value(&mut output, &public["metadata"], 2)?;
         writeln!(output, "Complete selected public records:")?;
         privacy_preview::write_session(&mut output, &prepared.protected)?;
         output.flush()?;
@@ -258,9 +196,6 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     }
 
-    if let Some(viewing) = viewing.as_ref() {
-        viewing.verify(repo.as_ref().expect("repository key has a source"))?;
-    }
     anyhow::ensure!(
         source.policy_digest()? == prepared.policy_digest,
         "privacy policy changed after the share preview; review a fresh preview before sharing"
@@ -283,9 +218,6 @@ pub fn run(mut args: Args) -> CmdResult {
     );
 
     ui::success("share created");
-    if let Some(viewing) = &viewing {
-        println!("Repository key source: {}", viewing.source());
-    }
 
     // When encrypted, the key is appended to the fragment — it is never sent to the server.
     let link = match &key {
@@ -360,7 +292,6 @@ struct ShareSource {
     projection_log: Option<String>,
     metadata: meta::Meta,
     branch: Option<String>,
-    snapshot: Option<String>,
 }
 
 impl ShareSource {
@@ -378,7 +309,6 @@ impl ShareSource {
 
 struct PreparedShare {
     text: String,
-    original: String,
     protected: String,
     projection: crate::domain::privacy_publication::SessionProjection,
     report: crate::domain::privacy_publication::ProjectionReport,
@@ -417,8 +347,7 @@ fn protected_readable(
         &source.metadata,
         additional,
     )?;
-    let original = selected;
-    let selected = projection.select(&original)?;
+    let selected = projection.select(&selected)?;
     let protected = crate::domain::privacy::service::transform(
         source.protection_repo.as_deref(),
         &selected,
@@ -438,7 +367,6 @@ fn protected_readable(
             report
         },
         policy_digest,
-        original,
         protected: selected,
         projection,
     })
@@ -568,7 +496,6 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         projection_log: None,
         metadata,
         branch: native.branch.clone(),
-        snapshot: None,
     })
 }
 
@@ -704,7 +631,6 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         projection_log: Some(projection_log),
         metadata: snapshot,
         branch: point.branch,
-        snapshot: Some(point.sha),
     })
 }
 

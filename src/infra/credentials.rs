@@ -663,6 +663,15 @@ pub fn current() -> Option<HubCredential> {
     load(&crate::infra::config::hub_url())
 }
 
+/// Local creation records the selected account even offline; names cannot substitute for IDs.
+pub fn current_account() -> Result<Option<crate::domain::session_privacy::AccountIdentity>> {
+    let hub = crate::infra::config::hub_url();
+    load_checked(&hub)?
+        .and_then(|credential| credential.account_id)
+        .map(|account| crate::domain::session_privacy::AccountIdentity::new(&hub, &account))
+        .transpose()
+}
+
 pub fn current_user() -> Option<String> {
     current().map(|c| c.username)
 }

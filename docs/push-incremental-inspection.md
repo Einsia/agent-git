@@ -8,13 +8,15 @@ excluded from secret detection, regardless of their media type.
 
 Publication does not run a secret gate. Local capture and explicit projection call the
 independent best-effort privacy worker. Every push schedules encrypted dictionary synchronization
-separately, including an up-to-date push. Scan, dictionary, key and synchronization failures
-cannot reject publication. Existing committed prefixes and historical object IDs are retained.
+separately, including an up-to-date push. Optional scan, dictionary-key and synchronization failures
+do not supply publication authority. Session registration, encryption and source-integrity checks
+must succeed. Accepted committed prefixes and historical object IDs are retained.
 
-An explicitly encrypted repository builds its selected public projection before transport.
-The optional projection cache binds source, path permissions, recipient, effective local
-rules and recoverable dictionary contents. A failed privacy dependency prevents reuse of a
-previous process's cache entry; it does not authorize an unchanged dependency fingerprint.
+Each session uses its registered plain or session-owner encryption scheme. Encrypted snapshots
+build a public projection before transport. The immutable candidate cache binds source, session
+owner, owner-key version, destination, effective local rules and recoverable dictionary contents.
+A failed privacy dependency prevents reuse of an unverified dependency fingerprint. Retries retain
+the same prepared ciphertext; they cannot fall back to plaintext after a key or registration failure.
 
 `agit scan` is an explicit diagnostic. `--audit` requests a separate interactive review;
 neither is an implicit prerequisite of the default upload path. See

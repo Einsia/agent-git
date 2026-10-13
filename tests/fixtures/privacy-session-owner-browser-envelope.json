@@ -1,0 +1,88 @@
+{
+  "aad_base64": "YWdpdC1wcml2YWN5LWVudmVsb3BlLXYyAHNoYTI1NjpkZTBmYmVjNTQ4YmQyZTNlMWMyMzdmNDBlNmRjODdiNmIwZjMxMTlkMjI0YmYyNTY4NDE2N2IyMDQxZGMxNGVl",
+  "config": {
+    "created_at": "2026-01-01T00:00:00Z",
+    "privacy": {
+      "creator": "account-alice",
+      "hub": "https://hub.test",
+      "owner": {
+        "id": "account-alice",
+        "kind": "user"
+      },
+      "owner_source": "creator",
+      "scheme": "session_owner_v2"
+    },
+    "repository_id": "00000000-0000-0000-0000-000000000001",
+    "revision": 1,
+    "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "content_key_response": {
+    "content_key": "LktKQpODNwwZCH7urO7sfQvXGUedKa+2RuvnPndISeM=",
+    "snapshot": {
+      "binding": {
+        "committer": {
+          "account_id": "account-bob",
+          "kind": "account"
+        },
+        "owner_key": {
+          "account_id": "account-alice",
+          "key_version": 1
+        },
+        "published_session_id": "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "repository_id": "00000000-0000-0000-0000-000000000001",
+        "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+      },
+      "envelope_digest": "sha256:c06ea7e0652e1c191f0bb12d9f464a3ea19a5b239e42fc88581c94cadb8c7367",
+      "published_commit": "dddddddddddddddddddddddddddddddddddddddd",
+      "version": 2
+    }
+  },
+  "envelope": {
+    "attachments": [],
+    "format_version": 2,
+    "policy_digest": "sha256:585be8baf92682c15da67e8c328a4eb8ddc8eec2f5555311539adc31c18e458c",
+    "private_payload": {
+      "algorithm": "aes-256-gcm",
+      "ciphertext": "0Ya+Sec6vHOtrVCn+y9/7d4JISUc/2UXADrFH2PLJPGI/uaYABUQRLuVWSF2d5vJsdAWQk7YsehgdM+Y6g==",
+      "nonce": "qU47q/kW+B3g4g7m",
+      "wrapped_keys": [
+        {
+          "algorithm": "x25519-sealed-box",
+          "ciphertext": "iGc7MHOsT1kW3shk5RIkqfx792kMik9+/Mt7uV7+1Aoug/Fmt9xRW5FYe5ox+/KL6s9+rlMEYM/5DRo344gJQjoW0e+DewHtVwx/TJFMTXA=",
+          "recipient": "session-owner-3756e41e9ef1783659089aed049402a574e02994f4a1c422299db7c32daa81e9"
+        }
+      ]
+    },
+    "public_projection": {
+      "canonical_order": {
+        "2": "two",
+        "10": "ten",
+        "": "bmp",
+        "😀": "astral"
+      },
+      "content": "safe synthetic session",
+      "logical_path": "<workspace>/src/main.rs",
+      "runtime": "codex"
+    },
+    "session_binding": {
+      "committer": {
+        "account_id": "account-bob",
+        "kind": "account"
+      },
+      "owner_key": {
+        "account_id": "account-alice",
+        "key_version": 1
+      },
+      "published_session_id": "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "repository_id": "00000000-0000-0000-0000-000000000001",
+      "session_id": "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "snapshot_digest": "sha256:7786343b1961ca1298bc2b0c30e86e7bf0c14c6f8a1b5a00f1609fb6bcd19693"
+  },
+  "envelope_bytes": "{\"attachments\":[],\"format_version\":2,\"policy_digest\":\"sha256:585be8baf92682c15da67e8c328a4eb8ddc8eec2f5555311539adc31c18e458c\",\"private_payload\":{\"algorithm\":\"aes-256-gcm\",\"ciphertext\":\"0Ya+Sec6vHOtrVCn+y9/7d4JISUc/2UXADrFH2PLJPGI/uaYABUQRLuVWSF2d5vJsdAWQk7YsehgdM+Y6g==\",\"nonce\":\"qU47q/kW+B3g4g7m\",\"wrapped_keys\":[{\"algorithm\":\"x25519-sealed-box\",\"ciphertext\":\"iGc7MHOsT1kW3shk5RIkqfx792kMik9+/Mt7uV7+1Aoug/Fmt9xRW5FYe5ox+/KL6s9+rlMEYM/5DRo344gJQjoW0e+DewHtVwx/TJFMTXA=\",\"recipient\":\"session-owner-3756e41e9ef1783659089aed049402a574e02994f4a1c422299db7c32daa81e9\"}]},\"public_projection\":{\"canonical_order\":{\"2\":\"two\",\"10\":\"ten\",\"\":\"bmp\",\"😀\":\"astral\"},\"content\":\"safe synthetic session\",\"logical_path\":\"<workspace>/src/main.rs\",\"runtime\":\"codex\"},\"session_binding\":{\"committer\":{\"account_id\":\"account-bob\",\"kind\":\"account\"},\"owner_key\":{\"account_id\":\"account-alice\",\"key_version\":1},\"published_session_id\":\"agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"repository_id\":\"00000000-0000-0000-0000-000000000001\",\"session_id\":\"agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"snapshot_digest\":\"sha256:7786343b1961ca1298bc2b0c30e86e7bf0c14c6f8a1b5a00f1609fb6bcd19693\"}",
+  "private_payload_base64": "c3ludGhldGljIG9yaWdpbmFsIHNlc3Npb24gYW5kIG1ldGFkYXRhIGJ5dGVz",
+  "test_only_viewing_private_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "viewing_public_key": "E75P6uryBMf9M1j8nAByGIHRdCeBKCJ+xnTzf3/pe20="
+}

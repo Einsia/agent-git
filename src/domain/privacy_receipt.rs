@@ -1,6 +1,6 @@
 //! Local source-to-publication acknowledgements never become part of the outgoing Git tree.
 
-use super::{privacy::PrivacyPolicy, repo::Repo, storage};
+use super::{repo::Repo, storage};
 use crate::hub::identity::RemoteIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -15,20 +15,19 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 
 pub mod outbox;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationMode {
     Ordinary,
-    #[default]
-    Encrypted,
+    SessionOwnerV2,
 }
 
 impl PublicationMode {
     pub fn is_encrypted(&self) -> bool {
-        *self == Self::Encrypted
+        *self == Self::SessionOwnerV2
     }
 
-    /// Legacy records are encrypted; ordinary records must explicitly identify their format.
+    /// Every receipt declares its scheme and carries that scheme's exact bindings.
     pub fn validate_bindings(
         &self,
         version: u32,
@@ -36,12 +35,15 @@ impl PublicationMode {
         recipient: Option<&str>,
     ) -> Result<()> {
         match self {
-            Self::Encrypted => ensure!(
-                version == 1
-                    && policy.is_some_and(|value| !value.is_empty())
-                    && recipient.is_some_and(|value| !value.is_empty()),
-                "incomplete or unsupported encrypted publication binding"
-            ),
+            Self::SessionOwnerV2 => {
+                ensure!(version == 3, "unsupported session-owner receipt version");
+                super::privacy_envelope::validate_digest(
+                    policy.context("session receipt has no policy")?,
+                )?;
+                super::privacy_envelope::validate_digest(
+                    recipient.context("session receipt has no owner key")?,
+                )?;
+            }
             Self::Ordinary => ensure!(
                 version == 2 && policy.is_none() && recipient.is_none(),
                 "ordinary publication must not carry encrypted-only bindings"
@@ -55,8 +57,9 @@ impl PublicationMode {
 #[serde(deny_unknown_fields)]
 pub struct PublicationReceipt {
     pub version: u32,
-    #[serde(default, skip_serializing_if = "PublicationMode::is_encrypted")]
     pub mode: PublicationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_snapshot: Option<super::session_privacy::AcceptedSnapshot>,
     pub repository: String,
     pub branch: String,
     pub source: String,
@@ -100,6 +103,29 @@ impl PublicationReceipt {
             self.policy_digest.as_deref(),
             self.recipient.as_deref(),
         )?;
+        if self.mode == PublicationMode::SessionOwnerV2 {
+            let snapshot = self
+                .session_snapshot
+                .as_ref()
+                .context("session receipt has no accepted snapshot binding")?;
+            snapshot.validate()?;
+            ensure!(
+                snapshot.binding.repository_id == self.destination.agent_id
+                    && snapshot.published_commit == self.published
+                    && (snapshot.binding.source_commit == self.source
+                        || self.source == self.published)
+                    && self.projected_session_id.as_deref()
+                        == Some(&snapshot.binding.published_session_id)
+                    && self.recipient.as_deref()
+                        == Some(&snapshot.binding.owner_key.fingerprint()?),
+                "session receipt differs from its accepted snapshot authority"
+            );
+        } else {
+            ensure!(
+                self.session_snapshot.is_none(),
+                "publication receipt has an unexpected session authority"
+            );
+        }
         ensure!(
             self.mode.is_encrypted() || self.source == self.published,
             "ordinary publication must retain the source commit identity"
@@ -129,14 +155,6 @@ impl PublicationReceipt {
         self.save_at(&receipt_path(repo, &self.branch)?)
     }
 
-    pub(crate) fn save_for_destination(&self, repo: &Repo) -> Result<()> {
-        self.save_at(&destination_receipt_path(
-            repo,
-            &self.branch,
-            &self.destination,
-        )?)
-    }
-
     fn save_at(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let parent = path
@@ -152,24 +170,6 @@ impl PublicationReceipt {
 
     pub fn load(repo: &Repo, branch: &str) -> Result<Option<Self>> {
         Self::load_at(&receipt_path(repo, branch)?, branch)
-    }
-
-    pub(crate) fn load_for_destination(
-        repo: &Repo,
-        branch: &str,
-        destination: &RemoteIdentity,
-    ) -> Result<Option<Self>> {
-        let saved = Self::load_at(
-            &destination_receipt_path(repo, branch, destination)?,
-            branch,
-        )?;
-        ensure!(
-            saved
-                .as_ref()
-                .is_none_or(|receipt| receipt.destination == *destination),
-            "publication receipt belongs to another destination"
-        );
-        Ok(saved)
     }
 
     fn load_at(path: &Path, branch: &str) -> Result<Option<Self>> {
@@ -202,9 +202,7 @@ impl PublicationReceipt {
         Ok(self.branch == branch
             && self.source == source
             && self.destination == *destination
-            && repo.remote_url().as_deref() == Some(self.url.as_str())
-            && (!self.mode.is_encrypted()
-                || Some(PrivacyPolicy::load(repo)?.digest()?) == self.policy_digest))
+            && repo.remote_url().as_deref() == Some(self.url.as_str()))
     }
 }
 
@@ -215,21 +213,6 @@ fn receipt_path(repo: &Repo, branch: &str) -> Result<PathBuf> {
         .common_dir()?
         .join("agit/privacy-published")
         .join(format!("{key}.json")))
-}
-
-fn destination_receipt_path(
-    repo: &Repo,
-    branch: &str,
-    destination: &RemoteIdentity,
-) -> Result<PathBuf> {
-    use sha2::Digest;
-    let key = hex::encode(sha2::Sha256::digest(serde_json::to_vec(destination)?));
-    let branch = hex::encode(sha2::Sha256::digest(branch.as_bytes()));
-    Ok(repo
-        .common_dir()?
-        .join("agit/publication-destinations")
-        .join(key)
-        .join(format!("{branch}.json")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,35 +417,57 @@ fn validate_repository(repository: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn bind_session_fixture(mut receipt: PublicationReceipt) -> PublicationReceipt {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/privacy-session-owner-envelope.json"
+    ))
+    .unwrap();
+    let mut snapshot: super::session_privacy::AcceptedSnapshot =
+        serde_json::from_value(fixture["content_key_response"]["snapshot"].clone()).unwrap();
+    snapshot.binding.repository_id = receipt.destination.agent_id.clone();
+    snapshot.binding.source_commit = receipt.source.clone();
+    snapshot.published_commit = receipt.published.clone();
+    snapshot.binding.published_session_id = receipt.projected_session_id.clone().unwrap();
+    snapshot.envelope_digest = super::privacy_envelope::digest_bytes(receipt.published.as_bytes());
+    receipt.version = 3;
+    receipt.mode = PublicationMode::SessionOwnerV2;
+    receipt.policy_digest = Some(super::privacy_envelope::digest_bytes(b"policy"));
+    receipt.recipient = Some(snapshot.binding.owner_key.fingerprint().unwrap());
+    receipt.session_snapshot = Some(snapshot);
+    receipt
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn ordinary_receipts_preserve_source_ids_and_legacy_encrypted_records_roundtrip() {
-        let legacy = json!({
-            "version":1, "repository":"alice/demo", "branch":"work",
-            "source":"a".repeat(40), "published":"b".repeat(40),
-            "destination":{"hub":"https://hub.example","agent_id":"00000000-0000-0000-0000-000000000001"},
-            "url":"https://hub.example/alice/demo.git", "policy_digest":"policy", "recipient":"recipient"
-        });
-        let encrypted: PublicationReceipt = serde_json::from_value(legacy.clone()).unwrap();
-        encrypted.validate().unwrap();
-        assert_eq!(encrypted.mode, PublicationMode::Encrypted);
-        assert_eq!(serde_json::to_value(&encrypted).unwrap(), legacy);
-
+    fn ordinary_receipts_preserve_source_identity_and_require_explicit_mode() {
         let ordinary = PublicationReceipt {
+            session_snapshot: None,
             version: 2,
             mode: PublicationMode::Ordinary,
-            published: encrypted.source.clone(),
+            repository: "alice/demo".into(),
+            branch: "work".into(),
+            source: "a".repeat(40),
+            published: "a".repeat(40),
+            projected_session_id: None,
+            destination: RemoteIdentity::new(
+                "https://hub.example",
+                "00000000-0000-0000-0000-000000000001",
+            )
+            .unwrap(),
+            url: "https://hub.example/alice/demo.git".into(),
             policy_digest: None,
             recipient: None,
-            ..encrypted.clone()
         };
         ordinary.validate().unwrap();
         let wire = serde_json::to_value(&ordinary).unwrap();
         assert_eq!(wire["mode"], "ordinary");
         assert!(wire.get("recipient").is_none() && wire.get("policy_digest").is_none());
+        let mut untyped = wire;
+        untyped.as_object_mut().unwrap().remove("mode");
+        assert!(serde_json::from_value::<PublicationReceipt>(untyped).is_err());
         let dir = tempfile::tempdir().unwrap();
         let repo = Repo::init(dir.path()).unwrap();
         ordinary.save(&repo).unwrap();
@@ -471,7 +476,7 @@ mod tests {
             Some(ordinary.clone())
         );
         let mut mismatched = ordinary.clone();
-        mismatched.published = encrypted.published;
+        mismatched.published = "b".repeat(40);
         assert!(mismatched.validate().is_err());
         mismatched = ordinary.clone();
         mismatched.recipient = Some("invented-recipient".into());

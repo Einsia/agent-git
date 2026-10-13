@@ -17,6 +17,7 @@ use super::CmdResult;
 use crate::domain::meta;
 use crate::domain::refs::{self, RefSpec};
 use crate::domain::repo::Repo;
+use crate::domain::session_privacy::{ForkContext, ForkOrigin, SessionPrivacy};
 use crate::domain::storage;
 use crate::infra::config;
 use crate::{ExitCode, ui};
@@ -172,19 +173,64 @@ pub fn fork_branch(
         return Ok(None);
     }
 
-    // Identity recast: replace the session in meta. The source tree is otherwise inherited, but
-    // the branch-local seal must not cross the fork boundary: forking is the sanctioned way to
-    // continue from a sealed line.
-    let log = storage::materialize_at(repo.root(), base_sha, meta::LOG_FILE)?;
-    let view = storage::materialize_at(repo.root(), base_sha, meta::VIEW_FILE)?;
-    let log = if base_snap.layout == meta::LayoutVersion::V0 {
-        storage::make_view_reachable(&log, &view)?
+    let mut origin = ForkOrigin {
+        commit: base_sha.clone(),
+        context: ForkContext::Original,
+        snapshot: None,
+    };
+    let mut snap = base_snap;
+    let original = match super::privacy::unlock::envelope_bytes(repo, base_sha)? {
+        Some(bytes) => {
+            let envelope = crate::domain::privacy_envelope::PrivacyEnvelope::parse(&bytes)?;
+            let (snapshot, layer) = super::privacy::unlock::open_session_original(
+                repo, base_sha, &bytes, &envelope, true,
+            )?;
+            origin.snapshot = Some(snapshot);
+            if layer.is_none() {
+                origin.context = ForkContext::Sanitized;
+            }
+            layer
+        }
+        None => None,
+    };
+    let (log, view) = if let Some(layer) = original {
+        layer.import_protection(repo)?;
+        snap = serde_json::from_value(layer.metadata.clone())?;
+        snap.cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        layer.session_bytes()?
+    } else {
+        (
+            zeroize::Zeroizing::new(storage::materialize_at(
+                repo.root(),
+                base_sha,
+                meta::LOG_FILE,
+            )?),
+            zeroize::Zeroizing::new(storage::materialize_at(
+                repo.root(),
+                base_sha,
+                meta::VIEW_FILE,
+            )?),
+        )
+    };
+    let log = if snap.layout == meta::LayoutVersion::V0 {
+        zeroize::Zeroizing::new(storage::make_view_reachable(&log, &view)?)
     } else {
         log
     };
-    let mut snap = base_snap;
+    if origin.snapshot.is_some() {
+        ui::info(match origin.context {
+            ForkContext::Original => "Fork context: authorized originals.",
+            ForkContext::Sanitized => "Fork context: sanitized snapshot.",
+        });
+    }
+    snap.committer_account = crate::infra::credentials::current_account()?;
+    snap.session_privacy = Some(SessionPrivacy::new(snap.committer_account.clone())?);
+    snap.fork_origin = Some(origin);
     snap.session = mint_claim(base_sha, new_name);
     snap.runtime_instances = Vec::new(); // instances belong to the source branch, not inherited
+    snap.baseline_bytes = None;
+    snap.cwd_state = None;
+    snap.cwd_is_agent_repository = false;
     // This commit establishes a new branch identity; it is not another user turn even when the
     // source tip's last commit was one. Backends use `kind` to build the turn timeline.
     snap.kind = meta::Kind::File;
@@ -196,7 +242,14 @@ pub fn fork_branch(
     // must be upgraded to the current layout while keeping the source VIEW's full context and the
     // original session annotation carried by each envelope.
     let tree = super::plumbing::session_snapshot_tree(repo, base_sha, &log, &view, &snap_text)?;
-    let tree = super::plumbing::tree_apply(repo, &tree, &[(super::branch::SEAL_FILE, None)])?;
+    let tree = super::plumbing::tree_apply(
+        repo,
+        &tree,
+        &[
+            (super::branch::SEAL_FILE, None),
+            ("privacy/envelope.json", None),
+        ],
+    )?;
     let commit = super::plumbing::commit_tree(
         repo,
         &tree,

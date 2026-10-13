@@ -30,7 +30,7 @@ pub struct Args {
     /// Output format.
     #[arg(
         long,
-        value_name = "jsonl|ir|markdown|privacy-envelope|RUNTIME",
+        value_name = "jsonl|ir|markdown|RUNTIME",
         default_value = "jsonl"
     )]
     pub format: String,
@@ -43,10 +43,6 @@ pub struct Args {
     /// Apply the repository privacy policy before rendering public content.
     #[arg(long)]
     pub privacy: bool,
-    /// Standard Base64 X25519 viewing public key; otherwise use the signed-in Hub account.
-    /// Remote-bound repositories still require authenticated privacy rules.
-    #[arg(long, value_name = "BASE64")]
-    pub viewing_public_key: Option<String>,
     /// Output path (default or `-`: stdout).
     #[arg(short = 'o', long, value_name = "path")]
     pub out: Option<String>,
@@ -111,24 +107,12 @@ pub fn run(args: Args) -> CmdResult {
     };
     let sha = resolved.sha.clone();
 
-    let encrypted = args.format == "privacy-envelope";
-    if encrypted && (args.view_only || spec.tail != refs::Tail::None) {
-        ui::error(
-            "privacy-envelope exports require a complete snapshot; use a branch, tag, or commit without --view-only or a turn selector",
-        );
-        return Ok(ExitCode::Usage);
-    }
-    if args.viewing_public_key.is_some() && !encrypted {
-        ui::error("--viewing-public-key requires --format privacy-envelope");
-        return Ok(ExitCode::Usage);
-    }
-
     let which = if args.view_only {
         meta::VIEW_FILE
     } else {
         meta::LOG_FILE
     };
-    let frozen = if args.privacy || encrypted {
+    let frozen = if args.privacy {
         Some(crate::domain::privacy_publication::read_snapshot(
             &repo, &sha,
         )?)
@@ -160,15 +144,6 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         env_text
     };
-    let viewing = if encrypted && args.viewing_public_key.is_none() {
-        Some(super::privacy::publication_key::PublicationKey::resolve(
-            &repo,
-            resolved.branch.as_deref(),
-            &sha,
-        )?)
-    } else {
-        None
-    };
     let projection = if let Some((metadata, log, view)) = frozen {
         Some(
             crate::domain::privacy_publication::project_frozen_with_sources(
@@ -184,15 +159,7 @@ pub fn run(args: Args) -> CmdResult {
         None
     };
     let selected = if let Some(projection) = &projection {
-        ui::privacy_preview::write_report(
-            &mut std::io::stderr().lock(),
-            projection.report(),
-            if encrypted {
-                ui::privacy_preview::Recovery::FullSession
-            } else {
-                ui::privacy_preview::Recovery::PublicOnly
-            },
-        )?;
+        ui::privacy_preview::write_report(&mut std::io::stderr().lock(), projection.report())?;
         projection.select(&selected)?
     } else {
         crate::domain::privacy::service::transform(
@@ -203,25 +170,6 @@ pub fn run(args: Args) -> CmdResult {
         .content
     };
     let result = match args.format.as_str() {
-        "privacy-envelope" => {
-            let public_key = match args.viewing_public_key.as_deref() {
-                Some(key) => key.to_owned(),
-                None => viewing
-                    .as_ref()
-                    .expect("repository export has a viewing key")
-                    .public_key
-                    .clone(),
-            };
-            let id = crate::domain::privacy_envelope::digest_bytes(public_key.as_bytes())
-                .replace(':', "-");
-            let recipient =
-                crate::domain::privacy_envelope::ViewingRecipient::from_base64(id, &public_key)?;
-            let envelope = projection
-                .as_ref()
-                .expect("encrypted export has a projection")
-                .seal(&recipient)?;
-            Ok(format!("{}\n", serde_json::to_string(&envelope)?))
-        }
         "jsonl" => Ok(transcript::unwrap_lossy(&selected).0),
         "ir" => to_ir(&selected),
         "markdown" => to_markdown(&selected),
@@ -229,7 +177,7 @@ pub fn run(args: Args) -> CmdResult {
         other => {
             ui::error(&format!("unknown format `{other}`."));
             ui::hint(&format!(
-                "jsonl | ir | markdown | privacy-envelope | {}",
+                "jsonl | ir | markdown | {}",
                 adapter::RUNTIMES.join(" | ")
             ));
             return Ok(ExitCode::Usage);
@@ -256,11 +204,6 @@ pub fn run(args: Args) -> CmdResult {
                 rep.secrets, rep.paths, rep.ips
             ))
         );
-    }
-
-    if let Some(viewing) = viewing.as_ref() {
-        viewing.verify(&repo)?;
-        eprintln!("Repository key source: {}", viewing.source());
     }
 
     match &args.out {

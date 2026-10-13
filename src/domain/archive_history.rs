@@ -746,6 +746,8 @@ impl Snapshot {
             anyhow::bail!("archive metadata must be a JSON object");
         };
         fields.remove("kind");
+        // A writer can change without changing the retained session or evidence.
+        fields.remove("committer_account");
         let log = if metadata.layout == meta::LayoutVersion::V1 {
             read_sequence(reader, &entries, meta::LOG_FILE)?
         } else {
@@ -1582,6 +1584,13 @@ mod tests {
         fixture.source = fixture.commit();
         let first_file = file_snapshot(&fixture, "Collected memory\n");
         fixture.metadata.milestone = None;
+        fixture.metadata.committer_account = Some(
+            crate::domain::session_privacy::AccountIdentity::new(
+                "https://hub.test",
+                "another-writer",
+            )
+            .unwrap(),
+        );
         let first_log = format!("{}{}", fixture.original, native("exploration"));
         fixture.stage_archive(&first_log, &fixture.original);
         let archive = fixture.commit();
@@ -1605,7 +1614,15 @@ mod tests {
 
     #[test]
     fn file_edges_cannot_hide_restored_storage_or_metadata_changes() {
-        for mutation in ["view", "log", "runtime", "turn", "code", "unknown"] {
+        for mutation in [
+            "view",
+            "log",
+            "runtime",
+            "turn",
+            "code",
+            "session_privacy",
+            "unknown",
+        ] {
             let fixture = Fixture::new();
             let metadata_path = fixture.repo.root().join(meta::FILE);
             let original_metadata = std::fs::read(&metadata_path).unwrap();
@@ -1625,6 +1642,19 @@ mod tests {
                 "runtime" => changed["runtime"] = serde_json::json!("claude-code"),
                 "turn" => changed["turn"] = serde_json::json!(2),
                 "code" => changed["code"] = serde_json::json!("f".repeat(40)),
+                "session_privacy" => {
+                    changed["session_privacy"] = serde_json::to_value(
+                        crate::domain::session_privacy::SessionPrivacy::new(Some(
+                            crate::domain::session_privacy::AccountIdentity::new(
+                                "https://hub.test",
+                                "replacement-owner",
+                            )
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap()
+                }
                 "unknown" => changed["future"] = serde_json::json!({"retained":false}),
                 _ => unreachable!(),
             }

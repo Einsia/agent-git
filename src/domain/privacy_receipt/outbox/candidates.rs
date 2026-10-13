@@ -90,9 +90,10 @@ mod tests {
         let legacy_path = original.record_path(path.parent().unwrap()).unwrap();
         original.write(&legacy_path).unwrap();
         fs::remove_file(path).unwrap();
-        let receipt = PublicationReceipt {
-            version: 1,
-            mode: Default::default(),
+        let receipt = crate::domain::privacy_receipt::bind_session_fixture(PublicationReceipt {
+            session_snapshot: None,
+            version: 3,
+            mode: crate::domain::privacy_receipt::PublicationMode::SessionOwnerV2,
             repository: request.repository.clone(),
             branch: request.branch.clone(),
             source: request.source.clone(),
@@ -100,18 +101,18 @@ mod tests {
             projected_session_id: Some(format!("agit-{}", "c".repeat(40))),
             destination: request.destination.clone(),
             url: "https://hub.invalid/owner/project.git".into(),
-            policy_digest: Some("policy".into()),
-            recipient: Some("recipient".into()),
-        };
+            policy_digest: None,
+            recipient: None,
+        });
         assert_eq!(
             Entry::prepare_candidate(&repo, &request, &receipt).unwrap(),
             request
         );
         let before = fs::read(&legacy_path).unwrap();
-        let changed = PublicationReceipt {
+        let changed = crate::domain::privacy_receipt::bind_session_fixture(PublicationReceipt {
             published: "d".repeat(40),
             ..receipt.clone()
-        };
+        });
         let selected = Entry::prepare_candidate(&repo, &request, &changed).unwrap();
         assert_ne!(selected.notification_id, request.notification_id);
         assert_eq!(fs::read(&legacy_path).unwrap(), before);

@@ -1555,18 +1555,12 @@ fn cancelling_the_bare_picker_creates_no_store_or_rc_directory() {
 }
 
 #[test]
-fn explicit_link_only_privacy_keeps_offline_copy_and_link_behavior() {
+fn link_only_import_records_unresolved_ownership_without_a_repository() {
     let lab = Lab::new();
     let original = fs::read(&lab.native).unwrap();
     let output = lab
         .command()
-        .args([
-            "import",
-            NATIVE_ID,
-            "--from=claude-code",
-            "--link-only",
-            "--privacy",
-        ])
+        .args(["import", NATIVE_ID, "--from=claude-code", "--link-only"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -1574,8 +1568,12 @@ fn explicit_link_only_privacy_keeps_offline_copy_and_link_behavior() {
     let store = agit::domain::store::Store::at(lab.agit.join("store"));
     let links = agit::domain::link::list(&store);
     assert_eq!(links.len(), 1);
-    assert_ne!(links[0].session_id, NATIVE_ID);
+    assert_eq!(links[0].session_id, NATIVE_ID);
     assert_eq!(links[0].source, "claude-code");
+    assert_eq!(
+        links[0].session_privacy,
+        Some(agit::domain::session_privacy::SessionPrivacy::new(None).unwrap())
+    );
     assert!(links[0].owner.is_none() && links[0].agent.is_none() && links[0].branch.is_none());
     assert!(!lab.agit.join("repos").exists());
     assert!(!lab.agit.join("credentials").exists());

@@ -55,28 +55,8 @@ JSON reads and successful writes distinguish `effective`, `stored`, and `source`
 active, a successful write still reports that override as effective alongside
 the newly stored value. `operation` identifies `list`, `get`, `set`, or `unset`.
 Existing settings retain their string representation, including booleans.
-`privacy.encryption` returns JSON booleans for `effective` and `stored` (or null
-when unset), with `scope: "creation_default"`.
 An unset `commit.auto` has the effective default `true`; displaying it never
 writes that default to disk.
-
-## Encryption creation default
-
-`privacy.encryption` accepts `true` or `false` and defaults to `false`: new Hub
-repositories use ordinary publication, which needs no viewing password. Set it to
-`true` to opt into encryption for every repository created afterward, or choose per
-repository with `--encryption=true`. An existing repository's mode is fixed at
-creation and does not follow later preference changes. Visibility and automatic
-uploading are independent settings.
-
-```bash
-agit config privacy.encryption true
-agit config privacy.encryption --json
-agit config --unset privacy.encryption
-```
-
-Unsetting the preference restores the default of `false`. The global config
-editor shows the effective value, stored value and source separately.
 
 ## Automatic publishing
 
@@ -90,30 +70,16 @@ agit config --repo alice/project --unset push.auto
 agit config --repo alice/project --list --json
 ```
 
-`push.auto` supports a repository override. `privacy.encryption` is read-only at
-repository scope: an established repository returns the authoritative Hub mode,
-`source: "hub"`, `scope: "repository_mode"`, `fixed: true` and its immutable
-`agent_id`. A purely local repository reports `scope: "creation_intent"` and
-`fixed: false`; that intent applies only when creating a new destination.
-A device-local RC repository reads the mode of its confirmed Hub destination;
-`publication_repository` names that destination separately from the local repository.
-Repository set/unset of `privacy.encryption` is refused. Mode lookup errors or
-an unsupported Hub response are errors, never a disabled-mode default.
+`push.auto` supports a repository override. Session encryption is registered separately for each
+session; repository configuration does not select it.
 
 Repository `push.auto` JSON results distinguish `repository` from `inherited`
 values. This changes the Agent repo preference, not the project code repository.
 
-Once enabled, a successful settlement publishes its selected branch after releasing
-local locks. Installed Stop hooks use the same behavior; empty settlements send nothing.
-For an ordinary repository nothing else is required: automatic push needs no earlier
-explicit push, passes the same inspection, identity and write-access checks as a manual
-push, never accepts secret findings, and creates a missing destination with the
-non-interactive visibility default. For an encrypted repository, first run
-`agit push <owner/repo>@<branch>` to inspect and confirm the destination and mode; that
-successful publication stores local authorization bound to the account, immutable
-repository, URL, visibility, mode, privacy policy and current recipient. Changed consent
-inputs require another explicit push, `--yes` cannot substitute for saved consent, and
-automatic encrypted publication cannot create a destination. No automatic push promotes
-a read-only checkout. A failed upload leaves the local commit intact; run an explicit push
-to inspect and retry. RC uses the same authoritative mode and requires a durable backend
-acknowledgement.
+Once enabled, a successful settlement publishes its selected branch after releasing local locks.
+Installed Stop hooks use the same behavior; empty settlements send nothing. Publication rechecks
+the selected account, immutable destination, write access and registered session settings. Automatic
+publication can create a missing destination with the noninteractive visibility default, while
+retaining existing session ownership and immutable ciphertext on retries. It cannot promote a
+read-only checkout. A failed upload leaves the local commit intact; use an explicit push to inspect
+and retry. RC additionally requires a durable receiver acknowledgement.
