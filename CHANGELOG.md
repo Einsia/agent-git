@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-10-21
+
 ### Added
 
 - `agit activity` and its MCP tool query a person's saved user and assistant messages
