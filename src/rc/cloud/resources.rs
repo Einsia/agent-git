@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::refusal::Refusal;
+
 pub type SourceIdentity = crate::protocol::NativeSourceRef;
 
 #[derive(Clone)]
@@ -245,12 +247,12 @@ impl Resources {
             Some(session) => Some(session),
             None => self.resolve_catalog(id)?,
         };
-        let mut session = session
-            .ok_or_else(|| anyhow::anyhow!("controller source conversation is unavailable"))?;
-        let source = session
-            .source
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("controller source identity is missing"))?;
+        let mut session = session.ok_or_else(|| {
+            Refusal::conversation_unavailable("controller source conversation is unavailable")
+        })?;
+        let source = session.source.as_ref().ok_or_else(|| {
+            Refusal::conversation_unavailable("controller source identity is missing")
+        })?;
         let context = super::super::runtime_context::RuntimeContext::resolve(
             &super::super::runtime_sources::Registry::open()?,
             &source.source_id,
@@ -258,20 +260,25 @@ impl Resources {
         anyhow::ensure!(
             context.source.generation == source.generation
                 && source.session_ref(&session.native_id) == id,
-            "controller source identity changed"
+            Refusal::conversation_changed("controller source identity changed")
         );
         let roots =
             super::super::policy::CanonicalRoots::from_untrusted(self.projects.values().cloned());
-        let native = context.locate(&session.native_id, &roots)?;
+        // Admission cannot wait for a cold transcript: the controller's handshake deadline would
+        // expire first, and every redial would occupy another blocking worker on the same decode.
+        let native = context
+            .locate_ready(&session.native_id, &roots)
+            .map_err(Refusal::locating)?;
         anyhow::ensure!(
             native.cwd == Path::new(&session.cwd),
-            "controller conversation directory changed"
+            Refusal::conversation_changed("controller conversation directory changed")
         );
         super::super::local_goal::validate_header(
             &native.transcript,
             &session.native_id,
             &native.cwd,
-        )?;
+        )
+        .map_err(Refusal::locating)?;
         session.id = id.into();
         Ok(session)
     }
@@ -285,7 +292,7 @@ impl Resources {
         anyhow::ensure!(
             self.controller_sessions.len() < 2048
                 || self.controller_sessions.contains_key(&session.id),
-            "source controller capacity exceeded"
+            Refusal::capacity("source controller capacity exceeded")
         );
         let lifetime = self
             .controller_sessions

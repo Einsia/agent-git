@@ -1,6 +1,6 @@
 //! Delegation narrows Hub controller authority and fences replaced owners.
 
-use super::{resources::Resources, store};
+use super::{refusal::Refusal, resources::Resources, store};
 use agit_peer::{
     access::{Access, Policy, Principal, Resource, Rule},
     cloud::{ConnectionGrant, ProjectController, SessionController},
@@ -52,7 +52,9 @@ impl Scope {
             (Some(session), None) => Ok(Some(Self::Session(session.clone()))),
             (None, Some(project)) => Ok(Some(Self::Project(project.clone()))),
             (None, None) => Ok(None),
-            _ => anyhow::bail!("controller grant has conflicting resource scopes"),
+            _ => Err(
+                Refusal::invalid_grant("controller grant has conflicting resource scopes").into(),
+            ),
         }
     }
 
@@ -87,11 +89,16 @@ pub(super) fn validate_resources(
     grant: &ConnectionGrant,
     resources: &Resources,
 ) -> anyhow::Result<()> {
-    ensure!(
-        Scope::from_grant(grant)?.is_none_or(|scope| scope.canonical(resources)),
-        "controller resource is unavailable or changed"
-    );
-    Ok(())
+    match Scope::from_grant(grant)? {
+        Some(scope @ Scope::Project(_)) if !scope.canonical(resources) => Err(
+            Refusal::project_unavailable("controller resource is unavailable or changed").into(),
+        ),
+        Some(scope) if !scope.canonical(resources) => Err(Refusal::conversation_unavailable(
+            "controller resource is unavailable or changed",
+        )
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 impl Owners {
@@ -181,7 +188,7 @@ impl Ownership {
 fn advance(current: &Owner, next: &Owner) -> anyhow::Result<()> {
     ensure!(
         next.generation > current.generation || next == current,
-        "controller ownership changed"
+        Refusal::ownership_changed()
     );
     Ok(())
 }

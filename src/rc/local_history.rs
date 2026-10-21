@@ -24,7 +24,26 @@ pub fn read(params: Value) -> crate::Result<Value> {
     read_timed(params, &mut Timings::default())
 }
 
+/// Identical requests share one read. A client that re-requests a page while it is still being
+/// read then waits for that read instead of repeating it in another history worker.
 pub fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> {
+    static PAGES: std::sync::LazyLock<snapshot::Flights<Value>> =
+        std::sync::LazyLock::new(Default::default);
+    let started = std::time::Instant::now();
+    let mut owner = false;
+    let result = PAGES.run(params.to_string(), || {
+        owner = true;
+        read_page(params, timings)
+    });
+    if !owner {
+        timings
+            .0
+            .insert("shared_wait_ms", started.elapsed().as_secs_f64() * 1000.0);
+    }
+    result
+}
+
+fn read_page(params: Value, timings: &mut Timings) -> crate::Result<Value> {
     let roster = timings.measure("roster_ms", super::roster::Roster::try_load)?;
     let compressed = params["response_encoding"] == transfer::ENCODING;
     let page = read_with_roster(params, &roster, timings)?;
@@ -40,16 +59,17 @@ fn read_with_roster(
     roster: &super::roster::Roster,
     timings: &mut Timings,
 ) -> crate::Result<Value> {
-    let session = params["session_id"]
-        .as_str()
-        .context("Session id is required")?;
+    let session = params["session_id"].as_str().context(Failure::Request)?;
     let entry = roster.get(session);
     let catalog_row = if entry.is_none() && session.starts_with("local-") {
-        Some(
-            super::runtime_catalog::Catalog::open()?
-                .lookup(session)?
-                .context(Failure::Missing)?,
-        )
+        let catalog = super::runtime_catalog::Catalog::open()?;
+        Some(match catalog.lookup(session) {
+            Ok(Some(row)) => row,
+            // A sweep in progress may not have reached the conversation yet.
+            Ok(None) | Err(_) if catalog.refreshing()? => return Err(Failure::Refreshing.into()),
+            Ok(None) => return Err(Failure::Missing.into()),
+            Err(error) => return Err(error),
+        })
     } else {
         None
     };
@@ -57,7 +77,7 @@ fn read_with_roster(
         .map(|e| e.runtime.as_str())
         .or_else(|| catalog_row.as_ref().map(|row| row.runtime.as_str()))
         .or_else(|| params["runtime"].as_str())
-        .context("Runtime is required")?;
+        .context(Failure::Request)?;
     let native = entry
         .map(|e| e.thread_id.as_str())
         .or_else(|| {
@@ -75,13 +95,13 @@ fn read_with_roster(
             && native
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
-        "Invalid native session id"
+        Failure::Request
     );
     let cwd = entry
         .map(|e| e.cwd.as_str())
         .or_else(|| catalog_row.as_ref().and_then(|row| row.cwd.to_str()))
         .or_else(|| params["cwd"].as_str())
-        .context("Working directory is required")?;
+        .context(Failure::Request)?;
     if catalog_row.is_some() {
         let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
         super::policy::require_within(std::path::Path::new(cwd), &roots)?;
@@ -100,8 +120,10 @@ fn read_with_roster(
         .as_ref()
         .map(|source| {
             let registry = super::runtime_sources::Registry::open()?;
+            // An unregistered or replaced source does not come back by retrying.
             let context =
-                super::runtime_context::RuntimeContext::resolve(&registry, &source.source_id)?;
+                super::runtime_context::RuntimeContext::resolve(&registry, &source.source_id)
+                    .context(Failure::Missing)?;
             ensure!(
                 context.source.generation == source.generation,
                 Failure::Changed
@@ -157,26 +179,26 @@ struct Target<'a> {
 }
 
 impl Target<'_> {
+    // A removed project directory keeps its history readable; see `CanonicalRoots::for_reading`.
+    fn roots(&self) -> super::policy::CanonicalRoots {
+        super::policy::CanonicalRoots::for_reading([std::path::PathBuf::from(self.cwd)])
+    }
+
     fn source_path(&self, native: &str) -> crate::Result<std::path::PathBuf> {
         let context = self.context.as_ref().context(Failure::Missing)?;
-        let roots =
-            super::policy::CanonicalRoots::from_untrusted([std::path::PathBuf::from(self.cwd)]);
+        let roots = self.roots();
         let thread = context.locate(native, &roots)?;
         if native == self.native {
-            ensure!(
-                thread.cwd == std::path::Path::new(self.cwd).canonicalize()?,
-                Failure::Changed
-            );
+            ensure!(Some(&thread.cwd) == roots.first(), Failure::Changed);
         }
-        super::local_goal::validate_header(&thread.transcript, native, &thread.cwd)?;
+        super::local_goal::validate_history_header(&thread.transcript, native, &thread.cwd)?;
         Ok(thread.transcript)
     }
 
     fn parent_path(&self, native: &str) -> crate::Result<std::path::PathBuf> {
         let context = self.context.as_ref().context(Failure::Missing)?;
-        let roots =
-            super::policy::CanonicalRoots::from_untrusted([std::path::PathBuf::from(self.cwd)]);
-        context.history_parent(
+        let roots = self.roots();
+        context.history_parent_carrier(
             native,
             &roots,
             crate::adapter::native_snapshot::Limits::default(),
@@ -270,10 +292,19 @@ pub(crate) enum Failure {
     Changed,
     #[error("Native history contains an invalid record")]
     Corrupt,
+    #[error("Conversation catalog is refreshing; retry shortly")]
+    Refreshing,
+    #[error("Invalid history request")]
+    Request,
 }
 
+/// `retryable` asks the client to repeat the same request silently; `restart` asks it to drop
+/// its snapshot and read from the newest page. A permanent condition sets neither, so the
+/// client shows it instead of retrying. Transient conditions report a known kind with a
+/// specific `reason`, so a client that does not know the reason still retries.
 pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     use crate::protocol::{ErrorCode, RpcError};
+    let mut reason = None;
     let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
         Some(Failure::Missing) => ("source_missing", false, true),
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
@@ -281,8 +312,24 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
         Some(Failure::Busy) => ("busy", true, false),
         Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
         Some(Failure::Limit) => ("resource_limit", false, false),
-        Some(Failure::Changed) => ("source_changed", true, true),
+        // The snapshot no longer holds the history it pinned; only a fresh read helps.
+        Some(Failure::Changed) => ("source_changed", false, true),
         Some(Failure::Corrupt) => ("invalid_record", false, false),
+        Some(Failure::Refreshing) => {
+            reason = Some("catalog_refreshing");
+            ("busy", true, false)
+        }
+        Some(Failure::Request) => ("invalid_request", false, false),
+        None if error
+            .downcast_ref::<crate::adapter::codex_rollout::Restoring>()
+            .is_some() =>
+        {
+            reason = Some("transcript_restoring");
+            ("busy", true, false)
+        }
+        None if error.downcast_ref::<super::policy::PolicyError>().is_some() => {
+            ("path_not_allowed", false, false)
+        }
         None if error
             .downcast_ref::<crate::adapter::native_snapshot::Unavailable>()
             .is_some() =>
@@ -293,7 +340,7 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
                 Unavailable::Unsupported => ("unsupported", false, false),
                 Unavailable::BudgetExceeded => ("resource_limit", false, false),
                 Unavailable::Incomplete => ("incomplete_record", true, false),
-                Unavailable::Changed => ("source_changed", true, true),
+                Unavailable::Changed => ("source_changed", false, true),
                 _ => ("read_failed", true, false),
             }
         }
@@ -311,7 +358,11 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
         ErrorCode::RuntimeUnavailable,
         format!("History read failed ({kind})"),
     );
-    result.data = Some(json!({"kind":kind,"retryable":retryable,"restart":restart}));
+    let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
+    if let Some(reason) = reason {
+        data["reason"] = json!(reason);
+    }
+    result.data = Some(data);
     result
 }
 
@@ -372,79 +423,238 @@ fn project_context(item: &mut crate::protocol::ItemCompleted, context: &HashSet<
     }
 }
 
+use crate::adapter::codex_rollout::HEADER_LIMIT;
+// A rewrite of the bytes just before a pinned end is what a truncate-and-regrow looks like.
+const FENCE_BYTES: u64 = 64 * 1024;
+
+/// One carrier of a lineage, pinned by an open handle and the end of its admitted prefix.
+///
+/// Parents are immutable prefixes and the leaf only grows, so bytes appended past `end` never
+/// invalidate a segment. A carrier that shrinks below `end`, or whose bytes before `end` are
+/// rewritten, no longer holds the pinned history and fails as changed.
 struct Segment {
+    /// The plain carrier name: record identities do not change when a cold parent is restored.
     source: std::path::PathBuf,
-    version: std::fs::Metadata,
-    file: std::fs::File,
+    carrier: Carrier,
     end: u64,
+}
+
+enum Carrier {
+    Open {
+        file: std::fs::File,
+        fence: [u8; 32],
+    },
+    /// A compressed parent is restored only when a page reaches it, and must then present the
+    /// header and boundary the lineage walk admitted.
+    Cold {
+        path: std::path::PathBuf,
+        header: Vec<u8>,
+        ordinal: u64,
+    },
+}
+
+impl Segment {
+    /// The leaf ends at its last complete record; a record still being written stays outside.
+    fn leaf(mut file: std::fs::File, source: std::path::PathBuf) -> crate::Result<Self> {
+        let end = complete_end(&mut file)?;
+        let fence = fence(&mut file, end)?;
+        Ok(Self {
+            source,
+            carrier: Carrier::Open { file, fence },
+            end,
+        })
+    }
+
+    fn file(&mut self) -> crate::Result<&mut std::fs::File> {
+        if let Carrier::Cold {
+            path,
+            header,
+            ordinal,
+        } = &self.carrier
+        {
+            let plain = crate::adapter::codex_rollout::restore(path)?;
+            let mut file = std::fs::File::open(plain)?;
+            ensure!(header_line(&mut file)? == *header, Failure::Changed);
+            ensure!(
+                self.end <= file.metadata()?.len(),
+                "Native parent history is incomplete"
+            );
+            verify_boundary(&mut file, self.end, header.len() as u64, *ordinal)?;
+            let fence = fence(&mut file, self.end)?;
+            self.carrier = Carrier::Open { file, fence };
+        }
+        let Carrier::Open {
+            file,
+            fence: pinned,
+        } = &mut self.carrier
+        else {
+            unreachable!("a cold carrier is opened above");
+        };
+        ensure!(fence(file, self.end)? == *pinned, Failure::Changed);
+        Ok(file)
+    }
+}
+
+fn fence(file: &mut std::fs::File, end: u64) -> crate::Result<[u8; 32]> {
+    use sha2::Digest;
+    ensure!(file.metadata()?.len() >= end, Failure::Changed);
+    let start = end.saturating_sub(FENCE_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut digest = sha2::Sha256::new();
+    std::io::copy(&mut file.take(end - start), &mut digest)?;
+    Ok(digest.finalize().into())
+}
+
+fn complete_end(file: &mut std::fs::File) -> crate::Result<u64> {
+    const CHUNK: u64 = 64 * 1024;
+    let length = file.metadata()?.len();
+    let mut end = length;
+    let mut buffer = vec![0; CHUNK as usize];
+    while end > 0 {
+        ensure!(
+            length - end < 128 * 1024 * 1024,
+            "A native transcript record exceeds the history page limit"
+        );
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buffer[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    ensure!(length == 0, Failure::Incomplete);
+    Ok(0)
+}
+
+fn verify_boundary(
+    file: &mut std::fs::File,
+    end: u64,
+    header: u64,
+    ordinal: u64,
+) -> crate::Result<()> {
+    ensure!(
+        end >= header && end > 0,
+        "Native parent boundary excludes its header"
+    );
+    file.seek(SeekFrom::Start(end - 1))?;
+    let mut delimiter = [0];
+    file.read_exact(&mut delimiter)?;
+    ensure!(
+        delimiter == *b"\n",
+        "Native parent boundary splits a record"
+    );
+    let (records, _, _) = page_file(file, Some(end))?;
+    let last: Value = serde_json::from_str(
+        &records
+            .last()
+            .context("Native parent boundary is empty")?
+            .text,
+    )?;
+    ensure!(
+        last["ordinal"].as_u64().and_then(|v| v.checked_add(1)) == Some(ordinal),
+        "Native parent history boundary changed"
+    );
+    Ok(())
+}
+
+fn header_line(file: &mut std::fs::File) -> crate::Result<Vec<u8>> {
+    let mut header = Vec::new();
+    std::io::BufRead::read_until(
+        &mut std::io::BufReader::new((&mut *file).take(HEADER_LIMIT)),
+        b'\n',
+        &mut header,
+    )?;
+    Ok(header)
+}
+
+/// A parent may be cold. Its plain carrier wins whenever it exists, as it does for Codex, and a
+/// restoration may publish that plain carrier between the lookup and this open.
+fn open_carrier(
+    carrier: &std::path::Path,
+    plain: &std::path::Path,
+    parent: bool,
+) -> crate::Result<(Option<std::fs::File>, Vec<u8>)> {
+    use crate::adapter::codex_rollout;
+    for _ in 0..2 {
+        match std::fs::File::open(plain) {
+            Ok(mut file) => {
+                let header = header_line(&mut file)?;
+                return Ok((Some(file), header));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && parent
+                    && codex_rollout::is_compressed(carrier) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match codex_rollout::first_line(carrier, HEADER_LIMIT) {
+            Ok(header) => return Ok((None, header)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
 }
 
 // Virtual byte coordinates join immutable parent prefixes to the growing leaf.
 fn lineage(path: &std::path::Path) -> crate::Result<Vec<Segment>> {
     lineage_from(path, |id| {
-        Ok(crate::adapter::native_snapshot::lookup_codex_rollout(
+        Ok(crate::adapter::native_snapshot::codex_carrier(
             id,
             crate::adapter::native_snapshot::Limits::default(),
-        )?
-        .path)
+        )?)
     })
 }
 
+/// `lookup` names a parent's carrier as it is on disk; a compressed one is not restored here.
 fn lineage_from(
     path: &std::path::Path,
     lookup: impl Fn(&str) -> crate::Result<std::path::PathBuf>,
 ) -> crate::Result<Vec<Segment>> {
-    use std::io::BufRead;
+    use crate::adapter::codex_rollout;
     let mut segments = Vec::new();
     let mut current = path.to_path_buf();
-    let mut boundary = None;
+    let mut boundary: Option<(u64, u64)> = None;
     let mut seen = std::collections::HashSet::new();
     loop {
+        let source = codex_rollout::plain_path(&current);
         ensure!(
-            segments.len() < 64 && seen.insert(current.clone()),
+            segments.len() < 64 && seen.insert(source.clone()),
             "Native history lineage is cyclic or too deep"
         );
-        let mut file = std::fs::File::open(&current)?;
-        let version = file.metadata()?;
-        let length = version.len();
-        let end = boundary.map(|(bytes, _)| bytes).unwrap_or(length);
-        ensure!(end <= length, "Native parent history is incomplete");
-        let mut header = String::new();
-        std::io::BufReader::new((&mut file).take(1024 * 1024)).read_line(&mut header)?;
-        let value = if header.ends_with('\n') {
-            serde_json::from_str::<Value>(&header).ok()
+        let (file, header) = open_carrier(&current, &source, boundary.is_some())?;
+        let value = if header.ends_with(b"\n") {
+            serde_json::from_slice::<Value>(&header).ok()
         } else {
             None
         };
-        if let Some((_, ordinal)) = boundary {
-            ensure!(
-                end >= header.len() as u64 && end > 0,
-                "Native parent boundary excludes its header"
-            );
-            file.seek(SeekFrom::Start(end - 1))?;
-            let mut delimiter = [0];
-            file.read_exact(&mut delimiter)?;
-            ensure!(
-                delimiter == *b"\n",
-                "Native parent boundary splits a record"
-            );
-            let (records, _, _) = page_file(&mut file, Some(end))?;
-            let last: Value = serde_json::from_str(
-                &records
-                    .last()
-                    .context("Native parent boundary is empty")?
-                    .text,
-            )?;
-            ensure!(
-                last["ordinal"].as_u64().and_then(|v| v.checked_add(1)) == Some(ordinal),
-                "Native parent history boundary changed"
-            );
-        }
-        segments.push(Segment {
-            version,
-            file,
-            end,
-            source: current.clone(),
+        segments.push(match (file, boundary) {
+            (Some(mut file), Some((end, ordinal))) => {
+                ensure!(
+                    end <= file.metadata()?.len(),
+                    "Native parent history is incomplete"
+                );
+                verify_boundary(&mut file, end, header.len() as u64, ordinal)?;
+                let fence = fence(&mut file, end)?;
+                Segment {
+                    source,
+                    carrier: Carrier::Open { file, fence },
+                    end,
+                }
+            }
+            (Some(file), None) => Segment::leaf(file, source)?,
+            (None, Some((end, ordinal))) => Segment {
+                source,
+                carrier: Carrier::Cold {
+                    path: current.clone(),
+                    header: header.clone(),
+                    ordinal,
+                },
+                end,
+            },
+            (None, None) => unreachable!("only a parent may be cold"),
         });
         let Some(value) = value else {
             ensure!(boundary.is_none(), "Native parent header is invalid");
@@ -506,7 +716,7 @@ fn page_segments(
         if before <= base {
             continue;
         }
-        let (mut lines, next, mode) = page_file(&mut part.file, Some(before - base))?;
+        let (mut lines, next, mode) = page_file(part.file()?, Some(before - base))?;
         for line in &mut lines {
             line.source = Some(super::tail::record_source(&part.source, line.lineno));
             line.lineno += base;
@@ -669,16 +879,35 @@ mod tests {
                 })).unwrap()).unwrap();
                 sources.push(source);
             }
+            // The bound root holds the project, so the project can be removed beneath it.
             let mut mirror = super::super::mirror::Mirror::default();
             mirror
-                .bind(super::super::endpoint::WORKSPACE, "project", &project)
+                .bind(super::super::endpoint::WORKSPACE, "root", directory.path())
                 .unwrap();
             mirror.save().unwrap();
             let roots = mirror.roots(super::super::endpoint::WORKSPACE);
             let catalog = super::super::runtime_catalog::Catalog::open().unwrap();
+            let unscanned = read_with_roster(
+                json!({"session_id":sources[0].session_ref(native)}),
+                &Default::default(),
+                &mut Timings::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                unscanned.downcast_ref(),
+                Some(Failure::Refreshing)
+            ));
             for _ in &sources {
                 catalog.reconcile(&roots).unwrap();
             }
+            let unknown = format!("local-{}", "0".repeat(64));
+            let gone = read_with_roster(
+                json!({"session_id":unknown}),
+                &Default::default(),
+                &mut Timings::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(gone.downcast_ref(), Some(Failure::Missing)));
             let direct = read_with_roster(json!({"session_id":sources[0].session_ref(native),"runtime":"forged","cwd":"/forged"}), &Default::default(), &mut Timings::default()).unwrap();
             assert!(direct.to_string().contains("alpha-child"));
             assert!(!direct.to_string().contains("beta-child"));
@@ -721,6 +950,19 @@ mod tests {
             )
             .unwrap();
             assert!(beta.to_string().contains("beta-child"));
+            // A removed project directory leaves its existing history readable.
+            let moved = directory.path().join("moved");
+            std::fs::rename(&project, &moved).unwrap();
+            for session in [json!("alpha"), json!(sources[0].session_ref(native))] {
+                let page = read_with_roster(
+                    json!({"session_id":session}),
+                    &roster,
+                    &mut Timings::default(),
+                )
+                .unwrap();
+                assert!(page.to_string().contains("alpha-child"));
+            }
+            std::fs::rename(&moved, &project).unwrap();
             registry.remove(&sources[0].source_id).unwrap();
             assert!(
                 read_with_roster(
@@ -750,6 +992,40 @@ mod tests {
                 .is_err()
             );
         });
+    }
+
+    /// Clients act on `retryable` and `restart` alone: a transient condition must be retried
+    /// silently and a permanent one shown. A policy refusal reported as retryable keeps a client
+    /// retrying forever, and a refreshing catalog reported as missing shows a conversation as
+    /// gone.
+    #[test]
+    fn history_errors_tell_transient_from_permanent_conditions() {
+        let flags = |error: anyhow::Error| {
+            let data = rpc_error(error).data.unwrap();
+            (
+                data["kind"].as_str().unwrap().to_owned(),
+                data["retryable"] == true,
+                data["restart"] == true,
+                data["reason"].as_str().map(str::to_owned),
+            )
+        };
+        let busy = |reason: &str| ("busy".to_owned(), true, false, Some(reason.to_owned()));
+        assert_eq!(
+            flags(Failure::Refreshing.into()),
+            busy("catalog_refreshing")
+        );
+        assert_eq!(
+            flags(crate::adapter::codex_rollout::Restoring.into()),
+            busy("transcript_restoring")
+        );
+        assert_eq!(
+            flags(super::super::policy::PolicyError::OutsideAllowlist("/outside".into()).into()),
+            ("path_not_allowed".to_owned(), false, false, None)
+        );
+        assert_eq!(
+            flags(Failure::Missing.into()),
+            ("source_missing".to_owned(), false, true, None)
+        );
     }
 
     #[test]
@@ -951,6 +1227,67 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(mode, super::super::codex_history::HistoryMode::Legacy);
         assert_eq!(rows.last().unwrap().text, "original");
+    }
+
+    /// Opening history pins carriers instead of copying them. A cold parent is restored only
+    /// when a page reaches it, a writer appending to the leaf (even mid-record) neither fails
+    /// nor extends the snapshot, and a truncated leaf fails as changed. A reader that restored
+    /// every ancestor up front, compared the leaf's length across the walk, or paged the
+    /// current file instead of the pinned prefix breaks one of these.
+    #[test]
+    fn pinned_lineage_defers_cold_parents_and_survives_leaf_appends() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent.jsonl");
+        let compressed = root.path().join("parent.jsonl.zst");
+        let child = root.path().join("child.jsonl");
+        let row = |ordinal, text: &str| {
+            format!(
+                "{}\n",
+                json!({"ordinal":ordinal,"type":"event_msg","payload":{"type":"user_message","message":text}})
+            )
+        };
+        let prefix = format!(
+            "{}\n{}",
+            json!({"ordinal":0,"type":"session_meta","payload":{"id":"parent","history_mode":"legacy"}}),
+            row(1, "Parent request")
+        );
+        std::fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                prefix.as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let header = json!({"ordinal":2,"type":"session_meta","payload":{"id":"child","history_mode":"paginated","history_base":{"thread_id":"parent","end_byte_offset":prefix.len(),"end_ordinal_exclusive":2}}});
+        std::fs::write(
+            &child,
+            format!("{header}\n{}{{\"ordinal\":4,", row(3, "Child request")),
+        )
+        .unwrap();
+        let mut segments = lineage_from(&child, |_| Ok(compressed.clone())).unwrap();
+        assert!(!parent.exists());
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&child)
+            .unwrap();
+        write!(
+            writer,
+            "\"type\":\"event_msg\"}}\n{}",
+            row(5, "Later request")
+        )
+        .unwrap();
+        let (leaf, cursor, _) = page_segments(&mut segments, None).unwrap();
+        assert!(leaf.last().unwrap().text.contains("Child request"));
+        assert!(!parent.exists());
+        let (earlier, cursor, _) = page_segments(&mut segments, Some(cursor)).unwrap();
+        assert_eq!(cursor, 0);
+        assert!(earlier.last().unwrap().text.contains("Parent request"));
+        assert!(parent.exists());
+        writer.set_len(prefix.len() as u64).unwrap();
+        let error = page_segments(&mut segments, None).unwrap_err();
+        assert!(matches!(error.downcast_ref(), Some(Failure::Changed)));
     }
 
     #[test]

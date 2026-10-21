@@ -61,6 +61,21 @@ pub(crate) fn compatible_string(stored: &str, live: &str) -> bool {
     false
 }
 
+/// Codex leads each segment of a thread with its own header. A branch keeps the header it first
+/// settled, so any header naming the same thread continues it; every later line still has to
+/// agree. Without this, a branch whose first line came from a later segment can never settle
+/// again once the capture leads with the thread's first header.
+fn same_thread_header(committed: &Value, live: &Value) -> bool {
+    let thread = |value: &Value| {
+        (value["type"] == "session_meta")
+            .then(|| value["payload"]["id"].as_str())
+            .flatten()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    };
+    thread(committed).is_some_and(|id| Some(id) == thread(live))
+}
+
 /// Compare a native prefix while retaining its committed content at each physical line.
 /// New privacy decisions apply only after the returned native byte boundary.
 pub fn retain_prefix(
@@ -89,7 +104,9 @@ pub fn retain_prefix(
         }
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             let content = &contents[index].content;
-            if !compatible(content, &comparisons[index].content, &value) {
+            let continues = compatible(content, &comparisons[index].content, &value)
+                || (index == 0 && same_thread_header(content, &value));
+            if !continues {
                 return Ok(None);
             }
             projected.push_str(&serde_json::to_string(content)?);
@@ -103,4 +120,41 @@ pub fn retain_prefix(
         cursor += line.len();
     }
     Ok((index == contents.len()).then_some((cursor, projected)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the first line may differ, and only as another header of the same thread; the
+    /// committed header is what settlement keeps. A comparison that accepts any differing header
+    /// would let another conversation continue the branch.
+    #[test]
+    fn a_later_segment_header_of_the_same_thread_continues_the_settled_prefix() {
+        let header = |id: &str, ordinal: u64| serde_json::json!({"type":"session_meta","ordinal":ordinal,"payload":{"id":id}});
+        let record = serde_json::json!({"type":"event_msg","payload":{"type":"user_message"}});
+        let committed = crate::domain::transcript::wrap_lines(
+            &format!("{}\n{record}\n", header("thread", 9)),
+            "codex",
+            "agit-0123456789abcdef0123456789abcdef01234567",
+        );
+        let live = format!("{}\n{record}\n{record}\n", header("thread", 0));
+        let (end, projected) = retain_prefix(&committed, &committed, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, live.len() - format!("{record}\n").len());
+        assert!(projected.starts_with(&serde_json::to_string(&header("thread", 9)).unwrap()));
+        let other = format!("{}\n{record}\n", header("other", 0));
+        assert!(
+            retain_prefix(&committed, &committed, &other)
+                .unwrap()
+                .is_none()
+        );
+        let changed = format!("{}\n{}\n", header("thread", 0), header("thread", 1));
+        assert!(
+            retain_prefix(&committed, &committed, &changed)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

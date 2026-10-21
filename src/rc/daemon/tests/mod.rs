@@ -77,6 +77,7 @@ pub(super) fn rpc_test_daemon(
         sessions,
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        exiting_launches: HashMap::new(),
         archive_recovering: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),

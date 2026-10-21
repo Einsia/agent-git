@@ -11,6 +11,10 @@ use std::path::Path;
 pub(super) const WATCH_RESPONSE_HEADSTART: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+/// How often a watch that is not revalidated on every poll re-resolves its transcript to follow a
+/// Codex segment rollover.
+const WATCH_ROLLOVER_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
 const MAX_WATCH_REQUESTS: usize = 32;
 const MAX_WATCH_SCANS: usize = 4;
 
@@ -539,6 +543,7 @@ impl Daemon {
                 let stream = watch_id.clone();
                 let rt = runtime.clone();
                 let workspace = caller.workspace_id.clone();
+                let thread = p.session_id.clone();
                 let handle = tokio::spawn(async move {
                     // Read from the start of the window instead of reading from the
                     // beginning and discarding — the latter costs memory the size of
@@ -574,22 +579,42 @@ impl Daemon {
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
                     let mut initial = true;
+                    let mut enrolled = enrolled;
+                    let mut rollover_check = tokio::time::Instant::now() + WATCH_ROLLOVER_CHECK;
                     loop {
-                        if let Some(watch) = &enrolled {
-                            let watch = watch.clone();
+                        // Codex continues a long thread in a new segment at a turn start. The
+                        // tail moves there only after this poll has drained the previous one.
+                        let mut rolled_over = None;
+                        if let Some(watch) = &mut enrolled {
+                            let mut next = watch.clone();
                             let workspace = workspace.clone();
-                            if !matches!(
-                                tokio::task::spawn_blocking(move || {
-                                    let roots = crate::rc::mirror::Mirror::load().roots(&workspace);
-                                    watch.validate(&roots)
-                                })
-                                .await,
-                                Ok(Ok(()))
-                            ) {
+                            let followed = tokio::task::spawn_blocking(move || {
+                                let roots = crate::rc::mirror::Mirror::load().roots(&workspace);
+                                next.follow(&roots).map(|moved| (moved, next))
+                            })
+                            .await;
+                            let Ok(Ok((moved, next))) = followed else {
                                 history_status(&frames, &stream, "failed", Some("source_revoked"))
                                     .await;
                                 break;
-                            }
+                            };
+                            rolled_over = moved.then(|| next.path.clone());
+                            *watch = next;
+                        } else if rt == "codex" && tokio::time::Instant::now() >= rollover_check {
+                            rollover_check = tokio::time::Instant::now() + WATCH_ROLLOVER_CHECK;
+                            let current = tailer.as_ref().map(|tailer| tailer.path().to_owned());
+                            let thread = thread.clone();
+                            rolled_over = tokio::task::spawn_blocking(move || {
+                                use crate::adapter::Adapter;
+                                let current = current?;
+                                let next =
+                                    crate::adapter::codex::Codex.resolve_present(&thread, None)?;
+                                crate::adapter::codex_rollout::continues(&next, &current)
+                                    .then_some(next)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
                         }
                         if let Some(mut frame) = seed.take() {
                             frame.stream = Some(stream.clone());
@@ -715,6 +740,19 @@ impl Daemon {
                         if initial && !tailer.has_pending() {
                             history_status(&frames, &stream, "complete", None).await;
                             initial = false;
+                        }
+                        if let Some(path) = rolled_over {
+                            // The new segment is read from its start, and the coordinates it
+                            // reports are its own, as history pages report them.
+                            let handle = same_file::Handle::from_path(&path).ok();
+                            *tailer = crate::rc::tail::Tailer::at(
+                                path,
+                                0,
+                                0,
+                                handle,
+                                WATCH_BACKFILL_LINES,
+                            );
+                            settings_boundary = None;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(
                             crate::rc::supervisor::TAIL_POLL_MS,

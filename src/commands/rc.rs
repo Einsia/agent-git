@@ -127,6 +127,18 @@ impl LandArgs {
             .unwrap_or_else(|| Ok(self.session.clone()))
     }
 
+    /// The binding a landing records: the requested store at its current generation. A queued
+    /// archive or roster row can carry an older generation; resolution validates the store's
+    /// home identity, which is what names the transcript.
+    fn current_binding(&self) -> crate::Result<Option<crate::domain::link::NativeBinding>> {
+        let Some(mut binding) = self.native_binding()? else {
+            return Ok(None);
+        };
+        let registry = crate::rc::runtime_sources::Registry::open()?;
+        binding.source.generation = registry.resolve(&binding.source.source_id)?.generation;
+        Ok(Some(binding))
+    }
+
     fn validate_source(&self) -> crate::Result<()> {
         if let Some(binding) = self.native_binding()? {
             let registry = crate::rc::runtime_sources::Registry::open()?;
@@ -134,10 +146,6 @@ impl LandArgs {
                 &registry,
                 &binding.source.source_id,
             )?;
-            anyhow::ensure!(
-                context.source.generation == binding.source.generation,
-                "native source changed before landing"
-            );
             let cwd = std::path::Path::new(&self.cwd).canonicalize()?;
             let roots = crate::rc::policy::CanonicalRoots::from_verified(vec![cwd.clone()]);
             let thread = context.locate(&binding.thread_id, &roots)?;
@@ -601,7 +609,7 @@ fn landed_link(
 ) -> crate::Result<crate::domain::link::Link> {
     args.validate_source()?;
     let key = args.link_key()?;
-    let binding = args.native_binding()?;
+    let binding = args.current_binding()?;
     let existing = if binding.is_some() {
         crate::domain::link::read_archive_link_snapshot(store, &args.runtime, &key)?
             .map(|snapshot| snapshot.link)

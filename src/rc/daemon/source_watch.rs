@@ -45,12 +45,34 @@ impl SourceWatch {
     }
 
     pub fn validate(&self, roots: &CanonicalRoots) -> crate::Result<()> {
+        self.current(roots).map(drop)
+    }
+
+    /// [`Self::validate`], moving the watch to the segment Codex continued the thread in.
+    /// Returns whether the transcript moved.
+    pub fn follow(&mut self, roots: &CanonicalRoots) -> crate::Result<bool> {
+        let current = self.current(roots)?;
+        let moved = current != self.path;
+        self.path = current;
+        Ok(moved)
+    }
+
+    /// The transcript is either the one being watched or the segment that continues it; any
+    /// other change revokes the watch.
+    fn current(&self, roots: &CanonicalRoots) -> crate::Result<PathBuf> {
         let current = self.context.locate(&self.native_id, roots)?;
         anyhow::ensure!(
-            current.cwd == self.cwd && current.transcript == self.path,
+            current.cwd == self.cwd
+                && (current.transcript == self.path
+                    || crate::adapter::codex_rollout::continues(&current.transcript, &self.path)),
             "native watch source changed"
         );
-        crate::rc::local_goal::validate_header(&self.path, &self.native_id, &self.cwd)
+        crate::rc::local_goal::validate_history_header(
+            &current.transcript,
+            &self.native_id,
+            &self.cwd,
+        )?;
+        Ok(current.transcript)
     }
 
     pub fn identity(&self) -> crate::protocol::NativeSourceRef {
@@ -75,7 +97,7 @@ mod tests {
             std::fs::create_dir(&home).unwrap();
             let project = project.canonicalize().unwrap();
             let native = uuid::Uuid::new_v4().to_string();
-            let path = home.join("history.jsonl");
+            let path = home.join(format!("rollout-2026-10-12T00-00-00-{native}.jsonl"));
             std::fs::write(
                 &path,
                 format!(
@@ -104,6 +126,39 @@ mod tests {
             assert_eq!(watch.native_id, native);
             assert_eq!(watch.identity().source_id, source.source_id);
             watch.validate(&roots).unwrap();
+            // A segment that continues the watched carrier is followed; any other file revokes.
+            let rollover = |name: &str, base: serde_json::Value| {
+                let next = home.join(name);
+                std::fs::write(
+                    &next,
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"type":"session_meta","payload":{
+                    "id":native,"cwd":project,"history_mode":"paginated","history_base":base}})
+                    ),
+                )
+                .unwrap();
+                db.execute("UPDATE threads SET rollout_path=?1", [next.to_str()])
+                    .unwrap();
+                next.canonicalize().unwrap()
+            };
+            let segment = uuid::Uuid::new_v4();
+            rollover(
+                &format!(
+                    "rollout-2026-10-12T00-00-02-{native}_{}.jsonl",
+                    uuid::Uuid::new_v4()
+                ),
+                serde_json::json!({"thread_id":segment.to_string(),"end_byte_offset":1,"end_ordinal_exclusive":1}),
+            );
+            assert!(watch.validate(&roots).is_err());
+            let next = rollover(
+                &format!("rollout-2026-10-12T00-00-01-{native}_{segment}.jsonl"),
+                serde_json::json!({"thread_id":native,"end_byte_offset":1,"end_ordinal_exclusive":1}),
+            );
+            let mut watch = watch;
+            assert!(watch.follow(&roots).unwrap());
+            assert_eq!(watch.path, next);
+            assert!(!watch.follow(&roots).unwrap());
             db.execute("UPDATE threads SET cwd=?1", [root.path().to_str()])
                 .unwrap();
             assert!(watch.validate(&roots).is_err());

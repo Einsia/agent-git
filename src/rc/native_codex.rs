@@ -39,10 +39,9 @@ impl Source {
             .canonicalize()
             .context("cannot resolve Codex runtime home")?;
         ensure!(home.is_dir(), "Codex runtime home is not a directory");
-        let executable = executable
-            .canonicalize()
-            .context("cannot resolve Codex executable")?;
-        ensure!(executable.is_file(), "Codex executable is not a file");
+        // The program is needed only to start a server; attaching to a running one must not
+        // depend on an install that an upgrade may already have removed.
+        let executable = executable.to_path_buf();
         let socket = match socket {
             Some(path) => {
                 ensure!(path.is_absolute(), "Codex socket path must be absolute");
@@ -90,6 +89,10 @@ impl Source {
         ensure!(
             self.socket == self.home.join("app-server-control/app-server-control.sock"),
             "The registered Codex endpoint is unavailable; start its server before reconnecting"
+        );
+        ensure!(
+            crate::adapter::which(&self.executable.to_string_lossy()).is_some(),
+            "No Codex program is installed to start this source's server; install codex on PATH or register one with --executable"
         );
         self.require_shared_service().await?;
         let mut starter = self.spawn_persistent_server()?;
@@ -279,7 +282,7 @@ type Writer = std::pin::Pin<Box<dyn Sink<Message, Error = tungstenite::Error> + 
 
 /// Dropping a client closes its subscription transport, never the shared executor.
 pub struct Client {
-    writer: Writer,
+    writer: Option<Writer>,
     lines: mpsc::Receiver<QueuedLine>,
     reader: tokio::task::JoinHandle<()>,
     // Child drop reaps the launcher without terminating the independent executor.
@@ -344,7 +347,7 @@ impl Client {
             queue_line(&tx, &budget, Line::Eof, 1).await;
         });
         Self {
-            writer: Box::pin(writer),
+            writer: Some(Box::pin(writer)),
             lines,
             reader,
             starter: None,
@@ -364,7 +367,11 @@ impl Client {
             payload.len() <= MAX_LINE_BYTES,
             "Codex request exceeds the transport limit"
         );
-        self.writer.send(Message::Text(payload.into())).await?;
+        self.writer
+            .as_mut()
+            .context("the Codex shared-server connection is closed")?
+            .send(Message::Text(payload.into()))
+            .await?;
         Ok(())
     }
 
@@ -372,11 +379,16 @@ impl Client {
         self.lines.recv().await
     }
 
-    pub async fn close(&mut self) -> crate::Result<()> {
-        let result = tokio::time::timeout(CLOSE_TIMEOUT, self.writer.close()).await;
+    /// End this subscription. The socket is released whether or not the close handshake
+    /// completes, so it cannot fail: a transport that already broke has nothing left to close,
+    /// and a caller that waits for a successful close would otherwise wait forever.
+    pub async fn close(&mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, writer.close()).await;
+        }
         self.reader.abort();
-        result.context("Codex client close timed out")??;
-        Ok(())
+        #[cfg(windows)]
+        self.proxy.take();
     }
 }
 
@@ -454,12 +466,12 @@ mod tests {
                 if v["result"]["thread"]["id"] == "shared-thread")
             );
         }
-        a.close().await.unwrap();
+        a.close().await;
         b.send(&json!({"id":2,"method":"thread/read"}))
             .await
             .unwrap();
         assert!(matches!(b.next().await.unwrap().into_line(), Line::Json(v) if v["id"] == 2));
-        b.close().await.unwrap();
+        b.close().await;
         tokio::time::timeout(CONNECT_TIMEOUT, server)
             .await
             .unwrap()

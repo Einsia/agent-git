@@ -278,7 +278,17 @@ fn claims(store: &Store, owner: &str, agent: &str, branch: &str) -> crate::Resul
 
 fn read_native(claim: &link::Link) -> crate::Result<Vec<u8>> {
     let path = match claim.source.as_str() {
-        "codex" => crate::adapter::codex::resolve_readonly(&claim.session_id)?,
+        "codex" => {
+            let path = crate::adapter::codex::resolve_readonly(&claim.session_id)?;
+            // Inspection decodes a cold rollout in memory instead of restoring it.
+            if crate::adapter::codex_rollout::is_compressed(&path) {
+                return Ok(crate::adapter::codex_rollout::read_decoded(
+                    &path,
+                    storage::MAX_MATERIALIZED_BYTES as u64,
+                )?);
+            }
+            path
+        }
         "claude-code" | "claude-desktop" => {
             crate::adapter::claude_code::resolve_readonly(&claim.session_id)?
         }

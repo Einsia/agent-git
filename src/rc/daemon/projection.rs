@@ -471,18 +471,15 @@ impl Daemon {
                     )
                 })
                 .map_err(source_sessions::unavailable)?;
-            if context.source.generation != source.generation {
-                return Err(source_sessions::unavailable(
-                    "runtime source changed; reconnect this conversation",
-                ));
-            }
+            // Resolution refuses a removed or replaced store. A generation bump alone (re-enabling
+            // the same home) leaves this connection's transcripts and their capture intact.
             let native = live
                 .runtime_thread_id
                 .as_deref()
                 .ok_or_else(|| source_sessions::unavailable("native binding is unavailable"))?;
             let thread = context
-                .locate(native, &self.mirror.roots(&caller.workspace_id))
-                .map_err(source_sessions::unavailable)?;
+                .locate_ready(native, &self.mirror.roots(&caller.workspace_id))
+                .map_err(source_sessions::locate_failed)?;
             if self
                 .roster
                 .get(session_id)
@@ -589,7 +586,12 @@ impl Daemon {
     /// throughout. That same-lock invariant is the whole reason the web can
     /// make that comparison.
     pub(super) fn stamped(&self, mut info: SessionInfo) -> SessionInfo {
-        if self.opts.local_owner {
+        // A session running without its capture binding keeps saying so.
+        let degraded = info.agent.is_none()
+            && info.publication.as_ref().is_some_and(|status| {
+                status.reason == Some(crate::protocol::PublicationReason::BindingInvalid)
+            });
+        if self.opts.local_owner && !degraded {
             let progress = info.publication.as_ref().map(|status| status.progress);
             info.publication = Some(if info.agent.is_some() && info.branch.is_some() {
                 crate::protocol::SessionPublicationStatus::checking()
@@ -892,6 +894,7 @@ mod bound_lineage_tests {
                         sessions: [("agit-S".to_string(), live)].into_iter().collect(),
                         latest_session_generations: HashMap::new(),
                         opening_sessions: HashMap::new(),
+                        exiting_launches: HashMap::new(),
                         archive_recovering: HashMap::new(),
                         watches: HashMap::new(),
                         terminals: HashMap::new(),

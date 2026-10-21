@@ -1,15 +1,25 @@
 //! Cloud sockets carry authenticated principals through the shared executor mux.
 
 use super::{Client, ClientOutput, Incoming, MAX_FRAME, MAX_PENDING};
+use crate::protocol::Frame;
 use crate::rc::{
-    cloud::{host, ingress},
+    cloud::{host, ingress, refusal::Refusal},
     diagnostics::Log,
 };
+use agit_peer::cloud::ConnectionGrant;
 use agit_tunnel::Packet;
 use anyhow::{Context, ensure};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
+
+/// How long a refused controller may take to send the request its refusal answers.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(5);
+const MAX_REFUSALS: usize = 16;
+const REMEMBERED_REFUSALS: usize = 256;
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -17,6 +27,8 @@ mod tests;
 pub(super) struct Ingress {
     pub incoming: mpsc::Receiver<host::Authenticated>,
     pub registry: ingress::Registry,
+    refused: HashMap<String, (Instant, Refusal)>,
+    refusals: Arc<tokio::sync::Semaphore>,
     _service: Option<host::Service>,
 }
 
@@ -28,6 +40,8 @@ impl Ingress {
         Ok(Self {
             incoming,
             registry,
+            refused: HashMap::new(),
+            refusals: Arc::new(tokio::sync::Semaphore::new(MAX_REFUSALS)),
             _service: Some(service),
         })
     }
@@ -40,9 +54,90 @@ impl Ingress {
         Self {
             incoming,
             registry,
+            refused: HashMap::new(),
+            refusals: Arc::new(tokio::sync::Semaphore::new(MAX_REFUSALS)),
             _service: None,
         }
     }
+
+    /// A lease that redials before its refusal can change is answered without a new admission.
+    pub fn remembered(&mut self, grant: &ConnectionGrant) -> Option<Refusal> {
+        let now = Instant::now();
+        self.refused.retain(|_, (until, _)| *until > now);
+        self.refused
+            .get(&lease_scope(grant))
+            .map(|(_, refusal)| refusal.clone())
+    }
+
+    pub fn remember(&mut self, grant: &ConnectionGrant, refusal: &Refusal) {
+        let Some(retention) = refusal.retention() else {
+            return;
+        };
+        if self.refused.len() >= REMEMBERED_REFUSALS
+            && let Some(oldest) = self
+                .refused
+                .iter()
+                .min_by_key(|(_, (until, _))| *until)
+                .map(|(scope, _)| scope.clone())
+        {
+            self.refused.remove(&oldest);
+        }
+        self.refused.insert(
+            lease_scope(grant),
+            (Instant::now() + retention, refusal.clone()),
+        );
+    }
+
+    /// Answers the controller's first request with the refusal, then closes the tunnel.
+    ///
+    /// A controller that understands the refusal stops or paces its redials; one that does not
+    /// sees a failed handshake, exactly as when the tunnel closes unanswered. Returns false when
+    /// too many refusals are in flight and the tunnel is closed unanswered.
+    pub fn refuse(&self, accepted: host::Authenticated, refusal: &Refusal) -> bool {
+        let Ok(permit) = self.refusals.clone().try_acquire_owned() else {
+            return false;
+        };
+        let error = refusal.rpc_error();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let (mut sink, mut source) = accepted.connection.split();
+            let _ = tokio::time::timeout(REFUSAL_WINDOW, async {
+                while let Some(Ok(packet)) = source.next().await {
+                    let Packet::Text(text) = packet else {
+                        if matches!(packet, Packet::Ping(_) | Packet::Pong(_)) {
+                            continue;
+                        }
+                        return;
+                    };
+                    let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+                        return;
+                    };
+                    if let Some(id) = frame.id.filter(|_| frame.method.is_some()) {
+                        let response = Frame::error_response(id, error);
+                        let _ = sink.send(Packet::Text(response.to_json())).await;
+                        return;
+                    }
+                }
+            })
+            .await;
+        });
+        true
+    }
+}
+
+/// Each admission uses a fresh grant, so a refusal is remembered for the controller lease and
+/// resource it names: a new lease or a new owner generation is always admitted afresh.
+fn lease_scope(grant: &ConnectionGrant) -> String {
+    serde_json::json!([
+        grant.caller,
+        grant.source.id,
+        grant.source.credential_epoch,
+        grant.source.certificate.fingerprint(),
+        grant.target.id,
+        grant.session_controller,
+        grant.project_controller,
+    ])
+    .to_string()
 }
 
 pub(super) fn attach(
@@ -55,7 +150,7 @@ pub(super) fn attach(
     let (mut sink, mut source) = accepted.connection.split();
     let mut lifetime = accepted.stopped;
     let (stop, mut stopped) = watch::channel(());
-    let (output, mut messages) = ClientOutput::channel(Some(stop));
+    let (output, mut messages) = ClientOutput::channel(stop);
     let projection = guard.clone();
     let lease = guard.lease();
     let renewal = accepted.renewal;
@@ -150,6 +245,8 @@ pub(super) fn attach(
         peers: Default::default(),
         peer_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING)),
         cloud: Some(guard),
+        active: std::time::Instant::now(),
+        requester: watch::channel(()).0,
     }
 }
 

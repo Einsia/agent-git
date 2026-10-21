@@ -19,8 +19,13 @@ use tokio::{
 pub const WORKSPACE: &str = "local-owner";
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_CLIENTS: usize = 16;
+const MAX_CLOUD_CLIENTS: usize = 32;
 const CLIENT_QUEUE: usize = 256;
 const MAX_PENDING: usize = 64;
+/// A live controller probes its route more often than this, so a cloud client silent for this
+/// long has lost its controller and may give its slot to a new one. Evicting a live route would
+/// only make it redial into the slot it was evicted for.
+const EVICTION_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Read a bounded record without allocating an attacker-selected line length.
 async fn read_record<R: AsyncBufRead + Unpin>(reader: &mut R) -> crate::Result<Option<Vec<u8>>> {
@@ -92,6 +97,27 @@ struct Client {
     peers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     peer_slots: std::sync::Arc<tokio::sync::Semaphore>,
     cloud: Option<super::cloud::ingress::Client>,
+    /// The last request received or event delivered.
+    active: std::time::Instant,
+    /// Dropped with the client, which tells its accepted reads that nobody awaits them.
+    requester: tokio::sync::watch::Sender<()>,
+}
+
+/// The least recently active cloud client with no request in flight and nothing heard or sent
+/// within [`EVICTION_IDLE`].
+fn idle_cloud_client(clients: &HashMap<u64, Client>, pending: &PendingRequests) -> Option<u64> {
+    clients
+        .iter()
+        .filter(|(id, client)| {
+            client
+                .cloud
+                .as_ref()
+                .is_some_and(|guard| !guard.in_flight())
+                && client.active.elapsed() >= EVICTION_IDLE
+                && !pending.values().any(|(owner, ..)| owner == *id)
+        })
+        .min_by_key(|(_, client)| client.active)
+        .map(|(id, _)| *id)
 }
 
 struct MessageReceipt {
@@ -116,7 +142,15 @@ enum ReceiptEvent {
     },
 }
 
-fn receipt_response(entry: &MessageReceipt, digest: &[u8], id: RequestId) -> Frame {
+/// A duplicate gets the original's result. While the original is still in flight it gets a
+/// retryable pending status, so its sender asks again and receives that result; an original
+/// without a result and not in flight was interrupted by a restart and stays uncertain.
+fn receipt_response(
+    entry: &MessageReceipt,
+    digest: &[u8],
+    id: RequestId,
+    in_flight: bool,
+) -> Frame {
     let mut response = if entry.digest != digest {
         Frame::error_response(
             id.clone(),
@@ -127,6 +161,14 @@ fn receipt_response(entry: &MessageReceipt, digest: &[u8], id: RequestId) -> Fra
         )
     } else if let Some(response) = &entry.response {
         response.clone()
+    } else if in_flight {
+        let mut error = RpcError::new(
+            ErrorCode::SessionBusy,
+            "this message is still being delivered; its result follows shortly",
+        );
+        error.data =
+            Some(serde_json::json!({"outcome":"pending","retryable":true,"retry_after_ms":1000}));
+        Frame::error_response(id.clone(), error)
     } else {
         let mut error = RpcError::new(
             ErrorCode::SessionBusy,
@@ -179,11 +221,20 @@ async fn deliver_response(
             if let Some(log) = diagnostics {
                 log.record("executor.replay_queued", serde_json::json!({"client_id":client,"request_id":frame.id,"frames":frames,"succeeded":result.is_ok()}));
             }
-            result
+            // A replay that cannot be queued is answered as busy; the reader subscribes again
+            // from its cursor instead of losing its connection.
+            result.or_else(|work| {
+                let mut error = RpcError::new(
+                    ErrorCode::SessionBusy,
+                    "the viewer is catching up; subscribe again shortly",
+                );
+                error.data = Some(serde_json::json!({"retryable":true,"retry_after_ms":1000}));
+                let id = frame.id.clone().unwrap_or(RequestId::Num(0));
+                peer.output
+                    .send_work(Frame::error_response(id, error).to_json(), work)
+            })
         } else {
-            peer.output
-                .send_work(frame.to_json(), std::time::Duration::from_secs(2), work)
-                .await
+            peer.output.send_work(frame.to_json(), work)
         };
         if result.is_err() {
             if let Some(log) = diagnostics {
@@ -224,7 +275,8 @@ fn attach(
     controller: &agit_controller::Controller,
 ) -> Client {
     let (reader, mut writer) = tokio::io::split(socket);
-    let (output, mut messages) = ClientOutput::channel(None);
+    let (stop, mut stopped) = tokio::sync::watch::channel(());
+    let (output, mut messages) = ClientOutput::channel(stop);
     let peers = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashSet::<String>::new(),
     ));
@@ -266,7 +318,7 @@ fn attach(
                     .contains(event.peer_id());
                 if subscribed {
                     event_output
-                        .send_timeout(
+                        .send_waiting(
                             super::peers::notification(&event).to_json(),
                             std::time::Duration::from_secs(2),
                         )
@@ -276,7 +328,7 @@ fn attach(
             #[allow(unreachable_code)]
             Ok::<_, ()>(())
         };
-        tokio::select! { _ = read => {}, _ = write => {}, _ = forward => {} }
+        tokio::select! { _ = read => {}, _ = write => {}, _ = forward => {}, _ = stopped.changed() => {} }
         let _ = input.send(Incoming::Closed(client)).await;
     });
     Client {
@@ -285,6 +337,31 @@ fn attach(
         peers,
         peer_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING)),
         cloud: None,
+        active: std::time::Instant::now(),
+        requester: tokio::sync::watch::channel(()).0,
+    }
+}
+
+/// Logs a refused controller and answers it over its authenticated tunnel. `detail` is the
+/// admission failure; a refusal without one was answered from memory.
+fn refuse(
+    ingress: &cloud::Ingress,
+    accepted: super::cloud::host::Authenticated,
+    refusal: &super::cloud::refusal::Refusal,
+    detail: Option<&str>,
+    diagnostics: &Option<super::diagnostics::Log>,
+) {
+    let (grant_id, source_id) = (accepted.grant.id.clone(), accepted.grant.source.id.clone());
+    let delivered = ingress.refuse(accepted, refusal);
+    if let Some(log) = diagnostics {
+        log.record(
+            "cloud.controller_rejected",
+            serde_json::json!({
+                "grant_id":grant_id, "source_id":source_id, "reason":refusal.reason(),
+                "retryable":refusal.retryable(), "error_code":refusal.code(),
+                "detail":detail, "remembered":detail.is_none(), "delivered":delivered,
+            }),
+        );
     }
 }
 
@@ -401,7 +478,7 @@ async fn serve_described(
                                 let response = match result {
                                     Ok((saved, false)) => {
                                         let entry = MessageReceipt { digest:saved.digest, response:saved.response, created:std::time::Instant::now() };
-                                        let response = receipt_response(&entry, &message_digest(&frame), id);
+                                        let response = receipt_response(&entry, &message_digest(&frame), id, false);
                                         receipts.insert(key, entry);
                                         response
                                     }
@@ -426,10 +503,24 @@ async fn serve_described(
                 }
             }
             Some(accepted) = async { cloud.as_mut().unwrap().incoming.recv().await }, if cloud.is_some() => {
-                if clients.values().filter(|client| client.cloud.is_some()).count() + cloud_admissions.len() >= MAX_CLIENTS {
+                let ingress = cloud.as_mut().unwrap();
+                if let Some(refusal) = ingress.remembered(&accepted.grant) {
+                    refuse(ingress, accepted, &refusal, None, &diagnostics);
                     continue;
                 }
-                let admission = cloud.as_ref().unwrap().registry.admitted(accepted.grant.clone());
+                let attached = clients.values().filter(|client| client.cloud.is_some()).count();
+                if attached + cloud_admissions.len() >= MAX_CLOUD_CLIENTS {
+                    let Some(idle) = idle_cloud_client(&clients, &pending) else {
+                        let refusal = super::cloud::refusal::Refusal::capacity(format!("{attached} cloud clients attached"));
+                        refuse(ingress, accepted, &refusal, Some("capacity"), &diagnostics);
+                        continue;
+                    };
+                    if let Some(log) = &diagnostics {
+                        log.record("cloud.client_evicted", serde_json::json!({"client_id":idle,"idle_ms":clients[&idle].active.elapsed().as_millis(),"grant_id":accepted.grant.id}));
+                    }
+                    clients.remove(&idle);
+                }
+                let admission = ingress.registry.admitted(accepted.grant.clone());
                 cloud_admissions.spawn(async move { (accepted, admission.await) });
             }
             Some(admitted) = cloud_admissions.join_next(), if !cloud_admissions.is_empty() => {
@@ -437,7 +528,10 @@ async fn serve_described(
                 let guard = match guard {
                     Ok(guard) => guard,
                     Err(error) => {
-                        if let Some(log) = &diagnostics { log.record("cloud.controller_rejected", serde_json::json!({"grant_id":accepted.grant.id,"reason":error.to_string()})); }
+                        let refusal = super::cloud::refusal::Refusal::classify(&error);
+                        let ingress = cloud.as_mut().context("cloud admission outlived its ingress")?;
+                        ingress.remember(&accepted.grant, &refusal);
+                        refuse(ingress, accepted, &refusal, Some(&error.to_string()), &diagnostics);
                         continue;
                     }
                 };
@@ -472,6 +566,7 @@ async fn serve_described(
                 Incoming::Request(client, raw) => {
                     let Some(peer) = clients.get_mut(&client) else { continue };
                     if let Some(log) = &diagnostics { log.request(client, &raw); }
+                    peer.active = std::time::Instant::now();
                     let original_id = raw.id.clone().unwrap_or(RequestId::Num(0));
                     let authorized = if let Some(guard) = &peer.cloud {
                         match guard.authorize(*raw) {
@@ -484,10 +579,14 @@ async fn serve_described(
                             }
                         }
                     } else { authorize(*raw, client) };
+                    let authorized = authorized.map(|mut frame| {
+                        frame.authority.requested_by(peer.requester.subscribe());
+                        frame
+                    });
                     let Some(work) = admission.enter() else {
                         let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy,
                             "local daemon is restarting; nothing was accepted"));
-                        let _ = peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                        let _ = peer.output.try_send(response.to_json());
                         continue;
                     };
                     match authorized {
@@ -496,18 +595,18 @@ async fn serve_described(
                                 && let Some(id) = frame.params.as_ref().and_then(|p| p.get("peer_id")).and_then(serde_json::Value::as_str) {
                                     let mut peers = peer.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if peers.len() >= 64 || id.len() > 256 {
-                                        let _ = peer.output.try_send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer subscription capacity exceeded")).to_json(), work);
+                                        let _ = peer.output.send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer subscription capacity exceeded")).to_json(), work);
                                         continue;
                                     }
                                     peers.insert(id.into());
                             }
                             let Ok(permit) = peer.peer_slots.clone().try_acquire_owned() else {
                                 let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "too many peer requests"));
-                                let _ = peer.output.try_send_work(response.to_json(), work);
+                                let _ = peer.output.send_work(response.to_json(), work);
                                 continue;
                             };
                             let Ok(global_permit) = peer_slots.clone().try_acquire_owned() else {
-                                let _ = peer.output.try_send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer request capacity exhausted")).to_json(), work);
+                                let _ = peer.output.send_work(Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "peer request capacity exhausted")).to_json(), work);
                                 continue;
                             };
                             let controller = controller.clone();
@@ -518,45 +617,51 @@ async fn serve_described(
                                 let _permit = (permit, global_permit);
                                 let response = super::peers::dispatch(&controller, &cloud_clients, frame).await;
                                 if let Some(log) = &diagnostics { log.response(client, &response); }
-                                let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
+                                let _ = output.send_work(response.to_json(), work);
                             });
                         }
                         Ok(frame) if frame.method() == "machine.describe" => {
                             let response = Frame::response(original_id, description.clone());
                             if let Some(log) = &diagnostics { log.response(client, &response); }
-                            if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
+                            if peer.output.send_work(response.to_json(), work).is_err() { clients.remove(&client); }
                         }
                         Ok(frame) if matches!(frame.method(), "runtime.models" | "session.goal.read") => {
                             let output = peer.output.clone();
                             let slots = discovery_slots.clone();
+                            let diagnostics = diagnostics.clone();
                             tokio::spawn(async move {
-                                let permit = tokio::time::timeout(std::time::Duration::from_secs(30), slots.acquire_owned()).await;
-                                let response = if let Ok(Ok(_permit)) = permit {
-                                    if let Err(error) = frame.authority.check() {
-                                        let _ = output.send_work(Frame::error_response(original_id, error).to_json(), std::time::Duration::from_secs(2), work).await;
-                                        return;
+                                let permit = tokio::select! {
+                                    permit = tokio::time::timeout(std::time::Duration::from_secs(30), slots.acquire_owned()) => permit.ok().and_then(Result::ok),
+                                    // A departed requester gives its place in the queue to a live one.
+                                    () = frame.authority.until_departed() => None,
+                                };
+                                let response = match (permit, frame.authority.check()) {
+                                    (None, _) => Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "Runtime inspection is busy; try again shortly")),
+                                    (Some(_), Err(error)) => Frame::error_response(original_id, error),
+                                    (Some(_permit), Ok(())) => {
+                                        let is_goal = frame.method() == "session.goal.read";
+                                        let params = frame.params.unwrap_or_default();
+                                        let runtime = params.get("runtime").and_then(serde_json::Value::as_str).unwrap_or("");
+                                        let cwd = params.get("cwd").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(PathBuf::from)
+                                            .unwrap_or_else(|| crate::infra::config::user_home().unwrap_or_default());
+                                        let result = if is_goal { super::local_goal::read(params).await } else { super::harness::models::discover(runtime, cwd).await };
+                                        match frame.authority.check() {
+                                            Err(error) => Frame::error_response(original_id, error),
+                                            Ok(()) => match result {
+                                                Ok(models) => Frame::response(original_id, models),
+                                                Err(error) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())),
+                                            },
+                                        }
                                     }
-                                    let is_goal = frame.method() == "session.goal.read";
-                                    let params = frame.params.unwrap_or_default();
-                                    let runtime = params.get("runtime").and_then(serde_json::Value::as_str).unwrap_or("");
-                                    let cwd = params.get("cwd").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(PathBuf::from)
-                                        .unwrap_or_else(|| crate::infra::config::user_home().unwrap_or_default());
-                                    let result = if is_goal { super::local_goal::read(params).await } else { super::harness::models::discover(runtime, cwd).await };
-                                    match frame.authority.check() {
-                                        Err(error) => Frame::error_response(original_id, error),
-                                        Ok(()) => match result {
-                                            Ok(models) => Frame::response(original_id, models),
-                                            Err(error) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())),
-                                        },
-                                    }
-                                } else { Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "Runtime inspection is busy; try again shortly")) };
-                                let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
+                                };
+                                if let Some(log) = &diagnostics { log.response(client, &response); }
+                                let _ = output.send_work(response.to_json(), work);
                             });
                         }
                         Ok(frame) if frame.method() == "session.history" => {
                             let Ok(permit) = history_slots.clone().try_acquire_owned() else {
                                 let response = Frame::error_response(original_id, super::local_history::rpc_error(super::local_history::Failure::Busy.into()));
-                                let _ = peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
+                                let _ = peer.output.send_work(response.to_json(), work);
                                 continue;
                             };
                             let output = peer.output.clone();
@@ -567,8 +672,13 @@ async fn serve_described(
                                     let _permit = permit;
                                     let queue_ms = started.elapsed().as_secs_f64() * 1000.0;
                                     let mut timings = super::local_history::Timings::default();
-                                    let result = frame.authority.check().map_err(|error| anyhow::anyhow!(error.message))
-                                        .and_then(|()| super::local_history::read_timed(frame.params.unwrap_or_default(), &mut timings));
+                                    // A page nobody awaits gives its blocking worker to a live reader.
+                                    let result = if frame.authority.departed() {
+                                        Err(super::local_history::Failure::Busy.into())
+                                    } else {
+                                        frame.authority.check().map_err(|error| anyhow::anyhow!(error.message))
+                                            .and_then(|()| super::local_history::read_timed(frame.params.unwrap_or_default(), &mut timings))
+                                    };
                                     (result, queue_ms, timings)
                                 }).await;
                                 if let (Some(log), Ok((_, queue_ms, phases))) = (&diagnostics, &result) {
@@ -583,12 +693,15 @@ async fn serve_described(
                                     log.response(client, &response);
                                     log.record("history.read_completed", serde_json::json!({"client_id":client,"request_id":response.id,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}));
                                 }
-                                let _ = output.send_work(response.to_json(),std::time::Duration::from_secs(2), work).await;
+                                let _ = output.send_work(response.to_json(), work);
                             });
                         }
                         Ok(mut frame) => {
                             if pending.len() >= MAX_PENDING * MAX_CLIENTS || pending.values().filter(|(owner, _, _, _)| *owner == client).count() >= MAX_PENDING {
-                                clients.remove(&client);
+                                let mut error = RpcError::new(ErrorCode::SessionBusy, "the device is handling too many requests; nothing was sent");
+                                error.data = Some(serde_json::json!({"outcome":"not_sent","retryable":true,"retry_after_ms":1000}));
+                                let response = Frame::error_response(original_id, error);
+                                if peer.output.send_work(response.to_json(), work).is_err() { clients.remove(&client); }
                                 continue;
                             }
                             let key = message_key(&frame).map(|key| peer.cloud.as_ref().map_or_else(|| key.clone(), |guard| guard.receipt_key(key.clone(), &frame)));
@@ -597,9 +710,10 @@ async fn serve_described(
                                     || pending.values().any(|(_, _, active, _)| active.as_ref() == Some(key))
                                     || (receipt_store.is_none() && entry.response.is_none()));
                                 if let Some(entry) = receipts.get(key) {
-                                    let response = receipt_response(entry, &message_digest(&frame), original_id);
+                                    let in_flight = pending.values().any(|(_, _, active, _)| active.as_ref() == Some(key));
+                                    let response = receipt_response(entry, &message_digest(&frame), original_id, in_flight);
                                     if let Some(cloud) = &peer.cloud { cloud.observe_response(&response); }
-                                    if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
+                                    if peer.output.send_work(response.to_json(), work).is_err() { clients.remove(&client); }
                                     continue;
                                 }
                                 if receipt_store.is_some() && receipts.len() >= 4096
@@ -608,7 +722,7 @@ async fn serve_described(
                                 }
                                 if receipts.len() >= 4096 || key.len() > 1024 {
                                     let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "message retry capacity exceeded; nothing was sent"));
-                                    if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
+                                    if peer.output.send_work(response.to_json(), work).is_err() { clients.remove(&client); }
                                     continue;
                                 }
                                 receipts.insert(key.clone(), MessageReceipt { digest: message_digest(&frame), response: None, created: std::time::Instant::now() });
@@ -636,7 +750,7 @@ async fn serve_described(
                                 }
                                 peer.output.recover(&response, None, work)
                             } else {
-                                peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await
+                                peer.output.send_work(response.to_json(), work)
                             };
                             if result.is_err() { clients.remove(&client); }
                         }
@@ -684,13 +798,14 @@ async fn serve_described(
                         }
                     let record = frame.to_json();
                     let mut closed = Vec::new();
-                    for (id, peer) in &clients {
+                    for (id, peer) in &mut clients {
                         if peer.cloud.as_ref().is_some_and(|guard| !guard.accepts_notification(&frame)) {
                             continue;
                         }
+                        peer.active = std::time::Instant::now();
                         // Subscription replay stays in its requester's writer. Only live
                         // notifications consume each client's event queue here.
-                        if peer.output.send_event(&frame, &record).await.is_err() {
+                        if peer.output.send_event(&frame, &record).is_err() {
                             if let Some(log) = &diagnostics {
                                 log.record("executor.client_closed", serde_json::json!({"client_id":id,"reason":"event_output_capacity","stream":frame.stream,"seq":frame.seq}));
                             }
@@ -737,6 +852,14 @@ mod tests {
             .unwrap();
         let super::super::link::LinkEvent::Frame { frame, .. } = requests.recv().await.unwrap();
         drop(client);
+        // The executor learns that nobody awaits the result, but the accepted request still
+        // holds the restart boundary until its response.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            frame.authority.until_departed(),
+        )
+        .await
+        .unwrap();
         assert!(admission.freeze().is_err());
         out.send(Frame::response(
             frame.id.unwrap(),
@@ -962,7 +1085,9 @@ mod tests {
             .error
             .unwrap();
         assert!(pending_error.is(ErrorCode::SessionBusy));
-        assert_eq!(pending_error.data.unwrap()["outcome"], "unknown");
+        let pending_data = pending_error.data.unwrap();
+        assert_eq!(pending_data["outcome"], "pending");
+        assert_eq!(pending_data["retryable"], true);
         assert!(requests.try_recv().is_err());
         out.send(Frame::error_response(
             frame.id.clone().unwrap(),

@@ -187,10 +187,18 @@ pub async fn dispatch(
             _ => anyhow::bail!("unknown cloud controller method"),
         }
     }.await;
+    let refusal = || {
+        (request["method"] == "peer.connect_cloud")
+            .then(|| controller.refusal(request["params"]["peer_id"].as_str()?))
+            .flatten()
+    };
     match result {
         Ok(frame) if request["method"] == "peer.request" => frame,
         Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-        Err(error) => rejected(&id, &error.to_string()),
+        Err(error) => match refusal() {
+            Some(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
+            None => rejected(&id, &error.to_string()),
+        },
     }
 }
 

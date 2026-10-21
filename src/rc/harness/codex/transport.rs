@@ -44,7 +44,11 @@ impl Transport {
     pub async fn shutdown(&mut self) -> crate::Result<()> {
         match self {
             Self::Private(proc) => proc.shutdown().await,
-            Self::Shared(client) => client.close().await,
+            // The shared server is not this client's to stop; closing ends only the subscription.
+            Self::Shared(client) => {
+                client.close().await;
+                Ok(())
+            }
         }
     }
 

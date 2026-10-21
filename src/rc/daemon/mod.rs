@@ -130,6 +130,9 @@ struct SpawnFailure {
     error: RpcError,
     reached_launch: bool,
     release_reservation: bool,
+    /// Process groups this launch created and dropped; once they are gone nothing it started
+    /// can still write, and its reservation is released.
+    exiting: Option<crate::rc::harness::proc::LaunchGroups>,
 }
 
 impl SpawnFailure {
@@ -138,6 +141,7 @@ impl SpawnFailure {
             error,
             reached_launch: false,
             release_reservation: true,
+            exiting: None,
         }
     }
 
@@ -146,6 +150,7 @@ impl SpawnFailure {
             error,
             reached_launch: true,
             release_reservation: false,
+            exiting: None,
         }
     }
 }
@@ -1121,7 +1126,10 @@ pub struct Daemon {
     latest_session_generations: HashMap<String, u64>,
     /// Reserved logical and native identities remain exclusive while a harness opens.
     opening_sessions: HashMap<String, LaunchReservation>,
-    archive_recovering: HashMap<String, crate::rc::archive_jobs::Job>,
+    /// Reservations held only until a failed launch's process tree is gone, by logical id.
+    /// `true` once that tree outlived forced termination.
+    exiting_launches: HashMap<String, bool>,
+    archive_recovering: HashMap<String, archive_recovery::Recovering>,
     /// Read-only watch (`session.watch`) tail tasks, registered by watch stream id.
     /// `info` is kept so `session.subscribe` can subscribe to a watch stream too (replaying its
     /// ring).
@@ -1607,6 +1615,17 @@ fn require_owner_to_drive(
     .with_hint(
         "running with no checks is handing out an unsupervised shell on a real machine — what it read then is still in its context",
     ))
+}
+
+/// Tell clients whether an error clears without anyone acting, under a stable `reason`.
+fn classified(mut error: RpcError, retryable: bool, reason: &str) -> RpcError {
+    let mut data = error.data.take().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("retryable".into(), serde_json::json!(retryable));
+        fields.insert("reason".into(), serde_json::json!(reason));
+    }
+    error.data = Some(data);
+    error
 }
 
 /// `SessionBusy`: a session still open in someone else's terminal cannot be taken over (writing
@@ -2208,15 +2227,23 @@ fn negotiated_start_id(
     }
 }
 
-fn pending_start_error(start_id: &str, session_id: &str) -> RpcError {
-    RpcError::new(
+/// `in_flight`: this daemon still holds the launch, so its outcome arrives without anyone acting.
+fn pending_start_error(start_id: &str, session_id: &str, in_flight: bool) -> RpcError {
+    let error = RpcError::new(
         ErrorCode::SessionBusy,
         format!(
             "session.start {start_id} is pending with logical session {session_id}; its launch outcome is intentionally not replayed"
         ),
-    )
-    .with_hint(
-        "inspect session.list and this machine; do not choose a new start_id because that could launch a duplicate agent",
+    );
+    if in_flight {
+        return classified(error, true, "launch_in_progress");
+    }
+    classified(
+        error.with_hint(
+            "inspect session.list and this machine; do not choose a new start_id because that could launch a duplicate agent",
+        ),
+        false,
+        "start_outcome_unknown",
     )
 }
 
@@ -2229,12 +2256,16 @@ fn conflicting_start_error() -> RpcError {
 }
 
 fn lost_start_history_error() -> RpcError {
-    RpcError::new(
-        ErrorCode::SessionBusy,
-        "session.start idempotency history is unavailable on this machine",
-    )
-    .with_hint(
-        "restore ~/.agit/rc/sessions.json before starting; choosing a new start_id could launch a duplicate agent",
+    classified(
+        RpcError::new(
+            ErrorCode::SessionBusy,
+            "session.start idempotency history is unavailable on this machine",
+        )
+        .with_hint(
+            "restore ~/.agit/rc/sessions.json before starting; choosing a new start_id could launch a duplicate agent",
+        ),
+        false,
+        "start_history_lost",
     )
 }
 
@@ -2272,23 +2303,26 @@ fn resume_lineage(
     }
 }
 
+/// Native writer ownership, when it is observable; `None` leaves only transcript age.
+fn native_writer_active(runtime: &str, thread_id: &str) -> Option<bool> {
+    if runtime == "codex"
+        && let Some(active) = crate::adapter::codex_ownership::writer_active(thread_id)
+    {
+        return Some(active);
+    }
+    // A registered Claude Code process is an exact writer even while its transcript is quiet;
+    // without a registration only recency is known.
+    (runtime == "claude-code" && crate::rc::claude_inbox::session_is_live(thread_id))
+        .then_some(true)
+}
+
 /// Native writer ownership takes precedence over transcript age when it is observable.
 fn native_session_likely_active(
     runtime: &str,
     thread_id: &str,
     recent: impl FnOnce() -> bool,
 ) -> bool {
-    if runtime == "codex"
-        && let Some(active) = crate::adapter::codex_ownership::writer_active(thread_id)
-    {
-        return active;
-    }
-    // A registered Claude Code process is an exact writer even while its transcript is quiet;
-    // without a registration only recency is known.
-    if runtime == "claude-code" && crate::rc::claude_inbox::session_is_live(thread_id) {
-        return true;
-    }
-    recent()
+    native_writer_active(runtime, thread_id).unwrap_or_else(recent)
 }
 
 fn transcript_likely_active(runtime: &str, thread_id: &str, cwd: &std::path::Path) -> bool {
@@ -2301,13 +2335,13 @@ fn transcript_recently_written(runtime: &str, thread_id: &str, cwd: &std::path::
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return false;
     };
-    let Some(p) = adapter.resolve(thread_id, Some(cwd)) else {
+    let Some(p) = adapter.resolve_present(thread_id, Some(cwd)) else {
         return false;
     };
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .map(recently_written)
-        .unwrap_or(false)
+    std::fs::metadata(p).is_ok_and(|metadata| {
+        !crate::rc::writer_release::unchanged(runtime, thread_id, &metadata)
+            && metadata.modified().is_ok_and(recently_written)
+    })
 }
 
 /// Select replay coordinates and retain the source those coordinates describe.

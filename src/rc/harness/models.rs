@@ -144,7 +144,7 @@ pub(crate) async fn shared_codex_goal(
         client.send(&json!({"id":2,"method":"thread/goal/get","params":{"threadId":thread}})).await?;
         response(&mut client, 2).await
     }).await.context("Native goal read timed out")?;
-    let _ = client.close().await;
+    client.close().await;
     result
 }
 

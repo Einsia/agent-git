@@ -46,6 +46,10 @@ pub struct RuntimeSource {
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executable_origin: Option<String>,
+    /// The program an explicit registration named, before symlinks were resolved. A package
+    /// manager link keeps naming the installed version after an upgrade; its target does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<PathBuf>,
     pub socket: Option<PathBuf>,
     pub generation: u64,
     pub enabled: bool,
@@ -113,11 +117,31 @@ impl RuntimeSource {
 
     pub fn native(&self) -> crate::Result<super::native_codex::Source> {
         self.validate()?;
+        // Attaching to a running server needs no program, so an unresolved one fails only a start.
         let executable = self
-            .executable
-            .as_deref()
-            .context("this source has no Codex executable; register it with --executable")?;
-        super::native_codex::Source::new(&self.home, executable, self.socket.as_deref())
+            .launch_executable()
+            .unwrap_or_else(|| PathBuf::from("codex"));
+        super::native_codex::Source::new(&self.home, &executable, self.socket.as_deref())
+    }
+
+    /// The program that starts this source's server, resolved each time one is needed.
+    ///
+    /// A saved path can be a versioned install that an upgrade or a store prune deletes. Only an
+    /// explicit registration selects a program, and only while it exists; otherwise `codex` on
+    /// PATH is the current install, and the last observed program serves a PATH without one.
+    pub(crate) fn launch_executable(&self) -> Option<PathBuf> {
+        let existing = |path: &Path| path.is_file().then(|| path.to_path_buf());
+        let explicit = if self.executable_origin.as_deref() == Some("explicit") {
+            self.command
+                .as_deref()
+                .and_then(existing)
+                .or_else(|| self.executable.as_deref().and_then(existing))
+        } else {
+            None
+        };
+        explicit
+            .or_else(|| crate::adapter::which("codex"))
+            .or_else(|| self.executable.as_deref().and_then(existing))
     }
 
     /// Only the opaque resource reference, source ID and native ID enter the cloud catalog.
@@ -330,6 +354,11 @@ impl Registry {
         let home = home.canonicalize().context("cannot resolve runtime home")?;
         let identity = file_identity(&home)?;
         let principal = principal()?;
+        let command = executable
+            .filter(|_| !automatic)
+            .map(std::path::absolute)
+            .transpose()
+            .context("cannot resolve Codex executable")?;
         let executable = executable
             .map(|path| -> crate::Result<PathBuf> {
                 let path = path
@@ -356,24 +385,25 @@ impl Registry {
         let _lock = self.lock()?;
         let mut state = self.read()?;
         // Automatic discovery must not revive an explicitly removed or replaced source.
+        // A program is a launch setting, not transcript identity: replacing it never changes the
+        // generation that saved claims, jobs and live connections were recorded under.
         if automatic
             && let Some(source) = state.sources.iter_mut().find(|source| source.home == home)
         {
             let enrich = source.enabled
                 && source.identity.matches(&identity)
                 && source.principal == principal
-                && (source.executable.is_none()
-                    || source.executable_origin.as_deref() == Some("path"))
+                && match source.executable_origin.as_deref() {
+                    None | Some("path") => true,
+                    Some("observed") => !source.executable.as_deref().is_some_and(Path::is_file),
+                    _ => source.executable.is_none(),
+                }
                 && executable
                     .as_ref()
                     .is_some_and(|executable| Some(executable) != source.executable.as_ref());
             if enrich {
                 source.executable = executable;
                 source.executable_origin = Some("observed".into());
-                source.generation = source
-                    .generation
-                    .checked_add(1)
-                    .context("runtime source generation exhausted")?;
             }
             let source = source.clone();
             if enrich {
@@ -386,19 +416,25 @@ impl Registry {
                 && source.identity.matches(&identity)
                 && source.principal == principal
         }) {
-            let changed = !source.enabled
+            // Only re-enabling starts a new connection epoch. A name, program or endpoint is a
+            // launch setting; bumping the generation for one strands every saved capture.
+            let reenabled = !source.enabled;
+            let changed = reenabled
                 || (rename_requested && source.name != name)
                 || (executable.is_some()
                     && source.executable_origin.as_deref() != Some("explicit"))
                 || executable
                     .as_ref()
                     .is_some_and(|exe| Some(exe) != source.executable.as_ref())
+                || (command.is_some() && command != source.command)
                 || socket.is_some_and(|path| Some(path) != source.socket.as_deref());
             if changed {
-                source.generation = source
-                    .generation
-                    .checked_add(1)
-                    .context("runtime source generation exhausted")?;
+                if reenabled {
+                    source.generation = source
+                        .generation
+                        .checked_add(1)
+                        .context("runtime source generation exhausted")?;
+                }
                 source.enabled = true;
                 source.disabled_reason = None;
                 if rename_requested {
@@ -407,6 +443,7 @@ impl Registry {
                 if executable.is_some() {
                     source.executable = executable;
                     source.executable_origin = Some("explicit".into());
+                    source.command = command;
                 }
                 if socket.is_some() {
                     source.socket = socket.map(Path::to_path_buf);
@@ -450,6 +487,7 @@ impl Registry {
             executable: executable.or_else(|| {
                 crate::adapter::which("codex").and_then(|path| path.canonicalize().ok())
             }),
+            command,
             socket: socket.map(Path::to_path_buf),
             generation: 1,
             enabled: true,
@@ -815,8 +853,10 @@ mod tests {
         }
         assert_eq!(registry.list().unwrap().len(), 4);
     }
+    /// A program, name or endpoint is a launch setting: changing one keeps the generation that
+    /// saved captures were recorded under. Only re-enabling a source starts a new epoch.
     #[test]
-    fn a_launch_binding_survives_observing_its_child_but_not_explicit_replacement() {
+    fn a_launch_binding_survives_observing_its_child_and_explicit_replacement() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("native");
         std::fs::create_dir(&home).unwrap();
@@ -840,10 +880,51 @@ mod tests {
         assert_eq!(observed.generation, source.generation);
         assert_eq!(observed.executable, source.executable);
         registry.pin_for_launch(&reference).unwrap();
-        let replaced = registry.register(&home, Some(&native), None, None).unwrap();
-        assert!(replaced.generation > source.generation);
-        assert!(registry.pin_for_launch(&reference).is_err());
+        let replaced = registry
+            .register(
+                &home,
+                Some(&native),
+                Some(Path::new("/endpoint.sock")),
+                Some("Renamed"),
+            )
+            .unwrap();
+        assert_eq!(replaced.generation, source.generation);
+        registry.pin_for_launch(&reference).unwrap();
         assert_eq!(replaced.executable, Some(native.canonicalize().unwrap()));
+        assert_eq!(replaced.name, "Renamed");
+        registry.remove(&source.source_id).unwrap();
+        let reenabled = registry.register(&home, None, None, None).unwrap();
+        assert!(reenabled.generation > source.generation);
+        assert!(registry.pin_for_launch(&reference).is_err());
+    }
+
+    /// A versioned install an upgrade removed is not the program that starts the server; the
+    /// current `codex` on PATH is, and an explicit choice wins only while it still exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_program_falls_back_to_the_current_install() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("native");
+        std::fs::create_dir(&home).unwrap();
+        let old = root.path().join("old-codex");
+        std::fs::write(&old, "old").unwrap();
+        let registry = Registry::at(root.path().join("registry")).unwrap();
+        let source = registry.enroll_observed(&home, Some(&old)).unwrap();
+        std::fs::remove_file(&old).unwrap();
+        let resolved = source.launch_executable();
+        assert_ne!(resolved, source.executable);
+        assert_eq!(resolved, crate::adapter::which("codex"));
+        source.native().unwrap();
+        let current = root.path().join("new-codex");
+        std::fs::write(&current, "new").unwrap();
+        let updated = registry.enroll_observed(&home, Some(&current)).unwrap();
+        assert_eq!(updated.generation, source.generation);
+        assert_eq!(updated.executable, Some(current.canonicalize().unwrap()));
+        let link = root.path().join("explicit-codex");
+        std::os::unix::fs::symlink(&current, &link).unwrap();
+        let explicit = registry.register(&home, Some(&link), None, None).unwrap();
+        assert_eq!(explicit.generation, source.generation);
+        assert_eq!(explicit.launch_executable(), Some(link));
     }
 
     #[test]

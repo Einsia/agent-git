@@ -67,8 +67,12 @@ impl Store {
 /// Map a path to a filename-safe key.
 ///
 /// Every non-alphanumeric character becomes `-`, so `/my/app` and `/my-app` collide into the
-/// same slug. That is acceptable: the slug only points Claude Code at a project directory, and
-/// the source of truth for which project a session belongs to is the cwd recorded in the link.
+/// same slug. That is acceptable: the source of truth for which project a session belongs to is
+/// the cwd recorded in the link.
+///
+/// This is the lexical key, not Claude Code's project directory name: Claude counts UTF-16 code
+/// units and hashes long paths (`adapter::claude_code::slug_for`). Readers of Claude transcripts
+/// also check this key, because installed transcripts may sit under it.
 pub fn slug_for(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::with_capacity(s.len());

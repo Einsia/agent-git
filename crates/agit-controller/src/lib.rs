@@ -148,6 +148,7 @@ impl Request {
 struct Peer {
     route_key: String,
     authority: Authority,
+    refusal: Arc<std::sync::OnceLock<Value>>,
     budget: Arc<tokio::sync::Semaphore>,
     requests: mpsc::Sender<Request>,
     status: watch::Receiver<Status>,
@@ -234,6 +235,36 @@ impl Controller {
             .peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut fingerprint = fingerprint;
+        // A refused route never dials again, so an explicit connect starts it anew under the
+        // executor identity it already learned. A peer rejected for a changed identity stays
+        // rejected: replacing it would forget the pin.
+        if let Some(peer) = peers
+            .get(&id)
+            .filter(|peer| peer.task.is_finished() && peer.refusal.get().is_some())
+            .cloned()
+        {
+            ensure!(
+                peer.route_key == route_key && peer.authority == authority,
+                "peer configuration changed; disconnect it before replacing its configuration"
+            );
+            let learned = peer
+                .status
+                .borrow()
+                .description
+                .as_ref()
+                .and_then(|description| {
+                    description["machine"]["machine_fingerprint"]
+                        .as_str()
+                        .map(str::to_owned)
+                });
+            ensure!(
+                fingerprint.is_none() || learned.is_none() || fingerprint == learned,
+                "peer fingerprint changed"
+            );
+            fingerprint = fingerprint.or(learned);
+            peers.remove(&id);
+        }
         if let Some(peer) = peers.get(&id) {
             ensure!(
                 peer.route_key == route_key && peer.authority == authority,
@@ -263,6 +294,7 @@ impl Controller {
         let (requests, receiver) = mpsc::channel(MAX_PENDING);
         let worker = self.worker.clone();
         let events = self.events.clone();
+        let refusal = Arc::new(std::sync::OnceLock::new());
         let task = tokio::spawn(peer::run(
             worker,
             route,
@@ -271,12 +303,14 @@ impl Controller {
             status_tx,
             events,
             self.event_budget.clone(),
+            refusal.clone(),
         ));
         peers.insert(
             id,
             Arc::new(Peer {
                 route_key,
                 authority,
+                refusal,
                 budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
                 requests,
                 status: status_rx,
@@ -293,6 +327,12 @@ impl Controller {
             .get(id)
             .cloned()
             .context("unknown peer")
+    }
+
+    /// The executor's RPC error when it refused this route permanently. Requests on the route
+    /// are answered with it, so hosts can forward it to callers as a terminal condition.
+    pub fn refusal(&self, id: &str) -> Option<Value> {
+        self.peer(id).ok()?.refusal.get().cloned()
     }
 
     pub fn list(&self) -> Vec<Status> {
@@ -412,6 +452,13 @@ impl Controller {
                     .await;
             }
         }
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.outcome == "not_sent")
+            && let Some(error) = self.refusal(&target.peer_id)
+        {
+            return Ok(refused(&operation_id, error));
+        }
         result.map_err(|mut failure| {
             failure.operation_id = operation_id;
             failure
@@ -438,6 +485,9 @@ impl Controller {
         let peer = self
             .peer(&target.peer_id)
             .map_err(|e| failure("not_sent", e.to_string()))?;
+        if let Some(error) = peer.refusal.get() {
+            return Ok(refused(&id, error.clone()));
+        }
         if peer.status.borrow().route_id != target.route_id {
             return Err(failure(
                 "not_sent",
@@ -479,6 +529,11 @@ impl Controller {
             )
         })?
     }
+}
+
+/// A refused route answers as the executor did, so callers see its code and retry policy.
+fn refused(id: &str, error: Value) -> Value {
+    serde_json::json!({"jsonrpc":"2.0","id":id,"error":error})
 }
 
 fn is_read(method: &str) -> bool {

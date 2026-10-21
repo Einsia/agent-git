@@ -219,19 +219,22 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         })
         .collect();
     let owner_id = describe.id.clone();
-    let owner_reader = tokio::spawn(async move {
+    let mut owner_reader = tokio::spawn(async move {
         owner
             .get_mut()
             .write_all(format!("{}\n", describe.to_json()).as_bytes())
             .await
             .unwrap();
-        let mut received_last = false;
-        let mut replied = false;
-        while !received_last || !replied {
+        let (mut received_final, mut replied, mut previous) = (false, false, 0);
+        while !received_final || !replied {
             let mut record = String::new();
             owner.read_line(&mut record).await.unwrap();
             let frame: Frame = serde_json::from_str(&record).unwrap();
-            received_last |= frame.seq == Some(last);
+            if let Some(seq) = frame.seq {
+                assert!(seq > previous, "the owner saw its stream out of order");
+                previous = seq;
+            }
+            received_final |= frame.seq == Some(last + 1);
             replied |= frame.id == owner_id;
         }
         owner
@@ -239,10 +242,6 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     for frame in &retained {
         out.send(frame.clone());
     }
-    let mut owner = tokio::time::timeout(Duration::from_secs(5), owner_reader)
-        .await
-        .unwrap()
-        .unwrap();
     let describe = Frame::request("machine.describe", json!({}));
     sink.send(Packet::Text(describe.to_json())).await.unwrap();
     let mut next_seq = first;
@@ -251,10 +250,14 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     let mut final_event = Frame::notification("turn.completed", json!({"outcome":"completed"}));
     final_event.stream = Some("visible".into());
     final_event.seq = Some(last + 1);
+    out.send(final_event.clone());
+    // Both readers lag behind the burst; each recovers from the journal independently.
+    let replays = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut owner = None;
     let catch_up = async {
-        while next_seq <= last + 1 || !replied {
+        while next_seq <= last + 1 || !replied || owner.is_none() {
             tokio::select! {
-                frame = receive(&mut source) => {
+                frame = receive(&mut source), if next_seq <= last + 1 || !replied => {
                     if frame.id == describe.id {
                         assert!(next_seq <= last, "control receipt waited behind the backfill");
                         replied = true;
@@ -263,6 +266,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
                         next_seq += 1;
                     }
                 }
+                finished = &mut owner_reader, if owner.is_none() => owner = Some(finished.unwrap()),
                 request = requests.recv() => {
                     let Some(crate::rc::link::LinkEvent::Frame { frame, .. }) = request else { panic!("missing journal recovery") };
                     assert_eq!(frame.method(), "session.subscribe");
@@ -270,14 +274,12 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
                     let after = frame.params.as_ref().unwrap()["after_seq"].as_u64().unwrap();
                     assert!(after >= first && after <= last);
                     let mut frames: Vec<_> = retained.iter().filter(|frame| frame.seq.unwrap() > after).cloned().collect();
-                    if recovered > 0 { frames.push(final_event.clone()); }
-                    let through = if recovered > 0 { last + 1 } else { last };
+                    frames.push(final_event.clone());
                     out.send_replay_response(
-                        Frame::response(frame.id.clone().unwrap(), json!({"session":{"last_seq":through},"from_seq":after+1})),
+                        Frame::response(frame.id.clone().unwrap(), json!({"session":{"last_seq":last + 1},"from_seq":after+1})),
                         frames,
-                        slots.clone().try_acquire_owned().unwrap(),
+                        replays.clone().try_acquire_owned().unwrap(),
                     );
-                    if recovered == 0 { out.send(final_event.clone()); }
                     recovered += 1;
                 }
             }
@@ -287,13 +289,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         .await
         .unwrap();
     assert!(recovered >= 1, "burst must exercise journal recovery");
-    // The owner already received the terminal turn event through normal fanout.
-    response.clear();
-    owner.read_line(&mut response).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Frame>(&response).unwrap().seq,
-        Some(last + 1)
-    );
+    let mut owner = owner.unwrap();
 
     for (method, params) in [
         ("session.history", json!({"session_id":"hidden"})),
@@ -346,19 +342,11 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
 #[tokio::test]
 async fn exhausted_cloud_output_closes_only_its_client_without_waiting() {
     let (stop, mut stopped) = watch::channel(());
-    let (output, _receiver) = ClientOutput::channel(Some(stop));
+    let (output, _receiver) = ClientOutput::channel(stop);
     for _ in 0..super::super::CLIENT_QUEUE {
         output.try_send("first".into()).unwrap();
     }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            output.send_timeout("second".into(), Duration::from_secs(30))
-        )
-        .await
-        .unwrap()
-        .is_err()
-    );
+    assert!(output.try_send("second".into()).is_err());
     stopped.changed().await.unwrap();
 }
 
@@ -511,4 +499,121 @@ async fn renewal_recovers_transport_failure_but_refusal_revokes_before_queued_cl
             .is_err()
     );
     server.await.unwrap();
+}
+
+/// A permanently refused controller learns why over its authenticated tunnel: its route stops
+/// dialing and every request on it is answered with the executor's code and retry policy. If the
+/// daemon closed the tunnel unanswered, or the controller treated the refusal as a transport
+/// failure, the route would back off and redial, and requests would fail as retryable `not_sent`.
+#[tokio::test]
+async fn a_refused_controller_stops_redialing_and_reports_the_executor_error() {
+    use agit_controller::{Authority, Connector, Opening};
+
+    struct Once(std::sync::Mutex<Option<agit_tunnel::Connection>>);
+    impl Connector for Once {
+        fn key(&self) -> &str {
+            "refused-project"
+        }
+        fn authority(&self) -> Authority {
+            Authority::CloudProjectController
+        }
+        fn open<'a>(&'a self, _: &'a agit_controller::Worker) -> Opening<'a> {
+            let connection = self.0.lock().unwrap().take();
+            Box::pin(async move { connection.context("the route was dialed again") })
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(directory.path().join("owner.sock")).unwrap();
+    let principal = Principal {
+        issuer: "https://cloud.example".into(),
+        account_id: "operator".into(),
+    };
+    let (admission, incoming) = mpsc::channel(1);
+    let ingress = Ingress::fixed(incoming, ingress::Registry::fixed(Policy::default()));
+    let (_out, outbound) = crate::rc::outbound::channel();
+    let (events, _requests) = mpsc::channel(16);
+    let server = tokio::spawn(super::super::serve_described(
+        listener,
+        outbound,
+        events,
+        json!({}),
+        crate::rc::peers::controller().unwrap(),
+        None,
+        Some(ingress),
+        super::super::Admission::default(),
+        None,
+    ));
+    let source_identity = Identity::generate().unwrap();
+    let target_identity = Identity::generate().unwrap();
+    let device = |id: &str, identity: &Identity| Device {
+        id: id.into(),
+        machine_id: id.into(),
+        display_name: id.into(),
+        owner: principal.clone(),
+        certificate: identity.certificate().clone(),
+        credential_epoch: 1,
+    };
+    let grant = ConnectionGrant {
+        id: "unbound-project".into(),
+        caller: principal.clone(),
+        source: device("controller", &source_identity),
+        target: device("executor", &target_identity),
+        expires_at_ms: i64::MAX,
+        session_controller: None,
+        project_controller: Some(agit_peer::cloud::ProjectController {
+            project_id: "unbound".into(),
+            local_path: "/unbound".into(),
+            generation: 1,
+            access: Access::Admin,
+        }),
+    };
+    let (source, target) = tokio::io::duplex(65536);
+    let (source, target) = tokio::join!(
+        source_identity.connect(target_identity.certificate(), source),
+        target_identity.accept(source_identity.certificate(), target),
+    );
+    let (_lifetime, stopped) = watch::channel(());
+    assert!(
+        admission
+            .send(host::Authenticated {
+                connection: framed(0, target.unwrap()),
+                grant,
+                stopped,
+                renewal: None,
+            })
+            .await
+            .is_ok()
+    );
+    let controller = agit_controller::Controller::new(agit_controller::Worker {
+        executable: Default::default(),
+        args: vec![],
+    });
+    let route = Once(std::sync::Mutex::new(Some(framed(0, source.unwrap()))));
+    controller
+        .connect_with("executor".into(), Arc::new(route), None)
+        .unwrap();
+    assert!(
+        controller
+            .ready("executor", Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        controller.list()[0].state,
+        agit_controller::State::Rejected
+    ));
+    let reply = controller
+        .request(
+            "executor",
+            "session.list".into(),
+            json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["error"]["code"], ErrorCode::WorkspaceNotFound.code());
+    assert_eq!(reply["error"]["data"]["retryable"], false);
+    assert_eq!(reply["error"]["data"]["reason"], "project_unavailable");
+    server.abort();
 }

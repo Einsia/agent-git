@@ -11,7 +11,7 @@
 //! One directory per date, **with no project information in the path**. Direct consequence:
 //! finding "the sessions that belong to a repo" means opening each file and reading
 //! `session_meta.cwd`. This is the most important structural difference from Claude Code, and it
-//! is why `read_head` exists.
+//! is why `primary_meta` reads only the first record.
 //!
 //! Every line is `{type, payload}`. The types that matter: `session_meta` (cwd/id),
 //! `response_item` (message / function_call / custom_tool_call / reasoning), `event_msg` +
@@ -78,67 +78,67 @@ pub(super) fn sessions_root() -> Result<PathBuf> {
     Ok(codex_home()?.join("sessions"))
 }
 
-/// Read only the leading bytes of a file.
-///
-/// **This function is performance-critical.** `session_meta` is always on the first line, while a
-/// transcript can run to tens of MB. Reading the whole file degrades "list the sessions that
-/// belong to this repo" to minutes on a machine with many sessions (especially with
-/// `$CODEX_HOME` on a network filesystem).
-fn read_head(path: &Path, bytes: usize) -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; bytes];
-    let n = f.read(&mut buf).ok()?;
-    buf.truncate(n);
-    // The cut can land inside a multi-byte character, so decode lossily (`from_utf8` would fail
-    // on the whole buffer).
-    Some(String::from_utf8_lossy(&buf).to_string())
-}
-
 /// Parse (id, cwd) out of the file header.
+///
+/// **This function is performance-critical.** `session_meta` is always the first record, while
+/// a transcript can run to hundreds of MB. Reading only that record keeps "list the sessions that
+/// belong to this repo" proportional to the number of files, and a compressed carrier is decoded
+/// only that far.
 fn primary_meta(path: &Path, choices_only: bool) -> Option<(String, String)> {
-    let head = read_head(path, 8192)?;
-    for line in head.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            // The last line of the header can be cut off by `read_head`; a parse failure here
-            // is expected.
-            continue;
-        };
-        if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
-            continue;
-        }
-        let p = v.get("payload")?;
-        if choices_only
-            && p.pointer("/source/subagent/other").and_then(|v| v.as_str()) == Some("guardian")
-        {
-            return None;
-        }
-        let cwd = p.get("cwd").and_then(|x| x.as_str()).unwrap_or("");
-        if cwd.is_empty() {
-            return None;
-        }
-        let id = p
-            .get("id")
-            .and_then(|x| x.as_str())
-            .map(String::from)
-            .or_else(|| id_from_filename(path))?;
-        return Some((id, cwd.to_string()));
+    let head = super::codex_rollout::first_line(path, super::codex_rollout::HEADER_LIMIT).ok()?;
+    let v = serde_json::from_slice::<serde_json::Value>(&head).ok()?;
+    if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
+        return None;
     }
-    None
+    let p = v.get("payload")?;
+    if choices_only
+        && p.pointer("/source/subagent/other").and_then(|v| v.as_str()) == Some("guardian")
+    {
+        return None;
+    }
+    let cwd = p.get("cwd").and_then(|x| x.as_str()).unwrap_or("");
+    if cwd.is_empty() {
+        return None;
+    }
+    let id = p
+        .get("id")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .or_else(|| id_from_filename(path))?;
+    Some((id, cwd.to_string()))
 }
 
-/// Take the uuid out of `rollout-2026-07-25T18-20-01-<uuid>.jsonl`.
+/// Take the rollout id out of `rollout-2026-07-25T18-20-01-<uuid>.jsonl`.
 ///
 /// The uuid is the last five `-`-separated segments (8-4-4-4-12); the timestamp is in front of it.
+/// A paginated segment is named `…-<thread>_<uuid>.jsonl`, and the `history_base` of the segment
+/// after it names it by that trailing uuid; reading the thread half instead breaks every lineage
+/// longer than one segment. A compressed `….jsonl.zst` carrier has the id of its plain name.
 pub(super) fn id_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let plain = super::codex_rollout::plain_path(path);
+    let stem = plain.file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 5 {
         return None;
     }
-    Some(parts[parts.len() - 5..].join("-"))
+    let mut id = parts[parts.len() - 5..].join("-");
+    if let Some((_, segment)) = id.split_once('_') {
+        id = segment.to_owned();
+    }
+    Some(id)
 }
 
+/// Last resort without the index: the filename `rollout-<ISO>-<uuid>.jsonl` embeds the id.
+///
+/// The carrier as it is on disk, which is compressed while the rollout is cold.
+fn rollout_carrier(session_id: &str) -> Option<PathBuf> {
+    all_rollouts(&sessions_root().ok()?)
+        .into_iter()
+        .find(|p| id_from_filename(p).as_deref() == Some(session_id))
+}
+
+/// Every rollout carrier, cold ones included: a listing that skipped compressed rollouts
+/// would lose most dormant conversations.
 fn all_rollouts(root: &Path) -> Vec<PathBuf> {
     if !root.exists() {
         return vec![];
@@ -148,7 +148,7 @@ fn all_rollouts(root: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .filter(|p| super::codex_rollout::is_carrier(p))
         .collect()
 }
 
@@ -419,6 +419,249 @@ pub(crate) fn lineage_bytes_with_lookup(
     Ok(bytes)
 }
 
+/// One carrier byte range inside a capture stream.
+#[cfg(feature = "rc")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureSpan {
+    pub path: PathBuf,
+    /// The carrier offsets this span copies.
+    pub file: std::ops::Range<u64>,
+    pub stream_start: u64,
+}
+
+/// Where a carrier prefix ends in a capture stream, or `None` when the stream does not hold it.
+#[cfg(feature = "rc")]
+pub(crate) fn capture_offset(spans: &[CaptureSpan], path: &Path, end: u64) -> Option<u64> {
+    spans
+        .iter()
+        .find(|span| span.path == path && span.file.start < end && end <= span.file.end)
+        .map(|span| span.stream_start + (end - span.file.start))
+}
+
+#[cfg(feature = "rc")]
+struct CaptureNode {
+    path: PathBuf,
+    parts: RolloutParts,
+    history: Option<HistoryPoint>,
+    body_len: usize,
+    complete_len: usize,
+    same_thread: bool,
+}
+
+/// The capture of a Codex conversation: every complete record its own segments wrote, in order,
+/// after the fixed prefix of any thread it was forked from.
+///
+/// A segment's `history_base` decides what the model sees next, and it can start before the end
+/// of the previous segment of the same thread when Codex rewinds that thread. Records after such
+/// a cut stay in the capture: they were written, may already be settled, and settled history is
+/// append-only. A fork parent keeps its cut, because what the parent wrote later belongs to the
+/// parent. The stream is led by the first segment's header, so a later segment never changes the
+/// bytes that a settled prefix covers.
+///
+/// With `full` false only headers and lengths are read: the spans are exact and the bytes empty.
+#[cfg(feature = "rc")]
+pub(crate) fn capture_lineage_with_lookup(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+    full: bool,
+    lookup: impl Fn(
+        &str,
+        super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
+) -> super::native_snapshot::Result<(Vec<u8>, Vec<CaptureSpan>)> {
+    use super::native_snapshot::Unavailable;
+
+    let mut visited = HashSet::new();
+    let mut nodes: Vec<CaptureNode> = Vec::new();
+    let mut current = source.clone();
+    let mut retained = 0usize;
+    loop {
+        let rollout_id = id_from_filename(&current.path).ok_or(Unavailable::Incomplete)?;
+        if nodes.len() >= MAX_FORK_DEPTH || !visited.insert(rollout_id) {
+            return Err(Unavailable::Incomplete);
+        }
+        let (bytes, file_len) = if full {
+            let bytes = super::native_snapshot::read_file_bytes(&current.path, limits)?;
+            let len = bytes.len();
+            (bytes, len)
+        } else {
+            capture_header(&current.path)?
+        };
+        retained = retained
+            .checked_add(bytes.len())
+            .ok_or(Unavailable::BudgetExceeded)?;
+        if retained > limits.working_bytes {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        let expected_thread_id = nodes.is_empty().then_some(source.session_id.as_str());
+        let (parts, history) =
+            split_rollout(bytes, expected_thread_id).map_err(|_| Unavailable::Incomplete)?;
+        let body_len = file_len
+            .checked_sub(parts.header.len())
+            .ok_or(Unavailable::Incomplete)?;
+        let complete_len = if full {
+            parts
+                .body
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        } else {
+            complete_body_len(&current.path, parts.header.len(), file_len)?
+        };
+        let same_thread = nodes.last().is_none_or(|node| node.same_thread)
+            && header_thread(&parts.header).as_deref() == Some(source.session_id.as_str());
+        let next = history.as_ref().map(|point| point.source_id.clone());
+        nodes.push(CaptureNode {
+            path: current.path.clone(),
+            parts,
+            history,
+            body_len,
+            complete_len,
+            same_thread,
+        });
+        let Some(next) = next else {
+            break;
+        };
+        current = lookup(
+            &next,
+            super::native_snapshot::Limits {
+                lookup_entries: limits.lookup_entries.saturating_sub(visited.len()),
+                ..limits
+            },
+        )?;
+    }
+
+    let first = nodes
+        .iter()
+        .rposition(|node| node.same_thread)
+        .ok_or(Unavailable::Incomplete)?;
+    // (node, header or body, kept body length)
+    let mut pieces = vec![(first, true, nodes[first].parts.header.len())];
+    for index in (0..nodes.len()).rev() {
+        let node = &nodes[index];
+        let kept = if index == 0 {
+            node.body_len
+        } else {
+            let history = nodes[index - 1]
+                .history
+                .as_ref()
+                .ok_or(Unavailable::Incomplete)?;
+            let cut = usize::try_from(history.byte_offset)
+                .ok()
+                .and_then(|offset| offset.checked_sub(node.parts.header.len()))
+                .filter(|cut| *cut <= node.complete_len)
+                .ok_or(Unavailable::Incomplete)?;
+            if full {
+                let mut unlimited = None;
+                if validated_prefix_end(&node.parts, history, &mut unlimited)? != cut {
+                    return Err(Unavailable::Incomplete);
+                }
+            }
+            if node.same_thread {
+                node.complete_len
+            } else {
+                cut
+            }
+        };
+        pieces.push((index, false, kept));
+    }
+
+    let output_limits = super::native_snapshot::Limits {
+        working_bytes: limits
+            .working_bytes
+            .checked_sub(retained)
+            .ok_or(Unavailable::BudgetExceeded)?,
+        ..limits
+    };
+    let mut bytes = Vec::new();
+    let mut spans = Vec::with_capacity(pieces.len());
+    let mut stream = 0u64;
+    for (index, header, kept) in pieces {
+        let node = &nodes[index];
+        let header_len = node.parts.header.len() as u64;
+        let file = if header {
+            0..header_len
+        } else {
+            header_len..header_len + kept as u64
+        };
+        if full {
+            let slice = if header {
+                &node.parts.header[..]
+            } else {
+                &node.parts.body[..kept]
+            };
+            append_bounded(&mut bytes, slice, output_limits)?;
+        } else if stream + kept as u64 > limits.bytes as u64 {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        spans.push(CaptureSpan {
+            path: node.path.clone(),
+            file,
+            stream_start: stream,
+        });
+        stream += kept as u64;
+    }
+    Ok((bytes, spans))
+}
+
+#[cfg(feature = "rc")]
+fn header_thread(header: &[u8]) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(header.strip_suffix(b"\n").unwrap_or(header)).ok()?;
+    value
+        .pointer("/payload/id")
+        .and_then(|id| id.as_str())
+        .map(str::to_owned)
+}
+
+/// A carrier's header line and current length, without reading its records.
+#[cfg(feature = "rc")]
+fn capture_header(path: &Path) -> super::native_snapshot::Result<(Vec<u8>, usize)> {
+    use super::native_snapshot::Unavailable;
+    use std::io::BufRead;
+    const MAX_HEADER_BYTES: u64 = 1024 * 1024;
+    let file = std::fs::File::open(path).map_err(|_| Unavailable::Read)?;
+    let len = file.metadata().map_err(|_| Unavailable::Read)?.len();
+    let mut header = Vec::new();
+    std::io::BufReader::new(std::io::Read::take(file, MAX_HEADER_BYTES))
+        .read_until(b'\n', &mut header)
+        .map_err(|_| Unavailable::Read)?;
+    if header.last() != Some(&b'\n') {
+        return Err(Unavailable::Incomplete);
+    }
+    Ok((
+        header,
+        usize::try_from(len).map_err(|_| Unavailable::BudgetExceeded)?,
+    ))
+}
+
+/// The body length through the carrier's last complete record.
+#[cfg(feature = "rc")]
+fn complete_body_len(
+    path: &Path,
+    header_len: usize,
+    file_len: usize,
+) -> super::native_snapshot::Result<usize> {
+    use super::native_snapshot::Unavailable;
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path).map_err(|_| Unavailable::Read)?;
+    let mut end = file_len;
+    let mut buffer = vec![0; CHUNK];
+    while end > header_len {
+        let start = end.saturating_sub(CHUNK).max(header_len);
+        let chunk = &mut buffer[..end - start];
+        file.seek(SeekFrom::Start(start as u64))
+            .map_err(|_| Unavailable::Read)?;
+        file.read_exact(chunk).map_err(|_| Unavailable::Read)?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + index + 1 - header_len);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
 /// Pending observation uses the captured history while retaining an incomplete leaf tail for
 /// the caller to distinguish active writes from settled-prefix damage.
 /// Parent-prefix validation shares an admission allowance across ancestors; the caller separately
@@ -444,9 +687,11 @@ fn lineage_snapshot(
 
 /// Inspection reads a unique rollout directly; opening a native index may create WAL sidecars.
 #[cfg(feature = "cli")]
+///
+/// A cold rollout resolves to its compressed carrier; readers decode it rather than restore it.
 pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
     super::unique_native_file(&sessions_root()?, usize::MAX, |path| {
-        path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        super::codex_rollout::is_carrier(path)
             && id_from_filename(path).as_deref() == Some(session_id)
     })
 }
@@ -543,7 +788,8 @@ fn scan_all_sessions(choices_only: bool) -> Result<Vec<SessionRef>> {
         out.push(SessionRef {
             title: None,
             id,
-            path: p,
+            // The plain name, as the index names a cold rollout; resolving restores it.
+            path: super::codex_rollout::plain_path(&p),
             runtime: "codex",
             cwd: Some(cwd),
             mtime,
@@ -609,7 +855,8 @@ impl Adapter for Codex {
     /// List the sessions whose cwd equals `repo`.
     ///
     /// The cost is linear in the **total** number of sessions (every header is read to decide its
-    /// cwd). `read_head` holds the per-file cost down to 8KB, but the file count is unavoidable.
+    /// cwd). `primary_meta` holds the per-file cost to the first record, but the file count is
+    /// unavoidable.
     /// So callers stay restrained: use it only in commands the user triggers, such as `doctor` and
     /// `push`.
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
@@ -677,16 +924,21 @@ impl Adapter for Codex {
     /// information.
     fn resolve(&self, session_id: &str, _cwd: Option<&Path>) -> Option<PathBuf> {
         if let Some(t) = super::codex_index::thread_by_id(session_id)
+            && let Ok(path) = super::codex_rollout::restore(&t.rollout_path)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+        super::codex_rollout::restore(&rollout_carrier(session_id)?).ok()
+    }
+
+    fn resolve_present(&self, session_id: &str, _cwd: Option<&Path>) -> Option<PathBuf> {
+        if let Some(t) = super::codex_index::thread_by_id(session_id)
             && t.rollout_path.is_file()
         {
             return Some(t.rollout_path);
         }
-        // Last resort: the filename has the form `rollout-<ISO>-<uuid>.jsonl`, with the id
-        // embedded in it.
-        let root = sessions_root().ok()?;
-        all_rollouts(&root)
-            .into_iter()
-            .find(|p| id_from_filename(p).as_deref() == Some(session_id))
+        rollout_carrier(session_id).filter(|path| !super::codex_rollout::is_compressed(path))
     }
 
     fn snapshot_native_readonly(
@@ -1772,6 +2024,129 @@ mod tests {
         );
     }
 
+    /// A paginated thread continues through segments named `<thread>_<segment>`, each pointing at
+    /// the previous segment by that segment's own id, and Codex compresses whichever of them go
+    /// cold. Matching the thread half of a segment name, or only plain carriers, leaves the leaf
+    /// without its history.
+    #[test]
+    fn lineage_crosses_segments_into_a_compressed_root() {
+        use super::super::native_snapshot::{Limits, Source, lookup_codex_rollout_in};
+
+        let home = tempfile::tempdir().unwrap();
+        let thread = "40404040-4040-4040-8040-404040404040";
+        let middle = "50505050-5050-4050-8050-505050505050";
+        let leaf = "60606060-6060-4060-8060-606060606060";
+        let root_path = rollout_path(home.path(), thread);
+        let middle_path = rollout_path(home.path(), &format!("{thread}_{middle}"));
+        let leaf_path = rollout_path(home.path(), &format!("{thread}_{leaf}"));
+        std::fs::create_dir_all(root_path.parent().unwrap()).unwrap();
+        let root_body = record(1, "user", "root");
+        let root_prefix = format!("{}{root_body}", header(thread, 0, None));
+        std::fs::write(
+            root_path.with_extension("jsonl.zst"),
+            ruzstd::encoding::compress_to_vec(
+                root_prefix.as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let middle_body = record(3, "assistant", "middle");
+        let middle_prefix = format!(
+            "{}{middle_body}",
+            header(thread, 2, Some((thread, 2, root_prefix.len())))
+        );
+        std::fs::write(&middle_path, &middle_prefix).unwrap();
+        let leaf_header = header(thread, 4, Some((middle, 4, middle_prefix.len())));
+        let leaf_body = record(5, "user", "leaf");
+        std::fs::write(&leaf_path, format!("{leaf_header}{leaf_body}")).unwrap();
+
+        let source = Source {
+            runtime: "codex",
+            session_id: thread.into(),
+            path: leaf_path,
+            database: false,
+        };
+        let bytes =
+            lineage_bytes_with_lookup(&source, Limits::default(), false, None, |id, limits| {
+                lookup_codex_rollout_in(home.path(), id, limits)
+            })
+            .unwrap();
+        assert_eq!(
+            bytes,
+            format!("{leaf_header}{root_body}{middle_body}{leaf_body}").as_bytes()
+        );
+        assert_eq!(std::fs::read_to_string(&root_path).unwrap(), root_prefix);
+    }
+
+    /// A capture never loses what a thread already wrote: when a later segment of the same
+    /// thread starts its history before the end of the previous one, the records after that cut
+    /// stay, and the stream keeps the thread's first header. A fork child still takes only its
+    /// parent's prefix. Header-only spans place every carrier where a full read puts it, so a
+    /// boundary recorded against an earlier segment maps into the current stream.
+    #[test]
+    fn capture_keeps_a_rewound_segment_tail_and_maps_every_carrier() {
+        use super::super::native_snapshot::{Limits, Source, lookup_codex_rollout_in};
+
+        let home = tempfile::tempdir().unwrap();
+        let thread = "70707070-7070-4070-8070-707070707070";
+        let segment = "80808080-8080-4080-8080-808080808080";
+        let fork = "90909090-9090-4090-8090-909090909090";
+        let root_path = rollout_path(home.path(), thread);
+        let segment_path = rollout_path(home.path(), &format!("{thread}_{segment}"));
+        let fork_path = rollout_path(home.path(), fork);
+        std::fs::create_dir_all(root_path.parent().unwrap()).unwrap();
+        let root_header = header(thread, 0, None);
+        let kept = record(1, "user", "kept");
+        let rewound = record(2, "user", "interrupted and replaced");
+        let cut = root_header.len() + kept.len();
+        std::fs::write(&root_path, format!("{root_header}{kept}{rewound}")).unwrap();
+        let segment_header = header(thread, 2, Some((thread, 2, cut)));
+        let replacement = record(3, "user", "replacement");
+        std::fs::write(&segment_path, format!("{segment_header}{replacement}")).unwrap();
+        let fork_header = header(fork, 2, Some((thread, 2, cut)));
+        let child = record(3, "user", "child");
+        std::fs::write(&fork_path, format!("{fork_header}{child}")).unwrap();
+
+        let capture = |id: &str, path: &PathBuf, full: bool| {
+            let source = Source {
+                runtime: "codex",
+                session_id: id.into(),
+                path: path.clone(),
+                database: false,
+            };
+            capture_lineage_with_lookup(&source, Limits::default(), full, |id, limits| {
+                lookup_codex_rollout_in(home.path(), id, limits)
+            })
+            .unwrap()
+        };
+        let (bytes, spans) = capture(thread, &segment_path, true);
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!("{root_header}{kept}{rewound}{replacement}")
+        );
+        assert_eq!(capture(thread, &segment_path, false).1, spans);
+        let root_len = std::fs::metadata(&root_path).unwrap().len();
+        assert_eq!(capture_offset(&spans, &root_path, root_len), Some(root_len));
+        let segment_len = std::fs::metadata(&segment_path).unwrap().len();
+        assert_eq!(
+            capture_offset(&spans, &segment_path, segment_len),
+            Some(bytes.len() as u64)
+        );
+        assert_eq!(capture_offset(&spans, &fork_path, 1), None);
+
+        let (bytes, spans) = capture(fork, &fork_path, true);
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!("{fork_header}{kept}{child}")
+        );
+        let fork_len = std::fs::metadata(&fork_path).unwrap().len();
+        assert_eq!(
+            capture_offset(&spans, &fork_path, fork_len),
+            Some(bytes.len() as u64)
+        );
+        assert_eq!(capture_offset(&spans, &root_path, root_len), None);
+    }
+
     #[test]
     fn fork_snapshot_places_the_fixed_parent_prefix_before_child_history() {
         let _environment = crate::infra::config::env_lock();
@@ -2096,6 +2471,13 @@ mod tests {
         assert_eq!(
             id_from_filename(p).unwrap(),
             "019f9a81-6fc8-7c41-8280-2d8e6dabe93f"
+        );
+        let segment = Path::new(
+            "rollout-2026-09-14T18-37-11-01a08c11-12a4-7201-9147-4c3b5eb2316a_01a09f7e-075b-7761-83c4-adabae22bc12.jsonl.zst",
+        );
+        assert_eq!(
+            id_from_filename(segment).unwrap(),
+            "01a09f7e-075b-7761-83c4-adabae22bc12"
         );
     }
 

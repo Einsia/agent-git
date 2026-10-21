@@ -669,6 +669,12 @@ pub struct NativeSourceRef {
 }
 
 impl NativeSourceRef {
+    /// Saved claims, jobs and roster rows name a transcript by store, not by connection epoch.
+    /// Comparing whole references here would orphan every record saved before a generation bump.
+    pub fn same_store(left: Option<&Self>, right: Option<&Self>) -> bool {
+        left.map(|source| &source.source_id) == right.map(|source| &source.source_id)
+    }
+
     pub fn session_ref(&self, native: &str) -> String {
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();

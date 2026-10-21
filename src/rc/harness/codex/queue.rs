@@ -22,12 +22,11 @@ impl CodexDriver {
             &registry,
             &request.source.source_id,
         )?;
+        // The attached server's home, not the generation saved when it attached, proves the store.
         anyhow::ensure!(
-            context.source.generation == request.source.generation
-                && self
-                    .source
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.home() == context.source.home),
+            self.source
+                .as_ref()
+                .is_some_and(|runtime| runtime.home() == context.source.home),
             "runtime source changed before queue delivery"
         );
         let thread = context.locate(

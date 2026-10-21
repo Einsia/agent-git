@@ -8,10 +8,25 @@ use std::{
 };
 use tokio::{sync::Notify, time::Instant};
 
+/// A cursor costs a few words, so a reader may lag on every stream it can see.
+const MAX_LAGGED_STREAMS: usize = 1024;
+/// Recovery requests share the client's request admission with its own RPCs.
+const MAX_RECOVERY_REQUESTS: usize = 8;
+const MAX_TERMINAL_GAPS: usize = 256;
+const TERMINAL_GAP_NOTICE: &str =
+    "\r\n[agit] this viewer fell behind; a stretch of terminal output could not be delivered.\r\n";
+
 #[derive(Default)]
 pub(super) struct Recovery {
     streams: Mutex<BTreeMap<String, Cursor>>,
+    terminals: Mutex<BTreeMap<String, TerminalGap>>,
     pub changed: Notify,
+}
+
+/// A terminal whose output was dropped; later output is dropped until its notice leaves.
+struct TerminalGap {
+    notice: Frame,
+    exited: Option<Frame>,
 }
 
 struct Cursor {
@@ -53,7 +68,7 @@ impl Recovery {
 
     pub fn lagged(&self, stream: &str, seq: u64) -> Result<(), ()> {
         let mut streams = self.streams.lock().unwrap();
-        if streams.len() >= super::MAX_PENDING {
+        if streams.len() >= MAX_LAGGED_STREAMS {
             return Err(());
         }
         streams.insert(
@@ -71,6 +86,9 @@ impl Recovery {
 
     pub fn next(&self) -> Option<Frame> {
         let mut streams = self.streams.lock().unwrap();
+        if outstanding(&streams) >= MAX_RECOVERY_REQUESTS {
+            return None;
+        }
         let (stream, cursor) = streams
             .iter_mut()
             .find(|(_, cursor)| cursor.request.is_none() && cursor.retry <= Instant::now())?;
@@ -85,13 +103,67 @@ impl Recovery {
     }
 
     pub fn deadline(&self) -> Option<Instant> {
-        self.streams
-            .lock()
-            .unwrap()
+        let streams = self.streams.lock().unwrap();
+        // A completed request wakes the reader, so a full request window needs no timer.
+        if outstanding(&streams) >= MAX_RECOVERY_REQUESTS {
+            return None;
+        }
+        streams
             .values()
             .filter(|cursor| cursor.request.is_none())
             .map(|cursor| cursor.retry)
             .min()
+    }
+
+    /// A recovery whose response cannot be queued yet asks the journal again later.
+    pub fn postpone(&self, frame: &Frame) {
+        let mut streams = self.streams.lock().unwrap();
+        if let Some(cursor) = streams
+            .values_mut()
+            .find(|cursor| cursor.request.is_some() && cursor.request == frame.id)
+        {
+            cursor.request = None;
+            cursor.retry = Instant::now() + Duration::from_secs(1);
+        }
+        self.changed.notify_one();
+    }
+
+    /// True when the frame belongs to a terminal whose gap notice is still queued. Its output is
+    /// dropped; its exit is kept to follow the notice.
+    pub fn terminal_gapped(&self, terminal: &str, frame: &Frame) -> bool {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(gap) = terminals.get_mut(terminal) else {
+            return false;
+        };
+        if frame.method() == crate::protocol::method::TERMINAL_EXITED {
+            gap.exited = Some(frame.clone());
+        }
+        true
+    }
+
+    pub fn terminal_lagged(&self, terminal: &str, frame: &Frame) -> Result<(), ()> {
+        let mut terminals = self.terminals.lock().unwrap();
+        if terminals.len() >= MAX_TERMINAL_GAPS {
+            return Err(());
+        }
+        let mut notice = Frame::notification(
+            crate::protocol::method::TERMINAL_OUTPUT,
+            serde_json::json!({"terminal_id":terminal, "data":TERMINAL_GAP_NOTICE}),
+        );
+        notice.stream = frame.stream.clone();
+        notice.seq = frame.seq;
+        let exited =
+            (frame.method() == crate::protocol::method::TERMINAL_EXITED).then(|| frame.clone());
+        terminals.insert(terminal.into(), TerminalGap { notice, exited });
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    pub fn next_terminal(&self) -> Option<Vec<Frame>> {
+        let mut terminals = self.terminals.lock().unwrap();
+        let terminal = terminals.keys().next()?.clone();
+        let gap = terminals.remove(&terminal)?;
+        Some(std::iter::once(gap.notice).chain(gap.exited).collect())
     }
 
     pub fn contains(&self, id: Option<&RequestId>) -> bool {
@@ -148,6 +220,13 @@ impl Recovery {
             through,
         })
     }
+}
+
+fn outstanding(streams: &BTreeMap<String, Cursor>) -> usize {
+    streams
+        .values()
+        .filter(|cursor| cursor.request.is_some())
+        .count()
 }
 
 fn gap(stream: &str, through: u64) -> Frame {

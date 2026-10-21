@@ -36,6 +36,7 @@
 //!   network the user assumes it was lost and sends it three more times.
 
 mod commands;
+pub(crate) mod program;
 
 use super::proc::{LaunchError, Line, Proc, Pushback};
 use super::{
@@ -124,11 +125,23 @@ fn cached_machine_commands() -> Vec<crate::protocol::SlashCommand> {
     filtered
 }
 
+pub(crate) fn version_of(program: &program::Program) -> Option<String> {
+    let mut command = crate::infra::background::command(&program.path);
+    command.arg("--version");
+    if let Some((name, value)) = program.env() {
+        command.env(name, value);
+    }
+    let output = command.output().ok()?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !version.is_empty()).then_some(version)
+}
+
 pub fn capability() -> RuntimeCapability {
+    let program = program::resolve();
     RuntimeCapability {
         runtime: "claude-code".into(),
-        available: crate::adapter::which("claude").is_some(),
-        version: super::probe_version("claude", &["--version"]),
+        available: program.is_some(),
+        version: program.as_ref().and_then(version_of),
         steer: Some(Delivery::AtToolBoundary),
         interrupt: true,
         approvals: true,
@@ -141,13 +154,16 @@ pub fn capability() -> RuntimeCapability {
         // is live: a `set_permission_mode` control request is answered
         // `{"mode":"auto"}` and the very next `system/init` reports the new
         // mode.
-        permission_modes: vec![
+        permission_modes: [
             PermissionMode::Default,
             PermissionMode::AcceptEdits,
             PermissionMode::Auto,
             PermissionMode::Plan,
             PermissionMode::Bypass,
-        ],
+        ]
+        .into_iter()
+        .filter(|mode| !(mode.is_dangerous() && bypass_refused()))
+        .collect(),
         permission_switch: Some(PermissionApply::Immediate),
     }
 }
@@ -341,7 +357,7 @@ pub struct ClaudeCodeDriver {
 ///
 /// Split out so a test can assert against **the argv that actually runs** — a copy
 /// transcribed into the test only ever pins the copy.
-fn argv(spec: &LaunchSpec, session_id: &str) -> Vec<String> {
+fn argv(spec: &LaunchSpec, session_id: &str, resume: bool) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-p".into(),
         "--input-format".into(),
@@ -365,37 +381,122 @@ fn argv(spec: &LaunchSpec, session_id: &str) -> Vec<String> {
         args.push("--model".into());
         args.push(m.clone());
     }
-    match &spec.resume_from {
-        Some(id) => {
-            args.push("--resume".into());
-            args.push(id.clone());
-        }
-        None => {
-            args.push("--session-id".into());
-            args.push(session_id.to_string());
-        }
-    }
+    args.push(if resume { "--resume" } else { "--session-id" }.into());
+    args.push(session_id.to_string());
     args
+}
+
+/// A reopened conversation whose transcript Claude no longer has, while its archive holds turns.
+///
+/// Claude deletes old transcripts on its own schedule, and a conversation opened but never sent a
+/// message has none yet. `--resume` of either exits at once, so the launch is decided before the
+/// spawn. Starting over under the same id is refused here: settlement would reject a transcript
+/// that no longer continues the archived turns.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Claude Code no longer has this conversation's transcript; its archived turns can be continued with `agit resume`"
+)]
+pub(crate) struct NativeTranscriptMissing;
+
+/// Whether the archive of a conversation already holds a settled transcript.
+fn archived_turns(lineage: &crate::rc::lineage::AgitSession) -> bool {
+    let Some(repo) = lineage
+        .repo_dir()
+        .ok()
+        .and_then(crate::domain::repo::Repo::open)
+    else {
+        return false;
+    };
+    repo.git_opt(&[
+        "cat-file",
+        "-e",
+        &format!(
+            "refs/heads/{}:{}",
+            lineage.branch(),
+            crate::domain::meta::LOG_FILE
+        ),
+    ])
+    .is_some()
+}
+
+/// Claude exits at once on `--dangerously-skip-permissions` when it runs as root outside a sandbox
+/// it recognizes, so on such a machine the mode is never offered or launched.
+fn bypass_refused() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions.
+        let root = unsafe { libc::getuid() } == 0;
+        let bubblewrap = std::env::var("CLAUDE_CODE_BUBBLEWRAP").is_ok_and(|value| {
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        });
+        root && std::env::var("IS_SANDBOX").as_deref() != Ok("1") && !bubblewrap
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// A new conversation without permission checks cannot start where Claude refuses them.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Claude Code refuses to skip permission checks as root; choose another permission mode, or run the daemon in a sandbox Claude recognizes"
+)]
+pub(crate) struct BypassUnavailable;
+
+/// Fits the requested mode to what Claude accepts here. A reopened conversation recorded without
+/// permission checks continues with approvals instead of failing every launch.
+fn admit_mode(spec: &mut LaunchSpec, bypass_refused: bool) -> Result<(), LaunchError> {
+    if !(bypass_refused && spec.effective_mode().is_dangerous()) {
+        return Ok(());
+    }
+    if spec.resume_from.is_none() {
+        return Err(LaunchError::not_spawned(BypassUnavailable.into()));
+    }
+    spec.dangerous = false;
+    spec.permission_mode = Some(PermissionMode::Default);
+    Ok(())
+}
+
+/// Whether a reopened conversation is resumed from its transcript or continued under its own id.
+fn reopen(spec: &LaunchSpec) -> Result<bool, LaunchError> {
+    let Some(id) = spec.resume_from.as_deref() else {
+        return Ok(false);
+    };
+    if crate::adapter::claude_code::locate_transcript(id, Some(&spec.cwd)).is_some() {
+        return Ok(true);
+    }
+    if spec.agit_session.as_ref().is_some_and(archived_turns) {
+        return Err(LaunchError::not_spawned(NativeTranscriptMissing.into()));
+    }
+    // Nothing was settled, so the conversation continues under its own id.
+    Ok(false)
 }
 
 impl ClaudeCodeDriver {
     /// Start a claude-code session. Failure comes back as [`LaunchError`], propagating
     /// "did the OS spawn happen" unchanged: an error from `Proc::spawn` is **provably nothing
     /// started**, while a failed handshake write leaves a process already running.
-    pub async fn launch(spec: LaunchSpec) -> Result<ClaudeCodeDriver, LaunchError> {
+    pub async fn launch(mut spec: LaunchSpec) -> Result<ClaudeCodeDriver, LaunchError> {
+        admit_mode(&mut spec, bypass_refused())?;
+        let resume = reopen(&spec)?;
         let session_id = spec
             .resume_from
             .clone()
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
-        let args = argv(&spec, &session_id);
+        let args = argv(&spec, &session_id, resume);
         let mode = spec.effective_mode();
 
         let mut env = super::lineage_env(spec.agit_session.as_ref());
         // Mark the child so nested tooling can tell it is running under RC.
         env.push(("AGIT_RC".into(), "1".into()));
 
-        let mut proc = Proc::spawn("claude", &args, &spec.cwd, &env)?;
+        let program = program::resolve();
+        env.extend(program.as_ref().and_then(program::Program::env));
+        let executable = program
+            .as_ref()
+            .map(|program| program.path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "claude".into());
+        let mut proc = Proc::spawn(&executable, &args, &spec.cwd, &env)?;
 
         // The SDK handshake. Declaring it is what puts the CLI in "ask the
         // client" mode for permissions; without it we would silently fall back
@@ -1463,7 +1564,7 @@ mod tests {
             dangerous: false,
             permission_mode: None,
         };
-        let args = argv(&spec, "sid");
+        let args = argv(&spec, "sid", spec.resume_from.is_some());
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--permission-mode" && w[1] == "default")
@@ -1475,6 +1576,124 @@ mod tests {
         assert!(args.contains(&"--include-partial-messages".to_string()));
         assert!(args.contains(&"--replay-user-messages".to_string()));
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    /// Where Claude refuses to skip permission checks, a new conversation asking for that is
+    /// refused before anything starts, and a reopened one continues with approvals; launching
+    /// either as asked makes Claude exit, and a reopened one would fail on every retry.
+    #[test]
+    fn refused_bypass_never_reaches_the_command_line() {
+        let spec = |resume_from: Option<&str>| LaunchSpec {
+            cwd: PathBuf::from("/tmp"),
+            resume_from: resume_from.map(Into::into),
+            agit_session: None,
+            model: None,
+            dangerous: true,
+            permission_mode: None,
+        };
+        let mut fresh = spec(None);
+        let refused = admit_mode(&mut fresh, true).err().unwrap();
+        assert!(!refused.reached_spawn());
+
+        let mut reopened = spec(Some("sid"));
+        admit_mode(&mut reopened, true).unwrap();
+        assert_eq!(reopened.effective_mode(), PermissionMode::Default);
+        assert!(!argv(&reopened, "sid", true).contains(&"--dangerously-skip-permissions".into()));
+
+        let mut allowed = spec(None);
+        admit_mode(&mut allowed, false).unwrap();
+        assert!(argv(&allowed, "sid", false).contains(&"--dangerously-skip-permissions".into()));
+    }
+
+    /// A reopened conversation whose transcript Claude deleted, or never wrote, cannot use
+    /// `--resume`: Claude exits at once, and every retry of the same launch fails the same way.
+    /// It continues under its own id when nothing was settled, and is refused before the spawn
+    /// when its archive already holds turns that a fresh transcript would not continue.
+    #[test]
+    fn reopening_follows_the_transcript_claude_still_has() {
+        let _environment = crate::infra::config::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let saved: Vec<_> = ["CLAUDE_CONFIG_DIR", "AGIT_HOME"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "90909090-9090-4090-8090-909090909090";
+        let mut spec = LaunchSpec {
+            cwd: cwd.clone(),
+            resume_from: Some(id.into()),
+            agit_session: None,
+            model: None,
+            dangerous: false,
+            permission_mode: None,
+        };
+        assert!(
+            !reopen(&spec).unwrap(),
+            "an unwritten conversation starts under its id"
+        );
+        assert!(
+            argv(&spec, id, false)
+                .windows(2)
+                .any(|w| w[0] == "--session-id" && w[1] == id)
+        );
+
+        let lineage = crate::rc::lineage::AgitSession::new(
+            "owner/name",
+            "00000000-0000-0000-0000-000000000001",
+            "desktop-x",
+        )
+        .unwrap();
+        let repo = lineage.repo_dir().unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false"
+                    ])
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "desktop-x"]);
+        std::fs::write(repo.join(crate::domain::meta::LOG_FILE), "{}\n").unwrap();
+        git(&["add", crate::domain::meta::LOG_FILE]);
+        git(&["commit", "-q", "-m", "turn"]);
+        spec.agit_session = Some(lineage);
+        let refused = reopen(&spec).expect_err("archived turns cannot start over");
+        assert!(!refused.reached_spawn());
+        assert!(refused.to_string().contains("agit resume"));
+
+        let transcript = crate::adapter::claude_code::projects_dir()
+            .unwrap()
+            .join(crate::adapter::claude_code::slug_for(&cwd))
+            .join(format!("{id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        assert!(reopen(&spec).unwrap(), "a present transcript is resumed");
+
+        for (name, value) in saved {
+            // SAFETY: the configuration lock is still held.
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
     }
 
     /// A driver that exists only to feed `classify()`: `cat` stands in for `Proc`, and these

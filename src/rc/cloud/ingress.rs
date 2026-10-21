@@ -29,6 +29,7 @@ pub struct Registry {
     owners: Arc<delegation::Owners>,
     task: tokio::task::JoinHandle<()>,
     log: Option<crate::rc::diagnostics::Log>,
+    reload: Option<fn() -> crate::Result<Resources>>,
 }
 
 impl Drop for Registry {
@@ -90,6 +91,7 @@ impl Registry {
             owners: Default::default(),
             task,
             log,
+            reload: Some(Resources::load),
         }
     }
 
@@ -103,6 +105,7 @@ impl Registry {
             owners: Default::default(),
             task: tokio::spawn(std::future::pending()),
             log: None,
+            reload: None,
         }
     }
 
@@ -125,7 +128,7 @@ impl Registry {
         grant: agit_peer::cloud::ConnectionGrant,
     ) -> impl std::future::Future<Output = anyhow::Result<Client>> + Send + use<> {
         let mut client = self.client(grant.caller.clone(), grant.expires_at_ms);
-        let (state, owners) = (self.state.clone(), self.owners.clone());
+        let (state, owners, reload) = (self.state.clone(), self.owners.clone(), self.reload);
         async move {
             let source = grant
                 .session_controller
@@ -148,10 +151,26 @@ impl Registry {
                 None
             };
             if grant.session_controller.is_some() || grant.project_controller.is_some() {
-                let state = state
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                delegation::validate_resources(&grant, &state.resources)?;
+                let validated = delegation::validate_resources(
+                    &grant,
+                    &state
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .resources,
+                );
+                match (validated, reload) {
+                    // Records refresh on a timer; a resource created since the last refresh must
+                    // not be refused as permanently unavailable.
+                    (Err(_), Some(reload)) => {
+                        let current = tokio::task::spawn_blocking(reload).await??;
+                        let mut state = state
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.resources.refresh(current);
+                        delegation::validate_resources(&grant, &state.resources)?;
+                    }
+                    (validated, _) => validated?,
+                }
             }
             client.controller = owners.accept(&grant).await?;
             client.grant = Some(grant);
@@ -364,6 +383,15 @@ impl Client {
 
     pub(crate) fn lease(&self) -> Lease {
         self.lease.clone()
+    }
+
+    /// A request holds its permit until its response is projected or dropped.
+    pub fn in_flight(&self) -> bool {
+        !self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     pub fn accepts_notification(&self, frame: &Frame) -> bool {

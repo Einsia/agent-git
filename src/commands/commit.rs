@@ -227,7 +227,12 @@ pub fn run(args: Args) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&super::terminal_error_message(&e));
-            let fallback = if e.is::<ImplicitClaimRefusal>() {
+            // A capture over its budget stays over it; retrying cannot settle it.
+            let over_budget = e.chain().any(|cause| {
+                cause.downcast_ref::<crate::adapter::native_snapshot::Unavailable>()
+                    == Some(&crate::adapter::native_snapshot::Unavailable::BudgetExceeded)
+            });
+            let fallback = if e.is::<ImplicitClaimRefusal>() || over_budget {
                 ExitCode::Policy
             } else if e.is::<LocalStoreFailure>() {
                 ExitCode::Precondition

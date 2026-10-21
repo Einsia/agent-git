@@ -12,6 +12,19 @@ pub(super) fn unavailable(error: impl std::fmt::Display) -> RpcError {
     )
 }
 
+/// A transcript still being restored is a busy conversation that clients retry, not a missing one.
+pub(super) fn locate_failed(error: anyhow::Error) -> RpcError {
+    if error.is::<crate::adapter::codex_rollout::Restoring>() {
+        let mut error = RpcError::new(
+            ErrorCode::SessionBusy,
+            "conversation history is being prepared; retry shortly",
+        );
+        error.data = Some(serde_json::json!({"retryable": true, "reason": "transcript_restoring"}));
+        return error;
+    }
+    unavailable(error)
+}
+
 impl Daemon {
     pub(super) fn prepare_source_resume(
         &mut self,
@@ -43,7 +56,9 @@ impl Daemon {
         .key()
         .map_err(unavailable)?;
         let roots = self.mirror.roots(&p.workspace_id);
-        let thread = context.locate(native, &roots).map_err(unavailable)?;
+        let thread = context
+            .locate_ready(native, &roots)
+            .map_err(locate_failed)?;
         crate::rc::local_goal::validate_header(&thread.transcript, native, &thread.cwd)
             .map_err(unavailable)?;
         if prior
@@ -97,9 +112,13 @@ impl Daemon {
                 .unwrap_or_else(crate::domain::meta::mint_session_id)
         };
         if self.ending_in(&logical, caller) {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "this conversation is still settling",
+            return Err(classified(
+                RpcError::new(
+                    ErrorCode::SessionBusy,
+                    "this conversation is still settling",
+                ),
+                true,
+                "settling",
             ));
         }
         if let Some(info) = self.supervised_in(&logical, caller) {
@@ -110,15 +129,21 @@ impl Daemon {
                 .unwrap(),
             ));
         }
+        // A resume outranks recovery of the same conversation.
+        self.preempt_archive(&logical, "codex", Some(&source), Some(native));
         let prior = prior.or_else(|| self.roster.get(&logical).cloned());
         if prior
             .as_ref()
             .is_some_and(|entry| !entry.guard_attempts.is_empty())
             && settings.permission_mode != Some(crate::protocol::PermissionMode::Plan)
         {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "native permissions are unresolved; select Plan in the native client before reconnecting",
+            return Err(classified(
+                RpcError::new(
+                    ErrorCode::SessionBusy,
+                    "native permissions are unresolved; select Plan in the native client before reconnecting",
+                ),
+                false,
+                "native_permissions_unresolved",
             ));
         }
         let store = crate::domain::store::Store::open().map_err(unavailable)?;

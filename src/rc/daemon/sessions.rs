@@ -27,21 +27,46 @@ fn active_writer_error(
     cwd: &Path,
     caller: &crate::protocol::CallerClaim,
 ) -> RpcError {
-    let mut error = busy_error();
     #[cfg(unix)]
     if runtime == "claude-code"
         && caller.is_owner()
         && crate::rc::native_claude::Client::reconnecting(session, cwd)
     {
+        let mut error = busy_error();
         error.data = Some(serde_json::json!({
             "retryable": true,
             "outcome": "not_sent",
             "reason": "native_control_reconnecting"
         }));
+        return error;
     }
     #[cfg(not(unix))]
-    let _ = (runtime, session, cwd, caller, &mut error);
-    error
+    let _ = (cwd, caller);
+    if native_writer_active(runtime, session) == Some(true) {
+        // An exact native writer holds the conversation until someone closes it there.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut error = classified(busy_error(), false, "native_writer_active");
+        // The owner could share a terminal Claude session; say why this one cannot be.
+        #[cfg(unix)]
+        if runtime == "claude-code"
+            && caller.is_owner()
+            && let Some(reason) = crate::rc::native_claude::status::unavailable()
+            && let Some(data) = error.data.as_mut().and_then(|data| data.as_object_mut())
+        {
+            data.insert("shared_control".into(), serde_json::json!(reason));
+        }
+        return error;
+    }
+    // Only transcript age is known, and it stops counting once the transcript stays quiet.
+    classified(
+        RpcError::new(
+            ErrorCode::SessionBusy,
+            "this conversation was written moments ago by a process this machine cannot identify",
+        )
+        .with_hint("control is admitted once the transcript stays quiet; nothing was launched"),
+        true,
+        "native_recent_activity",
+    )
 }
 
 impl Daemon {
@@ -231,12 +256,16 @@ impl Daemon {
         // genuinely dangerous actions (sending a message, allowing an approval) each sit behind
         // their own gate.
         if self.ending_in(&p.session_id, caller) {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "that session ended while an accepted instruction is still settling",
-            )
-            .with_hint(
-                "wait for the outstanding instruction to resolve before resuming this conversation",
+            return Err(classified(
+                RpcError::new(
+                    ErrorCode::SessionBusy,
+                    "that session ended while an accepted instruction is still settling",
+                )
+                .with_hint(
+                    "wait for the outstanding instruction to resolve before resuming this conversation",
+                ),
+                true,
+                "settling",
             ));
         }
         if let Some(mut info) = self.supervised_in(&p.session_id, caller) {
@@ -433,7 +462,10 @@ impl Daemon {
         if p.session_id.starts_with("local-") && p.session_id.len() == 70 {
             let row = crate::rc::runtime_catalog::Catalog::open()
                 .and_then(|catalog| catalog.lookup(&p.session_id))
-                .map_err(source_sessions::unavailable)?
+                .map_err(|error| {
+                    super::catalog::known(&error, false)
+                        .unwrap_or_else(|| source_sessions::unavailable(error))
+                })?
                 .ok_or_else(|| {
                     source_sessions::unavailable("conversation is no longer cataloged")
                 })?;
@@ -975,7 +1007,12 @@ impl Daemon {
                         .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
                 }
                 roster::StartState::Pending { session } => {
-                    return Err(pending_start_error(start_id, &session.session_id));
+                    let in_flight = self.opening_sessions.contains_key(&session.session_id);
+                    return Err(pending_start_error(
+                        start_id,
+                        &session.session_id,
+                        in_flight,
+                    ));
                 }
             }
         }
@@ -1114,7 +1151,12 @@ impl Daemon {
                         .map(SessionOpening::Ready)
                         .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
                 }
-                return Err(pending_start_error(&start_id, &session.session_id));
+                let in_flight = self.opening_sessions.contains_key(&session.session_id);
+                return Err(pending_start_error(
+                    &start_id,
+                    &session.session_id,
+                    in_flight,
+                ));
             }
             roster::StartClaim::Conflict => return Err(conflicting_start_error()),
             roster::StartClaim::HistoryLost => return Err(lost_start_history_error()),
@@ -1392,6 +1434,7 @@ impl Daemon {
             local_owner: self.opts.local_owner,
             prompt,
             attribution,
+            capture_degraded: false,
         })
     }
 }
@@ -1497,6 +1540,11 @@ impl LocalSessionSnapshot {
                         agent: link.and_then(|l| l.agent),
                         likely_active: native_session_likely_active(r.runtime, &r.id, || {
                             recently_written(r.mtime)
+                                && !std::fs::metadata(&r.path).is_ok_and(|metadata| {
+                                    crate::rc::writer_release::unchanged(
+                                        r.runtime, &r.id, &metadata,
+                                    )
+                                })
                         }),
                     });
                 }
@@ -1546,7 +1594,7 @@ fn local_gist_preview(item: &LocalSession) -> Option<String> {
         return None;
     }
     let adapter = crate::adapter::get(&item.runtime).ok()?;
-    let path = adapter.resolve(
+    let path = adapter.resolve_present(
         &item.runtime_session_id,
         Some(std::path::Path::new(&item.cwd)),
     )?;

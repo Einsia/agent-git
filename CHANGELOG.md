@@ -10,6 +10,40 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Remote control opens Codex conversations that have been idle long enough for
+  Codex to compress their transcript, and conversations Codex continued in a
+  new transcript segment. Such conversations stayed on "Restoring
+  conversation", returned history errors, and never archived their turns.
+  Restoring a compressed transcript no longer pauses other conversations on the
+  machine.
+- A failed or timed-out remote resume releases the conversation once its
+  processes have exited, instead of keeping it busy until the daemon restarts.
+  A capture binding that cannot be resolved no longer blocks control: the
+  conversation runs, and its turns archive once the binding resolves again.
+- Re-registering a runtime source, or upgrading or removing the Codex program it
+  was registered with, keeps existing conversations controllable and their
+  captures valid.
+- Busy and refusal errors say whether they clear on their own, so clients retry
+  passing conditions silently and show the ones that need a person. A refused
+  cloud connection is answered with its reason instead of being dropped, and
+  subscribing to a paused conversation reports that it needs a resume.
+- Opening history no longer copies the transcript and no longer fails while the
+  runtime is writing to it. Identical history requests share one read, and
+  history of a conversation whose folder was removed stays readable.
+- Archive recovery backs off, parks failures that cannot succeed, and lets a
+  resume take the conversation. A conversation larger than the capture budget
+  is reported once instead of after every turn.
+- The control channel keeps a slow or lagging reader connected, stops reads
+  whose requester has left, evicts idle clients before refusing new ones, and
+  reconnects within seconds after the machine wakes from sleep. A message sent
+  again while its first delivery is in flight reports that delivery as pending
+  and is never run twice.
+- Claude Code conversations whose transcript Claude deleted, or that never
+  received a message, reopen under their own id; one whose archived turns no
+  longer have a transcript points to `agit resume`. Claude Code is found outside
+  the daemon's PATH, bypass mode is not offered where Claude refuses it as root,
+  transcript folders follow Claude's naming for long and non-BMP paths, and a
+  terminal Claude session that cannot be shared says why.
 - A failed `agit clone` suggests asking for the owner's grant only when Git
   reports an authentication failure; any other failed transfer suggests
   retrying and, if it fails the same way again, reporting it with the output.

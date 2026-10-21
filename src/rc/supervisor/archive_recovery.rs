@@ -2,11 +2,7 @@
 
 use super::*;
 use crate::{
-    domain::{
-        link,
-        privacy_receipt::outbox::{Capture, Entry},
-        store::Store,
-    },
+    domain::privacy_receipt::outbox::{Capture, Entry},
     rc::archive_jobs::Job,
 };
 use anyhow::{Context, ensure};
@@ -53,6 +49,54 @@ impl Session {
     }
 }
 
+/// Landing validates a claim and creates a branch. A landing still running past this limit is
+/// waiting on a lock nobody releases, and a later attempt costs less than holding the capture.
+const LAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A resume asks recovery of its conversation to yield the capture writer.
+#[derive(Debug)]
+pub(crate) struct Preemption(tokio::sync::watch::Sender<bool>);
+
+impl Default for Preemption {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl Preemption {
+    pub(crate) fn request(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    async fn requested(&self) {
+        let mut requested = self.0.subscribe();
+        let _ = requested.wait_for(|requested| *requested).await;
+    }
+}
+
+/// A recovery attempt stopped before it could fail on its own.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Interrupted {
+    #[error("archive recovery yielded to a resume of its conversation")]
+    Yielded,
+    #[error("archive landing did not finish within its time limit")]
+    LandTimedOut,
+}
+
+/// A recovery subprocess exited unsuccessfully; its exit code tells a refusal from a fault.
+#[derive(Debug, thiserror::Error)]
+#[error("archive {stage} failed ({status}): {detail}")]
+pub(crate) struct StageFailure {
+    pub stage: &'static str,
+    pub code: Option<i32>,
+    status: std::process::ExitStatus,
+    detail: String,
+}
+
 pub(crate) struct Prepared {
     job: Job,
     request: SupervisorPushRequest,
@@ -61,9 +105,13 @@ pub(crate) struct Prepared {
 }
 
 /// A capture reservation protects native settlement, not the network publication wait.
+///
+/// A preemption stops landing at once and stops the attempt before its commit starts; a commit
+/// that already started finishes, because cancelling it can leave repository locks behind.
 pub(crate) async fn prepare(
     job: Job,
     mut state: tokio::sync::watch::Receiver<SettlementState>,
+    preemption: std::sync::Arc<Preemption>,
 ) -> crate::Result<Prepared> {
     let lease = settlement_lease(&state).context("archive recovery has no capture lease")?;
     ensure!(
@@ -71,7 +119,6 @@ pub(crate) async fn prepare(
         "archive recovery requires local capture authority"
     );
     let lineage = job.session()?;
-    job.verify_prefix(&job.transcript)?;
     let repo = crate::rc::capture::require(&lineage)?;
     let exe = std::env::current_exe()?;
     let mut land_args = crate::commands::rc::land_argv(
@@ -102,9 +149,13 @@ pub(crate) async fn prepare(
             serde_json::to_string(&handoff.role)?,
         );
     }
-    let landed = guarded_output(&mut state, lease, land)
-        .await
-        .context("archive landing was cancelled")?;
+    let landed = tokio::select! {
+        biased;
+        _ = preemption.requested() => return Err(Interrupted::Yielded.into()),
+        landed = tokio::time::timeout(LAND_LIMIT, guarded_output(&mut state, lease, land)) => landed
+            .map_err(|_| Interrupted::LandTimedOut)?
+            .context("archive landing was cancelled")?,
+    };
     require_success(&landed, "landing")?;
     let handoffs: Vec<_> = String::from_utf8_lossy(&landed.stdout)
         .lines()
@@ -131,7 +182,10 @@ pub(crate) async fn prepare(
             "archive landing returned another native capture"
         );
     }
-    verify_native(&job, &lineage)?;
+    verify_native(&job, &lineage, true).await?;
+    if preemption.is_requested() {
+        return Err(Interrupted::Yielded.into());
+    }
     let result = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
     let prepared = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
     let mut commit = command(
@@ -180,11 +234,11 @@ pub(crate) async fn prepare(
         committed.reported.as_deref() != Some(crate::commands::commit::archive::WITHHELD_RESULT),
         "archive exploration is withheld from publication"
     );
+    let end = verify_native(&job, &lineage, false).await?;
     ensure!(
-        committed.output.status.success() && job.covered_by(&repo, &committed.after)?,
+        committed.output.status.success() && job.covered_by(&repo, &committed.after, end)?,
         "archive commit does not cover the completed native turn"
     );
-    verify_native(&job, &lineage)?;
     let destination =
         crate::rc::capture::destination(&repo, &lineage, &crate::infra::config::hub_url())?
             .context("archive publication destination is not configured")?;
@@ -259,22 +313,28 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
         settlement_lease_is_current(&state, lease),
         "archive capture lease changed"
     );
-    verify_native(&job, &lineage)?;
-    crate::rc::archive_jobs::publication_confirmed(&repo, &request)
+    verify_native(&job, &lineage, false).await?;
+    tokio::task::spawn_blocking(move || {
+        crate::rc::archive_jobs::publication_confirmed(&repo, &request)
+    })
+    .await?
 }
 
-fn require_success(output: &std::process::Output, stage: &str) -> crate::Result<()> {
-    ensure!(
-        output.status.success(),
-        "archive {stage} failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+fn require_success(output: &std::process::Output, stage: &'static str) -> crate::Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(StageFailure {
+        stage,
+        code: output.status.code(),
+        status: output.status,
+        detail: String::from_utf8_lossy(&output.stderr)
             .trim()
             .chars()
             .take(4096)
-            .collect::<String>()
-    );
-    Ok(())
+            .collect(),
+    }
+    .into())
 }
 
 fn command(
@@ -302,33 +362,38 @@ fn command(
     command
 }
 
-fn verify_native(job: &Job, lineage: &crate::rc::lineage::AgitSession) -> crate::Result<()> {
-    if let Some(reference) = &job.native_source {
-        let source = crate::rc::runtime_sources::Registry::open()?.resolve(&reference.source_id)?;
+/// The job's route is current and its carrier is part of the conversation's lineage; with
+/// `prefix`, the carrier also still holds the completed prefix. Returns the job's boundary in
+/// capture-stream coordinates.
+async fn verify_native(
+    job: &Job,
+    lineage: &crate::rc::lineage::AgitSession,
+    prefix: bool,
+) -> crate::Result<u64> {
+    let job = job.clone();
+    let lineage = lineage.clone();
+    tokio::task::spawn_blocking(move || {
+        // Resolution refuses a removed or replaced store; a job queued under an older
+        // generation of the same store still names the same transcript.
+        if let Some(reference) = &job.native_source {
+            crate::rc::runtime_sources::Registry::open()?.resolve(&reference.source_id)?;
+        }
+        let current = crate::rc::capture::resolve(
+            &job.runtime,
+            &job.claim_key(),
+            &job.cwd,
+            Some(&lineage),
+            job.capture.as_ref(),
+        )?
+        .context("archive native capture route is missing")?;
         ensure!(
-            source.generation == reference.generation,
-            "archive native source generation changed"
+            current.to_string() == job.lineage && current.agent_id() == job.repository_id,
+            "archive capture route changed"
         );
-    }
-    let native = job
-        .native_source
-        .as_ref()
-        .map(|source| source.session_ref(&job.native))
-        .unwrap_or_else(|| job.native.clone());
-    let store = Store::open()?.context("archive native claim store is missing")?;
-    let claim = link::get_checked(&store, &job.runtime, &native)?
-        .context("archive native claim is missing")?;
-    let current = crate::rc::capture::resolve(
-        &job.runtime,
-        &native,
-        &job.cwd,
-        Some(lineage),
-        job.capture.as_ref(),
-    )?
-    .context("archive native capture route is missing")?;
-    ensure!(
-        current.to_string() == job.lineage && current.agent_id() == job.repository_id,
-        "archive capture route changed"
-    );
-    job.verify_prefix(&claim.resolve().context("archive transcript is missing")?)
+        if prefix {
+            job.verify_prefix()?;
+        }
+        job.stream_end(&job.claim()?)
+    })
+    .await?
 }

@@ -98,6 +98,14 @@ impl LaunchError {
         self.resume_rejected
     }
 
+    /// Whether the failure is, or was caused by, a typed refusal `E`.
+    pub fn is<E>(&self) -> bool
+    where
+        E: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static,
+    {
+        self.error.is::<E>()
+    }
+
     pub fn is_external_writer(&self) -> bool {
         self.external_writer
     }
@@ -189,6 +197,67 @@ thread_local! {
 #[cfg(unix)]
 pub(crate) fn fail_next_launch_writes(count: usize) {
     LAUNCH_WRITE_FAILURES.with(|slot| slot.set(count));
+}
+
+tokio::task_local! {
+    static LAUNCH_GROUPS: LaunchGroups;
+}
+
+/// The process groups one launch attempt created.
+///
+/// An attempt that fails, panics or is cancelled drops its `Proc`, and that `Drop` can signal the
+/// group but cannot wait for it. Whoever owns the attempt keeps this record instead, so it can
+/// confirm the tree is gone before another writer is admitted for the same conversation. A
+/// `Proc` spawned outside [`LaunchGroups::scope`] is not recorded anywhere.
+#[derive(Clone, Default)]
+pub(crate) struct LaunchGroups(
+    #[cfg_attr(not(unix), allow(dead_code))] std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
+);
+
+impl LaunchGroups {
+    /// Run `launch`, recording every `Proc` it spawns on this task.
+    pub(crate) async fn scope<F: std::future::Future>(&self, launch: F) -> F::Output {
+        LAUNCH_GROUPS.scope(self.clone(), launch).await
+    }
+
+    /// Whether every recorded process group disappeared before `within` elapsed.
+    ///
+    /// Only observes: the groups were already signalled when their `Proc` dropped, and signalling
+    /// a number again after its group is gone could reach an unrelated group that reused it.
+    pub(crate) async fn exited_within(&self, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if self.exited() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) fn exited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|pgid| !process_group_exists(*pgid))
+        }
+        // A Windows harness lives in a kill-on-close Job that closes with its dropped `Proc`.
+        #[cfg(not(unix))]
+        true
+    }
+
+    #[cfg(unix)]
+    fn record(&self, pgid: i32) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pgid);
+    }
 }
 
 /// The result of reading one line.
@@ -836,6 +905,10 @@ impl Proc {
 
         #[cfg(unix)]
         let pgid = child.id().map(|p| p as i32);
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
+            let _ = LAUNCH_GROUPS.try_with(|groups| groups.record(pgid));
+        }
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");

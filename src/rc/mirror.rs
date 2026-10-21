@@ -90,6 +90,14 @@ impl Mirror {
         )
     }
 
+    /// Every bound project root on this machine, across workspaces.
+    pub fn all_roots(&self) -> Vec<PathBuf> {
+        self.verified
+            .values()
+            .flat_map(|projects| projects.values().cloned())
+            .collect()
+    }
+
     /// Project metadata returned by workspace discovery.
     pub fn to_local(&self) -> Vec<LocalWorkspace> {
         self.workspaces

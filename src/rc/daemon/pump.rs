@@ -43,6 +43,7 @@ impl Daemon {
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
             opening_sessions: HashMap::new(),
+            exiting_launches: HashMap::new(),
             archive_recovering: HashMap::new(),
             watches: HashMap::new(),
             terminals: HashMap::new(),
@@ -459,8 +460,14 @@ impl Daemon {
                             }
                             match watch_rpc_queue.reserve(&frame) {
                                 Ok(ticket) => {
-                                    session_rpc_tasks.spawn(ticket.serve(d.clone(), out_tx.clone(),
-                                        frames_tx.clone(), *frame, epoch, session_rpc_stop_tx.subscribe()));
+                                    let (authority, watch) = (frame.authority.clone(), frame.method() == method::SESSION_WATCH);
+                                    let serve = ticket.serve(d.clone(), out_tx.clone(),
+                                        frames_tx.clone(), *frame, epoch, session_rpc_stop_tx.subscribe());
+                                    if watch {
+                                        session_rpc_tasks.spawn(unless_departed(authority, id, out_tx.clone(), serve));
+                                    } else {
+                                        session_rpc_tasks.spawn(serve);
+                                    }
                                 }
                                 Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
                             }
@@ -482,13 +489,14 @@ impl Daemon {
                                 Ok(prepared) => {
                                     let daemon = d.clone();
                                     let out = out_tx.clone();
-                                    session_rpc_tasks.spawn(async move {
+                                    let departure = (frame.authority.clone(), id.clone(), out_tx.clone());
+                                    session_rpc_tasks.spawn(unless_departed(departure.0, departure.1, departure.2, async move {
                                         let response = match prepared.execute(daemon, *frame, epoch).await {
                                             Ok(value) => Frame::response(id, value),
                                             Err(error) => Frame::error_response(id, error),
                                         };
                                         let _ = out.send(response);
-                                    });
+                                    }));
                                 }
                                 Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
                             }
@@ -513,7 +521,8 @@ impl Daemon {
                                     let out = out_tx.clone();
                                     let roots = snapshot.roots.clone();
                                     let include_local = frame.params_as::<SessionList>().is_ok_and(|params| params.include_local);
-                                    session_rpc_tasks.spawn(async move {
+                                    let departure = (frame.authority.clone(), id.clone(), out_tx.clone());
+                                    session_rpc_tasks.spawn(unless_departed(departure.0, departure.1, departure.2, async move {
                                         let scanned = tokio::task::spawn_blocking(move || {
                                             if include_local { snapshot.scan(LocalSessionScan::Listing) } else { vec![] }
                                         }).await;
@@ -526,7 +535,7 @@ impl Daemon {
                                             Err(error) => Frame::error_response(id, error),
                                         };
                                         let _ = out.send(response);
-                                    });
+                                    }));
                                 }
                                 Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
                             }
@@ -550,14 +559,15 @@ impl Daemon {
                                     let daemon = d.clone();
                                     let outbound = out_tx.clone();
                                     let mut stop = session_rpc_stop_tx.subscribe();
-                                    session_rpc_tasks.spawn(async move {
+                                    let departure = (frame.authority.clone(), id.clone(), out_tx.clone());
+                                    session_rpc_tasks.spawn(unless_departed(departure.0, departure.1, departure.2, async move {
                                         let result = prepared.execute(daemon, &mut stop).await;
                                         let frame = match result {
                                             Ok(value) => Frame::response(id, value),
                                             Err(error) => Frame::error_response(id, error),
                                         };
                                         let _ = outbound.send(frame);
-                                    });
+                                    }));
                                 }
                                 Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
                             }
@@ -968,5 +978,25 @@ impl Daemon {
         let revoked_epoch = self.settlement.borrow().epoch.wrapping_add(1);
         set_connection_features(&self.settlement, revoked_epoch, false, false);
         self.journal.flush();
+    }
+}
+
+/// A read whose requester has left stops at once, so it neither holds a task slot nor delays
+/// the requests queued behind it on the same stream. Its reply still releases the request's
+/// entry in the endpoint's table. Only reads may be wrapped: a mutation may already have reached
+/// the harness, and its receipt must still be recorded.
+async fn unless_departed(
+    authority: crate::rc::authority::Guard,
+    id: crate::protocol::RequestId,
+    out: crate::rc::outbound::OutboundTx,
+    read: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        biased;
+        () = read => {}
+        () = authority.until_departed() => {
+            let _ = out.send(Frame::error_response(id, RpcError::new(
+                ErrorCode::SessionBusy, "the requester left before this read finished")));
+        }
     }
 }

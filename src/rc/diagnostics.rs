@@ -12,10 +12,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
+    time::{Duration, Instant},
 };
 
 const FILE_BYTES: u64 = 4 * 1024 * 1024;
 const BACKUPS: usize = 3;
+/// A failed write, such as on a full disk, suspends the log for this long instead of ending it.
+const WRITE_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(super) struct Log(Arc<Inner>);
@@ -26,33 +29,36 @@ struct Inner {
     instance: String,
     path: PathBuf,
     sequence: AtomicU64,
-    dropped: AtomicU64,
+    dropped: Arc<AtomicU64>,
 }
 
 impl Log {
     pub(super) fn open(instance: &str) -> crate::Result<Self> {
-        Self::open_in(&super::rc_dir()?, instance, FILE_BYTES)
+        Self::open_in(&super::rc_dir()?, instance, FILE_BYTES, WRITE_RETRY)
     }
 
-    fn open_in(directory: &Path, instance: &str, limit: u64) -> crate::Result<Self> {
+    fn open_in(
+        directory: &Path,
+        instance: &str,
+        limit: u64,
+        retry: Duration,
+    ) -> crate::Result<Self> {
         let path = directory.join(format!("diagnostics-{instance}.jsonl"));
         let file = private_file(&path)?;
         let (sender, receive) = mpsc::sync_channel::<Vec<u8>>(512);
         let writer_path = path.clone();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let lost = dropped.clone();
         let worker = std::thread::Builder::new()
             .name("agitd-diagnostics".into())
-            .spawn(move || {
-                if let Err(error) = drain(file, &writer_path, receive, limit) {
-                    eprintln!("agitd: diagnostic writer stopped: {error}");
-                }
-            })?;
+            .spawn(move || drain(file, &writer_path, receive, limit, retry, &lost))?;
         Ok(Self(Arc::new(Inner {
             sender: Some(sender),
             _worker: Some(worker),
             instance: instance.into(),
             path,
             sequence: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
+            dropped,
         })))
     }
 
@@ -84,10 +90,14 @@ impl Log {
 
     pub(super) fn response(&self, client: u64, frame: &crate::protocol::Frame) {
         let error = frame.error.as_ref();
+        let data = error.and_then(|e| e.data.as_ref());
         self.record("rpc.completed", json!({
             "client": client, "request_id": request_id(frame.id.as_ref()), "error_code": error.map(|e| e.code),
-            "outcome": error.and_then(|e| e.data.as_ref()).map(|data| label(&data["outcome"])),
-            "operation_id": error.and_then(|e| e.data.as_ref()).map(|data| label(&data["operation_id"])),
+            "outcome": data.map(|data| label(&data["outcome"])),
+            "operation_id": data.map(|data| label(&data["operation_id"])),
+            "kind": data.and_then(|data| token(&data["kind"])),
+            "reason": data.and_then(|data| token(&data["reason"])),
+            "retryable": data.and_then(|data| data["retryable"].as_bool()),
         }));
     }
 
@@ -120,6 +130,17 @@ fn label(value: &Value) -> Option<String> {
     value.as_str().map(short)
 }
 
+/// Error classifiers are identifiers; anything else may carry a path or message text.
+fn token(value: &Value) -> Option<&str> {
+    value.as_str().filter(|value| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+}
+
 fn short(value: &str) -> String {
     value.chars().take(256).collect()
 }
@@ -140,34 +161,76 @@ fn private_file(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+fn appended_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+fn rotate(path: &Path) -> std::io::Result<File> {
+    for index in (1..=BACKUPS).rev() {
+        let source = if index == 1 {
+            path.to_owned()
+        } else {
+            path.with_extension(format!("jsonl.{}", index - 1))
+        };
+        let destination = path.with_extension(format!("jsonl.{index}"));
+        match std::fs::rename(source, destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+    }
+    private_file(path)
+}
+
+/// Writes lines until every sender is gone. A write failure counts lines as dropped until the
+/// retry time, then reopens the file; the drop count in later lines records the interruption.
 fn drain(
-    mut file: File,
+    file: File,
     path: &Path,
     receive: mpsc::Receiver<Vec<u8>>,
     limit: u64,
-) -> std::io::Result<()> {
-    let mut bytes = 0;
+    retry: Duration,
+    dropped: &AtomicU64,
+) {
+    let mut file = Some((file, 0_u64));
+    let mut suspended_until = None::<Instant>;
     for line in receive {
-        if bytes > 0 && bytes + line.len() as u64 > limit {
-            for index in (1..=BACKUPS).rev() {
-                let source = if index == 1 {
-                    path.to_owned()
-                } else {
-                    path.with_extension(format!("jsonl.{}", index - 1))
-                };
-                let destination = path.with_extension(format!("jsonl.{index}"));
-                match std::fs::rename(source, destination) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    result => result?,
-                }
+        if file.is_none() {
+            if suspended_until.is_some_and(|until| Instant::now() < until) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            file = private_file(path)?;
-            bytes = 0;
+            file = appended_file(path)
+                .and_then(|file| Ok((file.metadata()?.len(), file)))
+                .map(|(bytes, file)| (file, bytes))
+                .ok();
         }
-        file.write_all(&line)?;
-        bytes += line.len() as u64;
+        let written = file.as_mut().map(|(current, bytes)| {
+            if *bytes > 0 && *bytes + line.len() as u64 > limit {
+                *current = rotate(path)?;
+                *bytes = 0;
+            }
+            current.write_all(&line)?;
+            *bytes += line.len() as u64;
+            Ok::<_, std::io::Error>(())
+        });
+        if !matches!(written, Some(Ok(()))) {
+            if suspended_until.is_none() {
+                eprintln!("agitd: diagnostic writer suspended: {written:?}");
+            }
+            file = None;
+            suspended_until = Some(Instant::now() + retry);
+            dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            suspended_until = None;
+        }
     }
-    file.flush()
+    if let Some((mut file, _)) = file {
+        let _ = file.flush();
+    }
 }
 
 #[cfg(test)]
@@ -179,7 +242,7 @@ mod tests {
     #[test]
     fn rotation_retains_private_metadata_without_request_content() {
         let directory = tempfile::tempdir().unwrap();
-        let log = Log::open_in(directory.path(), "fixture", 512).unwrap();
+        let log = Log::open_in(directory.path(), "fixture", 512, WRITE_RETRY).unwrap();
         let frame = crate::protocol::Frame::request(
             "turn.start",
             json!({"session_id":"session", "message":"SYNTHETIC-PRIVATE-CONTENT"}),
@@ -206,5 +269,38 @@ mod tests {
                 assert_eq!(value["metadata"]["method"], "turn.start");
             }
         }
+    }
+
+    /// A writer that hits a failed write resumes once writing works again, and its later lines
+    /// say how many were lost. A writer that ends on the first error leaves the daemon without
+    /// diagnostics until it restarts.
+    #[test]
+    fn a_failed_write_suspends_the_log_until_writing_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("logs");
+        std::fs::create_dir(&directory).unwrap();
+        let log = Log::open_in(&directory, "fixture", 512, Duration::from_millis(50)).unwrap();
+        let frame = crate::protocol::Frame::request("session.list", json!({}));
+        let settle = || std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..4 {
+            log.request(1, &frame);
+        }
+        settle();
+        // Rotation cannot create the next file while its directory is gone.
+        std::fs::remove_dir_all(&directory).unwrap();
+        for _ in 0..8 {
+            log.request(1, &frame);
+        }
+        settle();
+        std::fs::create_dir(&directory).unwrap();
+        settle();
+        log.request(1, &frame);
+        let mut inner = Arc::try_unwrap(log.0).ok().unwrap();
+        inner.sender.take();
+        inner._worker.take().unwrap().join().unwrap();
+        let contents =
+            std::fs::read_to_string(directory.join("diagnostics-fixture.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert!(last["dropped"].as_u64().unwrap() > 0);
     }
 }

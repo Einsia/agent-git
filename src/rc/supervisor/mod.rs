@@ -155,8 +155,18 @@ struct PublicationRetry {
 
 impl PublicationRetry {
     fn failed(&mut self) {
+        self.schedule(300);
+    }
+
+    /// A policy refusal changes only when the transcript or local configuration does; each
+    /// idle attempt rereads the whole lineage, so it backs off further.
+    fn refused(&mut self) {
+        self.schedule(30 * 60);
+    }
+
+    fn schedule(&mut self, cap_seconds: u64) {
         self.failures = self.failures.saturating_add(1);
-        let seconds = 2_u64.saturating_pow(self.failures.min(9)).min(300);
+        let seconds = 2_u64.saturating_pow(self.failures.min(12)).min(cap_seconds);
         self.next = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(seconds));
     }
 
@@ -622,6 +632,7 @@ impl Drop for ProcessGroupGuard {
 /// behaves the same on every platform and when the file is *replaced* (which
 /// `agit resume`'s slow path does).
 pub const TAIL_POLL_MS: u64 = 120;
+const ROLLOVER_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long, in milliseconds, to wait at most for the transcript file to go quiet before
 /// declaring a turn over.
@@ -742,6 +753,8 @@ pub struct Session {
     background_poll_at: tokio::time::Instant,
     transcript_readable: bool,
     tailer: Option<Tailer>,
+    /// When the heartbeat next re-resolves the transcript to follow a Codex segment rollover.
+    rollover_check_at: tokio::time::Instant,
     native_records: native_records::NativeRecords,
     redactor: redact::Redactor,
     /// Emitted upward; the daemon numbers these and ships them to the hub.
@@ -833,6 +846,9 @@ pub struct Session {
     /// Publication owns the repository writer until its process tree has finished.
     publication: Option<Publication>,
     publication_retry: PublicationRetry,
+    /// The settlement failure the client was last told about. The same failure recurs until
+    /// the transcript or the branch changes, and one notice is enough.
+    reported_settlement_failure: Option<String>,
     local_settlement: Option<settlement_io::LocalSettlement>,
     settlement_due: bool,
     completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -1383,6 +1399,7 @@ impl Session {
             background_poll_at: tokio::time::Instant::now(),
             transcript_readable: false,
             tailer: None,
+            rollover_check_at: tokio::time::Instant::now(),
             native_records: native_records::NativeRecords::default(),
             redactor,
             out,
@@ -1397,6 +1414,7 @@ impl Session {
             pending_settlement: None,
             publication: None,
             publication_retry: PublicationRetry::default(),
+            reported_settlement_failure: None,
             local_settlement: None,
             settlement_due: false,
             completed_boundary: None,
@@ -2122,6 +2140,27 @@ impl Session {
         .await;
     }
 
+    /// A reaped private harness can no longer write; record the transcript it left behind.
+    /// A shared executor keeps writing after this client leaves, so it leaves no mark.
+    fn record_writer_release(&self, id: &str) {
+        if self.driver.shared_executor() {
+            return;
+        }
+        let (Some(thread), Some(transcript)) = (
+            self.driver.runtime_thread_id(),
+            self.driver.transcript_path(),
+        ) else {
+            return;
+        };
+        if let Err(error) =
+            crate::rc::writer_release::record(&self.info.runtime, &thread, &transcript)
+        {
+            tracing_note(&format!(
+                "[{id}] could not record the released transcript: {error:#}"
+            ));
+        }
+    }
+
     /// Run until the harness exits or we are told to stop.
     pub async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let id = self.info.session_id.clone();
@@ -2138,8 +2177,9 @@ impl Session {
         // machine. Funnelling into the single finally point means a newly added exit branch
         // cannot miss it either. A failed cleanup leaves a diagnostic behind but must not
         // swallow Ended — the daemon still has to remove a finished session from its table.
-        if let Err(e) = self.driver.shutdown().await {
-            tracing_note(&format!("[{id}] harness cleanup failed: {e}"));
+        match self.driver.shutdown().await {
+            Ok(()) => self.record_writer_release(&id),
+            Err(e) => tracing_note(&format!("[{id}] harness cleanup failed: {e}")),
         }
         // **A session ending is a settlement boundary too.** Funnelled into the same single
         // finally point: Shutdown, driver EOF and harness Exited each return on their own, and
@@ -2668,6 +2708,9 @@ impl Session {
                         && let Some(p) = self.driver.transcript_path() {
                             self.tailer = Some(Tailer::new(p, !self.resuming));
                         }
+                    if tokio::time::Instant::now() >= self.rollover_check_at {
+                        self.follow_rollover().await;
+                    }
                     self.drain_transcript().await;
                     self.poll_fallback_control().await;
                 }
@@ -2856,6 +2899,7 @@ impl Session {
                 }
             }
             HarnessEvent::TurnStarted { turn_id, prompt } => {
+                self.follow_rollover().await;
                 if let Err(message) = self
                     .announce_turn_started_once(turn_id, prompt, None, true)
                     .await
@@ -3548,14 +3592,24 @@ impl Session {
         ) {
             Ok(candidate) => candidate,
             Err(reason) => {
-                self.publication_retry.failed();
+                // A policy refusal (content that does not continue the branch, a blocked secret,
+                // a capture over its budget) repeats until the transcript or configuration
+                // changes.
+                if commit.status.code() == Some(crate::ExitCode::Policy.as_i32()) {
+                    self.publication_retry.refused();
+                } else {
+                    self.publication_retry.failed();
+                }
                 if lease.local_owner {
                     let detail = format!(
                         "{reason}: {}",
                         String::from_utf8_lossy(&commit.stderr).trim()
                     );
                     let scrubbed = self.redactor.scrub(&detail);
-                    self.emit("commit.failed", serde_json::json!({"session_id":self.info.session_id,"error":scrubbed.text})).await;
+                    if self.reported_settlement_failure.as_deref() != Some(scrubbed.text.as_str()) {
+                        self.emit("commit.failed", serde_json::json!({"session_id":self.info.session_id,"error":scrubbed.text})).await;
+                        self.reported_settlement_failure = Some(scrubbed.text);
+                    }
                 }
                 tracing_note(&format!(
                     "strict RC settlement stopped ({reason}): {}",
@@ -3564,6 +3618,7 @@ impl Session {
                 return;
             }
         };
+        self.reported_settlement_failure = None;
         let Some(sha) = candidate else {
             self.publication_retry = PublicationRetry::default();
             return; // strict commit succeeded but produced no new turn
@@ -3692,6 +3747,36 @@ impl Session {
             }
             tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
         }
+    }
+
+    /// Move the tailer into the segment Codex continues a long thread in.
+    ///
+    /// Codex rolls a thread over into a new carrier at a turn start and its index then names
+    /// that carrier. A tailer left on the previous one stops seeing completed items, and archive
+    /// boundaries keep pointing into it. The tailer moves only to a carrier whose header
+    /// continues the one it reads, after draining it, and reads the new one from its start:
+    /// its records and coordinates are that carrier's own, as history pages report them.
+    async fn follow_rollover(&mut self) {
+        self.rollover_check_at = tokio::time::Instant::now() + ROLLOVER_CHECK;
+        if self.info.runtime != "codex" {
+            return;
+        }
+        let Some(current) = self.tailer.as_ref().map(|tailer| tailer.path().to_owned()) else {
+            return;
+        };
+        let Some(next) = self.driver.transcript_path() else {
+            return;
+        };
+        if next == current || !crate::adapter::codex_rollout::continues(&next, &current) {
+            return;
+        }
+        self.drain_transcript().await;
+        tracing_note(&format!(
+            "[{}] following the native transcript into its next segment",
+            self.info.session_id
+        ));
+        self.tailer = Some(Tailer::new(next, true));
+        self.drain_transcript().await;
     }
 
     /// Read new transcript lines and emit one `item.completed` per IR event.

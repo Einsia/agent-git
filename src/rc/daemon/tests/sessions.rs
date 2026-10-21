@@ -756,15 +756,17 @@ fn session_start_idempotency_is_an_explicit_per_socket_feature() {
             .as_deref(),
         Some("018f47cb-60ff-7e31-aec9-02d2e39d3114")
     );
-    let pending = pending_start_error("018f47cb-60ff-7e31-aec9-02d2e39d3114", "agit-one");
+    let pending = pending_start_error("018f47cb-60ff-7e31-aec9-02d2e39d3114", "agit-one", false);
     assert_eq!(pending.code, ErrorCode::SessionBusy.code());
     assert!(pending.message.contains("launch outcome"));
+    let data = pending.data.unwrap();
     assert!(
-        pending.data.unwrap()["hint"]
+        data["hint"]
             .as_str()
             .unwrap()
             .contains("do not choose a new start_id")
     );
+    assert_eq!(data["retryable"], false);
 }
 
 #[tokio::test]
@@ -1252,9 +1254,10 @@ fn revoked_authority_before_native_launch_releases_the_unexecuted_reservation() 
 
 /// The **other side** of the boundary: `Command::spawn` succeeded (this machine really does have
 /// one more process), and the handshake write after it produced no proof of success. This case is
-/// still accounted for as having crossed the materialization boundary — the tombstone stays
-/// forever, and a retry with the same start_id gets `pending_start_error` and does **not** launch
-/// a second time.
+/// still accounted for as having crossed the materialization boundary — the tombstone stays while
+/// that process may still exist, and a retry with the same start_id gets `pending_start_error`
+/// and does **not** launch a second time. The inline launch used here never confirms an exit, so
+/// the tombstone outlives this test.
 ///
 /// This test is the control for the two above: pushing the classification down into `Proc::spawn`
 /// routes the provably-unlaunched paths through `before_launch`; it does not loosen the whole
@@ -2082,6 +2085,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         sessions: HashMap::new(),
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        exiting_launches: HashMap::new(),
         archive_recovering: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),
@@ -3126,4 +3130,60 @@ fn owner_resume_reconciles_project_aliases_without_retargeting_the_session() {
                 assert_eq!(current.expected_agent_id, entry.expected_agent_id);
             });
     });
+}
+
+/// A dormant conversation is resumable, not gone: the web resumes on reason `dormant`. A plain
+/// "not running" 302 would read as "no longer available", and reporting `dormant` for another
+/// workspace's row would reveal that the id exists.
+#[tokio::test]
+async fn subscribing_to_a_dormant_conversation_asks_for_resume_without_leaking_others() {
+    let mut roster = crate::rc::roster::Roster::default();
+    for (logical, workspace) in [("agit-dormant", "ws-a"), ("agit-foreign", "ws-b")] {
+        roster
+            .record(
+                logical,
+                crate::rc::roster::Entry {
+                    native_source: None,
+                    runtime: "codex".into(),
+                    thread_id: format!("{logical}-native"),
+                    cwd: "/tmp/project".into(),
+                    workspace_id: workspace.into(),
+                    project_id: None,
+                    agit_session: None,
+                    expected_agent_id: None,
+                    permission_mode: None,
+                    guard_attempts: Default::default(),
+                    prior_threads: vec![],
+                    ever_dangerous: false,
+                },
+            )
+            .unwrap();
+    }
+    let daemon = rpc_test_daemon(HashMap::new(), roster);
+    let mut state = daemon.lock().await;
+    let (frames, _) = mpsc::channel(1);
+    let subscribe = |session: &str| {
+        let mut frame = Frame::request(
+            method::SESSION_SUBSCRIBE,
+            serde_json::json!({"session_id": session}),
+        );
+        frame.caller = Some(claim("viewer", "ws-a"));
+        frame
+    };
+    let dormant = state
+        .dispatch(&subscribe("agit-dormant"), &frames)
+        .await
+        .unwrap_err();
+    assert_eq!(dormant.code, ErrorCode::SessionBusy as i32);
+    assert_eq!(
+        dormant.data,
+        Some(serde_json::json!({"retryable": true, "reason": "dormant"}))
+    );
+    for unknown in ["agit-foreign", "agit-never"] {
+        let error = state
+            .dispatch(&subscribe(unknown), &frames)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SessionNotFound as i32, "{unknown}");
+    }
 }

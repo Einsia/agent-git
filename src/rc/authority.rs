@@ -25,13 +25,18 @@ pub(crate) trait Authority: Send + Sync {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Guard(Option<Arc<dyn Authority>>);
+pub(crate) struct Guard {
+    authority: Option<Arc<dyn Authority>>,
+    /// Closes when the requester can no longer receive a response. Nothing is ever sent on it.
+    requester: Option<tokio::sync::watch::Receiver<()>>,
+}
 
 impl std::fmt::Debug for Guard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Guard")
-            .field("enforced", &self.0.is_some())
+            .field("enforced", &self.authority.is_some())
+            .field("requester", &self.requester.is_some())
             .finish()
     }
 }
@@ -41,7 +46,7 @@ impl Guard {
         let mut grant = None;
         if self.admit(|| {
             grant = self
-                .0
+                .authority
                 .as_ref()
                 .and_then(|authority| authority.owned_machine_grant());
             grant.is_some()
@@ -59,7 +64,7 @@ impl Guard {
         let mut grant = None;
         if self.admit(|| {
             grant = self
-                .0
+                .authority
                 .as_ref()
                 .and_then(|authority| authority.publication_grant());
             grant.is_some()
@@ -74,18 +79,42 @@ impl Guard {
     }
 
     pub fn new(authority: impl Authority + 'static) -> Self {
-        Self(Some(Arc::new(authority)))
+        Self {
+            authority: Some(Arc::new(authority)),
+            requester: None,
+        }
+    }
+
+    /// Ties the request to its requester's connection, whose sender closes when it leaves.
+    pub fn requested_by(&mut self, requester: tokio::sync::watch::Receiver<()>) {
+        self.requester = Some(requester);
+    }
+
+    /// True once the requester has left. Only reads may stop on it: a mutation may already have
+    /// reached the harness, and its receipt must still be recorded.
+    pub fn departed(&self) -> bool {
+        self.requester
+            .as_ref()
+            .is_some_and(|requester| requester.has_changed().is_err())
+    }
+
+    /// Resolves once the requester has left; never for a request without a tracked requester.
+    pub async fn until_departed(&self) {
+        let Some(mut requester) = self.requester.clone() else {
+            return std::future::pending().await;
+        };
+        while requester.changed().await.is_ok() {}
     }
 
     pub fn admit(&self, mut accept: impl FnMut() -> bool) -> bool {
-        match &self.0 {
+        match &self.authority {
             Some(authority) => authority.admit(&mut accept),
             None => accept(),
         }
     }
 
     pub fn watch_owner(&self) -> Option<String> {
-        self.0
+        self.authority
             .as_ref()
             .and_then(|authority| authority.watch_owner())
     }
@@ -103,7 +132,7 @@ impl Guard {
 
     pub fn check_project(&self, id: &str, path: &std::path::Path) -> Result<(), RpcError> {
         if self
-            .0
+            .authority
             .as_ref()
             .and_then(|authority| authority.project())
             .is_some_and(|(allowed_id, allowed_path)| allowed_id != id || allowed_path != path)

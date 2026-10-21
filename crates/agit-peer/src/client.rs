@@ -596,12 +596,44 @@ pub async fn join_data(
     Ok(Connection::from_parts(pid, sink, source))
 }
 
+/// The Hub answers a ping with a pong carrying its payload; a socket that cannot is replaced.
+const PRESENCE_PING_INTERVAL: Duration = Duration::from_secs(15);
+const PRESENCE_PONG_DEADLINE: Duration = Duration::from_secs(10);
+const PRESENCE_IDLE: Duration = Duration::from_secs(45);
+/// The monotonic clock stops while the machine sleeps, so its timers fire late after a wake.
+/// Wall time is compared on this cadence to notice a wake promptly.
+const PRESENCE_CLOCK_CHECK: Duration = Duration::from_secs(2);
+/// Wall time running ahead of monotonic time by more than this means the machine slept, and the
+/// Hub has most likely closed the socket that still looks open here.
+const PRESENCE_SLEEP_SKEW: Duration = Duration::from_secs(10);
+
 pub struct Presence {
     pub epoch: String,
     pub worker_pid: u32,
     sink: PacketSink,
     source: PacketSource,
+    ping: Option<(Vec<u8>, tokio::time::Instant)>,
+    pings: u64,
+    next_ping: tokio::time::Instant,
+    clock: (SystemTime, std::time::Instant),
 }
+
+#[derive(Debug)]
+pub struct PresenceSlept {
+    pub skew: Duration,
+}
+
+impl std::fmt::Display for PresenceSlept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the machine slept for about {}s; reopening cloud presence",
+            self.skew.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for PresenceSlept {}
 
 impl Presence {
     pub async fn open(connection: Connection) -> anyhow::Result<Self> {
@@ -618,20 +650,75 @@ impl Presence {
             worker_pid,
             sink,
             source,
+            ping: None,
+            pings: 0,
+            next_ping: tokio::time::Instant::now() + PRESENCE_PING_INTERVAL,
+            clock: (SystemTime::now(), std::time::Instant::now()),
         })
     }
 
+    fn check_clock(&mut self) -> anyhow::Result<()> {
+        let (wall, monotonic) = (SystemTime::now(), std::time::Instant::now());
+        let skew = wall
+            .duration_since(self.clock.0)
+            .unwrap_or_default()
+            .saturating_sub(monotonic.duration_since(self.clock.1));
+        self.clock = (wall, monotonic);
+        if skew > PRESENCE_SLEEP_SKEW {
+            return Err(PresenceSlept { skew }.into());
+        }
+        Ok(())
+    }
+
+    /// Waits for the next offer while probing the socket. Dropping the future between packets
+    /// loses nothing; a probe it was sending is simply sent again.
     pub async fn next(&mut self) -> anyhow::Result<PresenceEvent> {
+        let mut idle = tokio::time::Instant::now() + PRESENCE_IDLE;
         loop {
-            let packet = tokio::time::timeout(Duration::from_secs(45), self.source.next())
-                .await?
-                .context("cloud presence closed")??;
+            self.check_clock()?;
+            let now = tokio::time::Instant::now();
+            ensure!(now < idle, "cloud presence was silent past its deadline");
+            if let Some((_, sent)) = &self.ping {
+                ensure!(
+                    now < *sent + PRESENCE_PONG_DEADLINE,
+                    "cloud presence did not answer its heartbeat"
+                );
+            } else if now >= self.next_ping {
+                self.pings += 1;
+                let payload = self.pings.to_be_bytes().to_vec();
+                tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    self.sink.send(Packet::Ping(payload.clone())),
+                )
+                .await??;
+                self.ping = Some((payload, now));
+            }
+            let wake = self
+                .ping
+                .as_ref()
+                .map_or(self.next_ping, |(_, sent)| *sent + PRESENCE_PONG_DEADLINE)
+                .min(idle)
+                .min(now + PRESENCE_CLOCK_CHECK);
+            let Ok(packet) = tokio::time::timeout_at(wake, self.source.next()).await else {
+                continue;
+            };
+            let packet = packet.context("cloud presence closed")??;
+            idle = tokio::time::Instant::now() + PRESENCE_IDLE;
             match packet {
                 Packet::Ping(bytes) => {
                     tokio::time::timeout(REQUEST_TIMEOUT, self.sink.send(Packet::Pong(bytes)))
                         .await??;
                 }
-                Packet::Pong(_) => {}
+                Packet::Pong(bytes) => {
+                    if self
+                        .ping
+                        .as_ref()
+                        .is_some_and(|(payload, _)| *payload == bytes)
+                    {
+                        self.ping = None;
+                        self.next_ping = tokio::time::Instant::now() + PRESENCE_PING_INTERVAL;
+                    }
+                }
                 Packet::Text(text) => {
                     let event: PresenceEvent = serde_json::from_str(&text)
                         .map_err(|_| anyhow::anyhow!("invalid cloud presence offer"))?;
@@ -650,6 +737,45 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A presence socket that stops answering is replaced within one ping cycle, while one whose
+    /// Hub answers stays open however long no offer arrives. A daemon that only waits for reads
+    /// would keep a dead socket until its idle deadline and miss every offer meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn presence_heartbeat_replaces_only_an_unanswering_socket() {
+        for answering in [true, false] {
+            let (packets, incoming) = tokio::sync::mpsc::unbounded_channel();
+            let replies = packets.clone();
+            let source = futures_util::stream::unfold(incoming, |mut incoming| async move {
+                incoming.recv().await.map(|packet| (Ok(packet), incoming))
+            });
+            let sink = futures_util::sink::unfold((), move |(), packet| {
+                if let (true, Packet::Ping(bytes)) = (answering, &packet) {
+                    let _ = replies.send(Packet::Pong(bytes.clone()));
+                }
+                async { Ok::<_, anyhow::Error>(()) }
+            });
+            packets
+                .send(Packet::Text(
+                    serde_json::to_string(&PresenceEvent::Ready {
+                        epoch: "presence".into(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap();
+            let mut presence =
+                Presence::open(Connection::from_parts(0, Box::pin(sink), Box::pin(source)))
+                    .await
+                    .unwrap();
+            let waited = tokio::time::timeout(PRESENCE_PING_INTERVAL * 4, presence.next()).await;
+            if answering {
+                assert!(waited.is_err(), "an answering presence must stay open");
+            } else {
+                let error = waited.expect("a dead presence must fail").unwrap_err();
+                assert!(error.to_string().contains("heartbeat"));
+            }
+        }
+    }
 
     /// An authenticated HTTP response must still match the exact publication and delivery lease.
     #[tokio::test]

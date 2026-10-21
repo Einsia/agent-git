@@ -32,6 +32,7 @@ pub mod codex_index;
 pub(crate) mod codex_ownership;
 #[cfg(feature = "cli")]
 pub(crate) mod codex_provider;
+pub(crate) mod codex_rollout;
 mod codex_titles;
 pub mod cursor;
 pub mod detail;
@@ -660,6 +661,13 @@ pub trait Adapter {
     /// cwd, so passing it goes straight there. The slug rule is not one we can guarantee, so a
     /// failed direct hit must fall back to the lookup by id.
     fn resolve(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf>;
+
+    /// The transcript only when it is readable in place. Metadata and preview readers use this:
+    /// resolving may restore a runtime's cold storage, which a listing must never do for every
+    /// conversation it shows.
+    fn resolve_present(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+        self.resolve(session_id, cwd)
+    }
 
     /// Read-only inspection requires an explicit full identity and refuses ambiguous sources.
     fn lookup_native_readonly(

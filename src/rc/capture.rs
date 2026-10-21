@@ -11,6 +11,11 @@ use std::path::Path;
 
 pub(crate) const CAPTURE_ENV: &str = "AGIT_RC_CAPTURE_KIND";
 
+/// Another writer changed the claim while it was read; reading it again settles the race.
+#[derive(Debug, thiserror::Error)]
+#[error("capture claim changed during inspection")]
+pub(crate) struct ClaimChanged;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RepositoryKind {
@@ -119,18 +124,16 @@ fn select(
         );
         return Ok(None);
     }
-    let owner = claim
-        .owner
-        .as_deref()
-        .context("capture claim has no owner")?;
+    let owner = claim.owner.clone().context("capture claim has no owner")?;
     let name = claim
         .agent
-        .as_deref()
+        .clone()
         .context("capture claim has no repository")?;
     let branch = claim
         .branch
-        .as_deref()
+        .clone()
         .context("capture claim has no branch")?;
+    let (owner, name, branch) = (owner.as_str(), name.as_str(), branch.as_str());
     let probe = AgitSession::new(
         &format!("{owner}/{name}"),
         "00000000-0000-0000-0000-000000000001",
@@ -144,12 +147,20 @@ fn select(
     } else {
         None
     };
-    let current =
-        link::get_checked(&store, runtime, native)?.context("capture claim disappeared")?;
-    ensure!(
-        current.to_json()? == claim.to_json()?,
-        "capture claim changed during selection"
-    );
+    let current = link::get_checked(&store, runtime, native)?.ok_or(ClaimChanged)?;
+    if current.to_json()? != claim.to_json()? {
+        return Err(ClaimChanged.into());
+    }
+    // Under the link lock, a claim saved before a generation bump of its still-valid store
+    // records the current generation, so later readers and landings agree on it.
+    let mut claim = claim;
+    if serialize {
+        let mut refreshed = claim.clone();
+        if refreshed.refresh_native_generation().unwrap_or(false) {
+            link::write(&store, &refreshed)?;
+            claim = refreshed;
+        }
+    }
     ensure!(
         Path::new(
             claim
@@ -198,14 +209,14 @@ fn select(
         active.len() == 1 && active[0].instance() == claim.instance(),
         "capture branch has conflicting runtime claims"
     );
-    ensure!(
-        link::get_checked(&store, runtime, native)?
-            .map(|current| current.to_json())
-            .transpose()?
-            .as_ref()
-            == Some(&claim.to_json()?),
-        "capture claim changed during inspection"
-    );
+    if link::get_checked(&store, runtime, native)?
+        .map(|current| current.to_json())
+        .transpose()?
+        .as_ref()
+        != Some(&claim.to_json()?)
+    {
+        return Err(ClaimChanged.into());
+    }
     lineage.capture = Some(kind);
     Ok(Some(lineage))
 }
@@ -258,6 +269,113 @@ pub(crate) fn destination(
 mod tests {
     use super::*;
     use crate::adapter::Adapter;
+
+    /// A claim saved under an older generation of the same store keeps its capture route, and
+    /// selection records the current generation in it. A replaced home is still refused. An
+    /// implementation that compares whole source references reports the transcript as missing
+    /// after any bump, and one that ignores home identity adopts a copied store.
+    #[test]
+    fn a_source_generation_bump_keeps_the_capture_and_refreshes_its_claim() {
+        if crate::rc::in_isolated_test(
+            "rc::capture::tests::a_source_generation_bump_keeps_the_capture_and_refreshes_its_claim",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let home = root.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        let native = uuid::Uuid::now_v7().to_string();
+        let transcript = home.join(format!("rollout-{native}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":cwd}})
+            ),
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER)").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1,?2,?3,0,'question','cli',1)",
+            rusqlite::params![native, transcript.to_str(), cwd.to_str()],
+        )
+        .unwrap();
+        let registry = crate::rc::runtime_sources::Registry::open().unwrap();
+        let source = registry.register(&home, None, None, None).unwrap();
+        let binding = link::NativeBinding {
+            source: crate::protocol::NativeSourceRef {
+                source_id: source.source_id.clone(),
+                generation: source.generation,
+            },
+            thread_id: native.clone(),
+        };
+        let key = binding.key().unwrap();
+        let store = Store::open_or_init().unwrap();
+        let mut claim = link::Link::from_native(binding, &cwd).unwrap();
+        claim.owner = Some("alice".into());
+        claim.agent = Some("imported".into());
+        claim.branch = Some("work".into());
+        link::write(&store, &claim).unwrap();
+        let route = AgitSession::new(
+            "alice/imported",
+            "00000000-0000-0000-0000-000000000001",
+            "work",
+        )
+        .unwrap();
+        let repo = Repo::init(&route.repo_dir().unwrap()).unwrap();
+        repo.git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ])
+        .unwrap();
+        repo.git(&["branch", "work"]).unwrap();
+        identity::pin(
+            &repo,
+            &RemoteIdentity::new("https://hub.invalid", route.agent_id()).unwrap(),
+        )
+        .unwrap();
+
+        registry.remove(&source.source_id).unwrap();
+        let current = registry.register(&home, None, None, None).unwrap();
+        assert!(current.generation > source.generation);
+        let generation = |store: &Store| {
+            link::get_checked(store, "codex", &key)
+                .unwrap()
+                .unwrap()
+                .native_binding
+                .unwrap()
+                .source
+                .generation
+        };
+        assert_eq!(generation(&store), source.generation);
+        assert!(inspect("codex", &key, &cwd, None, None).unwrap().is_some());
+        assert_eq!(
+            generation(&store),
+            source.generation,
+            "read-only inspection never rewrites a claim"
+        );
+        let selected = resolve("codex", &key, &cwd, None, None).unwrap().unwrap();
+        assert_eq!(selected.to_string(), "alice/imported@work");
+        assert_eq!(generation(&store), current.generation);
+
+        std::fs::rename(&home, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        assert!(resolve("codex", &key, &cwd, None, None).is_err());
+    }
 
     #[test]
     fn native_capture_uses_the_exact_link_and_retains_repository_kind() {

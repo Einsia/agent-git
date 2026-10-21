@@ -6,6 +6,7 @@ mod delegation;
 pub mod host;
 pub mod ingress;
 mod publication;
+pub(crate) mod refusal;
 pub mod resources;
 pub mod store;
 pub use commands::{Args, run};

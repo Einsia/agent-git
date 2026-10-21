@@ -162,6 +162,7 @@ crossterm = { version = "0.29", optional = true }
 #
 # Not optional: `comfy-table` needs it to measure colored table widths too, so it
 # does not sit behind the `cli` gate.
+unicode-normalization = "0.1"
 unicode-width = "0.2"
 # The CLI passes pre-colored status text to table cells.  `custom_styling`
 # makes comfy-table measure ANSI-colored strings by their visible width;
@@ -203,6 +204,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 
 # ── Filesystem ──────────────────────────────────────────────────────────
 walkdir = "2"
+# Codex stores cold rollouts as zstd frames; agit only needs to decode them.
+ruzstd = "0.9"
 same-file = "1"
 tempfile = "3"
 # File locks: hooks can fire concurrently (two sessions opened at once), so writes

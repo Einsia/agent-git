@@ -169,7 +169,7 @@ pub(crate) fn live_transcript_target_in(
     cwd: &Path,
     projects: &Path,
 ) -> crate::Result<PathBuf> {
-    use crate::adapter::claude_code::{canonical_cwd, slug_for};
+    use crate::adapter::claude_code::{canonical_cwd, project_slugs, slug_for};
     let process = live
         .cwd()
         .context("the Claude Code process did not register its folder")?;
@@ -180,7 +180,7 @@ pub(crate) fn live_transcript_target_in(
     let name = format!("{}.jsonl", live.session_id);
     let target = projects.join(slug_for(process)).join(&name);
     let mut found: Option<PathBuf> = None;
-    for slug in [slug_for(process), crate::domain::store::slug_for(process)] {
+    for slug in project_slugs(process) {
         let path = projects.join(slug).join(&name);
         if found.as_ref() == Some(&path) {
             continue;

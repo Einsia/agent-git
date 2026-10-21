@@ -14,9 +14,37 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const BATCH_SIZE: usize = 16;
-const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const BATCH_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+/// The answer must reach the Hub before its own request deadline, with room for relay transit;
+/// an answer that arrives later is discarded together with the cursor it carries.
+const RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// An entry starts only with room for its receiver attempt and local bookkeeping.
+const ENTRY_RESERVE: std::time::Duration = std::time::Duration::from_secs(6);
 const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Entries finished so far. It outlives an interrupted batch, so the answer always carries a
+/// cursor past finished work and a retry resumes there instead of repeating it.
+#[derive(Default)]
+struct Progress {
+    started: bool,
+    items: Vec<Value>,
+    pending: usize,
+    finished: Option<String>,
+    next_after: Option<String>,
+}
+
+impl Progress {
+    fn finish(&mut self, id: String, item: Value) {
+        self.items.push(item);
+        self.finished = Some(id);
+    }
+
+    fn response(&self, logical: &str) -> Value {
+        let status = publication_status(&self.items, self.pending);
+        json!({"session_id":logical, "items":self.items, "pending":self.pending,
+            "next_after":self.next_after, "retry_after_ms": if self.pending > 0 { Some(5000) } else { None },
+            "publication":status})
+    }
+}
 
 pub(super) async fn dispatch(
     daemon: Arc<Mutex<Daemon>>,
@@ -154,7 +182,10 @@ impl Prepared {
         if !daemon.opts.local_owner
             || row.workspace_id != crate::rc::endpoint::WORKSPACE
             || row.runtime != self.runtime
-            || row.native_source != self.native_source
+            || !crate::protocol::NativeSourceRef::same_store(
+                row.native_source.as_ref(),
+                self.native_source.as_ref(),
+            )
             || (row.thread_id != self.native && !row.prior_threads.contains(&self.native))
             || row.agit_session.as_deref() != Some(self.lineage.to_string().as_str())
             || row.expected_agent_id.as_deref() != Some(self.lineage.agent_id())
@@ -170,15 +201,39 @@ impl Prepared {
         daemon: Arc<Mutex<Daemon>>,
         stop: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<Value, RpcError> {
-        tokio::select! {
-            biased;
-            _ = stop.wait_for(|stopped| *stopped) => Err(unavailable()),
-            result = tokio::time::timeout(BATCH_TIMEOUT, self.deliver(daemon)) => result.unwrap_or_else(|_| Err(unavailable())),
+        let deadline = tokio::time::Instant::now() + RESPONSE_BUDGET;
+        let mut progress = Progress {
+            finished: self.after.clone(),
+            ..Progress::default()
+        };
+        let result = {
+            let delivery =
+                tokio::time::timeout_at(deadline, self.deliver(daemon, deadline, &mut progress));
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => return Err(unavailable()),
+                result = delivery => result,
+            }
+        };
+        match result {
+            Ok(result) => result,
+            // Work in flight is abandoned, not undone: the finished prefix is reported and the
+            // interrupted entry is the first one a retry visits.
+            Err(_) if progress.started => {
+                self.authority.publication_grant()?;
+                progress.next_after = progress.finished.clone();
+                Ok(progress.response(&self.logical))
+            }
+            Err(_) => Err(unavailable()),
         }
     }
 
-    async fn deliver(&self, daemon: Arc<Mutex<Daemon>>) -> Result<Value, RpcError> {
-        let deadline = tokio::time::Instant::now() + BATCH_WORK_BUDGET;
+    async fn deliver(
+        &self,
+        daemon: Arc<Mutex<Daemon>>,
+        deadline: tokio::time::Instant,
+        progress: &mut Progress,
+    ) -> Result<Value, RpcError> {
         let grant = self.authority.publication_grant()?;
         let lineage = self.lineage.clone();
         let (native, runtime, hub) = (
@@ -229,7 +284,7 @@ impl Prepared {
         } {
             return Ok(setup_response(&self.logical, &records, reason));
         }
-        let mut pending = records
+        progress.pending = records
             .iter()
             .filter(|entry| entry.acknowledged.is_none())
             .count();
@@ -242,18 +297,16 @@ impl Prepared {
             })
             .take(BATCH_SIZE + 1)
             .collect();
-        let mut next_after =
+        progress.next_after =
             (selected.len() > BATCH_SIZE).then(|| selected[BATCH_SIZE - 1].notification_id.clone());
         let api =
             agit_peer::client::Client::new(&destination.identity.hub).map_err(|_| unavailable())?;
-        let mut items = vec![];
-        let mut processed = self.after.clone();
+        progress.started = true;
         for mut entry in selected.into_iter().take(BATCH_SIZE) {
-            if tokio::time::Instant::now() >= deadline {
-                next_after = processed;
+            if deadline.saturating_duration_since(tokio::time::Instant::now()) < ENTRY_RESERVE {
+                progress.next_after = progress.finished.clone();
                 break;
             }
-            processed = Some(entry.notification_id.clone());
             self.check_lineage(&*daemon.lock().await)?;
             let grant = self.authority.publication_grant()?;
             if entry.request().destination != destination.identity
@@ -274,7 +327,8 @@ impl Prepared {
                     entry = recovered;
                 }
                 if entry.publication.is_none() && entry.prepared.is_none() {
-                    items.push(json!({"notification_id":id, "status":"awaiting_publication"}));
+                    let item = json!({"notification_id":id, "status":"awaiting_publication"});
+                    progress.finish(id, item);
                     continue;
                 }
             }
@@ -329,7 +383,8 @@ impl Prepared {
             .await?;
             let Some(notification) = notification else {
                 self.authority.publication_grant()?;
-                items.push(json!({"notification_id":id, "status":"local_state_unavailable"}));
+                let item = json!({"notification_id":id, "status":"local_state_unavailable"});
+                progress.finish(id, item);
                 continue;
             };
             let delivery = Delivery::new(notification, &grant, now()).map_err(|_| forbidden())?;
@@ -358,7 +413,8 @@ impl Prepared {
                     Ok(response) => response,
                     Err(status) => {
                         self.authority.publication_grant()?;
-                        items.push(json!({"notification_id":id, "status":status}));
+                        let item = json!({"notification_id":id, "status":status});
+                        progress.finish(id, item);
                         continue;
                     }
                 };
@@ -395,21 +451,18 @@ impl Prepared {
                     Ok(())
                 })
                 .await?;
-                pending = pending.saturating_sub(1);
+                progress.pending = progress.pending.saturating_sub(1);
                 accepted
             };
             self.authority.publication_grant()?;
             let state = daemon.lock().await;
             self.check_lineage(&state)?;
             let coverage = current_coverage(&state, &entry.capture);
-            items.push(json!({"notification_id":id, "status":"acknowledged", "notification":delivery.notification, "receipt":receipt, "coverage":coverage}));
+            let item = json!({"notification_id":id, "status":"acknowledged", "notification":delivery.notification, "receipt":receipt, "coverage":coverage});
+            progress.finish(id, item);
         }
         self.authority.publication_grant()?;
-        let status = publication_status(&items, pending);
-        Ok(
-            json!({"session_id":self.logical, "items":items, "pending":pending,
-            "next_after":next_after, "retry_after_ms": if pending > 0 { Some(5000) } else { None }, "publication":status}),
-        )
+        Ok(progress.response(&self.logical))
     }
 }
 
@@ -626,6 +679,16 @@ mod status_tests {
             .as_mut()
             .unwrap()
             .generation += 1;
+        prepared.check_lineage(&daemon).unwrap();
+        daemon
+            .roster
+            .sessions
+            .get_mut("beta")
+            .unwrap()
+            .native_source
+            .as_mut()
+            .unwrap()
+            .source_id = format!("src-{}", uuid::Uuid::new_v4());
         assert!(prepared.check_lineage(&daemon).is_err());
     }
 

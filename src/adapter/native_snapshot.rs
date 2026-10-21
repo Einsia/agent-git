@@ -115,6 +115,7 @@ pub(crate) fn lookup_files(runtime: &'static str, id: &str, limits: Limits) -> R
     if runtime == "codex"
         && let Some(path) = super::codex_index::native_path_readonly(id, limits)?
     {
+        let path = super::codex_rollout::restore(&path).map_err(|_| Unavailable::Read)?;
         return file_source(runtime, id, path);
     }
     lookup_files_without_database(runtime, id, limits)
@@ -138,13 +139,30 @@ pub(crate) fn lookup_files_without_database(
 ///
 /// The state database is deliberately not consulted: after a rollback the logical thread row can
 /// point at a replacement rollout while existing children still reference the original physical
-/// carrier. Archived rollouts retain their filename and remain valid history bases.
+/// carrier. Archived rollouts retain their filename and remain valid history bases, and so do cold
+/// rollouts Codex has compressed: those are restored to their plain name before they are returned.
 pub(crate) fn lookup_codex_rollout(id: &str, limits: Limits) -> Result<Source> {
     let home = super::codex::codex_home().map_err(|_| Unavailable::Read)?;
     lookup_codex_rollout_in(&home, id, limits)
 }
 
 pub(crate) fn lookup_codex_rollout_in(home: &Path, id: &str, limits: Limits) -> Result<Source> {
+    let path = codex_carrier_in(home, id, limits)?;
+    let path = super::codex_rollout::restore(&path).map_err(|_| Unavailable::Read)?;
+    file_source("codex", id, path)
+}
+
+/// The rollout carrier as it is on disk: plain, or compressed when the rollout is cold.
+///
+/// Header readers use this instead of [`lookup_codex_rollout`]: walking a lineage must not
+/// decode every ancestor a page may never reach.
+#[cfg(feature = "rc")]
+pub(crate) fn codex_carrier(id: &str, limits: Limits) -> Result<PathBuf> {
+    let home = super::codex::codex_home().map_err(|_| Unavailable::Read)?;
+    codex_carrier_in(&home, id, limits)
+}
+
+pub(crate) fn codex_carrier_in(home: &Path, id: &str, limits: Limits) -> Result<PathBuf> {
     validate_id(id, limits)?;
     let mut selected = None;
     let mut visited = 0usize;
@@ -161,18 +179,19 @@ pub(crate) fn lookup_codex_rollout_in(home: &Path, id: &str, limits: Limits) -> 
             visited += 1;
             let entry = entry.map_err(|_| Unavailable::Read)?;
             let path = entry.path();
-            let matches = path
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
-                && super::codex::id_from_filename(path).as_deref() == Some(id);
-            if matches {
+            // While Codex compresses or restores a rollout both carriers exist briefly; they are
+            // one rollout, and the plain one is current.
+            if super::codex_rollout::is_carrier(path)
+                && super::codex::id_from_filename(path).as_deref() == Some(id)
+            {
                 if selected.is_some() {
                     return Err(Unavailable::Ambiguous);
                 }
-                selected = Some(file_source("codex", id, path.to_owned())?);
+                selected = Some(path.to_owned());
             }
         }
     }
+    // Restoring during the walk could surface the new plain file as a second match.
     selected.ok_or(Unavailable::NotFound)
 }
 
@@ -210,9 +229,14 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
         }
         let entry = entry.map_err(|_| Unavailable::Read)?;
         let path = entry.path();
-        let matches = path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
+        // A cold Codex rollout is a compressed carrier; it counts while its plain name is absent.
+        let carrier = if runtime == "codex" {
+            super::codex_rollout::is_carrier(path)
+        } else {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        };
+        let matches = carrier
             && match runtime {
                 "codex" => super::codex::id_from_filename(path).as_deref() == Some(id),
                 "cursor" => {
@@ -229,10 +253,18 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
             if selected.is_some() {
                 return Err(Unavailable::Ambiguous);
             }
-            selected = Some(file_source(runtime, id, path.to_owned())?);
+            selected = Some(path.to_owned());
         }
     }
-    selected.ok_or(Unavailable::NotFound)
+    let path = selected.ok_or(Unavailable::NotFound)?;
+    // Readers of the returned source need its records, so a cold carrier is restored the way
+    // every other rollout lookup restores it.
+    let path = if runtime == "codex" {
+        super::codex_rollout::restore(&path).map_err(|_| Unavailable::Read)?
+    } else {
+        path
+    };
+    file_source(runtime, id, path)
 }
 
 pub(crate) fn finish(source: Source, bytes: Vec<u8>, limits: Limits) -> Result<Snapshot> {

@@ -3,12 +3,10 @@
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BinaryHeap;
-use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 
 const PREFIX: &str = "files:";
 const CHUNK: usize = 100;
-const HEADER_BYTES: u64 = 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Directory {
@@ -185,11 +183,9 @@ pub(super) fn page(home: &Path, after: Option<&str>, limit: usize) -> crate::Res
                     sweep.stack.push(Directory::new(relative));
                 }
             }
+            // Cold rollouts are listed from their compressed carrier without restoring them.
             Ok(metadata)
-                if metadata.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "jsonl") =>
+                if metadata.is_file() && crate::adapter::codex_rollout::is_carrier(&path) =>
             {
                 match header(home, &path) {
                     Ok(thread) => threads.push(thread),
@@ -219,16 +215,17 @@ pub(super) fn header(
         path.starts_with(home),
         "native transcript escaped its source"
     );
-    let file = std::fs::File::open(&path)?;
-    let metadata = file.metadata()?;
+    let metadata = std::fs::metadata(&path)?;
     ensure!(
         metadata.is_file(),
         "native transcript is not a regular file"
     );
-    let mut line = String::new();
-    std::io::BufReader::new(file.take(HEADER_BYTES)).read_line(&mut line)?;
-    ensure!(line.ends_with('\n'), "native header is incomplete");
-    let record: serde_json::Value = serde_json::from_str(&line)?;
+    let line = crate::adapter::codex_rollout::first_line(
+        &path,
+        crate::adapter::codex_rollout::HEADER_LIMIT,
+    )?;
+    ensure!(line.ends_with(b"\n"), "native header is incomplete");
+    let record: serde_json::Value = serde_json::from_slice(&line)?;
     ensure!(record["type"] == "session_meta", "native header is invalid");
     let payload = &record["payload"];
     let id = payload["id"]
@@ -249,7 +246,8 @@ pub(super) fn header(
         .and_then(|duration| i64::try_from(duration.as_millis()).ok());
     Ok(crate::adapter::codex_index::Thread {
         id: id.into(),
-        rollout_path: path,
+        // The plain name, as Codex's index names a cold rollout; locating restores it.
+        rollout_path: crate::adapter::codex_rollout::plain_path(&path),
         cwd: Some(cwd.into()),
         gist: None,
         thread_source: None,
@@ -277,6 +275,54 @@ pub(super) fn locate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Most dormant rollouts are compressed, and real headers outgrow a small read. A sweep
+    /// that skipped compressed carriers would report complete coverage without them and the
+    /// catalog would delete their rows; one that restored them would decode every dormant
+    /// transcript on each sweep. While both carriers of one rollout exist, it is listed once.
+    #[test]
+    fn discovery_lists_cold_rollouts_once_without_restoring_them() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().canonicalize().unwrap();
+        let directory = home.join("sessions/2026/10/01");
+        std::fs::create_dir_all(&directory).unwrap();
+        let rollout = |id: &str| {
+            let header = serde_json::json!({"type":"session_meta","payload":{
+                "id":id,"cwd":home,"base_instructions":{"text":"x".repeat(64 * 1024)}}});
+            format!("{header}\n{{\"type\":\"event_msg\"}}\n").into_bytes()
+        };
+        let compress = |bytes: &[u8]| {
+            ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+        };
+        let cold = uuid::Uuid::from_u128(1).to_string();
+        let plain = directory.join(format!("rollout-2026-10-01T00-00-00-{cold}.jsonl"));
+        std::fs::write(
+            directory.join(format!("rollout-2026-10-01T00-00-00-{cold}.jsonl.zst")),
+            compress(&rollout(&cold)),
+        )
+        .unwrap();
+        let both = uuid::Uuid::from_u128(2).to_string();
+        let name = format!("rollout-2026-10-01T00-00-00-{both}.jsonl");
+        std::fs::write(directory.join(&name), rollout(&both)).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.zst")),
+            compress(&rollout(&both)),
+        )
+        .unwrap();
+        let result = page(&home, None, 100).unwrap();
+        assert!(result.next_cursor.is_none() && result.reliable);
+        let mut threads: Vec<_> = result
+            .threads
+            .into_iter()
+            .map(|thread| (thread.id, thread.rollout_path))
+            .collect();
+        threads.sort();
+        assert_eq!(
+            threads,
+            [(cold, plain.clone()), (both, directory.join(name))]
+        );
+        assert!(!plain.exists());
+    }
 
     #[test]
     fn discovery_resumes_across_directory_pages_and_retains_incomplete_coverage() {

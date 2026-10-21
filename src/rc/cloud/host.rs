@@ -315,10 +315,15 @@ async fn run_executor(
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         }.await;
+        let error = attempt.as_ref().err();
         record(
             &log,
             "cloud.presence_disconnected",
-            serde_json::json!({"hub":hub,"failed":attempt.is_err(),"retry_ms":backoff.as_millis()}),
+            serde_json::json!({
+                "hub":hub, "failed":attempt.is_err(), "retry_ms":backoff.as_millis(),
+                "slept":error.is_some_and(|error| error.is::<agit_peer::client::PresenceSlept>()),
+                "error":error.map(|error| format!("{error:#}").chars().take(512).collect::<String>()),
+            }),
         );
         if attempt.is_ok() {
             backoff = Duration::from_millis(250);

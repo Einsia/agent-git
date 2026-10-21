@@ -14,23 +14,21 @@ OpenCode uses projected-item positions. `has_more` must agree with `before > 0`.
 An empty display page may still have earlier records. A token-only request reads
 the tail of that same snapshot, allowing a collector to verify its final read.
 
-File sources and Codex ancestor prefixes are copied into private, unlinked
-scratch files with source metadata checked across capture. OpenCode uses the
-existing bounded read-only SQLite snapshot and native event projection, retaining
+File sources and Codex ancestor prefixes are pinned, not copied: a snapshot holds an
+open handle on each carrier together with the end of its admitted prefix. Ancestor
+prefixes are immutable and the leaf only grows, so records appended after the
+capture, including one still being written, stay outside the snapshot without
+invalidating it; the leaf is pinned at its last complete record. A carrier whose
+path is replaced keeps serving the pinned bytes through its handle. A carrier that
+shrinks below its pinned end, or whose bytes just before that end are rewritten,
+fails the page as `source_changed`. A compressed (`.jsonl.zst`) ancestor is admitted
+from its header alone and restored only when a page first reaches it. OpenCode uses
+the existing bounded read-only SQLite snapshot and native event projection, retaining
 stable part identities when rows are revised. Pagination never reopens a different
 native version. New writes remain available through watch and a fresh initial
-request; snapshot reads neither launch nor resume a harness. Copies have bounded
-size, cache capacity and idle lifetime; the constants live in
+request; snapshot reads neither launch nor resume a harness. Snapshots have bounded
+cache capacity and idle lifetime; the constants live in
 `src/rc/local_history/snapshot.rs`. Eviction or daemon restart expires the token.
-
-File-backed history has a separate logical disk budget from OpenCode's in-memory
-projection: up to 8 GiB per snapshot and 32 GiB across retained file snapshots.
-macOS and Linux attempt a filesystem copy-on-write clone of each open source;
-unsupported filesystems and other platforms stream into private scratch files
-with a fixed buffer. Neither method loads the whole transcript into RAM. Page
-and RPC response limits still apply. Clones stay isolated from subsequent source
-appends, truncation and replacement. A streaming capture can take longer and
-retries if the source changes during copying.
 
 If history shows a local privacy-protection failure, inspect the executor log.
 On macOS an existing dictionary may need Keychain authorization before its key
@@ -52,10 +50,20 @@ execution state of the harness.
 History RPC failures retain the existing JSON-RPC error code and add `data.kind`,
 `data.retryable`, and `data.restart`. Kinds include `source_missing`,
 `source_unreadable`, `invalid_record`, `incomplete_record`, `cursor_expired`,
-`source_changed`, `resource_limit`, `unsupported`, `busy`, and `read_failed`.
-Errors do not include native paths or parser excerpts. Missing or damaged sources
-are not successful empty histories. A caller retains already displayed messages
-on failure and offers an explicit reload for expired snapshots.
+`source_changed`, `resource_limit`, `unsupported`, `path_not_allowed`,
+`invalid_request`, `busy`, and `read_failed`. `retryable` asks the caller to repeat
+the same request; `restart` asks it to drop its snapshot and read the newest page
+again. A permanent condition sets neither, and the caller shows it. A transient
+`busy` may name its cause in `data.reason`: `catalog_refreshing` while a catalog
+sweep has not yet reached the conversation, or `transcript_restoring` while a
+compressed transcript is restored. Errors do not include native paths or parser
+excerpts. Missing or damaged sources are not successful empty histories. A caller
+retains already displayed messages on failure and offers an explicit reload for
+expired snapshots.
+
+Identical concurrent requests share one read. History of a conversation whose
+project directory was removed stays readable while the directory lies inside a
+bound project; launching or resuming it still requires the directory.
 
 ## Local verification
 

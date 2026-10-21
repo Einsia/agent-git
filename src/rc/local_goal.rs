@@ -7,10 +7,34 @@ use std::{
 };
 
 pub(crate) fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
+    validate_header_in(path, native, cwd, |actual| Ok(actual.canonicalize()?))
+}
+
+/// For reading existing history: the recorded directory may have been removed since, and is
+/// compared by the location the workspace policy judges for it.
+pub(crate) fn validate_history_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
+    validate_header_in(path, native, cwd, |actual| {
+        super::policy::resolved(actual).context("Native working directory cannot be resolved")
+    })
+}
+
+fn validate_header_in(
+    path: &Path,
+    native: &str,
+    cwd: &Path,
+    resolve: impl FnOnce(&Path) -> crate::Result<PathBuf>,
+) -> crate::Result<()> {
     let file = std::fs::File::open(path)?;
     let mut line = String::new();
     std::io::BufReader::new(file.take(1024 * 1024)).read_line(&mut line)?;
-    ensure!(line.ends_with('\n'), "Native session header is incomplete");
+    // A header still being written is a passing condition, not a different conversation.
+    ensure!(
+        line.ends_with('\n'),
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Native session header is incomplete"
+        )
+    );
     let header: Value = serde_json::from_str(&line)?;
     ensure!(
         header["type"] == "session_meta" && header["payload"]["id"] == native,
@@ -20,7 +44,7 @@ pub(crate) fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::R
         .as_str()
         .context("Native working directory is unavailable")?;
     ensure!(
-        Path::new(actual).canonicalize()? == cwd,
+        resolve(Path::new(actual))? == cwd,
         "Native session belongs to another working directory"
     );
     Ok(())
@@ -93,16 +117,18 @@ fn target(params: Value) -> crate::Result<Target> {
         .context("Working directory is required")?;
     let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
     let cwd = super::policy::require_within(Path::new(cwd), &roots)?;
-    let source = entry
-        .and_then(|entry| entry.native_source.clone())
-        .or_else(|| {
-            catalog
-                .as_ref()
-                .map(|row| crate::protocol::NativeSourceRef {
-                    source_id: row.source_id.clone(),
-                    generation: row.source_generation,
-                })
-        });
+    // A catalog row is fenced to the generation the client listed it under. A roster row names
+    // its store across generations; resolution still refuses a removed or replaced home.
+    let saved = entry.and_then(|entry| entry.native_source.clone());
+    let fenced = saved.is_none();
+    let source = saved.or_else(|| {
+        catalog
+            .as_ref()
+            .map(|row| crate::protocol::NativeSourceRef {
+                source_id: row.source_id.clone(),
+                generation: row.source_generation,
+            })
+    });
     let context = source
         .map(|source| {
             let context = super::runtime_context::RuntimeContext::resolve(
@@ -110,7 +136,7 @@ fn target(params: Value) -> crate::Result<Target> {
                 &source.source_id,
             )?;
             ensure!(
-                context.source.generation == source.generation,
+                !fenced || context.source.generation == source.generation,
                 "Runtime source changed"
             );
             Ok::<_, anyhow::Error>(context)

@@ -238,9 +238,17 @@ impl Tailer {
             .source
             .as_ref()
             .is_some_and(|previous| previous != &source);
-        let rewritten = len == self.offset && metadata.modified().ok() != self.modified;
+        // A carrier restored from its compressed copy is a new file holding the same bytes.
+        // Restarting there would replay the whole transcript as new records.
+        let restored = replaced
+            && len >= self.offset
+            && self.source.as_mut().is_some_and(|previous| {
+                same_prefix(previous.as_file_mut(), source.as_file_mut(), self.offset)
+            });
+        let rewritten =
+            !restored && len == self.offset && metadata.modified().ok() != self.modified;
         self.modified = metadata.modified().ok();
-        if replaced || rewritten || len < self.offset || self.source.is_none() {
+        if (replaced && !restored) || rewritten || len < self.offset || self.source.is_none() {
             self.reset = true;
             let (offset, line) = self.replay_window.map_or((0, 0), |want| {
                 let (offset, line, _, _) = window_start_bounded(source.as_file_mut(), want, len);
@@ -316,6 +324,9 @@ fn window_start_bounded(f: &mut std::fs::File, want: u64, len: u64) -> (u64, u64
             base_off = 0;
         }
     }
+    // The scan starts at `base_off` wherever an earlier reader left the shared cursor; a window
+    // read from that cursor instead would start mid-file and replay the wrong records.
+    let _ = f.seek(SeekFrom::Start(base_off));
     let mut starts: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
     let mut reader = BufReader::new(f.take(len - base_off));
     let mut offset: u64 = base_off;
@@ -338,6 +349,19 @@ fn window_start_bounded(f: &mut std::fs::File, want: u64, len: u64) -> (u64, u64
     // An empty capped window must stay at the aligned boundary, never rewind to the head.
     let (start_off, start_line) = starts.front().copied().unwrap_or((base_off, 0));
     (start_off, start_line, lineno, base_off == 0)
+}
+
+/// Whether `next` ends the consumed range with the bytes `previous` held there.
+fn same_prefix(previous: &mut std::fs::File, next: &mut std::fs::File, end: u64) -> bool {
+    const WINDOW: u64 = 64 * 1024;
+    let start = end.saturating_sub(WINDOW);
+    let read = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+        let mut bytes = vec![0; (end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    };
+    matches!((read(previous), read(next)), (Ok(left), Ok(right)) if left == right)
 }
 
 #[cfg(unix)]
@@ -470,6 +494,33 @@ mod tests {
             assert_eq!(tailer.poll().unwrap(), expected);
             assert!(tailer.poll().unwrap().is_empty());
         }
+    }
+
+    /// Codex compresses a dormant rollout and either side restores it later as a new file with
+    /// the same bytes. A tailer that treated that as a replacement would replay the whole
+    /// transcript as new records; a replacement with other bytes still restarts.
+    #[test]
+    fn a_restored_carrier_keeps_the_position_and_its_partial_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jsonl");
+        let restored = dir.path().join("restored.jsonl");
+        std::fs::write(&path, "one\ntwo\npar").unwrap();
+        let mut tailer = Tailer::new(&path, true);
+        assert_eq!(tailer.poll().unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+        assert!(tailer.poll().unwrap().is_empty());
+        std::fs::write(&restored, "one\ntwo\npartial\nthree\n").unwrap();
+        std::fs::rename(&restored, &path).unwrap();
+        let lines = tailer.poll().unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["partial", "three"]
+        );
+        assert_eq!(lines[0].lineno, 2);
+        assert!(!tailer.take_reset());
     }
 
     #[test]

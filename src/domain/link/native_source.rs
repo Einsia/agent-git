@@ -69,21 +69,38 @@ impl Link {
             .native_binding
             .as_ref()
             .context("native source binding is missing")?;
+        // Resolution validates the store's home identity; that, not the connection generation
+        // saved with the claim, decides whether this claim still names the same transcripts.
         let registry = crate::rc::runtime_sources::Registry::open()?;
         let context = crate::rc::runtime_context::RuntimeContext::resolve(
             &registry,
             &binding.source.source_id,
         )?;
-        ensure!(
-            context.source.generation == binding.source.generation,
-            "native source changed; refresh the session binding"
-        );
         let cwd = self
             .cwd
             .as_deref()
             .context("source-qualified link has no working directory")?;
         let roots = crate::rc::policy::CanonicalRoots::from_untrusted([PathBuf::from(cwd)]);
         Ok((context, roots))
+    }
+
+    /// Record the source's current generation in a claim whose store still validates.
+    /// Returns whether the binding changed; the caller holds the link lock and writes it.
+    #[cfg(feature = "rc")]
+    pub fn refresh_native_generation(&mut self) -> crate::Result<bool> {
+        if self.native_binding.is_none() {
+            return Ok(false);
+        }
+        let (context, _) = self.source_context()?;
+        let binding = self
+            .native_binding
+            .as_mut()
+            .context("native source binding is missing")?;
+        if binding.source.generation == context.source.generation {
+            return Ok(false);
+        }
+        binding.source.generation = context.source.generation;
+        Ok(true)
     }
 
     /// The runtime home this link's session is read from: its registered source at the bound
@@ -122,7 +139,25 @@ impl Link {
 
     #[cfg(feature = "rc")]
     pub(super) fn read_source_bytes(&self) -> crate::Result<Vec<u8>> {
-        use crate::adapter::native_snapshot::{Limits, Source, Unavailable};
+        Ok(self.capture(true)?.0)
+    }
+
+    /// Where each carrier of this conversation sits in its capture stream, from headers alone.
+    #[cfg(feature = "rc")]
+    pub(crate) fn capture_spans(&self) -> crate::Result<Vec<crate::adapter::codex::CaptureSpan>> {
+        anyhow::ensure!(
+            self.native_binding.is_some(),
+            "only source-bound conversations have a segmented capture"
+        );
+        Ok(self.capture(false)?.1)
+    }
+
+    #[cfg(feature = "rc")]
+    fn capture(
+        &self,
+        full: bool,
+    ) -> crate::Result<(Vec<u8>, Vec<crate::adapter::codex::CaptureSpan>)> {
+        use crate::adapter::native_snapshot::{Limits, Source};
         let (context, roots) = self.source_context()?;
         let path = self.resolve_source()?;
         let source = Source {
@@ -131,15 +166,27 @@ impl Link {
             path,
             database: false,
         };
-        let bytes = crate::adapter::codex::lineage_bytes_with_lookup(
+        // A fork carries history its parent recorded in another bound project; a directory
+        // nobody bound on this machine stays out of the capture.
+        let parent_roots = crate::rc::policy::CanonicalRoots::from_untrusted(
+            roots
+                .iter()
+                .cloned()
+                .chain(crate::rc::mirror::Mirror::load().all_roots()),
+        );
+        let failure = std::cell::RefCell::new(None);
+        let captured = crate::adapter::codex::capture_lineage_with_lookup(
             &source,
             Limits::capture(),
-            false,
-            None,
+            full,
             |id, limits| {
                 let path = context
-                    .history_parent(id, &roots, limits)
-                    .map_err(|_| Unavailable::Changed)?;
+                    .history_parent(id, &parent_roots, limits)
+                    .map_err(|error| {
+                        let kind = parent_failure(&error);
+                        *failure.borrow_mut() = Some(error);
+                        kind
+                    })?;
                 Ok(Source {
                     runtime: "codex",
                     session_id: id.into(),
@@ -147,9 +194,21 @@ impl Link {
                     database: false,
                 })
             },
-        )?;
+        );
+        let captured = match captured {
+            Ok(captured) => captured,
+            Err(kind) => {
+                let error = anyhow::Error::from(kind);
+                return Err(match failure.into_inner() {
+                    Some(detail) => {
+                        error.context(format!("native history parent is unavailable: {detail:#}"))
+                    }
+                    None => error,
+                });
+            }
+        };
         context.validate()?;
-        Ok(bytes)
+        Ok(captured)
     }
 
     #[cfg(not(feature = "rc"))]
@@ -172,11 +231,104 @@ impl Link {
     }
 }
 
+/// A missing parent and a parent outside the bound projects persist until the user acts; only a
+/// store that moved under the reader is a change a retry can outlive.
+#[cfg(feature = "rc")]
+fn parent_failure(error: &anyhow::Error) -> crate::adapter::native_snapshot::Unavailable {
+    use crate::adapter::native_snapshot::Unavailable;
+    if let Some(kind) = error.downcast_ref::<Unavailable>() {
+        *kind
+    } else if error
+        .downcast_ref::<crate::rc::policy::PolicyError>()
+        .is_some()
+    {
+        Unavailable::NotFound
+    } else {
+        Unavailable::Changed
+    }
+}
+
 #[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
     use crate::domain::{link, store::Store};
     use serde_json::json;
+
+    /// A fork whose parent started in another bound project reads that parent's history; a
+    /// parent in an unbound directory or a missing parent is reported as not found, which stays
+    /// true until the user acts, rather than as a change a retry could outlive.
+    #[test]
+    fn fork_parents_resolve_across_bound_projects_and_report_their_real_failure() {
+        use crate::adapter::native_snapshot::Unavailable;
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let project = |name: &str| {
+                let path = root.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                path.canonicalize().unwrap()
+            };
+            let (child_cwd, parent_cwd) = (project("child"), project("parent"));
+            let home = root.path().join("codex");
+            let sessions = home.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let parent = "00000000-0000-0000-0000-000000000011";
+            let child = "00000000-0000-0000-0000-000000000012";
+            let parent_path = sessions.join(format!("rollout-{parent}.jsonl"));
+            let child_path = sessions.join(format!("rollout-{child}.jsonl"));
+            let write_parent = |cwd: &Path| {
+                let prefix = format!(
+                    "{}\n{}\n",
+                    json!({"type":"session_meta","ordinal":0,"payload":{"id":parent,"cwd":cwd}}),
+                    json!({"type":"event_msg","ordinal":1,"payload":{"type":"user_message","message":"parent-turn"}})
+                );
+                std::fs::write(&parent_path, &prefix).unwrap();
+                prefix.len()
+            };
+            let prefix = write_parent(&parent_cwd);
+            std::fs::write(&child_path, format!("{}\n{}\n",
+                json!({"type":"session_meta","ordinal":2,"payload":{"id":child,"cwd":child_cwd,"history_mode":"paginated","history_base":{"thread_id":parent,"end_byte_offset":prefix,"end_ordinal_exclusive":2}}}),
+                json!({"type":"event_msg","ordinal":3,"payload":{"type":"user_message","message":"child-turn"}}))).unwrap();
+            let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES (?1,?2,?3,'question','cli',1,0)",
+                rusqlite::params![child, child_path.to_str(), child_cwd.to_str()],
+            )
+            .unwrap();
+            let source = crate::rc::runtime_sources::Registry::open()
+                .unwrap()
+                .register(&home, None, None, None)
+                .unwrap();
+            let link = Link::from_native(
+                NativeBinding {
+                    source: crate::protocol::NativeSourceRef {
+                        source_id: source.source_id,
+                        generation: source.generation,
+                    },
+                    thread_id: child.into(),
+                },
+                &child_cwd,
+            )
+            .unwrap();
+            let kind = |link: &Link| {
+                *link
+                    .read_bytes()
+                    .unwrap_err()
+                    .downcast_ref::<Unavailable>()
+                    .unwrap()
+            };
+            assert_eq!(kind(&link), Unavailable::NotFound);
+            let mut mirror = crate::rc::mirror::Mirror::load();
+            mirror
+                .bind("workspace", "parent-project", &parent_cwd)
+                .unwrap();
+            mirror.save().unwrap();
+            let bytes = String::from_utf8(link.read_bytes().unwrap()).unwrap();
+            assert!(bytes.contains("parent-turn") && bytes.contains("child-turn"));
+            std::fs::remove_file(&parent_path).unwrap();
+            assert_eq!(kind(&link), Unavailable::NotFound);
+        });
+    }
 
     #[test]
     fn copied_threads_have_independent_links_and_source_confined_parent_bytes() {

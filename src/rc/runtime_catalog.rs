@@ -3,13 +3,25 @@
 use super::policy::CanonicalRoots;
 use super::runtime_context::{CatalogRow, RuntimeContext};
 use super::runtime_sources::Registry;
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const SCAN_PAGE: usize = 100;
+/// Both how often restoration temporaries are swept and how old one must be to be removed.
+const RESTORATION_SWEEP: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 mod deltas;
+
+/// A row no longer matches its runtime source; a rescan of that source replaces it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}; refresh the catalog")]
+pub(crate) struct SourceChanged(pub(crate) &'static str);
+
+/// The conversation is gone from the source or the place the catalog points to.
+#[derive(Debug, thiserror::Error)]
+#[error("conversation is unavailable in its registered source or bound project")]
+pub(crate) struct Unavailable;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,17 +443,19 @@ impl Catalog {
         });
         if request.resolve_session.is_some() {
             for row in &rows {
-                let context = RuntimeContext::resolve(&self.registry, &row.source_id)?;
-                ensure!(
-                    context.source.generation == row.source_generation
-                        && context.source.session_ref(&row.native_session_id) == row.session_ref,
-                    "conversation source changed during catalog lookup"
-                );
-                let thread = context.locate(&row.native_session_id, roots)?;
-                ensure!(
-                    thread.cwd == row.cwd,
-                    "conversation directory changed during catalog lookup"
-                );
+                let context =
+                    RuntimeContext::resolve(&self.registry, &row.source_id).context(Unavailable)?;
+                if context.source.generation != row.source_generation
+                    || context.source.session_ref(&row.native_session_id) != row.session_ref
+                {
+                    return Err(SourceChanged("conversation source changed").into());
+                }
+                let thread = context
+                    .locate(&row.native_session_id, roots)
+                    .context(Unavailable)?;
+                if thread.cwd != row.cwd {
+                    return Err(SourceChanged("conversation directory changed").into());
+                }
                 super::local_goal::validate_header(
                     &thread.transcript,
                     &row.native_session_id,
@@ -479,14 +493,39 @@ impl Catalog {
             return Ok(None);
         };
         let row: CatalogRow = serde_json::from_str(&serialized)?;
-        let source = self.registry.resolve(&row.source_id)?;
-        ensure!(
-            row.session_ref == session_ref
-                && source.generation == row.source_generation
-                && source.session_ref(&row.native_session_id) == session_ref,
-            "cached conversation source changed; refresh the catalog"
-        );
+        let source = self.registry.resolve(&row.source_id).context(Unavailable)?;
+        if row.session_ref != session_ref
+            || source.generation != row.source_generation
+            || source.session_ref(&row.native_session_id) != session_ref
+        {
+            return Err(SourceChanged("cached conversation source changed").into());
+        }
         Ok(Some(row))
+    }
+
+    /// Whether a sweep is still due for an enabled source, so a conversation missing from the
+    /// catalog may yet appear. A source whose sweep failed does not count: its retained rows
+    /// are all the catalog will have until it recovers.
+    pub(crate) fn refreshing(&self) -> crate::Result<bool> {
+        let connection = self.connection()?;
+        for source in self
+            .registry
+            .list()?
+            .into_iter()
+            .filter(|source| source.enabled)
+        {
+            let status: Option<String> = connection
+                .query_row(
+                    "SELECT status FROM sources WHERE source_id=?1 AND generation=?2",
+                    params![source.source_id, source.generation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if status.as_deref().is_none_or(|status| status == "scanning") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn settings(
@@ -494,20 +533,25 @@ impl Catalog {
         roots: &CanonicalRoots,
         request: &SettingsRequest,
     ) -> crate::Result<serde_json::Value> {
-        let context = RuntimeContext::resolve(&self.registry, &request.source_id)?;
-        ensure!(
-            context.source.generation == request.source_generation
-                && context.source.session_ref(&request.native_session_id) == request.session_id,
-            "conversation source identity changed; refresh the catalog"
-        );
-        let thread = context.locate(&request.native_session_id, roots)?;
-        ensure!(
-            request
-                .expected_cwd
-                .as_ref()
-                .is_none_or(|cwd| *cwd == thread.cwd),
-            "conversation moved outside its catalog authorization; refresh the catalog"
-        );
+        let context =
+            RuntimeContext::resolve(&self.registry, &request.source_id).context(Unavailable)?;
+        if context.source.generation != request.source_generation
+            || context.source.session_ref(&request.native_session_id) != request.session_id
+        {
+            return Err(SourceChanged("conversation source identity changed").into());
+        }
+        let thread = context
+            .locate(&request.native_session_id, roots)
+            .context(Unavailable)?;
+        if request
+            .expected_cwd
+            .as_ref()
+            .is_some_and(|cwd| *cwd != thread.cwd)
+        {
+            return Err(
+                SourceChanged("conversation moved outside its catalog authorization").into(),
+            );
+        }
         let settings = context.settings(&thread)?;
         context.validate()?;
         Ok(
@@ -526,6 +570,7 @@ impl Worker {
     pub fn start() -> Self {
         Self(tokio::spawn(async {
             let mut next_discovery = tokio::time::Instant::now();
+            let mut next_sweep = tokio::time::Instant::now();
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -535,9 +580,23 @@ impl Worker {
                     next_discovery =
                         tokio::time::Instant::now() + std::time::Duration::from_secs(15);
                 }
+                let sweep = tokio::time::Instant::now() >= next_sweep;
+                if sweep {
+                    next_sweep = tokio::time::Instant::now() + RESTORATION_SWEEP;
+                }
                 let _ = tokio::task::spawn_blocking(move || -> crate::Result<()> {
                     let catalog = Catalog::open()?;
                     catalog.registry.enroll_default()?;
+                    if sweep {
+                        for source in catalog.registry.list()? {
+                            if source.enabled && source.runtime == "codex" {
+                                crate::adapter::codex_rollout::sweep_restorations(
+                                    &source.home,
+                                    RESTORATION_SWEEP,
+                                );
+                            }
+                        }
+                    }
                     let mirror = super::mirror::Mirror::load();
                     let roots = CanonicalRoots::from_verified(
                         mirror

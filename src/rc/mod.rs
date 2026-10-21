@@ -116,6 +116,7 @@ pub mod ticket;
 pub mod tunnel;
 #[cfg(windows)]
 pub(crate) mod windows_job;
+pub(crate) mod writer_release;
 #[cfg(windows)]
 use crate::infra::windows_security;
 

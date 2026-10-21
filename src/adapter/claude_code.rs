@@ -6,7 +6,7 @@
 //! ~/.claude/projects/<project-slug>/<uuid>.jsonl
 //! ```
 //!
-//! The project-slug is derived from the cwd (every non-alphanumeric character becomes `-`), so
+//! The project-slug is derived from the cwd (see [`slug_for`]), so
 //! sessions are already partitioned by project — which makes "list the sessions belonging to one
 //! repo" cheap (a single readdir), in contrast with Codex.
 //!
@@ -147,7 +147,101 @@ pub(crate) fn canonical_cwd(cwd: &Path) -> PathBuf {
 ///
 /// Must match Claude Code's own algorithm, or it never finds the session installed into it.
 pub fn slug_for(cwd: &Path) -> String {
-    crate::domain::store::slug_for(&canonical_cwd(cwd))
+    project_slug(&canonical_cwd(cwd).to_string_lossy())
+}
+
+/// Claude Code caps a project directory name at this many UTF-16 code units before hashing.
+const PROJECT_SLUG_LIMIT: usize = 200;
+
+/// Claude Code's project directory name for an already canonical path.
+///
+/// Claude normalizes the path to NFC, replaces every UTF-16 code unit outside `[A-Za-z0-9]` with
+/// `-` (so a character outside the Basic Multilingual Plane becomes two dashes), and when the
+/// result is longer than [`PROJECT_SLUG_LIMIT`] keeps that many units followed by `-` and the
+/// base-36 magnitude of a 32-bit `h * 31 + unit` hash over the normalized path's UTF-16 units.
+/// Any step spelled differently names a directory Claude never reads or writes.
+fn project_slug(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = path.nfc().collect();
+    let units: Vec<u16> = normalized.encode_utf16().collect();
+    let slug: String = units
+        .iter()
+        .map(|&unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect();
+    if units.len() <= PROJECT_SLUG_LIMIT {
+        return slug;
+    }
+    let hash = units.iter().fold(0i32, |hash, &unit| {
+        hash.wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit))
+    });
+    format!(
+        "{}-{}",
+        &slug[..PROJECT_SLUG_LIMIT],
+        base36(u64::from(hash.unsigned_abs()))
+    )
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base-36 digits are ASCII")
+}
+
+/// Every project directory name a transcript for `cwd` may sit under, current spelling first.
+///
+/// Installed transcripts may sit under the lexical key of the physical or the given path; a
+/// reader that checks only Claude's spelling loses them for paths where the two differ.
+pub(crate) fn project_slugs(cwd: &Path) -> Vec<String> {
+    let physical = canonical_cwd(cwd);
+    let mut slugs = vec![project_slug(&physical.to_string_lossy())];
+    for legacy in [
+        crate::domain::store::slug_for(&physical),
+        crate::domain::store::slug_for(cwd),
+    ] {
+        if !slugs.contains(&legacy) {
+            slugs.push(legacy);
+        }
+    }
+    slugs
+}
+
+/// The transcript of `session_id` in whichever project directory holds it.
+///
+/// The directories `cwd` maps to are checked first; a transcript written under another spelling
+/// of the same folder is then found by its session id alone.
+pub(crate) fn locate_transcript(session_id: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let root = projects_dir().ok()?;
+    let name = format!("{session_id}.jsonl");
+    if let Some(cwd) = cwd {
+        for slug in project_slugs(cwd) {
+            let direct = root.join(slug).join(&name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+        }
+    }
+    // One level is enough: a project directory holds `<id>.jsonl` directly, no recursion.
+    for entry in std::fs::read_dir(&root).ok()? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path().join(&name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 pub(crate) fn session_path(session_id: &str, cwd: &Path) -> Result<PathBuf> {
@@ -206,14 +300,12 @@ impl Adapter for ClaudeCode {
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         let root = projects_dir()?;
         let cwd = canonical_cwd(repo);
-        let dir = root.join(slug_for(&cwd));
-        let legacy = root.join(crate::domain::store::slug_for(repo));
         let mut sessions = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let directories = std::iter::once(&dir).chain((legacy != dir).then_some(&legacy));
-        for path in directories {
+        for slug in project_slugs(repo) {
+            let path = root.join(slug);
             if path.is_dir() {
-                for session in collect_dir(path, Some(cwd.to_string_lossy().into_owned()))? {
+                for session in collect_dir(&path, Some(cwd.to_string_lossy().into_owned()))? {
                     if seen.insert(session.id.clone()) {
                         sessions.push(session);
                     }
@@ -267,26 +359,7 @@ impl Adapter for ClaudeCode {
 
     /// Prefer the physical project directory, retaining lexical and global lookup for old files.
     fn resolve(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-        let root = projects_dir().ok()?;
-
-        if let Some(c) = cwd {
-            for slug in [slug_for(c), crate::domain::store::slug_for(c)] {
-                let direct = root.join(slug).join(format!("{session_id}.jsonl"));
-                if direct.is_file() {
-                    return Some(direct);
-                }
-            }
-        }
-
-        // One level is enough: a project directory holds `<id>.jsonl` directly, no recursion.
-        for e in std::fs::read_dir(&root).ok()? {
-            let Ok(e) = e else { continue };
-            let p = e.path().join(format!("{session_id}.jsonl"));
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        None
+        locate_transcript(session_id, cwd)
     }
 
     fn parse(&self, text: &str) -> Result<Session> {
@@ -2117,6 +2190,43 @@ mod tests {
 #[cfg(test)]
 mod config_directory_tests {
     use super::*;
+
+    /// **A project directory name is Claude Code's, byte for byte.**
+    ///
+    /// The expected names come from running Claude Code 2.1.299's own folder function on the
+    /// same input. Counting Unicode scalar values instead of UTF-16 units turns the crab into
+    /// one dash; skipping the cap keeps the whole path; hashing the slug, the raw bytes, or the
+    /// unnormalized spelling (the accent arrives decomposed here) changes the suffix; and a
+    /// signed suffix breaks on this path's negative hash.
+    #[test]
+    fn project_directory_names_follow_claude_for_astral_and_long_paths() {
+        assert_eq!(
+            project_slug("/Users/dev/crab-\u{1F980}"),
+            "-Users-dev-crab---"
+        );
+        assert_eq!(project_slug("/Users/dev/caf\u{e9}"), "-Users-dev-caf-");
+        let long = format!(
+            "/Users/dev/{}/crab-\u{1F980}-{}/cafe\u{301}",
+            "a".repeat(120),
+            "b".repeat(80)
+        );
+        assert_eq!(
+            project_slug(&long),
+            format!(
+                "-Users-dev-{}-crab----{}-ous4vx",
+                "a".repeat(120),
+                "b".repeat(60)
+            )
+        );
+        assert_eq!(
+            project_slugs(Path::new("/nonexistent-agit/crab-\u{1F980}")),
+            vec![
+                "-nonexistent-agit-crab---".to_string(),
+                "-nonexistent-agit-crab--".to_string()
+            ],
+            "readers also look under the lexical key installed transcripts may use"
+        );
+    }
 
     #[cfg(all(unix, feature = "rc"))]
     #[test]

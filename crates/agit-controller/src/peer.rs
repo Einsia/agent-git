@@ -15,6 +15,7 @@ struct Write {
 }
 
 const HANDSHAKE: Duration = Duration::from_secs(20);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const DISCOVERY_RETRY: Duration = Duration::from_secs(1);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,6 +38,98 @@ fn publish(
     });
 }
 
+/// An executor that refuses admission answers the handshake with a typed error before closing.
+#[derive(Debug)]
+pub(super) struct Refused {
+    /// The executor's RPC error, reduced to fields a caller may forward.
+    pub error: Value,
+    /// Present exactly when the same route can be admitted once the condition clears.
+    pub retry_after: Option<Duration>,
+}
+
+impl Refused {
+    fn parse(error: &Value) -> Option<Self> {
+        let data = &error["data"];
+        let code = error["code"].as_i64()?;
+        let message = error["message"].as_str()?;
+        let retryable = data["retryable"].as_bool()?;
+        if data["kind"] != "admission_refused" {
+            return None;
+        }
+        let retry_after = retryable.then(|| {
+            Duration::from_millis(data["retry_after_ms"].as_u64().unwrap_or(1000))
+                .clamp(Duration::from_millis(250), MAX_RETRY_AFTER)
+        });
+        let mut public = serde_json::json!({
+            "kind": "admission_refused",
+            "retryable": retryable,
+            "outcome": "not_sent",
+        });
+        if let Some(reason) = data["reason"].as_str().filter(|reason| reason.len() <= 64) {
+            public["reason"] = reason.into();
+        }
+        if let Some(retry_after) = retry_after {
+            public["retry_after_ms"] = (retry_after.as_millis() as u64).into();
+        }
+        Some(Self {
+            error: serde_json::json!({
+                "code": code,
+                "message": message.chars().take(512).collect::<String>(),
+                "data": public,
+            }),
+            retry_after,
+        })
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "peer refused admission: {}",
+            self.error["message"].as_str().unwrap_or_default()
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The admission API refused the route itself; dialing it again cannot succeed.
+///
+/// A missing target or an executor without the requested delegation stays refused, so its
+/// error is terminal. A refused credential or lease belongs to this route only: its host can
+/// obtain a fresh one, so callers may retry once it does.
+fn route_refused(error: &anyhow::Error) -> Option<Value> {
+    #[cfg(feature = "cloud")]
+    if let Some(http) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<agit_peer::client::HttpFailure>())
+    {
+        let (code, message, retryable) = match http.status {
+            401 => (200, "The connection credential is no longer valid.", true),
+            403 => (202, "Access to this device expired or was revoked.", true),
+            404 => (201, "This device is unavailable to this account.", false),
+            409 => (
+                102,
+                "This action requires a newer AgentGit version on the device.",
+                false,
+            ),
+            _ => return None,
+        };
+        let mut data = serde_json::json!({
+            "kind": "route_refused", "reason": format!("http_{}", http.status),
+            "retryable": retryable, "outcome": "not_sent",
+        });
+        if retryable {
+            data["retry_after_ms"] = 2000.into();
+        }
+        return Some(serde_json::json!({"code":code,"message":message,"data":data}));
+    }
+    let _ = error;
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     worker: Worker,
     route: Arc<dyn Connector>,
@@ -45,6 +138,7 @@ pub(super) async fn run(
     status: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
     shared_budget: Option<Arc<tokio::sync::Semaphore>>,
+    refusal: Arc<std::sync::OnceLock<Value>>,
 ) {
     let mut backoff = Duration::from_millis(250);
     loop {
@@ -139,6 +233,28 @@ pub(super) async fn run(
             }
             Err(error) => Err(error),
         };
+        let refused = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<Refused>());
+        // A permanent refusal answers every request on this route; redialing would only
+        // repeat the refusal at the cost of a full relay pairing.
+        if let Some(refused) = refused.filter(|refused| refused.retry_after.is_none()) {
+            let _ = refusal.set(refused.error.clone());
+        } else if let Some(error) = result.as_ref().err().and_then(route_refused) {
+            let _ = refusal.set(error);
+        }
+        if refusal.get().is_some() {
+            publish(&status, &events, |s| {
+                s.state = State::Rejected;
+                s.worker_pid = None;
+                s.error = result.err().map(|e| e.to_string());
+            });
+            return;
+        }
+        let pause = refused
+            .and_then(|refused| refused.retry_after)
+            .map_or(backoff, |retry_after| retry_after.max(backoff));
         publish(&status, &events, |s| {
             s.state = State::Backoff;
             s.worker_pid = None;
@@ -148,7 +264,7 @@ pub(super) async fn run(
         // responsibility for connection policy.
         let jitter = u128::from(uuid::Uuid::new_v4().as_bytes()[0]);
         let pause = tokio::time::sleep(
-            backoff + Duration::from_millis((backoff.as_millis() * jitter / 1024) as u64),
+            pause + Duration::from_millis((pause.as_millis() * jitter / 1024) as u64),
         );
         tokio::pin!(pause);
         loop {
@@ -201,7 +317,12 @@ async fn describe(
         {
             continue;
         }
-        ensure!(frame.get("error").is_none(), "peer rejected discovery");
+        if let Some(error) = frame.get("error") {
+            if let Some(refused) = Refused::parse(error) {
+                return Err(refused.into());
+            }
+            anyhow::bail!("peer rejected discovery");
+        }
         let description = frame
             .get("result")
             .context("peer omitted its description")?

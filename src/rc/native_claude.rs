@@ -4,6 +4,7 @@ mod approval;
 pub(crate) mod completion;
 pub(crate) mod event_queue;
 mod install;
+pub(crate) mod status;
 mod transport;
 pub(crate) use approval::wait_approval;
 pub use install::install_plugin;

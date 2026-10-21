@@ -104,20 +104,18 @@ impl Prepared {
         let roots = self.workspace_roots;
         let result = tokio::task::spawn_blocking(move || {
             frame.authority.check()?;
-            let catalog = Catalog::open().map_err(internal)?;
+            let catalog = Catalog::open().map_err(|error| failed(error, false))?;
             let value = match self.request {
-                Request::List(request) => {
-                    serde_json::to_value(catalog.list(&self.roots, &request).map_err(internal)?)
-                        .map_err(internal)?
-                }
-                Request::Settings(request) => {
-                    catalog.settings(&self.roots, &request).map_err(|_| {
-                        RpcError::new(
-                            ErrorCode::SessionNotFound,
-                            "conversation is unavailable in its registered source or bound project",
-                        )
-                    })?
-                }
+                Request::List(request) => serde_json::to_value(
+                    catalog
+                        .list(&self.roots, &request)
+                        .map_err(|error| failed(error, false))?,
+                )
+                .map_err(internal)?,
+                // The request names a source generation, so a changed source never matches it.
+                Request::Settings(request) => catalog
+                    .settings(&self.roots, &request)
+                    .map_err(|error| failed(error, true))?,
             };
             Ok::<_, RpcError>((frame, value))
         })
@@ -136,15 +134,109 @@ impl Prepared {
 }
 
 fn internal(_error: impl std::fmt::Display) -> RpcError {
-    RpcError::new(
-        ErrorCode::Internal,
-        "runtime catalog is unavailable; inspect local source status",
+    classified(
+        RpcError::new(
+            ErrorCode::Internal,
+            "runtime catalog is unavailable; inspect local source status",
+        ),
+        false,
+        "catalog_unavailable",
     )
+}
+
+fn failed(error: anyhow::Error, request_names_source: bool) -> RpcError {
+    known(&error, request_names_source).unwrap_or_else(|| internal(error))
+}
+
+/// Catalog conditions with their own meaning: a vanished conversation, a source the catalog is
+/// still catching up with, and a transcript or index that is busy for a moment.
+pub(super) fn known(error: &anyhow::Error, request_names_source: bool) -> Option<RpcError> {
+    use crate::rc::runtime_catalog::{SourceChanged, Unavailable};
+    let busy = |message: &str, reason: &str| {
+        Some(classified(
+            RpcError::new(ErrorCode::SessionBusy, message),
+            true,
+            reason,
+        ))
+    };
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::adapter::codex_rollout::Restoring>())
+    {
+        return busy(
+            "conversation history is being prepared; retry shortly",
+            "transcript_restoring",
+        );
+    }
+    if let Some(changed) = error.downcast_ref::<SourceChanged>() {
+        if request_names_source {
+            return Some(classified(
+                RpcError::new(ErrorCode::SessionBusy, changed.to_string()),
+                false,
+                "source_changed",
+            ));
+        }
+        return busy(&changed.to_string(), "catalog_refreshing");
+    }
+    if error.downcast_ref::<Unavailable>().is_some() {
+        return Some(RpcError::new(
+            ErrorCode::SessionNotFound,
+            "conversation is unavailable in its registered source or bound project",
+        ));
+    }
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    }) {
+        return busy("the runtime catalog is busy; retry shortly", "catalog_busy");
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A catalog that is catching up with its source clears by itself, a request that names an
+    /// old source never does, and a vanished conversation is not an internal fault. Folding all
+    /// three into one code leaves the web either retrying forever or giving up on a transient.
+    #[test]
+    fn catalog_conditions_keep_their_codes_and_say_whether_they_clear() {
+        use crate::rc::runtime_catalog::Unavailable;
+        let changed = || {
+            anyhow::Error::from(crate::rc::runtime_catalog::SourceChanged(
+                "conversation source changed",
+            ))
+        };
+        let refreshing = known(&changed(), false).unwrap();
+        assert_eq!(refreshing.code, ErrorCode::SessionBusy as i32);
+        assert_eq!(refreshing.data.unwrap()["retryable"], true);
+        let stale = known(&changed(), true).unwrap();
+        assert_eq!(stale.code, ErrorCode::SessionBusy as i32);
+        assert_eq!(
+            stale.data,
+            Some(serde_json::json!({"retryable": false, "reason": "source_changed"}))
+        );
+        let missing = anyhow::anyhow!("transcript is missing").context(Unavailable);
+        assert_eq!(
+            known(&missing, false).unwrap().code,
+            ErrorCode::SessionNotFound as i32
+        );
+        let restoring =
+            anyhow::Error::from(crate::adapter::codex_rollout::Restoring).context(Unavailable);
+        assert_eq!(
+            known(&restoring, false).unwrap().data.unwrap()["reason"],
+            "transcript_restoring"
+        );
+        assert!(known(&anyhow::anyhow!("unexplained"), false).is_none());
+    }
 
     #[tokio::test]
     async fn catalog_reads_revalidate_workspace_and_reject_wire_selected_roots() {

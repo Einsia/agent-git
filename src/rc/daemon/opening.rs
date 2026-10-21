@@ -5,6 +5,12 @@ use std::panic::AssertUnwindSafe;
 use tokio::sync::watch;
 
 const LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Capture is not needed to control a conversation, so it never holds a launch longer than this.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a failed launch's killed process groups may take to disappear before the
+/// conversation reports them as lingering.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const LINGER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(super) struct LaunchReservation {
     pub(super) generation: u64,
@@ -44,6 +50,8 @@ pub(super) struct PreparedSpawn {
     pub(super) settlement: watch::Receiver<SettlementState>,
     pub(super) prompt: Option<String>,
     pub(super) attribution: MessageAttribution,
+    /// The native capture binding could not be resolved, so this launch runs without lineage.
+    pub(super) capture_degraded: bool,
 }
 
 pub(super) struct Spawned {
@@ -91,41 +99,27 @@ impl SessionOpening {
         let result = match self {
             Self::Ready(value) => Ok(value),
             Self::Launch(mut spawn, reply) => {
-                // Cancellation or panic cannot prove that the OS spawn boundary was not crossed.
-                // Keep the reservation until recovery instead of admitting another writer.
-                let result = if *stop.borrow() {
-                    Err(SpawnFailure::before_launch(RpcError::new(
-                        ErrorCode::SessionBusy,
-                        "the daemon is stopping; nothing was launched",
-                    )))
-                } else {
-                    let launch = AssertUnwindSafe(async {
-                        spawn
-                            .resolve_capture()
-                            .await
-                            .map_err(SpawnFailure::before_launch)?;
-                        {
-                            let mut state = daemon.lock().await;
-                            state
-                                .persist_capture(&spawn)
-                                .map_err(SpawnFailure::before_launch)?;
-                        }
-                        spawn.execute().await
-                    })
-                    .catch_unwind();
-                    tokio::select! {
-                        biased;
-                        _ = stop.changed() => Err(unknown_launch("the daemon stopped during launch")),
-                        result = tokio::time::timeout(LAUNCH_TIMEOUT, launch) => match result {
-                            Ok(Ok(result)) => result,
-                            Ok(Err(_)) => Err(unknown_launch("the harness launch worker panicked")),
-                            Err(_) => Err(unknown_launch("the harness launch timed out")),
-                        },
-                    }
+                let result = spawn.open(&daemon, &mut stop).await;
+                let exiting = match &result {
+                    Err(failure) => failure.exiting.clone(),
+                    Ok(_) => None,
                 };
+                let (session_id, generation) = (spawn.info.session_id.clone(), spawn.generation);
+                let start_id = reply.start_id();
                 let mut state = daemon.lock().await;
                 let result = state.finish_spawn(*spawn, result);
-                reply.finish(&mut state, result)
+                let result = reply.finish(&mut state, result);
+                drop(state);
+                if let Some(groups) = exiting {
+                    tokio::spawn(release_after_exit(
+                        daemon.clone(),
+                        session_id,
+                        generation,
+                        start_id,
+                        groups,
+                    ));
+                }
+                result
             }
         };
         let frame = match result {
@@ -136,13 +130,67 @@ impl SessionOpening {
     }
 }
 
+fn stopping(message: &str) -> RpcError {
+    classified(
+        RpcError::new(ErrorCode::SessionBusy, message),
+        true,
+        "daemon_stopping",
+    )
+}
+
 fn unknown_launch(message: &str) -> SpawnFailure {
-    SpawnFailure::after_launch(RpcError::new(ErrorCode::SessionBusy, message).with_hint(
-        "launch completion is unknown; this session remains reserved and will not be launched again automatically",
+    SpawnFailure::after_launch(classified(
+        RpcError::new(ErrorCode::SessionBusy, message),
+        true,
+        "launch_superseded",
     ))
 }
 
+/// Admit the next writer for a conversation only after the failed launch's own processes exit.
+///
+/// A private harness process is itself the native writer, so its reservation outlives it. A
+/// shared Codex app-server is the only writer of every thread it loads: an attach that failed or
+/// was abandoned leaves at most a subscription that closes with its socket, and attaching again
+/// joins the same writer instead of creating a second one. Shared attaches record no process
+/// group and are released at once.
+async fn release_after_exit(
+    daemon: Arc<Mutex<Daemon>>,
+    session_id: String,
+    generation: u64,
+    start_id: Option<String>,
+    groups: crate::rc::harness::proc::LaunchGroups,
+) {
+    if !groups.exited_within(EXIT_GRACE).await {
+        let mut state = daemon.lock().await;
+        if state
+            .opening_sessions
+            .get(&session_id)
+            .is_some_and(|reservation| reservation.generation == generation)
+        {
+            state.exiting_launches.insert(session_id.clone(), true);
+        }
+        drop(state);
+        eprintln!(
+            "agitd: a harness process from a failed launch of {session_id} survived forced termination; the conversation stays reserved until it exits"
+        );
+        while !groups.exited() {
+            tokio::time::sleep(LINGER_POLL).await;
+        }
+    }
+    daemon
+        .lock()
+        .await
+        .release_exited_launch(&session_id, generation, start_id.as_deref());
+}
+
 impl OpeningReply {
+    fn start_id(&self) -> Option<String> {
+        match self {
+            Self::Start(start_id) => start_id.clone(),
+            Self::Resume => None,
+        }
+    }
+
     fn finish(
         self,
         daemon: &mut Daemon,
@@ -171,6 +219,80 @@ impl OpeningReply {
 }
 
 impl PreparedSpawn {
+    /// Capture, persistence and the harness launch, each under its own bound. A launch that
+    /// fails, panics or is abandoned reports the process groups it dropped, never an unknown
+    /// outcome.
+    async fn open(
+        &mut self,
+        daemon: &Arc<Mutex<Daemon>>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<Spawned, SpawnFailure> {
+        if *stop.borrow() {
+            return Err(SpawnFailure::before_launch(stopping(
+                "the daemon is stopping; nothing was launched",
+            )));
+        }
+        let capture = AssertUnwindSafe(self.resolve_capture()).catch_unwind();
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                return Err(SpawnFailure::before_launch(stopping(
+                    "the daemon is stopping; nothing was launched",
+                )));
+            }
+            result = capture => match result {
+                Ok(result) => result.map_err(SpawnFailure::before_launch)?,
+                Err(_) => {
+                    return Err(SpawnFailure::before_launch(classified(
+                        RpcError::new(ErrorCode::Internal, "capture inspection failed"),
+                        false,
+                        "launch_failed",
+                    )));
+                }
+            },
+        }
+        daemon
+            .lock()
+            .await
+            .persist_capture(self)
+            .map_err(SpawnFailure::before_launch)?;
+        let groups = crate::rc::harness::proc::LaunchGroups::default();
+        let launch = AssertUnwindSafe(groups.scope(self.execute())).catch_unwind();
+        let result = tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SpawnFailure::after_launch(stopping(
+                "the daemon stopped during launch",
+            ))),
+            result = tokio::time::timeout(LAUNCH_TIMEOUT, launch) => match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(SpawnFailure::after_launch(classified(
+                    RpcError::new(ErrorCode::Internal, "the harness launch worker panicked"),
+                    false,
+                    "launch_failed",
+                ))),
+                Err(_) => Err(SpawnFailure::after_launch(classified(
+                    RpcError::new(
+                        ErrorCode::RuntimeUnavailable,
+                        "the harness did not finish opening in time",
+                    ),
+                    false,
+                    "launch_timeout",
+                ))),
+            },
+        };
+        // The dropped launch future has signalled every process group it created.
+        result.map_err(|mut failure| {
+            if failure.reached_launch && !failure.release_reservation {
+                if groups.exited() {
+                    failure.release_reservation = true;
+                } else {
+                    failure.exiting = Some(groups);
+                }
+            }
+            failure
+        })
+    }
+
     async fn resolve_capture(&mut self) -> Result<(), RpcError> {
         if !self.local_owner {
             return Ok(());
@@ -178,7 +300,7 @@ impl PreparedSpawn {
         let Some(native) = self.spec.resume_from.clone() else {
             return Ok(());
         };
-        let lineage = super::capture_binding::Request {
+        let request = super::capture_binding::Request {
             logical: self.info.session_id.clone(),
             runtime: self.info.runtime.clone(),
             native,
@@ -190,13 +312,39 @@ impl PreparedSpawn {
             wire: self.spec.agit_session.clone(),
             authority: self.authority.clone(),
             settlement: self.settlement.clone(),
-        }
-        .resolve()
-        .await?;
+        };
+        use super::capture_binding::Failure;
+        let lineage =
+            match tokio::time::timeout(CAPTURE_TIMEOUT, request.resolve_for_launch()).await {
+                Ok(Ok(lineage)) => lineage,
+                Ok(Err(Failure::Busy(error) | Failure::Refused(error))) => return Err(error),
+                Ok(Err(Failure::Invalid(error))) => {
+                    self.degrade_capture(&error.message);
+                    return Ok(());
+                }
+                // A lock that outlasts the bound may never be released; control must not wait on it.
+                Err(_) => {
+                    self.degrade_capture("capture inspection did not finish in time");
+                    return Ok(());
+                }
+            };
         self.info.agent = lineage.as_ref().map(|lineage| lineage.slug());
         self.info.branch = lineage.as_ref().map(|lineage| lineage.branch().into());
         self.spec.agit_session = lineage;
         Ok(())
+    }
+
+    /// Control does not depend on capture. The roster keeps its recorded lineage, so a later
+    /// resume whose binding resolves settles the turns this run adds.
+    fn degrade_capture(&mut self, reason: &str) {
+        eprintln!(
+            "agitd: session {} runs without archive capture ({reason}); it will not settle until a later resume resolves its capture binding",
+            self.info.session_id
+        );
+        self.capture_degraded = true;
+        self.spec.agit_session = None;
+        self.info.agent = None;
+        self.info.branch = None;
     }
 
     async fn revalidate_capture(&self) -> Result<(), RpcError> {
@@ -212,7 +360,7 @@ impl PreparedSpawn {
                     .unwrap_or_else(|| native.clone())
             });
             let cwd = self.spec.cwd.clone();
-            tokio::task::spawn_blocking(move || -> crate::Result<()> {
+            let revalidation = tokio::task::spawn_blocking(move || -> crate::Result<()> {
                 crate::rc::capture::require(&lineage)?;
                 if let Some(native) = native {
                     crate::rc::capture::resolve(
@@ -224,15 +372,17 @@ impl PreparedSpawn {
                     )?;
                 }
                 Ok(())
-            })
-            .await
-            .map_err(|_| RpcError::new(ErrorCode::Internal, "capture revalidation failed"))?
-            .map_err(|_| {
-                RpcError::new(
-                    ErrorCode::Forbidden,
-                    "capture binding changed before launch",
-                )
-            })?;
+            });
+            // The binding resolved moments ago, so a change or a held lock is a concurrent writer.
+            tokio::time::timeout(CAPTURE_TIMEOUT, revalidation)
+                .await
+                .map_err(|_| {
+                    super::capture_binding::busy_error("the native capture claim is busy")
+                })?
+                .map_err(|_| RpcError::new(ErrorCode::Internal, "capture revalidation failed"))?
+                .map_err(|_| {
+                    super::capture_binding::busy_error("capture binding changed before launch")
+                })?;
         }
         Ok(())
     }
@@ -243,9 +393,13 @@ impl PreparedSpawn {
             pause.notified().await;
         }
         if self.settlement.borrow().epoch != self.epoch {
-            return Err(SpawnFailure::before_launch(RpcError::new(
-                ErrorCode::SessionBusy,
-                "the connection authority changed before launch",
+            return Err(SpawnFailure::before_launch(classified(
+                RpcError::new(
+                    ErrorCode::SessionBusy,
+                    "the connection authority changed before launch",
+                ),
+                true,
+                "connection_changed",
             )));
         }
         // Confinement may change after admission while this worker waits for executor time.
@@ -270,27 +424,49 @@ impl PreparedSpawn {
         ).await.map_err(|failure| {
             if self.spec.resume_from.is_some() && failure.is_external_writer() {
                 return SpawnFailure {
-                    error: RpcError::new(ErrorCode::SessionBusy, failure.to_string()).with_hint(
-                        "this session is read-only while another application controls it; retry resume after that application releases control",
+                    error: classified(
+                        RpcError::new(ErrorCode::SessionBusy, failure.to_string()).with_hint(
+                            "this session is read-only while another application controls it; retry resume after that application releases control",
+                        ),
+                        false,
+                        "native_writer_active",
                     ),
                     reached_launch: true,
                     release_reservation: true,
+                    exiting: None,
                 };
             }
             if self.spec.resume_from.is_some() && failure.is_resume_rejected() {
                 return SpawnFailure {
-                    error: RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string()),
+                    error: classified(
+                        RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string()),
+                        false,
+                        "resume_rejected",
+                    ),
                     reached_launch: true,
                     release_reservation: true,
+                    exiting: None,
                 };
             }
             let reached_spawn = failure.reached_spawn();
             let error = RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string());
             if reached_spawn {
-                SpawnFailure::after_launch(error)
+                SpawnFailure::after_launch(classified(error, false, "launch_failed"))
             } else {
-                SpawnFailure::before_launch(error.with_hint(
-                    "nothing was launched on this machine; fix the runtime and retry the same start_id",
+                use crate::rc::harness::claude_code::{BypassUnavailable, NativeTranscriptMissing};
+                let reason = if failure.is::<NativeTranscriptMissing>() {
+                    "native_transcript_missing"
+                } else if failure.is::<BypassUnavailable>() {
+                    "bypass_unavailable"
+                } else {
+                    "runtime_unavailable"
+                };
+                SpawnFailure::before_launch(classified(
+                    error.with_hint(
+                        "nothing was launched on this machine; fix the runtime and retry the same start_id",
+                    ),
+                    false,
+                    reason,
                 ))
             }
         })?;
@@ -325,9 +501,10 @@ impl Daemon {
                 .get(&spawn.info.session_id)
                 .is_none_or(|reservation| reservation.generation != spawn.generation)
         {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "capture launch authority changed",
+            return Err(classified(
+                RpcError::new(ErrorCode::SessionBusy, "capture launch authority changed"),
+                true,
+                "connection_changed",
             ));
         }
         let id = &spawn.info.session_id;
@@ -345,8 +522,7 @@ impl Daemon {
         if self.roster.get(id).map(coordinates) != spawn.prior_entry.as_ref().map(coordinates)
             || self.roster.captures.get(id) != spawn.prior_capture.as_ref()
         {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
+            return Err(super::capture_binding::busy_error(
                 "capture association changed during inspection",
             ));
         }
@@ -368,6 +544,22 @@ impl Daemon {
             self.roster.captures.insert(id.clone(), kind.clone());
         }
         let prior = self.roster.get(id);
+        // A degraded launch keeps the recorded route so a later resume can settle its turns.
+        let (agit_session, expected_agent_id) = if spawn.capture_degraded {
+            (
+                prior.and_then(|entry| entry.agit_session.clone()),
+                prior.and_then(|entry| entry.expected_agent_id.clone()),
+            )
+        } else {
+            (
+                spawn.spec.agit_session.as_ref().map(ToString::to_string),
+                spawn
+                    .spec
+                    .agit_session
+                    .as_ref()
+                    .map(|lineage| lineage.agent_id().into()),
+            )
+        };
         let entry = roster::Entry {
             native_source: spawn.info.native_source.clone(),
             runtime: spawn.info.runtime.clone(),
@@ -375,12 +567,8 @@ impl Daemon {
             cwd: spawn.spec.cwd.to_string_lossy().into_owned(),
             workspace_id: spawn.info.workspace_id.clone(),
             project_id: spawn.info.project_id.clone(),
-            agit_session: spawn.spec.agit_session.as_ref().map(ToString::to_string),
-            expected_agent_id: spawn
-                .spec
-                .agit_session
-                .as_ref()
-                .map(|lineage| lineage.agent_id().into()),
+            agit_session,
+            expected_agent_id,
             permission_mode: spawn.info.permission_mode,
             guard_attempts: prior
                 .map(|entry| entry.guard_attempts.clone())
@@ -396,9 +584,13 @@ impl Daemon {
         }
         if self.roster.save().is_err() {
             self.roster = previous;
-            return Err(RpcError::new(
-                ErrorCode::Internal,
-                "capture binding could not be persisted; nothing was launched",
+            return Err(classified(
+                RpcError::new(
+                    ErrorCode::Internal,
+                    "capture binding could not be persisted; nothing was launched",
+                ),
+                false,
+                "state_unwritable",
             ));
         }
         Ok(())
@@ -458,47 +650,76 @@ impl Daemon {
                         opening.native_id.as_deref(),
                     ))
         });
-        if self.sessions.contains_key(&info.session_id)
-            || self.opening_sessions.contains_key(&info.session_id)
-            || archive_busy
+        let live = self.sessions.contains_key(&info.session_id)
             || self.sessions.values().any(|live| {
                 native_conflict(
                     &live.info.runtime,
                     live.info.native_source.as_ref(),
                     live.runtime_thread_id.as_deref(),
                 )
+            });
+        let opening: Vec<_> = self
+            .opening_sessions
+            .iter()
+            .filter(|(logical, opening)| {
+                *logical == &info.session_id
+                    || native_conflict(
+                        &opening.runtime,
+                        opening.native_source.as_ref(),
+                        opening.native_id.as_deref(),
+                    )
             })
-            || self.opening_sessions.values().any(|opening| {
-                native_conflict(
-                    &opening.runtime,
-                    opening.native_source.as_ref(),
-                    opening.native_id.as_deref(),
-                )
-            })
-        {
+            .map(|(logical, _)| self.exiting_launches.get(logical).copied())
+            .collect();
+        if live || archive_busy || !opening.is_empty() {
             let mut error = RpcError::new(
                 ErrorCode::SessionBusy,
                 "this conversation already has a live or unresolved harness launch",
             );
-            if archive_busy || observation_busy {
-                error.data = Some(serde_json::json!({
+            error.data = Some(if archive_busy || observation_busy {
+                serde_json::json!({
                     "retryable": true,
                     "outcome": "not_sent",
                     "reason": "archive_settlement"
-                }));
-            }
+                })
+            } else if live {
+                // Another logical identity or workspace drives this native conversation.
+                serde_json::json!({"retryable": false, "reason": "conversation_live_elsewhere"})
+            } else if opening.contains(&Some(true)) {
+                serde_json::json!({"retryable": false, "reason": "launch_process_lingering"})
+            } else if opening.contains(&Some(false)) {
+                serde_json::json!({"retryable": true, "reason": "launch_exiting"})
+            } else {
+                serde_json::json!({"retryable": true, "reason": "launch_in_progress"})
+            });
             return Err(SpawnFailure::before_launch(error));
         }
         Ok(())
     }
 
+    /// A start is forgotten once nothing it launched can still run, so the same `start_id` may
+    /// launch again. A native conversation the failed attempt created stays behind unused; no
+    /// writer from that attempt survives to share it.
     pub(super) fn failed_start(&mut self, start_id: &str, failure: SpawnFailure) -> RpcError {
-        if failure.reached_launch {
-            return RpcError::new(ErrorCode::SessionBusy, format!(
+        if failure.exiting.is_some() {
+            return classified(
+                RpcError::new(
+                    ErrorCode::SessionBusy,
+                    format!(
+                        "session.start failed and its harness is still exiting: {}",
+                        failure.error.message
+                    ),
+                ),
+                true,
+                "launch_exiting",
+            );
+        }
+        if failure.reached_launch && !failure.release_reservation {
+            return classified(RpcError::new(ErrorCode::SessionBusy, format!(
                 "session.start was durably reserved but launch completion is unknown: {}", failure.error.message,
             )).with_hint(format!(
                 "no second launch will be attempted for {start_id}; inspect this machine and retry the same start_id after recovery",
-            ));
+            )), false, "start_outcome_unknown");
         }
         self.roster.forget_start(start_id);
         if let Err(error) = self.roster.save() {
@@ -507,6 +728,31 @@ impl Daemon {
             );
         }
         failure.error
+    }
+
+    /// The failed launch's process groups are gone; its conversation may be opened again.
+    fn release_exited_launch(&mut self, session_id: &str, generation: u64, start_id: Option<&str>) {
+        if self
+            .opening_sessions
+            .get(session_id)
+            .is_none_or(|reservation| reservation.generation != generation)
+        {
+            return;
+        }
+        self.opening_sessions.remove(session_id);
+        self.exiting_launches.remove(session_id);
+        if let Some(start_id) = start_id
+            && self.roster.starts.get(start_id).is_some_and(|intent| {
+                matches!(&intent.state, roster::StartState::Pending { session } if session.session_id == session_id)
+            })
+        {
+            self.roster.forget_start(start_id);
+            if let Err(error) = self.roster.save() {
+                eprintln!(
+                    "agitd: released session.start {start_id} in memory but could not persist it: {error:#}"
+                );
+            }
+        }
     }
 
     pub(super) fn finish_spawn(
@@ -523,6 +769,7 @@ impl Daemon {
             frames,
             prompt,
             attribution,
+            capture_degraded,
             ..
         } = prepared;
         let session_id = info.session_id.clone();
@@ -536,17 +783,22 @@ impl Daemon {
             ));
         }
         let Spawned {
-            session,
+            mut session,
             frames: mut tagged_rx,
         } = match result {
             Ok(spawned) => spawned,
             Err(failure) => {
                 if failure.release_reservation {
                     self.opening_sessions.remove(&session_id);
+                } else if failure.exiting.is_some() {
+                    self.exiting_launches.insert(session_id, false);
                 }
                 return Err(failure);
             }
         };
+        if capture_degraded {
+            session.info.publication = Some(super::capture_binding::binding_invalid());
+        }
         let info = session.info.clone();
         self.latest_session_generations
             .insert(session_id.clone(), generation);
@@ -854,6 +1106,65 @@ mod tests {
         );
     }
 
+    /// A recorded capture route that no longer resolves leaves the conversation controllable. The
+    /// launch runs without lineage, and the roster keeps the route so a later resume whose binding
+    /// resolves settles these turns. Refusing would lock the user out of their own conversation;
+    /// erasing the route would let a later resume adopt a different repository.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresolvable_capture_binding_degrades_instead_of_refusing_control() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::opening::tests::an_unresolvable_capture_binding_degrades_instead_of_refusing_control",
+        ) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let (_root, daemon, mut spawn) = fixture().await;
+        let route = "alice/imported@work";
+        let row: roster::Entry = serde_json::from_value(serde_json::json!({
+            "runtime":"codex", "thread_id":"native", "cwd":spawn.spec.cwd,
+            "workspace_id":"ws", "project_id":"project", "agit_session":route,
+            "expected_agent_id":"00000000-0000-0000-0000-000000000001"
+        }))
+        .unwrap();
+        spawn.local_owner = true;
+        spawn.info.runtime = "codex".into();
+        spawn.spec.resume_from = Some("native".into());
+        spawn.prior_entry = Some(row.clone());
+        daemon
+            .lock()
+            .await
+            .roster
+            .record(&spawn.info.session_id, row)
+            .unwrap();
+        spawn.resolve_capture().await.unwrap();
+        assert!(spawn.capture_degraded);
+        assert!(spawn.spec.agit_session.is_none());
+        assert!(spawn.info.agent.is_none() && spawn.info.branch.is_none());
+        let mut state = daemon.lock().await;
+        state.persist_capture(&spawn).unwrap();
+        assert_eq!(
+            state
+                .roster
+                .get(&spawn.info.session_id)
+                .unwrap()
+                .agit_session
+                .as_deref(),
+            Some(route)
+        );
+        let mut info = spawn.info.clone();
+        info.publication = Some(super::super::capture_binding::binding_invalid());
+        assert_eq!(
+            state.stamped(info).publication,
+            Some(super::super::capture_binding::binding_invalid()),
+            "the web keeps seeing why this run will not settle"
+        );
+    }
+
     /// An unresolved opening excludes native aliases across workspace boundaries.
     #[tokio::test]
     async fn pending_launch_reserves_logical_and_native_identity() {
@@ -905,7 +1216,8 @@ mod tests {
         assert!(state.require_launch_slot(&alias, &spec).is_err());
     }
 
-    /// Waiting for one harness leaves daemon state available, including other launch slots.
+    /// Waiting for one harness leaves daemon state available, including other launch slots, and
+    /// a launch that never spawned a process gives its conversation back when it times out.
     #[tokio::test(start_paused = true)]
     async fn stuck_launch_does_not_hold_daemon_lock_and_times_out_once() {
         let (_dir, daemon, mut spawn) = fixture().await;
@@ -931,15 +1243,95 @@ mod tests {
         task.await.unwrap();
         let reply = replies.next_write().await.unwrap();
         assert_eq!(reply.frame().id, Some(id));
-        assert!(reply.frame().error.is_some());
+        let error = reply.frame().error.clone().unwrap();
+        assert_eq!(error.code, ErrorCode::RuntimeUnavailable as i32);
+        assert_eq!(error.data.unwrap()["reason"], "launch_timeout");
         reply.commit();
         assert!(replies.next_write().await.is_none());
         let state = daemon.lock().await;
         assert!(state.sessions.is_empty());
-        assert!(
-            state.opening_sessions.contains_key("agit-opening"),
-            "an unknown outcome cannot release its writer reservation"
-        );
+        assert!(state.opening_sessions.is_empty());
+    }
+
+    /// A launch that crossed the OS spawn keeps its conversation reserved until every process it
+    /// created is gone, and only then admits the next writer. Releasing on the failure itself
+    /// would let a retry start a second writer beside a dying one; never releasing would lock the
+    /// conversation until the daemon restarts.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_launch_holds_its_conversation_until_its_process_exits() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::opening::tests::a_spawned_launch_holds_its_conversation_until_its_process_exits",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (_dir, daemon, mut spawn) = fixture().await;
+                    spawn.info.runtime = "claude-code".into();
+                    let (info, spec) = (spawn.info.clone(), spawn.spec.clone());
+                    let stub = home.path().join("stub-harness");
+                    std::fs::write(&stub, "#!/bin/sh\nexec cat\n").unwrap();
+                    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let (out, mut replies) = crate::rc::outbound::channel();
+                    let (_stop, stopped) = watch::channel(false);
+                    {
+                        let _stub = crate::rc::harness::proc::override_harness_program(
+                            stub.to_string_lossy().into_owned(),
+                        );
+                        crate::rc::harness::proc::fail_next_launch_writes(1);
+                        SessionOpening::launch(spawn, OpeningReply::Resume)
+                            .serve(
+                                daemon.clone(),
+                                out,
+                                crate::protocol::RequestId::Num(7),
+                                stopped,
+                            )
+                            .await;
+                    }
+                    let reply = replies.next_write().await.unwrap();
+                    let error = reply.frame().error.clone().unwrap();
+                    assert_eq!(error.code, ErrorCode::RuntimeUnavailable as i32);
+                    assert_eq!(error.data.unwrap()["retryable"], false);
+                    reply.commit();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let state = daemon.lock().await;
+                        assert!(state.sessions.is_empty());
+                        if !state.opening_sessions.contains_key(&info.session_id) {
+                            assert!(state.exiting_launches.is_empty());
+                            break;
+                        }
+                        let refused = state.require_launch_slot(&info, &spec).err().unwrap();
+                        assert_eq!(
+                            refused.error.data,
+                            Some(
+                                serde_json::json!({"retryable": true, "reason": "launch_exiting"})
+                            )
+                        );
+                        drop(state);
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "an exited launch must give its conversation back"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    assert!(
+                        daemon
+                            .lock()
+                            .await
+                            .require_launch_slot(&info, &spec)
+                            .is_ok()
+                    );
+                });
+        });
     }
 
     #[tokio::test]

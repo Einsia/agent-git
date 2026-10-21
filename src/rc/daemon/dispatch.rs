@@ -451,7 +451,25 @@ impl Daemon {
                     // `watch_stream_id`), so the ownership check below holds for it too.
                     .or_else(|| self.watches.get(&p.session_id).map(|w| w.info.clone()))
                     .filter(|i| i.workspace_id == caller.workspace_id)
-                    .ok_or_else(|| no_such_session(&p.session_id))?;
+                    .ok_or_else(|| {
+                        // A conversation this workspace owns but nothing runs is resumable,
+                        // not gone; other ids stay indistinguishable from unknown ones.
+                        if self
+                            .roster
+                            .get(&p.session_id)
+                            .is_some_and(|entry| entry.workspace_id == caller.workspace_id)
+                        {
+                            let mut error = RpcError::new(
+                                ErrorCode::SessionBusy,
+                                "this conversation is not running; resume it to continue",
+                            );
+                            error.data =
+                                Some(serde_json::json!({"retryable": true, "reason": "dormant"}));
+                            error
+                        } else {
+                            no_such_session(&p.session_id)
+                        }
+                    })?;
                 // Take the slot before taking the frames — the other order has already made the
                 // copies.
                 let Ok(slot) = self.replay_slots.clone().try_acquire_owned() else {
@@ -576,6 +594,7 @@ mod tests {
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
             opening_sessions: HashMap::new(),
+            exiting_launches: HashMap::new(),
             archive_recovering: HashMap::new(),
             watches: HashMap::new(),
             terminals: HashMap::new(),

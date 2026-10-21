@@ -123,6 +123,26 @@ impl RuntimeContext {
     }
 
     pub fn locate(&self, native: &str, roots: &CanonicalRoots) -> crate::Result<LocatedThread> {
+        self.locate_with(native, roots, true)
+    }
+
+    /// For callers holding a lock other conversations need: a cold transcript is restored in the
+    /// background and reported as [`crate::adapter::codex_rollout::Restoring`] instead of being
+    /// decoded while the lock is held.
+    pub(crate) fn locate_ready(
+        &self,
+        native: &str,
+        roots: &CanonicalRoots,
+    ) -> crate::Result<LocatedThread> {
+        self.locate_with(native, roots, false)
+    }
+
+    fn locate_with(
+        &self,
+        native: &str,
+        roots: &CanonicalRoots,
+        wait: bool,
+    ) -> crate::Result<LocatedThread> {
         self.validate()?;
         let thread = crate::adapter::codex_index::thread_by_id_in(&self.source.home, native)
             .map(Ok)
@@ -140,9 +160,14 @@ impl RuntimeContext {
             ),
             roots,
         )?;
-        let transcript = thread
-            .rollout_path
-            .canonicalize()
+        if !wait
+            && crate::adapter::codex_rollout::begin_restore(&thread.rollout_path)
+                .context("native conversation transcript is unavailable")?
+        {
+            return Err(crate::adapter::codex_rollout::Restoring.into());
+        }
+        let transcript = crate::adapter::codex_rollout::restore(&thread.rollout_path)
+            .and_then(|path| path.canonicalize())
             .context("native conversation transcript is unavailable")?;
         ensure!(
             transcript.starts_with(&self.source.home),
@@ -163,23 +188,37 @@ impl RuntimeContext {
         roots: &CanonicalRoots,
         limits: crate::adapter::native_snapshot::Limits,
     ) -> crate::Result<PathBuf> {
-        use std::io::{BufRead, Read};
+        let carrier = self.history_parent_carrier(physical_id, roots, limits)?;
+        Ok(crate::adapter::codex_rollout::restore(&carrier)?)
+    }
+
+    /// The parent carrier as it is on disk, admitted by its header without restoring it.
+    pub(crate) fn history_parent_carrier(
+        &self,
+        physical_id: &str,
+        roots: &CanonicalRoots,
+        limits: crate::adapter::native_snapshot::Limits,
+    ) -> crate::Result<PathBuf> {
         self.validate()?;
-        let source = crate::adapter::native_snapshot::lookup_codex_rollout_in(
+        let carrier = crate::adapter::native_snapshot::codex_carrier_in(
             &self.source.home,
             physical_id,
             limits,
         )?;
-        let path = source.path.canonicalize()?;
+        let path = carrier.canonicalize()?;
         ensure!(
             path.starts_with(&self.source.home),
             "native history points outside its runtime source"
         );
-        let mut header = String::new();
-        std::io::BufReader::new(std::fs::File::open(&path)?.take(1024 * 1024))
-            .read_line(&mut header)?;
-        ensure!(header.ends_with('\n'), "native parent header is incomplete");
-        let header: serde_json::Value = serde_json::from_str(&header)?;
+        let header = crate::adapter::codex_rollout::first_line(
+            &path,
+            crate::adapter::codex_rollout::HEADER_LIMIT,
+        )?;
+        ensure!(
+            header.ends_with(b"\n"),
+            "native parent header is incomplete"
+        );
+        let header: serde_json::Value = serde_json::from_slice(&header)?;
         ensure!(
             header["type"] == "session_meta",
             "native parent header is invalid"
@@ -339,6 +378,44 @@ mod tests {
         assert!(third.rows[0].technical);
         assert!(third.next_cursor.is_none());
         assert!(context.locate("a", &roots).is_err());
+    }
+
+    /// Codex compresses a rollout that has been idle for long enough and keeps naming its plain
+    /// path in the state database. Resolving only the plain file makes every dormant managed
+    /// conversation unreadable and impossible to resume.
+    #[test]
+    fn dormant_conversations_resolve_after_codex_compresses_their_rollout() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        let home = root.path().join("home");
+        native_store(&home, &project, "model-a");
+        let transcript = home.join("thread.jsonl");
+        let header = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"b","cwd":project.join("nested")}})
+        );
+        std::fs::write(
+            home.join("thread.jsonl.zst"),
+            ruzstd::encoding::compress_to_vec(
+                header.as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(&transcript).unwrap();
+        let registry = Registry::at(root.path().join("registry")).unwrap();
+        let source = registry.register(&home, None, None, None).unwrap();
+        let context = RuntimeContext::resolve(&registry, &source.source_id).unwrap();
+        let roots = CanonicalRoots::from_untrusted([project]);
+
+        let thread = context.locate("b", &roots).unwrap();
+        assert_eq!(thread.transcript, transcript.canonicalize().unwrap());
+        assert_eq!(std::fs::read_to_string(&transcript).unwrap(), header);
+        assert_eq!(
+            context.settings(&thread).unwrap().model()["model"],
+            "model-a"
+        );
     }
 
     #[test]

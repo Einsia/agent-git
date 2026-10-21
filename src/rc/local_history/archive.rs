@@ -114,7 +114,8 @@ impl Anchor {
             claim.resolve().as_ref() == Some(&last.source),
             "Archive native file changed"
         );
-        verify_prefix(&mut last.file, last.end, bytes, hash)?;
+        let end = last.end;
+        verify_prefix(last.file()?, end, bytes, hash)?;
         parents.iter().try_fold(bytes, |total, part| {
             total.checked_add(part.end).context(Failure::Limit)
         })

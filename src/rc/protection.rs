@@ -20,8 +20,10 @@ pub(crate) fn native_repository(
     };
     let (owner, agent) = crate::commands::parse_slug(&format!("{owner}/{agent}"))?;
     if let Some(recorded) = &link.cwd {
+        // A removed project directory still selects its repository's mappings for reading.
+        let recorded = super::policy::resolved(Path::new(recorded));
         anyhow::ensure!(
-            Path::new(recorded).canonicalize()? == cwd.canonicalize()?,
+            recorded.is_some() && recorded == super::policy::resolved(cwd),
             "native session protection context has a different working directory"
         );
     }

@@ -64,6 +64,20 @@ impl CanonicalRoots {
         )
     }
 
+    /// Roots for reading history that already exists. A project directory that was removed
+    /// (a deleted worktree or temporary directory) still confines its own conversations: it
+    /// is resolved like a target, through its existing ancestors with the missing remainder
+    /// kept literally, instead of being dropped. Launches and writes must not use these roots,
+    /// because they act inside the directory and it has to exist.
+    pub fn for_reading(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(
+            roots
+                .into_iter()
+                .filter_map(|root| resolve_existing_ancestor(&root))
+                .collect(),
+        )
+    }
+
     /// Build from paths that were returned by [`require_bindable_dir`].
     ///
     /// Kept crate-private so a wire path cannot label itself canonical. This deliberately does
@@ -157,6 +171,14 @@ pub fn require_within(target: &Path, roots: &CanonicalRoots) -> Result<PathBuf, 
         Some(t) if within(&t, roots) => Ok(t),
         _ => Err(PolicyError::OutsideAllowlist(target.display().to_string())),
     }
+}
+
+/// The location [`require_within`] judges for `target`, whether or not it still exists.
+///
+/// Two spellings of one directory compare equal through it, so a recorded working directory
+/// can be matched after the directory was removed. It authorizes nothing by itself.
+pub fn resolved(target: &Path) -> Option<PathBuf> {
+    resolve_existing_ancestor(target)
 }
 
 /// Validate a directory that is about to be bound as a project.

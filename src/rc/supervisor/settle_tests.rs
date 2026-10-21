@@ -1221,6 +1221,28 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                     .is_some_and(|receipt| receipt.source == awaiting_binding)
             }));
             assert!(resumed.publication_retry.next.is_none());
+
+            // A policy refusal recurs until the transcript changes; repeating it is one notice.
+            std::fs::write(
+                &fixture.exe,
+                script.replace(
+                    "commit)\n",
+                    &format!(
+                        "commit)\n echo refused >&2\n exit {}\n",
+                        crate::ExitCode::Policy as i32
+                    ),
+                ),
+            )
+            .unwrap();
+            let mut notices = 0;
+            for _ in 0..2 {
+                notices += settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn)
+                    .await
+                    .iter()
+                    .filter(|frame| frame.method() == "commit.failed")
+                    .count();
+            }
+            assert_eq!(notices, 1);
         });
     });
 }

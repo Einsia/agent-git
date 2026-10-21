@@ -2,7 +2,6 @@
 use super::*;
 use std::{
     collections::HashMap,
-    io::Write,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -14,9 +13,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
-const FILE_BUDGET_UNIT: u64 = 1024 * 1024;
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_TOTAL_FILE_UNITS: usize = 32 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 const LIFETIME: Duration = Duration::from_secs(600);
 
@@ -27,7 +23,6 @@ struct Snapshot {
     native_items: Option<Vec<Value>>,
     bytes: u64,
     _budget: OwnedSemaphorePermit,
-    _file_budget: Option<OwnedSemaphorePermit>,
 }
 
 struct CachedSnapshot {
@@ -36,61 +31,138 @@ struct CachedSnapshot {
     touched: Instant,
 }
 
-struct CaptureState {
-    finished: bool,
-    result: Option<(String, Arc<Mutex<Snapshot>>)>,
-}
-
-struct InFlightCapture {
-    state: Mutex<CaptureState>,
+struct Flight<T> {
+    /// `None` while the owner runs; then the shared result, or `None` inside for a failure.
+    state: Mutex<Option<Option<T>>>,
     ready: Condvar,
     waiters: AtomicUsize,
 }
 
-impl InFlightCapture {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(CaptureState {
-                finished: false,
-                result: None,
-            }),
-            ready: Condvar::new(),
-            waiters: AtomicUsize::new(0),
-        }
-    }
-
-    fn wait(&self) -> crate::Result<Option<(String, Arc<Mutex<Snapshot>>)>> {
+impl<T: Clone> Flight<T> {
+    fn wait(&self) -> crate::Result<Option<T>> {
         self.waiters.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().map_err(|_| Failure::Busy)?;
-        while !state.finished {
+        loop {
+            if let Some(result) = &*state {
+                return Ok(result.clone());
+            }
             state = self.ready.wait(state).map_err(|_| Failure::Busy)?;
         }
-        Ok(state.result.clone())
     }
 
-    fn finish(&self, result: Option<(String, Arc<Mutex<Snapshot>>)>) -> crate::Result<()> {
-        let mut state = self.state.lock().map_err(|_| Failure::Busy)?;
-        state.finished = true;
-        state.result = result;
+    fn finish(&self, result: Option<T>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.get_or_insert(result);
         self.ready.notify_all();
-        Ok(())
+    }
+}
+
+/// One in-flight run per key; concurrent identical requests share its result.
+///
+/// The work runs to completion on its owner's thread. A waiter that stops waiting therefore
+/// cannot cancel it for the others, and neither can the owner's requester going away. A
+/// failure is not shared: the next waiter becomes the owner and runs the work again, so a
+/// transient failure is retried instead of being fanned out to every waiter.
+pub(super) struct Flights<T> {
+    inflight: Mutex<HashMap<String, Arc<Flight<T>>>>,
+}
+
+impl<T> Default for Flights<T> {
+    fn default() -> Self {
+        Self {
+            inflight: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T: Clone> Flights<T> {
+    pub(super) fn run(
+        &self,
+        key: String,
+        work: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let mut work = Some(work);
+        loop {
+            let (flight, owner) = {
+                let mut inflight = self.inflight.lock().map_err(|_| Failure::Busy)?;
+                if let Some(flight) = inflight.get(&key) {
+                    (flight.clone(), false)
+                } else {
+                    let flight = Arc::new(Flight {
+                        state: Mutex::new(None),
+                        ready: Condvar::new(),
+                        waiters: AtomicUsize::new(0),
+                    });
+                    inflight.insert(key.clone(), flight.clone());
+                    (flight, true)
+                }
+            };
+            if !owner {
+                if let Some(result) = flight.wait()? {
+                    return Ok(result);
+                }
+                continue;
+            }
+            // Waiters must be released even if the work panics.
+            let release = Release {
+                flights: self,
+                key: &key,
+                flight: &flight,
+            };
+            let result = (work.take().expect("a single-flight run has one owner"))();
+            flight.finish(result.as_ref().ok().cloned());
+            drop(release);
+            return result;
+        }
+    }
+}
+
+struct Release<'a, T> {
+    flights: &'a Flights<T>,
+    key: &'a str,
+    flight: &'a Arc<Flight<T>>,
+}
+
+impl<T> Drop for Release<'_, T> {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .flight
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.get_or_insert(None);
+            self.flight.ready.notify_all();
+        }
+        let mut inflight = self
+            .flights
+            .inflight
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if inflight
+            .get(self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, self.flight))
+        {
+            inflight.remove(self.key);
+        }
     }
 }
 
 struct Cache {
     entries: Mutex<HashMap<String, CachedSnapshot>>,
-    inflight: Mutex<HashMap<String, Arc<InFlightCapture>>>,
+    captures: Flights<(String, Arc<Mutex<Snapshot>>)>,
     bytes: Arc<Semaphore>,
-    file_units: Arc<Semaphore>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            captures: Flights::default(),
             bytes: Arc::new(Semaphore::new(MAX_TOTAL_BYTES as usize)),
-            file_units: Arc::new(Semaphore::new(MAX_TOTAL_FILE_UNITS)),
         }
     }
 }
@@ -111,45 +183,9 @@ impl Cache {
             return Ok((token.into(), entry.snapshot.clone()));
         }
 
-        let mut capture = Some(capture);
-        loop {
-            let (flight, owner) = {
-                let mut inflight = self.inflight.lock().map_err(|_| Failure::Busy)?;
-                if let Some(flight) = inflight.get(&scope) {
-                    (flight.clone(), false)
-                } else {
-                    let flight = Arc::new(InFlightCapture::new());
-                    inflight.insert(scope.clone(), flight.clone());
-                    (flight, true)
-                }
-            };
-
-            if !owner {
-                if let Some(result) = flight.wait()? {
-                    return Ok(result);
-                }
-                // The original capture failed. Re-enter as the next owner so a
-                // transient native writer race can be retried by a waiter.
-                continue;
-            }
-
-            let result = (capture
-                .take()
-                .expect("a single-flight capture has one owner"))()
-            .and_then(|snapshot| self.store(scope.clone(), snapshot));
-            match result {
-                Ok(result) => {
-                    flight.finish(Some(result.clone()))?;
-                    self.remove_inflight(&scope, &flight)?;
-                    return Ok(result);
-                }
-                Err(error) => {
-                    flight.finish(None)?;
-                    self.remove_inflight(&scope, &flight)?;
-                    return Err(error);
-                }
-            }
-        }
+        self.captures.run(scope.clone(), || {
+            capture().and_then(|snapshot| self.store(scope.clone(), snapshot))
+        })
     }
 
     fn store(
@@ -180,24 +216,8 @@ impl Cache {
         Ok((token, snapshot))
     }
 
-    fn remove_inflight(&self, scope: &str, flight: &Arc<InFlightCapture>) -> crate::Result<()> {
-        let mut inflight = self.inflight.lock().map_err(|_| Failure::Busy)?;
-        if inflight
-            .get(scope)
-            .is_some_and(|current| Arc::ptr_eq(current, flight))
-        {
-            inflight.remove(scope);
-        }
-        Ok(())
-    }
-
     fn reserve(&self, bytes: u32) -> crate::Result<OwnedSemaphorePermit> {
         self.reserve_from(&self.bytes, bytes)
-    }
-
-    fn reserve_files(&self, bytes: u64) -> crate::Result<OwnedSemaphorePermit> {
-        ensure!(bytes <= MAX_FILE_BYTES, Failure::Limit);
-        self.reserve_from(&self.file_units, bytes.div_ceil(FILE_BUDGET_UNIT) as u32)
     }
 
     fn reserve_from(
@@ -392,7 +412,6 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
         archive: None,
         floor: 0,
         _budget: cache.reserve(0)?,
-        _file_budget: None,
         parts: vec![],
         native_items: None,
         bytes: 0,
@@ -437,131 +456,17 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
                 .resolve(native, Some(std::path::Path::new(cwd)))
                 .ok_or(Failure::Missing)?
         };
-        let parts = if target.context.is_some() {
+        // Each carrier is pinned by its open handle: appends during and after the walk stay
+        // outside the snapshot, and no transcript bytes are copied.
+        snapshot.parts = if target.context.is_some() {
             lineage_from(&path, |id| target.parent_path(id))?
         } else if *runtime == "codex" {
             lineage(&path)?
         } else {
-            let file = std::fs::File::open(&path)?;
-            vec![Segment {
-                end: file.metadata()?.len(),
-                version: file.metadata()?,
-                file,
-                source: path,
-            }]
+            vec![Segment::leaf(std::fs::File::open(&path)?, path)?]
         };
-        snapshot.bytes = parts.iter().try_fold(0u64, |bytes, part| {
-            bytes.checked_add(part.end).context(Failure::Limit)
-        })?;
-        // File-backed snapshots consume disk capacity, not a transcript-sized read buffer.
-        snapshot._file_budget = Some(cache.reserve_files(snapshot.bytes)?);
-        for mut part in parts {
-            if part.end > 0 {
-                part.file.seek(SeekFrom::Start(part.end - 1))?;
-                let mut delimiter = [0];
-                part.file.read_exact(&mut delimiter)?;
-                ensure!(delimiter == *b"\n", Failure::Incomplete);
-            }
-            let before = part.version;
-            let copy = copy_prefix(&mut part.file, part.end)?;
-            let after = part.file.metadata()?;
-            ensure!(
-                before.len() == after.len() && before.modified()? == after.modified()?,
-                Failure::Changed
-            );
-            snapshot.parts.push(Segment {
-                version: copy.metadata()?,
-                file: copy,
-                end: part.end,
-                source: part.source,
-            });
-        }
     }
     Ok(snapshot)
-}
-
-fn copy_prefix(source: &mut std::fs::File, end: u64) -> crate::Result<std::fs::File> {
-    if let Some(copy) = clone_file(source)? {
-        ensure!(copy.metadata()?.len() >= end, Failure::Changed);
-        copy.set_len(end)?;
-        return Ok(copy);
-    }
-    let mut copy = tempfile::tempfile()?;
-    source.seek(SeekFrom::Start(0))?;
-    let mut remaining = end;
-    let mut buffer = [0; 64 * 1024];
-    while remaining > 0 {
-        let count = remaining.min(buffer.len() as u64) as usize;
-        source.read_exact(&mut buffer[..count])?;
-        copy.write_all(&buffer[..count])?;
-        remaining -= count as u64;
-    }
-    Ok(copy)
-}
-
-// Clone the open source so a path replacement cannot substitute a different transcript.
-// Unsupported filesystems use a bounded streaming copy with the same immutable result.
-#[cfg(target_os = "macos")]
-fn clone_directory() -> std::io::Result<tempfile::TempDir> {
-    use std::os::unix::fs::PermissionsExt;
-    tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
-}
-
-#[cfg(target_os = "macos")]
-fn clone_file(source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
-    let directory = clone_directory()?;
-    let target = directory.path().join("history");
-    let directory_file = std::fs::File::open(directory.path())?;
-    let result = unsafe {
-        libc::fclonefileat(
-            source.as_raw_fd(),
-            directory_file.as_raw_fd(),
-            c"history".as_ptr(),
-            0,
-        )
-    };
-    if result == 0 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
-        return std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(target)
-            .map(Some);
-    }
-    clone_unavailable(std::io::Error::last_os_error())
-}
-
-#[cfg(target_os = "linux")]
-fn clone_file(source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
-    let copy = tempfile::tempfile()?;
-    let result = unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
-    if result == 0 {
-        return Ok(Some(copy));
-    }
-    clone_unavailable(std::io::Error::last_os_error())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn clone_unavailable(error: std::io::Error) -> std::io::Result<Option<std::fs::File>> {
-    if matches!(
-        error.raw_os_error(),
-        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY | libc::ENOSYS)
-    ) || error.raw_os_error() == Some(libc::ENOTSUP)
-    {
-        Ok(None)
-    } else {
-        Err(error)
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn clone_file(_source: &std::fs::File) -> std::io::Result<Option<std::fs::File>> {
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -574,49 +479,6 @@ mod tests {
     };
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn clone_staging_is_private_before_source_permissions_are_copied() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = clone_directory().unwrap();
-        assert_eq!(
-            std::fs::metadata(directory.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert!(
-            clone_unavailable(std::io::Error::from_raw_os_error(libc::ENOTSUP))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn file_snapshots_keep_the_captured_prefix_without_reserving_transcript_sized_memory() {
-        let cache = Cache::default();
-        let disk = cache.reserve_files(MAX_BYTES + 1).unwrap();
-        assert_eq!(cache.bytes.available_permits(), MAX_TOTAL_BYTES as usize);
-        assert_eq!(
-            cache.file_units.available_permits(),
-            MAX_TOTAL_FILE_UNITS - (MAX_BYTES + 1).div_ceil(FILE_BUDGET_UNIT) as usize
-        );
-        let mut source = tempfile::tempfile().unwrap();
-        source.write_all(b"first\nsecond\n").unwrap();
-        let mut captured = copy_prefix(&mut source, 6).unwrap();
-        source.seek(SeekFrom::Start(0)).unwrap();
-        source.write_all(b"changed\nthird\n").unwrap();
-        source.set_len(0).unwrap();
-        captured.seek(SeekFrom::Start(0)).unwrap();
-        let mut bytes = String::new();
-        captured.read_to_string(&mut bytes).unwrap();
-        assert_eq!(bytes, "first\n");
-        drop(disk);
-        assert_eq!(cache.file_units.available_permits(), MAX_TOTAL_FILE_UNITS);
-    }
-
-    #[test]
     fn captures_and_readers_do_not_lock_unrelated_history_or_release_live_bytes() {
         let cache = Cache::default();
         let make = || {
@@ -627,7 +489,6 @@ mod tests {
                 native_items: None,
                 bytes: 1,
                 _budget: cache.reserve(1)?,
-                _file_budget: None,
             })
         };
         let (token, first) = cache
@@ -668,6 +529,43 @@ mod tests {
         assert!(cache.reserve(1).is_ok());
     }
 
+    /// A waiter must neither hang when its owner's work panics nor inherit the failure: it runs
+    /// the work itself. A flight released only on the owner's success path strands every waiter,
+    /// and each one keeps a history worker until the daemon restarts.
+    #[test]
+    fn a_panicking_owner_hands_the_work_to_a_waiter() {
+        let flights = Arc::new(Flights::<u32>::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let owner = {
+            let flights = flights.clone();
+            thread::spawn(move || {
+                flights.run("key".into(), || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    panic!("owner failed")
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        let waiter = {
+            let flights = flights.clone();
+            thread::spawn(move || flights.run("key".into(), || Ok(7)))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while flights.inflight.lock().unwrap()["key"]
+            .waiters
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            assert!(Instant::now() < deadline, "waiter did not join the flight");
+            thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        assert!(owner.join().is_err());
+        assert_eq!(waiter.join().unwrap().unwrap(), 7);
+    }
+
     #[test]
     fn concurrent_requests_for_one_scope_share_capture() {
         let cache = Arc::new(Cache::default());
@@ -688,7 +586,6 @@ mod tests {
                     native_items: None,
                     bytes: 1,
                     _budget: leader_cache.reserve(1)?,
-                    _file_budget: None,
                 })
             })
         });
@@ -708,7 +605,6 @@ mod tests {
                     native_items: None,
                     bytes: 1,
                     _budget: follower_cache.reserve(1)?,
-                    _file_budget: None,
                 })
             })
         });
@@ -717,6 +613,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let flight = cache
+                .captures
                 .inflight
                 .lock()
                 .unwrap()
