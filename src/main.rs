@@ -263,6 +263,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         | Startup::ScopedReview
         | Startup::RemoteSearch
         | Startup::LocalSearch
+        | Startup::ScopedActivity
         | Startup::ToolDispatcher => Ok(()),
     };
     if let Err(e) = prepared {
@@ -287,6 +288,8 @@ enum Startup {
     RemoteSearch,
     /// Offline search must not run update checks or create migration/cache state.
     LocalSearch,
+    /// Activity checks recovery only for the repository it reads locally; a Hub query reads none.
+    ScopedActivity,
     /// Each dispatched tool prepares its own storage; the protocol parent has no local scope.
     ToolDispatcher,
 }
@@ -300,6 +303,7 @@ impl Startup {
                 | Self::ScopedReview
                 | Self::RemoteSearch
                 | Self::LocalSearch
+                | Self::ScopedActivity
                 | Self::ToolDispatcher
         )
     }
@@ -317,6 +321,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
+        Commands::Activity(_) => Startup::ScopedActivity,
         Commands::Mcp(_) => Startup::ToolDispatcher,
         // A relay outlives the hook that starts it and touches only its own message queue.
         Commands::Hooks(args)
@@ -455,6 +460,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Pull(a) => commands::pull::run(a),
 
         Commands::Search(a) => commands::search::run(*a),
+        Commands::Activity(a) => commands::activity::run(*a),
         Commands::Share(a) => commands::share::run(a),
         Commands::Privacy(a) => commands::privacy::run(a),
         Commands::Pr(a) => commands::pr::run(a),

@@ -292,6 +292,7 @@ agit push <owner/repo> -b main --yes                    # follow the dry-run dec
 | `pull` | Fetch and fast-forward only; warns and skips divergence |
 | `pr` | Create, inspect, fetch, and merge Hub pull requests |
 | `share` | Create or revoke read-only sharing links |
+| `activity` | Query submitted user and assistant messages by author and commit time; fetch locally when available, otherwise query the Hub |
 | `search` | Search the AgentGit corpus visible to the current identity |
 | `rc` | Start and manage the `agitd` remote-control daemon and peer/Cloud connections |
 

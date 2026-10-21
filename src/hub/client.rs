@@ -1243,6 +1243,60 @@ impl Client {
         self.delete(&format!("api/shares/{slug}"))
     }
 
+    /// Accepted publication facts for a local query, bound to the pinned repository identity.
+    pub fn activity_attribution(
+        &self,
+        owner: &str,
+        name: &str,
+        expected_agent_id: &str,
+        request: &crate::domain::activity::AttributionRequest,
+    ) -> Result<crate::domain::activity::AttributionBody> {
+        let reply: crate::domain::activity::AttributionReply = self.post_expected(
+            &format!(
+                "api/agents/{}/{}/activity/attribution",
+                urlencode(owner),
+                urlencode(name)
+            ),
+            request,
+            Some(expected_agent_id),
+        )?;
+        anyhow::ensure!(
+            reply.schema_version == crate::domain::activity::SCHEMA_VERSION
+                && reply.repository_id == expected_agent_id,
+            "the Hub did not acknowledge the requested activity attribution contract"
+        );
+        Ok(reply.body)
+    }
+
+    pub fn activity(
+        &self,
+        owner: &str,
+        name: &str,
+        query: &crate::domain::activity::Query,
+    ) -> Result<crate::domain::activity::Page> {
+        let selection = query.selection()?;
+        let mut path = format!(
+            "api/agents/{}/{}/activity?author={}&since={}&before={}&limit={}",
+            urlencode(owner),
+            urlencode(name),
+            urlencode(&selection.author),
+            urlencode(&selection.since),
+            urlencode(&selection.before),
+            query.limit.unwrap_or(50)
+        );
+        for (key, value) in [("session", &selection.session), ("cursor", &query.cursor)] {
+            if let Some(value) = value {
+                path.push_str(&format!("&{key}={}", urlencode(value)));
+            }
+        }
+        if selection.assistant == crate::domain::activity::Assistant::Last {
+            path.push_str("&assistant=last");
+        }
+        let page: crate::domain::activity::Page = self.get(&path)?;
+        page.acknowledges(&format!("{owner}/{name}"), &selection)?;
+        Ok(page)
+    }
+
     /// Cross-session search (the legacy shape, a bare array).
     ///
     /// Kept because **an already-released CLI parses exactly this shape**: `/api/search` returns

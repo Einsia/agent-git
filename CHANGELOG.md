@@ -8,6 +8,17 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- `agit activity` and its MCP tool query a person's saved user and assistant messages
+  over an explicit time range, with optional session selection and JSON pagination.
+  Results are grouped by saved commit, oldest first, and a cursor keeps working while
+  new work is saved. Existing clones are fetched once per query and read locally;
+  other repositories are queried on the Hub without cloning. Encrypted publications
+  use accepted account attribution and publication time, and incompleteness is
+  reported for the whole query. `--assistant last` keeps every user message but only the
+  final assistant reply to each. Requires a Hub supporting activity schema version 3.
+
 ### Fixed
 
 - Remote control opens Codex conversations that have been idle long enough for

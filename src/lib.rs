@@ -97,6 +97,7 @@ pub mod ui;
 /// The test: a function only one domain uses stays inside that domain. The rule keeps another
 /// catch-all `core/` from growing.
 pub mod domain {
+    pub mod activity;
     pub mod archive_history;
     pub mod comparison;
     #[cfg(feature = "secret-vault")]

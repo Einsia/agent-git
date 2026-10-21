@@ -4,6 +4,7 @@ use crate::Result;
 use crate::adapter::{self, Event, EventKind, Session, ToolDetails};
 use crate::domain::{storage, transcript::Envelope};
 use anyhow::Context;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -36,19 +37,34 @@ pub(crate) fn source_key(envelope: &Envelope) -> SourceKey {
 /// Their line coordinates are mapped back to the selected sequence before rendering, so grouping
 /// cannot reorder interleaved history or fetch context excluded from that sequence.
 pub fn parse(envelopes: &str) -> Result<Session> {
-    Ok(parse_selected(envelopes, false)?.0)
+    Ok(parse_selected(lines(envelopes), false)?.0)
+}
+
+/// [`parse`] for envelopes a caller has already validated, so no line is parsed twice.
+pub fn parse_validated(envelopes: &[Envelope]) -> Result<Session> {
+    Ok(parse_selected(envelopes.iter().map(Ok), false)?.0)
 }
 
 /// Enrichment stays inside each native source group before event coordinates are remapped.
 pub fn parse_with_details(envelopes: &str) -> Result<(Session, ToolDetails)> {
-    parse_selected(envelopes, true)
+    parse_selected(lines(envelopes), true)
 }
 
-fn parse_selected(envelopes: &str, enrich: bool) -> Result<(Session, ToolDetails)> {
+fn lines(envelopes: &str) -> impl Iterator<Item = Result<Envelope>> {
+    envelopes
+        .split_inclusive('\n')
+        .map(storage::parse_envelope_line)
+}
+
+fn parse_selected<E: Borrow<Envelope>>(
+    envelopes: impl Iterator<Item = Result<E>>,
+    enrich: bool,
+) -> Result<(Session, ToolDetails)> {
     let mut groups: BTreeMap<SourceKey, NativeSession> = BTreeMap::new();
     let mut events = Vec::new();
-    for (position, line) in envelopes.split_inclusive('\n').enumerate() {
-        let envelope = storage::parse_envelope_line(line)?;
+    for (position, envelope) in envelopes.enumerate() {
+        let envelope = envelope?;
+        let envelope = envelope.borrow();
         let content = &envelope.content;
         if content["type"] == "user"
             && content["agit"] == "merge_summary"
@@ -70,7 +86,7 @@ fn parse_selected(envelopes: &str, enrich: bool) -> Result<(Session, ToolDetails
             ));
             continue;
         }
-        let group = groups.entry(source_key(&envelope)).or_default();
+        let group = groups.entry(source_key(envelope)).or_default();
         group
             .raw
             .push_str(&serde_json::to_string(&envelope.content)?);

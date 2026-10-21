@@ -55,7 +55,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     let logical = |letter: char| format!("agit-{}", letter.to_string().repeat(40));
     let account = |id: &str| AccountIdentity::new(&identity.hub, id).unwrap();
     let save = |metadata: &Meta, content: &str| {
-        let text = transcript::wrap_lines(
+        let mut text = transcript::wrap_lines(
             &format!(
                 "{}\n",
                 json!({"type":"user","message":{"role":"user","content":content}})
@@ -63,6 +63,17 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
             "claude-code",
             &metadata.session,
         );
+        if metadata.session_privacy.is_some() {
+            text += &transcript::wrap_lines(
+                &format!(
+                    "{}\n{}\n",
+                    json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"shell","name":"Bash","input":{"command":"private tool input"}}]}}),
+                    json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"shell","content":"private tool output"}]}}),
+                ),
+                "claude-code",
+                &metadata.session,
+            );
+        }
         storage::write_snapshot(source.root(), &text, &text).unwrap();
         meta::write(source.root(), metadata).unwrap();
         source.add_all().unwrap();
@@ -225,6 +236,10 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         )
         .unwrap()
     };
+    crate::domain::activity::tests::assert_encrypted_publication_activity(
+        first.repo(),
+        first.session_manifest(),
+    );
     let sealed_a = envelope(&first.repo, &published_a);
     let sealed_c = envelope(&first.repo, &published_c);
     let public_session = sealed_a

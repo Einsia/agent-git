@@ -186,7 +186,29 @@ pub fn parse_envelopes(text: &str) -> Result<Vec<Envelope>> {
 /// event id = `SHA256(canonical full envelope line, trailing LF included)[..40]`.
 pub fn event_id(envelope_line: &str) -> Result<String> {
     parse_envelope_line(envelope_line)?;
-    Ok(hex::encode(Sha256::digest(envelope_line.as_bytes()))[..meta::EVENT_ID_HEX_LEN].to_owned())
+    Ok(canonical_event_id(envelope_line))
+}
+
+/// [`event_id`] of a line already known to be a canonical envelope. Hashing unvalidated bytes
+/// names them without proving they are an envelope.
+pub fn canonical_event_id(envelope_line: &str) -> String {
+    hex::encode(Sha256::digest(envelope_line.as_bytes()))[..meta::EVENT_ID_HEX_LEN].to_owned()
+}
+
+/// The envelope of a line whose bytes are already authenticated, by matching its event ID or by
+/// being produced by a validating canonicalizer. A reader that only extracts content needs the
+/// shape; repeating the writer's canonical-form and `_object_hash` checks would re-serialize and
+/// re-hash every record without telling it anything the authentication did not.
+pub(crate) fn parse_authenticated_envelope(line: &str) -> Result<Envelope> {
+    let json = line
+        .strip_suffix('\n')
+        .context("envelope must end with exactly one LF")?;
+    let envelope: Envelope = serde_json::from_str(json).context("invalid envelope JSON")?;
+    anyhow::ensure!(
+        !envelope.source.is_empty() && meta::is_bare_id(&envelope.session_id),
+        "envelope source or session identity is invalid"
+    );
+    Ok(envelope)
 }
 
 /// Parse `LOG` / `VIEW` strictly. An empty sequence is valid; every line of a non-empty sequence

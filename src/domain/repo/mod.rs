@@ -55,6 +55,8 @@
 //! Authenticated git operations (`clone` / `fetch` / `push`) do not live here; they live in
 //! [`crate::hub::git`] — authentication is the hub's business.
 
+#[cfg(feature = "cli")]
+pub(crate) mod object_reader;
 mod preferences;
 #[cfg(feature = "cli")]
 pub mod publication;
@@ -1485,6 +1487,38 @@ impl Repo {
         )
     }
 
+    /// A long-lived `cat-file` in `mode` with the same isolation as this repository's other
+    /// local object reads.
+    #[cfg(feature = "cli")]
+    pub(crate) fn object_reader_command(
+        &self,
+        mode: &str,
+        deadline: crate::infra::local_git::Deadline,
+    ) -> Command {
+        let mut command = self.cmd();
+        ReadPolicy::LocalRepository(deadline).apply(&mut command);
+        command.args(["cat-file", mode]);
+        command
+    }
+
+    /// Stream a selected repository's output with the same isolation as its object reads.
+    #[cfg(feature = "cli")]
+    pub(crate) fn git_stream_split_inspection(
+        &self,
+        args: &[&str],
+        sep: u8,
+        deadline: crate::infra::local_git::Deadline,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_limit(
+            args,
+            sep,
+            ReadPolicy::LocalRepository(deadline),
+            1024 * 1024,
+            on_record,
+        )
+    }
+
     fn git_stream_split_with_policy(
         &self,
         args: &[&str],
@@ -2831,6 +2865,39 @@ impl LocalWorktreeRecord {
     }
 }
 
+/// Writing to Git input whose reader has gone must fail the write, not terminate the CLI, whose
+/// output pipe keeps the default signal disposition. Call this on the thread that will write.
+pub(crate) fn suppress_pipe_signal(stdin: &std::process::ChildStdin) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        const F_SETNOSIGPIPE: libc::c_int = 73;
+        // Darwin delivers pipe signals to the process, so suppression belongs to this pipe.
+        if unsafe { libc::fcntl(stdin.as_raw_fd(), F_SETNOSIGPIPE, 1) } == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not suppress the Git input pipe's signal");
+        }
+    }
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        let _ = stdin;
+        // The mask belongs to this dedicated writer; pending pipe signals die with its thread.
+        let result = unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGPIPE);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
+        };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result))
+                .context("could not block the Git input writer's pipe signal");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = stdin;
+    Ok(())
+}
+
 /// Bounded readers can close Git input early without changing the CLI output-pipe disposition.
 fn spawn_cat_file_writer(
     stdin: std::process::ChildStdin,
@@ -2838,30 +2905,7 @@ fn spawn_cat_file_writer(
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || {
         use std::io::Write;
-        #[cfg(target_vendor = "apple")]
-        {
-            use std::os::fd::AsRawFd;
-            const F_SETNOSIGPIPE: libc::c_int = 73;
-            // Darwin delivers pipe signals to the process, so suppression belongs to this pipe.
-            if unsafe { libc::fcntl(stdin.as_raw_fd(), F_SETNOSIGPIPE, 1) } == -1 {
-                return Err(std::io::Error::last_os_error())
-                    .context("could not suppress the Git input pipe's signal");
-            }
-        }
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        {
-            // The mask belongs to this dedicated writer; pending pipe signals die with its thread.
-            let result = unsafe {
-                let mut mask: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut mask);
-                libc::sigaddset(&mut mask, libc::SIGPIPE);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
-            };
-            if result != 0 {
-                return Err(std::io::Error::from_raw_os_error(result))
-                    .context("could not block the Git input writer's pipe signal");
-            }
-        }
+        suppress_pipe_signal(&stdin)?;
         let mut writer = std::io::BufWriter::new(stdin);
         for oid in &oids {
             if writer.write_all(oid.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {

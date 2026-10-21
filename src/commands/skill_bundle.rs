@@ -35,6 +35,7 @@ macro_rules! subskills {
 /// The sub-skill of every top-level command. This list must match the `Commands` enum one for
 /// one.
 pub const SUBSKILLS: &[(&str, &str)] = subskills![
+    "activity",
     "branch",
     "cherry-pick",
     "clone",

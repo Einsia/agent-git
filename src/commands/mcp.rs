@@ -57,6 +57,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             id,
             serde_json::json!({
                 "tools": [
+                    {"name":"activity","description":"Read a person's submitted user and assistant conversation text by Hub username/account ID or legacy Git author and save time. Results are contributions (one per saved commit, oldest first) holding their new messages; tools and repeated cumulative history are excluded. Encrypted projections use accepted publication time; original commits use committer time. Fetch and query locally when cloned, otherwise query the Hub. Follow next_cursor while has_more, even after an empty page. incomplete covers every page so far; reasons counts what could not be read; warnings such as author_not_found do not affect completeness.","inputSchema":{"type":"object","properties":{"repo":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"session":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200},"assistant":{"type":"string","enum":["all","last"],"description":"all (default) or last: only the final assistant message before each user message"}},"required":["repo","author","since","before"],"additionalProperties":false}},
                     {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), org (readable repositories in current membership organizations), public, or one owner/repo; every remote search requires login. local=true searches saved local session history without HTTP or native transcript access; it keeps the login precondition and refuses scope, here and unsupported Hub-only filters/types before scanning.", "inputSchema": {"type":"object","properties":{"local":{"type":"boolean"},"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, org, public, or owner/repo; sessions and agents only"},"here":{"type":"boolean","description":"Restrict sessions to the current code Git repository exact origin; requires a supporting Hub."},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
@@ -178,6 +179,42 @@ fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+fn activity_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    let mut object = args
+        .as_object()
+        .cloned()
+        .ok_or("activity arguments must be an object")?;
+    let repo = object
+        .remove("repo")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .ok_or("repo is required")?;
+    super::parse_slug(&repo).map_err(|e| e.to_string())?;
+    let query: crate::domain::activity::Query =
+        serde_json::from_value(object.into()).map_err(|e| e.to_string())?;
+    query.selection().map_err(|e| e.to_string())?;
+    let mut out = vec![
+        "activity".into(),
+        format!("--author={}", query.author),
+        format!("--since={}", query.since),
+        format!("--before={}", query.before),
+        format!("--limit={}", query.limit.unwrap_or(50)),
+        format!(
+            "--assistant={}",
+            match query.assistant {
+                crate::domain::activity::Assistant::All => "all",
+                crate::domain::activity::Assistant::Last => "last",
+            }
+        ),
+    ];
+    for (key, value) in [("session", query.session), ("cursor", query.cursor)] {
+        if let Some(value) = value {
+            out.push(format!("--{key}={value}"));
+        }
+    }
+    out.extend(["--".into(), repo]);
+    Ok(out)
+}
+
 /// Subprocess stdin must be closed so a CLI prompt cannot consume the MCP request stream.
 fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
     let exe = std::env::current_exe().unwrap_or_else(|_| "agit".into());
@@ -195,6 +232,12 @@ fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
         cmd.env("AGIT_TELEMETRY_PARENT_ID", parent);
     }
     match name {
+        "activity" => match activity_arguments(args) {
+            Ok(arguments) => {
+                cmd.args(arguments);
+            }
+            Err(error) => return ToolOutput::error(format!("invalid activity arguments: {error}")),
+        },
         "search" => match search_arguments(args) {
             Ok(arguments) => {
                 cmd.args(arguments);
@@ -314,7 +357,7 @@ fn commit_target(args: &serde_json::Value) -> Result<Option<String>, String> {
 /// The VIEW tool returns its structured value directly; the CLI envelope is transport.
 /// Other tools and failed operations retain their own result contracts.
 fn mcp_result(name: &str, stdout: &str) -> String {
-    if name != "view" {
+    if !matches!(name, "view" | "activity") {
         return stdout.to_owned();
     }
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else {
@@ -358,6 +401,19 @@ mod workspace_tool_tests {
         assert_eq!(mcp_result("view", envelope), envelope);
         assert_eq!(mcp_result("status", envelope), envelope);
         assert_eq!(mcp_result("view", "plain output\n"), "plain output\n");
+    }
+
+    #[test]
+    fn activity_arguments_preserve_literals_and_reject_unknown_filters() {
+        let mut args = serde_json::json!({"repo":"alice/work", "author":"--counts", "since":"2026-10-01", "before":"2026-10-02", "session":"--help", "limit":1});
+        let command = super::activity_arguments(&args).unwrap();
+        assert!(command.iter().any(|s| s == "--author=--counts"));
+        assert!(command.iter().any(|s| s == "--session=--help"));
+        assert!(command.ends_with(&["--".into(), "alice/work".into()]));
+        args["message_time"] = true.into();
+        assert!(super::activity_arguments(&args).is_err());
+        let envelope = r#"{"ok":true,"result":{"format":"json","value":{"messages":[]}}}"#;
+        assert_eq!(mcp_result("activity", envelope), r#"{"messages":[]}"#);
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub mod memory;
 pub mod tag;
 
 // Inspection
+pub mod activity;
 pub mod diff;
 pub mod log;
 pub mod show;
@@ -1457,6 +1458,8 @@ pub enum Commands {
     // ── Discovery and sharing ───────────────────────────────────────
     /// Find matching sessions, repositories, pull requests, or people
     Search(Box<search::Args>),
+    /// Query a person's saved conversations by account and time.
+    Activity(Box<activity::Args>),
     /// Create a read-only link to a conversation
     Share(share::Args),
     /// Configure and preview the device-local privacy allowlist
@@ -1524,6 +1527,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Fetch(_) => "fetch",
         Commands::Pull(_) => "pull",
         Commands::Search(_) => "search",
+        Commands::Activity(_) => "activity",
         Commands::Share(_) => "share",
         Commands::Privacy(_) => "privacy",
         Commands::Pr(_) => "pr",

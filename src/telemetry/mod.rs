@@ -726,6 +726,7 @@ pub fn runtime(value: &str) {
 }
 
 pub const MCP_TOOLS: &[&str] = &[
+    "activity",
     "search",
     "show",
     "view",
