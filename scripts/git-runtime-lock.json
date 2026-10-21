@@ -29,11 +29,11 @@
       },
       {
         "name": "c-ares",
-        "version": "1.34.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/c-ares-1.34.8-r0.apk",
-        "sha256": "123fdeadc5ec884b897787f98d865492bf70402697b251cd1f3591a00b8c9d73",
+        "version": "1.34.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/c-ares-1.34.9-r0.apk",
+        "sha256": "3539a3e11c1ef1516117d8179a546ac882086e94e0d78ad51d687b3fa2b3b5f2",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/138a6bf9dea5974644e48fef4826b7c474f2f7d8/main/c-ares"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/50f178d7a4c30ea44b54b7d4731ab58558c38b14/main/c-ares"
       },
       {
         "name": "git",
@@ -69,11 +69,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.8.5-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.8.5-r0.apk",
-        "sha256": "2e56946bc495cbed9eb1ad70859a79cba9db6420016453e065a0628848b32c7e",
+        "version": "2.9.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.9.0-r0.apk",
+        "sha256": "32b127f31e0a919110a18a7f0bb3780d8fb66ba4d8d61b2d301d633f0e319d0e",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/41a9605db84bb52cd65c6349e5e087c2c7fe9efb/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c10df79ce35862cf273f98f6eb78d52e4f064ac7/main/expat"
       },
       {
         "name": "libidn2",
@@ -159,11 +159,11 @@
       },
       {
         "name": "c-ares",
-        "version": "1.34.8-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/c-ares-1.34.8-r0.apk",
-        "sha256": "689603d300dc56f0b99e313506e4d7b3a3ffb87cec536324f8a306bc218afe67",
+        "version": "1.34.9-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/c-ares-1.34.9-r0.apk",
+        "sha256": "1bda7f36597a3f6d616b0c8bd25cd611299bf353ec5ee2ae102e97694885c2f1",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/138a6bf9dea5974644e48fef4826b7c474f2f7d8/main/c-ares"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/50f178d7a4c30ea44b54b7d4731ab58558c38b14/main/c-ares"
       },
       {
         "name": "git",
@@ -199,11 +199,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.8.5-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.8.5-r0.apk",
-        "sha256": "568a12a4889a00711d1c80c197a5540ee1cdec26c1c59da38f8342ad69e7eff9",
+        "version": "2.9.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.9.0-r0.apk",
+        "sha256": "7128bfe18b8a315b9cf90ddf0beffeee454648ae72ff7898ff7d7b09803a559d",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/41a9605db84bb52cd65c6349e5e087c2c7fe9efb/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c10df79ce35862cf273f98f6eb78d52e4f064ac7/main/expat"
       },
       {
         "name": "libidn2",
@@ -361,12 +361,12 @@
     "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e41cbd2ae991adfe8df298ba8e8e777e90bd0e03/main/ca-certificates",
     "source_archives": [
       {
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ca-certificates-bundle-20260611-r0.apk",
-        "sha256": "cd7752154d0fa628a5f7360218e9e8e83edf31f7fa26f58ee42d26b507bd0372"
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ca-certificates-bundle-20261020-r0.apk",
+        "sha256": "bb008f6d214b6af7576324659856fb63dc8dcb4373f8345ff706388696f1254d"
       },
       {
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/ca-certificates-bundle-20260611-r0.apk",
-        "sha256": "bc5d3ae0b602748852e0bc601a4348cabc4f654f12f27578919cbf3c810f1c1e"
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/ca-certificates-bundle-20261020-r0.apk",
+        "sha256": "d0a573c27d337c369ad3abe3f39f09ffe67b95af23861577a8d134738375176a"
       }
     ],
     "compression": "gzip"

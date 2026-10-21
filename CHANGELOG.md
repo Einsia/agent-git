@@ -8,7 +8,7 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
-## [0.2.23] - 2026-10-21
+## [0.2.24] - 2026-10-21
 
 ### Added
 
@@ -23,6 +23,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- The bundled Linux Git runtime uses the current Alpine builds of expat, c-ares
+  and the CA bundle; the previous builds are no longer published, so release
+  builds could not assemble the runtime.
 - Remote control opens Codex conversations that have been idle long enough for
   Codex to compress their transcript, and conversations Codex continued in a
   new transcript segment. Such conversations stayed on "Restoring
