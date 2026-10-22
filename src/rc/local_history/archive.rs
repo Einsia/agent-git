@@ -281,6 +281,12 @@ mod tests {
         let full = read(wrong.clone()).unwrap();
         assert!(full["after_archive"].is_null());
         assert_eq!(full["items"].as_array().unwrap().len(), 2);
+        // A client pages a fallback chain without the anchor it was not given back.
+        let mut earlier = params.clone();
+        earlier.as_object_mut().unwrap().remove("after_archive");
+        earlier["snapshot"] = full["snapshot"].clone();
+        earlier["before"] = full["before"].clone();
+        read(earlier).expect("the next page of a fallback chain must not expire");
         wrong["snapshot"] = tail["snapshot"].clone();
         wrong["before"] = json!(0);
         assert!(read(wrong).is_err());

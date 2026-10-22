@@ -167,10 +167,19 @@ impl Default for Cache {
     }
 }
 
+/// The key a snapshot chain is filed under: the conversation and the archive anchor in force.
+fn scope(conversation: &Value, anchor: Option<&archive::Anchor>) -> String {
+    json!([conversation, anchor]).to_string()
+}
+
 impl Cache {
+    /// A page names its chain by the anchor the first page reported, not the one it asked for:
+    /// when a requested anchor cannot be applied the page falls back to the whole native history,
+    /// reports no anchor, and the following pages ask without one.
     fn snapshot(
         &self,
-        scope: String,
+        conversation: Value,
+        anchor: Option<&archive::Anchor>,
         token: Option<&str>,
         capture: impl FnOnce() -> crate::Result<Snapshot>,
     ) -> crate::Result<(String, Arc<Mutex<Snapshot>>)> {
@@ -178,13 +187,19 @@ impl Cache {
             let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
             entries.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
             let entry = entries.get_mut(token).context(Failure::Expired)?;
-            ensure!(entry.scope == scope, Failure::Expired);
+            ensure!(
+                entry.scope == scope(&conversation, anchor),
+                Failure::Expired
+            );
             entry.touched = Instant::now();
             return Ok((token.into(), entry.snapshot.clone()));
         }
 
-        self.captures.run(scope.clone(), || {
-            capture().and_then(|snapshot| self.store(scope.clone(), snapshot))
+        self.captures.run(scope(&conversation, anchor), || {
+            capture().and_then(|snapshot| {
+                let applied = scope(&conversation, snapshot.archive.as_ref());
+                self.store(applied, snapshot)
+            })
         })
     }
 
@@ -271,10 +286,11 @@ pub(super) fn read(
         .as_ref()
         .map(|context| (&context.source.source_id, context.source.generation));
     let anchor = archive::Anchor::parse(params)?;
-    let scope = json!([runtime, native, cwd, source, anchor]).to_string();
+    let conversation = json!([runtime, native, cwd, source]);
+    let requested = anchor.clone();
     let cache = SNAPSHOTS.get_or_init(Default::default);
     let (token, snapshot) = timings.measure("snapshot_ms", || {
-        cache.snapshot(scope, token, || {
+        cache.snapshot(conversation, requested.as_ref(), token, || {
             let mut snapshot = capture(target, cache)?;
             if let Some(anchor) = anchor {
                 // Missing or changed evidence falls back to a complete native page.
@@ -492,24 +508,24 @@ mod tests {
             })
         };
         let (token, first) = cache
-            .snapshot("first".into(), None, || {
-                let (_, other) = cache.snapshot("other".into(), None, make)?;
+            .snapshot(json!("first"), None, None, || {
+                let (_, other) = cache.snapshot(json!("other"), None, None, make)?;
                 assert_eq!(other.lock().unwrap().bytes, 1);
                 make()
             })
             .unwrap();
         let reading = first.lock().unwrap();
-        let (_, second) = cache.snapshot("second".into(), None, make).unwrap();
+        let (_, second) = cache.snapshot(json!("second"), None, None, make).unwrap();
         assert_eq!(second.lock().unwrap().bytes, 1);
         assert!(
             cache
-                .snapshot("another scope".into(), Some(&token), make)
+                .snapshot(json!("another scope"), None, Some(&token), make)
                 .is_err()
         );
         assert!(Arc::ptr_eq(
             &first,
             &cache
-                .snapshot("first".into(), Some(&token), make)
+                .snapshot(json!("first"), None, Some(&token), make)
                 .unwrap()
                 .1
         ));
@@ -522,7 +538,11 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(cache.bytes.available_permits(), MAX_TOTAL_BYTES as usize);
-        assert!(cache.snapshot("first".into(), Some(&token), make).is_err());
+        assert!(
+            cache
+                .snapshot(json!("first"), None, Some(&token), make)
+                .is_err()
+        );
         let full = cache.reserve(MAX_TOTAL_BYTES as u32).unwrap();
         assert!(cache.reserve(1).is_err());
         drop(full);
@@ -575,7 +595,7 @@ mod tests {
         let leader_cache = cache.clone();
         let leader_captures = captures.clone();
         let leader = thread::spawn(move || {
-            leader_cache.snapshot("scope".into(), None, || {
+            leader_cache.snapshot(json!("scope"), None, None, || {
                 leader_captures.fetch_add(1, Ordering::Relaxed);
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -596,7 +616,7 @@ mod tests {
         let follower_captures = captures.clone();
         let follower = thread::spawn(move || {
             follower_entered_tx.send(()).unwrap();
-            follower_cache.snapshot("scope".into(), None, || {
+            follower_cache.snapshot(json!("scope"), None, None, || {
                 follower_captures.fetch_add(1, Ordering::Relaxed);
                 Ok(Snapshot {
                     archive: None,
@@ -617,7 +637,7 @@ mod tests {
                 .inflight
                 .lock()
                 .unwrap()
-                .get("scope")
+                .get(&scope(&json!("scope"), None))
                 .cloned()
                 .unwrap();
             if flight.waiters.load(Ordering::Relaxed) > 0 {

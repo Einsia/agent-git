@@ -10,6 +10,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Loading earlier messages of a remote conversation whose saved archive could not
+  be applied no longer fails as an expired history snapshot; the page kept
+  spinning on "Loading the latest conversation" while it retried.
 - A conversation taken over from a registered runtime source keeps the name the
   device shows for it, instead of appearing as an untitled session in its
   project.
