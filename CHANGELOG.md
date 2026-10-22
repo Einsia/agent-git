@@ -10,6 +10,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `agit push` previews session branches with a long plain history instead of failing with
+  "plain preview exceeds its content budget", and prepares them substantially faster. The
+  preview shows each distinct file version once and an append-only file as the bytes it adds.
 - After a macOS restart, `agit rc status`, `agit upgrade` and daemon startup
   recognize the control socket a stopped daemon left behind and reclaim it,
   instead of asking for a manual `agit rc local recover`.

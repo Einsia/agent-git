@@ -11,21 +11,23 @@ pub(super) struct Birth {
 pub(super) struct History {
     pub births: BTreeMap<String, Birth>,
     aliases: BTreeMap<String, String>,
+    /// Metadata of every frozen commit that has readable metadata, read once.
+    metadata: BTreeMap<String, Meta>,
 }
 
 impl History {
     pub fn read(repo: &Repo, plan: &PublicationPlan) -> Result<Self> {
-        let mut parents = BTreeMap::new();
+        let parents = commit_parent_map(repo, plan.commit_objects())?;
         let mut records = BTreeMap::new();
+        let mut cached = BTreeMap::new();
         for oid in plan.commit_objects() {
-            parents.insert(
-                oid.clone(),
-                commit_parents(&read(repo, &["cat-file", "commit", oid], MAX_COMMIT)?)?,
-            );
             // Accepted opaque ancestors need no metadata interpretation; admission validates new objects.
-            if let Ok(metadata) = super::super::super::storage::metadata_local(repo.root(), oid)
-                && metadata.is_session_line()
-            {
+            let Ok(metadata) = super::super::super::storage::metadata_local(repo.root(), oid)
+            else {
+                continue;
+            };
+            cached.insert(oid.clone(), metadata.clone());
+            if metadata.is_session_line() {
                 records.insert(
                     oid.clone(),
                     (
@@ -98,11 +100,23 @@ impl History {
                 }
             }
         }
-        Ok(Self { births, aliases })
+        Ok(Self {
+            births,
+            aliases,
+            metadata: cached,
+        })
+    }
+
+    /// Stored metadata of a frozen commit, without resolving an unclaimed birth's session.
+    pub fn stored(&self, oid: &str) -> Option<&Meta> {
+        self.metadata.get(oid)
     }
 
     pub fn metadata(&self, repo: &Repo, oid: &str) -> Result<Meta> {
-        let mut metadata = super::super::super::storage::metadata_local(repo.root(), oid)?;
+        let mut metadata = match self.metadata.get(oid) {
+            Some(metadata) => metadata.clone(),
+            None => super::super::super::storage::metadata_local(repo.root(), oid)?,
+        };
         if metadata.is_session_line() && metadata.session.is_empty() {
             metadata.session = self
                 .aliases

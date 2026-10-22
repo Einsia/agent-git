@@ -141,6 +141,13 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         ),
     )
     .unwrap();
+    fs::write(
+        source.root().join("README.md"),
+        "Accepted plain file\nAppended plain line\n",
+    )
+    .unwrap();
+    fs::write(source.root().join("first-copy.txt"), "Shared plain text\n").unwrap();
+    fs::write(source.root().join("second-copy.txt"), "Shared plain text\n").unwrap();
     let plain = save(&legacy, "New plain conversation");
     source.git(&["checkout", "-b", "work", &base]).unwrap();
     let mut unclaimed = Meta::new_session_line("claude-code".into(), String::new());
@@ -329,6 +336,27 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         .unwrap();
     assert_eq!(binary["binary_bytes"], b"\0binary bytes".len());
     assert!(binary.get("text").is_none());
+    // An append-only file shows the bytes it adds to its accepted version, and a blob that two
+    // paths introduce is shown once; a preview that dropped either path would hide a publication.
+    let file = |path: &str| files.iter().find(|file| file["path"] == path).unwrap();
+    assert_eq!(file("README.md")["text"], "Appended plain line\n");
+    assert!(file("README.md")["appended_to"].is_string());
+    let copies = [file("first-copy.txt"), file("second-copy.txt")];
+    assert_eq!(copies[0]["blob"], copies[1]["blob"]);
+    assert_eq!(
+        copies
+            .iter()
+            .filter(|file| file["text"] == "Shared plain text\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        copies
+            .iter()
+            .filter(|file| file["repeated"] == true)
+            .count(),
+        1
+    );
     assert!(
         !preview
             .to_string()

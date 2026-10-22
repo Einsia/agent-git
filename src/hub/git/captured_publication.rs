@@ -30,17 +30,23 @@ struct AdvertisedBaseline {
 
 impl GitContent {
     pub(super) fn capture(source: &Source, plan: &PublicationPlan) -> Result<Self> {
-        Self::capture_for(source, plan, None)
+        Self::capture_for(source, plan, None, None)
     }
 
+    /// An advertisement already read for the same destination can serve as the baseline.
     fn capture_for(
         source: &Source,
         plan: &PublicationPlan,
         target: Option<(&str, &RemoteIdentity)>,
+        advertised: Option<crate::hub::git::RemoteRefs>,
     ) -> Result<Self> {
         let advertised = target.and_then(|(url, identity)| {
-            let refs =
-                FrozenPublication::advertised_refs_for(&Repo::at(&source.root), url, identity)?;
+            let refs = match advertised {
+                Some(refs) => refs,
+                None => {
+                    FrozenPublication::advertised_refs_for(&Repo::at(&source.root), url, identity)?
+                }
+            };
             Some(AdvertisedBaseline {
                 url: url.into(),
                 identity: identity.clone(),
@@ -185,7 +191,7 @@ impl CapturedPublication {
         byte_budget: u64,
         policy_repo: &Repo,
     ) -> Result<Self> {
-        Self::capture_projected_for(projected, byte_budget, policy_repo, None)
+        Self::capture_projected_for(projected, byte_budget, policy_repo, None, None)
     }
 
     pub fn capture_projected_for(
@@ -193,9 +199,10 @@ impl CapturedPublication {
         byte_budget: u64,
         policy_repo: &Repo,
         target: Option<(&str, &RemoteIdentity)>,
+        advertised: Option<crate::hub::git::RemoteRefs>,
     ) -> Result<Self> {
         let source = Source::new(projected.repo())?;
-        let mut git = GitContent::capture_for(&source, projected.plan(), target)?;
+        let mut git = GitContent::capture_for(&source, projected.plan(), target, advertised)?;
         git.lfs_objects = super::lfs_cache::capture(&Source::new(policy_repo)?);
         Self::stage(
             policy_repo,
@@ -241,7 +248,7 @@ impl CapturedPublication {
         target: Option<(&str, &RemoteIdentity)>,
     ) -> Result<Self> {
         let source = Source::new(repo)?;
-        let git = GitContent::capture_for(&source, plan, target)?;
+        let git = GitContent::capture_for(&source, plan, target, None)?;
         Self::stage(repo, plan, byte_budget, recover_missing, source, git)
     }
 

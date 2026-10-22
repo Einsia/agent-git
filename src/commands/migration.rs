@@ -713,28 +713,52 @@ fn check_readonly_repo_startup_with_policy(
             "the selected repository has pending recovery; complete recovery through the original AgentGit store before inspecting it"
         );
     }
-    for root in canonical_roots {
-        let checkout = if repo.is_local_inspection() {
-            Repo::at(&root).local_objects_only()
+    // A probe touches only its own checkout, so a bounded set runs at once; failures are
+    // reported in root order.
+    let local = repo.is_local_inspection();
+    let pending = |root: &PathBuf| -> Result<bool> {
+        let checkout = if local {
+            Repo::at(root).local_objects_only()
         } else {
-            Repo::at(&root)
+            Repo::at(root)
         };
-        let pending =
+        Ok(
             super::plumbing::interrupted_checkout_metadata_with_policy(&checkout, policy)?
                 || probe_legacy_storage_checkout_recovery_with_policy(
                     &checkout,
                     MigrationFailureKind::Skippable,
                     policy,
                 )
-                .map_err(RepoMigrationFailure::into_error)?;
-        anyhow::ensure!(
-            !pending,
-            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting it",
-            root.display()
-        );
+                .map_err(RepoMigrationFailure::into_error)?,
+        )
+    };
+    for group in canonical_roots.chunks(STARTUP_CHECKOUT_WORKERS) {
+        let results = std::thread::scope(|scope| {
+            let workers = group
+                .iter()
+                .map(|root| scope.spawn(move || pending(root)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("checkout inspection panicked")))
+                })
+                .collect::<Vec<_>>()
+        });
+        for (root, result) in group.iter().zip(results) {
+            anyhow::ensure!(
+                !result?,
+                "{} has pending recovery; complete recovery through the original AgentGit store before inspecting it",
+                root.display()
+            );
+        }
     }
     Ok(())
 }
+
+const STARTUP_CHECKOUT_WORKERS: usize = 8;
 
 fn recovery_evidence_repo(path: &Path) -> Result<PathBuf> {
     const MAX_RECOVERY_PATH_BYTES: u64 = 64 * 1024;

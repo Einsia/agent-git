@@ -107,7 +107,11 @@ ask. Noninteractive creation defaults to private. Existing repository visibility
 ## Review and publication
 
 The preview identifies the account, Hub, immutable destination, audience, registered modes and
-selected refs. Stored preview JSON contains public snapshots and plain file content. Encrypted
+selected refs. Stored preview JSON contains public snapshots and plain file content; each plain
+snapshot contributes the files it introduces relative to its parents. A blob appears with its
+content once; a later entry carrying it is marked `repeated`. A file that only appends to its first
+parent's version shows the appended bytes under `appended_to`, and an object above the per-object
+limit is listed with `omitted_bytes` after its payload is verified. Encrypted
 snapshots exclude independent repository files and attachment bodies. Complete original LOG and
 VIEW records remain encrypted; reading them requires exact-snapshot account authorization.
 

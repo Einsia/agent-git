@@ -25,6 +25,20 @@ pub(super) fn run(
         !automatic || repo.auto_push_enabled()?,
         "automatic publication is disabled for this repository"
     );
+    // Starting the local privacy worker overlaps its startup with the destination checks. It is
+    // joined before preparation, so the preparation's own branch-name check never contends for it.
+    let warmed = {
+        let (root, names) = (repo.root().to_path_buf(), branches.to_vec());
+        std::thread::spawn(move || {
+            if let Ok(redactor) = crate::domain::redact::Redactor::try_this_machine()
+                .and_then(|redactor| redactor.with_repository(&root))
+            {
+                for name in &names {
+                    let _ = redactor.try_scrub(name);
+                }
+            }
+        })
+    };
     intent.verify_account(&client)?;
     intent.verify_before_mutation(&client, &repo)?;
     let original = PublicationPlan::freeze(&repo, branches)?;
@@ -95,15 +109,19 @@ pub(super) fn run(
                 .map(str::to_owned)
         })
         .collect::<Result<Vec<_>>>()?;
+    let remote =
+        crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
+            .context("cannot establish accepted publication history")?;
     let selected = SessionPublicationPlan::resolve(
         &repo,
         &selected_branches,
         &client,
         &repository,
         identity.clone(),
-        &intent.url,
+        remote,
         !args.dry_run,
     )?;
+    let _ = warmed.join();
     let mut projected =
         ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])?;
     let receipts = projected.session_receipts(&repository, &identity, &intent.url)?;
@@ -138,6 +156,10 @@ pub(super) fn run(
         baseline
             .as_ref()
             .map(|identity| (intent.url.as_str(), identity)),
+        baseline
+            .as_ref()
+            .filter(|identity| **identity == selected.identity)
+            .map(|_| selected.remote.clone()),
     )?;
     let inspected = captured.inspect(limits);
     spinner.finish_and_clear();

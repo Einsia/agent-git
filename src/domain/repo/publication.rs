@@ -305,6 +305,87 @@ struct Reader {
     prefix: Vec<String>,
     bytes: usize,
     reads: usize,
+    objects: Option<ObjectPipe>,
+}
+
+/// One `cat-file --batch` process answers object reads strictly in request order. Each request
+/// is written only after the previous answer has been consumed, so neither pipe can fill while
+/// the other side waits. Any error leaves the stream position unknown and discards the process.
+struct ObjectPipe {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl ObjectPipe {
+    fn start(repo: &Repo, prefix: &[String]) -> Result<Self> {
+        let mut args: Vec<&str> = prefix.iter().map(String::as_str).collect();
+        args.extend(["cat-file", "--batch"]);
+        let mut child = repo
+            .inspection_command(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("audit publication data is unavailable locally")?;
+        let input = child.stdin.take().context("git cat-file has no stdin")?;
+        let output = child.stdout.take().context("git cat-file has no stdout")?;
+        Ok(Self {
+            child,
+            input,
+            output: std::io::BufReader::new(output),
+        })
+    }
+
+    /// The object's type and size; the caller must consume the body with `body` or `skip`.
+    fn request(&mut self, oid: &str) -> Result<(String, usize)> {
+        use std::io::{BufRead, Write};
+        writeln!(self.input, "{oid}")?;
+        self.input.flush()?;
+        let mut line = String::new();
+        self.output.read_line(&mut line)?;
+        let fields = line
+            .strip_suffix('\n')
+            .context("audit publication data is unavailable locally")?
+            .split(' ')
+            .collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 3 && fields[0] == oid,
+            "audit publication data is unavailable locally"
+        );
+        Ok((fields[1].to_owned(), fields[2].parse()?))
+    }
+
+    fn body(&mut self, size: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut body = vec![0; size + 1];
+        self.output.read_exact(&mut body)?;
+        ensure!(
+            body.pop() == Some(b'\n'),
+            "audit publication object stream is malformed"
+        );
+        Ok(body)
+    }
+
+    fn skip(&mut self, size: usize) -> Result<()> {
+        use std::io::Read;
+        let skipped = std::io::copy(
+            &mut (&mut self.output).take(size as u64 + 1),
+            &mut std::io::sink(),
+        )?;
+        ensure!(
+            skipped == size as u64 + 1,
+            "audit publication object stream is malformed"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ObjectPipe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Reader {
@@ -321,7 +402,48 @@ impl Reader {
             ],
             bytes: 0,
             reads: 0,
+            objects: None,
         }
+    }
+
+    /// Requests one object from the shared batch process, counted against the read budget.
+    fn request(&mut self, oid: &str) -> Result<(String, usize)> {
+        ensure!(
+            self.reads < MAX_READS,
+            "audit publication read limit exceeded"
+        );
+        self.reads += 1;
+        if self.objects.is_none() {
+            self.objects = Some(ObjectPipe::start(&self.repo, &self.prefix)?);
+        }
+        let result = self.objects.as_mut().expect("started above").request(oid);
+        if result.is_err() {
+            self.objects = None;
+        }
+        result
+    }
+
+    fn pipe(&mut self) -> &mut ObjectPipe {
+        self.objects.as_mut().expect("a request precedes its body")
+    }
+
+    /// Consumes a requested body; an error discards the process with its stream position.
+    fn finish<T>(&mut self, read: impl FnOnce(&mut ObjectPipe) -> Result<T>) -> Result<T> {
+        let result = read(self.pipe());
+        if result.is_err() {
+            self.objects = None;
+        }
+        result
+    }
+
+    /// Drops a requested body that is not needed. A body above the object limit is not read
+    /// through: the process is discarded instead and the next request starts another.
+    fn discard(&mut self, size: usize) -> Result<()> {
+        if size > MAX_OBJECT_BYTES {
+            self.objects = None;
+            return Ok(());
+        }
+        self.finish(|pipe| pipe.skip(size))
     }
 
     fn ancestry(&mut self, mut pending: Vec<String>) -> Result<BTreeSet<String>> {
@@ -401,17 +523,18 @@ impl Reader {
         let remaining = MAX_METADATA_BYTES
             .checked_sub(self.bytes)
             .context("audit publication metadata limit exceeded")?;
-        let body = self.read(&["cat-file", kind, oid], remaining.min(MAX_OBJECT_BYTES))?;
+        let (actual, size) = self.request(oid)?;
+        if actual != kind || size > remaining.min(MAX_OBJECT_BYTES) {
+            self.discard(size)?;
+            ensure!(
+                actual == kind,
+                "audit publication data is unavailable locally"
+            );
+            anyhow::bail!("audit publication object exceeds its read limit");
+        }
+        let body = self.finish(|pipe| pipe.body(size))?;
         self.bytes += body.len();
-        let actual = match oid.len() {
-            40 => digest::<sha1::Sha1>(kind, &body),
-            64 => digest::<sha2::Sha256>(kind, &body),
-            _ => unreachable!("object id length is validated before reading"),
-        };
-        ensure!(
-            actual == oid,
-            "audit publication object does not match its id"
-        );
+        verify_identity(oid, kind, &body)?;
         Ok(body)
     }
 
@@ -424,15 +547,27 @@ impl Reader {
                 seen.insert(current.clone()),
                 "audit tag chain repeats an object"
             );
-            let kind = self.read(&["cat-file", "-t", &current], 32)?;
-            match kind.as_slice() {
-                b"commit\n" => return Ok(Some((current, objects))),
-                b"tag\n" => {
-                    let body = self.object(&current, "tag")?;
-                    objects.push(current);
-                    current = tag_target(&body)?;
+            let (kind, size) = self.request(&current)?;
+            if kind == "tag" {
+                // The batch answer already carries the body that `object` would request again.
+                let remaining = MAX_METADATA_BYTES
+                    .checked_sub(self.bytes)
+                    .context("audit publication metadata limit exceeded")?;
+                if size > remaining.min(MAX_OBJECT_BYTES) {
+                    self.discard(size)?;
+                    anyhow::bail!("audit publication object exceeds its read limit");
                 }
-                b"tree\n" | b"blob\n" => return Ok(None),
+                let body = self.finish(|pipe| pipe.body(size))?;
+                self.bytes += body.len();
+                verify_identity(&current, "tag", &body)?;
+                objects.push(current);
+                current = tag_target(&body)?;
+                continue;
+            }
+            self.discard(size)?;
+            match kind.as_str() {
+                "commit" => return Ok(Some((current, objects))),
+                "tree" | "blob" => return Ok(None),
                 _ => anyhow::bail!("audit tag target has an unsupported object type"),
             }
         }
@@ -445,6 +580,19 @@ fn valid_oid(oid: &str) -> bool {
         && oid
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn verify_identity(oid: &str, kind: &str, body: &[u8]) -> Result<()> {
+    let actual = match oid.len() {
+        40 => digest::<sha1::Sha1>(kind, body),
+        64 => digest::<sha2::Sha256>(kind, body),
+        _ => anyhow::bail!("audit publication object id is malformed"),
+    };
+    ensure!(
+        actual == oid,
+        "audit publication object does not match its id"
+    );
+    Ok(())
 }
 
 fn digest<D: Digest>(kind: &str, body: &[u8]) -> String {

@@ -39,6 +39,29 @@ impl Snapshot {
         Ok((id, size))
     }
 
+    /// The blob each event path names, without reading the blobs.
+    pub(super) fn event_blob_ids(&self, ids: &[&str]) -> Result<Vec<String>> {
+        let tree = self.objects.find_tree(self.tree)?;
+        ids.iter()
+            .map(|id| {
+                let path = meta::event_path(id)?;
+                let entry = tree
+                    .lookup_entry(path.split('/'))?
+                    .with_context(|| format!("event {id} is missing at {path}"))?;
+                anyhow::ensure!(entry.mode().is_blob(), "event {id} at {path} is not a blob");
+                Ok(entry.object_id().to_string())
+            })
+            .collect()
+    }
+
+    pub(super) fn blob_size(&self, id: &str) -> Result<usize> {
+        let header = self
+            .objects
+            .find_header(gix::ObjectId::from_hex(id.as_bytes())?)?;
+        anyhow::ensure!(header.kind() == gix::objs::Kind::Blob, "{id} is not a blob");
+        usize::try_from(header.size()).context("snapshot object size overflow")
+    }
+
     pub(super) fn blob(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
         let (id, size) = self.blob_header(path)?;
         if size > limit {

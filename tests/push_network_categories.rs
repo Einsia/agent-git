@@ -526,7 +526,7 @@ fn dry_run_reads_registered_history_without_pinning_or_publishing() {
                 "GET /alice/qa.git/info/refs?service=git-receive-pack",
                 Reply::Status(200),
             ),
-            Step::inspection_refs("alice/qa", AGENT_ID),
+            // One advertisement establishes accepted history and the inspection baseline.
             Step::inspection_refs("alice/qa", AGENT_ID),
         ],
     );
@@ -845,7 +845,6 @@ fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
                 "GET /alice/qa.git/info/refs?service=git-receive-pack",
                 Reply::Status(200),
             ),
-            Step::inspection_refs("alice/qa", AGENT_ID),
             Step::inspection_refs("alice/qa", AGENT_ID),
         ],
     );

@@ -28,7 +28,7 @@ impl SessionPublicationPlan {
         client: &crate::hub::Client,
         repository: &str,
         identity: RemoteIdentity,
-        url: &str,
+        remote: RemoteRefs,
         register: bool,
     ) -> Result<Self> {
         ensure!(
@@ -37,11 +37,9 @@ impl SessionPublicationPlan {
         );
         let plan = PublicationPlan::freeze_selected(source, branches)?;
         let history = sources::History::read(source, &plan)?;
-        let remote =
-            crate::hub::git::FrozenPublication::advertised_refs_for(source, url, &identity)
-                .context("cannot establish accepted publication history")?;
         let ledger = accepted::Ledger::open(source, &identity)?;
         let accepted = plan.accepted_commits(source, &remote.heads)?;
+        let enveloped = enveloped_commits(source, plan.commit_objects())?;
         let mut sessions = BTreeSet::new();
         for oid in plan.commit_objects() {
             let mut inherited = false;
@@ -53,7 +51,7 @@ impl SessionPublicationPlan {
             }
             let metadata = history.metadata(source, oid)?;
             ensure!(
-                source.show_result(oid, "privacy/envelope.json")?.is_none(),
+                !enveloped.contains(oid),
                 "unaccepted ciphertext requires its original publication authority"
             );
             if metadata.is_session_line() {
@@ -214,11 +212,8 @@ impl ProjectedHistory {
         }
         let mut ledger = accepted::Ledger::open(&source, identity)?;
         ledger.reconcile(&selected.remote)?;
-        let mut parents = BTreeMap::new();
-        for oid in source_plan.commit_objects() {
-            let bytes = read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?;
-            parents.insert(oid.clone(), commit_parents(&bytes)?);
-        }
+        let parents = commit_parent_map(&source, source_plan.commit_objects())?;
+        let enveloped = enveloped_commits(&source, source_plan.commit_objects())?;
         let order = parent_first(&parents)?;
         let source_sessions = sources::History::read(&source, &source_plan)?;
         let accepted = source_plan.accepted_commits(&source, &selected.remote.heads)?;
@@ -227,6 +222,7 @@ impl ProjectedHistory {
         let mut snapshots = BTreeMap::new();
         let mut preserved = BTreeSet::new();
         let mut reports = Vec::new();
+        let mut imports = crate::commands::plumbing::CommitImports::default();
         #[cfg(test)]
         let mut preparations = 0;
         PathAliasStore::transact(&source, |aliases| {
@@ -304,10 +300,14 @@ impl ProjectedHistory {
                             public_parents == parents[oid],
                             "accepted history cannot change parents"
                         );
-                        crate::commands::plumbing::import_commit_graph(&repo, &source, oid)?;
-                        retain_session_mapping(&repo, oid, identity, &mut cache)?;
-                        let session = super::super::storage::metadata_local(source.root(), oid)
-                            .map(|metadata| metadata.session)
+                        imports.add(oid, &parents[oid]);
+                        if enveloped.contains(oid) {
+                            // Accepted objects keep their IDs, so the source holds the same bytes.
+                            retain_session_mapping(&source, oid, identity, &mut cache)?;
+                        }
+                        let session = source_sessions
+                            .stored(oid)
+                            .map(|metadata| metadata.session.clone())
                             .unwrap_or_default();
                         preserved.insert(oid.clone());
                         mapped.insert(
@@ -342,10 +342,10 @@ impl ProjectedHistory {
                             "plain publication cannot expose unaccepted original ancestry from an encrypted session"
                         );
                         ensure!(
-                            source.show_result(oid, "privacy/envelope.json")?.is_none(),
+                            !enveloped.contains(oid),
                             "encrypted or obsolete ciphertext cannot be admitted as plaintext"
                         );
-                        crate::commands::plumbing::import_commit_graph(&repo, &source, oid)?;
+                        imports.add(oid, &parents[oid]);
                         let snapshot = match config {
                             None => PublishedSnapshot::FileLine {
                                 commit: oid.clone(),
@@ -376,7 +376,7 @@ impl ProjectedHistory {
                     let response = config.expect("encrypted session configuration");
                     let config = &response.config;
                     ensure!(
-                        source.show_result(oid, "privacy/envelope.json")?.is_none(),
+                        !enveloped.contains(oid),
                         "unaccepted ciphertext requires its original publication authority"
                     );
                     let limit = super::super::privacy_publication::MAX_INPUT_BYTES;
@@ -523,6 +523,7 @@ impl ProjectedHistory {
             }
             Ok(())
         })?;
+        imports.finish(&repo, &source)?;
         retain_tags(&source, &source_plan, &repo, &candidates, &mut references)?;
         // A previously accepted alias wins when the same public object is reached on another branch.
         snapshots.retain(|commit, _| !preserved.contains(commit));
@@ -574,6 +575,203 @@ impl ProjectedHistory {
             _lock: lock,
         })
     }
+}
+
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+/// A blob a published commit introduces at a path.
+struct Introduced {
+    commit: String,
+    path: String,
+    blob: String,
+    /// The blob the first parent holds at the same path, when that is a file.
+    previous: Option<String>,
+}
+
+impl Introduced {
+    fn preview(&self) -> serde_json::Value {
+        json!({"commit":self.commit,"path":self.path,"blob":self.blob})
+    }
+}
+
+/// Every introduced entry is emitted in order; one whose blob was read earlier is a repeat.
+struct PreviewOrder<'a> {
+    introduced: &'a [Introduced],
+    next: usize,
+}
+
+impl PreviewOrder<'_> {
+    fn repeat_until(
+        &mut self,
+        end: usize,
+        emit: &mut impl FnMut(serde_json::Value) -> Result<()>,
+    ) -> Result<()> {
+        while self.next < end {
+            let mut value = self.introduced[self.next].preview();
+            value["repeated"] = json!(true);
+            emit(value)?;
+            self.next += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Text is shown as text; anything else by its length.
+fn describe(value: &mut serde_json::Value, bytes: &[u8]) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => value["text"] = json!(text),
+        _ => value["binary_bytes"] = json!(bytes.len()),
+    }
+}
+
+/// The entries each commit introduces. A path counts only when its blob differs from the same
+/// path in every parent, so content a parent already carries is not reviewed again; a root
+/// commit introduces its whole tree. Commits keep the caller's order.
+fn introduced_blobs(repo: &Repo, commits: &[&str]) -> Result<Vec<Introduced>> {
+    let Some(first) = commits.first() else {
+        return Ok(Vec::new());
+    };
+    let empty = if first.len() == 64 {
+        EMPTY_TREE_SHA256
+    } else {
+        EMPTY_TREE_SHA1
+    };
+    let mut trees = BTreeMap::new();
+    let mut parents = BTreeMap::new();
+    read_commit_trees(
+        repo,
+        commits.iter().map(|oid| (*oid).to_owned()).collect(),
+        &mut trees,
+        &mut parents,
+    )?;
+    let outside = parents
+        .values()
+        .flatten()
+        .filter(|oid| !trees.contains_key(*oid))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    read_commit_trees(
+        repo,
+        outside.into_iter().collect(),
+        &mut trees,
+        &mut BTreeMap::new(),
+    )?;
+    type Changes = BTreeMap<String, (String, Option<String>)>;
+    let mut pairs = BTreeMap::<(String, String), Changes>::new();
+    for commit in commits {
+        let tree = &trees[*commit];
+        if parents[*commit].is_empty() {
+            pairs.insert((empty.to_owned(), tree.clone()), BTreeMap::new());
+        }
+        for parent in &parents[*commit] {
+            pairs.insert((trees[parent].clone(), tree.clone()), BTreeMap::new());
+        }
+    }
+    let mut input = tempfile::tempfile()?;
+    for (old, new) in pairs.keys() {
+        writeln!(input, "{old} {new}")?;
+    }
+    input.rewind()?;
+    // Tree-pair headers end with LF even under -z and precede every pair, including an empty
+    // diff; each raw record is followed by its NUL-terminated path.
+    let mut current = None;
+    let mut pending = None;
+    repo.git_stream_split_stdin_file(
+        &["diff-tree", "--stdin", "-r", "-z", "--no-renames", "--raw"],
+        input,
+        0,
+        |token| {
+            if let Some(blob) = pending.take() {
+                let path = std::str::from_utf8(token)
+                    .context("plain preview requires UTF-8 paths")?
+                    .to_owned();
+                if let Some(blob) = blob {
+                    pairs
+                        .get_mut(current.as_ref().context("diff record has no tree pair")?)
+                        .context("diff record names an unrequested tree pair")?
+                        .insert(path, blob);
+                }
+                return Ok(());
+            }
+            let text = std::str::from_utf8(token).context("invalid plain preview diff")?;
+            let mut lines = text.split('\n').peekable();
+            while let Some(line) = lines.next() {
+                if lines.peek().is_some() {
+                    let (old, new) = line.split_once(' ').context("invalid diff tree pair")?;
+                    current = Some((old.to_owned(), new.to_owned()));
+                } else if let Some(record) = line.strip_prefix(':') {
+                    let fields = record.split(' ').collect::<Vec<_>>();
+                    ensure!(fields.len() == 5, "invalid plain preview diff record");
+                    let file = |mode: &str| matches!(mode, "100644" | "100755" | "120000");
+                    let blob = file(fields[1]).then(|| {
+                        (
+                            fields[3].to_owned(),
+                            file(fields[0]).then(|| fields[2].to_owned()),
+                        )
+                    });
+                    pending = Some(blob);
+                } else {
+                    ensure!(line.is_empty(), "invalid plain preview diff output");
+                }
+            }
+            Ok(())
+        },
+    )?;
+    ensure!(pending.is_none(), "plain preview diff is truncated");
+    let mut introduced = Vec::new();
+    for commit in commits {
+        let tree = &trees[*commit];
+        let compared = if parents[*commit].is_empty() {
+            vec![&pairs[&(empty.to_owned(), tree.clone())]]
+        } else {
+            parents[*commit]
+                .iter()
+                .map(|parent| &pairs[&(trees[parent].clone(), tree.clone())])
+                .collect()
+        };
+        for (path, (blob, previous)) in compared[0] {
+            if compared[1..]
+                .iter()
+                .all(|other| other.get(path).is_some_and(|(other, _)| other == blob))
+            {
+                introduced.push(Introduced {
+                    commit: (*commit).to_owned(),
+                    path: path.clone(),
+                    blob: blob.clone(),
+                    previous: previous.clone(),
+                });
+            }
+        }
+    }
+    Ok(introduced)
+}
+
+fn read_commit_trees(
+    repo: &Repo,
+    commits: Vec<String>,
+    trees: &mut BTreeMap<String, String>,
+    parents: &mut BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    repo.git_cat_file_batch_with_policy(
+        commits,
+        MAX_COMMIT,
+        crate::domain::repo::ReadPolicy::LocalOnly,
+        |oid, kind, body| {
+            let crate::domain::repo::ObjectBody::Read(bytes) = body else {
+                anyhow::bail!("plain preview commit exceeds its size limit");
+            };
+            ensure!(kind == "commit", "plain preview commit is unavailable");
+            let tree = std::str::from_utf8(bytes)?
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("tree "))
+                .context("plain preview commit has no tree")?;
+            trees.insert(oid.to_owned(), tree.to_owned());
+            parents.insert(oid.to_owned(), commit_parents(bytes)?);
+            Ok(())
+        },
+    )
 }
 
 fn retain_tags(
@@ -744,78 +942,122 @@ impl ProjectedHistory {
         Ok(receipts)
     }
 
-    /// Plain file review reads captured payloads; a live LFS cache cannot change the reviewed bytes.
+    /// Plain file review covers the blobs each snapshot introduces relative to its parents and
+    /// reads captured payloads, so a live LFS cache cannot change the reviewed bytes.
+    ///
+    /// Entries are emitted in publication order while at most two object bodies are held, so the
+    /// review of a long history costs disk, not memory. A blob is shown once and later entries
+    /// that carry it are marked `repeated`. A file that grows by appending to the blob its first
+    /// parent holds at the same path shows only the appended bytes, under `appended_to`. An
+    /// object over the per-object limit is still verified but shown by its size alone.
     pub(crate) fn plain_file_preview(
         &self,
         captured: &crate::hub::git::CapturedPublication,
-    ) -> Result<Vec<serde_json::Value>> {
+        mut emit: impl FnMut(serde_json::Value) -> Result<()>,
+    ) -> Result<()> {
+        use crate::domain::repo::{ObjectBody, ReadPolicy};
         use std::io::Read;
+        const OBJECT_LIMIT: usize = super::super::privacy_publication::MAX_INPUT_BYTES;
+        enum Step {
+            Previous,
+            Entry(usize),
+        }
         ensure!(
             captured.plan() == &self.plan,
             "preview capture differs from its publication plan"
         );
-        let manifest = &self.session_manifest;
-        let mut budget = super::super::privacy_publication::MAX_INPUT_BYTES;
-        let mut files = Vec::new();
-        for entry in &manifest.snapshots {
-            if matches!(entry, PublishedSnapshot::SessionOwnerV2 { .. }) {
+        let commits = self
+            .session_manifest
+            .snapshots
+            .iter()
+            .filter(|entry| !matches!(entry, PublishedSnapshot::SessionOwnerV2 { .. }))
+            .map(PublishedSnapshot::commit)
+            .collect::<Vec<_>>();
+        let introduced = introduced_blobs(&self.repo, &commits)?;
+        let mut seen = BTreeSet::new();
+        let mut reads = Vec::new();
+        let mut steps = Vec::new();
+        for (index, entry) in introduced.iter().enumerate() {
+            if !seen.insert(entry.blob.as_str()) {
                 continue;
             }
-            let commit = entry.commit();
-            let tree = self
-                .repo
-                .git_bytes_result(&["ls-tree", "-r", "-l", "-z", commit])?;
-            for entry in tree
-                .split(|byte| *byte == 0)
-                .filter(|entry| !entry.is_empty())
-            {
-                let entry =
-                    std::str::from_utf8(entry).context("plain preview requires UTF-8 paths")?;
-                let (header, path) = entry
-                    .split_once('\t')
-                    .context("invalid plain preview tree")?;
-                let parts = header.split_whitespace().collect::<Vec<_>>();
-                ensure!(parts.len() == 4, "invalid plain preview tree entry");
-                if parts[1] != "blob" {
-                    continue;
-                }
-                let size: usize = parts[3].parse()?;
-                budget = budget
-                    .checked_sub(size)
-                    .context("plain preview exceeds its content budget")?;
-                let mut bytes = read(&self.repo, &["cat-file", "blob", parts[2]], size)?;
-                ensure!(bytes.len() == size, "plain preview object changed size");
-                let mut value = json!({"commit":commit,"path":path});
-                if let Some(pointer) = super::super::lfs::Pointer::parse(&bytes)? {
+            if let Some(previous) = &entry.previous {
+                reads.push(previous.clone());
+                steps.push(Step::Previous);
+            }
+            reads.push(entry.blob.clone());
+            steps.push(Step::Entry(index));
+        }
+        let mut order = PreviewOrder {
+            introduced: &introduced,
+            next: 0,
+        };
+        let mut steps = steps.into_iter();
+        let mut previous: Option<Vec<u8>> = None;
+        self.repo.git_cat_file_batch_with_policy(
+            reads,
+            OBJECT_LIMIT,
+            ReadPolicy::LocalOnly,
+            |_, kind, body| {
+                ensure!(kind == "blob", "plain preview object is unavailable");
+                let index = match steps.next().context("plain preview read is unrequested")? {
+                    Step::Previous => {
+                        previous = match body {
+                            ObjectBody::Read(bytes) => Some(bytes.to_vec()),
+                            ObjectBody::TooLarge(_) => None,
+                        };
+                        return Ok(());
+                    }
+                    Step::Entry(index) => index,
+                };
+                order.repeat_until(index, &mut emit)?;
+                let entry = &introduced[index];
+                let base = previous.take();
+                let mut value = entry.preview();
+                let bytes = match body {
+                    ObjectBody::TooLarge(size) => {
+                        value["omitted_bytes"] = json!(size);
+                        order.next = index + 1;
+                        return emit(value);
+                    }
+                    ObjectBody::Read(bytes) => bytes,
+                };
+                if let Some(pointer) = super::super::lfs::Pointer::parse(bytes)? {
                     value["lfs"] = serde_json::to_value(&pointer)?;
-                    if captured.preserves_object(parts[2])
+                    if captured.preserves_object(&entry.blob)
                         && !captured.pointers().contains(&pointer)
                     {
                         value["preserved"] = json!(true);
-                        files.push(value);
-                        continue;
+                    } else if pointer.size > OBJECT_LIMIT as u64 {
+                        pointer.verify(captured.open_payload(&pointer)?)?;
+                        value["omitted_bytes"] = json!(pointer.size);
+                    } else {
+                        let mut payload = Vec::new();
+                        captured.open_payload(&pointer)?.read_to_end(&mut payload)?;
+                        pointer.verify(payload.as_slice())?;
+                        describe(&mut value, &payload);
                     }
-                    let size =
-                        usize::try_from(pointer.size).context("plain LFS preview size overflow")?;
-                    budget = budget
-                        .checked_sub(size)
-                        .context("plain preview exceeds its content budget")?;
-                    bytes.clear();
-                    captured.open_payload(&pointer)?.read_to_end(&mut bytes)?;
-                    pointer.verify(bytes.as_slice())?;
+                } else if let Some(base) =
+                    base.filter(|base| !base.is_empty() && bytes.starts_with(base))
+                {
+                    value["appended_to"] = json!(entry.previous);
+                    describe(&mut value, &bytes[base.len()..]);
+                } else {
+                    describe(&mut value, bytes);
                 }
-                match std::str::from_utf8(&bytes) {
-                    Ok(text) if !text.contains('\0') => value["text"] = json!(text),
-                    _ => value["binary_bytes"] = json!(bytes.len()),
-                }
-                files.push(value);
-            }
-        }
-        Ok(files)
+                order.next = index + 1;
+                emit(value)
+            },
+        )?;
+        ensure!(steps.next().is_none(), "plain preview read is truncated");
+        order.repeat_until(introduced.len(), &mut emit)
     }
 
+    /// Plain snapshots report their metadata and sequence lengths; their content is reviewed as the
+    /// files each one introduces, and every distinct event is validated against its ID once.
     pub(crate) fn session_preview(&self) -> Result<Vec<serde_json::Value>> {
         let manifest = &self.session_manifest;
+        let mut validator = super::super::storage::SnapshotValidator::default();
         let mut snapshots = Vec::new();
         for entry in &manifest.snapshots {
             let commit = entry.commit();
@@ -842,9 +1084,23 @@ impl ProjectedHistory {
                     envelope.public_projection
                 }
                 PublishedSnapshot::Plain { .. } => {
-                    let (metadata, log, view) =
-                        super::super::privacy_publication::read_snapshot(&self.repo, commit)?;
-                    json!({"metadata":metadata,"session":{"log":log,"view":view}})
+                    let metadata = super::super::storage::metadata_local(self.repo.root(), commit)?;
+                    ensure!(
+                        metadata.is_session_line(),
+                        "privacy publication requires a session snapshot"
+                    );
+                    let (log, view) = match metadata.layout {
+                        meta::LayoutVersion::V0 => {
+                            let (_, log, view) = super::super::privacy_publication::read_snapshot(
+                                &self.repo, commit,
+                            )?;
+                            (log.lines().count(), view.lines().count())
+                        }
+                        meta::LayoutVersion::V1 => {
+                            validator.validate_local(self.repo.root(), commit)?
+                        }
+                    };
+                    json!({"metadata":metadata,"session":{"log_events":log,"view_events":view}})
                 }
                 PublishedSnapshot::FileLine { .. } => {
                     json!({"metadata": super::super::storage::metadata_local(self.repo.root(), commit)?})
@@ -861,5 +1117,78 @@ impl ProjectedHistory {
             snapshots.push(json!({"commit":commit,"preserved":true}));
         }
         Ok(snapshots)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A root introduces its tree and a merge introduces only paths whose blob differs from every
+    /// parent; a union over parents would review again what one parent already carries.
+    #[test]
+    fn merge_introduces_only_paths_that_differ_from_every_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let commit = |path: &str, text: &str, message: &str| {
+            std::fs::write(root.join(path), text).unwrap();
+            git(root, &["add", path]);
+            git(root, &["commit", "-q", "-m", message]);
+            git(root, &["rev-parse", "HEAD"])
+        };
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "base").unwrap();
+        git(root, &["add", "a.txt"]);
+        let base = commit("b.txt", "base", "base");
+        let left = commit("a.txt", "left", "left");
+        git(root, &["checkout", "-q", "-b", "side", &base]);
+        let side = commit("b.txt", "side", "side");
+        git(root, &["checkout", "-q", &left]);
+        git(root, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+        let merge = commit("c.txt", "merge", "merge");
+
+        let repo = Repo::at(root).local_objects_only();
+        let introduced = introduced_blobs(&repo, &[&base, &left, &side, &merge]).unwrap();
+        let named = introduced
+            .iter()
+            .map(|entry| (entry.commit.as_str(), entry.path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            [
+                (base.as_str(), "a.txt"),
+                (base.as_str(), "b.txt"),
+                (left.as_str(), "a.txt"),
+                (side.as_str(), "b.txt"),
+                (merge.as_str(), "c.txt"),
+            ]
+        );
     }
 }

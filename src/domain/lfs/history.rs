@@ -122,6 +122,10 @@ pub(crate) fn for_inspection(
     )
 }
 
+/// Each group of candidate small blobs costs one batch process; the group size bounds only how
+/// many object IDs are held at once.
+const POINTER_BATCH: usize = 65_536;
+
 fn read_pointers(
     repo: &Repo,
     args: &[&str],
@@ -183,7 +187,7 @@ fn read_pointers_excluding(
             return Ok(());
         }
         batch.push(oid.to_owned());
-        if batch.len() == 256 {
+        if batch.len() == POINTER_BATCH {
             read(&mut batch, &mut pointers)?;
         }
         Ok(())

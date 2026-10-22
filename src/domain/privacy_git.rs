@@ -96,8 +96,12 @@ impl ProjectedHistory {
 
     /// Digest the public projections in publication order without incorporating private layers.
     pub fn public_digest(&self) -> Result<String> {
+        self.public_digest_of(&self.session_preview()?)
+    }
+
+    fn public_digest_of(&self, snapshots: &[serde_json::Value]) -> Result<String> {
         let manifest = &self.session_manifest;
-        digest_json(&json!({"manifest":manifest,"snapshots":self.session_preview()?}))
+        digest_json(&json!({"manifest":manifest,"snapshots":snapshots}))
     }
 
     /// Save the actual public contents reviewed by the CLI; the private envelope stays ciphertext.
@@ -110,15 +114,29 @@ impl ProjectedHistory {
         self.verify_source(source)?;
         let policy = effective_policy(source, &self.additional_policies)?;
         let snapshots = self.session_preview()?;
-        let files = self.plain_file_preview(captured)?;
         let path = self.repo.root().join(".git/publication-preview.json");
-        let public_digest = self.public_digest()?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(
-                &json!({"destination":destination,"policy":policy,"plan":self.plan,"public_digest":public_digest,"snapshots":snapshots,"files":files,"session_manifest":self.session_manifest}),
-            )?,
+        let public_digest = self.public_digest_of(&snapshots)?;
+        let summary = serde_json::to_string_pretty(
+            &json!({"destination":destination,"policy":policy,"plan":self.plan,"public_digest":public_digest,"snapshots":snapshots,"session_manifest":self.session_manifest}),
         )?;
+        // File entries stream after the summary, so the document never has to fit in memory.
+        let body = summary
+            .strip_suffix("\n}")
+            .context("preview summary is not an object")?;
+        let mut output = std::io::BufWriter::new(fs::File::create(&path)?);
+        write!(output, "{body},\n  \"files\": [")?;
+        let mut first = true;
+        self.plain_file_preview(captured, |file| {
+            output.write_all(if first { b"\n    " } else { b",\n    " })?;
+            first = false;
+            serde_json::to_writer(&mut output, &file)?;
+            Ok(())
+        })?;
+        output.write_all(b"\n  ]\n}\n")?;
+        output
+            .into_inner()
+            .map_err(|error| error.into_error())?
+            .sync_all()?;
         Ok(path)
     }
 
@@ -410,6 +428,58 @@ fn initialize_with_format(root: &Path, oid_length: usize) -> Result<()> {
 
 fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Commits whose tree carries `privacy/envelope.json`, answered by one batch lookup.
+fn enveloped_commits(repo: &Repo, commits: &[String]) -> Result<BTreeSet<String>> {
+    let specs = commits
+        .iter()
+        .map(|commit| format!("{commit}:privacy/envelope.json"))
+        .collect();
+    let mut found = BTreeSet::new();
+    let mut answered = 0;
+    repo.git_cat_file_batch_check_with_policy(
+        specs,
+        super::repo::ReadPolicy::LocalOnly,
+        |_, kind, _| {
+            let commit = commits
+                .get(answered)
+                .context("privacy envelope lookup returned extra answers")?;
+            if kind != "missing" {
+                found.insert(commit.clone());
+            }
+            answered += 1;
+            Ok(())
+        },
+    )?;
+    ensure!(
+        answered == commits.len(),
+        "privacy envelope lookup is incomplete"
+    );
+    Ok(found)
+}
+
+/// Raw parent lists of local commits, read through one batch process.
+fn commit_parent_map(repo: &Repo, commits: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut parents = BTreeMap::new();
+    repo.git_cat_file_batch_with_policy(
+        commits.to_vec(),
+        MAX_COMMIT,
+        super::repo::ReadPolicy::LocalOnly,
+        |oid, kind, body| {
+            let super::repo::ObjectBody::Read(bytes) = body else {
+                anyhow::bail!("privacy source object is unavailable");
+            };
+            ensure!(kind == "commit", "privacy source object is unavailable");
+            parents.insert(oid.to_owned(), commit_parents(bytes)?);
+            Ok(())
+        },
+    )?;
+    ensure!(
+        commits.iter().all(|oid| parents.contains_key(oid)),
+        "privacy source object is unavailable"
+    );
+    Ok(parents)
 }
 
 fn read(repo: &Repo, args: &[&str], limit: usize) -> Result<Vec<u8>> {

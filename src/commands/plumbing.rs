@@ -3778,6 +3778,32 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
     // graph.  Feed it straight to `index-pack --stdin`, which installs the objects but updates no
     // refs.  Disable replace-object resolution on both sides: the imported parent must be the real
     // graph that the source ref names, not a local replacement that would disappear later.
+    transfer_pack(
+        target,
+        source,
+        &format!("{source_commit}\n"),
+        &source_commit,
+    )?;
+
+    let imported = target
+        .git(&[
+            "rev-parse",
+            "--verify",
+            &format!("{source_commit}^{{commit}}"),
+        ])?
+        .trim()
+        .to_string();
+    if imported != source_commit {
+        anyhow::bail!("imported merge parent resolved to {imported}, expected {source_commit}");
+    }
+    verify_commit_connectivity(target, &source_commit).with_context(|| {
+        format!("imported merge parent {source_commit} does not have a complete reachable graph")
+    })?;
+    Ok(())
+}
+
+/// Stream a pack of `revisions` (`pack-objects --revs` stdin syntax) from `source` into `target`.
+fn transfer_pack(target: &Repo, source: &Repo, revisions: &str, source_commit: &str) -> Result<()> {
     let mut pack = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
@@ -3812,7 +3838,7 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("git pack-objects has no stdin"))?
-        .write_all(format!("{source_commit}\n").as_bytes());
+        .write_all(revisions.as_bytes());
     if let Err(error) = write_result {
         let _ = pack.kill();
         let _ = index.kill();
@@ -3836,20 +3862,110 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
         );
     }
 
-    let imported = target
-        .git(&[
-            "rev-parse",
-            "--verify",
-            &format!("{source_commit}^{{commit}}"),
-        ])?
-        .trim()
-        .to_string();
-    if imported != source_commit {
-        anyhow::bail!("imported merge parent resolved to {imported}, expected {source_commit}");
+    Ok(())
+}
+
+/// Raw commits that join a target store together, after every caller-side check has passed.
+/// Parents outside the set must already be present in the target with a complete graph.
+#[derive(Default)]
+pub struct CommitImports {
+    commits: Vec<String>,
+    parents: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl CommitImports {
+    pub fn add(&mut self, commit: &str, parents: &[String]) {
+        if !self.parents.contains_key(commit) {
+            self.commits.push(commit.to_owned());
+            self.parents.insert(commit.to_owned(), parents.to_vec());
+        }
     }
-    verify_commit_connectivity(target, &source_commit).with_context(|| {
-        format!("imported merge parent {source_commit} does not have a complete reachable graph")
-    })?;
+
+    /// One pack carries the objects absent commits introduce beyond the parents already present,
+    /// and one walk proves connectivity for everything the set reaches beyond its outside parents,
+    /// so a chain costs its new objects rather than its whole history per commit. A failed walk
+    /// falls back to complete per-commit imports, which also repair a damaged store.
+    pub fn finish(self, target: &Repo, source: &Repo) -> Result<()> {
+        if self.commits.is_empty() || target.root() == source.root() {
+            return Ok(());
+        }
+        let mut absent = std::collections::BTreeSet::new();
+        let mut answered = 0;
+        target.git_cat_file_batch_check_with_policy(
+            self.commits.clone(),
+            crate::domain::repo::ReadPolicy::LocalOnly,
+            |_, kind, _| {
+                let commit = self.commits.get(answered).ok_or_else(|| {
+                    anyhow::anyhow!("commit presence check returned extra answers")
+                })?;
+                if kind != "commit" {
+                    absent.insert(commit.clone());
+                }
+                answered += 1;
+                Ok(())
+            },
+        )?;
+        anyhow::ensure!(
+            answered == self.commits.len(),
+            "commit presence check is incomplete"
+        );
+        if let Some(first) = absent.first() {
+            let mut revisions = String::new();
+            for commit in &absent {
+                revisions.push_str(&format!("{commit}\n"));
+                for parent in &self.parents[commit] {
+                    if !absent.contains(parent) {
+                        revisions.push_str(&format!("^{parent}\n"));
+                    }
+                }
+            }
+            transfer_pack(target, source, &revisions, first)?;
+        }
+        let mut revisions = String::new();
+        for commit in &self.commits {
+            revisions.push_str(&format!("{commit}\n"));
+            for parent in &self.parents[commit] {
+                if !self.parents.contains_key(parent) {
+                    revisions.push_str(&format!("^{parent}\n"));
+                }
+            }
+        }
+        if verify_revisions_connected(target, &revisions).is_ok() {
+            return Ok(());
+        }
+        for commit in &self.commits {
+            import_commit_graph(target, source, commit)?;
+        }
+        Ok(())
+    }
+}
+
+/// `rev-list --objects` fails on a missing object among those reachable from the positive
+/// revisions but not from the negative ones; with connected negatives this proves the graph.
+fn verify_revisions_connected(repo: &Repo, revisions: &str) -> Result<()> {
+    let mut child = crate::infra::git_runtime::command()
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(repo.root())
+        .args(["rev-list", "--objects", "--quiet", "--stdin"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git rev-list has no stdin"))?
+        .write_all(revisions.as_bytes());
+    let output = child.wait_with_output()?;
+    written?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-list rejected the imported graph: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 

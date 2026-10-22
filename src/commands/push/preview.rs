@@ -29,9 +29,7 @@ pub(super) fn show(
             writeln!(output, "Snapshot {}:", snapshot["commit"])?;
             write_value(&mut output, &snapshot, 2)?;
         }
-        for file in history.plain_file_preview(captured)? {
-            write_value(&mut output, &file, 2)?;
-        }
+        history.plain_file_preview(captured, |file| write_value(&mut output, &file, 2))?;
     }
     output.flush()?;
     Ok(())

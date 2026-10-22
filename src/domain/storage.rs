@@ -1023,6 +1023,162 @@ pub(crate) fn materialize_pair_local(
     )
 }
 
+/// A sequence file cannot exceed the longest legal sequence of SHA-256 IDs and their LFs.
+#[cfg(feature = "cli")]
+const MAX_SEQUENCE_FILE_BYTES: usize = MAX_SEQUENCE_EVENTS * 65;
+/// One validation read holds at most this many event bytes unless a single event is larger.
+#[cfg(feature = "cli")]
+const VALIDATION_READ_BYTES: usize = 8 * 1024 * 1024;
+
+/// Validates v1 snapshots without materializing them. Every snapshot's VIEW must stay inside its
+/// LOG, and every LOG ID must name a stored blob within the event limit whose bytes hash to that
+/// ID. Git names a blob by its bytes, so a blob already checked against an ID needs no second read
+/// when a later snapshot carries it; different bytes stored under a known ID form another blob and
+/// are read and checked like any other.
+#[cfg(feature = "cli")]
+#[derive(Default)]
+pub(crate) struct SnapshotValidator {
+    /// Checked event blobs and the event ID each one hashes to.
+    validated: HashMap<String, String>,
+}
+
+#[cfg(feature = "cli")]
+impl SnapshotValidator {
+    /// Returns the LOG and VIEW lengths of an immutable local v1 snapshot.
+    pub(crate) fn validate_local(
+        &mut self,
+        repo_root: &Path,
+        commit: &str,
+    ) -> Result<(usize, usize)> {
+        immutable_local_oid(commit)?;
+        let policy = ReadPolicy::LocalOnly;
+        let log_ids = read_local_sequence(repo_root, commit, meta::LOG_FILE)?;
+        let view_ids = read_local_sequence(repo_root, commit, meta::VIEW_FILE)?;
+        let (unique, indexes) = index_unique_ids(&log_ids)?;
+        if let Some(id) = view_ids
+            .iter()
+            .find(|id| !indexes.contains_key(id.as_str()))
+        {
+            anyhow::bail!("VIEW references event {id} which is not reachable from LOG");
+        }
+        // Resolving every event path through Git costs a tree walk per event for each snapshot,
+        // so a long history reads its earlier events once per later snapshot; the native reader
+        // reuses decoded trees and reads sizes only for events not validated yet.
+        let objects = match native::Snapshot::open(repo_root, commit) {
+            Some(snapshot) => snapshot
+                .event_blob_ids(&unique)?
+                .into_iter()
+                .map(|blob| {
+                    let size = if self.validated.contains_key(&blob) {
+                        0
+                    } else {
+                        snapshot.blob_size(&blob)?
+                    };
+                    Ok((blob, size))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => inspect_git_event_objects_with_policy(repo_root, commit, &unique, policy)?,
+        };
+        let (mut pending, mut sizes, mut blobs) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, (blob, size)) in unique.iter().zip(objects) {
+            match self.validated.get(&blob) {
+                Some(checked) if checked == id => {}
+                Some(checked) => anyhow::bail!(
+                    "event id mismatch: sequence names {id}, envelope hashes to {checked}"
+                ),
+                None => {
+                    pending.push(*id);
+                    sizes.push(size);
+                    blobs.push(blob);
+                }
+            }
+        }
+        validate_event_sizes(&pending, &sizes, MAX_EVENT_BYTES)?;
+        let mut start = 0;
+        while start < pending.len() {
+            let mut end = start + 1;
+            let mut bytes = sizes[start];
+            while end < pending.len() {
+                match bytes.checked_add(sizes[end]) {
+                    Some(next) if next <= VALIDATION_READ_BYTES => bytes = next,
+                    _ => break,
+                }
+                end += 1;
+            }
+            let (ids, group) = (&pending[start..end], &sizes[start..end]);
+            let mut offsets = Vec::with_capacity(group.len());
+            let mut offset = 0usize;
+            for size in group {
+                offsets.push(offset);
+                offset += size;
+            }
+            let mut output = allocate_materialization_output(bytes)?;
+            read_git_events_into_output_with_policy(
+                repo_root,
+                commit,
+                ids,
+                group,
+                &offsets,
+                &mut output,
+                policy,
+            )?;
+            validate_unique_output(ids, group, &offsets, &output, MAX_EVENT_BYTES)?;
+            for (id, blob) in ids.iter().zip(&blobs[start..end]) {
+                self.validated.insert(blob.clone(), (*id).to_owned());
+            }
+            start = end;
+        }
+        Ok((log_ids.len(), view_ids.len()))
+    }
+}
+
+/// The blob ID and size stored for each event ID at `git_ref`, in request order.
+#[cfg(feature = "cli")]
+fn inspect_git_event_objects_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    ids: &[&str],
+    policy: ReadPolicy,
+) -> Result<Vec<(String, usize)>> {
+    with_event_batch(
+        repo_root,
+        git_ref,
+        ids,
+        "--batch-check",
+        policy,
+        None,
+        |reader| {
+            let mut objects = Vec::new();
+            objects
+                .try_reserve_exact(ids.len())
+                .context("cannot allocate git event objects")?;
+            for id in ids {
+                let header = read_batch_header(reader)?;
+                let size = event_size_from_header(git_ref, id, &header)?;
+                let blob = header
+                    .split_whitespace()
+                    .next()
+                    .context("batch header omitted object id")?;
+                objects.push((blob.to_owned(), size));
+            }
+            Ok(objects)
+        },
+    )
+}
+
+#[cfg(feature = "cli")]
+fn read_local_sequence(repo_root: &Path, commit: &str, path: &str) -> Result<Vec<String>> {
+    let bytes = git_blob_with_policy(
+        repo_root,
+        commit,
+        path,
+        MAX_SEQUENCE_FILE_BYTES,
+        ReadPolicy::LocalOnly,
+    )?;
+    let text = String::from_utf8(bytes).with_context(|| format!("{commit}:{path} is not UTF-8"))?;
+    parse_sequence(&text).with_context(|| format!("invalid v1 sequence {commit}:{path}"))
+}
+
 /// Status keeps all metadata, sequence and event reads inside its page's Git deadline.
 #[cfg(feature = "cli")]
 pub(crate) fn materialize_pair_status(
@@ -3857,6 +4013,43 @@ mod tests {
                 .unwrap(),
             (log, view)
         );
+    }
+
+    /// A blob checked under an event ID does not vouch for other bytes a later snapshot stores
+    /// under that ID; a validator that skips IDs it has already checked accepts the swap.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn snapshot_validator_rechecks_different_bytes_under_a_checked_event_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let first = line(SID_A, 1);
+        write_snapshot(dir.path(), &first, &first).unwrap();
+        meta::write(
+            dir.path(),
+            &meta::Meta::new(SID_A.into(), "codex".into(), "/r".into()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("valid").unwrap();
+        let valid = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let id = event_id(&first).unwrap();
+        std::fs::write(
+            dir.path().join(meta::event_path(&id).unwrap()),
+            line(SID_A, 2),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("swapped").unwrap();
+        let swapped = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+
+        let mut validator = SnapshotValidator::default();
+        assert_eq!(
+            validator.validate_local(dir.path(), &valid).unwrap(),
+            (1, 1)
+        );
+        let error = validator.validate_local(dir.path(), &swapped).unwrap_err();
+        assert!(error.to_string().contains("event id mismatch"), "{error:#}");
     }
 
     #[test]

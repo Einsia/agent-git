@@ -899,7 +899,7 @@ fn execute_transport_inner(
 }
 
 /// Advertised branches and unpeeled tags from an identity-fenced remote probe.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RemoteRefs {
     pub heads: Vec<String>,
     pub tags: std::collections::BTreeMap<String, String>,

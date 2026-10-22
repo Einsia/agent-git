@@ -156,8 +156,13 @@ Captured plain LFS payloads are verified and included in complete review. The pr
 captured bytes, so later live-cache changes cannot alter confirmed content.
 
 Explicit push displays the destination and complete outgoing public snapshots, metadata,
-omissions and plain file content before confirmation. It also retains `publication-preview.json`
-in private local storage. `--dry-run` prepares an existing registered destination without upload;
+omissions and plain file content before confirmation. A plain snapshot lists its metadata and
+LOG/VIEW lengths after every event is checked against its ID; its file content is the blobs it
+introduces relative to its parents, so content a parent carries is reviewed once. Each distinct
+blob is shown once, an append-only file shows only the bytes it appends to its first parent's
+version, and an object above the per-object limit is verified and listed by size. Entries are
+written as they are read, so review memory does not grow with history length. It also retains
+`publication-preview.json` in private local storage. `--dry-run` prepares an existing registered destination without upload;
 a new destination needs creation confirmation before its immutable identity can bind envelopes.
 `--audit` adds separate model review and terminal confirmation. Identity, authority and captured
 source changes after review stop publication. See [push](commands/push.md) for command behavior.
