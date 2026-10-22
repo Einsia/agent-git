@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Projected commits carry this anonymous signature; their attribution comes from the Hub.
-pub const PROJECTED_EMAIL: &str = "privacy@agentgit.local";
 pub(super) const FACTS_LIMIT: usize = 256;
 pub(super) const MAX_COVERAGE: usize = 1 << 18;
 const MAX_WALK: usize = 1 << 20;
@@ -346,8 +344,8 @@ pub(super) struct Walked {
     pub truncated: bool,
 }
 
-/// One streaming pass reads commit headers only; session metadata is read later and only for
-/// commits a page reaches.
+/// Accepted publication IDs and envelope paths identify projections independently of Git authors.
+/// Envelope paths are located in batches; session metadata is read only for commits a page reaches.
 pub(super) fn walk(
     store: &mut impl Store,
     scope: &Scope,
@@ -381,6 +379,7 @@ pub(super) fn walk(
     args.push("--");
     let started = Instant::now();
     let mut seen = 0;
+    let mut unclassified = Vec::new();
     store.rev_list(&args, &mut |line| {
         if line.is_empty() || line.starts_with("commit ") {
             return Ok(true);
@@ -391,26 +390,56 @@ pub(super) fn walk(
             return Ok(false);
         }
         let header = header(line)?;
-        if header.email == PROJECTED_EMAIL {
-            if wanted.contains(header.commit.as_str()) {
-                walked
-                    .published
-                    .insert(header.commit.clone(), header.parent);
-            }
+        if wanted.contains(header.commit.as_str()) {
+            walked
+                .published
+                .insert(header.commit.clone(), header.parent);
             if coverage && walked.projected.len() <= MAX_COVERAGE {
                 walked.projected.push(header.commit);
             }
             return Ok(true);
         }
-        walked.author_seen |= who.signs(&header.name, &header.email);
-        if sources.contains(header.commit.as_str()) {
-            walked.originals.insert(header.commit.clone());
-        }
+        unclassified.push((
+            header.commit.clone(),
+            who.signs(&header.name, &header.email),
+        ));
         if header.at >= floor.max(since) && header.at < before {
             walked.plain.push(header);
         }
         Ok(true)
     })?;
+    let mut plain = HashSet::new();
+    for batch in unclassified.chunks(PREFETCH) {
+        if started.elapsed() > WALK_TIME {
+            walked.truncated = true;
+            break;
+        }
+        let paths: Vec<_> = batch
+            .iter()
+            .map(|(commit, _)| (commit.as_str(), "privacy/envelope.json"))
+            .collect();
+        let envelopes = store.locate(&paths)?;
+        ensure!(
+            envelopes.len() == batch.len(),
+            "activity projection inventory is incomplete"
+        );
+        for ((commit, signed), envelope) in batch.iter().zip(envelopes) {
+            if envelope.is_some() {
+                if coverage && walked.projected.len() <= MAX_COVERAGE {
+                    walked.projected.push(commit.clone());
+                }
+            } else {
+                walked.author_seen |= signed;
+                if sources.contains(commit.as_str()) {
+                    walked.originals.insert(commit.clone());
+                }
+                plain.insert(commit.as_str());
+            }
+        }
+    }
+    walked
+        .plain
+        .retain(|header| plain.contains(header.commit.as_str()));
     Ok(walked)
 }
 

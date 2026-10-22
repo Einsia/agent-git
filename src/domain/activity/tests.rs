@@ -355,7 +355,19 @@ fn message_chunks_preserve_utf8_and_incompleteness_spans_pages() {
     assert_eq!(format!("{}{}", chunks[0].text, chunks[1].text), text);
 }
 
-/// Real publication output uses anonymous Git headers and a separate logical session identity.
+pub(crate) fn assert_unattributed_projection(repo: &Repo, commit: &str) {
+    let missing = read(repo, &mut Fixed::default(), &query()).unwrap();
+    assert!(missing.incomplete);
+    assert!(
+        missing.reasons["missing_publication_metadata"]
+            .examples
+            .iter()
+            .any(|id| id == commit)
+    );
+    assert!(missing.contributions.is_empty());
+}
+
+/// Real publication output retains source Git headers and a separate logical session identity.
 /// Attribution must come from accepted Hub records: without them the projected commits make the
 /// result incomplete rather than empty-and-complete, and with them the message reports the
 /// logical session, the saving account and the acceptance time.
@@ -415,10 +427,8 @@ pub(crate) fn assert_encrypted_publication_activity(
         )
         .unwrap()
     };
-    let missing = page(&mut Fixed::default(), &query);
-    assert!(missing.incomplete);
-    assert!(missing.reasons.contains_key("missing_publication_metadata"));
-    assert!(missing.contributions.is_empty());
+    let publication = attribution.facts.publications[0].clone();
+    assert_unattributed_projection(repo, &publication.commit);
     attribution.accepted = accepted;
     query.session = Some(format!("agit-{}", "b".repeat(40)));
     let result = page(&mut attribution, &query);
@@ -434,6 +444,15 @@ pub(crate) fn assert_encrypted_publication_activity(
         contribution.author_account_id.as_deref(),
         Some("writer-bob")
     );
+
+    // Acceptance remains authoritative even when the source author's identity matches the query.
+    query.session = Some(publication.public_session);
+    query.author = "original@example.invalid".into();
+    query.since = "1970-01-01".into();
+    query.before = "2100-01-01".into();
+    let unclaimed = page(&mut Fixed::default(), &query);
+    assert!(unclaimed.incomplete);
+    assert!(unclaimed.contributions.is_empty());
 }
 
 /// Pins record-window continuation: a contribution larger than one read window is emitted in

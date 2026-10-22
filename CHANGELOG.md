@@ -8,6 +8,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- Encrypted publication preserves Git authors, committers, timestamps, message encoding and
+  commit messages. Existing published snapshots remain compatible when history continues.
+
 ## [0.2.24] - 2026-10-21
 
 ### Added

@@ -477,7 +477,17 @@ fn check_capacity(directory: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn locked_path(repo: &Repo, request: &SupervisorPushRequest) -> Result<(PathBuf, fs::File)> {
+struct MutationLock(fs::File);
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        // Forked children can retain the open file description until exec; the mutation
+        // scope must release ownership even while those descriptors remain open.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn locked_path(repo: &Repo, request: &SupervisorPushRequest) -> Result<(PathBuf, MutationLock)> {
     request.validate()?;
     let path = path(repo, request)?;
     let directory = path.parent().context("publication directory is missing")?;
@@ -492,7 +502,7 @@ fn locked_path(repo: &Repo, request: &SupervisorPushRequest) -> Result<(PathBuf,
     let lock = options.open(directory.join("mutation.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another process is updating RC publication state; retry")?;
-    Ok((path, lock))
+    Ok((path, MutationLock(lock)))
 }
 
 #[cfg(test)]

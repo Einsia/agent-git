@@ -13,6 +13,8 @@ use crate::hub::{
 #[path = "session_sources.rs"]
 mod sources;
 
+const CANDIDATE_CACHE_VERSION: u32 = 3;
+
 pub struct SessionPublicationPlan {
     pub identity: RemoteIdentity,
     pub remote: RemoteRefs,
@@ -197,14 +199,19 @@ impl ProjectedHistory {
                 serde_json::from_slice(&bytes).context("invalid session candidate cache")?
             }
             None => Cache {
-                version: SESSION_ENVELOPE_VERSION,
+                version: CANDIDATE_CACHE_VERSION,
                 ..Default::default()
             },
         };
         ensure!(
-            cache.version == SESSION_ENVELOPE_VERSION,
+            matches!(cache.version, 2 | CANDIDATE_CACHE_VERSION),
             "unsupported session candidate cache"
         );
+        if cache.version != CANDIDATE_CACHE_VERSION {
+            // Session aliases remain stable, but anonymous candidates cannot identify attributed commits.
+            cache.commits.clear();
+            cache.version = CANDIDATE_CACHE_VERSION;
+        }
         let mut ledger = accepted::Ledger::open(&source, identity)?;
         ledger.reconcile(&selected.remote)?;
         let mut parents = BTreeMap::new();
@@ -379,8 +386,9 @@ impl ProjectedHistory {
                         limit,
                         limit,
                     )?;
+                    let original = read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?;
                     let committer = SourceCommitter::from_commit(
-                        &read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+                        &original,
                         metadata.committer_account.clone(),
                     )?;
                     let attribution = committer.attribution(&identity.hub)?;
@@ -458,7 +466,7 @@ impl ProjectedHistory {
                     let public = write_object(
                         &repo,
                         "commit",
-                        commit_body(&tree, &public_parents).as_bytes(),
+                        &commit_body(&tree, &public_parents, &original)?,
                     )?;
                     ensure!(
                         cache
@@ -842,7 +850,12 @@ impl ProjectedHistory {
                     json!({"metadata": super::super::storage::metadata_local(self.repo.root(), commit)?})
                 }
             };
-            snapshots.push(json!({"commit":commit,"publication":entry,"public":public}));
+            let git = commit_preview(&read(
+                &self.repo,
+                &["cat-file", "commit", commit],
+                MAX_COMMIT,
+            )?)?;
+            snapshots.push(json!({"commit":commit,"publication":entry,"public":public,"git":git}));
         }
         for commit in &manifest.preserved_commits {
             snapshots.push(json!({"commit":commit,"preserved":true}));

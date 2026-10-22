@@ -104,10 +104,18 @@ mod tests {
             policy_digest: None,
             recipient: None,
         });
+        // A live mutation excludes another writer; an inherited descriptor cannot extend its scope.
+        let (_, mutation) = locked_path(&repo, &request).unwrap();
+        let inherited = mutation.0.try_clone().unwrap();
+        let unchanged = fs::read(&legacy_path).unwrap();
+        assert!(Entry::prepare_candidate(&repo, &request, &receipt).is_err());
+        assert_eq!(fs::read(&legacy_path).unwrap(), unchanged);
+        drop(mutation);
         assert_eq!(
             Entry::prepare_candidate(&repo, &request, &receipt).unwrap(),
             request
         );
+        drop(inherited);
         let before = fs::read(&legacy_path).unwrap();
         let changed = crate::domain::privacy_receipt::bind_session_fixture(PublicationReceipt {
             published: "d".repeat(40),

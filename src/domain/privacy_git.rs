@@ -26,11 +26,14 @@ use std::{
 };
 
 const MAX_COMMIT: usize = 1024 * 1024;
-const COMMIT_SUFFIX: &str = "author AgentGit Privacy <privacy@agentgit.local> 0 +0000\ncommitter AgentGit Privacy <privacy@agentgit.local> 0 +0000\n\nPrivacy-projected snapshot\n";
+#[cfg(test)]
+const LEGACY_COMMIT_SUFFIX: &str = "author AgentGit Privacy <privacy@agentgit.local> 0 +0000\ncommitter AgentGit Privacy <privacy@agentgit.local> 0 +0000\n\nPrivacy-projected snapshot\n";
 
 mod accepted;
 #[cfg(test)]
 mod accepted_tests;
+#[cfg(test)]
+mod commit_tests;
 mod published;
 #[cfg(test)]
 mod receipt_tests;
@@ -141,8 +144,7 @@ pub(crate) fn receipt_session_id(
         MAX_COMMIT,
     )?;
     let parents = commit_parents(&commit)?;
-    let snapshot = published::reuse(&repo, &repo, &receipt.published, &parents)?
-        .context("retained publication is not a generated snapshot")?;
+    let snapshot = published::reuse(&repo, &repo, &receipt.published, &parents)?;
     ensure!(
         Some(snapshot.policy_digest.as_str()) == receipt.policy_digest.as_deref()
             && meta::is_bare_id(&snapshot.session_id),
@@ -278,13 +280,85 @@ fn effective_policy(
     Ok(policy)
 }
 
-fn commit_body(tree: &str, parents: &[String]) -> String {
-    let mut body = format!("tree {tree}\n");
-    for parent in parents {
-        body.push_str(&format!("parent {parent}\n"));
+/// Identity, dates, encoding and message belong to the source commit. Signatures and merge
+/// attestations cannot survive replacing its tree or parents, so only descriptive headers carry over.
+fn commit_body(tree: &str, parents: &[String], original: &[u8]) -> Result<Vec<u8>> {
+    let boundary = original
+        .windows(2)
+        .position(|bytes| bytes == b"\n\n")
+        .context("publication source commit has no header boundary")?;
+    let mut author = None;
+    let mut committer = None;
+    let mut encoding = None;
+    let mut retained_header = false;
+    for line in original[..boundary].split(|byte| *byte == b'\n') {
+        if line.starts_with(b" ") {
+            ensure!(
+                !retained_header,
+                "publication commit identity or encoding has a continuation"
+            );
+            continue;
+        }
+        retained_header = false;
+        let (field, value) = if let Some(value) = line.strip_prefix(b"author ") {
+            (&mut author, value)
+        } else if let Some(value) = line.strip_prefix(b"committer ") {
+            (&mut committer, value)
+        } else if let Some(value) = line.strip_prefix(b"encoding ") {
+            (&mut encoding, value)
+        } else {
+            continue;
+        };
+        ensure!(
+            !value.is_empty() && !value.contains(&0) && !value.contains(&b'\r'),
+            "publication commit identity or encoding is malformed"
+        );
+        ensure!(
+            field.replace(line).is_none(),
+            "publication commit has duplicate identity or encoding headers"
+        );
+        retained_header = true;
     }
-    body.push_str(COMMIT_SUFFIX);
-    body
+    let author = author.context("publication source commit has no author")?;
+    let committer = committer.context("publication source commit has no committer")?;
+    let mut body = format!("tree {tree}\n").into_bytes();
+    for parent in parents {
+        body.extend_from_slice(format!("parent {parent}\n").as_bytes());
+    }
+    for line in [Some(author), Some(committer), encoding]
+        .into_iter()
+        .flatten()
+    {
+        body.extend_from_slice(line);
+        body.push(b'\n');
+    }
+    body.push(b'\n');
+    body.extend_from_slice(&original[boundary + 2..]);
+    Ok(body)
+}
+
+/// Review uses published object bytes; non-UTF-8 fields remain lossless as escaped bytes.
+fn commit_preview(bytes: &[u8]) -> Result<serde_json::Value> {
+    let boundary = bytes
+        .windows(2)
+        .position(|bytes| bytes == b"\n\n")
+        .context("publication preview commit has no header boundary")?;
+    let text = |value: &[u8]| match std::str::from_utf8(value) {
+        Ok(value) => json!(value),
+        Err(_) => json!({"escaped_bytes": value.escape_ascii().to_string()}),
+    };
+    let mut preview = json!({"encoding": null, "message": text(&bytes[boundary + 2..])});
+    for line in bytes[..boundary].split(|byte| *byte == b'\n') {
+        for field in ["author", "committer", "encoding"] {
+            if let Some(value) = line
+                .strip_prefix(field.as_bytes())
+                .and_then(|value| value.strip_prefix(b" "))
+            {
+                preview[field] = text(value);
+            }
+        }
+    }
+    Ok(preview)
 }
 
 fn initialize_with_format(root: &Path, oid_length: usize) -> Result<()> {

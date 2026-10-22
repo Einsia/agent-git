@@ -79,7 +79,12 @@ The private layer is UTF-8 JSON with `version: 1`, `session`, `metadata`, `path_
 `source_committer`, and optional `protected_values`. `session.log` and `session.view` contain
 Base64 canonical AgentGit envelope JSONL, including original LOG events omitted from VIEW.
 VIEW must reference events reachable from LOG. Raw Git committer evidence and optional account
-attribution stay inside this layer; public Git headers use a generated privacy identity.
+attribution are retained in this layer to authenticate the public account or digest binding.
+Generated Git commits preserve the source author, committer, timestamps, time zones, message
+encoding and commit message. Their tree and parent IDs reference the published objects;
+signatures and merge attestations over original objects are omitted. Accepted anonymous
+snapshots retain their exact bytes, while unpublished cached candidates are regenerated with
+source attribution.
 
 Before sealing, publication hydrates local secret placeholders from a frozen dictionary,
 rebuilds event hashes and evidence references, and validates the complete original. Missing

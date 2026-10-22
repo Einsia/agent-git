@@ -64,7 +64,7 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
         &base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes()),
     )
     .unwrap();
-    let prepare = |source: &str, parents: &[String]| {
+    let prepare = |source_commit: &str, parents: &[String]| {
         let binding = crate::domain::session_privacy::SessionSnapshotBinding {
             repository_id: identity.agent_id.clone(),
             session_id: format!("agit-{}", "b".repeat(40)),
@@ -73,7 +73,7 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
             committer: crate::domain::session_privacy::CommitterAttribution::Account {
                 account_id: "writer".into(),
             },
-            source_commit: source.into(),
+            source_commit: source_commit.into(),
         };
         let envelope = PrivacyEnvelope::seal_session(
             policy.clone(),
@@ -89,8 +89,13 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
             BTreeMap::from([("privacy/envelope.json".into(), bytes.clone())]),
         )
         .unwrap();
-        let public =
-            write_object(&cache, "commit", commit_body(&tree, parents).as_bytes()).unwrap();
+        let original = read(&source, &["cat-file", "commit", source_commit], MAX_COMMIT).unwrap();
+        let public = write_object(
+            &cache,
+            "commit",
+            &commit_body(&tree, parents, &original).unwrap(),
+        )
+        .unwrap();
         crate::domain::session_privacy::AcceptedSnapshot {
             version: crate::domain::session_privacy::SESSION_ENVELOPE_VERSION,
             binding,

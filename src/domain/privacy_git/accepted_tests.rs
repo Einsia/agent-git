@@ -77,7 +77,15 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         storage::write_snapshot(source.root(), &text, &text).unwrap();
         meta::write(source.root(), metadata).unwrap();
         source.add_all().unwrap();
-        source.commit("Source snapshot").unwrap();
+        let saved = crate::infra::git_runtime::command()
+            .arg("-C")
+            .arg(source.root())
+            .args(["commit", "-m", "Source snapshot"])
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            .output()
+            .unwrap();
+        assert!(saved.status.success(), "{saved:?}");
         source.git(&["rev-parse", "HEAD"]).unwrap()
     };
     source.git(&["checkout", "-b", "legacy"]).unwrap();
@@ -462,6 +470,179 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     );
 }
 
+/// Preview caches can be regenerated, but accepted anonymous ancestors and their receipts are immutable.
+#[test]
+fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history() {
+    use super::sessions::SessionPublicationPlan;
+    use crate::domain::session_privacy::{AccountIdentity, SessionPrivacy, SessionPrivacyConfig};
+    use crate::hub::privacy::sessions::{AccountSessionKey, SessionPrivacyResponse};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = Repo::init(&temp.path().join("source")).unwrap();
+    source
+        .git(&["config", "user.name", "Original Writer"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "writer@example.invalid"])
+        .unwrap();
+    source.git(&["checkout", "-b", "work"]).unwrap();
+    let identity = RemoteIdentity::new(
+        "https://hub.invalid",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    .unwrap();
+    let account = AccountIdentity::new(&identity.hub, "owner").unwrap();
+    let mut metadata = Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+    metadata.committer_account = Some(account);
+    let save = |content: &str| {
+        let text = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &metadata.session,
+        );
+        storage::write_snapshot(source.root(), &text, &text).unwrap();
+        meta::write(source.root(), &metadata).unwrap();
+        source.add_all().unwrap();
+        source.commit(content).unwrap();
+        source.git(&["rev-parse", "HEAD"]).unwrap()
+    };
+    let original = save("Original session snapshot");
+    let key = SecretKey::from([45; 32]);
+    let mut selected = SessionPublicationPlan {
+        identity: identity.clone(),
+        remote: RemoteRefs::default(),
+        configs: BTreeMap::from([(
+            metadata.session.clone(),
+            SessionPrivacyResponse {
+                config: SessionPrivacyConfig {
+                    repository_id: identity.agent_id.clone(),
+                    session_id: metadata.session.clone(),
+                    privacy: metadata.session_privacy.clone().unwrap(),
+                    revision: 1,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                },
+                owner_key: Some(AccountSessionKey {
+                    account_id: "owner".into(),
+                    key_version: 1,
+                    public_key_algorithm: "x25519".into(),
+                    public_key: STANDARD.encode(key.public_key().as_bytes()),
+                }),
+            },
+        )]),
+    };
+    let prepare = |selected: &SessionPublicationPlan| {
+        ProjectedHistory::prepare_sessions_with_redactor(
+            &source,
+            &["work".into()],
+            selected,
+            &[],
+            &Redactor::new(Default::default()),
+        )
+        .unwrap()
+    };
+    let first = prepare(&selected);
+    let head = first.plan.heads()[0].oid();
+    let tree = first
+        .repo
+        .git(&["rev-parse", &format!("{head}^{{tree}}")])
+        .unwrap();
+    let anonymous_bytes = format!("tree {tree}\n{LEGACY_COMMIT_SUFFIX}");
+    let anonymous = write_object(&first.repo, "commit", anonymous_bytes.as_bytes()).unwrap();
+    let scope =
+        digest_json(&json!({"version":2, "kind":"session-owner", "identity":identity})).unwrap();
+    let cache_path = first.repo.root().join(".git/session-candidates");
+    let mut cache: Cache =
+        serde_json::from_slice(&state::load(&cache_path, &scope).unwrap().unwrap()).unwrap();
+    cache.version = 2;
+    for commit in cache.commits.values_mut() {
+        *commit = anonymous.clone();
+    }
+    state::save(&cache_path, &scope, &serde_json::to_vec(&cache).unwrap()).unwrap();
+    let mut candidate = first.candidates["work"].clone();
+    candidate.public_head = anonymous.clone();
+    candidate.mappings.get_mut(&original).unwrap().public = anonymous.clone();
+    let mut receipt = first
+        .session_receipts("owner/app", &identity, "https://hub.invalid/owner/app.git")
+        .unwrap()
+        .pop()
+        .unwrap();
+    receipt.published = anonymous.clone();
+    receipt.session_snapshot.as_mut().unwrap().published_commit = anonymous.clone();
+    let public_session = receipt.projected_session_id.clone().unwrap();
+    drop(first);
+
+    let refreshed = prepare(&selected);
+    let refreshed_head = refreshed.plan.heads()[0].oid();
+    assert_ne!(refreshed_head, anonymous);
+    let attribution = "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI%n%B";
+    assert_eq!(
+        refreshed
+            .repo
+            .git_bytes_result(&["show", "--no-patch", attribution, refreshed_head])
+            .unwrap(),
+        source
+            .git_bytes_result(&["show", "--no-patch", attribution, &original])
+            .unwrap()
+    );
+    let refreshed_receipt = refreshed
+        .session_receipts("owner/app", &identity, "https://hub.invalid/owner/app.git")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        refreshed_receipt.projected_session_id.as_deref(),
+        Some(public_session.as_str())
+    );
+    drop(refreshed);
+
+    accepted::Ledger::open(&source, &identity)
+        .unwrap()
+        .prepare(&BTreeMap::from([("work".into(), candidate)]))
+        .unwrap();
+    selected.remote = RemoteRefs {
+        heads: vec![anonymous.clone()],
+        refs: BTreeMap::from([("refs/heads/work".into(), anonymous.clone())]),
+        ..Default::default()
+    };
+    let retained = prepare(&selected);
+    assert_eq!(retained.plan.heads()[0].oid(), anonymous);
+    assert!(retained.session_manifest().snapshots.is_empty());
+    crate::domain::activity::tests::assert_unattributed_projection(retained.repo(), &anonymous);
+    drop(retained);
+    assert_eq!(receipt.session_id(&source).unwrap(), public_session);
+
+    source.git(&["config", "user.name", "Next Writer"]).unwrap();
+    let continued = save("Continue accepted anonymous history");
+    let next = prepare(&selected);
+    let head = next.plan.heads()[0].oid();
+    assert_eq!(
+        next.repo.git(&["rev-parse", &format!("{head}^")]).unwrap(),
+        anonymous
+    );
+    assert_eq!(
+        next.repo
+            .git_bytes_result(&["show", "--no-patch", attribution, head])
+            .unwrap(),
+        source
+            .git_bytes_result(&["show", "--no-patch", attribution, &continued])
+            .unwrap()
+    );
+    assert_eq!(
+        next.repo
+            .git_bytes_result(&["cat-file", "commit", &anonymous])
+            .unwrap(),
+        anonymous_bytes.as_bytes()
+    );
+}
+
 /// The original publisher retains opaque accepted ciphertext without a legacy decoder or key.
 #[test]
 fn legacy_accepted_mapping_preserves_public_objects_when_original_history_continues() {
@@ -527,7 +708,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
     files.insert(meta::FILE.into(), metadata_text.into_bytes());
     files.insert("privacy/envelope.json".into(), legacy.to_vec());
     let tree = write_tree(&retained, files).unwrap();
-    let public_bytes = commit_body(&tree, &[]);
+    let public_bytes = format!("tree {tree}\n{LEGACY_COMMIT_SUFFIX}");
     let public = write_object(&retained, "commit", public_bytes.as_bytes()).unwrap();
     let policy = serde_json::from_slice::<serde_json::Value>(legacy).unwrap()["policy_digest"]
         .as_str()

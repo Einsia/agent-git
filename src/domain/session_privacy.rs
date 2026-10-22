@@ -403,7 +403,7 @@ impl CommitterAttribution {
     }
 }
 
-/// Original Git attribution stays private; the public binding carries an account or a digest.
+/// Original Git committer evidence authenticates the account or digest in the public binding.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceCommitter {

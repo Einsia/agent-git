@@ -45,9 +45,7 @@ pub(super) fn retain_accepted(
         super::super::privacy_envelope::MAX_ENVELOPE_BYTES,
     )?;
     if !is_legacy_envelope(&bytes)? {
-        return reuse(source, destination, oid, parents)?
-            .context(accepted::RECOVERY)
-            .map(Some);
+        return reuse(source, destination, oid, parents).map(Some);
     }
     let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
     ensure!(
@@ -69,11 +67,8 @@ pub(super) fn reuse(
     destination: &Repo,
     oid: &str,
     parents: &[String],
-) -> Result<Option<Reused>> {
+) -> Result<Reused> {
     let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
-    if !original.ends_with(COMMIT_SUFFIX.as_bytes()) {
-        return Ok(None);
-    }
     let bytes = read(
         source,
         &["cat-file", "blob", &format!("{oid}:privacy/envelope.json")],
@@ -149,22 +144,22 @@ pub(super) fn reuse(
     )?;
     files.insert("privacy/envelope.json".into(), bytes);
     let tree = write_tree(destination, files)?;
-    let body = commit_body(&tree, parents);
+    let body = commit_body(&tree, parents, &original)?;
     // Exact reconstruction rejects extra blobs, symlinks, native archives and unvalidated parents.
     ensure!(
-        original == body.as_bytes(),
+        original == body,
         "published ancestry differs from its declared public tree or verified parents"
     );
     ensure!(
-        write_object(destination, "commit", body.as_bytes())? == oid,
+        write_object(destination, "commit", &body)? == oid,
         "published ancestry changed object identity"
     );
-    Ok(Some(Reused {
+    Ok(Reused {
         inspection,
         report: public.report,
         session_id: metadata.session,
         policy_digest: envelope.policy_digest,
-    }))
+    })
 }
 
 fn logical_path(alias: &str) -> Result<&str> {

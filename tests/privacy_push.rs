@@ -596,7 +596,18 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         storage::write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), metadata).unwrap();
         repo.add_all().unwrap();
-        repo.commit("Saved session snapshot").unwrap();
+        repo.git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "i18n.commitEncoding=ISO-8859-1",
+            "commit",
+            "--author=Original Author <author@example.invalid>",
+            "--date=1700000000 +0530",
+            "-m",
+            "Saved session snapshot\n\nReviewed by the original writer.",
+        ])
+        .unwrap();
         git(repo.root(), &["rev-parse", "HEAD"])
     };
     repo.git(&["checkout", "-b", "legacy"]).unwrap();
@@ -712,6 +723,36 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         .as_str()
         .unwrap()
         .to_owned();
+    let source_commit = git(repo.root(), &["cat-file", "commit", &original]);
+    let committer = source_commit
+        .lines()
+        .find_map(|line| line.strip_prefix("committer "))
+        .unwrap();
+    let snapshot = reviewed["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snapshot| snapshot["commit"] == planned)
+        .unwrap();
+    assert_eq!(
+        snapshot["git"],
+        json!({
+            "author": "Original Author <author@example.invalid> 1700000000 +0530",
+            "committer": committer,
+            "encoding": "ISO-8859-1",
+            "message": "Saved session snapshot\n\nReviewed by the original writer.\n",
+        })
+    );
+    for field in snapshot["git"].as_object().unwrap().values() {
+        for line in field
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+        {
+            assert!(displayed.contains(line), "missing preview content: {line}");
+        }
+    }
     let rotated = SecretKey::from([26; 32]);
     *hub.viewing_public.lock().unwrap() = STANDARD.encode(rotated.public_key().as_bytes());
     hub.key_version.store(2, Ordering::Release);
@@ -739,6 +780,11 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         .all(|name| name != format!("refs/tags/agit-{original}"))
     );
     assert_eq!(git(&remote, &["rev-parse", &format!("{planned}^")]), base);
+    let attribution = "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI%n%B";
+    assert_eq!(
+        git(&remote, &["show", "--no-patch", attribution, &planned]),
+        git(repo.root(), &["show", "--no-patch", attribution, &original])
+    );
     let envelope = |commit: &str| {
         PrivacyEnvelope::parse(
             git(
