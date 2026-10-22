@@ -43,6 +43,21 @@ impl SocketIdentity {
     }
 }
 
+impl SocketIdentity {
+    /// Whether `current` is the socket this record was taken from.
+    ///
+    /// A device number is not stable across mounts: macOS renumbers volumes at boot, so a
+    /// recorded device never matches again after a restart and the stale socket of a dead daemon
+    /// could never be reclaimed. The socket lives beside the lock, so it must be on the lock's
+    /// current device; inode and change time then identify the instance on that device.
+    fn identifies(&self, current: &Self, lock_device: u64) -> bool {
+        current.device == lock_device
+            && current.inode == self.inode
+            && current.changed_secs == self.changed_secs
+            && current.changed_nanos == self.changed_nanos
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Record {
     version: u32,
@@ -114,7 +129,9 @@ impl Ownership {
             .context("daemon ownership record is missing, incomplete or unrecognized")?;
         ensure!(record.version == 1, "unrecognized daemon ownership version");
         ensure!(
-            record.socket == SocketIdentity::read(path)?,
+            record
+                .socket
+                .identifies(&SocketIdentity::read(path)?, self.file.metadata()?.dev()),
             "daemon ownership record does not identify this socket"
         );
         Ok(())
@@ -186,5 +203,48 @@ impl Ownership {
         write!(pid, "{}", std::process::id())?;
         pid.persist(self.directory.join("agitd.pid"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a reboot the volume's device number changes while the socket file is unchanged; a
+    /// record that compared devices would leave the dead daemon's socket unrecoverable. Any other
+    /// difference is still a different socket.
+    #[test]
+    fn a_renumbered_volume_still_identifies_the_recorded_socket() {
+        let recorded = SocketIdentity {
+            device: 1,
+            inode: 7,
+            changed_secs: 10,
+            changed_nanos: 20,
+        };
+        let after_reboot = SocketIdentity {
+            device: 2,
+            ..recorded
+        };
+        assert!(recorded.identifies(&after_reboot, 2));
+        assert!(
+            !recorded.identifies(&after_reboot, 3),
+            "socket must sit beside the lock"
+        );
+        for other in [
+            SocketIdentity {
+                inode: 8,
+                ..after_reboot
+            },
+            SocketIdentity {
+                changed_secs: 11,
+                ..after_reboot
+            },
+            SocketIdentity {
+                changed_nanos: 21,
+                ..after_reboot
+            },
+        ] {
+            assert!(!recorded.identifies(&other, 2));
+        }
     }
 }

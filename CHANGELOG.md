@@ -10,6 +10,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- After a macOS restart, `agit rc status`, `agit upgrade` and daemon startup
+  recognize the control socket a stopped daemon left behind and reclaim it,
+  instead of asking for a manual `agit rc local recover`.
 - Loading earlier messages of a remote conversation whose saved archive could not
   be applied no longer fails as an expired history snapshot; the page kept
   spinning on "Loading the latest conversation" while it retried.
