@@ -12,6 +12,22 @@ pub(super) fn unavailable(error: impl std::fmt::Display) -> RpcError {
     )
 }
 
+/// The display labels the source catalog holds for a native conversation, if it has scanned it.
+///
+/// A source-bound session that opens without them reaches clients and the hub with no name, and
+/// the hub keeps a missing label until something reports one.
+pub(super) fn catalog_labels(
+    source: &NativeSourceRef,
+    native: &str,
+) -> (Option<String>, Option<String>) {
+    crate::rc::runtime_catalog::Catalog::open()
+        .and_then(|catalog| catalog.lookup(&source.session_ref(native)))
+        .ok()
+        .flatten()
+        .filter(|row| row.source_id == source.source_id && row.native_session_id == native)
+        .map_or((None, None), |row| (row.title, row.gist))
+}
+
 /// A transcript still being restored is a busy conversation that clients retry, not a missing one.
 pub(super) fn locate_failed(error: anyhow::Error) -> RpcError {
     if error.is::<crate::adapter::codex_rollout::Restoring>() {
@@ -175,6 +191,7 @@ impl Daemon {
             )?,
         };
         let now = chrono::Utc::now().to_rfc3339();
+        let (title, gist) = catalog_labels(&source, native);
         let info = SessionInfo {
             interrupt_fenced: None,
             publication: None,
@@ -188,8 +205,8 @@ impl Daemon {
             branch: lineage.as_ref().map(|lineage| lineage.branch().to_string()),
             status: SessionStatus::Idle,
             last_seq: 0,
-            gist: None,
-            title: None,
+            gist,
+            title,
             dangerous: false,
             permission_mode: settings.permission_mode,
             created_at: now.clone(),
@@ -273,6 +290,12 @@ mod tests {
                 expected_agent_id: None,
                 branch: None,
             };
+            // A conversation opens under the name the catalog shows for it, not unnamed.
+            let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
+            let roots = policy::CanonicalRoots::from_untrusted([project.clone()]);
+            for _ in &sources {
+                catalog.reconcile(&roots).unwrap();
+            }
             let mut ids = vec![];
             for source in &sources {
                 let opening = state
@@ -299,6 +322,7 @@ mod tests {
                     Some(crate::protocol::PermissionMode::Plan)
                 );
                 assert!(!spawn.info.dangerous);
+                assert_eq!(spawn.info.gist.as_deref(), Some("question"));
                 ids.push(spawn.info.session_id);
             }
             assert_ne!(ids[0], ids[1]);

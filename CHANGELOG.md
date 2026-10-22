@@ -10,6 +10,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- A conversation taken over from a registered runtime source keeps the name the
+  device shows for it, instead of appearing as an untitled session in its
+  project.
 - Encrypted publication preserves Git authors, committers, timestamps, message encoding and
   commit messages. Existing published snapshots remain compatible when history continues.
 

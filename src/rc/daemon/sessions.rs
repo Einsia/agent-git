@@ -137,6 +137,20 @@ impl Daemon {
             .map(|row| ((row.runtime.as_str(), row.runtime_session_id.as_str()), row))
             .collect();
         for session in self.sessions.values_mut().filter(|session| {
+            session.info.workspace_id == caller.workspace_id
+                && session.info.native_source.is_some()
+                && session.info.title.is_none()
+                && session.info.gist.is_none()
+        }) {
+            if let (Some(source), Some(native)) = (
+                session.info.native_source.as_ref(),
+                session.runtime_thread_id.as_deref(),
+            ) {
+                (session.info.title, session.info.gist) =
+                    source_sessions::catalog_labels(source, native);
+            }
+        }
+        for session in self.sessions.values_mut().filter(|session| {
             session.info.workspace_id == caller.workspace_id && session.info.native_source.is_none()
         }) {
             if let Some(row) = session
