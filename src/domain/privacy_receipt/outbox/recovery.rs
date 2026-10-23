@@ -26,7 +26,7 @@ impl Entry {
             ) else {
                 continue;
             };
-            if publication.mode.is_encrypted()
+            if publication.mode.uses_generated_history()
                 || confirmed.request.repository != request.repository
                 || confirmed.request.destination != request.destination
                 || confirmed.capture.session_id != original.capture.session_id

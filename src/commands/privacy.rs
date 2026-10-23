@@ -15,6 +15,7 @@ use clap::{Args as ClapArgs, Subcommand};
 use std::path::{Path, PathBuf};
 
 mod access;
+mod mode;
 pub(crate) mod sources;
 mod status;
 pub(crate) mod unlock;
@@ -36,6 +37,13 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
+    /// Inspect or choose a session's publication mode before its first remote registration.
+    Mode {
+        #[arg(value_name = "OWNER/REPO@REF")]
+        target: String,
+        #[arg(value_enum)]
+        mode: Option<mode::Mode>,
+    },
     /// Show original storage, sanitized display readiness and your exact-snapshot access.
     Status {
         #[arg(value_name = "OWNER/REPO@SNAPSHOT")]
@@ -169,6 +177,7 @@ pub enum PolicyAction {
 
 pub fn run(args: Args) -> CmdResult {
     match args.command {
+        Action::Mode { target, mode } => mode::run(&target, mode),
         Action::Status { target } => status::run(&target),
         Action::Access { command } => access::run(command),
         Action::Unlock { target, workspace } => unlock::run(&target, workspace.as_deref()),

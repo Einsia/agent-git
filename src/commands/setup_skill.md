@@ -288,6 +288,7 @@ agit push <owner/repo> -b main --yes                    # follow the dry-run dec
 | Command | Meaning |
 |---|---|
 | `push` | Publish existing local refs; it never creates a branch |
+| `privacy` | Choose a session's initial publication mode, inspect storage, and manage original access |
 | `fetch` | Fetch objects and remote refs; local branches do not move |
 | `pull` | Fetch and fast-forward only; warns and skips divergence |
 | `pr` | Create, inspect, fetch, and merge Hub pull requests |
@@ -295,6 +296,12 @@ agit push <owner/repo> -b main --yes                    # follow the dry-run dec
 | `activity` | Query submitted user and assistant messages by author and commit time; fetch locally when available, otherwise query the Hub |
 | `search` | Search the AgentGit corpus visible to the current identity |
 | `rc` | Start and manage the `agitd` remote-control daemon and peer/Cloud connections |
+
+New sessions default to encryption. If the user explicitly requests unencrypted publication,
+run `agit privacy mode <owner/repo>@<branch> plain` before the session's first remote registration,
+then publish normally. The choice follows the logical session across branches. Repository
+visibility (`push --public` / `--private`) is separate; registered modes cannot change.
+Read [privacy](references/commands/privacy.md) for confirmation and registration boundaries.
 
 ### Export, integration, and diagnostics
 

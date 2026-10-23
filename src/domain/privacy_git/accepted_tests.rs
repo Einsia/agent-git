@@ -743,6 +743,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         .unwrap()
         .to_owned();
     let mapping = accepted::Mapping {
+        plain: false,
         source: original.clone(),
         public: public.clone(),
         source_parents: vec![],

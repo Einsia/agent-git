@@ -6,9 +6,14 @@ description: Publish saved history using registered session privacy settings and
 # agit push
 
 Publish existing saved branches with their registered privacy settings. Plain sessions and file
-lines retain their original Git objects. Encrypted sessions publish a sanitized projection and
+lines retain their original Git objects unless initial plain selection requires publication metadata
+to be normalized. Encrypted sessions publish a sanitized projection and
 originals encrypted to the session owner's account key. Accepted ancestry remains unchanged, so
 a repository can contain both modes. Use `new`, `fork` or `import` to create a session.
+
+For an explicitly requested unencrypted session, run `agit privacy mode owner/repo@branch plain`
+before its first registration. This selects the logical session's mode across its branches;
+`--public` and `--private` only select repository visibility. Registered modes cannot change.
 
 ## Synopsis
 

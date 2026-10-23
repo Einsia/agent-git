@@ -1,4 +1,37 @@
-# Original access
+# Session publication mode and original access
+
+## Choose an initial publication mode
+
+New sessions default to encryption. Before the session's first remote registration, its creator
+can explicitly choose plain publication:
+
+```sh
+agit privacy mode alice/project@work plain
+agit privacy status alice/project@work
+agit push alice/project@work --private
+```
+
+`plain` publishes the session without session encryption. Repository readers can read the
+published history. Local secret protection and ordinary publication checks still apply.
+`--private` and `--public` control repository visibility separately from session encryption.
+
+The choice is local and follows the logical session across branch renames and multiple branches.
+It covers all unpublished snapshots and future commits in that session. It does not create a
+remote repository or register the session. Before registration, choose `encrypted` to restore
+the encrypted default. Omit the mode argument to inspect the local choice and remote registration.
+Changes require confirmation; use global `--yes` for an explicitly authorized unattended change.
+
+The first push registers the selected mode. Once registered, it cannot change, even if that push
+fails before uploading history. Original-access policy commands can also register an encrypted
+session before its first push. A registered plain session uses repository read access instead
+of original-content grants. `push --dry-run` still requires an existing registered session.
+
+Existing local snapshots retain their source commits. Publication generates plain metadata and
+mapped parents when their birth metadata declares encryption; event bytes and file content stay
+unchanged. Accepted history retains its exact commits. Custom tags targeting rewritten commits
+must be removed before publication or recreated on the accepted public commits.
+
+## Original access
 
 New sessions enable session-level explicit authorization by default. The immutable
 session owner, while a current repository member, manages grants. Select a branch

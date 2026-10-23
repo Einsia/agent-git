@@ -477,7 +477,9 @@ agit push alice/payments@ratelimit           # review destination creation and t
 agit push alice/payments@ratelimit --dry-run # inspect an already registered destination/session
 ```
 
-- **New sessions use owner-account encryption.** Existing plain sessions keep their registered
+- **New sessions default to owner-account encryption.** Before first registration, the creator
+  can choose unencrypted publication with `agit privacy mode alice/payments@ratelimit plain`.
+  Use `encrypted` to restore the default before registration. Existing plain sessions keep their registered
   settings, so both schemes can coexist in one repository. First publication needs a registered
   destination and session before a dry-run preview can be prepared. Explicit unattended
   publication uses `--yes` to confirm creation and the prepared preview.

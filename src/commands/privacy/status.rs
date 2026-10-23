@@ -24,6 +24,10 @@ pub(super) fn run(target: &str) -> CmdResult {
     };
     let (repo, _) = super::resolve_repo(Some(&slug))?;
     let resolved = refs::resolve(&repo, &spec)?;
+    if crate::hub::identity::read(&repo)?.is_none() {
+        super::mode::Selection::resolve(target)?.show();
+        return Ok(ExitCode::Ok);
+    }
     let (client, repository, identity) = super::unlock::reader_context(&repo)?;
     let (commit, bytes) = crate::domain::privacy_git::publication_envelope(
         &repo,
@@ -45,13 +49,15 @@ pub(super) fn run(target: &str) -> CmdResult {
         (snapshot.binding.session_id.clone(), Some(snapshot))
     } else {
         let metadata = crate::domain::storage::metadata_local(repo.root(), &resolved.sha)?;
-        ensure!(
-            metadata
+        if commit == resolved.sha
+            && metadata
                 .session_privacy
                 .as_ref()
-                .is_none_or(|privacy| privacy.scheme == SessionScheme::Plain),
-            "this encrypted session has no accepted publication; publish its saved snapshot first"
-        );
+                .is_some_and(|privacy| privacy.scheme != SessionScheme::Plain)
+        {
+            super::mode::Selection::resolve(target)?.show();
+            return Ok(ExitCode::Ok);
+        }
         (metadata.session, None)
     };
     let (client, repository, identity) = if let Some(snapshot) = &expected {

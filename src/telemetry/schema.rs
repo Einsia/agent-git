@@ -492,6 +492,16 @@ mod tests {
         assert_eq!(value["arg_target"], true);
         assert_eq!(value["arg_member"], true);
         assert!(!value.to_string().contains("private-canary"));
+
+        for mode in [None, Some("plain"), Some("encrypted")] {
+            let mut args = vec!["agit", "privacy", "mode", "private-canary/repo@session"];
+            args.extend(mode);
+            let value = capture(&args);
+            assert_eq!(value["command_path"], "privacy mode");
+            assert_eq!(value["arg_target"], true);
+            assert_eq!(value.get("arg_mode"), mode.map(|mode| json!(mode)).as_ref());
+            assert!(!value.to_string().contains("private-canary"));
+        }
     }
 
     #[test]

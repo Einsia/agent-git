@@ -40,6 +40,7 @@ struct Hub {
     creations: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
     key_version: Arc<AtomicUsize>,
+    key_requests: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -52,6 +53,8 @@ impl Hub {
         let served_public = Arc::clone(&viewing_public);
         let key_version = Arc::new(AtomicUsize::new(1));
         let served_version = Arc::clone(&key_version);
+        let key_requests = Arc::new(AtomicUsize::new(0));
+        let requested_keys = Arc::clone(&key_requests);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -247,9 +250,12 @@ impl Hub {
                             )
                         }
                     }
-                    ("POST", "/api/me/session-key/ensure") => Some(
-                        json!({"ready":true,"key":{"account_id":"account-1","key_version":served_version.load(Ordering::Acquire),"public_key_algorithm":"x25519","public_key":served_public.lock().unwrap().clone()}}),
-                    ),
+                    ("POST", "/api/me/session-key/ensure") => {
+                        requested_keys.fetch_add(1, Ordering::Acquire);
+                        Some(
+                            json!({"ready":true,"key":{"account_id":"account-1","key_version":served_version.load(Ordering::Acquire),"public_key_algorithm":"x25519","public_key":served_public.lock().unwrap().clone()}}),
+                        )
+                    }
                     ("POST", "/api/auth/refresh") => {
                         assert_eq!(
                             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["refresh_token"],
@@ -419,6 +425,7 @@ impl Hub {
             creations,
             viewing_public,
             key_version,
+            key_requests,
             stop,
             worker: Some(worker),
         }
@@ -489,6 +496,7 @@ fn assert_success(out: &Output) {
 }
 
 /// Creation and Git receive require consent and exact receipts; retries preserve session authority.
+/// Explicit plain selection survives renames and retries without changing source history or other sessions.
 #[test]
 fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retries() {
     use agit::domain::session_privacy::{AccountIdentity, CommitterAttribution, SessionPrivacy};
@@ -558,6 +566,42 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         &["tag", "-a", "file-notes", "-m", "Reviewed file release"],
     );
     let file_tag = git(repo.root(), &["rev-parse", "refs/tags/file-notes"]);
+    assert_success(&run(
+        &["new", "alice/app", "-b", "unencrypted", "--no-launch"],
+        false,
+    ));
+    let plain_birth = git(repo.root(), &["rev-parse", "refs/heads/unencrypted"]);
+    let chosen_meta = meta::read_at_ref_result(&repo, &plain_birth)
+        .unwrap()
+        .unwrap();
+    let mode_args = ["privacy", "mode", "alice/app@unencrypted", "plain"];
+    assert!(!run(&mode_args, false).status.success());
+    let unchanged = run(
+        &["--json", "privacy", "mode", "alice/app@unencrypted"],
+        false,
+    );
+    assert_success(&unchanged);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unchanged.stdout).unwrap()["result"]["value"]
+            ["local_mode"],
+        "session_owner_v2"
+    );
+    assert_success(&run(
+        &["--yes", "privacy", "mode", "alice/app@unencrypted", "plain"],
+        false,
+    ));
+    let mode = run(
+        &["--json", "privacy", "status", "alice/app@unencrypted"],
+        false,
+    );
+    assert_success(&mode);
+    let mode: serde_json::Value = serde_json::from_slice(&mode.stdout).unwrap();
+    assert_eq!(mode["result"]["value"]["local_mode"], "plain");
+    assert_eq!(
+        mode["result"]["value"]["registered_mode"],
+        serde_json::Value::Null
+    );
+    assert!(!remote.exists());
     let dry = run(&["push", "alice/app@main", "--dry-run"], false);
     assert!(!dry.status.success(), "{dry:?}");
     assert_eq!(hub.creations.load(Ordering::Acquire), 0);
@@ -673,7 +717,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert!(!refused_tag.status.success(), "{refused_tag:?}");
     assert!(
         String::from_utf8_lossy(&refused_tag.stderr)
-            .contains("points to rewritten encrypted history"),
+            .contains("points to rewritten publication history"),
         "{refused_tag:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
@@ -980,4 +1024,101 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             ["policy"],
         disabled_policy
     );
+    let key_requests = hub.key_requests.load(Ordering::Acquire);
+    repo.git(&["checkout", "--ignore-other-worktrees", "unencrypted"])
+        .unwrap();
+    let first_plain_source = save(&chosen_meta, "Explicit plain context");
+    let second_plain_source = save(&chosen_meta, "Next plain context");
+    repo.git(&["branch", "-m", "unencrypted", "publish-plain"])
+        .unwrap();
+    assert_success(&run(&["privacy", "mode", "alice/app@publish-plain"], false));
+    let access = run(
+        &["privacy", "access", "policy", "alice/app@publish-plain"],
+        false,
+    );
+    assert!(!access.status.success());
+    assert!(
+        String::from_utf8_lossy(&access.stderr)
+            .contains("plain sessions use repository read access")
+    );
+    let plain_push = ["--yes", "push", "alice/app@publish-plain"];
+    hub.corrupt_receipt.store(true, Ordering::Release);
+    assert!(!run(&plain_push, false).status.success());
+    let locked = run(
+        &[
+            "--yes",
+            "privacy",
+            "mode",
+            "alice/app@publish-plain",
+            "encrypted",
+        ],
+        false,
+    );
+    assert!(!locked.status.success());
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("already registered"));
+    hub.corrupt_receipt.store(false, Ordering::Release);
+    assert_success(&run(&plain_push, false));
+    let plain_head = git(&remote, &["rev-parse", "refs/heads/publish-plain"]);
+    assert_ne!(plain_head, second_plain_source);
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "refs/heads/publish-plain"]),
+        second_plain_source
+    );
+    assert!(
+        git(
+            &remote,
+            &["ls-tree", "-r", &plain_head, "--", "privacy/envelope.json"]
+        )
+        .is_empty()
+    );
+    let plain_metadata: meta::Meta = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("{plain_head}:session/meta.json")],
+    ))
+    .unwrap();
+    assert_eq!(
+        plain_metadata.session_privacy.unwrap().scheme,
+        agit::domain::session_privacy::SessionScheme::Plain
+    );
+    assert_eq!(
+        storage::materialize_at(&remote, &plain_head, meta::LOG_FILE).unwrap(),
+        storage::materialize_at(repo.root(), &second_plain_source, meta::LOG_FILE).unwrap()
+    );
+    assert_ne!(
+        git(&remote, &["rev-parse", &format!("{plain_head}^")]),
+        first_plain_source
+    );
+    assert_success(&run(&plain_push, false));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/publish-plain"]),
+        plain_head
+    );
+    let third = save(&chosen_meta, "Continued plain context");
+    assert_success(&run(&plain_push, false));
+    let next_plain = git(&remote, &["rev-parse", "refs/heads/publish-plain"]);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{next_plain}^")]),
+        plain_head
+    );
+    let receipt = agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "publish-plain")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.source, third);
+    assert_eq!(receipt.published, next_plain);
+    assert_eq!(
+        receipt.mode,
+        agit::domain::privacy_receipt::PublicationMode::SessionPlain
+    );
+    assert_eq!(hub.key_requests.load(Ordering::Acquire), key_requests);
+    for (target, mode) in [
+        ("alice/app@publish-plain", "encrypted"),
+        ("alice/app@prepublish", "plain"),
+    ] {
+        let refused = run(&["--yes", "privacy", "mode", target, mode], false);
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("already registered"),
+            "{refused:?}"
+        );
+    }
 }

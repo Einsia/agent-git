@@ -308,6 +308,17 @@ impl Selection {
             )
         } else {
             let metadata = crate::domain::storage::metadata_local(repo.root(), &resolved.sha)?;
+            let _mode_lock =
+                crate::domain::privacy_git::modes::lock(&repo, &identity.hub, &metadata.session)?;
+            if let Some(choice) =
+                crate::domain::privacy_git::modes::load(&repo, &identity.hub, &metadata.session)?
+            {
+                choice.verify(&identity, &repository)?;
+                ensure!(
+                    choice.scheme != crate::domain::session_privacy::SessionScheme::Plain,
+                    "plain sessions use repository read access; original grants require session encryption"
+                );
+            }
             ensure!(
                 metadata.is_session_line() && crate::domain::meta::is_bare_id(&metadata.session),
                 "original access requires one identified logical session"
@@ -321,7 +332,14 @@ impl Selection {
                 &identity,
                 &metadata.session,
             )? {
-                Some(response) => response,
+                Some(response) => {
+                    ensure!(
+                        response.config.privacy.scheme
+                            != crate::domain::session_privacy::SessionScheme::Plain,
+                        "plain sessions use repository read access; original grants require session encryption"
+                    );
+                    response
+                }
                 None => {
                     let privacy = if local.owner_source == OwnerResolution::Unresolved {
                         let mut privacy = SessionPrivacy::new(Some(actor.clone()))?;

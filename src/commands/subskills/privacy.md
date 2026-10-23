@@ -1,6 +1,6 @@
 ---
 name: agit-privacy
-description: Configure a local privacy policy, preview candidates, and manage account access to session originals.
+description: Choose initial session publication modes, configure privacy policy, and manage original access.
 ---
 
 # Privacy policy and original access
@@ -8,6 +8,20 @@ description: Configure a local privacy policy, preview candidates, and manage ac
 New sessions encrypt originals to their creator's account by default. Existing plain sessions
 retain their registered mode. Repository visibility and access to original content are separate:
 key delivery requires current repository membership and permission for the exact saved snapshot.
+
+Before a session is registered, its creator can explicitly select unencrypted publication:
+
+```sh
+agit privacy mode alice/agent@work plain
+agit push alice/agent@work --private
+```
+
+This local choice covers all unpublished snapshots and future commits of the logical session,
+including its other branches. Confirm only when the user requests unencrypted publication.
+`encrypted` restores the default before registration; omit the mode to inspect current settings.
+The first registration locks the mode, including registration during an unsuccessful push or an
+original-access policy operation. Repository visibility flags do not select encryption.
+Plain content uses repository read access; local secret protection still applies.
 
 Inspect exact publication storage and access without requesting a content key:
 

@@ -1,7 +1,7 @@
 //! Public Git history is built in an object store with no source-object alternates.
 //!
 //! Private cache keys bind original snapshots, projected bytes, policy, recipients and parents.
-//! Encrypted snapshots publish generated trees; registered plain and accepted objects keep their bytes.
+//! Initial plain selection normalizes source privacy metadata; accepted objects keep their bytes.
 
 use super::{
     meta::{self, Meta},
@@ -34,6 +34,7 @@ mod accepted;
 mod accepted_tests;
 #[cfg(test)]
 mod commit_tests;
+pub(crate) mod modes;
 mod published;
 #[cfg(test)]
 mod receipt_tests;
@@ -156,6 +157,18 @@ pub(crate) fn receipt_session_id(
     receipt: &super::privacy_receipt::PublicationReceipt,
 ) -> Result<String> {
     let (repo, _lock) = receipt_cache(source, receipt)?;
+    if receipt.mode == super::privacy_receipt::PublicationMode::SessionPlain {
+        let metadata = super::storage::metadata_local(repo.root(), &receipt.published)?;
+        ensure!(
+            metadata.is_session_line()
+                && Some(&metadata.session) == receipt.projected_session_id.as_ref()
+                && metadata.session_privacy.as_ref().is_none_or(
+                    |privacy| privacy.scheme == super::session_privacy::SessionScheme::Plain
+                ),
+            "plain session receipt differs from its accepted metadata"
+        );
+        return Ok(metadata.session);
+    }
     let commit = read(
         &repo,
         &["cat-file", "commit", &receipt.published],
@@ -248,7 +261,7 @@ fn receipt_cache(
 ) -> Result<(Repo, fs::File)> {
     receipt.validate()?;
     ensure!(
-        receipt.mode.is_encrypted(),
+        receipt.mode.uses_generated_history(),
         "ordinary publication does not use generated history"
     );
     let parent = source.common_dir()?.join("agit/privacy-publication");

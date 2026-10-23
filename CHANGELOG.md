@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- `agit privacy mode OWNER/REPO@BRANCH plain` selects unencrypted publication before a session's
+  first remote registration. The choice follows the logical session across branches, keeps source
+  history unchanged, and is separate from repository visibility. Use `encrypted` to restore the
+  default before registration, or omit the mode to inspect the local choice and registered mode.
+
 ### Fixed
 
 - `agit push` previews session branches with a long plain history instead of failing with

@@ -64,10 +64,23 @@ impl SessionPublicationPlan {
         }
         let mut configs = BTreeMap::new();
         for session in sessions {
+            let _mode_lock = super::modes::lock(source, &identity.hub, &session)?;
+            let mut choice = super::modes::load(source, &identity.hub, &session)?;
+            if let Some(choice) = &choice {
+                choice.verify(&identity, repository)?;
+            }
             let response = match client
                 .registered_session_privacy(repository, &identity, &session)?
             {
-                Some(response) => response,
+                Some(response) => {
+                    ensure!(
+                        choice
+                            .as_ref()
+                            .is_none_or(|choice| choice.scheme == response.config.privacy.scheme),
+                        "session publication mode is already registered and differs from the local choice"
+                    );
+                    response
+                }
                 None => {
                     ensure!(
                         register,
@@ -91,15 +104,31 @@ impl SessionPublicationPlan {
                             account.clone(),
                         ))?;
                     }
-                    ensure!(
-                        privacy.scheme == SessionScheme::SessionOwnerV2,
-                        "an unregistered session cannot opt into legacy plaintext publication"
-                    );
+                    if let Some(choice) = &mut choice {
+                        ensure!(
+                            choice.actor == account
+                                && privacy.owner
+                                    == Some(crate::domain::session_privacy::SessionOwner::User(
+                                        account.account_id.clone()
+                                    )),
+                            "initial publication mode must be registered by the session creator who selected it"
+                        );
+                        privacy.scheme = choice.scheme;
+                        choice.repository_id = Some(identity.agent_id.clone());
+                        choice.save(source)?;
+                    } else {
+                        ensure!(
+                            privacy.scheme == SessionScheme::SessionOwnerV2,
+                            "an unregistered plain session requires an explicit privacy mode choice"
+                        );
+                    }
                     ensure!(
                         privacy.hub.as_deref() == Some(identity.hub.as_str()),
                         "session creator belongs to another Hub"
                     );
-                    if privacy.creator.as_deref() == Some(account.account_id.as_str()) {
+                    if privacy.scheme == SessionScheme::SessionOwnerV2
+                        && privacy.creator.as_deref() == Some(account.account_id.as_str())
+                    {
                         client.ensure_session_key(&account)?;
                     }
                     client.register_session_privacy(repository, &identity, &session, &privacy)?
@@ -143,7 +172,12 @@ impl SessionPublicationPlan {
             "registered session belongs to another publication authority"
         );
         if let Some(local) = &metadata.session_privacy {
-            config.verify_registration(&self.identity.agent_id, &metadata.session, local)?;
+            let mut effective = local.clone();
+            // Registered plain authority governs unpublished source snapshots whose birth default was encrypted.
+            if config.privacy.scheme == SessionScheme::Plain {
+                effective.scheme = SessionScheme::Plain;
+            }
+            config.verify_registration(&self.identity.agent_id, &metadata.session, &effective)?;
         }
         Ok(response)
     }
@@ -248,6 +282,7 @@ impl ProjectedHistory {
                     ensure!(found, "{}", accepted::RECOVERY);
                 }
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
+                let mut plain_rewrites = BTreeSet::new();
                 for oid in order.iter().filter(|oid| reachable.contains(*oid)) {
                     let public_parents = parents[oid]
                         .iter()
@@ -275,7 +310,22 @@ impl ProjectedHistory {
                             "{}",
                             accepted::RECOVERY
                         );
-                        if entry.source == entry.public {
+                        let plain = entry.plain;
+                        if plain {
+                            let metadata = crate::domain::storage::metadata_local(
+                                retained.root(),
+                                &entry.public,
+                            )?;
+                            ensure!(
+                                metadata
+                                    .session_privacy
+                                    .as_ref()
+                                    .is_none_or(|privacy| privacy.scheme == SessionScheme::Plain),
+                                "accepted plain history declares encryption"
+                            );
+                            plain_rewrites.insert(oid.clone());
+                        }
+                        if entry.source == entry.public || plain {
                             crate::commands::plumbing::import_commit_graph(
                                 &repo,
                                 &retained,
@@ -290,7 +340,9 @@ impl ProjectedHistory {
                             aliases.reserve_aliases(&reused.inspection)?;
                             reports.push(reused.report);
                         }
-                        retain_session_mapping(&repo, &entry.public, identity, &mut cache)?;
+                        if !plain {
+                            retain_session_mapping(&repo, &entry.public, identity, &mut cache)?;
+                        }
                         preserved.insert(entry.public.clone());
                         mapped.insert(oid.clone(), entry.clone());
                         continue;
@@ -322,6 +374,7 @@ impl ProjectedHistory {
                                 public_session: session,
                                 policy: policy_digest.clone(),
                                 recipient: None,
+                                plain: false,
                             },
                         );
                         continue;
@@ -338,7 +391,11 @@ impl ProjectedHistory {
                         response.config.privacy.scheme == SessionScheme::Plain
                     }) {
                         ensure!(
-                            public_parents == parents[oid],
+                            parents[oid]
+                                .iter()
+                                .zip(&public_parents)
+                                .all(|(source, public)| source == public
+                                    || plain_rewrites.contains(source)),
                             "plain publication cannot expose unaccepted original ancestry from an encrypted session"
                         );
                         ensure!(
@@ -346,22 +403,51 @@ impl ProjectedHistory {
                             "encrypted or obsolete ciphertext cannot be admitted as plaintext"
                         );
                         imports.add(oid, &parents[oid]);
+                        let public = if let Some(response) = config {
+                            let mut published = metadata.clone();
+                            if published
+                                .session_privacy
+                                .as_ref()
+                                .is_some_and(|privacy| privacy.scheme != SessionScheme::Plain)
+                            {
+                                published.session_privacy = Some(response.config.privacy.clone());
+                            }
+                            if metadata.session_privacy == published.session_privacy
+                                && public_parents == parents[oid]
+                            {
+                                oid.clone()
+                            } else {
+                                plain_commit(
+                                    &source,
+                                    &repo,
+                                    oid,
+                                    &public_parents,
+                                    Some(&published),
+                                )?
+                            }
+                        } else if public_parents != parents[oid] {
+                            plain_commit(&source, &repo, oid, &public_parents, None)?
+                        } else {
+                            oid.clone()
+                        };
+                        plain_rewrites.insert(oid.clone());
                         let snapshot = match config {
                             None => PublishedSnapshot::FileLine {
-                                commit: oid.clone(),
+                                commit: public.clone(),
                             },
                             Some(response) => PublishedSnapshot::Plain {
-                                commit: oid.clone(),
+                                commit: public.clone(),
                                 session_id: metadata.session.clone(),
                                 config_revision: response.config.revision,
                             },
                         };
-                        snapshots.insert(oid.clone(), snapshot);
+                        snapshots.insert(public.clone(), snapshot);
+                        let rewritten = public != *oid;
                         mapped.insert(
                             oid.clone(),
                             accepted::Mapping {
                                 source: oid.clone(),
-                                public: oid.clone(),
+                                public,
                                 source_parents: parents[oid].clone(),
                                 public_parents,
                                 store: store.clone(),
@@ -369,6 +455,7 @@ impl ProjectedHistory {
                                 public_session: metadata.session,
                                 policy: policy_digest.clone(),
                                 recipient: None,
+                                plain: rewritten,
                             },
                         );
                         continue;
@@ -500,6 +587,7 @@ impl ProjectedHistory {
                             public_session,
                             policy: policy_digest.clone(),
                             recipient: Some(binding.owner_key.fingerprint()?),
+                            plain: false,
                         },
                     );
                     reports.push(projection.report().clone());
@@ -575,6 +663,91 @@ impl ProjectedHistory {
             _lock: lock,
         })
     }
+}
+
+/// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
+fn plain_commit(
+    source: &Repo,
+    destination: &Repo,
+    oid: &str,
+    parents: &[String],
+    metadata: Option<&Meta>,
+) -> Result<String> {
+    fn replace(
+        source: &Repo,
+        destination: &Repo,
+        tree: &str,
+        parts: &[&str],
+        blob: &str,
+    ) -> Result<String> {
+        let entries = source.git_bytes_result(&["ls-tree", "-z", tree])?;
+        let mut output = Vec::new();
+        let mut found = false;
+        for entry in entries
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let separator = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("invalid plain tree entry")?;
+            if &entry[separator + 1..] == parts[0].as_bytes() {
+                found = true;
+                let header = std::str::from_utf8(&entry[..separator])?;
+                let fields: Vec<_> = header.split(' ').collect();
+                ensure!(fields.len() == 3, "invalid plain tree entry");
+                let replacement = if parts.len() == 1 {
+                    ensure!(
+                        fields[0] == "100644" && fields[1] == "blob",
+                        "session metadata must be a regular file"
+                    );
+                    blob.to_owned()
+                } else {
+                    ensure!(
+                        fields[0] == "040000" && fields[1] == "tree",
+                        "session metadata parent must be a directory"
+                    );
+                    replace(source, destination, fields[2], &parts[1..], blob)?
+                };
+                output.extend_from_slice(
+                    format!("{} {} {}\t", fields[0], fields[1], replacement).as_bytes(),
+                );
+                output.extend_from_slice(&entry[separator + 1..]);
+            } else {
+                output.extend_from_slice(entry);
+            }
+            output.push(0);
+        }
+        ensure!(found, "plain publication metadata path is missing");
+        // Source objects are imported in a batch before this publication becomes inspectable.
+        input(destination, &["mktree", "-z", "--missing"], &output)
+    }
+    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+    let tree = source.git(&["rev-parse", &format!("{oid}^{{tree}}")])?;
+    let tree = if let Some(metadata) = metadata {
+        let mut value: serde_json::Value = serde_json::from_slice(&read(
+            source,
+            &["cat-file", "blob", &format!("{oid}:{}", meta::FILE)],
+            1024 * 1024,
+        )?)?;
+        value["session_privacy"] = serde_json::to_value(&metadata.session_privacy)?;
+        value["session"] = json!(metadata.session);
+        let blob = write_object(destination, "blob", &serde_json::to_vec(&value)?)?;
+        replace(
+            source,
+            destination,
+            &tree,
+            &meta::FILE.split('/').collect::<Vec<_>>(),
+            &blob,
+        )?
+    } else {
+        tree
+    };
+    write_object(
+        destination,
+        "commit",
+        &commit_body(&tree, parents, &original)?,
+    )
 }
 
 const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -799,7 +972,7 @@ fn retain_tags(
             .collect::<Vec<_>>();
         ensure!(
             !mappings.is_empty() && mappings.iter().all(|entry| entry.public == commit),
-            "custom tag {} points to rewritten encrypted history; remove it from the source or recreate it on the accepted public commit",
+            "custom tag {} points to rewritten publication history; remove it from the source or recreate it on the accepted public commit",
             tag.name()
         );
         if let Some(previous) = references.insert(tag.name().to_owned(), tag.oid().to_owned()) {
@@ -909,6 +1082,10 @@ impl ProjectedHistory {
                 policy_digest: None,
                 recipient: None,
             };
+            if receipt.source != receipt.published {
+                receipt.version = 3;
+                receipt.mode = PublicationMode::SessionPlain;
+            }
             let object = format!("{}:privacy/envelope.json", candidate.public_head);
             if self.repo.git(&["cat-file", "-e", &object]).is_ok() {
                 let bytes = read(

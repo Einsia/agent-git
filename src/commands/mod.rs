@@ -1462,7 +1462,7 @@ pub enum Commands {
     Activity(Box<activity::Args>),
     /// Create a read-only link to a conversation
     Share(share::Args),
-    /// Configure and preview the device-local privacy allowlist
+    /// Choose session publication modes, manage original access, and configure privacy policy
     Privacy(privacy::Args),
     /// Pull requests: create / list / show / fetch / merge
     Pr(pr::Args),

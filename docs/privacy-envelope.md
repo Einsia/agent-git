@@ -6,6 +6,14 @@ New sessions record their creator locally and default to session encryption. Exi
 sessions retain their accepted history. Missing configuration, unavailable keys, and failed
 requests cannot authorize plaintext publication for an encrypted session.
 
+Before remote registration, the creator can select `plain` with
+`agit privacy mode OWNER/REPO@BRANCH plain`. The authenticated local choice is scoped to the
+Hub, destination and logical session, and is bound to the immutable repository ID before
+registration. A registered mode always wins and conflicts refuse publication. Native source
+commits remain unchanged; initially plain publication normalizes encrypted birth metadata in
+generated commits, retaining event bytes and native attribution. Accepted mappings preserve
+these public commits on retries. No key-service failure can select this path implicitly.
+
 ## Envelope and exact snapshot identity
 
 `domain::privacy_envelope::PrivacyEnvelope` supports format version `2`. Each snapshot uses
@@ -265,7 +273,9 @@ remove inherited `AGIT_YES`. Each attempt resolves registered session authority 
 and checks captured content again. Enrollment and publication settings remain device-local.
 
 Local ordinary receipts use version `2` and preserve source/public identity. Encrypted receipts
-use version `3`, explicit `session_owner_v2`, and a complete accepted snapshot. Retained object
+use version `3`, explicit `session_owner_v2`, and a complete accepted snapshot. Generated plain
+receipts use version `3` and `session_plain`, retain the logical session ID, and carry no key or
+encrypted-snapshot binding. Retained object
 lookup requires an authenticated ledger mapping and isolated storage; current branch tips do
 not substitute for saved publication identity.
 

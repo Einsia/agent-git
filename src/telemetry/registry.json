@@ -69,6 +69,7 @@
     "privacy access revoke": {"aliases":[],"args":{"member":{"action":"Set","policy":"presence"},"target":{"action":"Set","policy":"presence"}}},
     "privacy access show": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "privacy access stop": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
+    "privacy mode": {"aliases":[],"args":{"mode":{"action":"Set","policy":"enum","values":["plain","encrypted"]},"target":{"action":"Set","policy":"presence"}}},
     "privacy policy": {"aliases":[],"args":{}},
     "privacy policy add-external": {"aliases":[],"args":{"exclude":{"action":"Append","policy":"count"},"include":{"action":"Append","policy":"count"},"label":{"action":"Set","policy":"presence"},"path":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},
     "privacy policy allow-memory": {"aliases":[],"args":{"pattern":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},

@@ -19,10 +19,14 @@ pub mod outbox;
 #[serde(rename_all = "snake_case")]
 pub enum PublicationMode {
     Ordinary,
+    SessionPlain,
     SessionOwnerV2,
 }
 
 impl PublicationMode {
+    pub fn uses_generated_history(&self) -> bool {
+        *self != Self::Ordinary
+    }
     pub fn is_encrypted(&self) -> bool {
         *self == Self::SessionOwnerV2
     }
@@ -35,6 +39,10 @@ impl PublicationMode {
         recipient: Option<&str>,
     ) -> Result<()> {
         match self {
+            Self::SessionPlain => ensure!(
+                version == 3 && policy.is_none() && recipient.is_none(),
+                "plain session receipt must not carry encrypted bindings"
+            ),
             Self::SessionOwnerV2 => {
                 ensure!(version == 3, "unsupported session-owner receipt version");
                 super::privacy_envelope::validate_digest(
@@ -77,7 +85,7 @@ pub struct PublicationReceipt {
 impl PublicationReceipt {
     pub(crate) fn session_id(&self, repo: &Repo) -> Result<String> {
         self.validate()?;
-        if self.mode.is_encrypted() {
+        if self.mode.uses_generated_history() {
             return super::privacy_git::receipt_session_id(repo, self);
         }
         let metadata = storage::metadata_local(repo.root(), &self.published)?;
@@ -90,7 +98,7 @@ impl PublicationReceipt {
 
     pub(crate) fn ancestors(&self, repo: &Repo) -> Result<std::collections::BTreeSet<String>> {
         self.validate()?;
-        if self.mode.is_encrypted() {
+        if self.mode.uses_generated_history() {
             super::privacy_git::receipt_ancestors(repo, self)
         } else {
             super::repo::publication::raw_ancestors(repo, &self.published)
@@ -127,8 +135,12 @@ impl PublicationReceipt {
             );
         }
         ensure!(
-            self.mode.is_encrypted() || self.source == self.published,
+            self.mode.uses_generated_history() || self.source == self.published,
             "ordinary publication must retain the source commit identity"
+        );
+        ensure!(
+            self.mode != PublicationMode::SessionPlain || self.projected_session_id.is_some(),
+            "plain session receipt requires its logical session identity"
         );
         crate::domain::repo::valid_branch_name(&self.branch)?;
         validate_repository(&self.repository)?;
@@ -477,6 +489,14 @@ mod tests {
         );
         let mut mismatched = ordinary.clone();
         mismatched.published = "b".repeat(40);
+        assert!(mismatched.validate().is_err());
+        mismatched.mode = PublicationMode::SessionPlain;
+        mismatched.version = 3;
+        assert!(mismatched.validate().is_err());
+        mismatched.projected_session_id = Some(format!("agit-{}", "c".repeat(40)));
+        mismatched.validate().unwrap();
+        mismatched.policy_digest =
+            Some(super::super::privacy_envelope::digest_bytes(b"unexpected"));
         assert!(mismatched.validate().is_err());
         mismatched = ordinary.clone();
         mismatched.recipient = Some("invented-recipient".into());

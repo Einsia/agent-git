@@ -105,7 +105,7 @@ impl Client {
     pub fn session_account(&self) -> Result<AccountIdentity> {
         ensure!(
             self.checked_access_token()?.is_some(),
-            "sign in before publishing an encrypted session"
+            "sign in before managing session publication"
         );
         let account = match self
             .credential_snapshot()

@@ -23,6 +23,8 @@ pub(super) struct Mapping {
     /// Cloned accepted ciphertext can outlive access to its public-key fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -161,10 +163,15 @@ impl Ledger {
             return Ok(None);
         };
         ensure!(
-            receipt.mode.is_encrypted()
-                && ((Some(entry.policy.as_str()) == receipt.policy_digest.as_deref()
-                    && entry.recipient.as_deref() == receipt.recipient.as_deref())
-                    || (receipt.session_snapshot.is_some() && entry.source == entry.public)),
+            (receipt.mode == crate::domain::privacy_receipt::PublicationMode::SessionPlain
+                && entry.plain
+                && entry.recipient.is_none()
+                && entry.source_session == entry.public_session
+                && Some(&entry.public_session) == receipt.projected_session_id.as_ref())
+                || receipt.mode.is_encrypted()
+                    && ((Some(entry.policy.as_str()) == receipt.policy_digest.as_deref()
+                        && entry.recipient.as_deref() == receipt.recipient.as_deref())
+                        || (receipt.session_snapshot.is_some() && entry.source == entry.public)),
             "retained publication scope differs from its authenticated mapping"
         );
         Ok(Some(&entry.store))
@@ -285,11 +292,17 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
             );
         }
         super::super::privacy_envelope::validate_digest(&entry.policy)?;
+        if entry.plain {
+            ensure!(
+                entry.recipient.is_none() && entry.source_session == entry.public_session,
+                "plain mapping cannot change session authority or carry an encryption recipient"
+            );
+        }
         if let Some(recipient) = &entry.recipient {
             super::super::privacy_envelope::validate_digest(recipient)?;
         } else {
             ensure!(
-                entry.source == entry.public,
+                entry.source == entry.public || entry.plain,
                 "a newly encrypted mapping requires its publishing recipient"
             );
         }
@@ -298,6 +311,9 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
 }
 
 fn compatible_recipient(left: &Mapping, right: &Mapping) -> bool {
+    if left.plain != right.plain {
+        return false;
+    }
     match (&left.recipient, &right.recipient) {
         (Some(left), Some(right)) => left == right,
         _ => true,
