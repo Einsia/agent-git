@@ -30,6 +30,7 @@ mod publication_http;
 mod startup_cache;
 
 const AGENT_ID: &str = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7";
+const TRANSPORT_USER_AGENT: &str = "synthetic-publisher-transport";
 
 struct Hub {
     base: String,
@@ -120,6 +121,7 @@ impl Hub {
                 let target = words.next().unwrap();
                 let mut length = 0;
                 let mut content_type = String::new();
+                let mut user_agent = String::new();
                 let mut authenticated = false;
                 let mut receipt_id = None;
                 let mut receiver_scope = None;
@@ -135,6 +137,9 @@ impl Hub {
                     }
                     if let Some(value) = lower.strip_prefix("content-type:") {
                         content_type = value.trim().to_owned();
+                    }
+                    if let Some(value) = lower.strip_prefix("user-agent:") {
+                        user_agent = value.trim().to_owned();
                     }
                     assert!(
                         !lower.starts_with("transfer-encoding:"),
@@ -353,6 +358,7 @@ impl Hub {
                         "unexpected request: {first}"
                     );
                     if method == "POST" && target.ends_with("/git-receive-pack") {
+                        assert_eq!(user_agent, TRANSPORT_USER_AGENT);
                         let receipt: serde_json::Value = pending_receipt
                             .take()
                             .expect("receive needs a single-use confirmation");
@@ -496,6 +502,7 @@ fn assert_success(out: &Output) {
 }
 
 /// Creation and Git receive require consent and exact receipts; retries preserve session authority.
+/// Projected Git uploads use the publisher's configured transport preferences.
 /// Explicit plain selection survives renames and retries without changing source history or other sessions.
 #[test]
 fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retries() {
@@ -551,6 +558,8 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         command.output().unwrap()
     };
     let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
     repo.git(&["config", "user.name", "Source Writer"]).unwrap();
     repo.git(&["config", "user.email", "source@example.invalid"])
         .unwrap();

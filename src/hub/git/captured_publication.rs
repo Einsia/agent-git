@@ -202,7 +202,18 @@ impl CapturedPublication {
         advertised: Option<crate::hub::git::RemoteRefs>,
     ) -> Result<Self> {
         let source = Source::new(projected.repo())?;
-        let mut git = GitContent::capture_for(&source, projected.plan(), target, advertised)?;
+        let advertised = target.and_then(|(url, identity)| {
+            let refs = match advertised {
+                Some(refs) => refs,
+                None => FrozenPublication::advertised_refs_for(policy_repo, url, identity)?,
+            };
+            Some(AdvertisedBaseline {
+                url: url.into(),
+                identity: identity.clone(),
+                refs,
+            })
+        });
+        let mut git = GitContent::capture_advertised(&source, projected.plan(), advertised)?;
         git.lfs_objects = super::lfs_cache::capture(&Source::new(policy_repo)?);
         Self::stage(
             policy_repo,
@@ -379,22 +390,24 @@ impl CapturedPublication {
         canonical_url: &str,
         identity: &RemoteIdentity,
     ) -> Result<PreparedPublication> {
-        self.bind(repo, canonical_url, identity, None)
+        self.bind(repo, repo, canonical_url, identity, None)
     }
 
     pub(super) fn bind_destination_with_client(
         self,
         repo: &Repo,
+        transport_repo: &Repo,
         canonical_url: &str,
         identity: &RemoteIdentity,
         client: crate::hub::Client,
     ) -> Result<PreparedPublication> {
-        self.bind(repo, canonical_url, identity, Some(client))
+        self.bind(repo, transport_repo, canonical_url, identity, Some(client))
     }
 
     fn bind(
         self,
         repo: &Repo,
+        transport_repo: &Repo,
         canonical_url: &str,
         identity: &RemoteIdentity,
         client: Option<crate::hub::Client>,
@@ -411,7 +424,9 @@ impl CapturedPublication {
             git,
             source,
         } = self;
-        let source = Source::at(repo, source.environment)?;
+        let content = Source::at(repo, source.environment.clone())?;
+        git.attach(&content)?;
+        let source = Source::at(transport_repo, source.environment)?;
         let (url, client) = match client {
             Some(client) => FrozenPublication::destination_with_client(
                 &source,
@@ -421,7 +436,6 @@ impl CapturedPublication {
             )?,
             None => FrozenPublication::destination(&source, canonical_url, identity)?,
         };
-        git.attach(&source)?;
         let mut publication = FrozenPublication::from_captured(
             source,
             git,

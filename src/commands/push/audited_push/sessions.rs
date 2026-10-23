@@ -268,8 +268,9 @@ pub(super) fn run(
         selection.bind(&repo, &remote.identity)?;
     }
     projected.verify_source(&repo)?;
-    let prepared = complete.bind_destination_with_client(
+    let prepared = complete.bind_projected_destination_with_client(
         projected.repo(),
+        &repo,
         &remote.push_url,
         &remote.identity,
         client,

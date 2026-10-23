@@ -16,9 +16,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-pub const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ENVELOPE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PUBLIC_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PRIVATE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PRIVATE_BYTES: usize = 64 * 1024 * 1024;
 const AES_ALGORITHM: &str = "aes-256-gcm";
 const WRAP_ALGORITHM: &str = "x25519-sealed-box";
 
@@ -541,6 +541,49 @@ mod tests {
         tampered = parsed;
         tampered.private_payload.wrapped_keys[0].recipient = "another-viewer".into();
         assert!(tampered.open(&secret).is_err());
+    }
+
+    /// Large originals retain both sequences across layer, envelope and decryption bounds.
+    #[test]
+    fn large_session_originals_round_trip_with_both_sequences() {
+        let (sample, secret) = sample();
+        let binding = sample.session_binding.unwrap();
+        let metadata = super::super::meta::Meta::new(
+            binding.session_id.clone(),
+            "codex".into(),
+            "/synthetic/workspace".into(),
+        );
+        let native = serde_json::json!({"type":"message", "content":"x".repeat(4 * 1024 * 1024)});
+        let log =
+            super::super::transcript::wrap_lines(&native.to_string(), "codex", &binding.session_id);
+        let layer = PrivateLayer::new(
+            &log,
+            &log,
+            serde_json::to_value(metadata).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&layer).unwrap();
+        let recipient = ViewingRecipient::from_base64(
+            binding.owner_key.recipient_id().unwrap(),
+            &STANDARD.encode(secret.public_key().as_bytes()),
+        )
+        .unwrap();
+        let envelope = PrivacyEnvelope::seal_session(
+            sample.policy_digest,
+            sample.public_projection,
+            &bytes,
+            &recipient,
+            binding,
+        )
+        .unwrap();
+        let parsed = PrivacyEnvelope::parse(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let restored: PrivateLayer =
+            serde_json::from_slice(&parsed.open(&secret).unwrap()).unwrap();
+        restored.validate().unwrap();
+        let (restored_log, restored_view) = restored.session_bytes().unwrap();
+        assert_eq!(*restored_log, log);
+        assert_eq!(*restored_view, log);
     }
 
     #[test]

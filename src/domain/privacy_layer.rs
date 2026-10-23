@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const PRIVATE_LAYER_VERSION: u32 = 1;
-const MAX_LAYER_BYTES: usize = 4 * 1024 * 1024 - 16;
+const MAX_LAYER_BYTES: usize = super::privacy_envelope::MAX_PRIVATE_BYTES - 16;
 
 #[cfg(feature = "cli")]
 pub(crate) use super::transcript::recovery::{EVIDENCE_FIELD, EVIDENCE_PREFIX, EvidenceReference};
@@ -273,17 +273,16 @@ mod tests {
     use super::*;
     use crate::domain::transcript;
 
-    /// Oversized input is rejected before Base64 copies or parsing an invalid session body.
+    /// Both encoded sequences share the allocation budget; overflow cannot bypass it.
     #[test]
-    fn private_session_budget_precedes_encoding_and_parsing() {
+    fn private_session_budget_accounts_for_both_encoded_sequences() {
+        assert!(PrivateLayer::check_session_size(5 * 1024 * 1024, 5 * 1024 * 1024).is_ok());
+        let boundary = MAX_LAYER_BYTES / 4 * 3;
+        assert!(PrivateLayer::check_session_size(boundary, 0).is_ok());
+        assert!(PrivateLayer::check_session_size(boundary + 1, 0).is_err());
+        assert!(PrivateLayer::check_session_size(boundary, boundary).is_err());
         assert!(PrivateLayer::check_session_size(usize::MAX, 1).is_err());
-        let source = "x".repeat(MAX_LAYER_BYTES);
-        let error = PrivateLayer::new(&source, &source, Value::Null, BTreeMap::new()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("private session exceeds the envelope budget")
-        );
+        assert!(PrivateLayer::check_session_size(0, usize::MAX).is_err());
     }
 
     #[test]

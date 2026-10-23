@@ -230,9 +230,26 @@ impl CompleteContentInspection {
         identity: &RemoteIdentity,
         client: crate::hub::Client,
     ) -> anyhow::Result<CompleteInspection> {
-        let prepared =
-            self.captured
-                .bind_destination_with_client(repo, canonical_url, identity, client)?;
+        self.bind_projected_destination_with_client(repo, repo, canonical_url, identity, client)
+    }
+
+    /// Generated objects use the publisher's transport preferences and repository identity pin.
+    /// The generated object store must not replace the publisher's configuration authority.
+    pub fn bind_projected_destination_with_client(
+        self,
+        repo: &Repo,
+        transport_repo: &Repo,
+        canonical_url: &str,
+        identity: &RemoteIdentity,
+        client: crate::hub::Client,
+    ) -> anyhow::Result<CompleteInspection> {
+        let prepared = self.captured.bind_destination_with_client(
+            repo,
+            transport_repo,
+            canonical_url,
+            identity,
+            client,
+        )?;
         Ok(CompleteInspection {
             prepared,
             report: self.report,

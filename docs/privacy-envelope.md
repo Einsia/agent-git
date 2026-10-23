@@ -101,9 +101,11 @@ snapshot, allowing later local settlement to protect recovered values without im
 source dictionary's key, rule names or allowances.
 
 Input budgets bound snapshot sequences and metadata before selection and encoding. The final
-serialized original layer must fit within 4 MiB minus the authentication tag; the complete
-envelope must fit within 8 MiB. Oversized input fails before upload. Referenced paths never
-cause independent file or attachment bodies to be collected.
+serialized original layer must fit within 64 MiB minus the authentication tag; the complete
+envelope must fit within 128 MiB. The original layer stores complete Base64-encoded LOG and VIEW
+sequences, so both contribute to its budget even when their records overlap. Oversized input
+fails before upload. Referenced paths never cause independent file or attachment bodies to be
+collected.
 
 `agit privacy unlock OWNER/REPO@REF --workspace DIRECTORY` installs validated local recovery
 under `<git-common-dir>/agit/privacy-recovery/<commit>` without changing branch refs. A caller
