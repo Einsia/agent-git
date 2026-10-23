@@ -1130,4 +1130,88 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             "{refused:?}"
         );
     }
+
+    // A publication restores repeated events across worker batches from one retained dictionary.
+    use agit::domain::privacy::{
+        dictionary::{Origin, Record},
+        keys,
+        storage::Store,
+    };
+    let owner = keys::owner(&hub.base, "account-1").unwrap();
+    let mut dictionary = Store::open(
+        &keys::owner_directory(&home.join("privacy"), &owner).join("dictionary"),
+        Some(owner),
+    )
+    .unwrap();
+    let secret = "AKIA2E7YQXK4NMZ5VJ3T";
+    let record = Record::new(&dictionary.dictionary_id, secret, Origin::RepositoryUser).unwrap();
+    dictionary
+        .append(std::slice::from_ref(&record), None)
+        .unwrap();
+    repo.git(&["checkout", "-b", "hydrated", &base]).unwrap();
+    let mut hydrated_meta = meta::Meta::new(
+        format!("agit-{}", "f".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    hydrated_meta.session_privacy = Some(
+        SessionPrivacy::new(Some(AccountIdentity::new(&hub.base, "account-1").unwrap())).unwrap(),
+    );
+    let repeated = transcript::wrap_lines(
+        &json!({"type":"user","message":{"role":"user","content":record.token}}).to_string(),
+        "claude-code",
+        &hydrated_meta.session,
+    );
+    let padding = transcript::wrap_lines(
+        &json!({"type":"user","message":{"role":"user","content":"padding ".repeat(20_000)}})
+            .to_string(),
+        "claude-code",
+        &hydrated_meta.session,
+    );
+    let log = format!("{repeated}{padding}{repeated}");
+    let view = repeated.repeat(2);
+    storage::write_snapshot(repo.root(), &log, &view).unwrap();
+    meta::write(repo.root(), &hydrated_meta).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Protected repeated events").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@hydrated"], false));
+    let restored = envelope(&git(&remote, &["rev-parse", "refs/heads/hydrated"]))
+        .open_layer(&rotated)
+        .unwrap();
+    let (restored_log, restored_view) = restored.session_bytes().unwrap();
+    let records = storage::parse_envelopes(&restored_log).unwrap();
+    assert_eq!(records[0].content["message"]["content"], secret);
+    assert_eq!(records[0].content, records[2].content);
+    assert_eq!(
+        *restored_view,
+        storage::envelope_line(&records[0]).repeat(2)
+    );
+    assert!(restored.protected_values.contains(secret));
+    assert_eq!(
+        storage::materialize_worktree(repo.root(), meta::LOG_FILE).unwrap(),
+        log
+    );
+
+    let missing = Record::new(
+        &dictionary.dictionary_id,
+        "missing original",
+        Origin::RepositoryUser,
+    )
+    .unwrap();
+    let unknown = transcript::wrap_lines(
+        &json!({"type":"user","message":{"role":"user","content":missing.token}}).to_string(),
+        "claude-code",
+        &hydrated_meta.session,
+    );
+    storage::write_snapshot(repo.root(), &unknown, &unknown).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Unavailable original").unwrap();
+    let received = hub.posts.load(Ordering::Acquire);
+    let refused = run(&["--yes", "push", "alice/app@hydrated"], false);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("publication hydration is incomplete"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), received);
 }

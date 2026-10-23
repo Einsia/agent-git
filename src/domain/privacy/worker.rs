@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const WORKER: &str = "__privacy-worker-v1";
 pub(crate) const SYNC: &str = "__privacy-sync-v1";
@@ -124,7 +124,7 @@ fn stamp(repo: Option<&Path>) -> Vec<(u64, Option<std::time::SystemTime>)> {
         .collect()
 }
 
-fn hydrate(request: &Request) -> crate::Result<Outcome> {
+fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
     let root = keys::root()?;
     let hub = crate::infra::config::hub_url();
     let credential = crate::infra::credentials::load(&hub);
@@ -147,7 +147,7 @@ fn hydrate(request: &Request) -> crate::Result<Outcome> {
         Ok(())
     })();
     complete &= stored.is_ok();
-    if let Some(repo) = &request.repo {
+    if let Some(repo) = repo {
         let legacy = crate::domain::secret_filter::RepositoryDictionary::open(repo)
             .and_then(|dictionary| dictionary.privacy_snapshot());
         match legacy {
@@ -159,14 +159,88 @@ fn hydrate(request: &Request) -> crate::Result<Outcome> {
             Err(_) => complete = false,
         }
     }
-    let mut projector = Projector {
+    Ok(Projector {
         store: storage::Store::empty()?,
         dictionary,
         policy: policy::Snapshot::compile(&[], &[], false)?,
         key: None,
         complete,
-    };
-    Ok(projector.transform(&request.text, request.mode))
+    })
+}
+
+fn hydrate(request: &Request) -> crate::Result<Outcome> {
+    Ok(hydration_projector(request.repo.as_deref())?.transform(&request.text, request.mode))
+}
+
+struct FrozenHydration {
+    repo: Option<PathBuf>,
+    preserve_protocol_ids: bool,
+    projector: Projector,
+    used_values: std::collections::BTreeSet<String>,
+}
+
+impl Drop for FrozenHydration {
+    fn drop(&mut self) {
+        for mut value in std::mem::take(&mut self.used_values) {
+            value.zeroize();
+        }
+    }
+}
+
+thread_local! {
+    static FROZEN_HYDRATION: std::cell::RefCell<Option<FrozenHydration>> = const { std::cell::RefCell::new(None) };
+}
+
+fn frozen_hydration(request: &Request) -> crate::Result<Outcome> {
+    FROZEN_HYDRATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if matches!(request.mode, Mode::FreezeHydration) {
+            *slot = None;
+            let preserve_protocol_ids: bool = serde_json::from_str(&request.text)?;
+            let projector = hydration_projector(request.repo.as_deref())?;
+            ensure!(projector.complete, "publication dictionary is incomplete");
+            *slot = Some(FrozenHydration {
+                repo: request.repo.clone(),
+                preserve_protocol_ids,
+                projector,
+                used_values: Default::default(),
+            });
+        } else {
+            let frozen = slot
+                .as_mut()
+                .context("publication dictionary is not frozen")?;
+            ensure!(
+                frozen.repo == request.repo,
+                "publication dictionary belongs to another repository"
+            );
+            if matches!(request.mode, Mode::HydrateFrozenJsonl) {
+                for (_, _, token) in super::projector::tokens(&request.text) {
+                    if let Some(record) = frozen.projector.dictionary.get(token) {
+                        frozen.used_values.insert(record.original.clone());
+                    }
+                }
+                return Ok(frozen
+                    .projector
+                    .hydrate_frozen(&request.text, frozen.preserve_protocol_ids));
+            }
+        }
+        Ok(Outcome {
+            content: if matches!(request.mode, Mode::HydrationValues) {
+                serde_json::to_string(
+                    &slot
+                        .as_ref()
+                        .context("publication dictionary is not frozen")?
+                        .used_values,
+                )?
+            } else {
+                "true".into()
+            },
+            status: super::projector::Status::Complete,
+            replacements: 0,
+            unresolved: 0,
+            consumed: None,
+        })
+    })
 }
 
 fn status() -> crate::Result<Outcome> {
@@ -205,6 +279,12 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         request.text.len() <= super::projector::MAX_UNIT_BYTES,
         "privacy input exceeds its byte budget"
     );
+    if matches!(
+        request.mode,
+        Mode::FreezeHydration | Mode::HydrateFrozenJsonl | Mode::HydrationValues
+    ) {
+        return frozen_hydration(request);
+    }
     if matches!(request.mode, Mode::ProjectPublication) {
         return super::super::privacy_publication::project_worker(
             request.repo.as_deref(),
@@ -387,6 +467,15 @@ fn serve(clock: Instant, deadline: &AtomicU64) -> crate::Result<()> {
         let bytes = read_frame(&mut input)?;
         deadline.store(clock.elapsed().as_millis() as u64 + 3000, Ordering::Release);
         let request: Request = serde_json::from_slice(&bytes)?;
+        if matches!(
+            request.mode,
+            Mode::FreezeHydration | Mode::HydrateFrozenJsonl | Mode::HydrationValues
+        ) {
+            deadline.store(
+                clock.elapsed().as_millis() as u64 + 30_000,
+                Ordering::Release,
+            );
+        }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             execute(&request, &mut loaded)
         }))

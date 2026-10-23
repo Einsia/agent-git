@@ -17,6 +17,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Encrypted publication restores originals against a frozen dictionary across all batches and
+  resolves evidence references independently of LOG order. Repeated events no longer fail with
+  "hydration has ambiguous evidence provenance" after partial foreground hydration or forward
+  evidence references; unavailable mappings stop preparation before upload.
+
+- Raise the sanitized public projection budget to 64 MiB to match the private ciphertext budget,
+  so large session displays can be published alongside their encrypted originals. The complete
+  envelope remains bounded to 128 MiB.
+
 - `agit push` previews session branches with a long plain history instead of failing with
   "plain preview exceeds its content budget", and prepares them substantially faster. The
   preview shows each distinct file version once and an append-only file as the bytes it adds.

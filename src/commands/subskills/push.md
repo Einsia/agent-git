@@ -128,10 +128,14 @@ binary content is summarized, and unchanged accepted pointers outside the upload
 A missing or unverifiable baseline requires full inspection. Unavailable payloads block publication.
 
 Local privacy processing applies path aliases, omissions, replacements and secret protection before
-encrypted public bytes are prepared. The processing worker can return partial results or skip
+encrypted public bytes are prepared. Optional display processing can return partial results or skip
 unavailable work. Session authority, source identity, ciphertext integrity and publication receipts
 remain required independently of privacy findings. Dictionary synchronization runs independently.
 Use `agit secrets review` or `agit scan` for explicit diagnostics.
+
+Original recovery during encrypted publication must complete against a frozen local dictionary.
+Missing mappings, hydration timeouts or worker failure stop preparation before upload; do not
+work around these errors by dropping records or substituting a partially restored transcript.
 
 Manual encrypted publication requires confirmation of the prepared preview; `--yes` supplies it
 for an unattended invocation. Plain-only publication can proceed without a prompt when no terminal

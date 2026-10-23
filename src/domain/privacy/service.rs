@@ -169,6 +169,113 @@ fn shared() -> &'static Mutex<State> {
     &STATE
 }
 
+/// Explicit publication needs one frozen dictionary and complete results, not foreground fallback.
+pub(crate) struct PublicationHydrator {
+    process: Process,
+    repo: std::path::PathBuf,
+    started: Instant,
+}
+
+impl PublicationHydrator {
+    pub fn new(repo: &Path, preserve_protocol_ids: bool) -> crate::Result<Self> {
+        let mut session = Self {
+            process: Process::start()?,
+            repo: repo.to_owned(),
+            started: Instant::now(),
+        };
+        let frozen = session.request(
+            if preserve_protocol_ids {
+                "true"
+            } else {
+                "false"
+            },
+            Mode::FreezeHydration,
+        )?;
+        ensure!(
+            frozen.content == "true",
+            "publication dictionary could not be frozen"
+        );
+        Ok(session)
+    }
+
+    fn request(&mut self, text: &str, mode: Mode) -> crate::Result<Outcome> {
+        let remaining = Duration::from_secs(120)
+            .saturating_sub(self.started.elapsed())
+            .min(Duration::from_secs(25));
+        ensure!(
+            !remaining.is_zero(),
+            "publication hydration timed out; retry before publishing"
+        );
+        let outcome = self.process.request(Some(&self.repo), text, mode, remaining)
+            .context("publication hydration failed; restore the source dictionary or retry before publishing")?;
+        ensure!(
+            outcome.status == Status::Complete && outcome.unresolved == 0,
+            "publication hydration is incomplete; restore the source dictionary or unlock the original publication"
+        );
+        Ok(outcome)
+    }
+
+    pub fn jsonl(&mut self, text: &str) -> crate::Result<Zeroizing<String>> {
+        let mut output = Zeroizing::new(String::new());
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let mut end = cursor;
+            for line in text[cursor..].split_inclusive('\n') {
+                if end > cursor && end + line.len() - cursor > BATCH_BYTES {
+                    break;
+                }
+                end += line.len();
+                if end - cursor >= BATCH_BYTES {
+                    break;
+                }
+            }
+            ensure!(
+                end - cursor <= MAX_UNIT_BYTES,
+                "publication event exceeds the hydration byte budget"
+            );
+            let outcome = self.request(&text[cursor..end], Mode::HydrateFrozenJsonl)?;
+            validate(&text[cursor..end], &outcome, Mode::HydrateJsonl)?;
+            crate::domain::privacy_layer::PrivateLayer::check_session_size(
+                output
+                    .len()
+                    .checked_add(outcome.content.len())
+                    .context("publication hydration size overflow")?,
+                0,
+            )?;
+            output.push_str(&outcome.content);
+            cursor = end;
+        }
+        Ok(output)
+    }
+
+    pub fn metadata(&mut self, metadata: &mut crate::domain::meta::Meta) -> crate::Result<()> {
+        let fields = observation_fields(metadata);
+        let input = Zeroizing::new(serde_json::to_string(&fields)?);
+        let hydrated = self.jsonl(&input)?;
+        let values: Vec<String> = serde_json::from_str(&hydrated)?;
+        ensure!(
+            fields.len() == values.len(),
+            "publication hydration changed metadata fields"
+        );
+        for (field, value) in fields.into_iter().zip(values) {
+            *field = value;
+        }
+        Ok(())
+    }
+
+    pub fn used_values(&mut self) -> crate::Result<std::collections::BTreeSet<String>> {
+        let values = Zeroizing::new(self.request("", Mode::HydrationValues)?.content);
+        Ok(serde_json::from_str(&values)?)
+    }
+}
+
+impl Drop for PublicationHydrator {
+    fn drop(&mut self) {
+        self.process.terminate();
+        let _ = self.process.child.wait();
+    }
+}
+
 /// One bounded attempt per operation; lock contention immediately uses the caller's input.
 pub fn transform(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

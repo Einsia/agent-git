@@ -96,14 +96,20 @@ source attribution.
 
 Before sealing, publication hydrates local secret placeholders from a frozen dictionary,
 rebuilds event hashes and evidence references, and validates the complete original. Missing
-secret mappings refuse encryption. `protected_values` contains only literals used in this
+secret mappings refuse encryption. Publication uses a dedicated hydration worker with one
+dictionary snapshot across LOG and metadata batches. Partial results, unavailable workers and
+timeouts stop preparation before upload; foreground privacy fallback cannot supply an original.
+Evidence references resolve in dependency order, so repeated events and forward references
+retain one restored identity while LOG and VIEW preserve their order and multiplicity.
+`protected_values` contains only literals used in this
 snapshot, allowing later local settlement to protect recovered values without importing the
 source dictionary's key, rule names or allowances.
 
 Input budgets bound snapshot sequences and metadata before selection and encoding. The final
-serialized original layer must fit within 64 MiB minus the authentication tag; the complete
-envelope must fit within 128 MiB. The original layer stores complete Base64-encoded LOG and VIEW
-sequences, so both contribute to its budget even when their records overlap. Oversized input
+serialized original layer must fit within 64 MiB minus the authentication tag. The canonical JSON
+public projection has a separate 64 MiB limit. The complete envelope, including both parts and
+Base64 encoding overhead, must still fit within 128 MiB. The original layer stores complete
+Base64-encoded LOG and VIEW sequences, so both contribute to its budget even when their records overlap. Oversized input
 fails before upload. Referenced paths never cause independent file or attachment bodies to be
 collected.
 

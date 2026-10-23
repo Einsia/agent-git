@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_ENVELOPE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_PUBLIC_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_PRIVATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PUBLIC_BYTES: usize = MAX_PRIVATE_BYTES;
 const AES_ALGORITHM: &str = "aes-256-gcm";
 const WRAP_ALGORITHM: &str = "x25519-sealed-box";
 
@@ -543,7 +543,7 @@ mod tests {
         assert!(tampered.open(&secret).is_err());
     }
 
-    /// Large originals retain both sequences across layer, envelope and decryption bounds.
+    /// Large display projections and originals retain both sequences through envelope recovery.
     #[test]
     fn large_session_originals_round_trip_with_both_sequences() {
         let (sample, secret) = sample();
@@ -571,13 +571,15 @@ mod tests {
         .unwrap();
         let envelope = PrivacyEnvelope::seal_session(
             sample.policy_digest,
-            sample.public_projection,
+            serde_json::json!({"session": {"log": &log, "view": &log}}),
             &bytes,
             &recipient,
             binding,
         )
         .unwrap();
         let parsed = PrivacyEnvelope::parse(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(parsed.public_projection["session"]["log"], log);
+        assert_eq!(parsed.public_projection["session"]["view"], log);
         let restored: PrivateLayer =
             serde_json::from_slice(&parsed.open(&secret).unwrap()).unwrap();
         restored.validate().unwrap();

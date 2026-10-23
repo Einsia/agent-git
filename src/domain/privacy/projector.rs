@@ -32,6 +32,9 @@ pub enum Mode {
     HydrateEnvelopes,
     Manage,
     ProjectPublication,
+    FreezeHydration,
+    HydrateFrozenJsonl,
+    HydrationValues,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,7 +97,7 @@ fn whole_token(text: &str) -> bool {
         .is_some_and(|(start, end, _)| start == 0 && end == text.len())
 }
 
-fn has_wrapped_carrier(value: &Value) -> bool {
+pub(crate) fn has_wrapped_carrier(value: &Value) -> bool {
     crate::adapter::protocol_ids::layout(value)
         .encoded
         .iter()
@@ -195,6 +198,24 @@ impl Projector {
                         .unwrap_or(false)
                 }
             });
+        self.transform_records(text, mode, preserve_protocol_ids)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn hydrate_frozen(&mut self, text: &str, preserve_protocol_ids: bool) -> Outcome {
+        if text.len() > MAX_UNIT_BYTES {
+            return Outcome::skipped(text);
+        }
+        self.transform_records(text, Mode::HydrateJsonl, preserve_protocol_ids)
+    }
+
+    fn transform_records(
+        &mut self,
+        text: &str,
+        mode: Mode,
+        preserve_protocol_ids: bool,
+    ) -> Outcome {
+        let hydrate = matches!(mode, Mode::HydrateJsonl | Mode::HydrateEnvelopes);
         let mut outcome = Outcome {
             content: String::with_capacity(text.len()),
             status: Status::Complete,

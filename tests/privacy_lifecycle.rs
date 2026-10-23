@@ -289,6 +289,45 @@ fn independent_devices_recover_durable_aliases_after_cloud_failure() {
     let protected = protected["content"].as_str().unwrap().to_owned();
     assert!(!protected.contains(secret));
     drop(worker);
+    // Publication batches retain one dictionary even when another worker adds mappings.
+    let mut frozen = first.worker();
+    assert_eq!(
+        frozen.call("freeze_hydration", "false")["status"],
+        "complete"
+    );
+    let before = frozen.call("hydrate_frozen_jsonl", &protected);
+    assert_eq!(before["status"], "complete");
+    assert_eq!(
+        serde_json::from_str::<Value>(before["content"].as_str().unwrap()).unwrap(),
+        serde_json::from_str::<Value>(&input).unwrap()
+    );
+    let next_input =
+        json!({"type":"assistant","data":{"api_key":"AKIA5Z7YQXK4NMZ5VJ3T"}}).to_string() + "\n";
+    let next = first.worker().call("protect_jsonl", &next_input);
+    assert!(next["replacements"].as_u64().unwrap() > 0);
+    let missing = frozen.call("hydrate_frozen_jsonl", next["content"].as_str().unwrap());
+    assert_eq!(missing["status"], "partial");
+    assert!(missing["unresolved"].as_u64().unwrap() > 0);
+    assert_eq!(
+        frozen.call("hydrate_frozen_jsonl", &protected)["content"],
+        before["content"]
+    );
+    let values = frozen.call("hydration_values", "");
+    assert!(
+        serde_json::from_str::<Vec<String>>(values["content"].as_str().unwrap())
+            .unwrap()
+            .iter()
+            .any(|value| value == secret)
+    );
+    assert_eq!(
+        frozen.call("freeze_hydration", "false")["status"],
+        "complete"
+    );
+    assert_eq!(
+        frozen.call("hydrate_frozen_jsonl", next["content"].as_str().unwrap())["status"],
+        "complete"
+    );
+    drop(frozen);
     let independent = second.worker().call("protect_jsonl", &input);
     let independent = independent["content"].as_str().unwrap().to_owned();
     assert_ne!(protected, independent);

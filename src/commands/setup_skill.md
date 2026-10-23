@@ -201,7 +201,8 @@ repository-supplied LFS endpoint.
 
 Proceed with an authorized push without requiring a scan or secret acceptance flag.
 Local privacy processing replaces detected secrets with durable reversible placeholders.
-Failures skip affected work and never block another operation. The Hub does not scan content.
+Optional processing failures skip affected work. Encrypted publication requires complete original
+recovery from a frozen dictionary and stops if that recovery is unavailable. The Hub does not scan content.
 Every push independently schedules encrypted dictionary synchronization; pending records and
 unavailable cloud keys do not gate uploads. LFS payloads are excluded.
 
