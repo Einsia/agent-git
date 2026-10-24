@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-10-25
+
 ### Added
 
 - `agit privacy mode OWNER/REPO@BRANCH plain` selects unencrypted publication before a session's
@@ -22,15 +24,23 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Changed
 
-- New sessions, first imports and independent forks default to plain publication. Existing
-  recorded and registered modes are preserved. Select `privacy mode OWNER/REPO@BRANCH encrypted`
-  before registration to enable encryption.
+- New sessions, first imports and independent forks default to plain publication again.
+  0.2.24 created them with encrypted publication by default, which its release notes did not
+  mention. Existing recorded and registered modes are preserved, including those of sessions
+  0.2.24 created. Select `privacy mode OWNER/REPO@BRANCH encrypted` before registration to
+  enable encryption.
 - Privacy projections default to visible tools and original attachments, including when an
   existing policy omits the new fields. Configure omission explicitly to hide them. Captured
   file-tool content no longer requires a workspace/include match; explicit and mandatory file
   exclusions remain effective. Readable text remains sanitized; recorded binary carriers are retained.
 
 ### Fixed
+
+- A privacy dictionary upload that the Hub, or a network policy in front of it, refuses is no
+  longer sent again on every push, fetch, clone and login. agit retries it after a delay that
+  starts at 10 minutes and grows to 6 hours, and keeps downloading dictionaries from other
+  devices meanwhile. `agit push` and `agit doctor` say whether a network policy or the Hub
+  refused it; `agit login` retries at once.
 
 - Publication notices distinguish configured hiding, attachment handling, unsupported formats
   and unverifiable sources. Omitted tools preserve call/result classification instead of opening
