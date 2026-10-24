@@ -583,7 +583,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let chosen_meta = meta::read_at_ref_result(&repo, &plain_birth)
         .unwrap()
         .unwrap();
-    let mode_args = ["privacy", "mode", "alice/app@unencrypted", "plain"];
+    let mode_args = ["privacy", "mode", "alice/app@unencrypted", "encrypted"];
     assert!(!run(&mode_args, false).status.success());
     let unchanged = run(
         &["--json", "privacy", "mode", "alice/app@unencrypted"],
@@ -593,12 +593,12 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&unchanged.stdout).unwrap()["result"]["value"]
             ["local_mode"],
-        "session_owner_v2"
+        "plain"
     );
-    assert_success(&run(
-        &["--yes", "privacy", "mode", "alice/app@unencrypted", "plain"],
-        false,
-    ));
+    assert_eq!(
+        chosen_meta.session_privacy.as_ref().unwrap().scheme,
+        agit::domain::session_privacy::SessionScheme::Plain
+    );
     let mode = run(
         &["--json", "privacy", "status", "alice/app@unencrypted"],
         false,
@@ -695,12 +695,13 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         "claude-code".into(),
         String::new(),
     );
-    metadata.session_privacy = Some(
-        SessionPrivacy::new(Some(
+    metadata.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(
             AccountIdentity::new(&hub.base, "session-owner").unwrap(),
         ))
-        .unwrap(),
-    );
+        .unwrap()
+    });
     metadata.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
     fs::write(
         repo.root().join("native-private.txt"),
@@ -897,6 +898,16 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         &["new", "alice/app", "-b", "prepublish", "--no-launch"],
         false,
     ));
+    assert_success(&run(
+        &[
+            "--yes",
+            "privacy",
+            "mode",
+            "alice/app@prepublish",
+            "encrypted",
+        ],
+        false,
+    ));
     let before_policy = git(repo.root(), &["rev-parse", "refs/heads/prepublish"]);
     let created = meta::read_at_ref_result(&repo, &before_policy)
         .unwrap()
@@ -1068,7 +1079,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     hub.corrupt_receipt.store(false, Ordering::Release);
     assert_success(&run(&plain_push, false));
     let plain_head = git(&remote, &["rev-parse", "refs/heads/publish-plain"]);
-    assert_ne!(plain_head, second_plain_source);
+    assert_eq!(plain_head, second_plain_source);
     assert_eq!(
         git(repo.root(), &["rev-parse", "refs/heads/publish-plain"]),
         second_plain_source
@@ -1093,7 +1104,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         storage::materialize_at(&remote, &plain_head, meta::LOG_FILE).unwrap(),
         storage::materialize_at(repo.root(), &second_plain_source, meta::LOG_FILE).unwrap()
     );
-    assert_ne!(
+    assert_eq!(
         git(&remote, &["rev-parse", &format!("{plain_head}^")]),
         first_plain_source
     );
@@ -1116,7 +1127,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert_eq!(receipt.published, next_plain);
     assert_eq!(
         receipt.mode,
-        agit::domain::privacy_receipt::PublicationMode::SessionPlain
+        agit::domain::privacy_receipt::PublicationMode::Ordinary
     );
     assert_eq!(hub.key_requests.load(Ordering::Acquire), key_requests);
     for (target, mode) in [
@@ -1154,9 +1165,10 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         "claude-code".into(),
         String::new(),
     );
-    hydrated_meta.session_privacy = Some(
-        SessionPrivacy::new(Some(AccountIdentity::new(&hub.base, "account-1").unwrap())).unwrap(),
-    );
+    hydrated_meta.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(AccountIdentity::new(&hub.base, "account-1").unwrap())).unwrap()
+    });
     let repeated = transcript::wrap_lines(
         &json!({"type":"user","message":{"role":"user","content":record.token}}).to_string(),
         "claude-code",

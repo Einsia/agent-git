@@ -158,14 +158,21 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     source.commit("Unclaimed session birth").unwrap();
     let birth = source.git(&["rev-parse", "HEAD"]).unwrap();
     let mut owned = Meta::new(logical('b'), "claude-code".into(), String::new());
-    owned.session_privacy = Some(SessionPrivacy::new(Some(account("owner-alice"))).unwrap());
+    owned.session_privacy = Some(SessionPrivacy {
+        scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(account("owner-alice"))).unwrap()
+    });
     owned.committer_account = Some(account("writer-bob"));
     fs::write(
         source.root().join("private-original.txt"),
         "Unpublished original file\n",
     )
     .unwrap();
-    let original = save(&owned, "Private session Alice");
+    // Activity keeps conversation text while discarding standalone publication notices.
+    let original = save(
+        &owned,
+        "[Content omitted by privacy policy]\n[Image omitted by policy]\n[Attachment body omitted; metadata retained: {}]\nPrivate session Alice",
+    );
     source.git(&["branch", "alias", &original]).unwrap();
     let key_a = SecretKey::from([41; 32]);
     let session_key = |id: &str, key: &SecretKey, version| AccountSessionKey {
@@ -180,7 +187,10 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     );
     source.git(&["checkout", "-b", "other", &base]).unwrap();
     let mut other = Meta::new(logical('c'), "claude-code".into(), String::new());
-    other.session_privacy = Some(SessionPrivacy::new(Some(account("owner-carol"))).unwrap());
+    other.session_privacy = Some(SessionPrivacy {
+        scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(account("owner-carol"))).unwrap()
+    });
     other.committer_account = Some(account("owner-carol"));
     let other_source = save(&other, "Private session Carol");
     let key_c = SecretKey::from([42; 32]);
@@ -525,7 +535,10 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
         "claude-code".into(),
         String::new(),
     );
-    metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+    metadata.session_privacy = Some(SessionPrivacy {
+        scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(account.clone())).unwrap()
+    });
     metadata.committer_account = Some(account);
     let save = |content: &str| {
         let text = transcript::wrap_lines(
@@ -806,10 +819,13 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
             config: SessionPrivacyConfig {
                 repository_id: identity.agent_id.clone(),
                 session_id: metadata.session.clone(),
-                privacy: SessionPrivacy::new(Some(
-                    AccountIdentity::new(&identity.hub, "owner").unwrap(),
-                ))
-                .unwrap(),
+                privacy: SessionPrivacy {
+                    scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+                    ..SessionPrivacy::new(Some(
+                        AccountIdentity::new(&identity.hub, "owner").unwrap(),
+                    ))
+                    .unwrap()
+                },
                 revision: 1,
                 created_at: "2026-01-01T00:00:00Z".into(),
             },

@@ -58,7 +58,7 @@ If `szh/p1` already exists, do not run `init` again. Use `new` for a new session
 ## Session privacy
 
 `init` creates the repository's shared-file line. New sessions created with `new`, `import` or
-`fork` record their creator and default to session-owner encryption. Existing sessions retain their
+`fork` record their creator and default to plain publication. Existing sessions retain their
 registered settings. Repository visibility and automatic publishing remain independent choices.
 
 ## Automatic publishing preference

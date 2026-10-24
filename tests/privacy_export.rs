@@ -74,6 +74,7 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
     repo.git(&["checkout", "work"]).unwrap();
     PrivacyPolicy {
         workspace: Some(workspace.clone()),
+        exclude: vec!["private.txt".into()],
         replacements: vec![publication_text::replacement()],
         ..Default::default()
     }
@@ -135,7 +136,7 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
     let report = String::from_utf8_lossy(&exported.stderr);
     assert!(report.contains("original records are not included"));
     assert!(report.contains("Source LOG record 2: omitted from public content"));
-    assert!(report.contains("tool source is excluded, ambiguous, or unknown"));
+    assert!(report.contains("file content is excluded by policy"));
     assert!(report.contains("Policy version 1: sha256:"));
     assert!(report.contains("repository.include"));
     assert!(report.contains("exclude_source"));
@@ -155,6 +156,67 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
     let selected = String::from_utf8(selected.stdout).unwrap();
     assert!(selected.contains("AGIT_SECRET_V1"));
     assert!(!selected.contains("Read"));
+    for args in [
+        vec![
+            "privacy",
+            "policy",
+            "tool",
+            "Bash",
+            "--omit",
+            "true",
+            "--repo",
+            "alice/app",
+        ],
+        vec![
+            "privacy",
+            "policy",
+            "tool",
+            "claude-code:Bash",
+            "--omit",
+            "false",
+            "--repo",
+            "alice/app",
+        ],
+    ] {
+        let configured = run(&args);
+        assert!(configured.status.success(), "{configured:?}");
+    }
+    let visible = run(&["export", "alice/app@work", "--privacy"]);
+    assert!(visible.status.success(), "{visible:?}");
+    assert!(String::from_utf8_lossy(&visible.stdout).contains("PRIVATE_SHELL_RESULT"));
+    let reset = run(&[
+        "privacy",
+        "policy",
+        "tool",
+        "claude-code:Bash",
+        "--reset",
+        "--repo",
+        "alice/app",
+    ]);
+    assert!(reset.status.success(), "{reset:?}");
+    let hidden = run(&["export", "alice/app@work", "--privacy"]);
+    assert!(hidden.status.success(), "{hidden:?}");
+    let hidden = String::from_utf8_lossy(&hidden.stdout);
+    assert!(!hidden.contains("SHELL_COMMAND"));
+    assert!(!hidden.contains("PRIVATE_SHELL_RESULT"));
+    assert!(hidden.contains("PRIVATE_MCP_RESULT"));
+    for mode in ["metadata", "omit"] {
+        let configured = run(&[
+            "privacy",
+            "policy",
+            "attachment",
+            mode,
+            "--repo",
+            "alice/app",
+        ]);
+        assert!(configured.status.success(), "{configured:?}");
+        let exported = run(&["export", "alice/app@work", "--privacy"]);
+        assert!(exported.status.success(), "{exported:?}");
+        let text = String::from_utf8_lossy(&exported.stdout);
+        assert!(!text.contains("MIXED_IMAGE_BODY"));
+        assert!(!text.contains("PRIVATE_DOCUMENT_BODY"));
+        assert_eq!(text.contains("diagram.png"), mode == "metadata");
+    }
     assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
     privacy_input_budget::commit_oversized_event(&repo);
     let output = temp.path().join("export.json");

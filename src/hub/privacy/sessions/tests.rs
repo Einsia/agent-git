@@ -99,7 +99,10 @@ fn account_registration_and_original_read_keep_exact_session_authority() {
     let client = Client::for_hub_with_token(anonymous.base(), "synthetic-account-token");
     let expected = AccountIdentity::new(client.base(), "account-alice").unwrap();
     assert!(client.ensure_session_key(&expected).unwrap().ready);
-    let local = SessionPrivacy::new(Some(expected)).unwrap();
+    let local = SessionPrivacy {
+        scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(expected)).unwrap()
+    };
     let registered = client
         .register_session_privacy("team/notes", &identity, &config.session_id, &local)
         .unwrap();

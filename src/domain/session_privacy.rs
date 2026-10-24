@@ -226,13 +226,13 @@ pub struct SessionPrivacy {
 }
 
 impl SessionPrivacy {
-    /// Offline birth retains the encrypted default without guessing an account from a namespace.
+    /// Offline birth retains the plain default without guessing an account from a namespace.
     pub fn new(creator: Option<AccountIdentity>) -> Result<Self> {
         if let Some(identity) = &creator {
             identity.validate()?;
         }
         Ok(Self {
-            scheme: SessionScheme::SessionOwnerV2,
+            scheme: SessionScheme::Plain,
             hub: creator.as_ref().map(|identity| identity.hub.clone()),
             creator: creator.as_ref().map(|identity| identity.account_id.clone()),
             owner: creator
@@ -690,9 +690,9 @@ mod tests {
         config.privacy.scheme = SessionScheme::SessionOwnerV2;
         assert!(config.validate().is_err());
         config.privacy = SessionPrivacy::new(None).unwrap();
-        assert!(config.validate().is_err());
-        config.privacy.scheme = SessionScheme::Plain;
         config.validate().unwrap();
+        config.privacy.scheme = SessionScheme::SessionOwnerV2;
+        assert!(config.validate().is_err());
     }
 
     /// Legacy parsing cannot turn absent mode data into permission for plaintext publication.
@@ -707,9 +707,8 @@ mod tests {
                 .get("session_privacy")
                 .is_none()
         );
-        let mut privacy = SessionPrivacy::new(None).unwrap();
-        assert_eq!(privacy.scheme, SessionScheme::SessionOwnerV2);
-        privacy.scheme = SessionScheme::Plain;
+        let privacy = SessionPrivacy::new(None).unwrap();
+        assert_eq!(privacy.scheme, SessionScheme::Plain);
         value["session_privacy"] = serde_json::to_value(privacy).unwrap();
         let plain: super::super::meta::Meta = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(plain.session_privacy.unwrap().scheme, SessionScheme::Plain);

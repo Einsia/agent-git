@@ -2,16 +2,17 @@
 
 Sessions use `plain` or `session_owner_v2`. Registered configuration binds an immutable
 repository ID and logical session ID to the scheme, owner, creator when known, and revision.
-New sessions record their creator locally and default to session encryption. Existing plain
-sessions retain their accepted history. Missing configuration, unavailable keys, and failed
+New sessions record their creator locally and default to plain publication. Existing sessions
+retain their recorded scheme and accepted history. Missing configuration, unavailable keys, and failed
 requests cannot authorize plaintext publication for an encrypted session.
 
-Before remote registration, the creator can select `plain` with
-`agit privacy mode OWNER/REPO@BRANCH plain`. The authenticated local choice is scoped to the
+Before remote registration, the creator can select encryption with
+`agit privacy mode OWNER/REPO@BRANCH encrypted`, or return to `plain`. The authenticated local choice is scoped to the
 Hub, destination and logical session, and is bound to the immutable repository ID before
 registration. A registered mode always wins and conflicts refuse publication. Native source
 commits remain unchanged; initially plain publication normalizes encrypted birth metadata in
-generated commits, retaining event bytes and native attribution. Accepted mappings preserve
+generated commits, retaining event bytes and native attribution. Encrypted publication likewise
+binds the selected registered mode while preserving source identity and ownership. Accepted mappings preserve
 these public commits on retries. No key-service failure can select this path implicitly.
 
 ## Envelope and exact snapshot identity
@@ -132,11 +133,25 @@ It transforms each LOG event once and selects those same bytes for VIEW. Public 
 are computed after rewriting. The public value is
 `{version: 1, session: {log, view}, metadata, report}` with canonical envelope JSONL strings.
 
-Recognized Claude, Cursor and Codex records preserve safe text and authorized file-tool
-content. Tool outputs require unambiguous call provenance and allowed paths. Shell commands,
-unknown control records and unsupported attachment bodies become public omission markers;
-the complete original remains private. Path aliases, replacements and the final semantic
-secret scan apply to content and presentation metadata. Source paths are never public IDs.
+Recognized native messages preserve readable text. Tool calls and associated results are visible
+by default, including shell and MCP tools. `tools.omit` and exact-name overrides can hide them;
+result delivery requires unambiguous call provenance. Captured file content is independent of
+collection authorization: missing workspace/include permission does not hide recorded tool bytes.
+Structured `path` and `file_path` inputs still honor explicit and mandatory exclusions.
+
+Attachments default to `original`: recorded carriers are retained, readable text is sanitized,
+and encoded binary payloads remain intact. `metadata` retains only descriptive fields and `omit`
+replaces the attachment with a typed notice. No referenced file or URL is fetched. Unsupported
+control records and unverifiable tool sources receive distinct notices. Omitted tools retain
+call/result classification and do not create user turns. Path aliases, replacements and secret
+protection apply to readable content and presentation metadata; binary bodies are not text-scanned.
+Source paths are never public IDs.
+
+These projection controls apply to encrypted publication, privacy export and share. Plain push
+retains its existing publication path and local secret protection; it does not apply tool or
+attachment projection controls. See [policy commands](commands/privacy.md#tool-and-attachment-publication)
+for configuration and defaults. Policy changes invalidate prepared projections without rewriting
+accepted Git objects or ciphertext.
 
 Reports identify source LOG positions, omission reasons, and optional policy-bound decisions.
 A decision's `rule` points into the effective policy, such as `repository.exclude[1]` or

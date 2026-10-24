@@ -62,6 +62,11 @@ pub struct PrivacyPolicy {
     /// Metadata publication mode.
     #[serde(default)]
     pub metadata: MetadataMode,
+    /// Tool omission applies to both a call and its associated results.
+    #[serde(default)]
+    pub tools: ToolPolicy,
+    #[serde(default)]
+    pub attachments: AttachmentMode,
     /// Branch restrictions can only narrow the repository policy.
     #[serde(default)]
     pub branches: BTreeMap<String, BranchRestriction>,
@@ -92,6 +97,35 @@ pub struct ReplacementRule {
     pub replacement: String,
     #[serde(default)]
     pub regex: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPolicy {
+    #[serde(default)]
+    pub omit: bool,
+    #[serde(default)]
+    pub overrides: BTreeMap<String, bool>,
+}
+
+impl ToolPolicy {
+    pub fn omits(&self, source: &str, name: &str) -> bool {
+        self.overrides
+            .get(&format!("{source}:{name}"))
+            .or_else(|| self.overrides.get(name))
+            .copied()
+            .unwrap_or(self.omit)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentMode {
+    Omit,
+    Metadata,
+    #[default]
+    Original,
 }
 
 /// Metadata fields exposed by a public projection.
@@ -128,6 +162,8 @@ impl Default for PrivacyPolicy {
             memory_allow: Vec::new(),
             replacements: Vec::new(),
             metadata: MetadataMode::Minimal,
+            tools: ToolPolicy::default(),
+            attachments: AttachmentMode::default(),
             branches: BTreeMap::new(),
             mandatory: Vec::new(),
         }
@@ -248,6 +284,12 @@ impl PrivacyPolicy {
         validate_patterns(&self.include)?;
         validate_patterns(&self.exclude)?;
         validate_patterns(&self.memory_allow)?;
+        for name in self.tools.overrides.keys() {
+            ensure!(
+                !name.is_empty() && !name.chars().any(char::is_control) && !name.contains('*'),
+                "tool overrides require an exact tool name or runtime:tool name"
+            );
+        }
         for rule in &self.replacements {
             ensure!(
                 !rule.pattern.is_empty(),
@@ -348,6 +390,81 @@ impl PrivacyPolicy {
             format!("{}/{}", root.label, slash_path(&root.relative)),
             format!("{}.include[{index}]", root.rule_prefix),
         )
+    }
+
+    /// Captured bytes need exclusion checks, not permission to collect a file from this device.
+    pub fn captured_file_exclusion(
+        &self,
+        path: &str,
+        cwd: Option<&str>,
+        branch: Option<&str>,
+    ) -> Option<String> {
+        use crate::domain::privacy_paths::normalize_path;
+        let normalize = |path: &str| normalize_path(path).map(|p| p.as_str().to_owned());
+        let Ok(mut path) = normalize(path) else {
+            return Some("path.normalization".into());
+        };
+        let absolute = |p: &str| p.starts_with('/') || p.as_bytes().get(1..3) == Some(b":/");
+        let cwd = cwd.and_then(|cwd| normalize(cwd).ok());
+        if !absolute(&path)
+            && let Some(cwd) = &cwd
+        {
+            let Ok(resolved) = normalize(&format!("{cwd}/{path}")) else {
+                return Some("path.normalization".into());
+            };
+            path = resolved;
+        }
+        if is_forced_exclude(Path::new(&path)) {
+            return Some("default.sensitive_file".into());
+        }
+        let relative_to = |root: &Path| {
+            let root = normalize(root.to_str()?).ok()?;
+            path.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+                .map(str::to_owned)
+        };
+        let mut roots = Vec::new();
+        if let Some(root) = &self.workspace
+            && let Some(relative) = relative_to(root)
+        {
+            roots.push((root.components().count(), relative, None));
+        }
+        for (index, root) in self.external_roots.iter().enumerate() {
+            if let Some(relative) = relative_to(&root.path) {
+                roots.push((root.path.components().count(), relative, Some(index)));
+            }
+        }
+        let (relative, external) = match roots.into_iter().max_by_key(|(depth, _, _)| *depth) {
+            Some((_, relative, external)) => (relative, external),
+            None => (
+                cwd.as_deref()
+                    .and_then(|cwd| relative_to(Path::new(cwd)))
+                    .unwrap_or_else(|| path.clone()),
+                None,
+            ),
+        };
+        let relative = Path::new(&relative);
+        for (index, source) in self.mandatory.iter().enumerate() {
+            if let Some(rule) = matching_rule(&source.exclude, relative) {
+                return Some(format!("mandatory[{index}].exclude[{rule}]"));
+            }
+        }
+        let branch_exclude = branch
+            .and_then(|b| self.branches.get(b))
+            .map(|b| b.exclude.as_slice())
+            .unwrap_or(&[]);
+        let external_exclude = external
+            .map(|i| self.external_roots[i].exclude.as_slice())
+            .unwrap_or(&[]);
+        for (prefix, patterns) in [
+            ("repository", self.exclude.as_slice()),
+            ("external_root", external_exclude),
+            ("branch", branch_exclude),
+        ] {
+            if let Some(rule) = matching_rule(patterns, relative) {
+                return Some(format!("{prefix}.exclude[{rule}]"));
+            }
+        }
+        None
     }
 
     /// Evaluate a relative memory path. Memory is opt-in even inside the workspace.
@@ -780,14 +897,14 @@ mod tests {
     }
 
     #[test]
-    fn default_workspace_allowlist_is_conservative() {
+    fn collection_requires_includes_but_captured_content_only_checks_exclusions() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("src/main.rs");
         let private = temp.path().join("notes.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, "fn main() {}\n").unwrap();
         fs::write(&private, "private\n").unwrap();
-        let policy = PrivacyPolicy {
+        let mut policy = PrivacyPolicy {
             workspace: Some(temp.path().to_path_buf()),
             ..PrivacyPolicy::default()
         };
@@ -804,6 +921,38 @@ mod tests {
                 .evaluate_file(&temp.path().join("src/../../missing-private.txt"), None)
                 .action,
             CandidateAction::Excluded
+        );
+        assert!(
+            policy
+                .captured_file_exclusion(private.to_str().unwrap(), None, None)
+                .is_none()
+        );
+        policy.workspace = None;
+        policy.exclude.push("notes.txt".into());
+        assert_eq!(
+            policy
+                .captured_file_exclusion(private.to_str().unwrap(), temp.path().to_str(), None)
+                .as_deref(),
+            Some("repository.exclude[0]")
+        );
+        assert_eq!(
+            policy
+                .captured_file_exclusion(".ssh/id_ed25519", None, None)
+                .as_deref(),
+            Some("default.sensitive_file")
+        );
+        policy.mandatory.push(mandatory::MandatoryPolicy {
+            version: 1,
+            id: "organization".into(),
+            revision: "r1".into(),
+            exclude: vec!["internal/**".into()],
+            memory_exclude: vec![],
+        });
+        assert_eq!(
+            policy
+                .captured_file_exclusion("C:\\work\\internal\\notes.txt", Some("C:\\work"), None)
+                .as_deref(),
+            Some("mandatory[0].exclude[0]")
         );
     }
 

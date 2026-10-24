@@ -38,7 +38,7 @@ resumed. Rebind with `--history all` to include them.
 `--auto-upload` installs available runtime hooks, confirms the current publication policy,
 and enables the existing **repository-wide** `push.auto` preference. Other managed
 sessions in that local repository inherit that preference. Global preferences are not
-changed. New imports record the importing account as creator and default to session-owner encryption.
+changed. New imports record the importing account as creator and default to plain publication.
 Existing claims retain their session owner and registered settings. Codex hooks must be supported,
 enabled and trusted in the installed runtime; a Codex without it does not block Claude Code capture,
 and its sessions are published by `project sync`. Binding fails only when no runtime can

@@ -32,7 +32,7 @@ pub fn records(workspace: &Path) -> Vec<Value> {
         json!({"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"fixture-read","content":[
                 {"type":"text","text":"MIXED_TEXT_BEFORE"},
-                {"type":"image","source":{"type":"base64","data":"MIXED_IMAGE_BODY"}},
+                {"type":"image","name":"diagram.png","source":{"type":"base64","data":"MIXED_IMAGE_BODY"}},
                 {"type":"file","file":{"file_data":"PRIVATE_FILE_BODY"}},
                 {"type":"document","source":{"type":"text","data":"PRIVATE_DOCUMENT_BODY"}},
                 {"type":"audio","source":{"type":"base64","data":"PRIVATE_AUDIO_BODY"}},
@@ -72,7 +72,15 @@ pub fn assert_public(public: &Value, workspace: &Path) {
     let log = public["session"]["log"].as_str().unwrap();
     for marker in [
         "STRUCTURED_STDOUT",
+        "SHELL_COMMAND",
+        "PRIVATE_SHELL_RESULT",
+        "PRIVATE_MCP_RESULT",
         "PUBLIC_MESSAGE",
+        "MIXED_IMAGE_BODY",
+        "PRIVATE_FILE_BODY",
+        "PRIVATE_DOCUMENT_BODY",
+        "PRIVATE_AUDIO_BODY",
+        "ATTACHMENT_SKILL_BODY",
         "MIXED_TEXT_BEFORE",
         "MIXED_TEXT_AFTER",
         "NESTED_TEXT",
@@ -84,19 +92,11 @@ pub fn assert_public(public: &Value, workspace: &Path) {
     let text = public.to_string();
     for marker in [
         "PRIVATE_VALUE",
-        "SHELL_COMMAND",
-        "PRIVATE_SHELL_RESULT",
-        "PRIVATE_MCP_RESULT",
         "UNKNOWN_RECORD",
         "RAW_BLOCK",
         "UNKNOWN_BLOCK",
         "ATTACHMENT_SIBLING_TEXT",
-        "ATTACHMENT_SKILL_BODY",
         "NESTED_IMAGE_BODY",
-        "MIXED_IMAGE_BODY",
-        "PRIVATE_FILE_BODY",
-        "PRIVATE_DOCUMENT_BODY",
-        "PRIVATE_AUDIO_BODY",
         "UNTYPED_ATTACHMENT_BODY",
         workspace.to_str().unwrap(),
     ] {
@@ -148,7 +148,7 @@ pub fn assert_public(public: &Value, workspace: &Path) {
                     |notice| notice["reason"] == "attachment body is excluded from public content"
                 )
                 .count()
-                >= 4
+                == 0
         );
     }
 }

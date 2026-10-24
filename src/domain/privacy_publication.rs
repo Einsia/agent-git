@@ -1,11 +1,11 @@
 //! Frozen session projection shared by privacy-aware publication entry points.
 //!
 //! Native records are inputs, never public output. Public records use recognized message fields;
-//! unsupported records and tool content without an authorized source remain private.
+//! unsupported records and tool results without verifiable call provenance remain private.
 
 use super::{
     meta::{self, Meta},
-    privacy::{CandidateAction, PrivacyPolicy},
+    privacy::{AttachmentMode, CandidateAction, PrivacyPolicy},
     privacy_envelope::{PrivacyEnvelope, ViewingRecipient},
     privacy_layer::{EVIDENCE_FIELD, EVIDENCE_PREFIX, EvidenceReference, PrivateLayer},
     privacy_metadata,
@@ -24,11 +24,12 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+use super::privacy::omission::Omission;
+
 mod snapshot;
 pub(crate) use snapshot::PublicationSnapshot;
 
 const PUBLIC_SESSION: &str = "agit-0000000000000000000000000000000000000001";
-const OMITTED: &str = "[Content omitted by privacy policy]";
 
 /// Per-sequence source admission budget, before secret hydration and private-layer encoding.
 pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -353,11 +354,10 @@ impl SessionProjection {
         let mut private: PrivateLayer =
             serde_json::from_slice(&Zeroizing::new(serde_json::to_vec(&self.private)?))?;
         if let Some(local) = private.metadata.get("session_privacy") {
-            config.verify_registration(
-                &binding.repository_id,
-                &binding.session_id,
-                &serde_json::from_value(local.clone())?,
-            )?;
+            let mut local: super::session_privacy::SessionPrivacy =
+                serde_json::from_value(local.clone())?;
+            local.scheme = config.privacy.scheme;
+            config.verify_registration(&binding.repository_id, &binding.session_id, &local)?;
         }
         private.metadata["session_privacy"] = serde_json::to_value(&config.privacy)?;
         private.validate()?;
@@ -520,9 +520,9 @@ fn project_frozen_local(
 }
 
 #[derive(Clone)]
-struct FileCall {
+struct ToolCall {
     id: String,
-    allowed: bool,
+    omission: Option<Omission>,
     ambiguous: bool,
 }
 
@@ -567,7 +567,7 @@ pub fn project_session(
     }
     // Native IDs are scoped by runtime and source session. Ambiguous reuse cannot authorize
     // either output, even when one of the calls names an allowed file.
-    let mut calls: BTreeMap<(String, String, String), FileCall> = BTreeMap::new();
+    let mut calls: BTreeMap<(String, String, String), ToolCall> = BTreeMap::new();
     let mut contexts = BTreeMap::<(String, String), String>::new();
     let mut cwd_at = Vec::with_capacity(records.len());
     for (index, record) in records.iter().enumerate() {
@@ -577,18 +577,32 @@ pub fn project_session(
             contexts.insert(group.clone(), cwd.to_owned());
         }
         let cwd = contexts.get(&group).cloned();
-        for (id, name, input) in tool_calls(record) {
+        let calls_in_record = projector
+            .native_message(record)
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, blocks)| blocks)
+            .unwrap_or_default();
+        for block in calls_in_record
+            .into_iter()
+            .filter(|block| block["type"] == "tool_use")
+        {
+            let Some(id) = block["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let name = block["name"].as_str().unwrap_or_default();
+            let input = &block["input"];
             let key = (group.0.clone(), group.1.clone(), id.to_owned());
             if let Some(existing) = calls.get_mut(&key) {
                 existing.ambiguous = true;
-                existing.allowed = false;
+                existing.omission = Some(Omission::ToolSource);
             } else {
-                let allowed = projector.allow_call(&name, &input, cwd.as_deref())?;
+                let omission =
+                    projector.call_omission(&record.source, name, input, cwd.as_deref())?;
                 calls.insert(
                     key,
-                    FileCall {
+                    ToolCall {
                         id: format!("call-{index}-{}", calls.len()),
-                        allowed,
+                        omission,
                         ambiguous: false,
                     },
                 );
@@ -609,7 +623,7 @@ pub fn project_session(
                 {
                     json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("Recovered historical session evidence (policy-projected).\n{source}")}]}})
                 } else {
-                    json!({"type":"user","message":{"role":"user","content":[projector.omit("recovered evidence source is unavailable")]}})
+                    json!({"type":"user","message":{"role":"user","content":[projector.omit(Omission::HistoricalSource)]}})
                 }
             }
             None => projector.record(record, cwd_at[index].as_deref(), &calls)?,
@@ -835,59 +849,40 @@ impl Projector<'_> {
         }
         Ok(projection)
     }
-    fn omit(&mut self, reason: &'static str) -> Value {
+    fn notice(&mut self, reason: Omission) -> &'static str {
         self.report.omissions.push(ProjectionNotice {
             record: self.record.expect("omission belongs to a source record"),
-            reason: reason.into(),
+            reason: reason.reason().into(),
         });
-        json!({"type":"text", "text": OMITTED})
+        reason.text()
     }
 
-    fn allow_call(&mut self, name: &str, input: &Value, cwd: Option<&str>) -> Result<bool> {
-        if !is_file_tool(name) {
-            return Ok(false);
+    fn omit(&mut self, reason: Omission) -> Value {
+        json!({"type":"text", "text": self.notice(reason)})
+    }
+
+    fn call_omission(
+        &mut self,
+        source: &str,
+        name: &str,
+        input: &Value,
+        cwd: Option<&str>,
+    ) -> Result<Option<Omission>> {
+        if name.is_empty() {
+            return Ok(Some(Omission::ToolSource));
         }
-        let Some(input) = input.as_object() else {
-            return Ok(false);
-        };
-        if input.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "file_path"
-                    | "path"
-                    | "offset"
-                    | "limit"
-                    | "old_string"
-                    | "new_string"
-                    | "replace_all"
-                    | "content"
-            )
-        }) {
-            return Ok(false);
+        if self.policy.tools.omits(source, name) {
+            return Ok(Some(Omission::ToolCall));
         }
-        let paths = [input.get("file_path"), input.get("path")]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if paths.len() != 1 {
-            return Ok(false);
+        for field in ["file_path", "path"] {
+            if let Some(path) = input.get(field).and_then(Value::as_str)
+                && let Some(rule) = self.policy.captured_file_exclusion(path, cwd, self.branch)
+            {
+                self.note(rule, ProjectionAction::ExcludeSource, 1);
+                return Ok(Some(Omission::File));
+            }
         }
-        let Some(path) = paths[0].as_str() else {
-            return Ok(false);
-        };
-        let path = if absolute_path(path) {
-            path.to_owned()
-        } else if let Some(cwd) = cwd {
-            format!("{cwd}/{path}")
-        } else {
-            return Ok(false);
-        };
-        let path = decode_file_uri(&path)?.replace('\\', "/");
-        // A foreign-platform absolute path is historical evidence, not a file under this device's cwd.
-        if !Path::new(&path).is_absolute() {
-            return Ok(false);
-        }
-        Ok(self.file(Path::new(&path))?.action == CandidateAction::Allowed)
+        Ok(None)
     }
 
     fn remember_native_role(&mut self, record: &Envelope) {
@@ -1125,12 +1120,16 @@ impl Projector<'_> {
         &mut self,
         record: &Envelope,
         cwd: Option<&str>,
-        calls: &BTreeMap<(String, String, String), FileCall>,
+        calls: &BTreeMap<(String, String, String), ToolCall>,
     ) -> Result<Value> {
         let value = &record.content;
         let message = self
             .native_message(record)
             .or_else(|| match record.source.as_str() {
+                _ if value["type"] == "attachment" && value.get("attachment").is_some() => Some((
+                    "user".into(),
+                    vec![json!({"type":"attachment", "attachment":value["attachment"].clone()})],
+                )),
                 _ if value["type"] == "user"
                     && value["agit"] == "merge_summary"
                     && value["message"]["role"] == "user"
@@ -1150,7 +1149,7 @@ impl Projector<'_> {
             matches!(role.as_str(), "user" | "assistant") && !blocks.is_empty()
         }) else {
             return Ok(with_native_classification(
-                json!({"type":"user", "message":{"role":"user", "content":[self.omit("unsupported native record")]}}),
+                json!({"type":"user", "message":{"role":"user", "content":[self.omit(Omission::NativeRecord)]}}),
                 value,
                 true,
             ));
@@ -1161,11 +1160,11 @@ impl Projector<'_> {
             let projected = match block["type"].as_str() {
                 Some("text" | "input_text" | "output_text") => match block["text"].as_str() {
                     Some(text) => json!({"type":"text", "text":self.rewrite(&json!(text))?}),
-                    None => self.omit("unsupported message content"),
+                    None => self.omit(Omission::MessageContent),
                 },
                 Some("thinking" | "reasoning" | "redacted_thinking") => {
                     if role != "assistant" {
-                        self.omit("reasoning is not owned by an assistant message")
+                        self.omit(Omission::ReasoningRole)
                     } else {
                         let text = reasoning_block_text(&block);
                         let text = self.rewrite(&json!(text))?;
@@ -1187,109 +1186,178 @@ impl Projector<'_> {
                             ))
                         })
                         .flatten();
+                    let public_id = call
+                        .filter(|call| !call.ambiguous)
+                        .map(|call| call.id.clone())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "call-{}-block-{block_index}",
+                                self.record.expect("tool belongs to a source record")
+                            )
+                        });
                     if is_call {
-                        // IDs establish result provenance; each file input needs its own authorization.
-                        let allowed = self.allow_call(name, &block["input"], cwd)?
-                            && call.is_none_or(|call| call.allowed && !call.ambiguous);
-                        if !allowed {
-                            self.omit("tool source is excluded, ambiguous, or unknown")
+                        let omission = self
+                            .call_omission(&record.source, name, &block["input"], cwd)?
+                            .or_else(|| call.and_then(|call| call.omission));
+                        if let Some(reason) = omission {
+                            json!({"type":"tool_use", "id":public_id, "name":"omitted", "input":{"notice":self.notice(reason)}})
                         } else {
-                            let id = call
-                                .filter(|call| !call.ambiguous)
-                                .map(|call| call.id.clone())
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "call-{}-block-{block_index}",
-                                        self.record.expect("tool call belongs to a source record")
-                                    )
-                                });
                             let mut input = block["input"].clone();
-                            if is_file_tool(name) {
-                                for field in ["path", "file_path"] {
-                                    if let Some(path) = input[field].as_str() {
-                                        let path = if absolute_path(path) {
-                                            path.to_owned()
-                                        } else {
-                                            format!("{}/{path}", cwd.unwrap_or_default())
-                                        };
-                                        input[field] = json!(self.path_alias(&path)?);
-                                    }
+                            for field in ["path", "file_path"] {
+                                if let Some(path) = input[field].as_str() {
+                                    let path = if absolute_path(path) {
+                                        path.to_owned()
+                                    } else if let Some(cwd) = cwd {
+                                        format!("{cwd}/{path}")
+                                    } else {
+                                        path.to_owned()
+                                    };
+                                    input[field] = json!(self.path_alias(&path)?);
                                 }
                             }
-                            let input = self.without_attachments(&input, ContentContext::Json);
-                            json!({
-                                "type":"tool_use",
-                                "id":id,
-                                "name":self.rewrite(&json!(name))?,
-                                "input":self.rewrite(&input)?
-                            })
+                            let input =
+                                self.project_content(&input, ContentContext::Json, false)?;
+                            json!({"type":"tool_use", "id":public_id, "name":self.rewrite(&json!(name))?, "input":input})
                         }
                     } else {
-                        if call.is_none_or(|call| !call.allowed || call.ambiguous) {
-                            self.omit("tool source is excluded, ambiguous, or unknown")
+                        let omission = match call {
+                            None => Some(Omission::ToolSource),
+                            Some(call) => call.omission.map(|reason| {
+                                if reason == Omission::ToolCall {
+                                    Omission::ToolOutput
+                                } else {
+                                    reason
+                                }
+                            }),
+                        };
+                        let content = if let Some(reason) = omission {
+                            self.notice(reason).to_owned()
                         } else {
-                            let result_id = call
-                                .filter(|call| call.allowed && !call.ambiguous)
-                                .map(|call| call.id.clone())
-                                .expect("validated tool result has a public call identity");
-                            json!({
-                                "type":"tool_result",
-                                "tool_use_id":result_id,
-                                "content":self.result_text(&block["content"])?,
-                                "is_error":block["is_error"].as_bool().unwrap_or(false)
-                            })
-                        }
+                            self.result_text(&block["content"])?
+                        };
+                        json!({"type":"tool_result", "tool_use_id":public_id, "content":content, "is_error":block["is_error"].as_bool().unwrap_or(false)})
                     }
                 }
                 _ if is_attachment(&block, ContentContext::MessageBlock) => {
-                    self.omit("attachment body is excluded from public content")
+                    let projected = self.attachment(&block)?;
+                    if let Some(text) = projected.as_str() {
+                        json!({"type":"text", "text":text})
+                    } else {
+                        projected
+                    }
                 }
-                _ => self.omit("unsupported message content"),
+                _ => self.omit(Omission::MessageContent),
             };
             output.push(projected);
         }
         Ok(with_native_classification(
             json!({"type":role, "message":{"role":role, "content":output}}),
             value,
-            codex_internal,
+            codex_internal || value["type"] == "attachment",
         ))
     }
 
-    fn without_attachments(&mut self, value: &Value, context: ContentContext) -> Value {
-        // Attachment boundaries apply before generic JSON traversal, including nested payloads.
-        if is_attachment(value, context) {
-            self.omit("attachment body is excluded from public content");
-            return json!(OMITTED);
+    fn attachment(&mut self, value: &Value) -> Result<Value> {
+        match self.policy.attachments {
+            AttachmentMode::Omit => Ok(json!(self.notice(attachment_omission(value)))),
+            AttachmentMode::Metadata => {
+                self.notice(Omission::AttachmentMetadata);
+                let mut metadata = serde_json::Map::new();
+                for source in [
+                    value,
+                    &value["attachment"],
+                    &value["source"],
+                    &value["file"],
+                    &value["resource"],
+                ] {
+                    for key in [
+                        "type",
+                        "name",
+                        "filename",
+                        "title",
+                        "mimeType",
+                        "mime_type",
+                        "media_type",
+                        "size",
+                    ] {
+                        if let Some(field) = source.get(key).filter(|v| v.is_string() || v.is_u64())
+                        {
+                            metadata
+                                .entry(key.to_owned())
+                                .or_insert_with(|| field.clone());
+                        }
+                    }
+                }
+                let metadata = self.rewrite(&Value::Object(metadata))?;
+                Ok(json!(format!(
+                    "[Attachment body omitted; metadata retained: {metadata}]"
+                )))
+            }
+            AttachmentMode::Original => self.project_content(value, ContentContext::Json, true),
         }
+    }
+
+    fn attachment_values(&mut self, value: &Value) -> Result<Value> {
         match value {
-            Value::Array(values) => Value::Array(
+            Value::Array(values) => Ok(Value::Array(
                 values
                     .iter()
-                    .map(|value| self.without_attachments(value, ContentContext::Json))
-                    .collect(),
-            ),
-            Value::Object(fields) => Value::Object(
-                fields
+                    .map(|v| self.attachment(v))
+                    .collect::<Result<_>>()?,
+            )),
+            _ => self.attachment(value),
+        }
+    }
+
+    fn project_content(
+        &mut self,
+        value: &Value,
+        context: ContentContext,
+        original_attachment: bool,
+    ) -> Result<Value> {
+        if !original_attachment && is_attachment(value, context) {
+            return self.attachment(value);
+        }
+        match value {
+            Value::Array(values) => Ok(Value::Array(
+                values
                     .iter()
-                    .map(|(key, value)| {
-                        let value = if matches!(key.as_str(), "attachment" | "attachments") {
-                            self.omit("attachment body is excluded from public content");
-                            json!(OMITTED)
+                    .map(|v| self.project_content(v, ContentContext::Json, original_attachment))
+                    .collect::<Result<_>>()?,
+            )),
+            Value::Object(fields) => {
+                let mut output = serde_json::Map::new();
+                for (key, child) in fields {
+                    let projected =
+                        if original_attachment && encoded_attachment_field(value, key, child) {
+                            child.clone()
+                        } else if matches!(key.as_str(), "attachment" | "attachments") {
+                            self.attachment_values(child)?
                         } else {
-                            self.without_attachments(value, ContentContext::Json)
+                            self.project_content(child, ContentContext::Json, original_attachment)?
                         };
-                        (key.clone(), value)
-                    })
-                    .collect(),
-            ),
-            _ => value.clone(),
+                    let key = if original_attachment {
+                        key.clone()
+                    } else {
+                        self.rewrite(&json!(key))?
+                            .as_str()
+                            .context("public field name must remain text")?
+                            .to_owned()
+                    };
+                    ensure!(
+                        output.insert(key, projected).is_none(),
+                        "privacy rewriting collides JSON field names"
+                    );
+                }
+                Ok(Value::Object(output))
+            }
+            _ => self.rewrite(value),
         }
     }
 
     fn public_text(&mut self, value: &Value, context: ContentContext) -> Result<String> {
-        let admitted = self.without_attachments(value, context);
         // Scrub string leaves before JSON escaping can hide a sensitive match.
-        match self.rewrite(&admitted)? {
+        match self.project_content(value, context, false)? {
             Value::String(text) => Ok(text),
             rewritten => Ok(serde_json::to_string(&rewritten)?),
         }
@@ -1758,143 +1826,6 @@ fn codex_user_message_is_internal(value: &Value) -> bool {
         })
 }
 
-fn tool_calls(record: &Envelope) -> Vec<(String, String, Value)> {
-    let value = &record.content;
-    match record.source.as_str() {
-        "claude-code" | "claude-desktop" | "cursor"
-            if message_role(record) == Some("assistant") =>
-        {
-            value["message"]["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block["type"] == "tool_use")
-                .filter_map(|block| {
-                    Some((
-                        block["id"].as_str().filter(|id| !id.is_empty())?.into(),
-                        block["name"].as_str()?.into(),
-                        block["input"].clone(),
-                    ))
-                })
-                .collect()
-        }
-        "claude-desktop" if value["message"]["role"] == "assistant" => value["message"]["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|block| block["type"] == "tool_use")
-            .filter_map(|block| {
-                Some((
-                    block["id"].as_str().filter(|id| !id.is_empty())?.into(),
-                    block["name"].as_str()?.into(),
-                    block["input"].clone(),
-                ))
-            })
-            .collect(),
-        "codex"
-            if value["type"] == "response_item" && value["payload"]["type"] == "function_call" =>
-        {
-            let payload = &value["payload"];
-            match (payload["call_id"].as_str(), payload["name"].as_str()) {
-                (Some(id), Some(name)) if !id.is_empty() => {
-                    vec![(id.into(), name.into(), decode_arguments(payload))]
-                }
-                _ => vec![],
-            }
-        }
-        "openclaw"
-            if matches!(value["type"].as_str(), Some("message" | "custom_message"))
-                && (if value["type"] == "message" {
-                    value["message"]["role"] == "assistant"
-                } else {
-                    value["role"] == "assistant"
-                }) =>
-        {
-            let body = if value["type"] == "message" {
-                &value["message"]
-            } else {
-                value
-            };
-            body["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block["type"] == "toolCall" || block["type"] == "tool_use")
-                .filter_map(|block| {
-                    Some((
-                        block["id"].as_str().filter(|id| !id.is_empty())?.into(),
-                        block["name"].as_str()?.into(),
-                        native_tool_input(
-                            block
-                                .get("arguments")
-                                .or_else(|| block.get("input"))
-                                .unwrap_or(&Value::Null),
-                        ),
-                    ))
-                })
-                .collect()
-        }
-        "workbuddy" if value["type"] == "message" && value["role"] == "assistant" => {
-            value["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block["type"] == "toolCall" || block["type"] == "tool_use")
-                .filter_map(|block| {
-                    Some((
-                        block["id"].as_str().filter(|id| !id.is_empty())?.into(),
-                        block["name"].as_str()?.into(),
-                        native_tool_input(
-                            block
-                                .get("arguments")
-                                .or_else(|| block.get("input"))
-                                .unwrap_or(&Value::Null),
-                        ),
-                    ))
-                })
-                .collect()
-        }
-        "workbuddy" if value["type"] == "function_call" => {
-            match (value["callId"].as_str(), value["name"].as_str()) {
-                (Some(id), Some(name)) if !id.is_empty() => {
-                    vec![(
-                        id.into(),
-                        name.into(),
-                        native_tool_input(&value["arguments"]),
-                    )]
-                }
-                _ => vec![],
-            }
-        }
-        "hermes" if value["type"] == "hermes_message" && value["data"]["role"] == "assistant" => {
-            let calls = match &value["data"]["tool_calls"] {
-                Value::String(text) => serde_json::from_str::<Value>(text).ok(),
-                value => Some(value.clone()),
-            };
-            calls
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|call| {
-                    Some((
-                        call["id"].as_str().filter(|id| !id.is_empty())?.into(),
-                        call["function"]["name"].as_str()?.into(),
-                        native_tool_input(&call["function"]["arguments"]),
-                    ))
-                })
-                .collect()
-        }
-        _ => vec![],
-    }
-}
-
-fn is_file_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "Read" | "read_file" | "Edit" | "edit_file" | "Write" | "write_file"
-    )
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContentContext {
     Json,
@@ -1909,6 +1840,50 @@ fn is_message_block(value: &Value) -> bool {
     ) && value["text"].is_string()
         && value.as_object().is_some_and(|fields| fields.len() == 2))
         || is_attachment(value, ContentContext::Json)
+}
+
+fn attachment_omission(value: &Value) -> Omission {
+    let kind = value["type"].as_str().unwrap_or_default();
+    let mime = value["mimeType"]
+        .as_str()
+        .or_else(|| value["mime_type"].as_str())
+        .or_else(|| value["media_type"].as_str())
+        .unwrap_or_default();
+    if matches!(kind, "image" | "input_image" | "output_image") || mime.starts_with("image/") {
+        Omission::Image
+    } else if matches!(kind, "document" | "file" | "input_file") || mime == "application/pdf" {
+        Omission::Document
+    } else if matches!(kind, "audio" | "input_audio" | "output_audio") || mime.starts_with("audio/")
+    {
+        Omission::Audio
+    } else if kind == "video" || mime.starts_with("video/") {
+        Omission::Video
+    } else {
+        Omission::Attachment
+    }
+}
+
+/// Encoded payloads are opaque bytes; text rewriting would corrupt the retained attachment.
+fn encoded_attachment_field(parent: &Value, key: &str, value: &Value) -> bool {
+    let data_url = value.as_str().is_some_and(|text| text.starts_with("data:"));
+    let mime = parent["mimeType"]
+        .as_str()
+        .or_else(|| parent["mime_type"].as_str())
+        .or_else(|| parent["media_type"].as_str());
+    let binary = mime.is_some_and(|mime| {
+        mime.starts_with("image/")
+            || mime.starts_with("audio/")
+            || mime.starts_with("video/")
+            || matches!(mime, "application/pdf" | "application/octet-stream")
+    });
+    value.is_string()
+        && (matches!(key, "blob" | "file_data")
+            || (key == "data"
+                && (parent["type"] == "base64"
+                    || parent["encoding"] == "base64"
+                    || binary
+                    || parent.get("format").is_some()))
+            || (matches!(key, "url" | "image_url" | "file_url" | "video_url") && data_url))
 }
 
 fn is_attachment(value: &Value, context: ContentContext) -> bool {
@@ -1992,6 +1967,84 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn tool_policy_defaults_open_and_scoped_overrides_control_both_halves() {
+        use super::super::privacy::ToolPolicy;
+        let session = format!("agit-{}", "a".repeat(40));
+        let raw = [
+            json!({"type":"session_meta","payload":{"cwd":"/historical/work"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"shell","name":"exec_command","arguments":"{\"cmd\":\"echo PRIVATE_MARKER\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"shell","output":"SHELL_BODY PRIVATE_MARKER"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"file","name":"read_file","arguments":"{\"path\":\"outside-include.txt\",\"extra_option\":true}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"file","output":"FILE_BODY"}}),
+        ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
+        let log = transcript::wrap_lines(&raw, "codex", &session);
+        let mut policy = PrivacyPolicy {
+            replacements: vec![super::super::privacy::ReplacementRule {
+                pattern: "PRIVATE_MARKER".into(),
+                replacement: "MASKED".into(),
+                regex: false,
+            }],
+            ..Default::default()
+        };
+        let project = |policy: &PrivacyPolicy| {
+            project_session(
+                policy,
+                &mut PathAliasStore::default(),
+                None,
+                &log,
+                &log,
+                &Meta::new(session.clone(), "codex".into(), String::new()),
+                &Redactor::new(Default::default()),
+            )
+            .unwrap()
+        };
+        let visible = project(&policy);
+        assert!(visible.log().contains("SHELL_BODY MASKED"));
+        assert!(visible.log().contains("FILE_BODY"));
+        assert!(!visible.log().contains("PRIVATE_MARKER"));
+        let default_digest = policy.digest().unwrap();
+        policy.tools = ToolPolicy {
+            omit: true,
+            overrides: BTreeMap::from([
+                ("exec_command".into(), false),
+                ("codex:exec_command".into(), true),
+            ]),
+        };
+        assert_ne!(policy.digest().unwrap(), default_digest);
+        let hidden = project(&policy);
+        assert!(!hidden.log().contains("exec_command"));
+        assert!(!hidden.log().contains("SHELL_BODY"));
+        assert!(!hidden.log().contains("FILE_BODY"));
+        assert!(hidden.log().contains(Omission::ToolCall.text()));
+        assert!(hidden.log().contains(Omission::ToolOutput.text()));
+        let parsed = transcript::display::parse(hidden.log()).unwrap();
+        assert!(
+            parsed
+                .events
+                .iter()
+                .all(|event| event.kind != crate::adapter::EventKind::UserPrompt)
+        );
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|event| event.kind == crate::adapter::EventKind::ToolUse)
+        );
+        let blocks = storage::parse_envelopes(hidden.log()).unwrap();
+        assert_eq!(
+            blocks[1].content["message"]["content"][0]["id"],
+            blocks[2].content["message"]["content"][0]["tool_use_id"]
+        );
+
+        policy.tools.overrides.remove("codex:exec_command");
+        assert!(project(&policy).log().contains("SHELL_BODY MASKED"));
+        let mut old = serde_json::to_value(&policy).unwrap();
+        old.as_object_mut().unwrap().remove("tools");
+        let old: PrivacyPolicy = serde_json::from_value(old).unwrap();
+        assert!(project(&old).log().contains("FILE_BODY"));
+    }
+
+    #[test]
     fn complete_snapshot_projects_paths_and_recovers_original_layer() {
         use crate::domain::session_privacy::{
             AccountIdentity, OwnerKeyBinding, SessionPrivacy, SessionPrivacyConfig,
@@ -2020,15 +2073,17 @@ mod tests {
         );
         metadata.committer_account =
             Some(AccountIdentity::new("https://hub.test", "writer-bob").unwrap());
-        metadata.session_privacy = Some(
-            SessionPrivacy::new(Some(
+        metadata.session_privacy = Some(SessionPrivacy {
+            scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+            ..SessionPrivacy::new(Some(
                 AccountIdentity::new("https://hub.test", "owner-alice").unwrap(),
             ))
-            .unwrap(),
-        );
+            .unwrap()
+        });
         let policy = PrivacyPolicy {
             workspace: Some(temp.path().to_path_buf()),
             include: vec!["src/**".into()],
+            exclude: vec!["private.txt".into()],
             replacements: vec![
                 super::super::privacy::ReplacementRule {
                     pattern: "MARKER".into(),
@@ -2059,7 +2114,7 @@ mod tests {
         assert_eq!(projection.report.records, 5);
         assert!(!projection.log().contains(source.to_string_lossy().as_ref()));
         assert!(projection.log().contains("<workspace>/src/visible.rs"));
-        assert!(projection.log().contains(OMITTED));
+        assert!(projection.log().contains(Omission::File.text()));
         assert!(projection.log().contains("allowed file body"));
         assert!(!projection.log().contains("excluded file body"));
         assert!(projection.log().contains("synthetic-private-value"));
@@ -2154,7 +2209,7 @@ mod tests {
                 .decisions
                 .iter()
                 .any(|decision| decision.record == Some(3)
-                    && decision.rule == "repository.include"
+                    && decision.rule == "repository.exclude[0]"
                     && decision.action == ProjectionAction::ExcludeSource)
         );
         assert!(
@@ -2317,7 +2372,10 @@ mod tests {
 
     #[test]
     fn native_tool_results_filter_attachments_after_projection() {
-        let policy = PrivacyPolicy::default();
+        let policy = PrivacyPolicy {
+            attachments: AttachmentMode::Omit,
+            ..Default::default()
+        };
         let mut aliases = PathAliasStore::default();
         let redactor = Redactor::new(Default::default());
         let mut projector = Projector::new(&policy, &mut aliases, None, &redactor, 1).unwrap();
@@ -2337,14 +2395,17 @@ mod tests {
         };
         let calls = BTreeMap::from([(
             ("openclaw".into(), "session".into(), "call".into()),
-            FileCall {
+            ToolCall {
                 id: "call".into(),
-                allowed: true,
+                omission: None,
                 ambiguous: false,
             },
         )]);
         let projected = projector.record(&record, None, &calls).unwrap();
-        assert_eq!(projected["message"]["content"][0]["content"], OMITTED);
+        assert_eq!(
+            projected["message"]["content"][0]["content"],
+            Omission::Document.text()
+        );
         assert!(!projected.to_string().contains("PRIVATE_ATTACHMENT"));
     }
 
@@ -2368,9 +2429,9 @@ mod tests {
         };
         let calls = BTreeMap::from([(
             ("workbuddy".into(), "session".into(), "call".into()),
-            FileCall {
+            ToolCall {
                 id: "call".into(),
-                allowed: true,
+                omission: None,
                 ambiguous: false,
             },
         )]);
@@ -2779,7 +2840,7 @@ mod tests {
                 && event
                     .text
                     .as_deref()
-                    .is_some_and(|text| text.contains(OMITTED))
+                    .is_some_and(|text| text.contains(Omission::NativeRecord.text()))
         }));
         assert!(!projection.log().contains("internal progress"));
         assert!(public.events.iter().any(|event| {
@@ -2848,12 +2909,12 @@ mod tests {
         .unwrap();
         assert!(projection.log().contains("Public label"));
         assert!(projection.log().contains("Checked reply"));
-        assert!(!projection.log().contains("BASH_RESULT"));
-        assert!(!projection.log().contains("call-2-"));
+        assert!(projection.log().contains("BASH_RESULT"));
+        assert!(projection.log().contains("call-2-"));
         assert!(!projection.log().contains("shell-call"));
         assert!(projection.log().contains("<workspace>/src/main.rs"));
         assert!(!projection.log().contains("MARKER"));
-        assert!(!projection.log().contains("PRIVATE_COMMAND"));
+        assert!(projection.log().contains("PRIVATE_COMMAND"));
         assert!(!projection.log().contains("PRIVATE_CONTROL_RECORD"));
         assert!(!projection.log().contains("UNPAIRED_RESULT"));
         assert!(!projection.log().contains(temp.path().to_str().unwrap()));
@@ -2870,7 +2931,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_file_exclusions_cover_shell_and_unknown_tool_results() {
+    fn explicit_tool_and_mandatory_file_exclusions_cover_calls_and_results() {
         let temp = tempfile::tempdir().unwrap();
         let private = temp.path().join("src/budget.txt");
         let allowed = temp.path().join("src/overview.txt");
@@ -2914,6 +2975,10 @@ mod tests {
         let log = transcript::wrap_lines(&raw, "codex", &session);
         let policy = PrivacyPolicy {
             workspace: Some(temp.path().into()),
+            tools: super::super::privacy::ToolPolicy {
+                overrides: BTreeMap::from([("exec_command".into(), true)]),
+                ..Default::default()
+            },
             mandatory: vec![super::super::privacy::mandatory::MandatoryPolicy {
                 version: 1,
                 id: "organization".into(),
@@ -2945,8 +3010,15 @@ mod tests {
         assert!(!public.contains(private_body));
         assert!(public.contains("Public overview"));
         let records = storage::parse_envelopes(projection.log()).unwrap();
-        for record in &records[..6] {
-            assert_eq!(record.content["message"]["content"][0]["text"], OMITTED);
+        for (record, reason) in records.iter().zip([
+            Omission::File,
+            Omission::File,
+            Omission::ToolCall,
+            Omission::ToolOutput,
+            Omission::File,
+            Omission::File,
+        ]) {
+            assert!(record.content.to_string().contains(reason.text()));
         }
         assert_eq!(
             records[6].content["message"]["content"][0]["type"],
@@ -2995,7 +3067,7 @@ mod tests {
     }
 
     #[test]
-    fn file_inputs_require_authorization_with_or_without_call_ids() {
+    fn file_exclusions_apply_with_or_without_call_ids() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
         std::fs::write(temp.path().join("src/main.rs"), "allowed").unwrap();
@@ -3032,6 +3104,7 @@ mod tests {
         let projection = project_session(
             &PrivacyPolicy {
                 workspace: Some(temp.path().into()),
+                exclude: vec!["private.txt".into()],
                 ..Default::default()
             },
             &mut PathAliasStore::default(),
@@ -3051,7 +3124,7 @@ mod tests {
         let projected = records[0].content["message"]["content"].as_array().unwrap();
         for (source, projected) in blocks.iter().zip(projected) {
             if source["input"]["file_path"] == "private.txt" {
-                assert_eq!(projected["text"], OMITTED);
+                assert_eq!(projected["input"]["notice"], Omission::File.text());
             } else {
                 assert_eq!(projected["type"], "tool_use");
                 assert_eq!(projected["input"]["file_path"], "<workspace>/src/main.rs");
@@ -3075,7 +3148,7 @@ mod tests {
             json!(["SECRET_VALUE",7,true,null,{"type":"text","text":"RETAIN_ROW","row":1},[path,"SECRET_VALUE"]]),
             json!([]),
         ];
-        let (projection, _) = project_tool_results(&results, temp.path());
+        let (projection, _) = project_tool_results(&results, temp.path(), AttachmentMode::Original);
         let expected = [
             json!({"status":200,"mime_type":"application/json","body":{"message":"RETAIN_ME","secret":"MASKED","path":"<workspace>/src/main.rs"},"metadata":{"mimeType":"text/plain","media_type":"application/json","data":"RETAIN_DATA"}}),
             json!([
@@ -3103,14 +3176,19 @@ mod tests {
             {"type":"text","text":"BEFORE SECRET_VALUE"},
             {"type":"file","file":{"file_data":"PRIVATE_FILE_BODY"}},
             {"type":"document","source":{"type":"text","data":"PRIVATE_DOCUMENT_BODY"}},
-            {"mimeType":"image/png","data":"PRIVATE_IMAGE_BODY"},
+            {"mimeType":"image/png","name":"SECRET_VALUE.png","size":12,"data":"SECRET_VALUE/PRIVATE_IMAGE_BODY","url":"https://private.invalid/private-image","file_id":"PRIVATE_ID"},
             {"type":"output_text","text":"AFTER"}
         ])];
-        let (projection, log) = project_tool_results(&results, temp.path());
+        let (projection, log) = project_tool_results(&results, temp.path(), AttachmentMode::Omit);
         let records = storage::parse_envelopes(projection.log()).unwrap();
         assert_eq!(
             records[1].content["message"]["content"][0]["content"],
-            format!("BEFORE MASKED\n{OMITTED}\n{OMITTED}\n{OMITTED}\nAFTER")
+            format!(
+                "BEFORE MASKED\n{}\n{}\n{}\nAFTER",
+                Omission::Document.text(),
+                Omission::Document.text(),
+                Omission::Image.text()
+            )
         );
         assert_eq!(projection.report.omissions.len(), 3);
         for notice in &projection.report.omissions {
@@ -3124,9 +3202,43 @@ mod tests {
         let (private_log, private_view) = private.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
+
+        let (original, _) = project_tool_results(&results, temp.path(), AttachmentMode::Original);
+        assert!(original.log().contains("SECRET_VALUE/PRIVATE_IMAGE_BODY"));
+        assert!(original.log().contains("PRIVATE_FILE_BODY"));
+        assert!(original.log().contains("MASKED.png"));
+        assert!(original.report.omissions.is_empty());
+        let (metadata, _) = project_tool_results(&results, temp.path(), AttachmentMode::Metadata);
+        assert!(metadata.log().contains("MASKED.png"));
+        assert!(metadata.log().contains("BEFORE MASKED"));
+        for hidden in [
+            "PRIVATE_IMAGE_BODY",
+            "PRIVATE_FILE_BODY",
+            "PRIVATE_DOCUMENT_BODY",
+            "private.invalid",
+            "PRIVATE_ID",
+        ] {
+            assert!(
+                !metadata.log().contains(hidden),
+                "metadata exposes {hidden}"
+            );
+        }
+        assert_ne!(metadata.policy_digest, original.policy_digest);
+        let mut old = serde_json::to_value(PrivacyPolicy::default()).unwrap();
+        old.as_object_mut().unwrap().remove("attachments");
+        assert_eq!(
+            serde_json::from_value::<PrivacyPolicy>(old)
+                .unwrap()
+                .attachments,
+            AttachmentMode::Original
+        );
     }
 
-    fn project_tool_results(results: &[Value], workspace: &Path) -> (SessionProjection, String) {
+    fn project_tool_results(
+        results: &[Value],
+        workspace: &Path,
+        attachments: AttachmentMode,
+    ) -> (SessionProjection, String) {
         let session = format!("agit-{}", "c".repeat(40));
         std::fs::create_dir_all(workspace.join("src")).unwrap();
         let call = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"file","name":"Read","input":{"file_path":workspace.join("src/main.rs")}}]}});
@@ -3135,6 +3247,7 @@ mod tests {
         })).map(|record| format!("{record}\n")).collect::<String>();
         let log = transcript::wrap_lines(&raw, "claude-code", &session);
         let policy = PrivacyPolicy {
+            attachments,
             workspace: Some(workspace.into()),
             replacements: vec![super::super::privacy::ReplacementRule {
                 pattern: "SECRET_VALUE".into(),
@@ -3212,7 +3325,10 @@ mod tests {
         assert!(projection.log().contains("Public answer"));
         let records = storage::parse_envelopes(projection.log()).unwrap();
         for record in &records[..3] {
-            assert_eq!(record.content["message"]["content"][0]["text"], OMITTED);
+            assert_eq!(
+                record.content["message"]["content"][0]["text"],
+                Omission::NativeRecord.text()
+            );
             assert_eq!(record.content["isMeta"], true);
         }
         assert_eq!(projection.report.omissions.len(), 3);

@@ -11,7 +11,7 @@ to be normalized. Encrypted sessions publish a sanitized projection and
 originals encrypted to the session owner's account key. Accepted ancestry remains unchanged, so
 a repository can contain both modes. Use `new`, `fork` or `import` to create a session.
 
-For an explicitly requested unencrypted session, run `agit privacy mode owner/repo@branch plain`
+New sessions publish plain by default. To enable encryption, run `agit privacy mode owner/repo@branch encrypted`
 before its first registration. This selects the logical session's mode across its branches;
 `--public` and `--private` only select repository visibility. Registered modes cannot change.
 
@@ -93,7 +93,7 @@ at the terminal, and `--yes` cannot replace its review or final confirmation.
 
 ## Session authority and first publication
 
-New sessions record their creator and default to session-owner encryption. Existing plain sessions
+New sessions record their creator and default to plain publication. Existing plain sessions
 retain their registered plain mode. Unknown local sessions require registration before a dry run;
 only the Hub's explicit unregistered-session response permits registration. Missing permissions,
 malformed responses and network failures never select a plaintext fallback.
@@ -117,7 +117,8 @@ snapshot contributes the files it introduces relative to its parents. A blob app
 content once; a later entry carrying it is marked `repeated`. A file that only appends to its first
 parent's version shows the appended bytes under `appended_to`, and an object above the per-object
 limit is listed with `omitted_bytes` after its payload is verified. Encrypted
-snapshots exclude independent repository files and attachment bodies. Complete original LOG and
+snapshots exclude independent repository files. Captured attachments follow the local attachment
+policy and default to retaining their recorded carriers. Complete original LOG and
 VIEW records remain encrypted; reading them requires exact-snapshot account authorization.
 
 Objects absent from the destination's authenticated live advertisement are captured for inspection.
@@ -126,6 +127,11 @@ tags and LFS pointers are included even when a later snapshot deletes them. New 
 require captured payload bytes with matching size and hash. Full preview displays captured LFS text;
 binary content is summarized, and unchanged accepted pointers outside the upload are marked preserved.
 A missing or unverifiable baseline requires full inspection. Unavailable payloads block publication.
+
+Tool and attachment projection settings apply to encrypted snapshots, privacy exports and shares;
+plain push retains its existing path and local secret protection. Tool content defaults to visible
+and attachments default to original. Configure `privacy policy tool` or `privacy policy attachment`
+to hide content before preparing new publications.
 
 Local privacy processing applies path aliases, omissions, replacements and secret protection before
 encrypted public bytes are prepared. Optional display processing can return partial results or skip

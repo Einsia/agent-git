@@ -71,7 +71,9 @@ agit config --repo alice/project --list --json
 ```
 
 `push.auto` supports a repository override. Session encryption is registered separately for each
-session; repository configuration does not select it.
+session and defaults to plain for new sessions; repository configuration does not select it.
+Use `agit privacy mode OWNER/REPO@BRANCH encrypted` before registration to enable encryption.
+Tool omission and attachment settings live under `agit privacy policy`, not `agit config`.
 
 Repository `push.auto` JSON results distinguish `repository` from `inherited`
 values. This changes the Agent repo preference, not the project code repository.

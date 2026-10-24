@@ -24,8 +24,6 @@ const MAX_SEQUENCE_BYTES: usize = storage::MAX_SEQUENCE_EVENTS * ID_LINE;
 const MAX_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
 /// Cached sequences beyond the newest are evicted past this size.
 const SEQUENCE_CACHE_BYTES: usize = 96 * 1024 * 1024;
-/// Encrypted publications replace excluded content with this reserved line.
-const PRIVACY_PLACEHOLDER: &str = "[Content omitted by privacy policy]";
 
 /// The page's read budget cannot cover the next read; the page ends and a continuation retries
 /// the same deterministic window with a fresh budget.
@@ -375,7 +373,11 @@ impl<'s, S: Store> Extractor<'s, S> {
             if candidate.published {
                 text = text
                     .split_inclusive('\n')
-                    .filter(|line| line.trim_end_matches(['\r', '\n']) != PRIVACY_PLACEHOLDER)
+                    .filter(|line| {
+                        !crate::domain::privacy::omission::is_notice(
+                            line.trim_end_matches(['\r', '\n']),
+                        )
+                    })
                     .collect();
             }
             if !text.is_empty() {

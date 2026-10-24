@@ -35,7 +35,10 @@ pub(super) fn publication(
     let mut metadata = Meta::new(session.clone(), "codex".into(), String::new());
     if session_encrypted {
         let account = AccountIdentity::new(&destination.hub, "account-1").unwrap();
-        metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+        metadata.session_privacy = Some(SessionPrivacy {
+            scheme: crate::domain::session_privacy::SessionScheme::SessionOwnerV2,
+            ..SessionPrivacy::new(Some(account.clone())).unwrap()
+        });
         metadata.committer_account = Some(account);
     }
     meta::write(repo.root(), &metadata).unwrap();

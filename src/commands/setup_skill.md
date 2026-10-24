@@ -64,8 +64,8 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   pushing needs an account: signed out, `--auto-push=true` prints a login link
   for the human and stops before creating anything. A first `agit push` without
   `--public` or `--private` publishes private when nobody can be asked. New
-  sessions record their creator and default to owner-account encryption. Existing
-  plain sessions retain their registered settings. First publication confirms
+  sessions record their creator and default to plain publication. Existing
+  sessions retain their recorded settings. First publication confirms
   repository creation, then presents the prepared session preview; unattended
   explicit publication requires `--yes`.
 - For a new repository's first push, explicitly pass `--public` or `--private`
@@ -298,8 +298,8 @@ agit push <owner/repo> -b main --yes                    # follow the dry-run dec
 | `search` | Search the AgentGit corpus visible to the current identity |
 | `rc` | Start and manage the `agitd` remote-control daemon and peer/Cloud connections |
 
-New sessions default to encryption. If the user explicitly requests unencrypted publication,
-run `agit privacy mode <owner/repo>@<branch> plain` before the session's first remote registration,
+New sessions default to plain publication. If the user requests encryption,
+run `agit privacy mode <owner/repo>@<branch> encrypted` before the session's first remote registration,
 then publish normally. The choice follows the logical session across branches. Repository
 visibility (`push --public` / `--private`) is separate; registered modes cannot change.
 Read [privacy](references/commands/privacy.md) for confirmation and registration boundaries.

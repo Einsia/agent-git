@@ -19,9 +19,10 @@ Replace the uppercase names with actual account names. Repeat the grant for each
 The current `repo create` creates under the signed-in account; select an existing organization
 repository through the website instead of passing an organization-qualified creation name.
 
-Developers publish using their own accounts. New sessions default to encryption for the session
-creator's account. Repository membership permits published-content access; original content also
-requires eligible default or explicit access. New sessions use session-level grants: the
+Developers publish using their own accounts. New sessions default to plain publication. To encrypt a session,
+select `agit privacy mode MANAGER/project-name@SESSION_BRANCH encrypted` before first registration.
+Repository membership permits published-content access; encrypted originals also require eligible
+default or explicit access. Encrypted sessions use session-level grants: the
 session owner can authorize current members
 access with `agit privacy access grant MANAGER/project-name@SESSION_BRANCH` after reviewing the
 session scope and frozen member list. This covers existing and future commits until

@@ -502,6 +502,43 @@ mod tests {
             assert_eq!(value.get("arg_mode"), mode.map(|mode| json!(mode)).as_ref());
             assert!(!value.to_string().contains("private-canary"));
         }
+
+        let value = capture(&[
+            "agit",
+            "privacy",
+            "policy",
+            "attachment",
+            "metadata",
+            "--repo",
+            "private-canary/repo",
+        ]);
+        assert_eq!(value["command_path"], "privacy policy attachment");
+        assert_eq!(value["arg_mode"], "metadata");
+        assert_eq!(value["arg_repo"], true);
+        assert!(!value.to_string().contains("private-canary"));
+
+        for (choice, omit, reset) in [
+            (vec!["--omit", "false"], Some("false"), false),
+            (vec!["--reset"], None, true),
+        ] {
+            let mut args = vec![
+                "agit",
+                "privacy",
+                "policy",
+                "tool",
+                "private-canary-tool",
+                "--repo",
+                "private-canary/repo",
+            ];
+            args.extend(choice);
+            let value = capture(&args);
+            assert_eq!(value["command_path"], "privacy policy tool");
+            assert_eq!(value["arg_name"], true);
+            assert_eq!(value["arg_repo"], true);
+            assert_eq!(value.get("arg_omit"), omit.map(|omit| json!(omit)).as_ref());
+            assert_eq!(value["arg_reset"], reset);
+            assert!(!value.to_string().contains("private-canary"));
+        }
     }
 
     #[test]

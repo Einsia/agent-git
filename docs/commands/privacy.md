@@ -2,11 +2,12 @@
 
 ## Choose an initial publication mode
 
-New sessions default to encryption. Before the session's first remote registration, its creator
-can explicitly choose plain publication:
+New sessions default to `plain` publication. This applies to new sessions, first imports,
+independent forks and offline creation. Before the session's first remote registration, its
+creator can explicitly enable encryption:
 
 ```sh
-agit privacy mode alice/project@work plain
+agit privacy mode alice/project@work encrypted
 agit privacy status alice/project@work
 agit push alice/project@work --private
 ```
@@ -17,8 +18,10 @@ published history. Local secret protection and ordinary publication checks still
 
 The choice is local and follows the logical session across branch renames and multiple branches.
 It covers all unpublished snapshots and future commits in that session. It does not create a
-remote repository or register the session. Before registration, choose `encrypted` to restore
-the encrypted default. Omit the mode argument to inspect the local choice and remote registration.
+remote repository or register the session. Before registration, choose `plain` to return to
+unencrypted publication. Omit the mode argument to inspect the local choice and remote registration.
+Existing sessions retain their recorded mode, including encrypted sessions created offline. Resume,
+repeat import and clone preserve that mode; upgrading the CLI does not downgrade existing sessions.
 Changes require confirmation; use global `--yes` for an explicitly authorized unattended change.
 
 The first push registers the selected mode. Once registered, it cannot change, even if that push
@@ -31,9 +34,100 @@ mapped parents when their birth metadata declares encryption; event bytes and fi
 unchanged. Accepted history retains its exact commits. Custom tags targeting rewritten commits
 must be removed before publication or recreated on the accepted public commits.
 
+## Tool and attachment publication
+
+Privacy projections show tool calls and results by default, and retain recorded attachments in
+`original` mode. Configure exclusions yourself when you want to hide content.
+
+**These controls apply to encrypted public views, `export --privacy`, and `share`. Ordinary plain
+push keeps its existing publication path and local secret protection; it does not apply these
+projection controls.** Session encryption does not by itself hide tools or attachments in the
+public view. Repository visibility determines who can read that view.
+
+Inspect the effective configuration or locate the device-local JSON file:
+
+```sh
+agit privacy policy show --repo alice/project
+agit privacy policy file --repo alice/project
+```
+
+The relevant fields are:
+
+```json
+{
+  "tools": {
+    "omit": false,
+    "overrides": {}
+  },
+  "attachments": "original"
+}
+```
+
+These fields also supply the defaults when an existing policy file omits them. Keep the other
+fields when editing the file. Policies remain below the local Git common directory; cloning a
+repository does not install another device's policy.
+
+### Hide or show tools
+
+A tool setting controls both the call arguments and its associated results, including shell
+stdout/stderr. Override names are exact and case-sensitive. `runtime:tool` takes precedence over
+a bare tool name, which takes precedence over `tools.omit`. There are no wildcard rules.
+
+```sh
+agit privacy policy tool --omit true --repo alice/project
+agit privacy policy tool Read --omit false --repo alice/project
+agit privacy policy tool codex:exec_command --omit true --repo alice/project
+agit privacy policy tool mcp__company__query --omit true --repo alice/project
+agit privacy policy tool codex:exec_command --reset --repo alice/project
+agit privacy policy tool --omit false --repo alice/project
+```
+
+Reset removes the named override; it then inherits a matching bare-name rule or the default.
+Tool names come from the recorded runtime. Results with missing or ambiguous call identities
+remain unavailable because a tool-specific choice cannot be established for them.
+
+Captured file-tool content does not require a configured workspace or an include match.
+`workspace`, `external_roots` and `include` still control file collection and path aliases.
+Structured `path` and `file_path` inputs honor built-in sensitive-file exclusions, configured
+exclusions, branch exclusions and mandatory sources. Exclusion patterns use the most specific
+configured root, then the recorded cwd when available. Shell commands are not parsed to infer
+which files their output contains; use the shell tool's omission setting to hide that output.
+Readable tool text still undergoes path aliasing, configured replacements and secret protection.
+
+### Choose attachment handling
+
+```sh
+agit privacy policy attachment omit --repo alice/project
+agit privacy policy attachment metadata --repo alice/project
+agit privacy policy attachment original --repo alice/project
+```
+
+| Mode | Published content |
+| --- | --- |
+| `omit` | A typed notice such as `[Image omitted by policy]` |
+| `metadata` | Available descriptive type, name/title, MIME type and size, after text sanitization; no body, URL, path or resource ID |
+| `original` | The recorded attachment structure and payload; readable text is sanitized and encoded binary payloads remain intact |
+
+The mode applies to message attachments and nested tool attachments. Hiding a tool also hides
+its attachments. Original mode retains data already captured in the transcript; it does not
+read referenced files or fetch URLs. Binary payloads are not decoded for text scanning. Existing
+input and publication size limits still apply, and this setting does not guarantee that every
+viewer renders every attachment format.
+
+### Omission notices and existing history
+
+Notices distinguish tool policy, file exclusions, attachment handling, unsupported formats and
+unverifiable sources. For example, `[Tool output omitted by policy]` is a configured choice,
+while `[Content unavailable: unsupported message format]` is a format limitation. Reports retain
+the source LOG position and reason. Hidden tools remain tool events rather than new user turns.
+
+Changes apply when generating new projections. Accepted commits, ciphertext and previously
+created shares remain unchanged. Older generic notices retain their wording; their cause is not
+guessed from the placeholder. Activity summaries omit both old and new standalone notices.
+
 ## Original access
 
-New sessions enable session-level explicit authorization by default. The immutable
+Encrypted sessions enable session-level explicit authorization by default. The immutable
 session owner, while a current repository member, manages grants. Select a branch
 or complete commit from a local checkout:
 

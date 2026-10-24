@@ -310,9 +310,9 @@ impl Selection {
             let metadata = crate::domain::storage::metadata_local(repo.root(), &resolved.sha)?;
             let _mode_lock =
                 crate::domain::privacy_git::modes::lock(&repo, &identity.hub, &metadata.session)?;
-            if let Some(choice) =
-                crate::domain::privacy_git::modes::load(&repo, &identity.hub, &metadata.session)?
-            {
+            let choice =
+                crate::domain::privacy_git::modes::load(&repo, &identity.hub, &metadata.session)?;
+            if let Some(choice) = &choice {
                 choice.verify(&identity, &repository)?;
                 ensure!(
                     choice.scheme != crate::domain::session_privacy::SessionScheme::Plain,
@@ -323,10 +323,13 @@ impl Selection {
                 metadata.is_session_line() && crate::domain::meta::is_bare_id(&metadata.session),
                 "original access requires one identified logical session"
             );
-            let local = metadata
+            let mut local = metadata
                 .session_privacy
                 .clone()
                 .unwrap_or(SessionPrivacy::new(metadata.committer_account.clone())?);
+            if let Some(choice) = choice {
+                local.scheme = choice.scheme;
+            }
             let response = match client.registered_session_privacy(
                 &repository,
                 &identity,
@@ -338,9 +341,14 @@ impl Selection {
                             != crate::domain::session_privacy::SessionScheme::Plain,
                         "plain sessions use repository read access; original grants require session encryption"
                     );
+                    local.scheme = response.config.privacy.scheme;
                     response
                 }
                 None => {
+                    ensure!(
+                        local.scheme != crate::domain::session_privacy::SessionScheme::Plain,
+                        "plain sessions use repository read access; select encrypted mode before managing original grants"
+                    );
                     let privacy = if local.owner_source == OwnerResolution::Unresolved {
                         let mut privacy = SessionPrivacy::new(Some(actor.clone()))?;
                         privacy.scheme = local.scheme;

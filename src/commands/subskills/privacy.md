@@ -5,20 +5,20 @@ description: Choose initial session publication modes, configure privacy policy,
 
 # Privacy policy and original access
 
-New sessions encrypt originals to their creator's account by default. Existing plain sessions
-retain their registered mode. Repository visibility and access to original content are separate:
+New sessions default to plain publication. Existing sessions retain their recorded mode.
+Encryption is opt-in before the first registration. Repository visibility and access to original content are separate:
 key delivery requires current repository membership and permission for the exact saved snapshot.
 
-Before a session is registered, its creator can explicitly select unencrypted publication:
+Before a session is registered, its creator can explicitly enable encryption:
 
 ```sh
-agit privacy mode alice/agent@work plain
+agit privacy mode alice/agent@work encrypted
 agit push alice/agent@work --private
 ```
 
 This local choice covers all unpublished snapshots and future commits of the logical session,
-including its other branches. Confirm only when the user requests unencrypted publication.
-`encrypted` restores the default before registration; omit the mode to inspect current settings.
+including its other branches. Change the mode only when authorized by the user.
+`plain` restores the default before registration; omit the mode to inspect current settings.
 The first registration locks the mode, including registration during an unsuccessful push or an
 original-access policy operation. Repository visibility flags do not select encryption.
 Plain content uses repository read access; local secret protection still applies.
@@ -78,11 +78,25 @@ current access before confirming a new request. See `docs/commands/privacy.md` f
 publication pipeline. The policy is stored below the local AgentGit repository's Git common
 directory and is never committed to the AgentGit tree.
 
-The default policy is conservative: no workspace is authorized until one is configured, and the
-default include list covers common source, documentation, test, example, and project metadata
-paths. Sensitive names such as `.env`, SSH keys, and private credential files remain excluded even
-when an include pattern matches them. Memory stays private until an explicit memory pattern is
-added.
+File collection requires an authorized workspace and an include match. Captured file-tool content
+is visible by default without either requirement; structured file paths still honor explicit,
+mandatory and sensitive-file exclusions. Memory collection remains opt-in.
+
+Privacy projections default to `tools.omit: false` and `attachments: "original"`. To hide content:
+
+```sh
+agit privacy policy tool codex:exec_command --omit true --repo alice/agent
+agit privacy policy tool mcp__company__query --omit true --repo alice/agent
+agit privacy policy attachment metadata --repo alice/agent
+```
+
+Tool settings apply to both calls and results. A runtime-qualified exact name overrides a bare
+exact name, which overrides the default. `tool --omit true` hides tools by default; a named
+`--omit false` allows one. `tool NAME --reset` removes an override. Attachments support `omit`,
+`metadata` and `original`; original retains recorded binary carriers and sanitizes readable text.
+It does not fetch referenced files or URLs. Configurations without these fields use open defaults.
+These settings affect encrypted public views, privacy exports and shares; plain push uses its
+existing path. Existing accepted history is immutable. See `docs/commands/privacy.md` for details.
 
 System/device mandatory exclusions override repository includes and branch settings. The CLI
 loads the platform's system policy and the absolute source paths listed in

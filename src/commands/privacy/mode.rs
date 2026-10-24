@@ -141,7 +141,7 @@ impl Selection {
                 self.metadata
                     .session_privacy
                     .as_ref()
-                    .map_or(SessionScheme::SessionOwnerV2, |privacy| privacy.scheme)
+                    .map_or(SessionScheme::Plain, |privacy| privacy.scheme)
             });
         let registered = self
             .registered

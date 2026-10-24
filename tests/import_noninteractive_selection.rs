@@ -1588,7 +1588,7 @@ fn imported_and_live_metadata_remain_publishable() {
     assert_eq!(ownership.creator.as_deref(), Some("creator-a"));
     assert_eq!(
         ownership.scheme,
-        agit::domain::session_privacy::SessionScheme::SessionOwnerV2
+        agit::domain::session_privacy::SessionScheme::Plain
     );
     select_account("committer-b");
     assert_eq!(adopt(), ownership);

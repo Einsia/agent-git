@@ -195,7 +195,7 @@ fn public_and_encrypted_shares_contain_the_same_sanitized_records() {
         String::from_utf8_lossy(&output.stderr)
             .matches("attachment body is excluded from public content")
             .count()
-            >= 4
+            == 0
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let key = stdout
@@ -686,7 +686,7 @@ fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
         let preview = String::from_utf8_lossy(&output.stderr);
         assert!(preview.contains("Privacy preview"));
         assert!(preview.contains("Source LOG record"));
-        assert!(preview.contains("tool source is excluded, ambiguous, or unknown"));
+        assert!(preview.contains("file content is excluded by policy"));
         assert!(preview.contains("original records are not included"));
         assert!(preview.contains("ALLOWED_TOOL_TAIL\\u{1b}[2J"));
         assert!(!preview.contains('\u{1b}'));

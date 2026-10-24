@@ -477,7 +477,7 @@ retain authenticated owner recipients, immutable source/ref, schema, and client 
 they do not evaluate secret findings or cloud content exclusions. Server summary/projection
 validation no longer rejects content because a field name resembles a secret or a value resembles
 a local path. Registered session encryption is separate from the automatic per-account dictionary
-key. New sessions default to owner-account encryption and accepted plain sessions retain their
+key. New sessions default to plain publication and accepted plain sessions retain their
 registered mode. Session authority and cryptographic validation remain required even when optional
 local privacy work is unavailable.
 

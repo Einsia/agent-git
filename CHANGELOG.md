@@ -12,10 +12,29 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 - `agit privacy mode OWNER/REPO@BRANCH plain` selects unencrypted publication before a session's
   first remote registration. The choice follows the logical session across branches, keeps source
-  history unchanged, and is separate from repository visibility. Use `encrypted` to restore the
-  default before registration, or omit the mode to inspect the local choice and registered mode.
+  history unchanged, and is separate from repository visibility. Use `encrypted` to opt into
+  encryption before registration, or omit the mode to inspect the local choice and registered mode.
+
+- `agit privacy policy tool [NAME] --omit true|false` controls calls and results together, with
+  exact tool-name and runtime-qualified overrides. `--reset` removes a named override.
+- `agit privacy policy attachment omit|metadata|original` controls recorded attachments in
+  encrypted public views, privacy exports and shares. Plain push retains its existing path.
+
+### Changed
+
+- New sessions, first imports and independent forks default to plain publication. Existing
+  recorded and registered modes are preserved. Select `privacy mode OWNER/REPO@BRANCH encrypted`
+  before registration to enable encryption.
+- Privacy projections default to visible tools and original attachments, including when an
+  existing policy omits the new fields. Configure omission explicitly to hide them. Captured
+  file-tool content no longer requires a workspace/include match; explicit and mandatory file
+  exclusions remain effective. Readable text remains sanitized; recorded binary carriers are retained.
 
 ### Fixed
+
+- Publication notices distinguish configured hiding, attachment handling, unsupported formats
+  and unverifiable sources. Omitted tools preserve call/result classification instead of opening
+  user turns, and activity summaries exclude both legacy and specific omission notices.
 
 - Encrypted publication restores originals against a frozen dictionary across all batches and
   resolves evidence references independently of LOG order. Repeated events no longer fail with

@@ -26,5 +26,6 @@ pub mod sync;
 pub mod worker;
 
 pub mod mandatory;
+pub(crate) mod omission;
 mod repository;
 pub use repository::*;

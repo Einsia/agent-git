@@ -1,11 +1,13 @@
-//! The privacy command manages the device-local publication allowlist.
+//! The privacy command manages device-local publication policy.
 //!
 //! The policy file is outside the tracked AgentGit tree. The file action prints its location for
 //! direct edits, while the other policy actions validate and save the same JSON through the CLI.
 //! Preview evaluates only paths named by the caller; it never walks a directory implicitly.
 
 use super::CmdResult;
-use crate::domain::privacy::{ExternalRoot, PreviewReport, PrivacyPolicy, ReplacementRule};
+use crate::domain::privacy::{
+    AttachmentMode, ExternalRoot, PreviewReport, PrivacyPolicy, ReplacementRule,
+};
 use crate::domain::privacy_paths::PathAliasStore;
 use crate::domain::repo::Repo;
 use crate::infra::config;
@@ -38,6 +40,7 @@ pub struct Args {
 #[derive(Subcommand)]
 pub enum Action {
     /// Inspect or choose a session's publication mode before its first remote registration.
+    /// New sessions publish plain by default; select encrypted to enable encryption.
     Mode {
         #[arg(value_name = "OWNER/REPO@REF")]
         target: String,
@@ -86,6 +89,27 @@ pub enum Action {
 
 #[derive(Subcommand)]
 pub enum PolicyAction {
+    /// Choose how captured attachments appear in encrypted views, privacy exports and shares.
+    /// The default is original; plain push does not apply this setting.
+    Attachment {
+        #[arg(value_enum)]
+        mode: AttachmentMode,
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// Omit or show a tool's calls and results in encrypted views, privacy exports and shares.
+    /// Tools are visible by default; plain push does not apply this setting.
+    Tool {
+        /// Exact tool name or runtime:tool; omitted changes the default.
+        name: Option<String>,
+        #[arg(long, action = clap::ArgAction::Set, required_unless_present = "reset", conflicts_with = "reset")]
+        omit: Option<bool>,
+        /// Remove the named override and inherit the default.
+        #[arg(long, requires = "name")]
+        reset: bool,
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Print the policy and its non-reversible digest.
     Show {
         #[arg(long, value_name = "OWNER/REPO")]
@@ -194,6 +218,8 @@ pub fn run(args: Args) -> CmdResult {
 fn run_policy(command: PolicyAction) -> CmdResult {
     let repo_arg = match &command {
         PolicyAction::Show { repo }
+        | PolicyAction::Tool { repo, .. }
+        | PolicyAction::Attachment { repo, .. }
         | PolicyAction::File { repo }
         | PolicyAction::SetWorkspace { repo, .. }
         | PolicyAction::ClearWorkspace { repo }
@@ -209,6 +235,35 @@ fn run_policy(command: PolicyAction) -> CmdResult {
     };
     let (repo, slug) = resolve_repo(repo_arg)?;
     match command {
+        PolicyAction::Attachment { mode, .. } => mutate(
+            &repo,
+            |policy| {
+                policy.attachments = mode;
+                Ok(())
+            },
+            "attachment publication policy updated",
+        ),
+        PolicyAction::Tool {
+            name, omit, reset, ..
+        } => mutate(
+            &repo,
+            |policy| {
+                if let Some(name) = name {
+                    if reset {
+                        policy.tools.overrides.remove(&name);
+                    } else {
+                        policy
+                            .tools
+                            .overrides
+                            .insert(name, omit.context("tool omission choice is required")?);
+                    }
+                } else {
+                    policy.tools.omit = omit.context("tool omission choice is required")?;
+                }
+                Ok(())
+            },
+            "tool publication policy updated",
+        ),
         PolicyAction::Show { .. } => show(&repo, &slug),
         PolicyAction::File { .. } => file(&repo),
         PolicyAction::SetWorkspace { path, .. } => mutate(

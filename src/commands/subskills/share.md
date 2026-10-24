@@ -58,10 +58,13 @@ content. The confirmation and result label this source as a live runtime transcr
 from a saved VIEW; use an AgentGit ref with `--full-log` for saved LOG content. A name that matches
 both a ref and a native session is refused rather than choosing for you.
 
-Both public and encrypted shares contain only the sanitized selected records. Encrypted shares
+Both public and encrypted shares contain the selected projection. Tools default to visible and
+attachments default to retaining recorded originals. Use `privacy policy tool NAME --omit true`
+or `privacy policy attachment omit|metadata` with `--repo` to hide them. Readable text is sanitized;
+retained binary attachments are not text-scanned. Encrypted shares
 use browser-compatible AES-GCM; the key is carried in the URL fragment and is never uploaded.
-Original records remain governed by the source snapshot's account permissions. Use `privacy access`
-to manage original readers and `privacy unlock` for local recovery. The share's `--password` is a
+For encrypted source snapshots, original recovery remains governed by account permissions. Use
+`privacy access` to manage original readers and `privacy unlock` for local recovery. The share's `--password` is a
 separate access passphrase.
 
 The command sends the versioned request to `/api/shares/privacy` and requires a format acknowledgement.

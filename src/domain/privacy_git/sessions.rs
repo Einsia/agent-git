@@ -100,9 +100,11 @@ impl SessionPublicationPlan {
                     if privacy.owner_source
                         == super::super::session_privacy::OwnerResolution::Unresolved
                     {
+                        let scheme = privacy.scheme;
                         privacy = super::super::session_privacy::SessionPrivacy::new(Some(
                             account.clone(),
                         ))?;
+                        privacy.scheme = scheme;
                     }
                     if let Some(choice) = &mut choice {
                         ensure!(
@@ -116,11 +118,6 @@ impl SessionPublicationPlan {
                         privacy.scheme = choice.scheme;
                         choice.repository_id = Some(identity.agent_id.clone());
                         choice.save(source)?;
-                    } else {
-                        ensure!(
-                            privacy.scheme == SessionScheme::SessionOwnerV2,
-                            "an unregistered plain session requires an explicit privacy mode choice"
-                        );
                     }
                     ensure!(
                         privacy.hub.as_deref() == Some(identity.hub.as_str()),
@@ -173,10 +170,8 @@ impl SessionPublicationPlan {
         );
         if let Some(local) = &metadata.session_privacy {
             let mut effective = local.clone();
-            // Registered plain authority governs unpublished source snapshots whose birth default was encrypted.
-            if config.privacy.scheme == SessionScheme::Plain {
-                effective.scheme = SessionScheme::Plain;
-            }
+            // Registered authority governs unpublished snapshots independently of their birth default.
+            effective.scheme = config.privacy.scheme;
             config.verify_registration(&self.identity.agent_id, &metadata.session, &effective)?;
         }
         Ok(response)

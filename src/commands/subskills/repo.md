@@ -52,9 +52,10 @@ Creation selects the repository's name and visibility, then installs a local che
 its immutable Hub identity. If the name already exists, use `agit clone` to retain its identity and
 history. A mismatched creation response cannot replace the local identity or imported history.
 
-Privacy settings belong to individual sessions. New sessions default to owner-account encryption;
-existing plain sessions retain their registered mode. Repository access permits published-content
-reads, while original access also requires membership and an entitlement for the exact snapshot.
+Privacy settings belong to individual sessions. New sessions default to plain publication;
+existing sessions retain their recorded mode. Repository access permits published-content reads.
+For encrypted sessions, original access also requires membership and an entitlement for the exact
+snapshot. Enable encryption before registration with `agit privacy mode OWNER/REPO@BRANCH encrypted`.
 
 ## Invite links
 

@@ -145,7 +145,10 @@ fn prepare_real_claude_recovery(
     .unwrap();
     let account = AccountIdentity::new("http://127.0.0.1:1", "account-alice").unwrap();
     let mut metadata = meta::read(repo.root()).unwrap();
-    metadata.session_privacy = Some(SessionPrivacy::new(Some(account.clone())).unwrap());
+    metadata.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(account.clone())).unwrap()
+    });
     metadata.committer_account = Some(account.clone());
     let mut layer = PrivateLayer::new(
         &saved,
@@ -304,8 +307,10 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         source.into(),
         "/source/workspace".into(),
     );
-    let ownership =
-        SessionPrivacy::new(Some(AccountIdentity::new(&base, "account-alice").unwrap())).unwrap();
+    let ownership = SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(AccountIdentity::new(&base, "account-alice").unwrap())).unwrap()
+    };
     metadata.session_privacy = Some(ownership.clone());
     metadata.committer_account = Some(AccountIdentity::new(&base, "account-bob").unwrap());
     let source_committer = SourceCommitter::from_commit(
@@ -973,18 +978,16 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         }
 
         let old_file = runtime_file.clone();
-        let (link_path, claim, legacy) =
+        let (link_path, _, legacy) =
             install_legacy_baseline(&repo, &before, &home, &old_file, &workspace);
+        let claim = std::fs::read_to_string(&link_path).unwrap();
         let rewritten = legacy.replacen("synthetic private session", "synthetic edited session", 1);
         assert_ne!(rewritten, legacy);
         std::fs::write(&old_file, &rewritten).unwrap();
         let refused = run(&resume_args);
         assert!(!refused.status.success());
         assert_eq!(std::fs::read_to_string(&old_file).unwrap(), rewritten);
-        assert_eq!(
-            std::fs::read_to_string(&link_path).unwrap(),
-            claim.to_string()
-        );
+        assert_eq!(std::fs::read_to_string(&link_path).unwrap(), claim);
 
         let tail = format!(
             "{}\n",
@@ -1273,6 +1276,15 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         assert!(reinstalled.contains("native-signature"));
     }
 
+    agit::domain::privacy::PrivacyPolicy {
+        tools: agit::domain::privacy::ToolPolicy {
+            omit: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .save(&repo)
+    .unwrap();
     let public_export = run(&["export", "alice/app@encrypted", "--privacy"]);
     assert!(
         public_export.status.success(),
