@@ -324,6 +324,13 @@ pub fn run(args: Args) -> CmdResult {
     // key the configured store does not hold, fails the first commit that finds a secret — on
     // a machine with no desktop session, that is the first sign anything is wrong.
     checks.push(("secret keystore".into(), keystore_row()));
+    if let Some(refusal) = crate::domain::privacy::sync::recorded_refusal(&hub) {
+        let (said, next) = refusal.describe(chrono::Utc::now().timestamp());
+        checks.push((
+            "privacy sync".into(),
+            Check::Warn(format!("{said} — {next}")),
+        ));
+    }
 
     // ── Backend ──
     if args.check_backend {

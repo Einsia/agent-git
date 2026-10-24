@@ -15,7 +15,9 @@ use std::time::Duration;
 #[derive(Default)]
 struct Cloud {
     packages: Vec<(String, Value)>,
-    reject_upload: bool,
+    /// Status, content type and body answered to every package upload.
+    refuse_upload: Option<(u16, &'static str, &'static str)>,
+    upload_attempts: usize,
 }
 
 struct Hub {
@@ -74,6 +76,7 @@ impl Hub {
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).unwrap();
                 let mut cloud = cloud.lock().unwrap();
+                let mut refusal = None;
                 let (status, value) = if path == "/api/me/privacy/key" {
                     (
                         200,
@@ -92,8 +95,10 @@ impl Hub {
                         assert_eq!(envelope["format"], 1);
                         assert!(envelope["ciphertext"].as_str().is_some());
                         assert!(!String::from_utf8_lossy(&body).contains("AKIA"));
-                        if cloud.reject_upload {
-                            (503, json!({"error":"dictionary temporarily unavailable"}))
+                        cloud.upload_attempts += 1;
+                        if let Some((status, kind, body)) = cloud.refuse_upload {
+                            refusal = Some((kind, body));
+                            (status, Value::Null)
                         } else {
                             let index = cloud
                                 .packages
@@ -121,8 +126,11 @@ impl Hub {
                 } else {
                     panic!("unexpected privacy request: {method} {path}")
                 };
-                let bytes = serde_json::to_vec(&value).unwrap();
-                write!(socket,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).unwrap();
+                let (kind, bytes) = match refusal {
+                    Some((kind, body)) => (kind, body.as_bytes().to_vec()),
+                    None => ("application/json", serde_json::to_vec(&value).unwrap()),
+                };
+                write!(socket,"HTTP/1.1 {status} Fixture\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).unwrap();
                 socket.write_all(&bytes).unwrap();
             }
         });
@@ -220,6 +228,12 @@ impl Device {
             output.status.success(),
             "privacy synchronization failed: {output:?}"
         );
+    }
+
+    fn doctor(&self) -> String {
+        let output = self.command().arg("doctor").output().unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr)
     }
 
     fn worker(&self) -> Worker {
@@ -342,10 +356,14 @@ fn independent_devices_recover_durable_aliases_after_cloud_failure() {
         .unwrap()
             > 0
     }));
-    hub.state.lock().unwrap().reject_upload = true;
+    hub.state.lock().unwrap().refuse_upload = Some((
+        503,
+        "application/json",
+        r#"{"error":"dictionary temporarily unavailable"}"#,
+    ));
     first.sync();
     assert!(hub.state.lock().unwrap().packages.is_empty());
-    hub.state.lock().unwrap().reject_upload = false;
+    hub.state.lock().unwrap().refuse_upload = None;
     first.sync();
     let count = hub.state.lock().unwrap().packages.len();
     assert!(count > 0);
@@ -375,4 +393,52 @@ fn independent_devices_recover_durable_aliases_after_cloud_failure() {
     let output = second.worker().call("protect_text", secret);
     assert_eq!(output["status"], "skipped");
     assert_eq!(output["content"], secret);
+}
+
+/// A refusal that an immediate retry would meet again is paced and reported by cause. A sync
+/// that treats it like a transient failure re-sends the outbox on every run; one that reports
+/// every 403 as an account problem sends the user to `agit login` for a block that no sign-in
+/// can lift.
+#[test]
+fn refused_dictionary_uploads_back_off_and_name_their_cause() {
+    let hub = Hub::new();
+    let input =
+        json!({"type":"assistant","data":{"api_key":"AKIA2E7YQXK4NMZ5VJ3T"}}).to_string() + "\n";
+    let edge = Device::new(&hub.url);
+    let account = Device::new(&hub.url);
+    for device in [&edge, &account] {
+        let protected = device.worker().call("protect_jsonl", &input);
+        assert!(protected["replacements"].as_u64().unwrap() > 0);
+    }
+
+    hub.state.lock().unwrap().refuse_upload = Some((
+        403,
+        "text/html",
+        "<html><body><h1>403 Forbidden</h1></body></html>",
+    ));
+    edge.sync();
+    let attempts = hub.state.lock().unwrap().upload_attempts;
+    assert!(attempts > 0);
+    edge.sync();
+    assert_eq!(hub.state.lock().unwrap().upload_attempts, attempts);
+    let report = edge.doctor();
+    assert!(
+        report.contains("blocked before it reached the Hub"),
+        "{report}"
+    );
+    assert!(!report.contains("agit login`, then push"), "{report}");
+
+    hub.state.lock().unwrap().refuse_upload = Some((
+        403,
+        "application/json",
+        r#"{"error":"privacy storage is disabled for this account","kind":"forbidden"}"#,
+    ));
+    account.sync();
+    let report = account.doctor();
+    assert!(
+        report.contains("privacy storage is disabled for this account"),
+        "{report}"
+    );
+    assert!(report.contains("agit login`, then push"), "{report}");
+    assert!(hub.state.lock().unwrap().packages.is_empty());
 }

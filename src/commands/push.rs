@@ -260,6 +260,12 @@ pub fn run(mut args: Args) -> CmdResult {
     }
     if !args.dry_run {
         crate::domain::privacy::service::schedule_sync(client.base());
+        // Dictionary sync runs detached, so push is where its refusals become visible.
+        if let Some(refusal) = crate::domain::privacy::sync::recorded_refusal(client.base()) {
+            let (said, next) = refusal.describe(chrono::Utc::now().timestamp());
+            ui::warning(&said);
+            ui::hint(&next);
+        }
     }
     if branches.is_empty() {
         ui::info("nothing to publish yet — no turns have been settled.");
