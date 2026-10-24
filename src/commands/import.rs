@@ -1499,7 +1499,7 @@ pub(super) fn declare_session_line(
     let mut born = Meta::new(
         super::fork::mint_claim(&head, branch),
         lk.source.clone(),
-        lk.cwd.clone().unwrap_or_default(),
+        claim_cwd(lk),
     );
     born.kind = meta::Kind::File;
     born.committer_account = crate::infra::credentials::current_account()?;
@@ -1523,6 +1523,31 @@ pub(super) fn declare_session_line(
     )?;
     super::plumbing::update_ref_cas(repo, &head_ref, &commit, Some(&head))?;
     Ok(Some(commit))
+}
+
+/// The working directory a claim records when the link does not know it yet: the transcript's own
+/// cwd, then the process directory, the order settlement uses to fill the link. The claim is a
+/// claimed session line in published history, and the Hub refuses any session line whose cwd is
+/// empty, so leaving it blank makes the whole branch unpublishable.
+fn claim_cwd(lk: &Link) -> String {
+    lk.cwd
+        .clone()
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| {
+            let adapter = adapter::get(&lk.source).ok()?;
+            let path = adapter.resolve(&lk.session_id, None)?;
+            adapter
+                .parse_at(&path)
+                .ok()?
+                .cwd
+                .filter(|cwd| !cwd.is_empty())
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
 }
 
 /// Find a session by id, prefix or Codex deep link. **Does not open the transcript file.**

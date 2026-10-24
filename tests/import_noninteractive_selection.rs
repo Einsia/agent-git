@@ -1687,6 +1687,10 @@ fn imported_and_live_metadata_remain_publishable() {
     .unwrap();
     assert_eq!(birth.session, snapshot.session);
     assert_eq!(birth.session_privacy.as_ref(), Some(&ownership));
+    // The Hub refuses a claimed session line without a cwd; the birth is born before settlement
+    // fills the link, so it must take the transcript's cwd itself.
+    assert!(!birth.cwd.is_empty());
+    assert_eq!(birth.cwd, snapshot.cwd);
     assert!(!snapshot.cwd.contains(lab.work.to_str().unwrap()));
     assert_eq!(snapshot.runtime, "claude-code");
     assert_eq!(snapshot.turn, Some(1));
