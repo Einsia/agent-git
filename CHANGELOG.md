@@ -8,6 +8,16 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.26] - 2026-10-25
+
+### Fixed
+
+- The first push of a newly imported session no longer fails with `HTTP 422 provenance_rejected:
+  refs/heads/publication: session/meta.json unreadable (cwd is empty)`. Since 0.2.25 publishes new
+  sessions in plain mode, the Hub verifies every commit of the branch, including the commit that
+  claims it, and that commit recorded an empty working directory. A branch claimed by 0.2.25 keeps
+  its empty claim and still cannot be pushed; import the session into a new branch instead.
+
 ## [0.2.25] - 2026-10-25
 
 ### Added
