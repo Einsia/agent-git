@@ -441,8 +441,7 @@ pub fn missing_lfs_uploads(
     let transport =
         TransportIdentity::new(Some(repo.root()), &["lfs", "push", "origin"], identity)?;
     let agent = crate::hub::transport::agent(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
+        crate::hub::transport::transfer(ureq::Agent::config_builder())
             .max_redirects(0)
             .http_status_as_error(false)
             .build(),

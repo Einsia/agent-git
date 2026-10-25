@@ -3,7 +3,9 @@
 use anyhow::{Context, bail};
 use std::io::{self, Read};
 
-const MAX_JSON_BYTES: u64 = 10 * 1024 * 1024;
+/// Hub JSON is decoded in memory, so a hostile or broken hub cannot be allowed an unbounded
+/// answer.
+const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn read<T: serde::de::DeserializeOwned>(
     response: ureq::http::Response<ureq::Body>,
@@ -49,12 +51,14 @@ fn parse<T: serde::de::DeserializeOwned>(reader: impl Read, limit: u64) -> anyho
     Ok(serde_json::from_reader(io::BufReader::new(DecodedLimit {
         reader,
         remaining: limit,
+        limit,
     }))?)
 }
 
 struct DecodedLimit<R> {
     reader: R,
     remaining: u64,
+    limit: u64,
 }
 
 impl<R: Read> Read for DecodedLimit<R> {
@@ -65,7 +69,10 @@ impl<R: Read> Read for DecodedLimit<R> {
         if self.remaining == 0 {
             return match self.reader.read(&mut [0])? {
                 0 => Ok(0),
-                _ => Err(io::Error::other("Hub JSON response exceeds size limit")),
+                _ => Err(io::Error::other(format!(
+                    "Hub JSON response exceeds the {} bytes the CLI decodes in memory",
+                    self.limit
+                ))),
             };
         }
         let size = self.remaining.min(buffer.len() as u64) as usize;

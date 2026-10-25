@@ -288,7 +288,7 @@ fn asset_name(version: &str) -> Result<String> {
 
 fn download(url: &str) -> Result<Vec<u8>> {
     let agent = crate::hub::transport::agent(
-        ureq::Agent::config_builder()
+        crate::hub::transport::transfer(ureq::Agent::config_builder())
             .user_agent(concat!("agit/", env!("CARGO_PKG_VERSION")))
             .build(),
     );

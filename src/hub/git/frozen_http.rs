@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
 use ureq::tls::{PemItem, RootCerts, TlsConfig};
 
 const CA_LIMIT: u64 = 1024 * 1024;
@@ -110,8 +109,7 @@ pub(super) fn prepare(
             tls = tls.root_certs(captured_ca(Path::new(path))?);
         }
     }
-    let mut config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(30)))
+    let mut config = crate::hub::transport::transfer(ureq::Agent::config_builder())
         .max_redirects(0)
         .http_status_as_error(false)
         // Explicit None also replaces any proxy inferred by Config from the live environment.
@@ -267,7 +265,12 @@ mod tests {
             matches!(config.user_agent(), ureq::config::AutoHeaderValue::Provided(value) if value.as_str() == "prepared-agent")
         );
         assert_eq!(config.max_redirects(), 0);
-        assert_eq!(config.timeouts().global, Some(Duration::from_secs(30)));
+        // Large objects have no total deadline; the connection and each wait stay bounded.
+        assert_eq!(config.timeouts().global, None);
+        assert_eq!(
+            config.timeouts().connect,
+            Some(crate::hub::transport::CONNECT_TIMEOUT)
+        );
         assert!(!config.http_status_as_error());
         let RootCerts::Specific(roots) = config.tls_config().root_certs() else {
             panic!("CA snapshot missing")

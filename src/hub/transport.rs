@@ -1,6 +1,8 @@
 //! SOCKS negotiation shares the request deadline with proxy resolution and TCP connection.
 //! A host with several addresses is dialed by racing them, so one unreachable address costs
 //! at most an attempt delay instead of its share of the connection deadline.
+//! Every wait on an established connection is bounded by [`IDLE_TIMEOUT`], so a transfer may
+//! take as long as its size needs while a silent peer is still detected.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -8,19 +10,119 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use ureq::config::ConfigBuilder;
+use ureq::typestate::AgentScope;
 use ureq::unversioned::resolver::{DefaultResolver, Resolver};
 use ureq::unversioned::transport::{
-    ConnectProxyConnector, ConnectionDetails, Connector, Either, NextTimeout, RustlsConnector,
-    TcpConnector, Transport, TransportAdapter, time,
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, NextTimeout,
+    RustlsConnector, TcpConnector, Transport, TransportAdapter, time,
 };
 use ureq::{Error, Proxy, ProxyProtocol};
 
 pub(crate) fn agent(config: ureq::config::Config) -> ureq::Agent {
+    agent_with_idle(config, IDLE_TIMEOUT)
+}
+
+fn agent_with_idle(config: ureq::config::Config, idle: Duration) -> ureq::Agent {
     let connector = SocksConnector
         .chain(ConnectProxyConnector::default())
         .chain(RacingTcpConnector)
-        .chain(RustlsConnector::default());
+        .chain(RustlsConnector::default())
+        .chain(IdleConnector { idle });
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+}
+
+/// How long establishing a connection may take: resolution, then TCP, proxy negotiation and TLS.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a peer may stay silent while an exchange is under way.
+///
+/// It must exceed the idle timeout of every proxy in front of the Hub: a wait a proxy allows is
+/// never cut short by the client, and a wait a proxy cuts ends with that proxy's gateway
+/// response, which names the side that stalled.
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Transfer timeouts: a bounded connection and no total deadline, so an upload or a download
+/// takes as long as its size needs while every wait stays bounded by [`IDLE_TIMEOUT`].
+pub(crate) fn transfer(builder: ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope> {
+    // ureq names a timeout after the earliest deadline among the current phase and the phases
+    // before it, and reports a wait with no deadline at all as the global timeout. Deadlines the
+    // idle bound always undercuts, each shorter than the one before it, make the error name the
+    // phase that stalled.
+    let never = Duration::from_secs(u32::MAX as u64);
+    builder
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_send_request(Some(never))
+        .timeout_send_body(Some(never / 2))
+        .timeout_recv_response(Some(never / 4))
+        .timeout_recv_body(Some(never / 8))
+}
+
+/// Wraps the established connection so each read or write waits at most `idle`.
+#[derive(Debug)]
+struct IdleConnector {
+    idle: Duration,
+}
+
+impl<In: Transport> Connector<In> for IdleConnector {
+    type Out = Idle<In>;
+
+    fn connect(
+        &self,
+        _: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, Error> {
+        Ok(chained.map(|inner| Idle {
+            inner,
+            idle: self.idle,
+        }))
+    }
+}
+
+/// A phase deadline shorter than the idle bound still applies; only an absent or longer one is
+/// replaced, so a total deadline set by the caller keeps its meaning.
+#[derive(Debug)]
+struct Idle<T> {
+    inner: T,
+    idle: Duration,
+}
+
+impl<T> Idle<T> {
+    fn bound(&self, timeout: NextTimeout) -> NextTimeout {
+        if timeout.after.is_not_happening() || *timeout.after > self.idle {
+            NextTimeout {
+                after: self.idle.into(),
+                reason: timeout.reason,
+            }
+        } else {
+            timeout
+        }
+    }
+}
+
+impl<T: Transport> Transport for Idle<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+        let timeout = self.bound(timeout);
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+        let timeout = self.bound(timeout);
+        self.inner.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
 }
 
 /// How long a pending attempt runs alone before the next address joins the race.
@@ -416,6 +518,74 @@ fn push_string(packet: &mut Vec<u8>, value: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transfer is bounded by silence, not by its length: a response that keeps arriving in
+    /// small pieces completes although it outlasts the idle bound in total, and a peer that
+    /// stops sending fails within the bound. A total deadline fails the first; no bound hangs on
+    /// the second.
+    #[test]
+    fn idle_bound_limits_silence_not_transfer_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"0123456789";
+        std::thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let _ = stream.read(&mut [0; 4096]);
+                if index == 2 {
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                for (offset, byte) in body.iter().enumerate() {
+                    let pause = if index == 1 && offset == body.len() / 2 {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(60)
+                    };
+                    std::thread::sleep(pause);
+                    if stream.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let idle = Duration::from_millis(300);
+        let agent = agent_with_idle(transfer(ureq::Agent::config_builder()).build(), idle);
+        let url = format!("http://{address}/");
+
+        let started = Instant::now();
+        let received = agent
+            .get(&url)
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        assert_eq!(received.as_bytes(), body);
+        assert!(started.elapsed() > idle);
+
+        let started = Instant::now();
+        let stalled = agent
+            .get(&url)
+            .call()
+            .and_then(|mut response| response.body_mut().read_to_string());
+        // The error names the phase that stalled, which tells the user whether the hub answered.
+        assert!(
+            matches!(stalled, Err(Error::Timeout(ureq::Timeout::RecvBody))),
+            "{stalled:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let unanswered = agent.get(&url).call().map(drop);
+        assert!(
+            matches!(unanswered, Err(Error::Timeout(ureq::Timeout::RecvResponse))),
+            "{unanswered:?}"
+        );
+    }
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::from(([192, 0, 2, last], 443))

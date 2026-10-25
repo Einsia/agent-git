@@ -167,40 +167,50 @@ fn credential_matches_hub(base: &str, cred: &credentials::HubCredential) -> bool
     })
 }
 
+/// How long one request may take.
+#[derive(Debug, Clone, Copy)]
+enum Patience {
+    /// Commands: a bounded connection, then no total deadline while the hub keeps the exchange
+    /// moving, so a request takes as long as its size needs. See [`super::transport::transfer`].
+    Transfer,
+    /// Incidental work bounded by one total deadline, so it never makes a command feel hung.
+    Deadline(Duration),
+}
+
 impl Client {
     /// Build from the environment and the credentials file. The single construction entry point.
     pub fn from_env() -> Client {
-        Self::from_env_with_timeout(Duration::from_secs(30))
+        Self::stored_hub(config::hub_url(), Patience::Transfer)
     }
 
-    /// Build a client with an explicit request timeout.
+    /// Build a client whose every request must finish within `timeout`.
     ///
-    /// Normal commands get a generous timeout, while incidental work such as the startup
-    /// version nudge must fail fast and never make the user's command feel hung.
+    /// For incidental work such as the startup version nudge, which must fail fast and never
+    /// make the user's command feel hung. Commands use [`Self::from_env`].
     pub fn from_env_with_timeout(timeout: Duration) -> Client {
-        Self::stored_hub_with_timeout(config::hub_url(), timeout)
+        Self::stored_hub(config::hub_url(), Patience::Deadline(timeout))
     }
 
     pub(crate) fn for_stored_hub(hub: &str) -> Client {
-        Self::for_stored_hub_with_timeout(hub, Duration::from_secs(30))
+        Self::stored_hub(hub.to_string(), Patience::Transfer)
     }
 
     pub(crate) fn for_stored_hub_with_timeout(hub: &str, timeout: Duration) -> Client {
-        Self::stored_hub_with_timeout(hub.to_string(), timeout)
+        Self::stored_hub(hub.to_string(), Patience::Deadline(timeout))
     }
 
-    fn stored_hub_with_timeout(base: String, timeout: Duration) -> Client {
+    fn stored_hub(base: String, patience: Patience) -> Client {
         match credentials::load_checked(&base) {
-            Ok(cred) => Self::new(base, cred, timeout),
+            Ok(cred) => Self::new(base, cred, patience),
             Err(_) => {
-                let mut client = Self::new(base, None, timeout);
+                let mut client = Self::new(base, None, patience);
                 client.credential_binding_valid = false;
                 client
             }
         }
     }
 
-    fn new(base: String, cred: Option<credentials::HubCredential>, timeout: Duration) -> Client {
+    fn new(base: String, cred: Option<credentials::HubCredential>, patience: Patience) -> Client {
         let base = if HubAuthority::parse(&base).is_ok() {
             base.trim().trim_end_matches('/').to_string()
         } else {
@@ -210,11 +220,15 @@ impl Client {
             .as_ref()
             .is_none_or(|cred| credential_matches_hub(&base, cred));
         let cred = cred.filter(|_| credential_binding_valid);
-        let cfg = ureq::Agent::config_builder()
-            .accept_encoding("identity")
-            // A timeout is mandatory: hanging on an unresponsive hub buys nothing, and the
-            // user reads it as agit being dead.
-            .timeout_global(Some(timeout))
+        let cfg = ureq::Agent::config_builder().accept_encoding("identity");
+        // Every wait is bounded: hanging on an unresponsive hub buys nothing, and the user reads
+        // it as agit being dead. A total deadline would also cut a large upload that is still
+        // moving, so commands bound the connection and each wait instead.
+        let cfg = match patience {
+            Patience::Transfer => super::transport::transfer(cfg),
+            Patience::Deadline(timeout) => cfg.timeout_global(Some(timeout)),
+        };
+        let cfg = cfg
             // 4xx/5xx are not transport errors: by default ureq turns a status code into
             // `Error::StatusCode`, and that variant **drops the response body** — the refusal
             // the server wrote into the body disappears with it. With it off, status codes go
@@ -242,7 +256,8 @@ impl Client {
 
     /// A terminable privacy worker must never consume a single-use refresh credential.
     pub(crate) fn for_privacy(hub: &str) -> Client {
-        let mut client = Self::stored_hub_with_timeout(hub.to_owned(), Duration::from_secs(2));
+        let mut client =
+            Self::stored_hub(hub.to_owned(), Patience::Deadline(Duration::from_secs(2)));
         *client.cred.get_mut() = None;
         client
     }
@@ -265,7 +280,7 @@ impl Client {
     /// A named hub plus a whole credential: requests carry its access token, and a 401 renews
     /// with its own refresh token and stores the new pair back under **its** hub.
     pub fn for_credential(hub: &str, cred: &credentials::HubCredential) -> Client {
-        Self::new(hub.to_string(), Some(cred.clone()), Duration::from_secs(30))
+        Self::new(hub.to_string(), Some(cred.clone()), Patience::Transfer)
     }
 
     pub fn base(&self) -> &str {
@@ -274,12 +289,12 @@ impl Client {
 
     /// A named hub with no credentials (the constructor for the browser / device login flow).
     pub fn for_hub(hub: &str) -> Client {
-        Self::for_hub_with_timeout(hub, Duration::from_secs(30))
+        Self::new(hub.to_string(), None, Patience::Transfer)
     }
 
-    /// [`Self::for_hub`] with an explicit request timeout.
+    /// [`Self::for_hub`] whose every request must finish within `timeout`.
     pub(crate) fn for_hub_with_timeout(hub: &str, timeout: Duration) -> Client {
-        Self::new(hub.to_string(), None, timeout)
+        Self::new(hub.to_string(), None, Patience::Deadline(timeout))
     }
 
     /// A named hub plus a ready-made token (the constructor for `login --with-token`).
@@ -1011,12 +1026,30 @@ impl Client {
     /// Only unreachable, timed out and TLS problems are left — status codes go through
     /// [`Client::api_error`]. A raw `ureq` error ("Connection refused") gives the user nothing
     /// to act on; what they need is which address they are connecting to and how to change it.
-    fn explain(&self, e: ureq::Error, _path: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "cannot reach hub {}: {e}\n  \
-             Is the hub running? Point AGIT_HUB_URL at another address.",
-            self.base
-        )
+    fn explain(&self, e: ureq::Error, path: &str) -> anyhow::Error {
+        use ureq::Timeout;
+        let idle = super::transport::IDLE_TIMEOUT.as_secs();
+        match e {
+            ureq::Error::Timeout(Timeout::SendRequest | Timeout::SendBody) => anyhow::anyhow!(
+                "hub {} stopped accepting the request to {path} for {idle}s; nothing more was \
+                 sent. Check the network, then retry.",
+                self.base
+            ),
+            ureq::Error::Timeout(Timeout::RecvResponse | Timeout::RecvBody) => anyhow::anyhow!(
+                "hub {} sent nothing for {idle}s while answering {path}. The request may still \
+                 complete on the hub; check its effect before retrying.",
+                self.base
+            ),
+            ureq::Error::Timeout(Timeout::Global | Timeout::PerCall) => anyhow::anyhow!(
+                "hub {} did not answer {path} before the timeout this check allows",
+                self.base
+            ),
+            e => anyhow::anyhow!(
+                "cannot reach hub {}: {e}\n  \
+                 Is the hub running? Point AGIT_HUB_URL at another address.",
+                self.base
+            ),
+        }
     }
 
     // ── API ─────────────────────────────────────────────────────────
