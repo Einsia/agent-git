@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 spec = importlib.util.spec_from_file_location("runtime", Path(__file__).with_name("prepare-git-runtime.py"))
 runtime = importlib.util.module_from_spec(spec)
@@ -15,6 +16,14 @@ spec.loader.exec_module(runtime)
 
 
 class RuntimeArchiveTests(unittest.TestCase):
+    def setUp(self):
+        # The upstream-path contracts below hold whether or not the suite runs inside GitLab CI.
+        environment = patch.dict(runtime.os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for key in ("CI_API_V4_URL", "CI_PROJECT_ID", "CI_JOB_TOKEN"):
+            runtime.os.environ.pop(key, None)
+
     def test_linux_certificate_store_is_pinned_and_available_without_network(self):
         lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
         with tempfile.TemporaryDirectory() as temporary, patch.object(
@@ -71,6 +80,39 @@ class RuntimeArchiveTests(unittest.TestCase):
                 self.assertEqual(runtime.download(pin, Path(temporary)), body)
             cached = Path(temporary) / (pin["sha256"] + "-runtime.tar.gz")
             self.assertEqual(cached.read_bytes(), body)
+
+    def test_package_mirror_is_a_shortcut_that_cannot_change_the_pinned_bytes(self):
+        """In CI the package registry copy is tried first and used only if it has the pinned digest.
+
+        A mirror that served unchecked bytes, or a missing copy that failed the job instead of falling
+        back to the upstream URL, would each break one of the three cases below.
+        """
+        body = b"verified runtime"
+        pin = {"url": "https://example.invalid/runtime.tar.gz", "sha256": hashlib.sha256(body).hexdigest()}
+        api = "https://gitlab.invalid/api/v4"
+        mirror = f"{api}/projects/87/packages/generic/git-runtime-archives/{pin['sha256']}/runtime.tar.gz"
+        cases = {
+            "verified copy": (lambda: io.BytesIO(body), 0),
+            "tampered copy": (lambda: io.BytesIO(b"tampered"), 1),
+            "missing copy": (lambda: (_ for _ in ()).throw(urllib.error.HTTPError(mirror, 404, "Not Found", {}, None)), 1),
+        }
+        for case, (mirror_reply, upstream_requests) in cases.items():
+            requested = []
+
+            def urlopen(request, timeout):
+                url = getattr(request, "full_url", request)
+                requested.append(url)
+                if url == mirror:
+                    self.assertEqual(request.get_header("Job-token"), "job-token")
+                    return mirror_reply()
+                return io.BytesIO(body)
+
+            environment = {"CI_API_V4_URL": api, "CI_PROJECT_ID": "87", "CI_JOB_TOKEN": "job-token"}
+            with self.subTest(case), tempfile.TemporaryDirectory() as temporary, patch.dict(runtime.os.environ, environment):
+                with patch.object(runtime.urllib.request, "urlopen", side_effect=urlopen):
+                    self.assertEqual(runtime.download(pin, Path(temporary)), body)
+                self.assertEqual(requested[0], mirror)
+                self.assertEqual(requested.count(pin["url"]), upstream_requests)
 
 
 if __name__ == "__main__":

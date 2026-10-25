@@ -20,6 +20,35 @@ import urllib.request
 import zipfile
 
 
+MIRROR_PACKAGE = "git-runtime-archives"
+
+
+def fetch_mirror(pin):
+    """Return the pinned bytes from the project's GitLab package registry, or None to use upstream.
+
+    Inside GitLab CI every pinned archive is first looked up as
+    packages/generic/git-runtime-archives/<sha256>/<file name>. A missing, unreachable or wrong copy
+    only falls back to the upstream URL, so the mirror can neither block nor change a runtime.
+    """
+    api = os.environ.get("CI_API_V4_URL")
+    project = os.environ.get("CI_PROJECT_ID")
+    token = os.environ.get("CI_JOB_TOKEN")
+    if not (api and project and token):
+        return None
+    name = pin["url"].rsplit("/", 1)[-1]
+    url = f"{api}/projects/{project}/packages/generic/{MIRROR_PACKAGE}/{pin['sha256']}/{name}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"JOB-TOKEN": token}), timeout=120) as response:
+            body = response.read()
+    except OSError as error:
+        print(f"No package mirror copy of {name} ({error}); using {pin['url']}", file=sys.stderr, flush=True)
+        return None
+    if hashlib.sha256(body).hexdigest() != pin["sha256"]:
+        print(f"Package mirror copy of {name} fails its checksum; using {pin['url']}", file=sys.stderr, flush=True)
+        return None
+    return body
+
+
 def download(pin, cache):
     if "path" in pin:
         body = Path(__file__).parent.joinpath(pin["path"]).read_bytes()
@@ -34,19 +63,21 @@ def download(pin, cache):
     cache.mkdir(parents=True, exist_ok=True)
     path = cache / (pin["sha256"] + "-" + pin["url"].rsplit("/", 1)[-1])
     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != pin["sha256"]:
-        for attempt in range(3):
-            print(f"Downloading {pin['url']} (attempt {attempt + 1})", file=sys.stderr, flush=True)
-            try:
-                with urllib.request.urlopen(pin["url"], timeout=120) as response:
-                    body = response.read()
-                break
-            except OSError as error:
-                permanent = isinstance(error, urllib.error.HTTPError) and 400 <= error.code < 500 and error.code != 429
-                if permanent or attempt == 2:
-                    raise RuntimeError("could not download " + pin["url"]) from error
-                time.sleep(2 ** attempt)
-        if hashlib.sha256(body).hexdigest() != pin["sha256"]:
-            raise ValueError("upstream checksum mismatch: " + pin["url"])
+        body = fetch_mirror(pin)
+        if body is None:
+            for attempt in range(3):
+                print(f"Downloading {pin['url']} (attempt {attempt + 1})", file=sys.stderr, flush=True)
+                try:
+                    with urllib.request.urlopen(pin["url"], timeout=120) as response:
+                        body = response.read()
+                    break
+                except OSError as error:
+                    permanent = isinstance(error, urllib.error.HTTPError) and 400 <= error.code < 500 and error.code != 429
+                    if permanent or attempt == 2:
+                        raise RuntimeError("could not download " + pin["url"]) from error
+                    time.sleep(2 ** attempt)
+            if hashlib.sha256(body).hexdigest() != pin["sha256"]:
+                raise ValueError("upstream checksum mismatch: " + pin["url"])
         path.write_bytes(body)
     return path.read_bytes()
 
