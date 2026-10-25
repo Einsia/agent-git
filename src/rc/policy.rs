@@ -4715,7 +4715,10 @@ mod tests {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound)
         }
 
-        let d = tempfile::tempdir().unwrap();
+        // Every size below is measured against the kernel's path limit, so the fixture lives
+        // under a short fixed directory: a long TMPDIR or checkout path would leave no room
+        // for the chain it builds.
+        let d = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         // The root itself needs some length: what crosses the line is "the root + the piece
         // expanded out", while the kernel walking the spelling holds the root as a vnode,
         // which takes no room in its buffer.
@@ -4783,7 +4786,7 @@ mod tests {
         // The file outside the root. `escape`'s own absolute path already crosses the line,
         // so it can only be created through `S` — on that spelling the kernel never holds
         // anything this long.
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("S").join(&escape)).unwrap();
         let spelled = root.join("S").join(&escape).join("secret.txt");
