@@ -44,6 +44,9 @@ pub struct Args {
     pub max_chars: usize,
 }
 
+/// A commit written this long after its turn ended came from an import, not from live settlement.
+const IMPORTED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
     // `show` has its own `--tui` flag because, unlike the other entry points, it never opens the
@@ -881,29 +884,43 @@ fn render_saved_point(repo: &Repo, sha: &str, envelopes: &str, args: &Args) -> c
     let mut snapshot = meta::read_at_ref_result(repo, sha)?
         .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
     crate::domain::privacy::service::hydrate_metadata(repo.root(), &mut snapshot);
-    let (status, seconds, _) = repo.git_status_local(&[
+    let (status, times, _) = repo.git_status_local(&[
         "show",
         "--no-patch",
         "--no-show-signature",
-        "--format=%ct",
+        "--format=%at %ct",
         sha,
     ])?;
     anyhow::ensure!(status == Some(0), "cannot read the selected commit time");
-    let seconds = seconds.parse::<i64>()?;
-    let duration = std::time::Duration::from_secs(seconds.unsigned_abs());
-    let recorded = if seconds >= 0 {
-        std::time::UNIX_EPOCH.checked_add(duration)
-    } else {
-        std::time::UNIX_EPOCH.checked_sub(duration)
-    }
-    .ok_or_else(|| anyhow::anyhow!("the selected commit time is outside the supported range"))?;
+    let at = |seconds: &str| -> crate::Result<std::time::SystemTime> {
+        let seconds = seconds.parse::<i64>()?;
+        let duration = std::time::Duration::from_secs(seconds.unsigned_abs());
+        if seconds >= 0 {
+            std::time::UNIX_EPOCH.checked_add(duration)
+        } else {
+            std::time::UNIX_EPOCH.checked_sub(duration)
+        }
+        .ok_or_else(|| anyhow::anyhow!("the selected commit time is outside the supported range"))
+    };
+    let (authored, committed) = times
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("cannot read the selected commit time"))?;
+    // The author date is when the turn happened; a historical import commits it later.
+    let recorded = at(authored)?;
+    let committed = at(committed)?;
     let version = meta::id_from_sha(sha);
     let mut rows = vec![
         ("session", ui::bold(&snapshot.session)),
         ("runtime", snapshot.runtime.clone()),
         ("recorded", ui::ago(recorded)),
-        ("source", repository_source(args.log_only).into()),
     ];
+    if committed
+        .duration_since(recorded)
+        .is_ok_and(|gap| gap > IMPORTED_AFTER)
+    {
+        rows.push(("imported", ui::ago(committed)));
+    }
+    rows.push(("source", repository_source(args.log_only).into()));
     append_saved_metadata(&mut rows, &snapshot, Some(&version));
     rows.push(("file", format!("{sha}:{}", sequence_file(args.log_only))));
     let web = web_url(repo, &snapshot.session, sha);

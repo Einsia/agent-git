@@ -372,6 +372,7 @@ fn run_inner(args: Args) -> CmdResult {
 
     let opts = SettleOpts {
         milestone: args.milestone,
+        milestone_turn: None,
         tag: args.tag,
         code: args.code,
         completed_only: args.from_supervisor,
@@ -668,6 +669,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
         &owner,
         SettleOpts {
             milestone: None,
+            milestone_turn: None,
             tag: None,
             code: false,
             completed_only: false,
@@ -1072,6 +1074,8 @@ fn report_multiple_links(slug: &str, branch: &str, links: &[Link]) {
 
 struct SettleOpts {
     milestone: Option<String>,
+    /// The turn that carries `milestone`; `None` is the last turn this settlement lands.
+    milestone_turn: Option<u32>,
     tag: Option<String>,
     code: bool,
     completed_only: bool,
@@ -1092,6 +1096,8 @@ struct Chunk {
     gist: String,
     events: usize,
     dropped: usize,
+    /// When the turn's last timestamped native event happened, in Unix seconds.
+    ended_at: Option<i64>,
 }
 
 /// Why the trailing turn cannot settle yet.
@@ -1241,6 +1247,11 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         let end_byte = end_line.map(|l| ends.get(l).copied().unwrap_or(region.len()));
         let events = g.len();
         let dropped = chain.turns.get(i).map(|t| t.dropped).unwrap_or(0);
+        let ended_at = g
+            .iter()
+            .filter_map(|&j| ir.events[j].timestamp.as_deref())
+            .filter_map(native_time)
+            .max();
         chunks.push(end_byte.map(|e| {
             let gist = chain
                 .turns
@@ -1253,6 +1264,7 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
                 gist,
                 events,
                 dropped,
+                ended_at,
             }
         }));
     }
@@ -1277,6 +1289,7 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
             gist: c.gist.clone(),
             events: c.events,
             dropped: c.dropped,
+            ended_at: c.ended_at,
         });
     }
     // An in-flight trailing turn stays in the runtime. There is something to pop only when that
@@ -1286,6 +1299,20 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         out.pop();
     }
     out
+}
+
+/// A native event timestamp in Unix seconds: RFC 3339 text, or epoch seconds or milliseconds.
+fn native_time(text: &str) -> Option<i64> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(at.timestamp());
+    }
+    let number = text.parse::<i64>().ok()?;
+    // Epoch milliseconds pass ten to the twelfth long before epoch seconds could.
+    Some(if number >= 1_000_000_000_000 {
+        number / 1000
+    } else {
+        number
+    })
 }
 
 /// Completion receipts affect settlement only; stored native evidence is never synthesized.
@@ -1338,6 +1365,26 @@ fn completed_turn_chunks(
         .collect();
     boundaries.sort_unstable();
     boundaries.dedup();
+    // A snapshot is dated by the events it covers, so a later completion of the same user turn
+    // never lends its time to an earlier one. With no timestamp inside its range, the latest
+    // timestamp before its end stands in.
+    let ended_within = |start: usize, end: usize| {
+        let latest = |from: usize| {
+            ir.events
+                .iter()
+                .filter(|event| {
+                    event
+                        .line
+                        .and_then(|line| line_ends.get(line))
+                        .is_some_and(|&byte| byte > from && byte <= end)
+                })
+                .filter_map(|event| event.timestamp.as_deref())
+                .filter_map(native_time)
+                .max()
+        };
+        latest(start).or_else(|| latest(0))
+    };
+    let mut covered = 0;
     let mut completed = Vec::new();
     let mut previous = 0;
     let mut terminal = boundaries.into_iter().peekable();
@@ -1353,13 +1400,16 @@ fn completed_turn_chunks(
                     .unwrap_or(0)
             });
         while terminal.peek().is_some_and(|&end| end <= preamble_end) {
+            let end_byte = terminal.next().unwrap();
             completed.push(Chunk {
-                end_byte: terminal.next().unwrap(),
+                end_byte,
                 user_turn: Some(0),
                 gist: String::new(),
                 events: 0,
                 dropped: 0,
+                ended_at: ended_within(covered, end_byte),
             });
+            covered = end_byte;
         }
     }
     for (index, chunk) in user_chunks.into_iter().enumerate() {
@@ -1385,7 +1435,9 @@ fn completed_turn_chunks(
                 gist: chunk.gist.clone(),
                 events: chunk.events,
                 dropped: chunk.dropped,
+                ended_at: ended_within(covered, end_byte),
             });
+            covered = end_byte;
         }
         previous = chunk.end_byte;
     }
@@ -2350,6 +2402,14 @@ fn settle_bytes(
     };
 
     if new_chunks.is_empty() {
+        // A named milestone turn is a request this settlement must fulfil; landing nothing is
+        // not success for it.
+        if let Some(wanted) = opts.milestone_turn {
+            ui::error(&format!(
+                "turn #{wanted} is not among the turns this settlement lands: there is nothing new to settle"
+            ));
+            return Ok(ExitCode::Usage);
+        }
         if opts.message.is_none()
             && recovered.is_none()
             && let (Some(tip), Some(metadata), Some(binding)) = (
@@ -2578,6 +2638,38 @@ fn settle_bytes(
 
     let cwd = lk.cwd.clone().unwrap_or_else(|| ".".into());
     let total = new_chunks.len();
+    let turn_number = |i: usize, c: &Chunk| {
+        c.user_turn.map_or(head_turn_base + 1 + i as u32, |turn| {
+            if materialized_mode {
+                head_turn_base + turn
+            } else {
+                turn
+            }
+        })
+    };
+    // Several native completions can share one user turn; the milestone goes on the last.
+    let milestone_index = match opts.milestone_turn {
+        None => total.checked_sub(1),
+        Some(wanted) => {
+            let found = new_chunks
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, c)| turn_number(*i, c) == wanted)
+                .map(|(i, _)| i);
+            if found.is_none() {
+                let first = new_chunks.first().map(|c| turn_number(0, c));
+                let last = new_chunks.last().map(|c| turn_number(total - 1, c));
+                ui::error(&format!(
+                    "turn #{wanted} is not among the turns this settlement lands (#{} to #{})",
+                    first.unwrap_or_default(),
+                    last.unwrap_or_default()
+                ));
+                return Ok(ExitCode::Usage);
+            }
+            found
+        }
+    };
     crate::telemetry::runtime(&lk.source);
     let mut last_sha = String::new();
     // Every branch, including an unborn one, is settled without touching the real index/worktree:
@@ -2670,13 +2762,8 @@ fn settle_bytes(
     // can run. Memory collection is a separate file commit and cannot advance this boundary.
     record_supervisor_prepared()?;
     for (i, c) in new_chunks.iter().enumerate() {
-        let turn_no = c.user_turn.map_or(head_turn_base + 1 + i as u32, |turn| {
-            if materialized_mode {
-                head_turn_base + turn
-            } else {
-                turn
-            }
-        });
+        let turn_no = turn_number(i, c);
+        let milestone_here = milestone_index == Some(i);
         let absolute_end = region_start + c.end_byte;
         if !quiet && total > 1 {
             ui::progress(format_args!("  building turn {}/{}", i + 1, total));
@@ -2689,6 +2776,8 @@ fn settle_bytes(
         let last = i + 1 == total;
         if !last {
             snap.cwd_state = None;
+        }
+        if !milestone_here {
             snap.milestone = None;
         }
         // Historical imports cannot prove the workspace state at any captured turn. During
@@ -2706,7 +2795,7 @@ fn settle_bytes(
                 })
             })
         };
-        if last {
+        if milestone_here {
             snap.milestone = opts.milestone.as_ref().map(|value| {
                 privacy::transform(Some(repo.root()), value, PrivacyMode::ProtectText).content
             });
@@ -2721,15 +2810,14 @@ fn settle_bytes(
             }
         };
         let mut msg = subject.clone();
-        if i + 1 == total {
-            if let Some(m) = &opts.milestone {
-                msg.push_str(&format!("\n\nmilestone: {m}"));
-            }
-            if opts.code
-                && let Some((a, _)) = &code_anchor
-            {
-                msg.push_str(&format!("\n\ncode: {a}"));
-            }
+        if milestone_here && let Some(m) = &opts.milestone {
+            msg.push_str(&format!("\n\nmilestone: {m}"));
+        }
+        if i + 1 == total
+            && opts.code
+            && let Some((a, _)) = &code_anchor
+        {
+            msg.push_str(&format!("\n\ncode: {a}"));
         }
         let protected_message =
             privacy::transform(Some(repo.root()), &msg, PrivacyMode::ProtectText);
@@ -2784,12 +2872,16 @@ fn settle_bytes(
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        last_sha = super::plumbing::commit_tree_as(
+        // A historical import is authored when the turn happened and committed when it was
+        // imported; live settlement records the turn as it ends, so both are now.
+        let authored_at = c.ended_at.filter(|_| opts.historical);
+        last_sha = super::plumbing::commit_tree_authored(
             repo,
             &tree,
             &parents,
             &protected_message.content,
             (owner, &email),
+            authored_at,
         )?;
         pending_parent = Some(last_sha.clone());
         let protected_subject = protected_message
@@ -4146,13 +4238,15 @@ pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    record_at(store, lk, agent, owner, author, &repo_dir, true)
+    record_at(store, lk, agent, owner, author, &repo_dir, true, None)
 }
 
 /// Import settlement uses the repository selected before its adoption writes.
 ///
 /// With `automatic_push` false the settlement stays local even when automatic pushing is on, and
-/// one line names the `agit push` that publishes it on purpose.
+/// one line names the `agit push` that publishes it on purpose. A `milestone` lands on the named
+/// turn, or on the last settled turn without one.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_at(
     store: &Store,
     lk: Link,
@@ -4161,14 +4255,18 @@ pub(super) fn record_at(
     author: &str,
     repo_dir: &Path,
     automatic_push: bool,
+    milestone: Option<(String, Option<u32>)>,
 ) -> CmdResult {
     let branch = lk
         .branch
         .clone()
         .ok_or_else(|| anyhow::anyhow!("the imported session has no explicit branch claim"))?;
     let slug = format!("{owner}/{agent}");
+    let (milestone, milestone_turn) =
+        milestone.map_or((None, None), |(text, turn)| (Some(text), turn));
     let opts = SettleOpts {
-        milestone: None,
+        milestone,
+        milestone_turn,
         tag: None,
         code: false,
         completed_only: false,
@@ -4294,6 +4392,7 @@ mod tests {
     fn opts() -> SettleOpts {
         SettleOpts {
             milestone: None,
+            milestone_turn: None,
             tag: None,
             code: false,
             completed_only: false,
@@ -4397,6 +4496,42 @@ mod tests {
         assert_eq!(
             repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(),
             finished_tip
+        );
+    }
+
+    /// Each native completion of one user turn is dated by the events it covers. Dating every
+    /// completion by the user turn's last event would give the first snapshot the second one's
+    /// time, and a historical import would then author it an hour late.
+    #[test]
+    fn native_completions_of_one_user_turn_end_at_their_own_events() {
+        use crate::adapter::Adapter as _;
+        let region = concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2026-09-28T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"build it\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-28T10:00:05Z\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"built\"}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"turn_duration\"}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-28T11:00:00Z\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"continued\"}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"turn_duration\"}\n",
+        );
+        let boundaries = crate::adapter::claude_code::completed_turn_boundaries(region);
+        let mut ir = crate::adapter::claude_code::ClaudeCode
+            .parse(region)
+            .unwrap();
+        annotate_completed_boundaries(region, &mut ir, &boundaries).unwrap();
+        let chunks = completed_turn_chunks(region, &ir, &[], false);
+        let at = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .timestamp()
+        };
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.user_turn, chunk.ended_at))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1), Some(at("2026-09-28T10:00:05Z"))),
+                (Some(1), Some(at("2026-09-28T11:00:00Z")))
+            ]
         );
     }
 
@@ -4938,6 +5073,8 @@ mod tests {
                 propose_lineage: false,
                 independent: true,
                 privacy: false,
+                milestone: None,
+                milestone_turn: None,
             });
             let repo = Repo::open(&importer_repo).unwrap();
             assert_ne!(

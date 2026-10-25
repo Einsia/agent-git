@@ -102,6 +102,15 @@ pub struct Args {
     /// `agit export <ref> --redact`.
     #[arg(long)]
     pub privacy: bool,
+
+    /// Mark the imported history with a milestone, on its last settled turn unless
+    /// `--milestone-turn` names another
+    #[arg(long, value_name = "text", conflicts_with_all = ["link_only", "propose_lineage"])]
+    pub milestone: Option<String>,
+
+    /// The turn (`#n` on the destination branch) that carries `--milestone`
+    #[arg(long, value_name = "n", requires = "milestone", value_parser = clap::value_parser!(u32).range(1..))]
+    pub milestone_turn: Option<u32>,
 }
 
 /// The session that was found. All three fields come from the runtime index; **no transcript is
@@ -504,6 +513,9 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
             &owner,
             landing.repo_dir(),
             !other_conversation,
+            args.milestone
+                .clone()
+                .map(|text| (text, args.milestone_turn)),
         )
     })();
     if !matches!(outcome, Ok(ExitCode::Ok)) {
@@ -564,6 +576,8 @@ fn wants_tui(args: &Args) -> bool {
 /// Where this import lands, and how to put it back on failure.
 pub(super) struct Landing {
     repo_dir: PathBuf,
+    /// `owner/repo`, the route of the branch lock settlement takes.
+    slug: String,
     branch: String,
     /// This import created the branch (a failure deletes it).
     created: bool,
@@ -686,6 +700,30 @@ impl Landing {
                 ));
                 return;
             };
+            // The session worktree this import opened for the branch goes with it. Left behind,
+            // it holds the claim's index for a branch that no longer exists, and the next import
+            // onto the same name refuses to refresh that checkout. Both are removed only while the
+            // branch lock settlement takes is held and the branch still points where this import
+            // left it: a branch another settlement advanced keeps its worktree, uncommitted
+            // files included.
+            let guard = link::lock_branch(&self.store, &self.slug, &self.branch);
+            let unchanged = guard.is_ok()
+                && repo
+                    .git(&["rev-parse", "--verify", "--quiet", &head_ref])
+                    .is_ok_and(|tip| tip.trim() == oid);
+            if !unchanged {
+                ui::warning(&format!(
+                    "branch `{}` moved since this import created it — leaving it and its worktree in place",
+                    self.branch
+                ));
+                return;
+            }
+            if let Err(error) = super::worktree::release(&repo, &self.branch, true) {
+                ui::warning(&format!(
+                    "could not remove the worktree of `{}`: {error:#}",
+                    self.branch
+                ));
+            }
             match repo.git(&["update-ref", "-d", &head_ref, oid]) {
                 Ok(_) => println!(
                     "{}",
@@ -1339,6 +1377,7 @@ fn birth_session_branch(
     let claimed_bytes = std::fs::read(&claimed_path).unwrap_or_default();
     Ok(Placed::Ready(Box::new(Landing {
         repo_dir,
+        slug: format!("{owner}/{agent}"),
         branch,
         created,
         created_oid,
@@ -2268,6 +2307,7 @@ mod tests {
             .trim()
             .to_string();
         let landing = Landing {
+            slug: "owner/project".into(),
             claim_source: "codex".into(),
             claim_session: "AB".into(),
             previous_image: None,
@@ -2305,6 +2345,7 @@ mod tests {
             .trim()
             .to_string();
         let landing = Landing {
+            slug: "owner/project".into(),
             claim_source: "codex".into(),
             claim_session: "AB".into(),
             previous_image: None,
@@ -2348,6 +2389,7 @@ mod tests {
         link::write(&store, &advanced).unwrap();
         let (_rd, r) = repo_with_a_foreign_session();
         let landing = Landing {
+            slug: "owner/project".into(),
             claim_source: "codex".into(),
             claim_session: "AB".into(),
             previous_image: None,
@@ -2382,6 +2424,7 @@ mod tests {
                 let claimed_bytes = std::fs::read(&claimed_path).unwrap();
                 let landing = Landing {
                     repo_dir: repo.root().to_owned(),
+                    slug: "owner/project".into(),
                     branch: "unused".into(),
                     created: false,
                     created_oid: None,

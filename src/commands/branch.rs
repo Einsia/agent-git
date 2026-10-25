@@ -161,6 +161,7 @@ pub fn run(args: Args) -> CmdResult {
             repo.git(&["branch", "-D", &name])?;
             ui::success(&format!("local branch {name} deleted"));
             ui::info(ui::dim("  published history on the hub is unaffected"));
+            warn_orphaned_claims(&slug, &name);
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Seal { name }) => {
@@ -358,6 +359,32 @@ fn list(repo: &Repo, slug: &str, verbose: bool, all: bool) -> CmdResult {
         }
     }
     Ok(ExitCode::Ok)
+}
+
+/// A runtime session claimed by a deleted branch still names it as its target, and settling
+/// it later fails on a branch that cannot be read. Name each such session and the import that
+/// moves it, since nothing else says why its next settlement fails.
+fn warn_orphaned_claims(slug: &str, branch: &str) {
+    let Some((owner, agent)) = slug.split_once('/') else {
+        return;
+    };
+    let Ok(Some(store)) = crate::domain::store::Store::open() else {
+        return;
+    };
+    for lk in crate::domain::link::list(&store)
+        .into_iter()
+        .filter(|lk| crate::domain::link::claims_branch(lk, owner, agent, branch))
+    {
+        ui::warning(&format!(
+            "{} session {} is still claimed by the deleted branch {slug}@{branch}",
+            lk.source, lk.session_id
+        ));
+        ui::hint(&format!(
+            "to keep recording it, move the claim to another branch: `agit import {} --from {} --into {slug}@<branch> --independent -y`",
+            ui::session::shell_arg(&lk.session_id),
+            lk.source
+        ));
+    }
 }
 
 #[cfg(test)]

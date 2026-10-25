@@ -3659,6 +3659,35 @@ pub(super) fn commit_tree_as(
     )
 }
 
+/// [`commit_tree_as`] with the author date set to `authored_at` (Unix seconds) when given; the
+/// committer date stays the time of this call.
+pub(super) fn commit_tree_authored(
+    repo: &Repo,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    author: (&str, &str),
+    authored_at: Option<i64>,
+) -> Result<String> {
+    let Some(at) = authored_at else {
+        return commit_tree_as(repo, tree, parents, message, author);
+    };
+    let date = format!("@{at} +0000");
+    commit_tree_with_env(
+        repo,
+        tree,
+        parents,
+        message,
+        &[
+            ("GIT_AUTHOR_NAME", author.0),
+            ("GIT_AUTHOR_EMAIL", author.1),
+            ("GIT_AUTHOR_DATE", &date),
+            ("GIT_COMMITTER_NAME", author.0),
+            ("GIT_COMMITTER_EMAIL", author.1),
+        ],
+    )
+}
+
 fn commit_tree_with_env(
     repo: &Repo,
     tree: &str,

@@ -694,6 +694,132 @@ fn an_explicit_native_id_still_selects_only_that_transcript() {
     assert!(!stdout.contains("SYNTHETIC-CANDIDATE-0"), "{stdout}");
 }
 
+/// A historical import authors each turn commit when that turn happened and commits it at import
+/// time, and `--milestone-turn` puts the milestone on the named turn alone. Keeping the import
+/// time as the author date makes `show` report yesterday's session as just recorded; ignoring the
+/// turn puts the milestone on the last one; checking the turn only after writing leaves a branch
+/// behind for a refused import; reporting success when a repeated import lands nothing drops the
+/// named milestone silently.
+#[test]
+fn a_historical_import_dates_its_turns_and_places_the_milestone_on_the_named_turn() {
+    let lab = Lab::new(1);
+    let (id, path) = &lab.sources[0];
+    let record = |kind: &str, uuid: &str, content: &str, at: &str| {
+        let role = if kind == "user" { "user" } else { "assistant" };
+        format!(
+            "{}\n",
+            serde_json::json!({"type":kind, "sessionId":id, "cwd":lab.work, "uuid":uuid,
+                "timestamp":at, "message":{"role":role, "content":content}})
+        )
+    };
+    let first_end = "2026-09-28T13:40:00.000Z";
+    let second_end = "2026-09-28T13:53:55.000Z";
+    fs::write(
+        path,
+        [
+            record(
+                "user",
+                "u1",
+                "Build the deliverable",
+                "2026-09-28T13:38:48.000Z",
+            ),
+            record("assistant", "a1", "Built reconstruction.pptx", first_end),
+            record("user", "u2", "Polish the notes", "2026-09-28T13:50:00.000Z"),
+            record("assistant", "a2", "Notes polished", second_end),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let import = |turn: &str| {
+        lab.command()
+            .args(["import", id, "--into", "me/qa@dated", "--independent"])
+            .args(["--milestone", "deliverable", "--milestone-turn", turn])
+            .output()
+            .unwrap()
+    };
+    let repo = lab.store.join("repos/me/qa");
+    let branch_exists = || {
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/dated"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+
+    let refused = import("3");
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("turn #3"),
+        "{refused:?}"
+    );
+    assert!(!branch_exists(), "a refused milestone turn lands nothing");
+
+    let imported = import("1");
+    assert!(imported.status.success(), "{imported:?}");
+    let epoch = |at: &str| {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .timestamp()
+    };
+    let log = target_git(
+        &lab,
+        &repo,
+        &[
+            "log",
+            "--reverse",
+            "--format=%at %ct %s",
+            "-n",
+            "2",
+            "dated",
+        ],
+    );
+    let turns: Vec<(i64, i64)> = log
+        .lines()
+        .map(|line| {
+            let mut fields = line.split(' ');
+            let authored = fields.next().unwrap().parse().unwrap();
+            let committed = fields.next().unwrap().parse().unwrap();
+            (authored, committed)
+        })
+        .collect();
+    assert_eq!(
+        turns.iter().map(|turn| turn.0).collect::<Vec<_>>(),
+        [epoch(first_end), epoch(second_end)],
+        "{log}"
+    );
+    assert!(turns.iter().all(|turn| turn.1 > epoch(second_end)), "{log}");
+    let milestone = |rev: &str| -> Option<String> {
+        serde_json::from_str::<agit::domain::meta::Meta>(&target_git(
+            &lab,
+            &repo,
+            &["show", &format!("{rev}:session/meta.json")],
+        ))
+        .unwrap()
+        .milestone
+    };
+    assert_eq!(milestone("dated~1").as_deref(), Some("deliverable"));
+    assert_eq!(milestone("dated"), None);
+
+    let settled = import("2");
+    assert!(
+        !settled.status.success()
+            && String::from_utf8_lossy(&settled.stderr).contains("nothing new to settle"),
+        "a named milestone turn is refused when the import lands nothing: {settled:?}"
+    );
+
+    let shown = lab
+        .command()
+        .args(["show", "me/qa@dated"])
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("imported"), "{shown}");
+}
+
 /// Importing a session other than the one the runtime variable names is allowed — nested runtimes
 /// and earlier conversations are legitimate — but it is never silent: a JSON warning names both
 /// identities, and with automatic pushing on that import stays local. Importing the conversation

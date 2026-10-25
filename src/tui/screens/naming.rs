@@ -59,6 +59,8 @@ impl ImportChoice {
             propose_lineage: false,
             independent: false,
             privacy: false,
+            milestone: None,
+            milestone_turn: None,
         }
     }
 }

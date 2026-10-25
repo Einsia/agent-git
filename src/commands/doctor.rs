@@ -954,6 +954,22 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
     {
         anyhow::bail!("claim has an invalid local branch name");
     }
+    if repo
+        .git_status(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])?
+        .0
+        == Some(1)
+    {
+        anyhow::bail!(
+            "the claimed branch {slug}@{branch} no longer exists; move the claim with `agit import {} --from {} --into {slug}@<branch> --independent -y`",
+            crate::ui::session::shell_arg(&lk.session_id),
+            lk.source
+        );
+    }
     let head = repo
         .git(&[
             "rev-parse",
