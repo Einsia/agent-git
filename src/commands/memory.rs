@@ -148,6 +148,9 @@ pub struct Report {
     pub collected: usize,
     /// Files not collected because of a suspected secret.
     pub refused: Vec<String>,
+    /// Files not collected because their privacy check did not complete; the next collection
+    /// tries them again.
+    pub pending: Vec<String>,
     /// Memory files rejected before content scanning by the repository privacy policy.
     pub privacy_excluded: Vec<String>,
     /// The commit that landed.
@@ -160,6 +163,9 @@ pub struct Report {
     /// A mirror edit that could not enter the branch; materialization kept it instead of
     /// overwriting it with the branch content.
     pub conflicts: Vec<String>,
+    /// Files collection did not take (refused, pending or excluded by policy). Their baseline
+    /// entries stay as collection left them, so the next collection considers them again.
+    pub withheld: BTreeSet<String>,
 }
 
 /// How settlement treats a directory with no baseline.
@@ -460,17 +466,88 @@ fn upsert_index(existing: &str, scope: &str, lines: &[String]) -> String {
     out
 }
 
-/// Reversible text processing is optional; unsupported content remains available unchanged.
-fn protect_memory_bytes(repo: &Repo, bytes: &[u8]) -> crate::Result<Result<Vec<u8>, String>> {
+/// Why a memory file stays off the branch this time.
+#[derive(Debug)]
+enum Withheld {
+    /// It holds a private key that cannot be replaced, so it waits for the user.
+    Secret(&'static str),
+    /// Its privacy check did not complete, so the next collection tries again.
+    Pending,
+}
+
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Secret(rule) => write!(f, "suspected secret ({rule})"),
+            Self::Pending => f.write_str("privacy check pending"),
+        }
+    }
+}
+
+/// A memory file reaches a branch only as content that passed protection in full; otherwise it
+/// is withheld. Withholding is never a lasting cost: the file stays local and is collected once
+/// its check completes.
+///
+/// A memory file is projected as one text, not line by line: a key spans lines, and only a
+/// projection that sees the whole block replaces it from BEGIN through END. A BEGIN line without
+/// its END line, or an END line without its BEGIN line (the body a line-by-line projection left
+/// behind), has no boundary to replace up to, so the file is refused rather than guessed at, and
+/// so is a file whose key the projection left in place.
+fn protect_memory_bytes(repo: &Repo, bytes: &[u8]) -> crate::Result<Result<Vec<u8>, Withheld>> {
     let Ok(text) = std::str::from_utf8(bytes) else {
+        if private_key_marker().is_match(bytes) {
+            return Ok(Err(Withheld::Secret(
+                "private key in a file that is not UTF-8 text",
+            )));
+        }
         return Ok(Ok(bytes.to_vec()));
     };
+    if unbalanced_private_key(text) {
+        return Ok(Err(Withheld::Secret(
+            "private key block without its BEGIN or END line",
+        )));
+    }
     let outcome = crate::domain::privacy::service::transform(
         Some(repo.root()),
         text,
-        crate::domain::privacy::projector::Mode::ProtectJsonl,
+        crate::domain::privacy::projector::Mode::ProtectText,
     );
+    if !crate::domain::privacy::service::passed(&outcome) {
+        return Ok(Err(Withheld::Pending));
+    }
+    if private_key_marker().is_match(outcome.content.as_bytes()) {
+        return Ok(Err(Withheld::Secret("private key was not replaced")));
+    }
     Ok(Ok(outcome.content.into_bytes()))
+}
+
+/// The line that opens or closes a PEM private key, as the detector's private-key rule reads it,
+/// in any letter case.
+fn private_key_marker() -> &'static regex::bytes::Regex {
+    static MARKER: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+        regex::bytes::Regex::new(
+            r"(?i)-----(?:BEGIN|END)[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----",
+        )
+        .expect("the private key marker pattern is valid")
+    });
+    &MARKER
+}
+
+/// Whether a private key BEGIN line in `text` has no matching END line after it, or an END line
+/// has no matching BEGIN line before it.
+fn unbalanced_private_key(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    private_key_marker()
+        .find_iter(lower.as_bytes())
+        .any(|marker| {
+            let found = &lower[marker.start()..marker.end()];
+            if let Some(label) = found.strip_prefix("-----begin") {
+                !lower[marker.end()..].contains(&format!("-----end{label}"))
+            } else {
+                let label = found.strip_prefix("-----end").unwrap_or(found);
+                !lower[..marker.start()].contains(&format!("-----begin{label}"))
+            }
+        })
 }
 
 // ────────────────────── Collection plan ─────────────────────
@@ -585,7 +662,9 @@ pub fn materialize_with(
         let collected = collect_with(primary, branch, slug, mem_dir, policy)?;
         report.warnings.extend(collected.warnings);
         report.refused.extend(collected.refused);
+        report.pending.extend(collected.pending);
         report.privacy_excluded.extend(collected.privacy_excluded);
+        report.withheld = collected.withheld;
     }
     let baseline = read_baseline(&checkout, mem_dir)?.unwrap_or_default();
     let mut files = branch_files(&checkout, &tree_ref(branch))?;
@@ -594,7 +673,7 @@ pub fn materialize_with(
             *bytes = crate::domain::privacy::service::transform(
                 Some(primary.root()),
                 text,
-                crate::domain::privacy::projector::Mode::HydrateJsonl,
+                crate::domain::privacy::projector::Mode::HydrateText,
             )
             .content
             .into_bytes();
@@ -685,6 +764,16 @@ pub fn materialize_with(
 
     let mut next_baseline = Baseline::of(mem_dir, &md_files(mem_dir)?, &BTreeMap::new());
     next_baseline.mirror = placed_hashes;
+    for name in &report.withheld {
+        match baseline.files.get(name) {
+            Some(seen) => {
+                next_baseline.files.insert(name.clone(), seen.clone());
+            }
+            None => {
+                next_baseline.files.remove(name);
+            }
+        }
+    }
     store_baseline(&checkout, &next_baseline)?;
     Ok(report)
 }
@@ -766,8 +855,12 @@ pub fn collect_with(
             Ok(protected) => {
                 edits.insert(name.clone(), Some(protected));
             }
-            Err(rule) => {
+            Err(Withheld::Secret(rule)) => {
                 report.refused.push(format!("{name} ({rule})"));
+                refused_names.insert(name.clone());
+            }
+            Err(Withheld::Pending) => {
+                report.pending.push(name.clone());
                 refused_names.insert(name.clone());
             }
         }
@@ -818,6 +911,7 @@ pub fn collect_with(
             .warnings
             .push(format!("memory baseline was not updated: {error:#}"));
     }
+    report.withheld = refused_names;
     Ok(report)
 }
 
@@ -1444,6 +1538,11 @@ pub fn report_collect(report: &Report, branch: &str) {
             "memory/{refused}: suspected secret, not collected"
         ));
     }
+    for pending in &report.pending {
+        ui::warning(&format!(
+            "memory/{pending}: privacy check pending, not collected; retried next time"
+        ));
+    }
     for excluded in &report.privacy_excluded {
         ui::warning(&format!(
             "memory/{excluded}: not collected by the repository privacy policy"
@@ -1473,6 +1572,11 @@ pub fn report_materialize(report: &Report) {
     for refused in &report.refused {
         ui::warning(&format!(
             "memory/{refused}: suspected secret, not collected"
+        ));
+    }
+    for pending in &report.pending {
+        ui::warning(&format!(
+            "memory/{pending}: privacy check pending, not collected; retried next time"
         ));
     }
     for excluded in &report.privacy_excluded {

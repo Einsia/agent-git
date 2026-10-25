@@ -276,6 +276,14 @@ impl Drop for PublicationHydrator {
     }
 }
 
+/// Whether `outcome` passed protection in full, so that its content may be committed or
+/// published. A unit-test binary is not the agit executable and cannot host the worker, so there
+/// an unprocessed outcome also counts and unit tests keep exercising their own logic; the
+/// integration tests drive the real worker, where only a complete outcome counts.
+pub fn passed(outcome: &Outcome) -> bool {
+    outcome.status == Status::Complete || (cfg!(test) && outcome.status == Status::Skipped)
+}
+
 /// One bounded attempt per operation; lock contention immediately uses the caller's input.
 pub fn transform(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
