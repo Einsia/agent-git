@@ -813,7 +813,13 @@ impl Adapter for ClaudeCode {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
+            // Only conversation records open and answer calls. Other records can embed copies of
+            // earlier messages (request snapshots such as `api-request-blob`), and a copied
+            // tool_use that was answered before it would otherwise stay open for good.
+            if !matches!(
+                v.get("type").and_then(|x| x.as_str()),
+                Some("assistant" | "user")
+            ) || v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
                 || v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true)
                 || has_system_prompt_source(&v)
             {
@@ -1311,6 +1317,21 @@ mod tests {
         assert_eq!(c.prompts, 1);
         assert_eq!(c.replies, 1);
         assert_eq!(c.edits, 1, "a tool_use with file_path is an edit");
+    }
+
+    /// Claude Code writes request snapshots (`api-request-blob`) that copy earlier messages,
+    /// including tool_use blocks answered before the snapshot. Counting those copies leaves an
+    /// answered call open after the turn ends, and the turn is never settled.
+    #[test]
+    fn request_snapshots_do_not_reopen_answered_calls() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"sessionId":"s"}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"README.md"}]},"sessionId":"s"}"#;
+        let snapshot = r#"{"type":"api-request-blob","hash":"h","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"sessionId":"s"}"#;
+        let reply = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]},"sessionId":"s"}"#;
+        assert_eq!(
+            ClaudeCode.open_tool_calls(&format!("{call}\n{result}\n{snapshot}\n{reply}\n")),
+            Vec::new()
+        );
     }
 
     /// **Tool output must not leave a record eventless.**
