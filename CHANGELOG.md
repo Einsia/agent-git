@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.27] - 2026-10-25
+
+### Added
+
+- `agit import … --milestone <text> [--milestone-turn <n>]` marks a milestone on turn `#n` of the
+  imported branch, or on its last settled turn. A turn the import does not land is refused before
+  anything is written.
+
 ### Changed
 
 - Captured content has only high-confidence credentials replaced with reversible placeholders:
@@ -18,6 +26,19 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   recognized. Protocol identifiers such as Codex
   `call_id`, Claude Code tool-use IDs, thinking signatures and encrypted reasoning are never
   rewritten, so a resumed session keeps its call pairing and verified reasoning.
+
+### Fixed
+
+- Claude Code 2.1.3xx sessions save again. Those versions write request snapshots that repeat tool
+  calls already answered, and agit read them as calls still running, so `agit commit` and the Stop
+  hook reported "the current turn is still in flight" and saved nothing.
+- Historical imports date each turn at its last recorded event instead of the import time.
+  `agit show` reports when a turn was recorded and, if it was imported later, when it was imported.
+- A failed `agit import` onto a new branch can be retried onto the same branch. The retry failed
+  with `checkout refresh failed: refusing to overwrite index path "session/meta.json"`.
+- `agit branch rm` on a claimed branch names the sessions it still claims and the
+  `agit import … --independent` command that moves each claim. `agit doctor` reports a claimed
+  branch that no longer exists instead of "local Git inspection did not complete".
 
 ## [0.2.26] - 2026-10-25
 
