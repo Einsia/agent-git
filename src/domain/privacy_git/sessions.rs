@@ -261,7 +261,7 @@ impl ProjectedHistory {
                     .strip_prefix("refs/heads/")
                     .context("invalid publication branch")?;
                 ensure!(
-                    redactor.try_scrub(branch)?.text == branch,
+                    redactor.publishes_unchanged(branch)?,
                     "publication branch name requires privacy rewriting; rename it before publishing"
                 );
                 let reachable = ancestors(head.oid(), &parents)?;

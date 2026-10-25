@@ -771,9 +771,12 @@ pub(crate) fn is_token_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn private_key_region_end(text: &str, start: usize, header_end: usize) -> usize {
-    let header = &text[start..header_end];
-    let footer = header.replacen("-----BEGIN", "-----END", 1);
+    // Letter case does not change byte offsets, so the footer is found in a lower-cased copy.
+    let footer = text[start..header_end]
+        .to_ascii_lowercase()
+        .replacen("-----begin", "-----end", 1);
     text[header_end..]
+        .to_ascii_lowercase()
         .find(&footer)
         .map_or(text.len(), |offset| header_end + offset + footer.len())
 }

@@ -41,6 +41,12 @@ path = "tests/codex_resume_provider.rs"
 harness = false
 required-features = ["cli"]
 
+[[test]]
+name = "rc_text_protection"
+path = "tests/rc_text_protection.rs"
+harness = false
+required-features = ["cli"]
+
 [[bench]]
 name = "startup_migration"
 harness = false

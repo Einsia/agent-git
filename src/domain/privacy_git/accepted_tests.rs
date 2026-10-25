@@ -801,7 +801,10 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
     let same = prepare(&selected).unwrap();
     assert_eq!(same.plan.heads()[0].oid(), public);
     assert!(same.session_manifest().snapshots.is_empty());
-    assert_eq!(same.session_manifest().preserved_commits, [public.clone()]);
+    assert_eq!(
+        same.session_manifest().preserved_commits,
+        std::slice::from_ref(&public)
+    );
     assert!(
         same.session_receipts("team/app", &identity, "https://hub.invalid/team/app.git")
             .unwrap()

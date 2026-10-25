@@ -11,6 +11,10 @@ use zeroize::Zeroizing;
 
 const FOREGROUND_BUDGET: Duration = Duration::from_millis(750);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
+/// How long a caller can go without an answer through ordinary trouble: a worker back-off and
+/// one budget.
+pub(crate) const RETRY_WINDOW: Duration =
+    Duration::from_millis((RETRY_DELAY.as_millis() + FOREGROUND_BUDGET.as_millis()) as u64);
 const BATCH_BYTES: usize = 128 * 1024;
 
 struct Process {
@@ -106,6 +110,7 @@ impl Process {
     fn request(
         &mut self,
         repo: Option<&Path>,
+        context: &str,
         text: &str,
         mode: Mode,
         remaining: Duration,
@@ -114,6 +119,7 @@ impl Process {
             repo: repo.map(Path::to_owned),
             mode,
             text: text.to_owned(),
+            context: context.to_owned(),
         };
         let bytes = Zeroizing::new(serde_json::to_vec(&request)?);
         self.send
@@ -161,6 +167,18 @@ struct State {
     failed_until: Option<Instant>,
 }
 
+/// Wait until a worker that failed may be started again, at most one back-off.
+pub(crate) fn wait_for_retry() {
+    let until = shared().lock().ok().and_then(|state| state.failed_until);
+    if let Some(until) = until {
+        std::thread::sleep(
+            until
+                .saturating_duration_since(Instant::now())
+                .min(RETRY_DELAY),
+        );
+    }
+}
+
 fn shared() -> &'static Mutex<State> {
     static STATE: Mutex<State> = Mutex::new(State {
         process: None,
@@ -206,7 +224,7 @@ impl PublicationHydrator {
             !remaining.is_zero(),
             "publication hydration timed out; retry before publishing"
         );
-        let outcome = self.process.request(Some(&self.repo), text, mode, remaining)
+        let outcome = self.process.request(Some(&self.repo), "", text, mode, remaining)
             .context("publication hydration failed; restore the source dictionary or retry before publishing")?;
         ensure!(
             outcome.status == Status::Complete && outcome.unresolved == 0,
@@ -287,12 +305,21 @@ pub fn passed(outcome: &Outcome) -> bool {
 /// One bounded attempt per operation; lock contention immediately uses the caller's input.
 pub fn transform(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        worker::inline(repo, text, mode).unwrap_or_else(|| transform_inner(repo, text, mode))
+        worker::inline(repo, text, mode).unwrap_or_else(|| transform_inner(repo, "", text, mode))
     }))
     .unwrap_or_else(|_| Outcome::skipped(text))
 }
 
-fn transform_inner(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
+/// [`transform`] for text that continues `context`, text a stream already released: the
+/// worker's rules match across the context, and only `text` is protected and returned.
+pub fn transform_in(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -> Outcome {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transform_inner(repo, context, text, mode)
+    }))
+    .unwrap_or_else(|_| Outcome::skipped(text))
+}
+
+fn transform_inner(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -> Outcome {
     if matches!(
         mode,
         Mode::HydrateText | Mode::HydrateJsonl | Mode::HydrateEnvelopes
@@ -367,7 +394,9 @@ fn transform_inner(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
         } else {
             text.len()
         };
-        if end - cursor > MAX_UNIT_BYTES {
+        // The worker counts the context against the same bound, so the check here does too.
+        let carried = if cursor == 0 { context.len() } else { 0 };
+        if carried + end - cursor > MAX_UNIT_BYTES {
             outcome.content.push_str(&text[cursor..end]);
             outcome.status = Status::Partial;
             cursor = end;
@@ -375,6 +404,7 @@ fn transform_inner(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
         }
         let result = state.process.as_mut().expect("worker started").request(
             repo,
+            if cursor == 0 { context } else { "" },
             &text[cursor..end],
             mode,
             remaining,

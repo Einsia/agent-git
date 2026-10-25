@@ -30,12 +30,12 @@ description = "PostHog personal API key"
 regex = '''\bphx_[A-Za-z0-9]{32,64}\b'''
 keywords = ["phx_"]
 
-# A private-key header opens a sensitive region. The shared scanner extends this
-# match through the matching footer or the end of an incomplete carrier.
+# A private-key header, in any letter case, opens a sensitive region. The shared scanner
+# extends this match through the matching footer or the end of an incomplete carrier.
 [[rules]]
 id = "agit-private-key-header"
 description = "PEM private key region (including truncated private key output)"
-regex = '''-----BEGIN[ A-Za-z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----'''
+regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----'''
 keywords = ["-----begin"]
 
 # gitleaks has no general "password in a URL" rule (only the sidekiq kind, bound to one

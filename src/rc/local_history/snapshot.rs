@@ -25,6 +25,25 @@ struct Snapshot {
     _budget: OwnedSemaphorePermit,
 }
 
+/// How long a history page whose records may still pass is refused as busy, so the viewer asks
+/// again, before it is returned with the given-up marker in place of each record that did not
+/// pass and the viewer moves on past it. It is a time, not a count of requests: a viewer's retries
+/// come faster than a worker back-off ends.
+fn withheld_page_notice() -> Duration {
+    #[cfg(test)]
+    if let Some(notice) = WITHHELD_PAGE_NOTICE.with(std::cell::Cell::get) {
+        return notice;
+    }
+    crate::rc::supervisor::HELD_TAIL_NOTICE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces [`withheld_page_notice`] on this thread, so a test need not wait out a back-off.
+    pub(crate) static WITHHELD_PAGE_NOTICE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 struct CachedSnapshot {
     scope: String,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -155,6 +174,10 @@ struct Cache {
     entries: Mutex<HashMap<String, CachedSnapshot>>,
     captures: Flights<(String, Arc<Mutex<Snapshot>>)>,
     bytes: Arc<Semaphore>,
+    /// When a page was first refused because its privacy check did not pass, by conversation and
+    /// cursor. Kept beside the snapshots rather than in one: a first page is captured anew for
+    /// every request, and its refusals still have to add up.
+    refusals: Mutex<HashMap<(String, Option<u64>), Instant>>,
 }
 
 impl Default for Cache {
@@ -163,6 +186,7 @@ impl Default for Cache {
             entries: Mutex::new(HashMap::new()),
             captures: Flights::default(),
             bytes: Arc::new(Semaphore::new(MAX_TOTAL_BYTES as usize)),
+            refusals: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -231,6 +255,24 @@ impl Cache {
         Ok((token, snapshot))
     }
 
+    /// How long ago `page` was first refused, if it was.
+    fn refused_for(&self, page: &(String, Option<u64>)) -> Option<Duration> {
+        self.refusals.lock().ok()?.get(page).map(Instant::elapsed)
+    }
+
+    fn refuse(&self, page: (String, Option<u64>)) {
+        if let Ok(mut refusals) = self.refusals.lock() {
+            refusals.retain(|_, since| since.elapsed() < LIFETIME);
+            refusals.entry(page).or_insert_with(Instant::now);
+        }
+    }
+
+    fn accept(&self, page: &(String, Option<u64>)) {
+        if let Ok(mut refusals) = self.refusals.lock() {
+            refusals.remove(page);
+        }
+    }
+
     fn reserve(&self, bytes: u32) -> crate::Result<OwnedSemaphorePermit> {
         self.reserve_from(&self.bytes, bytes)
     }
@@ -287,6 +329,7 @@ pub(super) fn read(
         .map(|context| (&context.source.source_id, context.source.generation));
     let anchor = archive::Anchor::parse(params)?;
     let conversation = json!([runtime, native, cwd, source]);
+    let conversation_key = conversation.to_string();
     let requested = anchor.clone();
     let cache = SNAPSHOTS.get_or_init(Default::default);
     let (token, snapshot) = timings.measure("snapshot_ms", || {
@@ -355,17 +398,31 @@ pub(super) fn read(
                 })?;
             let mut projection_phases: std::collections::BTreeMap<&'static str, f64> =
                 std::collections::BTreeMap::new();
-            let items: Vec<Value> = timings.measure("projection_ms", || {
-                let (items, _) = super::super::supervisor::items_from_lines_profiled(
+            let items: Vec<Value> = timings.measure("projection_ms", || -> crate::Result<_> {
+                // A page whose privacy check did not complete is refused, not shown with a
+                // marker, so the viewer asks for the same page again instead of moving past it;
+                // only a page that keeps failing past the notice is returned with its markers.
+                let page = (conversation_key.clone(), cursor);
+                let given_up = cache
+                    .refused_for(&page)
+                    .is_some_and(|refused| refused >= withheld_page_notice());
+                let projected = super::super::supervisor::items_from_lines_tracked(
                     runtime,
                     &redactor,
                     &lines,
                     mode,
+                    if given_up { lines.len() } else { 0 },
                     &mut |name, elapsed| {
                         *projection_phases.entry(name).or_default() += elapsed;
                     },
                 );
-                items
+                if projected.first_withheld.is_some() {
+                    cache.refuse(page);
+                    anyhow::bail!(Failure::Busy);
+                }
+                cache.accept(&page);
+                Ok(projected
+                    .items
                     .into_iter()
                     .map(|mut item| {
                         if *runtime == "codex" && params["view"] == "conversation" {
@@ -379,8 +436,8 @@ pub(super) fn read(
                             "raw": item.raw,
                         })
                     })
-                    .collect()
-            });
+                    .collect())
+            })?;
 
             for (name, elapsed) in projection_phases {
                 *timings.0.entry(name).or_default() += elapsed;

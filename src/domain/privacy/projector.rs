@@ -67,6 +67,52 @@ pub(crate) struct NativeBatch {
     pub pointers: Vec<Vec<String>>,
 }
 
+/// Where a stream may cut a line too long to wait for its newline: at whitespace with no
+/// assignment separator within a window on either side, so a name leaves together with the
+/// separator after it. Zero when no such point exists. A rule that needs more context than the
+/// window still sees it in the released text every stream request carries (see
+/// `StreamRedactor`).
+fn long_line_cut(text: &str, boundary: usize) -> usize {
+    const WINDOW: usize = 96;
+    let mut end = boundary;
+    while let Some(cut) = text[..end].rfind(char::is_whitespace) {
+        let from = floor_boundary(text, cut.saturating_sub(WINDOW));
+        let to = ceil_boundary(text, (cut + WINDOW).min(text.len()));
+        let Some(at) = text[from..to].find(['=', ':']) else {
+            return cut;
+        };
+        // Every cut within the window of this separator fails the same way.
+        end = floor_boundary(text, (from + at).saturating_sub(WINDOW - 1));
+    }
+    0
+}
+
+/// Where an unclosed private-key block begins: the last BEGIN line, in any letter case, with no
+/// complete footer after it.
+fn open_key_block(text: &str) -> Option<usize> {
+    static FOOTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"-----end[ a-z0-9_-]{0,100}-----")
+            .expect("the key footer pattern is valid")
+    });
+    let lower = text.to_ascii_lowercase();
+    let start = lower.rfind("-----begin")?;
+    (!FOOTER.is_match(&lower[start..])).then_some(start)
+}
+
+fn floor_boundary(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn ceil_boundary(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
 pub struct Projector {
     pub store: Store,
     pub dictionary: Dictionary,
@@ -166,14 +212,21 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
 
 impl Projector {
     pub fn transform(&mut self, text: &str, mode: Mode) -> Outcome {
-        if text.len() > MAX_UNIT_BYTES {
+        self.transform_in("", text, mode)
+    }
+
+    /// [`Self::transform`] for text that continues `context`, text a stream already released.
+    /// Only stream and text protection read the context: rules match across it, and only `text`
+    /// is protected and returned.
+    pub fn transform_in(&mut self, context: &str, text: &str, mode: Mode) -> Outcome {
+        if context.len() + text.len() > MAX_UNIT_BYTES {
             return Outcome::skipped(text);
         }
         if matches!(mode, Mode::ProtectNative) {
             return self.native_batch(text);
         }
         if matches!(mode, Mode::ProtectStream) {
-            return self.stream(text);
+            return self.stream(context, text);
         }
         let hydrate = matches!(
             mode,
@@ -183,7 +236,7 @@ impl Projector {
             return if hydrate {
                 self.hydrate(text)
             } else {
-                self.protect(text)
+                self.protect_continuation(context, text)
             };
         }
         let preserve_protocol_ids = hydrate
@@ -305,38 +358,45 @@ impl Projector {
         outcome
     }
 
-    fn stream(&mut self, text: &str) -> Outcome {
-        const LIMIT: usize = 128 * 1024;
-        if text.len() >= LIMIT {
-            let mut outcome = self.protect(text);
-            outcome.consumed = Some(text.len());
-            outcome.status = Status::Partial;
-            return outcome;
-        }
-        // Keep literal lookahead and assignment context. Incomplete key blocks wait for a terminator.
-        let hold = self.policy.max_literal_bytes.clamp(128, LIMIT);
-        let mut boundary = text.len().saturating_sub(hold);
-        while !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        let mut cut = text[..boundary].rfind(char::is_whitespace).unwrap_or(0);
-        if let Some(start) = text.rfind("-----BEGIN ")
-            && !text[start..].contains("-----END ")
-        {
+    fn stream(&mut self, context: &str, text: &str) -> Outcome {
+        const LONG_LINE: usize = 128 * 1024;
+        // A lookahead window is held back and whole lines leave; a line is cut inside only once
+        // more than LONG_LINE bytes before the window have no newline. The scan covers `context`
+        // too, so the cut never splits a finding that began in released text. A key block with
+        // no complete footer waits from its BEGIN line on, and nothing leaves while the scan
+        // cannot finish.
+        let hold = self.policy.max_literal_bytes.clamp(128, LONG_LINE);
+        let boundary = floor_boundary(text, text.len().saturating_sub(hold));
+        let mut cut = match text[..boundary].rfind('\n') {
+            Some(newline) => newline + 1,
+            None if boundary >= LONG_LINE => long_line_cut(text, boundary),
+            None => 0,
+        };
+        if let Some(start) = open_key_block(text) {
             cut = cut.min(start);
         }
-        let batch = self.policy.scan(text, MAX_FINDINGS);
-        for hit in batch.findings {
-            if hit.start < cut && hit.end > cut {
-                cut = hit.start;
+        let offset = context.len();
+        let batch = self.policy.scan(&format!("{context}{text}"), MAX_FINDINGS);
+        if !batch.complete {
+            cut = 0;
+        }
+        let mut spans: Vec<(usize, usize)> = batch
+            .findings
+            .iter()
+            .map(|hit| (hit.start, hit.end))
+            .chain(tokens(text).map(|(start, end, _)| (offset + start, offset + end)))
+            .collect();
+        // Latest first: once the cut moves back to one span's start, every span that starts
+        // before it is still checked against the new cut.
+        spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.0));
+        let mut at = offset + cut;
+        for (start, end) in spans {
+            if start < at && end > at {
+                at = start.max(offset);
             }
         }
-        for (start, end, _) in tokens(text) {
-            if start < cut && end > cut {
-                cut = start;
-            }
-        }
-        let mut outcome = self.protect(&text[..cut]);
+        let cut = at - offset;
+        let mut outcome = self.protect_continuation(context, &text[..cut]);
         outcome.consumed = Some(cut);
         outcome
     }
@@ -653,6 +713,31 @@ impl Projector {
                 rule: "credential-assignment",
             }];
         }
+        self.protect_findings(text, batch)
+    }
+
+    /// Protects `text` as the continuation of `context`, text a stream released before it: rules
+    /// match across the two, and a finding that begins in `context` is replaced where it
+    /// continues into `text`.
+    fn protect_continuation(&mut self, context: &str, text: &str) -> Outcome {
+        if context.is_empty() || text.is_empty() {
+            return self.protect(text);
+        }
+        let offset = context.len();
+        let mut batch = self.policy.scan(&format!("{context}{text}"), MAX_FINDINGS);
+        batch.findings.retain_mut(|hit| {
+            if hit.end <= offset {
+                return false;
+            }
+            hit.start = hit.start.max(offset) - offset;
+            hit.end -= offset;
+            true
+        });
+        self.protect_findings(text, batch)
+    }
+
+    /// Replaces `batch`'s findings in `text`, except where they touch a valid placeholder.
+    fn protect_findings(&mut self, text: &str, mut batch: Batch) -> Outcome {
         let opaque: Vec<_> = tokens(text).map(|(start, end, _)| (start, end)).collect();
         batch.findings.retain(|hit| {
             !opaque

@@ -579,6 +579,7 @@ impl Daemon {
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
                     let mut initial = true;
+                    let mut held = crate::rc::supervisor::HeldTail::default();
                     let mut enrolled = enrolled;
                     let mut rollover_check = tokio::time::Instant::now() + WATCH_ROLLOVER_CHECK;
                     loop {
@@ -697,6 +698,8 @@ impl Daemon {
                             history_status(&frames, &stream, "reset", None).await;
                             initial = true;
                             settings_boundary = None;
+                            // Held lines belong to the content the reset replaced.
+                            held = Default::default();
                         }
                         if lines.iter().any(|line| {
                             !line.text.trim().is_empty()
@@ -706,24 +709,29 @@ impl Daemon {
                                 .await;
                             break;
                         }
-                        if lines.is_empty() {
-                            // Quiet decides nothing here: reaping is judged by the
-                            // daemon (`reap_idle_watches`) because it has to sit
-                            // under the same lock as "add a viewer". This only
-                            // reports whether there was activity.
-                        } else {
-                            // Report activity. **The daemon decides whether to
-                            // reap**, see `reap_idle_watches`.
+                        // Quiet decides nothing here: reaping is judged by the daemon
+                        // (`reap_idle_watches`) because it has to sit under the same lock as
+                        // "add a viewer". This only reports whether there was activity, and
+                        // retrying held lines is none, or a watch nobody views would never be
+                        // reaped while one record keeps failing.
+                        if !lines.is_empty() {
                             active.store(
                                 crate::rc::daemon::now_secs(),
                                 std::sync::atomic::Ordering::Release,
                             );
+                        }
+                        if !lines.is_empty() || !held.is_empty() {
                             // A read-only follow has no session identity, and
                             // `secret.detected` is a session-level alert: this only
                             // guarantees the content is redacted.
-                            for mut frame in
-                                watch_frames(&rt, &redactor, &lines, mode, settings_boundary)
-                            {
+                            for mut frame in held_watch_frames(
+                                &mut held,
+                                &rt,
+                                &redactor,
+                                lines,
+                                mode,
+                                settings_boundary,
+                            ) {
                                 frame.stream = Some(stream.clone());
                                 if matches!(
                                     frame.method(),
@@ -1050,6 +1058,7 @@ impl WatchRpcTicket {
 mod tests;
 
 /// Lifecycle markers stay interleaved with their protected source records.
+#[cfg(test)]
 fn watch_frames(
     runtime: &str,
     redactor: &crate::domain::redact::Redactor,
@@ -1057,9 +1066,35 @@ fn watch_frames(
     mode: crate::rc::codex_history::HistoryMode,
     settings_boundary: Option<u64>,
 ) -> Vec<Frame> {
-    let (items, _) =
-        crate::rc::supervisor::items_from_lines_with_mode(runtime, redactor, lines, mode);
-    let mut items = items.into_iter().peekable();
+    held_watch_frames(
+        &mut crate::rc::supervisor::HeldTail::default(),
+        runtime,
+        redactor,
+        lines.to_vec(),
+        mode,
+        settings_boundary,
+    )
+}
+
+/// Frames for the polled lines that may be shown now; lines whose privacy check may still pass
+/// wait in `held`, with their lifecycle markers, for the next poll.
+fn held_watch_frames(
+    held: &mut crate::rc::supervisor::HeldTail,
+    runtime: &str,
+    redactor: &crate::domain::redact::Redactor,
+    polled: Vec<crate::rc::tail::TailedLine>,
+    mode: crate::rc::codex_history::HistoryMode,
+    settings_boundary: Option<u64>,
+) -> Vec<Frame> {
+    let shown = held.project(
+        runtime,
+        redactor,
+        polled,
+        mode,
+        crate::rc::supervisor::Release::Retry,
+    );
+    let lines = &shown.lines;
+    let mut items = shown.items.into_iter().peekable();
     let mut frames = Vec::new();
     for line in lines {
         if let Some(frame) = watch_turn_event(runtime, &line.text) {

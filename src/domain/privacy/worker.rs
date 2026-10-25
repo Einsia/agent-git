@@ -25,6 +25,9 @@ pub(crate) struct Request {
     pub repo: Option<PathBuf>,
     pub mode: Mode,
     pub text: String,
+    /// Text a stream already released before `text`: matched against, never returned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
 }
 
 static IN_WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -47,6 +50,7 @@ pub(crate) fn inline(repo: Option<&Path>, text: &str, mode: Mode) -> Option<Outc
                 repo: repo.map(Path::to_owned),
                 text: text.to_owned(),
                 mode,
+                context: String::new(),
             },
             &mut state,
         )
@@ -279,7 +283,7 @@ fn status() -> crate::Result<Outcome> {
 
 fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outcome> {
     ensure!(
-        request.text.len() <= super::projector::MAX_UNIT_BYTES,
+        request.context.len() + request.text.len() <= super::projector::MAX_UNIT_BYTES,
         "privacy input exceeds its byte budget"
     );
     if matches!(
@@ -464,7 +468,9 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             consumed: None,
         });
     }
-    Ok(loaded.projector.transform(&request.text, request.mode))
+    Ok(loaded
+        .projector
+        .transform_in(&request.context, &request.text, request.mode))
 }
 
 fn serve(clock: Instant, deadline: &AtomicU64) -> crate::Result<()> {

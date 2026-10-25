@@ -950,6 +950,39 @@ mod tests {
             )
             .unwrap();
             assert!(beta.to_string().contains("beta-child"));
+            // A page whose records may still pass is refused as busy however often it is asked
+            // for, until it has been refused for the notice period; then it is returned with
+            // the given-up marker for each record. A count of tries runs out within one burst of
+            // a client's retries, long before a worker back-off ends.
+            crate::domain::redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
+            snapshot::WITHHELD_PAGE_NOTICE
+                .with(|n| n.set(Some(std::time::Duration::from_millis(200))));
+            for _ in 0..5 {
+                let refused = read_with_roster(
+                    json!({"session_id":"beta"}),
+                    &roster,
+                    &mut Timings::default(),
+                )
+                .unwrap_err();
+                assert!(matches!(refused.downcast_ref(), Some(Failure::Busy)));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let given_up = read_with_roster(
+                json!({"session_id":"beta"}),
+                &roster,
+                &mut Timings::default(),
+            )
+            .unwrap();
+            crate::domain::redact::WITHHOLD_NATIVE.with(|w| w.set(None));
+            snapshot::WITHHELD_PAGE_NOTICE.with(|n| n.set(None));
+            let items = given_up["items"].as_array().unwrap();
+            assert!(!items.is_empty());
+            assert!(
+                items
+                    .iter()
+                    .all(|item| item["event"]["text"] == crate::domain::redact::GIVEN_UP_TEXT),
+                "{given_up}"
+            );
             // A removed project directory leaves its existing history readable.
             let moved = directory.path().join("moved");
             std::fs::rename(&project, &moved).unwrap();

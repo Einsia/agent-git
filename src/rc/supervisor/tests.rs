@@ -129,6 +129,7 @@ pub(super) fn harness_test_session_with_channels(
         resolved_initial_turn: None,
         announced_turn_ids: Default::default(),
         delta_streams: Default::default(),
+        held: Default::default(),
         alerted_registered: Default::default(),
     };
     (session, out_rx, notes_rx)
@@ -142,44 +143,6 @@ fn codex_turn_test_session(thread_id: Option<&str>, responses: &[serde_json::Val
         "codex",
         SessionStatus::Idle,
     )
-}
-
-/// Privacy failure cannot discard transport fragments or the item completion boundary.
-#[tokio::test]
-async fn outbound_deltas_preserve_bytes_when_privacy_is_unavailable() {
-    let driver = AnyDriver::Codex(Box::new(
-        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread-output"), &[]),
-    ));
-    let (mut session, mut out, _notes) =
-        harness_test_session_with_channels(driver, "codex", SessionStatus::Running);
-    session.redactor = redact::Redactor::new(redact::Persona::default());
-    let text = "x".repeat(crate::domain::privacy::projector::MAX_UNIT_BYTES + 1);
-    for chunk in [text.as_str(), " complete"] {
-        session
-            .on_harness_event(HarnessEvent::Delta {
-                item_id: "output".into(),
-                text: chunk.into(),
-            })
-            .await;
-    }
-    session
-        .on_harness_event(HarnessEvent::ItemCompleted {
-            item_id: "output".into(),
-        })
-        .await;
-    let frames: Vec<Frame> = std::iter::from_fn(|| out.try_recv().ok()).collect();
-    let emitted = frames
-        .iter()
-        .filter(|frame| frame.method.as_deref() == Some(method::ITEM_DELTA))
-        .map(|frame| frame.params.as_ref().unwrap()["text"].as_str().unwrap())
-        .collect::<String>();
-    assert_eq!(emitted, format!("{text} complete"));
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame.method.as_deref() == Some("item.finished"))
-    );
-    assert!(session.delta_streams.is_empty());
 }
 
 #[tokio::test]
@@ -2801,5 +2764,129 @@ async fn accepted_claude_prompt_publishes_its_machine_generated_native_identity(
     );
     assert_eq!(prompt.sender.unwrap().account_id, "account-alice");
     assert_eq!(prompt.prompt.as_deref(), Some("Inspect the latency"));
+    session.driver.shutdown().await.unwrap();
+}
+
+fn assistant_line(lineno: u64, text: &str) -> crate::rc::tail::TailedLine {
+    crate::rc::tail::TailedLine {
+        source: None,
+        lineno,
+        text: serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+            "sessionId": "s"
+        })
+        .to_string(),
+    }
+}
+
+/// Tailed lines whose privacy check may still pass are held for as many polls as it takes:
+/// nothing from the first such line on shows until it has waited the notice, then its marker
+/// shows once while it is still retried, and once it passes the held lines show in order. The
+/// notice belongs to the first held line, so a later line that stalls gets its own; a first line
+/// that never passes is given up alone after its retry window, so the lines after it show; and
+/// once the held lines pass the byte bound, also while the first one is retried alone, whatever
+/// has not passed shows the given-up marker. A tail that gave up after a count of polls, kept one
+/// notice for the whole tail, let one record hold everything after it, or held without bound
+/// would lose, hide, stall or pile up records.
+#[test]
+fn held_tail_lines_wait_for_their_privacy_check_and_then_show() {
+    let notice = std::time::Duration::from_millis(100);
+    let redactor = redact::Redactor::new(redact::Persona::default());
+    let mut held = HeldTail::with_timing(notice, notice * 4);
+    let mut project = |polled: Vec<crate::rc::tail::TailedLine>, release: Release| {
+        held.project(
+            "claude-code",
+            &redactor,
+            polled,
+            crate::rc::codex_history::HistoryMode::Model,
+            release,
+        )
+        .items
+        .into_iter()
+        .map(|item| (item.line, item.event.text.unwrap_or_default()))
+        .collect::<Vec<_>>()
+    };
+    let withhold = |text: Option<&'static str>| redact::WITHHOLD_NATIVE.with(|w| w.set(text));
+    let shown = |line: u64, text: &str| vec![(line, text.to_owned())];
+
+    withhold(Some(""));
+    let first = vec![
+        assistant_line(1, "first reply"),
+        assistant_line(2, "second reply"),
+    ];
+    assert!(project(first, Release::Retry).is_empty());
+    for _ in 0..20 {
+        assert!(project(Vec::new(), Release::Retry).is_empty());
+    }
+    std::thread::sleep(notice);
+    assert_eq!(
+        project(Vec::new(), Release::Retry),
+        shown(1, redact::PROTECTION_ERROR_TEXT)
+    );
+    assert!(project(Vec::new(), Release::Retry).is_empty());
+
+    withhold(Some("second"));
+    assert_eq!(
+        project(vec![assistant_line(3, "third reply")], Release::Retry),
+        shown(1, "first reply")
+    );
+    std::thread::sleep(notice);
+    assert_eq!(
+        project(Vec::new(), Release::Retry),
+        shown(2, redact::PROTECTION_ERROR_TEXT)
+    );
+    std::thread::sleep(notice * 4);
+    let mut after = shown(2, redact::GIVEN_UP_TEXT);
+    after.extend(shown(3, "third reply"));
+    assert_eq!(project(Vec::new(), Release::Retry), after);
+
+    withhold(Some(""));
+    assert!(project(vec![assistant_line(4, "fourth reply")], Release::Retry).is_empty());
+    assert!(project(Vec::new(), Release::Retry).is_empty());
+    let large = "x".repeat(1024 * 1024);
+    let beyond: Vec<_> = (5..)
+        .take(HELD_TAIL_BYTES / large.len() + 1)
+        .map(|line| assistant_line(line, &large))
+        .collect();
+    let last = beyond.last().unwrap().lineno;
+    let given_up: Vec<_> = (4..=last)
+        .map(|line| (line, redact::GIVEN_UP_TEXT.to_owned()))
+        .collect();
+    assert_eq!(project(beyond, Release::Retry), given_up);
+    withhold(None);
+    assert!(held.is_empty());
+}
+
+/// Every way a session ends runs one exit funnel, which gives held lines a bounded wait and then
+/// shows each record that still waits as the given-up marker: a user stopping the session must
+/// not lose its last reply without a trace. An exit path that skipped the bounded release would
+/// drop those records silently.
+#[tokio::test]
+async fn held_lines_leave_a_marker_when_the_session_stops() {
+    let driver = AnyDriver::Codex(Box::new(
+        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]),
+    ));
+    let (mut session, mut out, _notes) =
+        harness_test_session_with_channels(driver, "claude-code", SessionStatus::Idle);
+    redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
+    let held = session.held.project(
+        "claude-code",
+        &session.redactor,
+        vec![assistant_line(7, "last reply")],
+        crate::rc::codex_history::HistoryMode::Model,
+        Release::Retry,
+    );
+    assert!(held.items.is_empty());
+    session.settle_on_exit().await;
+    redact::WITHHOLD_NATIVE.with(|w| w.set(None));
+    let mut items = Vec::new();
+    while let Ok(frame) = out.try_recv() {
+        if frame.method() == method::ITEM_COMPLETED {
+            items.push(frame.params.unwrap()["event"]["text"].clone());
+        }
+    }
+    assert_eq!(items, [serde_json::json!(redact::GIVEN_UP_TEXT)]);
+    assert!(session.held.is_empty());
     session.driver.shutdown().await.unwrap();
 }

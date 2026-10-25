@@ -875,6 +875,8 @@ pub struct Session {
     /// A delta is a transport chunk, not a semantic boundary; every item keeps its own safety
     /// tail.
     delta_streams: std::collections::HashMap<String, redact::StreamRedactor>,
+    /// Tailed lines that wait for their privacy check (see [`HeldTail`]).
+    held: HeldTail,
     /// One device-local rule alerts once per session; every occurrence is still redacted.
     alerted_registered: std::collections::HashSet<String>,
 }
@@ -1426,6 +1428,7 @@ impl Session {
             resolved_initial_turn: None,
             announced_turn_ids: Default::default(),
             delta_streams: Default::default(),
+            held: HeldTail::default(),
             alerted_registered: Default::default(),
             generation,
             publication_incarnation: None,
@@ -3291,11 +3294,13 @@ impl Session {
         self.finish_local_settlement(true).await;
         self.finish_publication(true).await;
         // Funnelled here for the same reason as the drain: the tail a streaming redactor holds
-        // back leaves only on a flush, while Shutdown, driver EOF and harness Exited each
-        // return on their own — adding the line to every exit path always misses one, and the
-        // symptom is that stretch of text **never** appearing on the web.
+        // back leaves only on a flush, and held lines only through their bounded release, while
+        // Shutdown, driver EOF and harness Exited each return on their own — adding the line to
+        // every exit path always misses one, and the symptom is that stretch of text **never**
+        // appearing on the web.
         self.flush_all_deltas().await;
         self.drain_transcript().await;
+        self.release_held().await;
         self.settle_and_push(SettlementBoundary::SessionExit).await;
     }
 
@@ -3740,12 +3745,18 @@ impl Session {
         while std::time::Instant::now() < deadline && quiet_rounds < 2 {
             let before = self.consumed_bytes;
             self.drain_transcript().await;
-            if self.consumed_bytes == before {
+            // Lines that wait for their privacy check are not settled output yet.
+            if self.consumed_bytes == before && self.held.is_empty() {
                 quiet_rounds += 1;
             } else {
                 quiet_rounds = 0;
             }
             tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
+        }
+        // The turn boundary does not wait for held lines: the first one shows its marker before
+        // it, and they are still retried and shown after it.
+        if !self.held.is_empty() {
+            self.project_held(Release::Notice).await;
         }
     }
 
@@ -3822,7 +3833,7 @@ impl Session {
         let Some(tailer) = self.tailer.as_mut() else {
             return;
         };
-        let (mode, lines) = if self.info.runtime == "codex" {
+        let (mode, polled) = if self.info.runtime == "codex" {
             let batch = match tailer.poll_codex() {
                 Ok(batch) => {
                     self.transcript_readable = true;
@@ -3841,7 +3852,7 @@ impl Session {
                 poll_and_mark(tailer, &mut self.consumed_bytes),
             )
         };
-        if lines.is_empty() {
+        if polled.is_empty() && self.held.is_empty() {
             return;
         }
 
@@ -3849,13 +3860,255 @@ impl Session {
         // so it must not be alive across an `.await` — keeping the parse in its
         // own scope (inside `items_from_lines`) is what lets this whole session
         // run as a spawned task.
-        let (items, registered_ids) =
-            items_from_lines_with_mode(&self.info.runtime, &self.redactor, &lines, mode);
-        self.alert_registered(registered_ids, "item_completed")
+        let shown = self.held.project(
+            &self.info.runtime,
+            &self.redactor,
+            polled,
+            mode,
+            Release::Retry,
+        );
+        self.alert_registered(shown.registered, "item_completed")
             .await;
-        for item in items {
+        for item in shown.items {
             self.emit(method::ITEM_COMPLETED, item).await;
         }
+    }
+
+    /// Before the session ends, held lines get a bounded wait for their privacy check; whatever
+    /// still waits is given up and shown as the marker, so no record a viewer would have seen is
+    /// lost without a trace.
+    async fn release_held(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SETTLE_MAX_MS);
+        while !self.held.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
+            self.drain_transcript().await;
+        }
+        if !self.held.is_empty() {
+            self.project_held(Release::Finish).await;
+        }
+    }
+
+    /// Show what the held lines may show now under `release`.
+    async fn project_held(&mut self, release: Release) {
+        let mode = self.held.mode();
+        let shown = self.held.project(
+            &self.info.runtime,
+            &self.redactor,
+            Vec::new(),
+            mode,
+            release,
+        );
+        self.alert_registered(shown.registered, "item_completed")
+            .await;
+        for item in shown.items {
+            self.emit(method::ITEM_COMPLETED, item).await;
+        }
+    }
+}
+
+/// How long tailed lines wait for their privacy check before a viewer is shown the marker in
+/// their place while they are still retried: longer than a worker back-off and one budget, so
+/// ordinary contention never shows it outside a turn boundary, which shows it at once (see
+/// [`Release::Notice`]).
+pub(crate) const HELD_TAIL_NOTICE: std::time::Duration = std::time::Duration::from_secs(12);
+const _: () = assert!(
+    HELD_TAIL_NOTICE.as_millis() > crate::domain::privacy::service::RETRY_WINDOW.as_millis()
+);
+/// How long the first held line is retried before it is given up and shown as the marker, so a
+/// record that never passes holds nothing after it: several worker back-offs.
+pub(crate) const HELD_TAIL_GIVE_UP: std::time::Duration =
+    std::time::Duration::from_secs(3 * HELD_TAIL_NOTICE.as_secs());
+/// How much tailed text may wait for its privacy check before it is given up and shown as the
+/// marker.
+pub(crate) const HELD_TAIL_BYTES: usize = 16 * 1024 * 1024;
+
+/// What a projection of held lines does with the ones whose privacy check has not passed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// Hold them and retry; the first one's marker shows once it has waited the notice.
+    Retry,
+    /// As `Retry`, but the first one's marker shows now: a turn boundary does not pass in
+    /// silence.
+    Notice,
+    /// Hold nothing: whatever has not passed is given up and shown as its marker.
+    Finish,
+}
+
+/// Tailed lines whose privacy check has not passed yet. The cursor that read them has moved on,
+/// so this is their only copy: they are held from the first line whose check may pass on a later
+/// try and projected again with the next poll, so a busy or slow privacy worker delays them
+/// instead of losing them. A record that can never pass is shown as its marker and not held, and
+/// so is a first line that has not passed within [`HELD_TAIL_GIVE_UP`].
+#[derive(Default)]
+pub(crate) struct HeldTail {
+    lines: Vec<crate::rc::tail::TailedLine>,
+    mode: Option<super::codex_history::HistoryMode>,
+    head: Option<HeldHead>,
+    #[cfg(test)]
+    timing: Option<(std::time::Duration, std::time::Duration)>,
+}
+
+/// The first held line, since when it waits, and whether its marker was shown.
+struct HeldHead {
+    line: (Option<String>, u64),
+    since: std::time::Instant,
+    noticed: bool,
+}
+
+fn held_key(line: &crate::rc::tail::TailedLine) -> (Option<String>, u64) {
+    (line.source.clone(), line.lineno)
+}
+
+/// What a tail may show now.
+pub(crate) struct ShownLines {
+    pub lines: Vec<crate::rc::tail::TailedLine>,
+    pub items: Vec<ItemCompleted>,
+    pub registered: Vec<String>,
+}
+
+impl HeldTail {
+    /// A tail whose notice and give-up periods are `notice` and `give_up`.
+    #[cfg(test)]
+    pub(crate) fn with_timing(notice: std::time::Duration, give_up: std::time::Duration) -> Self {
+        Self {
+            timing: Some((notice, give_up)),
+            ..Self::default()
+        }
+    }
+
+    fn timing(&self) -> (std::time::Duration, std::time::Duration) {
+        #[cfg(test)]
+        if let Some(timing) = self.timing {
+            return timing;
+        }
+        (HELD_TAIL_NOTICE, HELD_TAIL_GIVE_UP)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// The history mode the held lines were read in.
+    pub(crate) fn mode(&self) -> super::codex_history::HistoryMode {
+        self.mode
+            .unwrap_or(super::codex_history::HistoryMode::Model)
+    }
+
+    /// Project the held lines followed by `polled` and return the lines, with their items, that
+    /// may be shown now; [`Release`] says what happens to the ones that have not passed. A first
+    /// line that was held before is tried on its own first, so a record after it in the same
+    /// request cannot keep it from passing.
+    pub(crate) fn project(
+        &mut self,
+        runtime: &str,
+        redactor: &redact::Redactor,
+        polled: Vec<crate::rc::tail::TailedLine>,
+        mode: super::codex_history::HistoryMode,
+        release: Release,
+    ) -> ShownLines {
+        let held_before = !self.lines.is_empty();
+        let mut lines = std::mem::take(&mut self.lines);
+        lines.extend(polled);
+        self.mode = Some(mode);
+        // Beyond the byte bound nothing more is held: whatever has not passed is given up. It
+        // applies once lines already wait, so one large poll is still held once.
+        let release = if held_before
+            && lines.iter().map(|line| line.text.len()).sum::<usize>() > HELD_TAIL_BYTES
+        {
+            Release::Finish
+        } else {
+            release
+        };
+        let mut shown = ShownLines {
+            lines: Vec::new(),
+            items: Vec::new(),
+            registered: Vec::new(),
+        };
+        let mut start = 0;
+        if lines.len() > 1
+            && self
+                .head
+                .as_ref()
+                .is_some_and(|head| head.line == held_key(&lines[0]))
+        {
+            if self.step(runtime, redactor, &lines[..1], mode, release, &mut shown) == 0 {
+                self.lines = lines;
+                return shown;
+            }
+            start = 1;
+        }
+        let done = self.step(
+            runtime,
+            redactor,
+            &lines[start..],
+            mode,
+            release,
+            &mut shown,
+        );
+        self.lines = lines.split_off(start + done);
+        shown
+    }
+
+    /// Projects `lines` into `shown` and returns how many leading lines are done; the lines
+    /// after them stay held.
+    fn step(
+        &mut self,
+        runtime: &str,
+        redactor: &redact::Redactor,
+        lines: &[crate::rc::tail::TailedLine],
+        mode: super::codex_history::HistoryMode,
+        release: Release,
+        shown: &mut ShownLines,
+    ) -> usize {
+        let (notice, give_up) = self.timing();
+        let expired = self.head.as_ref().is_some_and(|head| {
+            lines
+                .first()
+                .is_some_and(|first| head.line == held_key(first))
+                && head.since.elapsed() >= give_up
+        });
+        let given_up = if release == Release::Finish {
+            lines.len()
+        } else {
+            usize::from(expired)
+        };
+        let projected =
+            items_from_lines_tracked(runtime, redactor, lines, mode, given_up, &mut |_, _| {});
+        let (show, done) = match projected.first_withheld {
+            None => {
+                self.head = None;
+                (lines.len(), lines.len())
+            }
+            Some(first) => {
+                let line = held_key(&lines[first]);
+                if !self.head.as_ref().is_some_and(|head| head.line == line) {
+                    self.head = Some(HeldHead {
+                        line,
+                        since: std::time::Instant::now(),
+                        noticed: false,
+                    });
+                }
+                let head = self.head.as_mut().expect("the first held line is tracked");
+                // Its marker shows once, while the line is still retried.
+                if !head.noticed && (release == Release::Notice || head.since.elapsed() >= notice) {
+                    head.noticed = true;
+                    (first + 1, first)
+                } else {
+                    (first, first)
+                }
+            }
+        };
+        shown.items.extend(
+            projected
+                .items
+                .into_iter()
+                .zip(projected.item_lines)
+                .filter(|(_, line)| *line < show)
+                .map(|(item, _)| item),
+        );
+        shown.registered.extend(projected.registered);
+        shown.lines.extend_from_slice(&lines[..show]);
+        done
     }
 }
 
@@ -3892,11 +4145,44 @@ pub(crate) fn items_from_lines_profiled(
     mode: super::codex_history::HistoryMode,
     record_timing: &mut dyn FnMut(&'static str, f64),
 ) -> (Vec<ItemCompleted>, Vec<String>) {
+    let projected = items_from_lines_tracked(runtime, redactor, lines, mode, 0, record_timing);
+    (projected.items, projected.registered)
+}
+
+/// `item.completed` payloads for `lines`, with where each came from and where privacy stopped.
+pub(crate) struct ProjectedLines {
+    pub items: Vec<ItemCompleted>,
+    pub registered: Vec<String>,
+    /// For each item, the index in `lines` of the line it came from.
+    pub item_lines: Vec<usize>,
+    /// The index in `lines` of the first line whose privacy check did not complete and may on
+    /// a later try. A record that can never pass, or one given up, shows its marker and does not
+    /// count here.
+    pub first_withheld: Option<usize>,
+}
+
+/// Records from lines before `given_up` whose privacy check did not complete are given up: each
+/// shows [`redact::GIVEN_UP_TEXT`]. Of the later ones, which may still pass, only the first
+/// shows a marker, since everything after it waits with it.
+pub(crate) fn items_from_lines_tracked(
+    runtime: &str,
+    redactor: &redact::Redactor,
+    lines: &[crate::rc::tail::TailedLine],
+    mode: super::codex_history::HistoryMode,
+    given_up: usize,
+    record_timing: &mut dyn FnMut(&'static str, f64),
+) -> ProjectedLines {
+    let mut projected = ProjectedLines {
+        items: vec![],
+        registered: vec![],
+        item_lines: vec![],
+        first_withheld: None,
+    };
     let Ok(adapter) = crate::adapter::get(runtime) else {
-        return (vec![], vec![]);
+        return projected;
     };
     let mut records = vec![];
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
         if line.text.trim().is_empty() {
             continue;
         }
@@ -3925,17 +4211,17 @@ pub(crate) fn items_from_lines_profiled(
         let verified = (runtime == "codex")
             .then(|| super::codex_history::prompt_identity_pointer(&raw, mode))
             .flatten();
-        records.push((line, raw, verified.into_iter().collect::<Vec<_>>()));
+        records.push((index, line, raw, verified.into_iter().collect::<Vec<_>>()));
     }
     let inputs: Vec<_> = records
         .iter()
-        .map(|(_, raw, pointers)| (raw, pointers.as_slice()))
+        .map(|(_, _, raw, pointers)| (raw, pointers.as_slice()))
         .collect();
     let protected = redactor.scrub_native_batch_profiled(&inputs, record_timing);
     let mut out = vec![];
     let mut registered = std::collections::HashSet::new();
-    let mut protection_error_emitted = false;
-    for ((line, raw, _), scrubbed) in records.into_iter().zip(protected) {
+    let mut pending_marker_emitted = false;
+    for ((index, line, raw, _), scrubbed) in records.into_iter().zip(protected) {
         let secret_projection = scrubbed.secret_projection;
         registered.extend(scrubbed.registered_ids);
         let scrubbed_raw = scrubbed.value;
@@ -3948,13 +4234,24 @@ pub(crate) fn items_from_lines_profiled(
         // still works.
         let object_hash = projected_object_hash(&raw, &scrubbed_raw, secret_projection);
         let events = if scrubbed_raw.get("protection_error").is_some() {
-            if protection_error_emitted {
-                continue;
-            }
-            protection_error_emitted = true;
+            let marker = if scrubbed.permanent {
+                scrubbed_raw["protection_error"]
+                    .as_str()
+                    .unwrap_or(redact::TOO_LARGE_TEXT)
+                    .to_owned()
+            } else if index < given_up {
+                redact::GIVEN_UP_TEXT.to_owned()
+            } else {
+                projected.first_withheld.get_or_insert(index);
+                if pending_marker_emitted {
+                    continue;
+                }
+                pending_marker_emitted = true;
+                redact::PROTECTION_ERROR_TEXT.to_owned()
+            };
             vec![crate::adapter::Event::text(
                 crate::adapter::EventKind::AssistantReply,
-                redact::PROTECTION_ERROR_TEXT,
+                marker,
                 None,
             )]
         } else if runtime == "codex" {
@@ -3977,6 +4274,7 @@ pub(crate) fn items_from_lines_profiled(
         // IR text and paths are derived from the protected native bytes before display truncation.
         for (i, mut event) in events.into_iter().enumerate() {
             event.line = Some(line.lineno as usize);
+            projected.item_lines.push(index);
             out.push(ItemCompleted {
                 source_id: line
                     .source
@@ -4000,7 +4298,9 @@ pub(crate) fn items_from_lines_profiled(
             });
         }
     }
-    (out, registered.into_iter().collect())
+    projected.items = out;
+    projected.registered = registered.into_iter().collect();
+    projected
 }
 
 /// The identity the hub is told this line has.

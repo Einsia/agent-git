@@ -1226,4 +1226,48 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         "{refused:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
+
+    // A value the user registered is refused in a publication branch name. Only the privacy
+    // worker's dictionary holds it, so a check that ran the detector alone would publish it.
+    let registered = "zephyr-orchid-7741";
+    let environment = git_command(temp.path());
+    let mut add = Command::new(env!("CARGO_BIN_EXE_agit"));
+    add.env_clear();
+    for (name, value) in environment.get_envs() {
+        if let Some(value) = value {
+            add.env(name, value);
+        }
+    }
+    let mut add = add
+        .current_dir(temp.path())
+        .env("AGIT_HOME", &home)
+        .env("AGIT_HUB_URL", &hub.base)
+        .env("CI", "1")
+        .env("AGIT_TUI", "0")
+        .env("AGIT_USE_SYSTEM_GIT", "1")
+        .env(
+            "AGIT_SECRETS_KEYSTORE",
+            if cfg!(unix) { "file" } else { "os" },
+        )
+        .args(["secrets", "add", "branch-word", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(registered.as_bytes())
+        .unwrap();
+    assert_success(&add.wait_with_output().unwrap());
+    let named = format!("ship-{registered}");
+    repo.git(&["branch", &named, "work"]).unwrap();
+    let refused = run(&["--yes", "push", &format!("alice/app@{named}")], false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("requires privacy rewriting"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), received);
 }
