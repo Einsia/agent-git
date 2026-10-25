@@ -1,18 +1,17 @@
 //! `agit scan` — the review before anything goes out.
 //!
-//! * `--secrets` (default): a standalone entry point into the scan `push` runs built-in, so CI
-//!   can run it on its own. A hit carries file / line / redacted snippet.
+//! * `--secrets` (default): an advisory scan of the publish surface; `push` neither scans nor
+//!   blocks. It lists the high-confidence findings (provider signatures, private keys, credential
+//!   assignments, registered values), each with file / line / redacted snippet and the record id
+//!   `agit secrets allow` accepts, and states how many there are. Entropy-only findings are only
+//!   counted unless `--low-confidence` is given: runtime ids, hashes and encrypted carriers are
+//!   opaque too, and listing them buries the credentials.
 //!
-//!   "Standalone entry point" is literal: destination, scan surface, the workspace pass, where
-//!   the allowlist comes from, the decision rules — all of it goes through
-//!   [`secrets::scan_agent_repo`] (workspace + reachable blob / commit / tag, repo-wide, run
-//!   **once**), the **same function** `push` calls. An entry point that only looks at reachable
-//!   objects and skips the workspace makes scan report clean while push blocks, on the most
-//!   common shape of all: a secret already pushed and still sitting in a workspace file. An
-//!   entry point that assembles its own scan surface also scans the `session/meta.json` that
-//!   push deliberately excludes, and reads the allowlist from the **repo root** instead of
-//!   `$AGIT_HOME` — an allowlist added exactly as scan's own hint says then has no effect
-//!   inside scan. Two implementations will drift apart sooner or later.
+//!   The scan surface is [`secrets::scan_agent_repo_allowing`]: workspace + reachable blob /
+//!   commit / tag, repo-wide, run **once**. A surface that skips the workspace misses the most
+//!   common shape of all, a secret already pushed and still sitting in a workspace file. Values
+//!   the user allowed in the privacy dictionary are skipped, so an allow stops a finding the way
+//!   the scan's own hint says it does.
 //!
 //!   Refs on the command line do **not** narrow the scan surface; they are only parsed and
 //!   validated (a mistyped ref errors on the spot rather than quietly scanning something else).
@@ -36,6 +35,7 @@ use crate::domain::repo::Repo;
 use crate::domain::secrets;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+use std::collections::HashSet;
 
 mod json;
 mod review;
@@ -56,6 +56,9 @@ pub struct Args {
     /// Bring up a local review agent to vet sensitive content.
     #[arg(long)]
     pub sensitive: bool,
+    /// Also list entropy-only findings (runtime ids, hashes, encrypted carriers).
+    #[arg(long)]
+    pub low_confidence: bool,
     /// Machine-readable report.
     #[arg(long)]
     pub json: bool,
@@ -64,6 +67,12 @@ pub struct Args {
 pub fn run(args: Args) -> CmdResult {
     if args.sensitive && args.secrets {
         ui::error("`--secrets` and `--sensitive` are two different checks; run them separately.");
+        return Ok(ExitCode::Usage);
+    }
+    if args.sensitive && args.low_confidence {
+        ui::error(
+            "`--low-confidence` lists secret scan findings; it does not apply to `--sensitive`.",
+        );
         return Ok(ExitCode::Usage);
     }
     let cwd = std::env::current_dir()?;
@@ -196,72 +205,142 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Ref);
         }
     }
-    let found = collect(&repo, &n)?;
+    let allowed = privacy_records(&repo, "allowed_values", None)
+        .and_then(|values| Ok(serde_json::from_value::<HashSet<String>>(values)?));
+    let found = collect(&repo, &n, allowed.as_ref().unwrap_or(&HashSet::new()))?;
     super::report_binary_carriers(found.binary_carriers);
     echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
-    let any_hit = !found.hits.is_empty();
-    let truncated = found.truncated;
-    let shown = found.hits.len();
-    let unscanned = found.unscanned.clone();
-    // Carrier-specific guidance uses the structured source, not the display location that a
-    // user-controlled filename can imitate. Exact declarations apply across these carriers.
-    let mut report: Vec<serde_json::Value> = vec![];
-    for (at, h) in &found.hits {
-        if args.json {
-            // `source` is the **structured** carrier, so a consumer never parses the prefix
-            // of `at` — that is exactly the test named wrong above (a user can create a
-            // directory genuinely called `commit object ab12cd34/...` and flip it).
-            report.push(serde_json::json!({
-                "rule": h.rule,
-                "at": at,
-                "line": h.line,
-                "preview": h.redacted,
-                "source": h.source.as_str(),
-            }));
-        } else {
-            // Print only the redacted snippet: this output goes into CI logs.
-            println!("  {}  {at}:{}  {}", h.rule, h.line, ui::dim(&h.redacted));
-        }
-    }
-
+    let records = if allowed.is_ok() && !found.hits.is_empty() {
+        record_ids(&repo, &found.hits)
+    } else {
+        None
+    };
+    let listed: Vec<(&(String, secrets::Hit), &str, Option<&str>)> = found
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(index, hit)| {
+            let record = records
+                .as_ref()
+                .and_then(|ids| ids.get(index))
+                .and_then(Option::as_deref);
+            (hit, "high", record)
+        })
+        .chain(
+            found
+                .low_confidence
+                .iter()
+                .filter(|_| args.low_confidence)
+                .map(|hit| (hit, "low", None)),
+        )
+        .collect();
+    let at_least = if found.counted_all { "" } else { "at least " };
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        // `source` is the **structured** carrier, so a consumer never parses the prefix of `at`:
+        // a user can create a directory genuinely called `commit object ab12cd34/...`.
+        let entries = |confidence: &str| -> Vec<serde_json::Value> {
+            listed
+                .iter()
+                .filter(|(_, tier, _)| *tier == confidence)
+                .map(|((at, h), tier, record)| {
+                    serde_json::json!({
+                        "rule": h.rule,
+                        "at": at,
+                        "line": h.line,
+                        "preview": h.redacted,
+                        "source": h.source.as_str(),
+                        "confidence": tier,
+                        "record_id": record,
+                    })
+                })
+                .collect()
+        };
+        let mut low = serde_json::json!({ "count": found.low_confidence_count });
+        if args.low_confidence {
+            low["findings"] = entries("low").into();
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "check": "secrets",
+                "advisory": true,
+                "count": found.count,
+                "count_exact": found.counted_all,
+                "findings": entries("high"),
+                "low_confidence": low,
+            }))?
+        );
+    } else {
+        for ((at, h), tier, record) in &listed {
+            // Print only the redacted snippet: this output goes into CI logs.
+            let suffix = match (tier, record) {
+                (_, Some(id)) => format!("  record {id}"),
+                (&"low", None) => "  (low confidence)".to_string(),
+                _ => String::new(),
+            };
+            println!(
+                "  {}  {at}:{}  {}{suffix}",
+                h.rule,
+                h.line,
+                ui::dim(&h.redacted)
+            );
+        }
     }
 
-    if any_hit {
-        if !unscanned.is_empty() {
-            super::report_unscanned(&unscanned);
+    let low_confidence_hint = (found.low_confidence_count > 0 && !args.low_confidence).then(|| {
+        format!(
+            "· {at_least}{} low-confidence values are not listed: entropy alone also matches runtime ids, hashes and encrypted carriers, and capture does not replace them by default; `--low-confidence` lists them",
+            found.low_confidence_count
+        )
+    });
+    if !found.hits.is_empty() {
+        if !found.unscanned.is_empty() {
+            super::report_unscanned(&found.unscanned);
         }
-        ui::error("secret-like patterns found. Handle before sending out:");
+        ui::error(&format!(
+            "{at_least}{} high-confidence secret findings. Review them before sharing this repo:",
+            found.count
+        ));
         // This one comes first: it decides how many times the actions below have to be
-        // repeated. Unsaid, a truncated report looks exactly like "this is all of it", and "fix
-        // these, then push" becomes a loop that never ends.
-        if truncated {
+        // repeated. Unsaid, a capped list looks exactly like "this is all of it".
+        if found.truncated {
             ui::hint(&format!(
-                "· this report is incomplete: it shows {shown} findings and stops there, more remain — handle these, then run `agit scan` again to see the rest"
+                "· this list shows the first {} — handle these, then run `agit scan` again to see the rest",
+                found.hits.len()
             ));
         }
         ui::hint(
-            "· reviewed false positive? use `agit secrets allow <record-id> --repo <path> --reason <reason>`, or pipe its exact value to `agit secrets allow --stdin --repo <path>`; check the reported synchronization status",
+            "· this scan is advisory: `agit push` does not scan or block, and publishes these values as they are",
         );
-        ui::hint(
-            "· after reviewing all remaining findings for the intended audience, repeat the same push with --allow-secrets to accept findings for that operation only",
-        );
-        ui::hint(
-            "· removing an event from VIEW leaves LOG and Git history intact and does not clear a historical secret finding",
-        );
-        // The carrier-specific hints come last: for a hit inside an object they are the only
-        // actions that work at all, and they cost the most.
+        match &records {
+            Some(_) => ui::hint(&format!(
+                "· not a credential? `agit secrets allow <record> --repo {}`, then scan again",
+                repo.root().display()
+            )),
+            None => ui::hint(
+                "· record ids are unavailable because the local privacy store did not answer; `agit secrets review --repo <path>` lists the records it holds",
+            ),
+        }
         super::hint_secret_hit_remedies(found.hits.iter().map(|(_, hit)| hit));
-        // Policy rejection is 7, not the generic failure 1 — CI has to tell "a secret was
-        // found" from "the command broke".
+        if let Some(hint) = low_confidence_hint {
+            ui::hint(&hint);
+        }
+        // Findings exit 7, not the generic failure 1: CI has to tell "a secret was found" from
+        // "the command broke".
         Ok(ExitCode::Policy)
-    } else if !unscanned.is_empty() {
-        // This must **not** say clean. A verdict read off an empty hit list is fail open — what
-        // was never scanned and what is clean look identical in an empty list, and that is
-        // exactly the drift where `agit push` blocks while `agit scan` reports clean. The two
-        // paths must return the same verdict, so this exits non-zero too.
-        super::report_unscanned(&unscanned);
+    } else if !found.counted_all {
+        // This must **not** say clean. What was never scanned and what is clean look identical in
+        // an empty hit list, so this exits non-zero too.
+        super::report_unscanned(&found.unscanned);
+        if found.unscanned.is_empty() {
+            ui::error(&format!(
+                "the scan stopped after counting {} low-confidence values; content behind them was not scanned, so no finding does not mean no credential.",
+                found.low_confidence_count
+            ));
+        }
+        if let Some(hint) = low_confidence_hint {
+            ui::hint(&hint);
+        }
         Ok(ExitCode::Policy)
     } else {
         if !args.json {
@@ -269,13 +348,50 @@ pub fn run(args: Args) -> CmdResult {
             // union of the refs on the command line. Reporting it as a per-ref count makes the
             // user believe "scan again with another ref" shows something else.
             ui::success_result(if found.binary_carriers == 0 {
-                "clean scan"
+                "no high-confidence secret findings"
             } else {
-                "no text findings; binary artifacts were not text-scanned"
+                "no high-confidence text findings; binary artifacts were not text-scanned"
             });
+            if let Some(hint) = low_confidence_hint {
+                ui::hint(&hint);
+            }
         }
         Ok(ExitCode::Ok)
     }
+}
+
+/// One explicit privacy management request against this repo's records.
+fn privacy_records(
+    repo: &Repo,
+    action: &str,
+    secret: Option<String>,
+) -> crate::Result<serde_json::Value> {
+    crate::domain::privacy::service::manage(
+        Some(repo.root()),
+        crate::domain::privacy::management::Command {
+            action: action.into(),
+            global: false,
+            id: None,
+            name: None,
+            secret,
+        },
+    )
+}
+
+/// The record id of each listed finding, in order. `None` when the privacy store does not answer:
+/// the report then says ids are unavailable instead of printing a placeholder a user would try.
+fn record_ids(repo: &Repo, hits: &[(String, secrets::Hit)]) -> Option<Vec<Option<String>>> {
+    let values: Vec<&str> = hits.iter().map(|(_, hit)| hit.value.expose()).collect();
+    // The request owns the serialized values and wipes them on drop.
+    let identities =
+        privacy_records(repo, "identify", Some(serde_json::to_string(&values).ok()?)).ok()?;
+    let identities = identities.as_array()?;
+    (identities.len() == hits.len()).then(|| {
+        identities
+            .iter()
+            .map(|identity| identity.as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 fn run_sensitive(repo: &Repo, slug: &str, targets: &[refs::RefSpec], json: bool) -> CmdResult {
@@ -474,11 +590,17 @@ pub(super) fn sensitive_report(
 /// Every hit from one `--secrets` scan, each carrying **the location it really belongs to**.
 struct Found {
     binary_carriers: u64,
-    /// `(display location, hit)`. The location is the hit's own carrier label, never prefixed
-    /// with a ref name.
+    /// `(display location, hit)` of the first high-confidence hits. The location is the hit's
+    /// own carrier label, never prefixed with a ref name.
     hits: Vec<(String, secrets::Hit)>,
-    /// Any truncated stretch makes the report as a whole incomplete — say so.
+    /// High-confidence hits exist that `hits` does not list — say so.
     truncated: bool,
+    count: usize,
+    /// The first entropy-only hits, labelled like `hits`.
+    low_confidence: Vec<(String, secrets::Hit)>,
+    low_confidence_count: usize,
+    /// Both counts are exact; otherwise they are lower bounds.
+    counted_all: bool,
     /// Some part was **never scanned**. An empty hit list plus this does not mean clean.
     unscanned: secrets::Unscanned,
 }
@@ -504,26 +626,26 @@ struct Found {
 /// still **parses and validates** every ref (a mistyped ref must error on the spot), but those
 /// shas never reach here — off the signature, they give no one the chance to narrow the scan
 /// surface with them.
-fn collect(repo: &Repo, agent: &str) -> crate::Result<Found> {
-    // Destination, scan surface, the workspace pass — every one of them goes through the
-    // **same code** as `agit push`. See [`secrets::scan_agent_repo`] and
-    // [`super::publish_destination`].
-    //
+fn collect(repo: &Repo, agent: &str, allowed: &HashSet<String>) -> crate::Result<Found> {
     // `agent` is the third element of the destination identity: the name this repo resolves to,
     // which is the one `agit push` publishes to from here. Without it, when `origin` points at
     // another agent under the same account, that agent's history is subtracted wholesale from
     // the scan surface.
     let plan = secrets::ScanPlan::to(super::publish_destination(repo, agent, false).scan);
-    let wide = secrets::scan_agent_repo(repo, &plan)?;
-    let hits = wide
-        .hits
-        .into_iter()
-        .map(|h| (h.file.clone().unwrap_or_else(|| "?".into()), h))
-        .collect();
+    let wide = secrets::scan_agent_repo_allowing(repo, &plan, allowed)?;
+    let labelled = |hits: Vec<secrets::Hit>| {
+        hits.into_iter()
+            .map(|h| (h.file.clone().unwrap_or_else(|| "?".into()), h))
+            .collect()
+    };
     Ok(Found {
         binary_carriers: wide.binary_carriers,
-        hits,
+        hits: labelled(wide.hits),
         truncated: wide.truncated,
+        count: wide.count,
+        low_confidence: labelled(wide.low_confidence),
+        low_confidence_count: wide.low_confidence_count,
+        counted_all: wide.counted_all,
         unscanned: wide.unscanned,
     })
 }
@@ -577,7 +699,7 @@ mod tests {
         let d = two_branch_repo();
         let repo = Repo::at(d.path());
 
-        let found = collect(&repo, "photo").expect("the repo is well-formed");
+        let found = collect(&repo, "photo", &HashSet::new()).expect("the repo is well-formed");
         let leaks: Vec<&(String, secrets::Hit)> = found
             .hits
             .iter()
@@ -600,7 +722,7 @@ mod tests {
         let d = two_branch_repo();
         let repo = Repo::at(d.path());
 
-        let found = collect(&repo, "photo").expect("the repo is well-formed");
+        let found = collect(&repo, "photo", &HashSet::new()).expect("the repo is well-formed");
         let (at, _) = found
             .hits
             .iter()
@@ -675,7 +797,7 @@ mod tests {
         // two different far sides, and this test then no longer pins "the same scan surface".
         const AGENT: &str = "photo";
         // The scan path.
-        let scanned = collect(&repo, AGENT).expect("the repo is well-formed");
+        let scanned = collect(&repo, AGENT, &HashSet::new()).expect("the repo is well-formed");
         // The push path: the same destination, the same plan.
         let plan =
             secrets::ScanPlan::to(crate::commands::publish_destination(&repo, AGENT, true).scan);

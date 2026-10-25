@@ -18,6 +18,7 @@ agit scan [REFS]... [options]
 | `[REFS]...` | Explicit refs, or the selected `AGIT_SESSION`; secrets scan the repo publish surface, sensitive review uses the selected committed VIEW |
 | `--secrets` | Scan credentials, tokens, keys, and other secrets |
 | `--sensitive` | Ask a supported installed runtime to review selected VIEW events for disclosure risks |
+| `--low-confidence` | With `--secrets`, also list entropy-only findings (by default they are only counted) |
 | `--json` | Print structured results |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options |
 
@@ -29,9 +30,11 @@ agit scan @ --sensitive
 agit scan szh/p1@feature-a --json
 ```
 
-`--secrets` and `--sensitive` are mutually exclusive. `--json` uses the common CLI envelope (version 2 by default; `--json-version 1` selects version 1). The report is at `result.value` when `result.format` is `json`. Secret scanning remains deterministic and repo-wide. Explicit scan results are diagnostic; neither local nor server privacy scanning blocks ordinary publication.
+`--secrets` and `--sensitive` are mutually exclusive. `--json` uses the common CLI envelope (version 2 by default; `--json-version 1` selects version 1). The report is at `result.value` when `result.format` is `json`. Secret scanning remains deterministic and repo-wide. Explicit scan results are advisory: `agit push` does not scan, does not block, and publishes findings as they are.
 
-Client secret scans honor exact local declarations, including pending ones, and warn when those decisions are not confirmed server policy. Inspect `agit secrets review --repo <path> --json` for the distinction. For authorized publication, review the matched values and source locations, declare clearly publishable false positives by record ID or stdin, and rescan. Follow [push](push.md) for pending synchronization and explicit operation-wide acceptance. Continue until truncated reports are resolved; displayed examples do not establish that omitted findings are publishable. Missing or unreadable content is an incomplete scan, not a credential finding that can be classified away.
+The secret report lists high-confidence findings: provider signatures, private keys, credential assignments and registered values. Each carries its location, a redacted preview and the privacy record id that `agit secrets allow <record-id> --repo <path>` accepts; an allowed value is no longer reported. The report states the total count, and says when only the first findings are listed or when the count is a lower bound. Entropy-only findings (runtime ids, hashes, encrypted carriers) are counted separately and listed only with `--low-confidence`. In JSON the report is `{check, advisory, count, count_exact, findings[], low_confidence: {count, findings[]?}}`, and every finding has `rule`, `at`, `line`, `preview`, `source`, `confidence` and `record_id` (`null` when the local privacy store is unavailable).
+
+A finding inside Agent history (blob, commit or tag objects) is never rewritten: `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW while LOG and Git history keep it, so revoke and rotate a real credential. Missing or unreadable content is an incomplete scan, not a credential finding that can be classified away.
 
 Sensitive review selects committed VIEW events, including `#n`, `#n.k`, or an ascending turn range. Historical selectors use the VIEW at that historical point. Unsettled runtime turns and working files are not included. Each finding has an immutable snapshot SHA, a validated `@#n.k` location, and locally generated command arguments. A branch-head removal remedy includes `--expected-head`, so a changed branch requires a fresh review. Historical points, sealed branches, and branch names that cannot be expressed unambiguously get inspection remedies only. Revert removes context from VIEW; the original evidence remains in LOG.
 On Windows, paste printed remedies into PowerShell. For arguments containing ASCII double quotes, a local PowerShell scope preserves the native argument bytes without changing your session identity or the caller's argument-passing preference. The structured `argv` recipe retains the same explicit target.

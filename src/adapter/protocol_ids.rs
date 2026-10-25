@@ -11,22 +11,36 @@ pub(crate) fn identifier_shape(text: &str) -> bool {
 }
 
 /// Verified native records can mask entropy-only findings without hiding credential signatures.
+///
+/// Identity fields and runtime-opaque carriers (encrypted reasoning, thinking signatures) are
+/// both masked under that rule; a carrier whose text also matches a credential rule keeps its
+/// text, so the signature is still reported.
 pub(crate) fn mask_entropy(value: &mut Value) {
-    layout(value).map(value, &mut |text, _| {
-        if identifier_shape(text) {
-            let scan = crate::domain::privacy::detector::scan(text, 1024);
-            if scan.complete
-                && !scan.findings.is_empty()
-                && scan
-                    .findings
-                    .iter()
-                    .all(|hit| hit.rule == "high-entropy-value")
-            {
-                return "0".repeat(text.len());
-            }
+    let layout = layout(value);
+    layout.map(value, &mut |text, _| {
+        if identifier_shape(text) && entropy_only(text) {
+            return "0".repeat(text.len());
         }
         text.into()
     });
+    for pointer in &layout.opaque {
+        if let Some(carrier) = value.pointer_mut(pointer)
+            && let Some(text) = carrier.as_str()
+            && entropy_only(text)
+        {
+            *carrier = Value::String("0".repeat(text.len()));
+        }
+    }
+}
+
+fn entropy_only(text: &str) -> bool {
+    let scan = crate::domain::privacy::detector::scan(text, 1024);
+    scan.complete
+        && !scan.findings.is_empty()
+        && scan
+            .findings
+            .iter()
+            .all(|hit| hit.rule == "high-entropy-value")
 }
 
 #[derive(Clone, Copy)]

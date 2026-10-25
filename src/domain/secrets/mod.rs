@@ -122,6 +122,47 @@ pub struct Hit {
     /// and goes into CI logs, so carrying the raw secret leaks it a second time. The display
     /// layer keeps looking only at `redacted`.
     pub fingerprint: u64,
+    /// The exact matched value, so a local report can name the dictionary record that
+    /// `agit secrets allow` accepts. It never reaches output: its `Debug` is opaque and no report
+    /// serializes it.
+    pub value: MatchedValue,
+}
+
+impl Hit {
+    /// Provider signatures, private keys, credential assignments and registered values. Bare
+    /// entropy and the generic key rule show only that a value is opaque, and runtime
+    /// identifiers, encrypted carriers and account ids all look like that.
+    pub fn is_high_confidence(&self) -> bool {
+        !matches!(self.rule.as_str(), "high-entropy-value" | "generic-api-key")
+    }
+}
+
+/// A matched value held in memory for record lookup; wiped on drop where zeroize is linked.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct MatchedValue(String);
+
+impl MatchedValue {
+    pub fn new(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for MatchedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MatchedValue(..)")
+    }
+}
+
+#[cfg(feature = "secret-vault")]
+impl Drop for MatchedValue {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
+    }
 }
 
 /// Internal-only exact values found by heuristic rules while settling a local
@@ -160,17 +201,26 @@ fn fingerprint(found: &str) -> u64 {
     h.finish()
 }
 
-/// How many hits one scan collects at most.
+/// How many hits of each confidence tier one report lists.
 ///
 /// Hits are a **function** of the input, not a subset of it: a history that matches on every line
 /// produces `Hit`s on the order of its line count, each carrying its own `String`. Streaming the
-/// input bounds only the input side.
-///
-/// Stopping when full **does not change the verdict** — one hit is enough to refuse, and this
-/// report is "a refusal plus a few examples", never a complete list.
+/// input bounds only the input side. Hits past the list are still counted, so the report can say
+/// how many it did not show.
 const MAX_REPORTED_HITS: usize = 200;
 
-/// Collects hits and stops when full.
+/// How many distinct hits one scan counts before it stops scanning.
+///
+/// Counting past the listed hits keeps the dedupe key of every counted hit, so the count needs a
+/// ceiling of its own. Once it is reached the scan stops and the count is a lower bound; below it
+/// the count is exact.
+#[cfg(not(test))]
+const MAX_COUNTED_HITS: usize = 1 << 16;
+/// Low enough that a test repo crosses it inside one object batch.
+#[cfg(test)]
+const MAX_COUNTED_HITS: usize = MAX_REPORTED_HITS * 4;
+
+/// Collects hits, lists the first of each confidence tier and counts the rest.
 ///
 /// # Why one type and not three `if`s
 ///
@@ -179,8 +229,11 @@ const MAX_REPORTED_HITS: usize = 200;
 /// which is not a contract that holds. Every path goes through the same collector, so a path
 /// added later is bounded by construction.
 ///
-/// Stopping when full **does not change the verdict**: one hit is enough to refuse, and this
-/// report is "a refusal plus a few examples", never a complete list.
+/// # Why the tiers are listed separately
+///
+/// Entropy-only hits far outnumber credential signatures in an Agent repo:
+/// runtime identifiers, encrypted reasoning carriers and account ids are all opaque. Sharing one
+/// list lets them fill it, and a real credential behind them is neither shown nor counted.
 ///
 /// # Why it also deduplicates
 ///
@@ -197,12 +250,15 @@ const MAX_REPORTED_HITS: usize = 200;
 /// Different carriers never collapse into each other: `file` for commit / tag / blob is
 /// `<kind> object <sha8>…`, all distinct. That is deliberate — the line in the working tree and
 /// the blob in history are **two things to handle separately** (an inline annotation only reaches
-/// the first, the second needs history rewritten), and collapsing them into one drops one of the
-/// two ways out.
+/// the first), and collapsing them into one drops one of the two ways out.
 struct HitCollector {
     hits: Vec<Hit>,
+    low_confidence: Vec<Hit>,
+    count: usize,
+    low_confidence_count: usize,
     seen: HashSet<String>,
-    truncated: bool,
+    /// Some hits were never counted: the ceiling stopped the scan, or a carrier's own bound did.
+    incomplete: bool,
     binary_carriers: u64,
 }
 
@@ -210,8 +266,11 @@ impl HitCollector {
     fn new() -> Self {
         Self {
             hits: Vec::new(),
+            low_confidence: Vec::new(),
+            count: 0,
+            low_confidence_count: 0,
             seen: HashSet::new(),
-            truncated: false,
+            incomplete: false,
             binary_carriers: 0,
         }
     }
@@ -243,38 +302,33 @@ impl HitCollector {
         )
     }
 
-    /// Whether there is room for more. The caller uses it to **skip the remaining scanning
-    /// work**, not just to skip a push.
+    /// Whether the counting ceiling is reached. The caller uses it to **skip the remaining
+    /// scanning work**, not just to skip a push.
     ///
-    /// # Why it sets `truncated` itself (hence `&mut self`)
+    /// # Why it sets `incomplete` itself (hence `&mut self`)
     ///
-    /// Because "I skipped the work behind me because I am full" and "I recorded that this list is
-    /// incomplete" have to be **one action**; half of it is not a thing. With only `push` setting
-    /// the flag, the caller's fast path (`if out.is_full() { ... }`) never reaches `push` — so
-    /// when the working tree fills the collector exactly and one tag hit sits behind it, the
-    /// report claims `truncated = false`, and the user fixes the list entry by entry, pushes
-    /// again, and is stopped by the same gate.
-    ///
-    /// The direction is conservative: when it is full and there happen to be no more hits, the
-    /// worst case is one extra "there may be more"; failing to say "there is more" is a lie.
+    /// Because "I skipped the work behind me because I am full" and "I recorded that the count is
+    /// a lower bound" have to be **one action**; half of it is not a thing. With only `push`
+    /// setting the flag, the caller's fast path (`if out.is_full() { ... }`) never reaches `push`,
+    /// and a report whose scan stopped early claims an exact count.
     fn is_full(&mut self) -> bool {
-        if self.hits.len() >= MAX_REPORTED_HITS {
-            self.truncated = true;
+        if self.seen.len() >= MAX_COUNTED_HITS {
+            self.incomplete = true;
             return true;
         }
         false
     }
 
-    /// How many more it can take.
+    /// How many more it can count.
     ///
     /// It goes into [`scan_text_capped`] as the bound before a single carrier is scanned: that
     /// layer's output has to be bounded too, since capping the final list does not stop a single
     /// dense carrier from materializing `Hit`s on the order of its own size first.
     fn remaining(&self) -> usize {
-        MAX_REPORTED_HITS.saturating_sub(self.hits.len())
+        MAX_COUNTED_HITS.saturating_sub(self.seen.len())
     }
 
-    /// Take one. When full it only records `truncated` (`is_full` does that) and stops growing.
+    /// Count one, and list it while its tier has room.
     ///
     /// A hit already taken is dropped and **costs no budget**: it carries no new information, and
     /// letting it eat a slot pushes a hit that was never reported out of this report.
@@ -285,7 +339,15 @@ impl HitCollector {
         if !self.seen.insert(Self::key(&h)) {
             return;
         }
-        self.hits.push(h);
+        let (count, list) = if h.is_high_confidence() {
+            (&mut self.count, &mut self.hits)
+        } else {
+            (&mut self.low_confidence_count, &mut self.low_confidence)
+        };
+        *count += 1;
+        if list.len() < MAX_REPORTED_HITS {
+            list.push(h);
+        }
     }
 
     /// Take a batch.
@@ -295,7 +357,7 @@ impl HitCollector {
         }
     }
 
-    /// Record "this list is incomplete" — but **not** because this collector is full.
+    /// Record "some hits were never counted" — but **not** because this collector is full.
     ///
     /// # Why `is_full` cannot be used to infer it
     ///
@@ -304,28 +366,56 @@ impl HitCollector {
     /// answer that: the miss happens **inside** the carrier, and the collector sees only the few
     /// hits handed to it.
     ///
-    /// With the budget counted in unique spans (the detector budget), hitting the budget happens to
-    /// mean the collector is full and `is_full` sets the flag along with it — but that is **two
-    /// independent decisions coinciding**: the budget's counting key, and the caller passing
-    /// `remaining()` as `cap`. Change either side and the inference silently stops holding,
-    /// always in the direction of "the report claims to be complete". (Were the budget counted
-    /// **before** dedupe, the inference fails outright: two rules recognizing one span each eat a
-    /// slot, the deduplicated list handed over is shorter than the budget, and the collector is
-    /// not full.)
-    ///
     /// So completeness is stated directly by **the side that knows** ([`ScanReport::truncated`])
     /// and booked here, not left for the next person to infer.
     fn mark_truncated(&mut self) {
-        self.truncated = true;
+        self.incomplete = true;
     }
 
+    fn into_report(self, unscanned: Unscanned) -> AgentRepoScan {
+        AgentRepoScan {
+            binary_carriers: self.binary_carriers,
+            truncated: self.incomplete || self.count > self.hits.len(),
+            count: self.count,
+            low_confidence_count: self.low_confidence_count,
+            counted_all: !self.incomplete && unscanned.is_empty(),
+            hits: self.hits,
+            low_confidence: self.low_confidence,
+            unscanned,
+        }
+    }
+
+    #[cfg(test)]
     fn into_hits(self) -> Vec<Hit> {
-        self.hits
+        self.hits.into_iter().chain(self.low_confidence).collect()
     }
+}
 
-    fn was_truncated(&self) -> bool {
-        self.truncated
-    }
+/// What a scan of an Agent repo produces: the listed hits of each tier and how many there are.
+///
+/// # Why the counts travel with the lists
+///
+/// A capped list on its own looks exactly like "this is all of it". The user then handles the
+/// report entry by entry and scans again, a loop whose length nobody can see. The counts say how
+/// many there are; [`Self::counted_all`] says whether even the count is a lower bound.
+pub struct AgentRepoScan {
+    /// Fully read binary carriers are publishable artifacts, not text-scanned credentials.
+    pub binary_carriers: u64,
+    /// The first high-confidence hits.
+    pub hits: Vec<Hit>,
+    /// High-confidence hits exist that `hits` does not list.
+    pub truncated: bool,
+    /// Distinct high-confidence hits counted.
+    pub count: usize,
+    /// The first entropy-only hits.
+    pub low_confidence: Vec<Hit>,
+    /// Distinct entropy-only hits counted.
+    pub low_confidence_count: usize,
+    /// The whole surface was read and every hit on it counted, so both counts are exact. When
+    /// false, finding no high-confidence hit does not establish that there is none.
+    pub counted_all: bool,
+    /// The part of the scan surface that **was never read at all**. See [`Unscanned`].
+    pub unscanned: Unscanned,
 }
 
 /// What one scan produces: the hits, plus **whether that list is complete**.
@@ -846,6 +936,10 @@ pub fn scan_text_capped_with_repository_policy(
                 line: lines.number_at(h.start),
                 redacted: redact(&view[h.start..h.end]),
                 fingerprint: fingerprint(&view[h.start..h.end]),
+                value: MatchedValue::new(
+                    &semantic_match_value(text, &json_regions, h.start, h.end)
+                        .unwrap_or_else(|| view[h.start..h.end].into()),
+                ),
             })
             .collect(),
         truncated,
@@ -947,6 +1041,7 @@ fn scan_semantic_strings(
                                 line,
                                 redacted: redact(found),
                                 fingerprint: fingerprint(found),
+                                value: MatchedValue::new(&decoded[hit.start..hit.end]),
                             }
                         }));
                 }
@@ -1127,6 +1222,7 @@ pub(crate) fn registered_hits_semantic_capped(
                     line,
                     redacted: "[redacted:registered-secret]".to_string(),
                     fingerprint,
+                    value: MatchedValue::new(&text[found.start..found.end]),
                 });
             }
         }
@@ -1168,6 +1264,7 @@ pub(crate) fn registered_hits_semantic_capped(
                         line,
                         redacted: "[redacted:registered-secret]".to_string(),
                         fingerprint,
+                        value: MatchedValue::new(&string[found.start..found.end]),
                     });
                 }
             }
@@ -3279,8 +3376,18 @@ pub fn in_publish_surface(rel: &str) -> bool {
 pub fn scan_agent_repo(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
-) -> crate::Result<ScanReport> {
-    scan_agent_repo_selected(repo, plan, None)
+) -> crate::Result<AgentRepoScan> {
+    scan_agent_repo_allowing(repo, plan, &HashSet::new())
+}
+
+/// [`scan_agent_repo`] that also skips the exact values the user allowed in the privacy
+/// dictionary, so an allowed value stops being reported the way it stops being replaced.
+pub fn scan_agent_repo_allowing(
+    repo: &crate::domain::repo::Repo,
+    plan: &ScanPlan,
+    allowed: &HashSet<String>,
+) -> crate::Result<AgentRepoScan> {
+    scan_agent_repo_selected(repo, plan, None, allowed)
 }
 
 /// Scan immutable publication roots without resolving live branches or tags during the scan.
@@ -3290,7 +3397,7 @@ pub fn scan_agent_repo_frozen(
     repo: &crate::domain::repo::Repo,
     commits: &[String],
     tag_objects: &[String],
-) -> crate::Result<ScanReport> {
+) -> crate::Result<AgentRepoScan> {
     anyhow::ensure!(
         !commits.is_empty() && commits.len() <= 4096 && tag_objects.len() <= 4096,
         "frozen secret scan exceeds its publication root limit"
@@ -3320,23 +3427,29 @@ pub fn scan_agent_repo_frozen(
             "frozen secret scan object check is incomplete"
         );
     }
-    scan_agent_repo_selected(&local, &ScanPlan::full(), Some((commits, tag_objects)))
+    scan_agent_repo_selected(
+        &local,
+        &ScanPlan::full(),
+        Some((commits, tag_objects)),
+        &HashSet::new(),
+    )
 }
 
 fn scan_agent_repo_selected(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
     frozen: Option<(&[String], &[String])>,
-) -> crate::Result<ScanReport> {
+    allowed: &HashSet<String>,
+) -> crate::Result<AgentRepoScan> {
     #[cfg(feature = "cli")]
     let started = std::time::Instant::now();
-    let result = scan_agent_repo_selected_inner(repo, plan, frozen);
+    let result = scan_agent_repo_selected_inner(repo, plan, frozen, allowed);
     #[cfg(feature = "cli")]
     crate::telemetry::operation(
         crate::telemetry::Operation::SecretScan,
         result.is_ok(),
         started.elapsed(),
-        result.as_ref().ok().map(|report| report.hits.len() as u64),
+        result.as_ref().ok().map(|report| report.count as u64),
     );
     result
 }
@@ -3345,9 +3458,11 @@ fn scan_agent_repo_selected_inner(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
     frozen: Option<(&[String], &[String])>,
-) -> crate::Result<ScanReport> {
+    allowed: &HashSet<String>,
+) -> crate::Result<AgentRepoScan> {
     let home = crate::infra::config::agit_home().context(ScanPreparationFailure::LocalState)?;
-    let allowlist = load_allowlist(&home);
+    let mut allowlist = load_allowlist(&home);
+    allowlist.extend(allowed.iter().cloned());
     // When a vault exists but cannot be unlocked or authenticated, return an error; degrading to
     // "there are no registered rules" is not allowed.
     let registered = registered_matcher_for_repo(repo)?;
@@ -3514,12 +3629,7 @@ fn scan_agent_repo_selected_inner(
         };
         scan_publish_objects(&context, spent, &mut out, &mut unscanned)?;
     }
-    Ok(ScanReport {
-        binary_carriers: out.binary_carriers,
-        truncated: out.was_truncated(),
-        hits: out.into_hits(),
-        unscanned,
-    })
+    Ok(out.into_report(unscanned))
 }
 
 fn is_lfs_worktree_file(repo: &crate::domain::repo::Repo, path: &str) -> crate::Result<bool> {
@@ -5301,15 +5411,25 @@ mod tests {
         assert!(!scanned.truncated);
     }
 
-    /// Native entropy exemptions require a verified event and stay at the protocol field.
-    /// Forged envelopes, payload copies and provider credentials must remain visible to scanning.
+    /// Native entropy exemptions require a verified event and stay at the protocol field or the
+    /// runtime-opaque carrier. Forged envelopes, payload copies and provider credentials must
+    /// remain visible to scanning.
     #[test]
     fn verified_protocol_ids_do_not_block_publication_or_exempt_tool_contents() {
         let call = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let content = serde_json::json!({"type":"response_item","payload":{
             "type":"function_call","call_id":call,"name":"exec_command","arguments":"{}"
         }});
+        let blob = "gAAAAABpQ7vXk2mZ9tR4wL8nC1yF6hJ3sD0bG5qT7eW2uK9oP4aV8xM1zN6cB3";
+        let reasoning = |encrypted: &str| {
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"reasoning","summary":[],"encrypted_content":encrypted
+            }})
+        };
         for (value, verified, expected) in [
+            (reasoning(blob), false, Some(blob)),
+            (reasoning(blob), true, None),
+            (reasoning(AWS), true, Some(AWS)),
             (content.clone(), false, Some(call)),
             (content.clone(), true, None),
             (
@@ -7772,7 +7892,7 @@ mod tests {
     }
 
     /// On the object path it is not only the report that is bounded: **the enumeration itself**
-    /// stops the moment the collector fills.
+    /// stops the moment the collector reaches its counting ceiling.
     ///
     /// # What this pins
     ///
@@ -7781,13 +7901,14 @@ mod tests {
     /// historical object. Completing the scan surface must not be paid for with an unbounded read,
     /// so every layer on this path is bounded: streaming enumeration, OIDs batched by
     /// [`OBJECT_BATCH`], a single blob's output capped by `remaining()`, and `rev-list` aborted as
-    /// soon as the collector fills.
+    /// soon as the ceiling is reached.
     ///
-    /// The object count built here exceeds one batch, so the collector fills **before the
+    /// The object count built here exceeds one batch, so the ceiling is reached **before the
     /// enumeration finishes** — and at that moment [`EnoughHits`] aborts `rev-list`. And "stopped
     /// because it is full" has to stay separable from "git faulted": the `expect` below pins
     /// exactly that, since getting it wrong ends this path in a scan failure (calling a good repo
-    /// broken), while swallowing both together calls a fault clean.
+    /// broken), while swallowing both together calls a fault clean. The count it reports is then
+    /// a lower bound, and the report has to say so.
     #[test]
     fn the_object_scan_stops_enumerating_once_it_is_full() {
         let d = repo_dir();
@@ -7847,8 +7968,8 @@ mod tests {
             report.hits.len()
         );
         assert!(
-            report.truncated,
-            "the scan stopped early on the cap, so the report must not claim this is all of it"
+            report.truncated && !report.counted_all,
+            "the scan stopped early on the ceiling, so the report must not claim an exact count"
         );
     }
 
@@ -7986,19 +8107,73 @@ mod tests {
         );
     }
 
-    /// A collector that fills **exactly** still reports truncation.
+    /// Entropy-only hits never take a listed slot, and both tiers are counted past the list.
     ///
-    /// # This pins the fast path
+    /// An Agent repo carries far more opaque runtime values than credentials. One capped list for
+    /// both tiers fills with entropy hits and shows no credential at all; a collector that stops
+    /// counting at the list cannot say how many credentials remain.
+    #[test]
+    fn credentials_are_listed_and_counted_past_entropy_noise() {
+        let d = repo_dir();
+        std::fs::create_dir_all(d.path().join("memory")).unwrap();
+        let mut text: String = (0..(MAX_REPORTED_HITS * 2))
+            .map(|i| {
+                format!(
+                    "id {:016x}{:016x}\n",
+                    fingerprint(&format!("a{i}")),
+                    fingerprint(&format!("b{i}"))
+                )
+            })
+            .collect();
+        text.extend((0..=MAX_REPORTED_HITS).map(|i| format!("{}\n", agit_n(i))));
+        std::fs::write(d.path().join("memory/notes.md"), text).unwrap();
+
+        let repo = crate::domain::repo::Repo::at(d.path());
+        let report = scan_agent_repo(&repo, &ScanPlan::full()).expect("the repo is healthy");
+        assert!(report.hits.iter().all(Hit::is_high_confidence));
+        assert_eq!(report.hits.len(), MAX_REPORTED_HITS);
+        assert_eq!(report.count, MAX_REPORTED_HITS + 1);
+        assert!(report.truncated, "one credential is counted but not listed");
+        assert!(report.counted_all, "nothing stopped the count");
+        assert!(report.low_confidence_count > MAX_REPORTED_HITS);
+        assert!(report.low_confidence.len() <= MAX_REPORTED_HITS);
+    }
+
+    /// Entropy noise that reaches the counting ceiling ahead of a credential leaves a report that
+    /// must not read as complete. A collector that judges completeness by the high-confidence
+    /// list alone returns an empty list here and lets the caller call the repo clean.
+    #[test]
+    fn noise_that_stops_the_count_leaves_the_report_incomplete() {
+        let d = repo_dir();
+        std::fs::create_dir_all(d.path().join("memory")).unwrap();
+        let mut text: String = (0..(MAX_COUNTED_HITS * 2))
+            .map(|i| {
+                format!(
+                    "id {:016x}{:016x}\n",
+                    fingerprint(&format!("a{i}")),
+                    fingerprint(&format!("b{i}"))
+                )
+            })
+            .collect();
+        text.push_str(&format!("{AWS}\n"));
+        std::fs::write(d.path().join("memory/notes.md"), text).unwrap();
+
+        let repo = crate::domain::repo::Repo::at(d.path());
+        let report = scan_agent_repo(&repo, &ScanPlan::full()).expect("the repo is healthy");
+        assert!(report.low_confidence_count > 0);
+        assert!(
+            !report.counted_all,
+            "the credential behind the noise was never counted: {} listed",
+            report.hits.len()
+        );
+    }
+
+    /// A list that fills **exactly** still reports truncation.
     ///
-    /// `HitCollector::push` sets `truncated` when full, but the caller's fast path
-    /// (`if out.is_full() { ... }`) never reaches `push` — what it skips is **the scanning work
-    /// behind it**. So when the working tree fills the collector exactly and one tag hit sits
-    /// behind it, the report claims `truncated = false`: the user fixes the list entry by entry,
-    /// pushes again, and is stopped by the same gate.
-    ///
-    /// So the flag is set the moment `is_full()` returns true — "I skipped work because I am
-    /// full" and "I recorded that the list is incomplete" are one action, and half of it is not a
-    /// thing.
+    /// When the working tree fills the list exactly and one tag hit sits behind it, a report that
+    /// judges completeness by "the list is not over the cap" claims `truncated = false`: the user
+    /// handles the list entry by entry, scans again, and finds one more. The count carries the hit
+    /// the list has no room for.
     #[test]
     fn an_exactly_full_collector_still_reports_truncation() {
         let d = repo_dir();

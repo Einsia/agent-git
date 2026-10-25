@@ -354,62 +354,40 @@ pub fn canonical_owner(owner: &str) -> Result<()> {
 /// What to do about one secret hit — **the remedies that branch on the carrier**.
 ///
 /// The test for branching is [`secrets::Source`]: the same advice on a different carrier is not
-/// "less convenient", it is **impossible to follow**. When the hit is inside a commit / tag
+/// "less convenient", it is **impossible to follow**. When the hit is inside a blob, commit or tag
 /// object, that line is not in the working tree and there is no line to write
 /// `agit:allow-secret` on.
-///
-/// This enum exists for two reasons: to make the branching testable, and to make `agit push` and
-/// `agit scan` take the **same** decision. Written once on each side they drift apart — scan
-/// branching on `source` while push unconditionally promises an inline annotation, and push is
-/// the gate that actually stops people.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretRemedy {
     /// Write `agit:allow-secret` on that line. Only a hit in a working-tree file can reach it.
     InlineAnnotation,
-    /// Locate the blob object and rewrite the commits carrying it.
-    RewriteBlob,
-    /// Rewrite the commit object.
-    RewriteCommit,
-    /// Re-create the annotated tag.
-    RetagObject,
+    /// The hit is in Agent history, which AgentGit never rewrites.
+    AgentHistory,
 }
 
 /// Which remedies this batch of hits earns. A pure function; the return order is the print order.
-///
-/// The three object remedies come last: they are the only actions that work on a hit inside an
-/// object, and the most expensive.
 pub fn secret_remedies(sources: impl IntoIterator<Item = secrets::Source>) -> Vec<SecretRemedy> {
-    let (mut file, mut blob, mut commit, mut tag) = (false, false, false, false);
+    let (mut file, mut object) = (false, false);
     for s in sources {
         match s {
             secrets::Source::File => file = true,
-            secrets::Source::BlobObject => blob = true,
-            secrets::Source::CommitObject => commit = true,
-            secrets::Source::TagObject => tag = true,
+            secrets::Source::BlobObject
+            | secrets::Source::CommitObject
+            | secrets::Source::TagObject => object = true,
         }
     }
     let mut out = Vec::new();
     if file {
         out.push(SecretRemedy::InlineAnnotation);
     }
-    if blob {
-        out.push(SecretRemedy::RewriteBlob);
-    }
-    if commit {
-        out.push(SecretRemedy::RewriteCommit);
-    }
-    if tag {
-        out.push(SecretRemedy::RetagObject);
+    if object {
+        out.push(SecretRemedy::AgentHistory);
     }
     out
 }
 
 /// Print the remedies [`secret_remedies`] selected.
 ///
-/// **`push` and `scan` both call this one.** A copy is where the two start to drift apart: same
-/// repo, `agit scan --secrets` branching by carrier and getting the advice right while
-/// `agit push` promises, for a hit inside an object, an inline annotation the user has nowhere to
-/// write.
 pub fn hint_secret_remedies(sources: impl IntoIterator<Item = secrets::Source>) {
     for r in secret_remedies(sources) {
         crate::ui::hint(&remedy_hint(r));
@@ -419,9 +397,8 @@ pub fn hint_secret_remedies(sources: impl IntoIterator<Item = secrets::Source>) 
 /// The rule that matched takes part in the remedy too: an explicitly registered rule accepts
 /// no inline annotation; local allowlists still apply.
 ///
-/// The object-rewrite remedies hold for both kinds of rule; only a built-in heuristic hit in the
-/// working tree can be allowed through with `agit:allow-secret`. Keeping that decision in one
-/// place is what stops push and scan from each promising a way out a registered rule ignores.
+/// The history remedy holds for both kinds of rule; only a built-in heuristic hit in the working
+/// tree can be allowed through with `agit:allow-secret`.
 pub fn hint_secret_hit_remedies<'a>(hits: impl IntoIterator<Item = &'a secrets::Hit>) {
     let mut registered = false;
     let mut sources = Vec::new();
@@ -445,41 +422,18 @@ pub fn hint_secret_hit_remedies<'a>(hits: impl IntoIterator<Item = &'a secrets::
 
 /// The body of each remedy.
 ///
-/// Split out from printing so the **text itself** can be asserted on. All of the value here is in
-/// "follow it and it is fixed", and parts of the body are not wording: drop the step that saves
-/// the original target from the tag remedy and it goes from "executable" to **executable and
-/// harmful** (see the assertion in `mod tests`).
+/// Split out from printing so the **text itself** can be asserted on: the history remedy must
+/// never name a history rewrite, which the agit rules installed in every Agent repo forbid.
 fn remedy_hint(r: SecretRemedy) -> String {
     match r {
         SecretRemedy::InlineAnnotation => format!(
             "· inline annotation (working-tree files only): put `{}` on that line",
             secrets::INLINE_PRAGMA
         ),
-        // The blob remedy **cannot** fall back to "add an inline annotation": the line that hit
-        // need not exist in the working tree (the file may have been deleted in a later commit,
-        // or the whole tree may have been swapped for a clean replacement object through
-        // `refs/replace/*`), and a user facing a working tree that does not contain that string
-        // has nowhere to start. So this one gives the two things that can actually be done:
-        // **locate** it by oid (read the content, find which commits carry it), then **rewrite**
-        // those commits.
-        //
-        // The last sentence is not wording either: deleting the file in a new commit is the most
-        // natural reaction and it fixes nothing — the old blob stays reachable and still ships
-        // with this push. Left unsaid, the user deletes it, is stopped by the same gate again,
-        // and concludes the gate is broken.
-        SecretRemedy::RewriteBlob => "· some hits are inside blob objects — file content that lives in history, not necessarily in your working tree (the file may have been deleted in a later commit), so there is no line to annotate. the report locates it as `blob object <oid>/<path>`: read it with `git cat-file blob <oid>` (the reported line number counts from there) and find the commits carrying it with `git log --all --find-object=<oid>`, then rewrite those: `git commit --amend` if only the tip has it, `git rebase -i <sha>~1` for anything older, or `git filter-repo --strip-blobs-with-ids <file-of-oids>` to drop it across the whole history. deleting the file in a new commit does not help — the old blob stays reachable and still ships".to_string(),
-        SecretRemedy::RewriteCommit => "· some hits are inside commit objects — those lines are not in your working tree, so neither the inline annotation nor `agit revert` reaches them. locate one with `git cat-file commit <sha>` (the reported line number counts from there), then rewrite the commit: `git commit --amend` for the tip, `git rebase -i` for anything older".to_string(),
-        // Re-creating it **must** carry the original target: `git tag -a <name>` with no target
-        // tags HEAD, so following the advice to change a tag's message silently moves a released
-        // version off the commit it pointed at and onto HEAD. The command that reads the target
-        // must also run **before** `git tag -d` — once the tag is deleted, that name no longer
-        // resolves to the commit it named.
-        // `%(object)` and **not** `rev-parse '<name>^{}'`: the latter peels **recursively** down
-        // to a commit. When the outer tag points straight at another annotated tag (a nested tag;
-        // git warns about it but allows it), `^{}` gives the final commit, and rebuilding from
-        // that silently swaps the outer tag's `object` from the inner tag OID to the commit OID —
-        // the tag topology is changed. `%(object)` gives the **direct** target, peeling nothing.
-        SecretRemedy::RetagObject => "· some hits are inside annotated tag objects. locate one with `git cat-file tag <sha>` (the reported line number counts from there), then re-create the tag on whatever it already points at. save that target first, before the delete: `target=$(git for-each-ref --format='%(object)' 'refs/tags/<name>')` — then `git tag -d <name> && git tag -a <name> $target`. two things are not optional: the target (`git tag -a <name>` with nothing after it tags HEAD, silently moving a released version onto whatever you have checked out), and using `%(object)` rather than `<name>^{}` (the latter peels recursively, so a tag pointing at another tag would be rebuilt pointing at the commit instead). no history rewrite needed, the tag is a separate object".to_string(),
+        // Deleting or reverting is the natural reaction and it removes the value from the VIEW
+        // only: the object stays reachable and every push still sends it, so a real credential
+        // has to be revoked where it was issued.
+        SecretRemedy::AgentHistory => "· some findings are in Agent history (blob, commit or tag objects), which AgentGit never rewrites. `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW, but LOG and Git history keep it and push still sends it: revoke and rotate a real credential".to_string(),
     }
 }
 
@@ -1192,123 +1146,37 @@ mod tests {
 
     /// When every hit is inside an object, an inline annotation **must not** be promised.
     ///
-    /// That line is not in the working tree and the user has nowhere to write it. A gate printing
-    /// it unconditionally while `agit scan` branches by carrier gives two different remedies for
-    /// the same repo, one of which goes nowhere.
-    ///
-    /// The blob one needs the most watching: its payload **looks** most like a working-tree file
-    /// (the report carries a path), while the file at that path may have been deleted long ago, or
-    /// the whole tree swapped for a clean replacement object through `refs/replace/*` — someone
-    /// following the path into the working tree does not find that string there at all.
+    /// That line is not in the working tree and the user has nowhere to write it. The blob one
+    /// needs the most watching: its payload **looks** most like a working-tree file (the report
+    /// carries a path), while the file at that path may have been deleted long ago.
     #[test]
     fn hits_that_are_all_inside_objects_get_no_inline_annotation_advice() {
-        let commits_only = secret_remedies([Source::CommitObject, Source::CommitObject]);
+        for source in [Source::CommitObject, Source::BlobObject, Source::TagObject] {
+            assert_eq!(
+                secret_remedies([source, source]),
+                vec![SecretRemedy::AgentHistory],
+                "a hit inside {source:?} has no line to annotate"
+            );
+        }
         assert_eq!(
-            commits_only,
-            vec![SecretRemedy::RewriteCommit],
-            "a hit inside a commit object has one way out only: rewriting history"
-        );
-
-        let blobs_only = secret_remedies([Source::BlobObject, Source::BlobObject]);
-        assert_eq!(
-            blobs_only,
-            vec![SecretRemedy::RewriteBlob],
-            "the line inside a blob object need not be in the working tree, so no inline annotation is promised"
-        );
-
-        // Mixed in, that one is still given — it is executable for the working-tree hits among
-        // them.
-        let mixed = secret_remedies([
-            Source::CommitObject,
-            Source::File,
-            Source::TagObject,
-            Source::BlobObject,
-        ]);
-        assert_eq!(
-            mixed,
-            vec![
-                SecretRemedy::InlineAnnotation,
-                SecretRemedy::RewriteBlob,
-                SecretRemedy::RewriteCommit,
-                SecretRemedy::RetagObject,
-            ]
+            secret_remedies([Source::CommitObject, Source::File, Source::BlobObject]),
+            vec![SecretRemedy::InlineAnnotation, SecretRemedy::AgentHistory],
+            "mixed in, the annotation is still given for the working-tree hits among them"
         );
     }
 
-    /// The blob advice must be **executable**: locate by oid, rewrite by commit.
-    ///
-    /// # Why these parts are pinned
-    ///
-    /// "There is a blob hit" on its own offers no way out. The user holds an oid and a path, and
-    /// exactly two steps are available: read that object out / find which commits carry it
-    /// (`git cat-file blob`, `git log --all --find-object=`), then rewrite those commits. Without
-    /// the locating half the advice becomes "work out where it is yourself"; without the rewriting
-    /// half the most natural reaction is to **delete the file in a new commit** — and the old blob
-    /// stays reachable and still ships with this push, so the same gate stops them again and they
-    /// conclude it is broken. That sentence has to stay in the body too.
+    /// The history advice must not contradict the agit rules every Agent repo carries ("Never
+    /// rebase or force-push AgentGit history"). Advice naming `--amend`, `rebase` or
+    /// `filter-repo` would send a user to break the session they are reviewing; advice that drops
+    /// "push still sends it" lets a revert pass for a fix.
     #[test]
-    fn the_blob_advice_is_executable_from_an_oid() {
-        let advice = super::remedy_hint(SecretRemedy::RewriteBlob);
-        assert!(
-            advice.contains("git cat-file blob <oid>"),
-            "the advice says how to read that object out: {advice}"
-        );
-        assert!(
-            advice.contains("git log --all --find-object=<oid>"),
-            "the advice says how to find which commits carry it: {advice}"
-        );
-        assert!(
-            advice.contains("git commit --amend") && advice.contains("git rebase -i"),
-            "locating is not enough; the advice names the rewrite action too: {advice}"
-        );
-        assert!(
-            advice.contains("deleting the file in a new commit does not help"),
-            "the advice must say that deleting the file in a new commit does not help, or the same gate stops the user again: {advice}"
-        );
-        assert!(
-            !advice.contains(crate::domain::secrets::INLINE_PRAGMA),
-            "the line of a blob hit need not be in the working tree, so no inline annotation belongs in this advice: {advice}"
-        );
-    }
-
-    /// The tag advice must spell out **how to read the original target**, and pass it to
-    /// `git tag -a`.
-    ///
-    /// `git tag -a <name>` with no target tags **HEAD**. Advice without the target is therefore
-    /// harmful: following it to change a tag's message moves that tag off the commit it pointed at
-    /// and onto HEAD — a released version silently relocated. That is worse than advice that
-    /// cannot be followed, because it **can be followed and does harm**.
-    ///
-    /// The read itself has a trap: `git rev-parse '<name>^{}'` peels **recursively** down to a
-    /// commit. When the outer tag points straight at another annotated tag, rebuilding it that way
-    /// silently turns the outer `object` from the inner tag OID into the commit OID — the tag
-    /// topology is changed. `%(object)` gives the **direct** target.
-    ///
-    /// So this assertion watches the three parts of the body (use the non-peeling read, pass what
-    /// it read back in, say why `^{}` is not used), and the next person simplifying the wording
-    /// does not delete them along with it.
-    #[test]
-    fn the_retag_advice_says_how_to_keep_the_tag_where_it_is() {
-        let advice = super::remedy_hint(SecretRemedy::RetagObject);
-        // The read has to be in the copy, and it has to be the **non-peeling** one.
-        assert!(
-            advice.contains("%(object)"),
-            "the advice reads the direct target with `%(object)`: {advice}"
-        );
-        assert!(
-            advice.contains("git tag -a <name> $target"),
-            "the target it read is passed back in: {advice}"
-        );
-        // `^{}` may appear only as the **counter-example** (why it is not used), never inside
-        // the command.
-        assert!(
-            !advice.contains("$(git rev-parse '<name>^{}')"),
-            "`^{{}}` peels recursively down to a commit, so a nested tag would be rebuilt pointing at the commit: {advice}"
-        );
-        assert!(
-            advice.contains("peels recursively"),
-            "the advice says why `^{{}}` is not used, or the next person swaps it back in: {advice}"
-        );
+    fn the_history_advice_never_names_a_rewrite() {
+        let advice = super::remedy_hint(SecretRemedy::AgentHistory);
+        for rewrite in ["amend", "rebase", "filter-repo", "git tag -d", "force"] {
+            assert!(!advice.contains(rewrite), "{rewrite}: {advice}");
+        }
+        assert!(advice.contains("agit revert"), "{advice}");
+        assert!(advice.contains("push still sends it"), "{advice}");
     }
 }
 

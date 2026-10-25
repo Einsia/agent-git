@@ -213,6 +213,57 @@ pub fn execute(
                 .collect::<Vec<_>>()
         ));
     }
+    if command.action == "allowed_values" {
+        // Both scopes apply, and an explicit block wins over an allow in either.
+        let repository = self::scope(repo)?;
+        let allowed = |token: &str| {
+            let rules: Vec<_> = decisions
+                .iter()
+                .filter(|rule| rule.token == token)
+                .filter(|rule| rule.scope == "global" || rule.scope == repository)
+                .collect();
+            rules.iter().any(|rule| rule.allow == Some(true))
+                && !rules.iter().any(|rule| rule.block == Some(true))
+        };
+        return Ok(json!(
+            projector
+                .dictionary
+                .records()
+                .filter(|record| allowed(&record.token))
+                .map(|record| record.original.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+    if command.action == "identify" {
+        // A finding without a record gets the record its replacement would have created, so
+        // every finding names an id that `allow` accepts.
+        let values: Vec<String> = serde_json::from_str(
+            command
+                .secret
+                .as_deref()
+                .context("missing finding values")?,
+        )?;
+        let mut identities = Vec::with_capacity(values.len());
+        for value in values {
+            let token = match projector.dictionary.for_value(&value) {
+                Some(record) => Some(record.token.clone()),
+                None => Record::new(&projector.store.dictionary_id, &value, Origin::Heuristic)
+                    .and_then(|record| {
+                        projector
+                            .store
+                            .append(std::slice::from_ref(&record), projector.key.as_ref())?;
+                        let token = record.token.clone();
+                        projector.dictionary.accept(record)?;
+                        Ok(token)
+                    })
+                    .ok(),
+            };
+            identities.push(json!(
+                token.as_deref().and_then(token_identity).map(|(_, id)| id)
+            ));
+        }
+        return Ok(Value::Array(identities));
+    }
     if command.action == "remember" {
         let values: Vec<String> = serde_json::from_str(
             command
