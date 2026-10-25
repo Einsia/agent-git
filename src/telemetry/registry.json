@@ -92,6 +92,7 @@
     "project": {"aliases":[],"args":{}},
     "project bind": {"aliases":[],"args":{"auto_upload":{"action":"SetTrue","policy":"boolean"},"dry_run":{"action":"SetTrue","policy":"boolean"},"history":{"action":"Set","policy":"enum","values":["all","none"]},"path":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},
     "project capture": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
+    "project drop": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "project status": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
     "project sync": {"aliases":[],"args":{"dry_run":{"action":"SetTrue","policy":"boolean"},"path":{"action":"Set","policy":"presence"}}},
     "project unbind": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},

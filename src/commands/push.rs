@@ -258,6 +258,39 @@ pub fn run(mut args: Args) -> CmdResult {
             ))
         ));
     }
+    let mut publishable = Vec::new();
+    for branch in branches {
+        match super::project::withheld(&checkout.slug(), &branch) {
+            Ok(None) => publishable.push(branch),
+            Ok(Some(reason)) if asked_explicitly => {
+                ui::error(&format!(
+                    "`{}@{branch}` will not be uploaded from this computer: {}.",
+                    checkout.slug(),
+                    reason.describe()
+                ));
+                ui::hint("its local history stays; nothing was sent to the Hub");
+                if reason == super::project::Withholding::UnknownStart {
+                    ui::hint(&format!(
+                        "to stop it from recording into this branch: `agit project drop {}@{branch}`",
+                        checkout.slug()
+                    ));
+                }
+                return Ok(ExitCode::Policy);
+            }
+            Ok(Some(reason)) => ui::info(format_args!(
+                "{}",
+                ui::dim(&format!("  skipping {branch} ({})", reason.describe()))
+            )),
+            Err(error) => {
+                ui::error(&format!(
+                    "cannot verify the project policy of `{}@{branch}`: {error:#}",
+                    checkout.slug()
+                ));
+                return Ok(ExitCode::Precondition);
+            }
+        }
+    }
+    let branches = publishable;
     if !args.dry_run {
         crate::domain::privacy::service::schedule_sync(client.base());
         // Dictionary sync runs detached, so push is where its refusals become visible.

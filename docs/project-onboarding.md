@@ -63,7 +63,9 @@ agit project bind /work/new-project --repo MANAGER/project-name --history none -
 
 Existing sessions are excluded unless this repository already claims them. Newly created
 sessions are adopted and uploaded
-at the end of their first completed turn; later turns update that same branch. Keep using
+at the end of their first completed turn; later turns update that same branch. Only a
+conversation that started inside the folder is adopted: one started elsewhere that later moves
+into it is offered, never adopted or uploaded. Keep using
 Claude Code or Codex normally. Rebind with `--history all` if you later want the old sessions.
 
 The command installs hooks for available supported runtimes. Codex must report an enabled
@@ -78,6 +80,7 @@ agit project status /work/project
 agit project sync /work/project --dry-run
 agit project sync /work/project
 agit project unbind /work/project
+agit project drop [MANAGER/project-name@BRANCH]
 ```
 
 Check that the Manager can open each developer's sessions in the shared repository.
@@ -91,6 +94,14 @@ version: fix access or connectivity and rerun sync. The Stop hook starts the upl
 background process and returns at once; `agit project status` shows its last result.
 Automatic uploads recheck account, immutable destination, write access and registered session
 settings. Changing the project's selected account or destination requires renewed binding.
+
+Every push, automatic or manual, checks the project's capture rule again. A project branch whose
+conversation started outside the folder, or whose session is excluded, is never pushed, whatever
+its claim says. agit drops such conversations on its own and says once which ones it dropped. To
+stop uploading a conversation yourself, run `agit project drop OWNER/REPO@BRANCH`, or
+`agit project drop` inside the conversation: it stops recording into that branch and the project
+no longer captures it; its local history stays, and it is never uploaded from this computer. A
+copy already on the Hub stays there until you remove it on the Hub.
 
 Unbind stops this project's hook capture and automatic pushing, without deleting existing
 history or resetting repository preferences. Explicit manual push is still possible. Nested

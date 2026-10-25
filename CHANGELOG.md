@@ -8,6 +8,19 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- `agit project drop [OWNER/REPO@BRANCH]` stops uploading a conversation from this computer; its
+  local history stays. Without a target it drops the conversation the command runs in. The
+  conversation stops recording into that branch and the project no longer captures it.
+
+### Fixed
+
+- A project never publishes a conversation that started outside its folder, or a session
+  excluded from it, whatever its claim says: automatic upload and `agit push` both refuse the
+  branch. Conversations captured that way by an earlier version are dropped on the first run, and
+  agit says once which ones; their local history stays. A copy already on the Hub is not removed.
+
 ## [0.2.27] - 2026-10-25
 
 ### Added

@@ -18,6 +18,8 @@ agit project sync /work/app --dry-run
 agit project sync /work/app
 agit project status /work/app
 agit project unbind /work/app
+agit project drop                       # the conversation this command runs in
+agit project drop team/app@project-claude-code-0123456789abcdef01234567
 ```
 
 Run configuration from the device's terminal, outside an RC supervisor. The repository
@@ -52,6 +54,14 @@ snapshot privacy contract. There is no resident retry queue. A failed push keeps
 local history, and `status` shows the last result. Retry with `project sync`.
 Changing the selected account or destination requires renewed project binding. RC-owned sessions
 retain their supervisor lifecycle and source publication authority.
+
+Hooks adopt only a conversation that started inside the bound folder. Every push, automatic
+or manual, checks that rule again together with the project's exclusions, and refuses a
+project branch that breaks it whatever its claim says; agit drops such conversations on its
+own and says once which. `drop` stops uploading a conversation from this computer: the named
+one, or without a target the conversation it runs in. It stops recording into its branch and
+the project no longer captures it; its local history stays. A copy already on the Hub stays
+there. Run `drop` only when the user asks for it.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is
 complete. `unbind` pauses project hook capture and automatic publication for the selected

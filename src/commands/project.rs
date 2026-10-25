@@ -53,6 +53,12 @@ pub enum Action {
     Status { path: PathBuf },
     /// Stop project hook capture; retain local and remote session history.
     Unbind { path: PathBuf },
+    /// Stop uploading a conversation from this computer; its local history stays.
+    Drop {
+        /// The conversation's branch; without it, the conversation this command runs in.
+        #[arg(value_name = "OWNER/REPO@BRANCH")]
+        target: Option<String>,
+    },
     /// Publish the project's hook-reported sessions; the hook that starts it does not wait.
     #[command(hide = true)]
     Capture { path: PathBuf },
@@ -293,11 +299,15 @@ fn placement(project: &Project, candidate: &Candidate) -> Result<Placement> {
             "session has a protected claim"
         );
     }
-    Ok(Placement::Claim(format!(
-        "project-{}-{}",
-        candidate.runtime,
-        hash(&key(&candidate.runtime, &candidate.session_id))
+    Ok(Placement::Claim(capture_branch(
+        &candidate.runtime,
+        &candidate.session_id,
     )))
+}
+
+/// The branch a project opens for a session it captures.
+fn capture_branch(runtime: &str, id: &str) -> String {
+    format!("project-{runtime}-{}", hash(&key(runtime, id)))
 }
 
 /// Resolve under the project lock so a moved claim cannot authorize another repository.
@@ -423,6 +433,7 @@ pub fn run(args: Args) -> CmdResult {
             );
             Ok(ExitCode::Ok)
         }
+        Action::Drop { target } => drop_command(target.as_deref()),
         Action::Sync { path, dry_run } => {
             let root = root(&path)?;
             let mut project = read(&root)?.context("bind this directory first")?;
@@ -791,6 +802,422 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     Ok(true)
 }
 
+// ── publication withheld by project policy ─────────────────────────────
+
+/// Branches withheld from publication, kept apart from the policies so that a dropped claim stays
+/// withheld after its link, and even its project, is gone.
+const WITHHELD: &str = "withheld";
+/// Present once this machine's existing claims have been judged by the capture rule.
+const RECHECKED: &str = "claims-rechecked";
+
+/// Why a project keeps a branch from being published, whatever claim the branch carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Withholding {
+    /// The project captured a conversation that started outside its folder.
+    StartedOutside,
+    /// The project cannot find where the captured conversation started.
+    UnknownStart,
+    /// The user excluded the session from the project.
+    Excluded,
+    /// The user dropped the claim.
+    Dropped,
+}
+
+impl Withholding {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::StartedOutside => "the conversation started outside the project folder",
+            Self::UnknownStart => "agit cannot verify where the conversation started",
+            Self::Excluded => "the conversation is excluded from the project",
+            Self::Dropped => "the conversation was dropped from the project",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Withheld {
+    repository: String,
+    branch: String,
+    session: Option<String>,
+    reason: Withholding,
+    announced: bool,
+}
+
+/// Every project policy on this machine. An unreadable policy fails the caller, since it may be
+/// the one that withholds a branch.
+fn policies() -> Result<Vec<Project>> {
+    let entries = match fs::read_dir(home()?) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut projects = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let is_policy = path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| {
+                    stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+                });
+        if is_policy {
+            projects.push(
+                serde_json::from_slice(&fs::read(&path)?)
+                    .with_context(|| format!("invalid project policy {}", path.display()))?,
+            );
+        }
+    }
+    Ok(projects)
+}
+
+fn withheld_records() -> Result<Vec<Withheld>> {
+    match fs::read(home()?.join(WITHHELD)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid withheld branch list"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read-modify-write of the withheld list under its own lock.
+fn update_withheld<T>(change: impl FnOnce(&mut Vec<Withheld>) -> T) -> Result<T> {
+    let home = home()?;
+    config::create_state_dir(&home)?;
+    let lock_path = home.join(WITHHELD).with_extension("lock");
+    let guard = config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    crate::infra::local_state::lock_patiently(
+        &guard,
+        &lock_path,
+        "the withheld branch lock",
+        true,
+    )?;
+    let mut records = withheld_records()?;
+    let result = change(&mut records);
+    let mut file = tempfile::NamedTempFile::new_in(&home)?;
+    file.write_all(&serde_json::to_vec_pretty(&records)?)?;
+    file.as_file().sync_all()?;
+    file.persist(home.join(WITHHELD)).map_err(|e| e.error)?;
+    Ok(result)
+}
+
+/// Where the conversation behind a claim started; `None` when its transcript or its first
+/// recorded directory cannot be found.
+fn start(claim: &link::Link) -> Option<PathBuf> {
+    let transcript = claim.resolve()?;
+    let start = crate::tui::screens::selector::recorded_cwd(&transcript)?;
+    Path::new(&start).canonicalize().ok()
+}
+
+/// Whether a branch carries the name a project capture gives a session. A resumed conversation
+/// keeps recording into that branch under a new session id, so the name, not the current claim,
+/// says that the branch began as a capture.
+fn is_capture_branch(branch: &str) -> bool {
+    branch
+        .strip_prefix("project-")
+        .and_then(|rest| rest.rsplit_once('-'))
+        .is_some_and(|(runtime, hash)| {
+            !runtime.is_empty() && hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
+/// The capture rule applied to one branch of the projects' repository, given every claim that
+/// records into it, current or superseded.
+///
+/// The conversation that opened a capture branch is judged by where it started, and the branch is
+/// sound when any project bound to the repository contains that start: the same repository may be
+/// bound from several folders, and a conversation that belongs to one of them is not outside
+/// because it is outside another. A branch the user named, without a capture's name, is theirs
+/// and only an exclusion withholds it.
+fn judge(projects: &[Project], branch: &str, claims: &[link::Link]) -> Option<Withholding> {
+    let excluded = claims.iter().any(|claim| {
+        let session = key(&claim.source, &claim.session_id);
+        projects.iter().any(|p| p.excluded.contains(&session))
+    });
+    if excluded {
+        return Some(Withholding::Excluded);
+    }
+    if !is_capture_branch(branch) {
+        return None;
+    }
+    let opener = claims
+        .iter()
+        .find(|claim| capture_branch(&claim.source, &claim.session_id) == branch);
+    match opener.and_then(start) {
+        Some(start)
+            if projects
+                .iter()
+                .any(|p| includes(p, &start).unwrap_or(false)) =>
+        {
+            None
+        }
+        Some(_) => Some(Withholding::StartedOutside),
+        None => Some(Withholding::UnknownStart),
+    }
+}
+
+/// Every claim, current or superseded, that records into `owner/agent@branch`.
+fn recording_into(all: &[link::Link], owner: &str, agent: &str, branch: &str) -> Vec<link::Link> {
+    all.iter()
+        .filter(|claim| {
+            claim.agent.as_deref() == Some(agent)
+                && claim.branch.as_deref() == Some(branch)
+                && claim.owner.as_deref().is_none_or(|o| o == owner)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Why `slug@branch` must not be published from this machine, if it must not.
+///
+/// Publication checks the capture rule again instead of trusting the claim: a claim made under a
+/// looser rule, or one the user excluded afterwards, would otherwise upload a conversation the
+/// project never had the right to capture.
+pub(crate) fn withheld(slug: &str, branch: &str) -> Result<Option<Withholding>> {
+    if let Some(record) = withheld_records()?
+        .into_iter()
+        .find(|r| r.repository == slug && r.branch == branch)
+    {
+        return Ok(Some(record.reason));
+    }
+    let projects: Vec<_> = policies()?
+        .into_iter()
+        .filter(|p| p.repository == slug)
+        .collect();
+    if projects.is_empty() {
+        return Ok(None);
+    }
+    // An excluded session's capture branch stays withheld after its claim is gone.
+    let excluded_branch = projects.iter().flat_map(|p| &p.excluded).any(|session| {
+        session
+            .split_once(':')
+            .is_some_and(|(runtime, id)| capture_branch(runtime, id) == branch)
+    });
+    if excluded_branch {
+        return Ok(Some(Withholding::Excluded));
+    }
+    let (owner, agent) = super::parse_slug(slug)?;
+    let store = Store::at(config::store_root()?);
+    let claims = recording_into(&link::list(&store), &owner, &agent, branch);
+    Ok(judge(&projects, branch, &claims))
+}
+
+/// Whether a project on this machine is bound to `slug`, so `project drop` can act on its branches.
+pub(crate) fn binds(slug: &str) -> bool {
+    policies().is_ok_and(|projects| projects.iter().any(|p| p.repository == slug))
+}
+
+/// Withholds the branch for good, then releases its current claims: the branch keeps its local
+/// history, and no session records into it any more.
+fn release(
+    store: &Store,
+    slug: &str,
+    branch: &str,
+    claims: &[link::Link],
+    reason: Withholding,
+    announced: bool,
+) -> Result<()> {
+    let session = claims
+        .iter()
+        .find(|c| c.is_active())
+        .map(|c| key(&c.source, &c.session_id));
+    update_withheld(|records| {
+        if !records
+            .iter()
+            .any(|r| r.repository == slug && r.branch == branch)
+        {
+            records.push(Withheld {
+                repository: slug.into(),
+                branch: branch.into(),
+                session: session.clone(),
+                reason,
+                announced,
+            });
+        }
+    })?;
+    let (owner, agent) = super::parse_slug(slug)?;
+    for claim in claims.iter().filter(|c| c.is_active()) {
+        let _guard = link::lock(store, &claim.source, &claim.session_id)?;
+        if link::get(store, &claim.source, &claim.session_id)
+            .is_some_and(|current| link::claims_branch(&current, &owner, &agent, branch))
+        {
+            fs::remove_file(link::link_path(store, &claim.source, &claim.session_id))?;
+        }
+    }
+    Ok(())
+}
+
+/// Judges this machine's existing claims once, so a claim made under a looser capture rule is
+/// dropped without the user having to know a command, and records what it dropped for
+/// [`announce_dropped`]. A failure leaves the judgement for the next command; publication checks
+/// each branch on its own meanwhile.
+pub fn recheck_claims(announce: bool) {
+    let _ = recheck();
+    if announce {
+        let _ = announce_dropped();
+    }
+}
+
+fn recheck() -> Result<()> {
+    let home = home()?;
+    if !home.is_dir() || home.join(RECHECKED).exists() {
+        return Ok(());
+    }
+    let projects = policies()?;
+    let store = Store::at(config::store_root()?);
+    let all = link::list(&store);
+    let branches: BTreeSet<_> = all
+        .iter()
+        .filter(|c| c.is_active())
+        .filter_map(|c| Some((c.owner.clone()?, c.agent.clone()?, c.branch.clone()?)))
+        .collect();
+    for (owner, agent, branch) in branches {
+        let slug = format!("{owner}/{agent}");
+        let bound: Vec<_> = projects
+            .iter()
+            .filter(|p| p.repository == slug)
+            .cloned()
+            .collect();
+        if bound.is_empty() {
+            continue;
+        }
+        let claims = recording_into(&all, &owner, &agent, &branch);
+        // A start that cannot be found is withheld at publication but not dropped: the claim
+        // may be sound, and only the user can tell.
+        match judge(&bound, &branch, &claims) {
+            None | Some(Withholding::UnknownStart) => {}
+            Some(reason) => release(&store, &slug, &branch, &claims, reason, false)?,
+        }
+    }
+    fs::write(home.join(RECHECKED), b"1\n")?;
+    Ok(())
+}
+
+/// Says once which claims [`recheck`] dropped.
+fn announce_dropped() -> Result<()> {
+    if !withheld_records()?.iter().any(|r| !r.announced) {
+        return Ok(());
+    }
+    let dropped = update_withheld(|records| {
+        records
+            .iter_mut()
+            .filter(|r| !r.announced)
+            .map(|r| {
+                r.announced = true;
+                format!(
+                    "{}@{}: {}; its history: `agit log {}@{}`",
+                    r.repository,
+                    r.branch,
+                    r.reason.describe(),
+                    r.repository,
+                    r.branch
+                )
+            })
+            .collect::<Vec<_>>()
+    })?;
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    ui::warning(&format!(
+        "these conversations will not be uploaded from this computer; their local history stays:\n  {}",
+        dropped.join("\n  ")
+    ));
+    ui::hint("a copy already pushed to the Hub stays there until you remove it on the Hub");
+    Ok(())
+}
+
+/// Keeps a project from capturing the session into a new branch.
+fn exclude(root: &Path, session: &str) -> Result<()> {
+    let _guard = lock(root)?;
+    if let Some(mut current) = read(root)?
+        && current.excluded.insert(session.into())
+    {
+        save(&current)?;
+    }
+    Ok(())
+}
+
+/// The branch of the conversation this command runs in. A conversation recorded into no branch
+/// is only excluded from the project its start belongs to, and `None` is returned.
+fn this_conversation() -> Result<Option<String>> {
+    let sessions = super::context::runtime_sessions();
+    let [session] = sessions.as_slice() else {
+        anyhow::bail!(
+            "{}; name the conversation as OWNER/REPO@BRANCH",
+            if sessions.is_empty() {
+                "this command does not run inside a conversation"
+            } else {
+                "the environment names several conversations"
+            }
+        );
+    };
+    if session.target.is_some() {
+        return Ok(session.target.clone());
+    }
+    let start = link::Link::new(session.runtime, &session.session_id, None)
+        .resolve()
+        .and_then(|transcript| crate::tui::screens::selector::recorded_cwd(&transcript))
+        .and_then(|start| Path::new(&start).canonicalize().ok());
+    if let Some(start) = start
+        && let Some(project) = nearest(&start)?
+        && includes(&project, &start)?
+    {
+        exclude(&project.root, &key(session.runtime, &session.session_id))?;
+    }
+    Ok(None)
+}
+
+fn drop_command(target: Option<&str>) -> CmdResult {
+    let target = match target {
+        Some(target) => target.to_owned(),
+        None => match this_conversation()? {
+            Some(target) => target,
+            None => {
+                println!(
+                    "This conversation will not be uploaded from this computer; its local history stays."
+                );
+                return Ok(ExitCode::Ok);
+            }
+        },
+    };
+    let (repository, branch) = target
+        .split_once('@')
+        .filter(|(_, branch)| !branch.is_empty())
+        .context("name the conversation as OWNER/REPO@BRANCH")?;
+    let (owner, agent) = super::parse_slug(repository)?;
+    let projects: Vec<_> = policies()?
+        .into_iter()
+        .filter(|p| p.repository == repository)
+        .collect();
+    ensure!(
+        !projects.is_empty(),
+        "no project on this machine is bound to {repository}"
+    );
+    let store = Store::at(config::store_root()?);
+    let claims = link::active_for_branch(&store, &owner, &agent, branch);
+    for claim in &claims {
+        for project in &projects {
+            exclude(&project.root, &key(&claim.source, &claim.session_id))?;
+        }
+    }
+    release(
+        &store,
+        repository,
+        branch,
+        &claims,
+        Withholding::Dropped,
+        true,
+    )?;
+    println!("{target} will not be uploaded from this computer; its local history stays.");
+    ui::hint("a copy already pushed to the Hub stays there until you remove it on the Hub");
+    Ok(ExitCode::Ok)
+}
+
 pub(crate) fn registration_scope(cwd: &Path) -> bool {
     nearest(cwd)
         .ok()
@@ -799,6 +1226,9 @@ pub(crate) fn registration_scope(cwd: &Path) -> bool {
 }
 
 pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<bool> {
+    if withheld(slug, branch)?.is_some() {
+        return Ok(true);
+    }
     let meta = crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))?
         .context("cannot verify project policy without branch metadata")?;
     if meta.is_file_line() {
@@ -1131,5 +1561,172 @@ mod tests {
         repo.add_all().unwrap();
         repo.commit("Unavailable project directory").unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", "work").is_err());
+    }
+
+    /// A Claude Code transcript that starts in `start`, and the project capture claim on it.
+    fn captured(project: &Project, id: &str, start: &Path) -> link::Link {
+        let native = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+            .join("projects")
+            .join(adapter::claude_code::slug_for(start));
+        fs::create_dir_all(&native).unwrap();
+        let record = |cwd: &Path| serde_json::json!({"type": "user", "sessionId": id, "cwd": cwd});
+        fs::write(
+            native.join(format!("{id}.jsonl")),
+            format!("{}\n{}\n", record(start), record(&project.root)),
+        )
+        .unwrap();
+        // A capture records the hook's directory, so the claim itself names the project.
+        let mut claim = link::Link::new("claude-code", id, Some(&project.root));
+        claim.owner = Some("alice".into());
+        claim.agent = Some("app".into());
+        claim.branch = Some(capture_branch("claude-code", id));
+        link::write(&Store::at(config::store_root().unwrap()), &claim).unwrap();
+        claim
+    }
+
+    /// Publication judges a project capture branch by where its conversation started and by the
+    /// project's exclusions, not by the claim: a branch captured from a conversation started
+    /// outside the folder, or a session excluded later, is refused by push and by automatic push
+    /// while push.auto is on, and so is such a branch after a resume moved it to a new session id.
+    /// A gate that trusted the claim would upload these; one that judged a conversation by every
+    /// folder bound to the repository would refuse a conversation of the other folder; one that
+    /// withheld every capture branch would stop the project's own sessions.
+    #[test]
+    fn publication_rechecks_the_capture_rule_whatever_the_claim_says() {
+        if !isolated("publication_rechecks_the_capture_rule_whatever_the_claim_says") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut project = project(work.path());
+        save(&project).unwrap();
+        let inside = captured(
+            &project,
+            "aaaaaaaa-0000-4000-8000-000000000021",
+            &project.root,
+        );
+        let strayed = captured(
+            &project,
+            "bbbbbbbb-0000-4000-8000-000000000022",
+            &outside.path().canonicalize().unwrap(),
+        );
+        let excluded = captured(
+            &project,
+            "cccccccc-0000-4000-8000-000000000023",
+            &project.root,
+        );
+        project
+            .excluded
+            .insert(key(&excluded.source, &excluded.session_id));
+        save(&project).unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let second = super::tests::project(second.path());
+        save(&second).unwrap();
+        let elsewhere = captured(
+            &second,
+            "dddddddd-0000-4000-8000-000000000024",
+            &second.root,
+        );
+        let resumed = captured(
+            &project,
+            "eeeeeeee-0000-4000-8000-000000000025",
+            &outside.path().canonicalize().unwrap(),
+        );
+        let store = Store::at(config::store_root().unwrap());
+        let mut successor = resumed.clone();
+        successor.session_id = "ffffffff-0000-4000-8000-000000000026".into();
+        link::write(&store, &successor).unwrap();
+        let mut superseded = resumed.clone();
+        superseded.superseded_by = Some(successor.instance());
+        link::write(&store, &superseded).unwrap();
+        let branch = |claim: &link::Link| claim.branch.clone().unwrap();
+        assert_eq!(withheld("alice/app", &branch(&inside)).unwrap(), None);
+        assert_eq!(withheld("alice/app", &branch(&elsewhere)).unwrap(), None);
+        assert_eq!(
+            withheld("alice/app", &branch(&resumed)).unwrap(),
+            Some(Withholding::StartedOutside)
+        );
+        assert_eq!(
+            withheld("alice/app", &branch(&strayed)).unwrap(),
+            Some(Withholding::StartedOutside)
+        );
+        assert_eq!(
+            withheld("alice/app", &branch(&excluded)).unwrap(),
+            Some(Withholding::Excluded)
+        );
+        let repo = Repo::init(&work.path().join("repo")).unwrap();
+        assert!(blocks_auto_push(&repo, "alice/app", &branch(&strayed)).unwrap());
+    }
+
+    /// Existing claims are judged without a command: a claim captured from a conversation started
+    /// outside the folder is dropped and stays withheld once its link is gone, the drop is said
+    /// once, and sound claims are kept, including one of another folder bound to the repository. `project drop` releases a claim the user names the same
+    /// way and excludes its session, so the project does not capture it again.
+    #[test]
+    fn existing_claims_are_rechecked_once_and_can_be_dropped() {
+        if !isolated("existing_claims_are_rechecked_once_and_can_be_dropped") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        save(&project).unwrap();
+        let store = Store::at(config::store_root().unwrap());
+        let inside = captured(
+            &project,
+            "aaaaaaaa-0000-4000-8000-000000000031",
+            &project.root,
+        );
+        let strayed = captured(
+            &project,
+            "bbbbbbbb-0000-4000-8000-000000000032",
+            &outside.path().canonicalize().unwrap(),
+        );
+        let second = tempfile::tempdir().unwrap();
+        let second = super::tests::project(second.path());
+        save(&second).unwrap();
+        let elsewhere = captured(
+            &second,
+            "cccccccc-0000-4000-8000-000000000033",
+            &second.root,
+        );
+        recheck_claims(false);
+        assert!(link::get(&store, &elsewhere.source, &elsewhere.session_id).is_some());
+        assert!(link::get(&store, &strayed.source, &strayed.session_id).is_none());
+        assert!(link::get(&store, &inside.source, &inside.session_id).is_some());
+        assert_eq!(
+            withheld("alice/app", strayed.branch.as_deref().unwrap()).unwrap(),
+            Some(Withholding::StartedOutside)
+        );
+        let unannounced = || {
+            withheld_records()
+                .unwrap()
+                .iter()
+                .filter(|r| !r.announced)
+                .count()
+        };
+        assert_eq!(unannounced(), 1);
+        recheck_claims(true);
+        assert_eq!(unannounced(), 0);
+
+        let target = format!("alice/app@{}", inside.branch.as_deref().unwrap());
+        run(Args {
+            action: Action::Drop {
+                target: Some(target),
+            },
+        })
+        .unwrap();
+        assert!(link::get(&store, &inside.source, &inside.session_id).is_none());
+        assert_eq!(
+            withheld("alice/app", inside.branch.as_deref().unwrap()).unwrap(),
+            Some(Withholding::Dropped)
+        );
+        assert!(
+            read(&project.root)
+                .unwrap()
+                .unwrap()
+                .excluded
+                .contains(&key(&inside.source, &inside.session_id))
+        );
     }
 }

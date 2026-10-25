@@ -273,6 +273,20 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     None
 }
 
+/// Commands that prepare local storage also judge existing project claims, once per machine. A
+/// hook's output does not reach the user, so what was dropped is said by the next other command.
+fn recheck_project_claims(command: &Commands) {
+    match command {
+        Commands::Hooks(_)
+        | Commands::Project(commands::project::Args {
+            action: commands::project::Action::Capture { .. },
+        }) => commands::project::recheck_claims(false),
+        Commands::Project(_) => commands::project::recheck_claims(true),
+        _ if startup_for(command) == Startup::Migrate => commands::project::recheck_claims(true),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Startup {
     Migrate,
@@ -418,6 +432,7 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
     agit::telemetry::observe(agit::telemetry::Observation::Stage("dispatch"));
+    recheck_project_claims(&cmd);
     let _echo = commands::echo::Invocation::enter(&cmd, json);
     let result = match cmd {
         Commands::Login(a) => commands::login::run(a),

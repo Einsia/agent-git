@@ -97,6 +97,10 @@ pub(super) fn after_settlement(
         Ok(output) if output.status.success() => {
             if !quiet {
                 ui::success(&format!("automatically pushed {target}"));
+                // The next turn uploads again, so the way to stop it comes with the notice.
+                if super::project::binds(slug) {
+                    ui::hint(&format!("not this one? `agit project drop {target}`"));
+                }
             }
         }
         _ => {

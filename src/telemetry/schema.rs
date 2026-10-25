@@ -569,6 +569,10 @@ mod tests {
             assert_eq!(value["arg_path"], true);
             assert!(!value.to_string().contains("private-canary"));
         }
+        let value = capture(&["agit", "project", "drop", "private-canary/repo@branch"]);
+        assert_eq!(value["command_path"], "project drop");
+        assert_eq!(value["arg_target"], true);
+        assert!(!value.to_string().contains("private-canary"));
     }
 
     #[test]
