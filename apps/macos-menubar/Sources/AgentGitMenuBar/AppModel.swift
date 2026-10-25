@@ -83,7 +83,7 @@ final class AppModel: ObservableObject {
         if cli == nil {
             problems.append(Problem(
                 id: "cli", title: "agit was not found on this Mac",
-                detail: "Install it with npx -y create-agit, or choose the agit program.",
+                detail: "Install it with npx -y create-agit@latest, or choose the agit program.",
                 fix: .chooseCLI))
             return problems
         }
