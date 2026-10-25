@@ -27,6 +27,12 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   `call_id`, Claude Code tool-use IDs, thinking signatures and encrypted reasoning are never
   rewritten, so a resumed session keeps its call pairing and verified reasoning.
 
+- Hub requests no longer fail after a fixed 30 seconds. agit bounds connecting to the Hub and each
+  wait for data once connected, so a large upload or a busy Hub keeps going while data moves. A Hub
+  that sends nothing for 150 seconds is reported as stalled, with a note that the request may still
+  complete on the Hub. Upgrade and large-file transfers use the same bounds, and Hub JSON responses
+  may be up to 64 MiB.
+
 ### Fixed
 
 - Claude Code 2.1.3xx sessions save again. Those versions write request snapshots that repeat tool
