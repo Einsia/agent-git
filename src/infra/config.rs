@@ -287,6 +287,18 @@ pub fn secret_keystore() -> Result<SecretKeystore> {
     }
 }
 
+/// Whether automatic privacy replacement includes bare high-entropy tokens.
+pub const PRIVACY_ENTROPY_KEY: &str = "privacy.entropy";
+
+/// `replace` opts into replacing bare entropy findings; anything else, including an unset or
+/// unreadable configuration, keeps them report-only.
+pub fn privacy_entropy_replace() -> bool {
+    get_global(PRIVACY_ENTROPY_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|value| value == "replace")
+}
+
 /// The config keys an environment variable overrides, and the variable.
 const ENV_OVERRIDES: [(&str, &str); 2] = [
     ("hub.url", "AGIT_HUB_URL"),

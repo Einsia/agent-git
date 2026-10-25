@@ -8,7 +8,7 @@ use clap::Args as ClapArgs;
 
 /// The full set of valid keys. Adding a key means editing here; an unknown key is always rejected
 /// and this table printed.
-pub const KEYS: [(&str, &str); 7] = [
+pub const KEYS: [(&str, &str); 8] = [
     (
         "hub.url",
         "default hub address (AGIT_HUB_URL takes priority)",
@@ -33,6 +33,10 @@ pub const KEYS: [(&str, &str); 7] = [
     (
         config::SecretKeystore::KEY,
         "where the global registration key lives: os (system credential store) | file (private file under AGIT_HOME/keystore; AGIT_SECRETS_KEYSTORE takes priority)",
+    ),
+    (
+        config::PRIVACY_ENTROPY_KEY,
+        "bare high-entropy values in newly captured content: report (left unchanged) | replace (stored as reversible placeholders)",
     ),
 ];
 
@@ -413,6 +417,7 @@ fn default_value(key: &str) -> Option<&'static str> {
         "push.auto" => Some("false"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
+        config::PRIVACY_ENTROPY_KEY => Some("report"),
         _ => None,
     }
 }
@@ -430,6 +435,7 @@ pub(crate) fn validate(key: &str, v: &str) -> crate::Result<()> {
         "runtime.default" => crate::adapter::normalize(v).is_ok(),
         "hub.url" => v.starts_with("http://") || v.starts_with("https://"),
         "secrets.keystore" => config::SecretKeystore::parse(v).is_some(),
+        config::PRIVACY_ENTROPY_KEY => matches!(v, "report" | "replace"),
         _ => false,
     };
     if !ok {

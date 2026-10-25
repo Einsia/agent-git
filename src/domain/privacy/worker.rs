@@ -103,6 +103,9 @@ fn route(
 
 fn stamp(repo: Option<&Path>) -> Vec<(u64, Option<std::time::SystemTime>)> {
     let mut paths = vec![];
+    if let Ok(path) = crate::infra::config::global_config_path() {
+        paths.push(path);
+    }
     if let Ok(path) = crate::infra::config::secret_filter_vault_path() {
         paths.push(path);
     }
@@ -415,7 +418,12 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             complete,
         };
         projector.policy =
-            management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?;
+            management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?
+                .with_entropy(if crate::infra::config::privacy_entropy_replace() {
+                    super::detector::Entropy::Include
+                } else {
+                    super::detector::Entropy::Exclude
+                });
         let policy_generation = projector.store.policy_generation()?;
         *loaded = Some(Loaded {
             repo: request.repo.clone(),

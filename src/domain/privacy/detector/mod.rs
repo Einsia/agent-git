@@ -186,7 +186,7 @@ pub struct Span {
 }
 
 pub(crate) fn raw_hits(text: &str, credential_field: bool) -> Vec<Span> {
-    let mut hits = raw_hits_capped(text, usize::MAX, |_, _| true).0;
+    let mut hits = raw_hits_capped(text, usize::MAX, Entropy::Include, |_, _| true).0;
     if credential_field {
         let view = view_of(text);
         for (start, end) in entropy_candidate_spans(&view, true) {
@@ -235,12 +235,28 @@ impl SpanBudget {
     }
 }
 
+/// Whether heuristic findings join: bare high-entropy tokens and the vendored generic key rule.
+/// Entropy shows that a value is opaque, and the generic rule fires on any opaque value after a
+/// name containing words such as `auth` or `key` and nearly any separator, so neither shows that
+/// a value is a credential. Automatic replacement excludes them unless the user opts in; explicit
+/// diagnostics include them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entropy {
+    Include,
+    Exclude,
+}
+
 pub(crate) fn raw_hits_capped(
     text: &str,
     cap: usize,
+    entropy: Entropy,
     keep: impl FnMut(&str, usize) -> bool,
 ) -> (Vec<Span>, bool) {
-    raw_hits_capped_in(&view_of(text), cap, &entropy_exempt_regions(text), keep)
+    let exempt = match entropy {
+        Entropy::Include => entropy_exempt_regions(text),
+        Entropy::Exclude => Vec::new(),
+    };
+    raw_hits_capped_in(&view_of(text), cap, &exempt, entropy, keep)
 }
 
 pub(crate) fn entropy_exempt_regions(text: &str) -> Vec<(usize, usize)> {
@@ -269,6 +285,7 @@ pub(crate) fn raw_hits_capped_in(
     view: &str,
     cap: usize,
     media: &[(usize, usize)],
+    entropy: Entropy,
     mut keep: impl FnMut(&str, usize) -> bool,
 ) -> (Vec<Span>, bool) {
     let mut out: Vec<Span> = vec![];
@@ -280,6 +297,9 @@ pub(crate) fn raw_hits_capped_in(
     let json_regions = std::cell::OnceCell::new();
     let mut failed = !rules::healthy();
     for rule in rules::candidates(view) {
+        if entropy == Entropy::Exclude && rule.id == GENERIC_RULE {
+            continue;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(re) = rule.regex() else {
                 failed = true;
@@ -348,10 +368,7 @@ pub(crate) fn raw_hits_capped_in(
         }
     }
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for (start, end) in bare_candidate_spans(view) {
-            if media::contains(media, start, end) {
-                continue;
-            }
+        for (start, end) in credential_assignment_spans(view) {
             let secret = &view[start..end];
             if rules::preset_allows(secret) || !keep(secret, start) {
                 continue;
@@ -360,7 +377,7 @@ pub(crate) fn raw_hits_capped_in(
                 break;
             }
             out.push(Span {
-                rule: "high-entropy-value",
+                rule: "credential-assignment",
                 start,
                 end,
             });
@@ -370,9 +387,290 @@ pub(crate) fn raw_hits_capped_in(
     {
         failed = true;
     }
+    if entropy == Entropy::Include
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (start, end) in bare_candidate_spans(view) {
+                if media::contains(media, start, end) {
+                    continue;
+                }
+                let secret = &view[start..end];
+                if rules::preset_allows(secret) || !keep(secret, start) {
+                    continue;
+                }
+                if !budget.charge(start, end) {
+                    break;
+                }
+                out.push(Span {
+                    rule: "high-entropy-value",
+                    start,
+                    end,
+                });
+            }
+        }))
+        .is_err()
+    {
+        failed = true;
+    }
     out.sort_by_key(|h| (h.start, h.end));
     dedupe_same_span(&mut out);
     (out, budget.exhausted || failed)
+}
+
+/// A credential-named field or variable supplies the evidence that a value's characters cannot:
+/// assigned values are findings even with the punctuation passwords carry, which the vendored
+/// generic rule's value class excludes. A quoted value is taken whole, up to its closing quote or,
+/// in text cut short, to where the text ends. Names that describe where
+/// or how a credential is used (endpoints, paths, types) and values that refer to other code,
+/// configuration or locations are not credentials, and neither is an unquoted value that reads as
+/// code: a path (`secret_filter::Session`), a reference (`token: &State`) or an identifier.
+static CREDENTIAL_ASSIGNMENT: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r#"(?i)([A-Za-z0-9_.-]{0,40}(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[A-Za-z0-9_.-]{0,24})["']?[ \t]{0,3}(?::=|=>|=|:)[ \t]{0,3}(?:"([^"\s]{8,256})"?|'([^'\s]{8,256})'?|`([^`\s]{8,256})`?|([^\s"'`;,<>(){}\[\]\\]{10,256}))"#,
+        )
+        .ok()
+    },
+);
+
+const NON_CREDENTIAL_NAMES: [&str; 28] = [
+    "endpoint",
+    "url",
+    "uri",
+    "path",
+    "file",
+    "dir",
+    "type",
+    "name",
+    "id",
+    "ids",
+    "count",
+    "length",
+    "limit",
+    "ttl",
+    "expiry",
+    "expires",
+    "expires_in",
+    "header",
+    "prefix",
+    "format",
+    "size",
+    "kind",
+    "mode",
+    "env",
+    "var",
+    "label",
+    "scope",
+    "method",
+];
+
+/// File extensions: a name ending in one is a file, as in search output (`secrets.md:42:…`).
+const FILE_EXTENSIONS: [&str; 24] = [
+    "md", "mdx", "txt", "log", "rs", "ts", "tsx", "js", "jsx", "mjs", "py", "go", "java", "kt",
+    "swift", "rb", "php", "json", "jsonl", "yaml", "yml", "toml", "sh", "sql",
+];
+
+/// Things whose `token` names a document, page or cursor rather than a credential, such as
+/// `file_token`, `node_token` or `nextPageToken`.
+const RESOURCE_TOKEN_OWNERS: [&str; 13] = [
+    "file",
+    "node",
+    "obj",
+    "doc",
+    "docs",
+    "base",
+    "wiki",
+    "sheet",
+    "folder",
+    "page",
+    "cursor",
+    "continuation",
+    "sync",
+];
+
+pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
+    let Some(pattern) = CREDENTIAL_ASSIGNMENT.as_ref() else {
+        return Vec::new();
+    };
+    pattern
+        .captures_iter(text)
+        .filter(|captures| {
+            captures
+                .get(1)
+                .is_some_and(|name| credential_name(name.as_str()))
+        })
+        .filter_map(|captures| {
+            let name = captures.get(1)?;
+            (2..=5).find_map(|group| {
+                captures.get(group).map(|value| {
+                    let shape = if group < 5 {
+                        Shape::Quoted
+                    } else {
+                        Shape::Unquoted {
+                            in_code: code_context(text, name, value),
+                        }
+                    };
+                    (value, shape)
+                })
+            })
+        })
+        .filter(|(value, shape)| assigned_credential(value.as_str(), *shape))
+        .map(|(value, _)| (value.start(), value.end()))
+        .collect()
+}
+
+/// A field named for a credential whose whole value has the shape of one.
+#[cfg(feature = "secret-vault")]
+pub(crate) fn credential_field_value(field: &str, value: &str) -> bool {
+    let probe = format!("{field} = 0123456789aB");
+    let named = field.len() <= 64
+        && CREDENTIAL_ASSIGNMENT
+            .as_ref()
+            .and_then(|pattern| pattern.captures(&probe))
+            .and_then(|captures| captures.get(1))
+            .is_some_and(|name| name.as_str() == field && credential_name(field));
+    named
+        && (8..=256).contains(&value.len())
+        && !value.contains(['\n', '\r'])
+        && assigned_credential(value, Shape::Quoted)
+}
+
+fn credential_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let last = name.rsplit(['_', '-', '.']).next().unwrap_or_default();
+    let compact: String = name.chars().filter(|c| !"_-.".contains(*c)).collect();
+    let file = name.contains('.') && FILE_EXTENSIONS.contains(&last);
+    !file
+        && !NON_CREDENTIAL_NAMES.contains(&last)
+        && !NON_CREDENTIAL_NAMES
+            .iter()
+            .any(|suffix| suffix.len() > 3 && name.ends_with(suffix))
+        && !compact.strip_suffix("token").is_some_and(|owner| {
+            RESOURCE_TOKEN_OWNERS
+                .iter()
+                .any(|resource| owner.ends_with(resource))
+        })
+}
+
+/// How an assigned value is written.
+#[derive(Clone, Copy)]
+enum Shape {
+    Quoted,
+    /// `in_code`: the assignment is a program declaration, so an identifier there names code
+    /// rather than holding a value.
+    Unquoted {
+        in_code: bool,
+    },
+}
+
+/// Keywords of program declarations, possibly with `mut` between keyword and name. Shell
+/// `local` and `readonly` are absent: they declare variables whose values are literal data.
+const DECLARATIONS: [&str; 7] = ["const", "let", "var", "val", "final", "mut", "static"];
+
+/// Whether an unquoted assignment is a program declaration (`const token = …`,
+/// `let mut secret = …`): a declaration keyword right before the name and an `=` with
+/// whitespace on both sides. Shell, `.env`, INI and YAML assignments, including shell
+/// `local NAME=…` and YAML flow mappings, are not, whatever follows the value.
+fn code_context(text: &str, name: regex::Match<'_>, value: regex::Match<'_>) -> bool {
+    let line = text[..name.start()]
+        .rsplit(['\n', '\r'])
+        .next()
+        .unwrap_or_default();
+    let declared = line
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .rfind(|word| !word.is_empty())
+        .is_some_and(|word| line.trim_end().ends_with(word) && DECLARATIONS.contains(&word));
+    let between = &text[name.end()..value.start()];
+    let spaced = between.starts_with([' ', '\t'])
+        && between.trim_start().starts_with('=')
+        && !between.trim_start().starts_with("=>")
+        && between.trim_start()[1..].starts_with([' ', '\t']);
+    declared && spaced
+}
+
+/// Whether an assigned value has a credential's shape. An unquoted path or reference
+/// (`secret_filter::Session`, `token: &State`) is code; so is a digit-free camel-case identifier
+/// in a program declaration. Elsewhere a camel-shaped value is still a credential, since random
+/// and passphrase passwords take that shape too.
+fn assigned_credential(value: &str, shape: Shape) -> bool {
+    let code = match shape {
+        Shape::Quoted => false,
+        Shape::Unquoted { in_code } => {
+            value.starts_with([':', '&', '*'])
+                || (in_code
+                    && value.bytes().all(|byte| byte.is_ascii_alphabetic())
+                    && value.bytes().skip(1).any(|byte| byte.is_ascii_uppercase())
+                    && camel_identifier(value))
+        }
+    };
+    let identifier = |part: &str| {
+        part.bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let environment = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| value.strip_prefix('$'))
+        .or_else(|| {
+            value
+                .strip_prefix('%')
+                .and_then(|rest| rest.strip_suffix('%'))
+        })
+        .is_some_and(identifier);
+    let path = ["/", "~/", "./", "../"]
+        .iter()
+        .any(|root| value.starts_with(root))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-~".contains(&byte));
+    let location = value.contains("://") || path;
+    let reference = environment
+        || location
+        || (value.contains('.') && value.split('.').all(identifier))
+        || (value.contains('_')
+            && value.split('_').all(|word| {
+                !word.is_empty()
+                    && (word
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                        || word.bytes().all(|byte| byte.is_ascii_lowercase()))
+            }));
+    let mixed_alpha = value.bytes().any(|byte| byte.is_ascii_uppercase())
+        && value.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_digit = value.bytes().any(|byte| byte.is_ascii_digit());
+    !code && !reference && (mixed_alpha || has_digit) && rules::shannon(value) >= 3.5
+}
+
+/// Words that each start with one capital and continue in lowercase letters or digits, after an
+/// optional lowercase head: `SnapshotToken`, `accessToken`.
+fn camel_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && !bytes[index].is_ascii_uppercase() {
+        if !bytes[index].is_ascii_lowercase() {
+            return false;
+        }
+        index += 1;
+    }
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_uppercase() {
+            return false;
+        }
+        index += 1;
+        let word = index;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit())
+        {
+            index += 1;
+        }
+        if index - word < 2 {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn bare_candidate_spans(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -597,8 +895,10 @@ pub(crate) fn field_value_regions(
     regions
 }
 
+const GENERIC_RULE: &str = "generic-api-key";
+
 pub(crate) fn dedupe_same_span(hits: &mut Vec<Span>) {
-    const CATCH_ALL: &str = "generic-api-key";
+    const CATCH_ALL: &str = GENERIC_RULE;
     let mut i = 0;
     while i < hits.len() {
         let mut j = i + 1;
@@ -621,16 +921,24 @@ pub struct Batch {
     pub complete: bool,
 }
 
+/// Every finding, including bare entropy, for explicit diagnostics.
 pub fn scan(text: &str, limit: usize) -> Batch {
-    scan_filtered(text, limit, |_, _| true)
+    scan_filtered(text, limit, Entropy::Include, |_, _| true)
+}
+
+/// Provider signatures, private keys and credential assignments: the findings that are
+/// replaced automatically and that the Hub re-checks after publication.
+pub fn scan_high_confidence(text: &str, limit: usize) -> Batch {
+    scan_filtered(text, limit, Entropy::Exclude, |_, _| true)
 }
 
 pub(crate) fn scan_filtered(
     text: &str,
     limit: usize,
+    entropy: Entropy,
     keep: impl FnMut(&str, usize) -> bool,
 ) -> Batch {
-    let (findings, incomplete) = raw_hits_capped(text, limit, keep);
+    let (findings, incomplete) = raw_hits_capped(text, limit, entropy, keep);
     Batch {
         findings,
         complete: !incomplete,
@@ -651,7 +959,7 @@ mod tests {
             &input[batch.findings[0].start..batch.findings[0].end],
             "AKIA2E7YQXK4NMZ5VJ3T"
         );
-        let batch = scan_filtered(input, 32, |value, _| {
+        let batch = scan_filtered(input, 32, Entropy::Include, |value, _| {
             assert!(!value.starts_with("ghp_"), "synthetic rule failure");
             true
         });

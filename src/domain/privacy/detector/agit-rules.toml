@@ -22,6 +22,14 @@ keywords = [
     "agit_lfs_",
 ]
 
+# A PostHog personal API key reads and writes a project's data. gitleaks has no PostHog rule;
+# the project key (`phc_`) is public by design and stays out.
+[[rules]]
+id = "posthog-personal-api-key"
+description = "PostHog personal API key"
+regex = '''\bphx_[A-Za-z0-9]{32,64}\b'''
+keywords = ["phx_"]
+
 # A private-key header opens a sensitive region. The shared scanner extends this
 # match through the matching footer or the end of an incomplete carrier.
 [[rules]]

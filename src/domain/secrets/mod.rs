@@ -678,9 +678,9 @@ pub fn load_allowlist(dir: &Path) -> HashSet<String> {
 
 pub use crate::domain::privacy::detector::view_of;
 use crate::domain::privacy::detector::{
-    Lines, Span as Raw, entropy_candidate_spans, entropy_exempt_regions, field_value_regions,
-    json_string_end, json_string_regions, merge_regions, raw_hits, raw_hits_capped_in,
-    semantic_match_value,
+    Entropy, Lines, Span as Raw, entropy_candidate_spans, entropy_exempt_regions,
+    field_value_regions, json_string_end, json_string_regions, merge_regions, raw_hits,
+    raw_hits_capped_in, semantic_match_value,
 };
 
 pub fn scan_text(text: &str, allowlist: &HashSet<String>) -> Vec<Hit> {
@@ -813,22 +813,27 @@ pub fn scan_text_capped_with_repository_policy(
     let mut semantic_regions = json_regions.clone();
     semantic_regions.extend(entropy_exempt_regions(text));
     let semantic_regions = merge_regions(semantic_regions);
-    let (raw, truncated) = raw_hits_capped_in(&view, cap, &semantic_regions, |found, start| {
-        if (!repository_identities.is_empty() || (policy.allowlist && !allowlist.is_empty()))
-            && semantic_match_value(text, &json_regions, start, start + found.len()).is_some_and(
-                |value| {
-                    repository_policy::allows(repository_identities, &value)
-                        || (policy.allowlist && is_allowlisted(&value, allowlist))
-                },
-            )
-        {
-            return false;
-        }
-        match &pragma_lines {
-            Some(l) => !l.text_at(start).contains(INLINE_PRAGMA),
-            None => true,
-        }
-    });
+    let (raw, truncated) = raw_hits_capped_in(
+        &view,
+        cap,
+        &semantic_regions,
+        Entropy::Include,
+        |found, start| {
+            if (!repository_identities.is_empty() || (policy.allowlist && !allowlist.is_empty()))
+                && semantic_match_value(text, &json_regions, start, start + found.len())
+                    .is_some_and(|value| {
+                        repository_policy::allows(repository_identities, &value)
+                            || (policy.allowlist && is_allowlisted(&value, allowlist))
+                    })
+            {
+                return false;
+            }
+            match &pragma_lines {
+                Some(l) => !l.text_at(start).contains(INLINE_PRAGMA),
+                None => true,
+            }
+        },
+    );
     let lines = pragma_lines.unwrap_or_else(|| Lines::new(&view));
     let mut report = ScanReport {
         binary_carriers: 0,
@@ -906,8 +911,13 @@ fn scan_semantic_strings(
                     } else {
                         entropy_exempt_regions(&decoded)
                     };
-                    let (mut raw, mut truncated) =
-                        raw_hits_capped_in(&view, remaining.saturating_add(1), &media, &mut record);
+                    let (mut raw, mut truncated) = raw_hits_capped_in(
+                        &view,
+                        remaining.saturating_add(1),
+                        &media,
+                        Entropy::Include,
+                        &mut record,
+                    );
                     if !truncated && media::contains(&credentials, start, end) {
                         for (start, end) in entropy_candidate_spans(&view, true) {
                             if !rules::preset_allows(&view[start..end])
@@ -1215,7 +1225,7 @@ pub(crate) fn oversized_finding_spans_in(
         }
         false
     };
-    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, &mut record);
+    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, Entropy::Include, &mut record);
     if credential_field {
         for (start, end) in entropy_candidate_spans(&view, true) {
             if !rules::preset_allows(&view[start..end]) {
@@ -1414,7 +1424,7 @@ fn collect_candidate(
     } else {
         entropy_exempt_regions(text)
     };
-    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, &mut record);
+    let (_, _) = raw_hits_capped_in(&view, usize::MAX, &media, Entropy::Include, &mut record);
     if field.is_some_and(is_credential_field) {
         for (start, end) in entropy_candidate_spans(&view, true) {
             if over_capacity {

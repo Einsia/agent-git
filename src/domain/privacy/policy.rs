@@ -20,6 +20,7 @@ pub struct Snapshot {
     block_sources: Vec<Source>,
     allows: Option<AhoCorasick>,
     inline_allow: bool,
+    entropy: detector::Entropy,
     pub max_literal_bytes: usize,
 }
 
@@ -76,14 +77,22 @@ impl Snapshot {
                 Some(AhoCorasick::new(allows)?)
             },
             inline_allow,
+            entropy: detector::Entropy::Exclude,
         })
     }
 
+    /// Bare entropy is replaced only after the user opts in; see `detector::Entropy`.
+    pub fn with_entropy(mut self, entropy: detector::Entropy) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
+    /// Whether the user allowed `value` as a whole; user allows override default heuristics.
     #[cfg(feature = "secret-vault")]
-    pub(crate) fn explicitly_blocks(&self, text: &str) -> bool {
-        self.blocks
+    pub(crate) fn allows(&self, value: &str) -> bool {
+        self.allows
             .as_ref()
-            .is_some_and(|blocks| blocks.is_match(text))
+            .is_some_and(|allows| allows.is_match(value))
     }
 
     pub(crate) fn explicit_findings(&self, text: &str, limit: usize) -> Batch {
@@ -116,6 +125,7 @@ impl Snapshot {
         let heuristics = detector::scan_filtered(
             text,
             limit.saturating_sub(findings.len()),
+            self.entropy,
             |value, start| {
                 !self
                     .allows
@@ -127,12 +137,34 @@ impl Snapshot {
             },
         );
         complete &= heuristics.complete;
-        findings.extend(heuristics.findings.into_iter().map(|hit| Finding {
-            start: hit.start,
-            end: hit.end,
-            source: Source::Default,
-            rule: hit.rule,
-        }));
+        // An allowed value is not replaced in part either: a heuristic hit that overlaps an
+        // occurrence of an allowed literal is the user's allowed value, not a new credential.
+        let allowed: Vec<(usize, usize)> = self
+            .allows
+            .as_ref()
+            .map(|allows| {
+                allows
+                    .find_overlapping_iter(text)
+                    .map(|hit| (hit.start(), hit.end()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        findings.extend(
+            heuristics
+                .findings
+                .into_iter()
+                .filter(|hit| {
+                    !allowed
+                        .iter()
+                        .any(|(start, end)| hit.start < *end && *start < hit.end)
+                })
+                .map(|hit| Finding {
+                    start: hit.start,
+                    end: hit.end,
+                    source: Source::Default,
+                    rule: hit.rule,
+                }),
+        );
         findings.sort_by_key(|hit| (hit.start, std::cmp::Reverse(hit.end)));
         let mut merged: Vec<Finding> = Vec::with_capacity(findings.len());
         for finding in findings {
@@ -186,6 +218,99 @@ mod tests {
         assert_eq!(batch.findings[1].source, Source::RepositoryUser);
         let allowed = Snapshot::compile(&[], &["2E7YQXK4"], false).unwrap();
         assert!(allowed.scan(secret, 32).findings.is_empty());
+    }
+
+    /// Automatic replacement covers provider credentials and values assigned to credential
+    /// names, including password punctuation, but leaves an opaque value whose only evidence is
+    /// entropy or the generic key rule unless the user opts in. A policy that kept heuristics on
+    /// by default would replace the trace identifier and the runtime's beta list; one that tied
+    /// assignment detection to entropy would leave the password; one whose assignment rule
+    /// ignored code would replace the configuration lookup, the type annotations, the document
+    /// tokens and a search result's file name; one that read every camel-shaped value as code
+    /// would leave the shell passwords.
+    #[test]
+    fn default_tier_replaces_credentials_and_reports_entropy_only_on_request() {
+        let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let password = "c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0";
+        let opaque = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
+        let posthog = "phx_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2Tq";
+        let text = format!(
+            "export GH_TOKEN={token}; password = \"{password}\"; trace {opaque}; \
+             secret_key = settings.SECRET_KEY_BASE; api_key = $OPENAI_API_KEY; \
+             token_endpoint = \"https://accounts.google.com/o/oauth2/token\"; \
+             db_password = \"$c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\"; \
+             passwd = 'c7Zq4xR2;mNv8LpT3!wYb6Ks1Hd9Fg5Jt0'; \
+             password = \"/c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\"; \
+             credential = \"~c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\"; \
+             secret_file = /run/secrets/db_password; \
+             \"betas\":[\"oauth-2025-04-20\",\"interleaved-thinking-2025-05-14\"]; \
+             fn save(token: &SnapshotStore, cred: Option<credentials::HubSession>) {{}} \
+             let secret = AccessTokenStore; \
+             {{\"file_token\": \"Bf7kQ2mXv9LpZ4tNc8Wj\", \"nextPageToken\": \"Cg7kQ2mXv9LpZ4tNc8Wj\"}}; \
+             docs/secrets.md:42:Rotate2026Keys; \
+             export DB_PASSWORD=Qc7xnvKb8lwpZj6tru \n \
+             export DB_PASSWORD=QcxnvKblwpZjtruMvx; ./start \n \
+             load() {{ local DB_PASSWORD=RdxnvKblwpZjtruMvx; }} \n \
+             readonly DB_PASSWORD=SexnvKblwpZjtruMvx \n \
+             {{DB_PASSWORD: TfxnvKblwpZjtruMvx}} \n \
+             const token = AuthenticationProvider \n \
+             let mut secret = AuthenticationProvider ; \n \
+             class Session {{ static token = AuthorizationProvider; }} \n \
+             PostHog Key: {posthog}; \
+             lastPrompt: DB_PASSWORD=\"Pf3P7wexdB!60zEEZ…"
+        );
+        let span = |batch: &Batch, value: &str| {
+            let start = text.find(value).unwrap();
+            batch
+                .findings
+                .iter()
+                .any(|hit| hit.start <= start && start + value.len() <= hit.end)
+        };
+        let default = Snapshot::compile(&[], &[], false).unwrap().scan(&text, 32);
+        assert!(span(&default, token));
+        assert!(span(&default, password));
+        assert!(!span(&default, opaque));
+        assert!(!span(&default, "settings.SECRET_KEY_BASE"));
+        assert!(!span(&default, "$OPENAI_API_KEY"));
+        assert!(!span(
+            &default,
+            "https://accounts.google.com/o/oauth2/token"
+        ));
+        assert!(span(&default, "$c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0"));
+        assert!(span(&default, "c7Zq4xR2;mNv8LpT3!wYb6Ks1Hd9Fg5Jt0"));
+        assert!(span(&default, "/c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0"));
+        assert!(span(&default, "~c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0"));
+        assert!(!span(&default, "/run/secrets/db_password"));
+        for code in [
+            "interleaved-thinking-2025-05-14",
+            "&SnapshotStore",
+            ":HubSession",
+            "AccessTokenStore",
+            "AuthenticationProvider",
+            "AuthorizationProvider",
+            "Bf7kQ2mXv9LpZ4tNc8Wj",
+            "Cg7kQ2mXv9LpZ4tNc8Wj",
+            "42:Rotate2026Keys",
+        ] {
+            assert!(!span(&default, code), "{code} is not a credential");
+        }
+        assert!(span(&default, posthog));
+        assert!(span(&default, "Qc7xnvKb8lwpZj6tru"));
+        for shell in [
+            "QcxnvKblwpZjtruMvx",
+            "RdxnvKblwpZjtruMvx",
+            "SexnvKblwpZjtruMvx",
+            "TfxnvKblwpZjtruMvx",
+        ] {
+            assert!(span(&default, shell), "{shell} is a credential");
+        }
+        assert!(span(&default, "Pf3P7wexdB!60zEEZ…"));
+        let opted_in = Snapshot::compile(&[], &[], false)
+            .unwrap()
+            .with_entropy(detector::Entropy::Include)
+            .scan(&text, 32);
+        assert!(span(&opted_in, token));
+        assert!(span(&opted_in, opaque));
     }
 
     #[test]

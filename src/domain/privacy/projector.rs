@@ -290,7 +290,6 @@ impl Projector {
                 if let Some(field) = value.pointer_mut(&pointer)
                     && let Some(text) = field.as_str()
                     && span == (0..text.len())
-                    && !self.policy.explicitly_blocks(text)
                 {
                     retained.push((pointer, field.take()));
                 }
@@ -480,18 +479,18 @@ impl Projector {
                 }
             }
         }
-        for identity in layout.fields.iter().filter(|_| !hydrate) {
-            if let Some(field) = value.pointer_mut(&identity.pointer)
-                && let Some(text) = field.as_str()
+        // Protocol identities and runtime-opaque carriers are never replaced: a placeholder there
+        // changes linkage or a verified byte sequence the runtime checks on resume.
+        let protocol = layout
+            .fields
+            .iter()
+            .map(|identity| identity.pointer.as_str())
+            .chain(layout.opaque.iter().map(String::as_str));
+        for pointer in protocol.filter(|_| !hydrate) {
+            if let Some(field) = value.pointer_mut(pointer)
+                && field.is_string()
             {
-                let next = self.protect_field(text, identity.pointer.rsplit('/').next(), true);
-                outcome.replacements += next.replacements;
-                outcome.unresolved += next.unresolved;
-                if next.status != Status::Complete {
-                    outcome.status = Status::Partial;
-                }
-                *field = Value::Null;
-                retained.push((identity.pointer.as_str(), Value::String(next.content)));
+                retained.push((pointer, field.take()));
             }
         }
         self.value(value, hydrate, outcome, None, protocol_root);
@@ -515,7 +514,7 @@ impl Projector {
                 let next = if hydrate {
                     self.hydrate(text)
                 } else {
-                    self.protect_field(text, field, false)
+                    self.protect_field(text, field)
                 };
                 *text = next.content;
                 outcome.replacements += next.replacements;
@@ -534,9 +533,6 @@ impl Projector {
                 for (field, value) in values {
                     if protocol_root
                         && !hydrate
-                        && value
-                            .as_str()
-                            .is_none_or(|text| !self.policy.explicitly_blocks(text))
                         && matches!(
                             field.as_str(),
                             "_session_id"
@@ -573,7 +569,7 @@ impl Projector {
     }
 
     fn protect(&mut self, text: &str) -> Outcome {
-        self.protect_field(text, None, false)
+        self.protect_field(text, None)
     }
 
     fn scan_encoded(&self, text: &str, decoded: &Value) -> Option<Batch> {
@@ -615,7 +611,7 @@ impl Projector {
         Some(batch)
     }
 
-    fn protect_field(&mut self, text: &str, field: Option<&str>, identity: bool) -> Outcome {
+    fn protect_field(&mut self, text: &str, field: Option<&str>) -> Outcome {
         // Decoded values keep assignment context without putting JSON escape bytes in a record.
         let prefix = field
             .filter(|field| field.len() <= 128 && field.is_ascii())
@@ -628,15 +624,6 @@ impl Projector {
         };
         let mut batch = self.policy.scan(&input, MAX_FINDINGS);
         batch.findings.retain_mut(|hit| {
-            // A typed protocol identifier supplies evidence against randomness alone. Credential
-            // signatures and explicit blocks still apply even inside a native identifier field.
-            if identity
-                && crate::adapter::protocol_ids::identifier_shape(text)
-                && hit.source == Source::Default
-                && hit.rule == "high-entropy-value"
-            {
-                return false;
-            }
             if hit.start < prefix.len() {
                 return false;
             }
@@ -644,6 +631,28 @@ impl Projector {
             hit.end -= prefix.len();
             true
         });
+        // A credential-named field delimits its value exactly, so the whole decoded value is one
+        // finding whatever punctuation, quotes included, it carries.
+        let explicit = batch
+            .findings
+            .iter()
+            .any(|hit| hit.source != Source::Default);
+        if field.is_some_and(|field| super::detector::credential_field_value(field, text))
+            && (explicit || !self.policy.allows(text))
+        {
+            let source = batch
+                .findings
+                .iter()
+                .map(|hit| hit.source)
+                .find(|source| *source != Source::Default)
+                .unwrap_or(Source::Default);
+            batch.findings = vec![super::policy::Finding {
+                start: 0,
+                end: text.len(),
+                source,
+                rule: "credential-assignment",
+            }];
+        }
         let opaque: Vec<_> = tokens(text).map(|(start, end, _)| (start, end)).collect();
         batch.findings.retain(|hit| {
             !opaque
@@ -775,8 +784,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Hidden protocol tokens share aliases with visible results, and hidden valid IDs reserve
-    /// their names before allocation. Tool arguments hydrate as data rather than protocol links.
+    /// Content saved by clients that placed tokens in protocol identifiers restores with hidden
+    /// protocol tokens sharing aliases with visible results, and hidden valid IDs reserve their
+    /// names before allocation. Tool arguments hydrate as data rather than protocol links.
     #[test]
     fn wrapped_carriers_share_materialized_aliases_and_reserve_hidden_identifiers() {
         let root = tempfile::tempdir().unwrap();
@@ -790,28 +800,33 @@ mod tests {
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let quoted = "quoted \" private value\nwith \\ escapes";
         let fragment = "\"name\":\"read\"},\"id\"";
-        let calls =
-            json!([{"id":id,"function":{"name":"read","arguments":{"id":id,"quoted":quoted}}}]);
-        let record = json!({"type":"hermes_message","data":{"role":"assistant","session_id":"session","tool_calls":calls.to_string()}});
-        let result = json!({"type":"hermes_message","data":{"role":"tool","session_id":"session","tool_call_id":id,"content":"complete"}});
-        projector.policy = Snapshot::compile(
-            &[id, quoted].map(|value| super::super::policy::Literal {
+        let mut legacy = |value: &str| {
+            let record = Record::new(
+                &projector.store.dictionary_id,
                 value,
-                source: Source::RepositoryUser,
-            }),
-            &[],
-            false,
-        )
-        .unwrap();
-        let fields = projector.transform(&format!("{record}\n{result}\n"), Mode::ProtectJsonl);
-        let baseline = crate::domain::install::repair_protocol_ids(&fields.content).unwrap();
+                Origin::RepositoryUser,
+            )
+            .unwrap();
+            projector
+                .store
+                .append(std::slice::from_ref(&record), None)
+                .unwrap();
+            let token = record.token.clone();
+            projector.dictionary.accept(record).unwrap();
+            token
+        };
+        let (id_token, quoted_token) = (legacy(id), legacy(quoted));
+        let calls = json!([{"id":id_token,"function":{"name":"read","arguments":{"id":id_token,"quoted":quoted_token}}}]);
+        let record = json!({"type":"hermes_message","data":{"role":"assistant","session_id":"session","tool_calls":calls.to_string()}});
+        let result = json!({"type":"hermes_message","data":{"role":"tool","session_id":"session","tool_call_id":id_token,"content":"complete"}});
+        let fields = format!("{record}\n{result}\n");
+        let baseline = crate::domain::install::repair_protocol_ids(&fields).unwrap();
         let baseline: Vec<Value> = baseline
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let collision = baseline[1]["data"]["tool_call_id"].as_str().unwrap();
         let mut rows: Vec<Value> = fields
-            .content
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -1115,15 +1130,52 @@ mod tests {
         }
     }
 
-    /// Native linkage survives every projection entry point. The same bytes in arguments or
-    /// results remain scannable, so a field-name allowlist cannot satisfy this contract.
+    /// A credential-named field's whole decoded value is one finding, punctuation included,
+    /// unless the user allowed that value. A field context fed to the detector as an unquoted
+    /// assignment would end the value at `;` and publish the rest; a whole-value rule that
+    /// ignored allows would override the user's decision.
+    #[test]
+    fn credential_named_fields_replace_their_whole_decoded_value() {
+        let root = tempfile::tempdir().unwrap();
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(&[], &[], false).unwrap(),
+            key: None,
+            complete: true,
+        };
+        let password = "c7Zq4xR2mNv8LpT3;mNv8L\"pT3!wYb6Ks1Hd9Fg5Jt0";
+        let record = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"passwd":password,"file_path":"/tmp/c7Zq4xR2.cfg"}}]}});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        for piece in ["c7Zq4xR2mNv8LpT3", "mNv8L", "pT3!wYb6"] {
+            assert!(!protected.content.contains(piece), "{}", protected.content);
+        }
+        assert!(protected.content.contains("/tmp/c7Zq4xR2.cfg"));
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored.content).unwrap(),
+            record
+        );
+        projector.policy = Snapshot::compile(&[], &[password], false).unwrap();
+        let allowed = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        assert_eq!(
+            serde_json::from_str::<Value>(&allowed.content).unwrap(),
+            record
+        );
+    }
+
+    /// Native linkage and runtime-opaque carriers survive every projection entry point, even
+    /// with entropy replacement opted in. The same bytes in arguments or results remain
+    /// replaceable, so a field-name allowlist cannot satisfy this contract.
     #[test]
     fn protocol_identifiers_survive_projection_without_exempting_tool_data() {
         let root = tempfile::tempdir().unwrap();
         let mut projector = Projector {
             store: Store::open(&root.path().join("privacy"), None).unwrap(),
             dictionary: Dictionary::default(),
-            policy: Snapshot::compile(&[], &[], false).unwrap(),
+            policy: Snapshot::compile(&[], &[], false)
+                .unwrap()
+                .with_entropy(crate::domain::privacy::detector::Entropy::Include),
             key: None,
             complete: true,
         };
@@ -1154,10 +1206,22 @@ mod tests {
                 "/payload/replacement_history/0/action",
             ),
             (
+                "codex",
+                json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":id}],"encrypted_content":id}}),
+                "/payload/encrypted_content",
+                "/payload/summary",
+            ),
+            (
                 "claude-code",
                 json!({"type":"assistant","message":{"role":"assistant","id":id,"content":[{"type":"tool_use","id":id,"name":"Read","input":{"id":id}}]}}),
                 "/message/content/0/id",
                 "/message/content/0/input",
+            ),
+            (
+                "claude-code",
+                json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":id,"signature":id}]}}),
+                "/message/content/0/signature",
+                "/message/content/0/thinking",
             ),
             (
                 "claude-desktop",
@@ -1263,7 +1327,8 @@ mod tests {
             &[],
             false,
         )
-        .unwrap();
+        .unwrap()
+        .with_entropy(crate::domain::privacy::detector::Entropy::Include);
         let encoded = json!({"type":"hermes_message","data":{"role":"assistant","session_id":"session","tool_calls":json!([{"id":id,"function":{"name":"read","arguments":json!({"id":id,"secret":secret}).to_string()}}]).to_string()}});
         let result = json!({"type":"hermes_message","data":{"role":"tool","session_id":"session","tool_call_id":id,"content":"complete"}});
         let transcript = format!("{encoded}\n{result}\n");
@@ -1328,13 +1393,15 @@ mod tests {
                 .content
                 .contains(id)
         );
+        // Neither a credential signature nor an explicit block rewrites a protocol identifier.
         let credential = json!({"type":"response_item","payload":{"type":"function_call","call_id":"AKIA2E7YQXK4NMZ5VJ3T","name":"read","arguments":"{}"}});
-        assert!(
-            !projector
+        let protected: Value = serde_json::from_str(
+            &projector
                 .transform(&credential.to_string(), Mode::ProtectJsonl)
-                .content
-                .contains("AKIA2E7YQXK4NMZ5VJ3T")
-        );
+                .content,
+        )
+        .unwrap();
+        assert_eq!(protected, credential);
         projector.policy = Snapshot::compile(
             &[super::super::policy::Literal {
                 value: id,
@@ -1345,12 +1412,13 @@ mod tests {
         )
         .unwrap();
         let blocked = json!({"type":"response_item","payload":{"type":"function_call","call_id":id,"name":"read","arguments":"{}"}});
-        assert!(
-            !projector
+        let protected: Value = serde_json::from_str(
+            &projector
                 .transform(&blocked.to_string(), Mode::ProtectJsonl)
-                .content
-                .contains(id)
-        );
+                .content,
+        )
+        .unwrap();
+        assert_eq!(protected, blocked);
 
         let quoted = "quoted \" private value";
         projector.policy = Snapshot::compile(

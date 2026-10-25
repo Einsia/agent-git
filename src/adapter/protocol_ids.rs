@@ -67,6 +67,10 @@ pub(crate) struct Field {
 pub(crate) struct Layout {
     pub fields: Vec<Field>,
     pub encoded: Vec<(String, Layout)>,
+    /// Runtime-opaque carriers (reasoning signatures and encrypted reasoning). A runtime
+    /// verifies them byte for byte on resume and no reader displays them, so privacy
+    /// replacement never rewrites them.
+    pub opaque: Vec<String>,
 }
 
 impl Layout {
@@ -106,12 +110,24 @@ impl Layout {
             Some("item_reference") => self.field(format!("{path}/id"), Kind::Identity),
             _ => {}
         }
+        if item["encrypted_content"].is_string() {
+            self.opaque.push(format!("{path}/encrypted_content"));
+        }
     }
 
     fn claude_message(&mut self, message: &Value) {
         self.field("/message/id", Kind::Message);
         if let Some(blocks) = message["content"].as_array() {
             for (index, block) in blocks.iter().enumerate() {
+                match block["type"].as_str() {
+                    Some("thinking") => self
+                        .opaque
+                        .push(format!("/message/content/{index}/signature")),
+                    Some("redacted_thinking") => {
+                        self.opaque.push(format!("/message/content/{index}/data"))
+                    }
+                    _ => {}
+                }
                 let field = match (message["role"].as_str(), block["type"].as_str()) {
                     (Some("assistant"), Some("tool_use" | "server_tool_use")) => "id",
                     (Some("user"), Some("tool_result")) => "tool_use_id",

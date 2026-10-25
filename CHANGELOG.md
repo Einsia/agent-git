@@ -8,6 +8,17 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Changed
+
+- Captured content has only high-confidence credentials replaced with reversible placeholders:
+  provider tokens, private keys, credential assignments and values you explicitly block. Runtime
+  identifiers, hashes, beta-feature lists, document tokens, code and other values whose only
+  evidence is high entropy or a key-like name stay unchanged; run
+  `agit config privacy.entropy replace` to replace them too. PostHog personal API keys are now
+  recognized. Protocol identifiers such as Codex
+  `call_id`, Claude Code tool-use IDs, thinking signatures and encrypted reasoning are never
+  rewritten, so a resumed session keeps its call pairing and verified reasoning.
+
 ## [0.2.26] - 2026-10-25
 
 ### Fixed

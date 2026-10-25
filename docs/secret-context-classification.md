@@ -1,6 +1,10 @@
 # Context for entropy discovery
 
 Entropy is evidence that a value may be opaque, not proof that it is a credential.
+Automatic replacement therefore excludes entropy-only findings, and those of the generic key
+rule, unless the user sets `privacy.entropy = replace` (see
+[plain publication](privacy-plain-publication.md)); the classification below decides which
+entropy findings explicit diagnostics and that opt-in see.
 Source identifiers and document references can have the same character distribution
 as credentials. Automatic protection must preserve those roles without exempting
 whole files or allowing the same bytes everywhere.
@@ -40,10 +44,10 @@ budget bounds classification work; it must never bound secret inspection.
 
 ## Native transcript identifiers
 
-Native record schemas identify linkage fields before local projection. Their
-bounded identifier values are exempt from entropy-only detection. Provider
-credential patterns and explicit blocks still apply. The same value in a tool
-argument, result, or message text remains ordinary content.
+Native record schemas identify linkage fields and runtime-opaque carriers (thinking
+signatures, redacted thinking and encrypted reasoning) before local projection. Their
+values are never rewritten: no rule, block or opt-in places a placeholder in them. The
+same value in a tool argument, result, or message text remains ordinary content.
 
 Encoded carriers also honor explicit literals in their serialized form. A block
 inside an unescaped string value is handled during decoded field scanning. A block

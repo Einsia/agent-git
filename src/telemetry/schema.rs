@@ -128,6 +128,7 @@ pub fn properties(argv: &[OsString]) -> Map<String, Value> {
             Some("push.visibility") => &["ask", "private", "public"],
             Some("memory.track") => &["session", "off"],
             Some("secrets.keystore") => &["os", "file"],
+            Some("privacy.entropy") => &["report", "replace"],
             Some("runtime.default") => &[
                 "claude-code",
                 "codex",

@@ -884,12 +884,15 @@ or a private file under `~/.agit/keystore/` for a machine with no desktop sessio
 login or a CI runner — Unix only, and a backup of `~/.agit` then carries the key along with the
 global vault; repository dictionaries keep their own local keys beside the mappings in `.git`;
 `AGIT_SECRETS_KEYSTORE` overrides it, and `agit doctor` reports whether the chosen store
-answers).
+answers) · `privacy.entropy` (`report | replace`; captured content always has provider credentials,
+private keys, credential assignments and explicitly blocked values replaced with reversible
+placeholders, while values whose only evidence is high entropy or the generic key rule stay
+unchanged unless this is `replace`).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.
-Session encryption uses each session's registered settings. New sessions default to owner-account
-encryption; existing plain sessions retain their mode.
+New sessions publish plain. Sessions that an earlier client registered as encrypted keep their
+registered mode.
 Automatic settlement is enabled by default: `commit.auto = true`. Setting it to `false` disables
 hook and supervisor settlement; explicit `agit commit` remains available. Unsetting the key
 restores the enabled default. The config list and editor show this effective default separately

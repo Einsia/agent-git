@@ -59,6 +59,7 @@ pub enum Refusal {
 /// Only status codes that stay the same on an immediate retry are refusals. Transport
 /// failures, 5xx, 408, 429 and 401 (the worker cannot renew access; the next foreground
 /// request does) keep retrying on every sync.
+#[cfg(feature = "cli")]
 pub fn classify(error: &anyhow::Error) -> Option<(Refusal, u16, String)> {
     let api = error.downcast_ref::<crate::hub::client::ApiError>()?;
     let refusal = match (api.status, api.kind.as_str()) {
@@ -69,6 +70,12 @@ pub fn classify(error: &anyhow::Error) -> Option<(Refusal, u16, String)> {
         _ => return None,
     };
     Some((refusal, api.status, api.detail.trim().to_owned()))
+}
+
+/// Without the CLI's Hub client no transport error carries a Hub status to classify.
+#[cfg(not(feature = "cli"))]
+pub fn classify(_error: &anyhow::Error) -> Option<(Refusal, u16, String)> {
+    None
 }
 
 const FIRST_RETRY_SECONDS: i64 = 10 * 60;
