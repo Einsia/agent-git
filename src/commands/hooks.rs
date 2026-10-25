@@ -316,6 +316,26 @@ fn runtime_of(explicit: Option<&str>, transcript_path: Option<&str>) -> &'static
     }
 }
 
+/// The directory the session started in, which decides whether a project captures it.
+///
+/// A hook's `cwd` follows the session's current directory, so a session started elsewhere that
+/// later runs commands inside a project would otherwise be adopted into that project's
+/// repository. The transcript's first recorded directory is the start. A session that is only now
+/// starting may have no transcript yet, and a runtime that reports no transcript offers nothing
+/// better; in those cases the reported directory is the start. Any other event without a recorded
+/// directory has no known start and is captured by no project.
+fn session_origin(ev: &Event) -> Option<String> {
+    match ev.transcript_path.as_deref() {
+        Some(path) => crate::tui::screens::selector::recorded_cwd(std::path::Path::new(path))
+            .or_else(|| {
+                matches!(ev.source, Source::Startup | Source::Clear)
+                    .then(|| ev.cwd.clone())
+                    .flatten()
+            }),
+        None => ev.cwd.clone(),
+    }
+}
+
 // ── ingest (SessionStart) ─────────────────────────────────────────────
 
 /// What this SessionStart does with this session.
@@ -411,7 +431,9 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     let env_session = super::context::from_session_env();
 
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
-    let bound = dir
+    let origin = session_origin(&ev);
+    let origin = origin.as_deref().map(std::path::Path::new);
+    let bound = origin
         .map(|d| workspace::read(d).is_some() || super::project::registration_scope(d))
         .unwrap_or(false);
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
@@ -482,7 +504,7 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
                 .and_then(|_| session_env_value(&lk))
         }
         Decision::Register => {
-            let _ = link::write(&store, &Link::new(rt, &ev.session_id, dir));
+            let _ = link::write(&store, &Link::new(rt, &ev.session_id, origin));
             None
         }
         Decision::Nothing => link::get(&store, rt, &ev.session_id)
@@ -695,7 +717,9 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
     };
-    if !archive_required && super::project::capture(rt, &ev.session_id, ev.cwd.as_deref())? {
+    if !archive_required
+        && super::project::capture(rt, &ev.session_id, session_origin(&ev).as_deref())?
+    {
         return Ok(());
     }
     let Some(lk) = super::commit::archive::native_link(
@@ -762,6 +786,52 @@ mod tests {
         // A session we started ourselves, even in a directory that was never bound.
         assert!(super::concerns_us(false, true));
         assert!(super::concerns_us(true, true));
+    }
+
+    /// A project captures sessions started inside it, so the hook judges a session by the
+    /// directory its transcript first records. An implementation that read the hook's `cwd`
+    /// would hand a session that merely moved into the project to that project's repository, and
+    /// one that fell back to the hook's `cwd` whenever the transcript records no directory would
+    /// do the same for a later event.
+    #[test]
+    fn a_session_is_placed_by_the_directory_it_started_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"summary","summary":"x"}"#,
+                "\n",
+                r#"{"type":"user","cwd":"/home/u"}"#,
+                "\n",
+                r#"{"type":"user","cwd":"/home/u/work/project"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let event = |transcript: &std::path::Path, source: &str| {
+            super::parse_event(
+                &serde_json::json!({
+                    "session_id": "4faae39f-0000-4000-8000-000000000000",
+                    "transcript_path": transcript,
+                    "cwd": "/home/u/work/project",
+                    "hook_event_name": "Stop",
+                    "source": source,
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            super::session_origin(&event(&transcript, "")).as_deref(),
+            Some("/home/u")
+        );
+        let unwritten = temp.path().join("unwritten.jsonl");
+        assert_eq!(super::session_origin(&event(&unwritten, "")), None);
+        assert_eq!(
+            super::session_origin(&event(&unwritten, "startup")).as_deref(),
+            Some("/home/u/work/project")
+        );
     }
 
     #[test]
