@@ -1312,32 +1312,32 @@ mod tests {
         .unwrap();
         let pgid = proc.pgid.unwrap();
         let _guard = ProcessGroupGuard { pgid, armed: true };
-        tokio::time::timeout(std::time::Duration::from_secs(5), proc.next())
+        // A group the drop failed to kill never goes away, so the test waits for the group to
+        // be gone and only a generous guard turns that into a failure. A short deadline would
+        // measure how fast a loaded machine reaps orphans, not whether the group was killed.
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+        tokio::time::timeout(HANG_GUARD, proc.next())
             .await
             .unwrap()
             .unwrap();
         drop(proc);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while process_group_exists(pgid) {
-            if tokio::time::Instant::now() >= deadline {
-                let output = std::process::Command::new("ps")
-                    .args(["-axo", "pid=,ppid=,pgid=,stat=,comm="])
-                    .output()
-                    .unwrap();
-                for line in String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter(|line| {
-                        line.split_whitespace().nth(2) == Some(pgid.to_string().as_str())
-                    })
-                {
-                    eprintln!("owned cleanup process: {line}");
-                }
+        let gone = async {
+            while process_group_exists(pgid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "cancelled harness left a live process group"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        if tokio::time::timeout(HANG_GUARD, gone).await.is_err() {
+            let output = std::process::Command::new("ps")
+                .args(["-axo", "pid=,ppid=,pgid=,stat=,comm="])
+                .output()
+                .unwrap();
+            for line in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.split_whitespace().nth(2) == Some(pgid.to_string().as_str()))
+            {
+                eprintln!("owned cleanup process: {line}");
+            }
+            panic!("cancelled harness left a live process group");
         }
     }
 

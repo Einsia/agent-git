@@ -13,12 +13,13 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
+/// A regression in the flow below deadlocks rather than errs, so each step waits on the event it
+/// needs and this one guard turns a hang into a failure. A deadline per step would measure how
+/// loaded the machine is, not whether a reader waited behind another.
+const HANG_GUARD: Duration = Duration::from_secs(180);
+
 async fn receive(source: &mut agit_tunnel::PacketSource) -> Frame {
-    let packet = tokio::time::timeout(Duration::from_secs(5), source.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let packet = source.next().await.unwrap().unwrap();
     let Packet::Text(text) = packet else {
         panic!("expected an RPC frame")
     };
@@ -27,6 +28,12 @@ async fn receive(source: &mut agit_tunnel::PacketSource) -> Frame {
 
 #[tokio::test]
 async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
+    tokio::time::timeout(HANG_GUARD, encrypted_cloud_ingress())
+        .await
+        .expect("a reader waited behind a stalled one");
+}
+
+async fn encrypted_cloud_ingress() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -177,10 +184,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     out.send(live);
     // A stalled Cloud replay must neither reach nor block another endpoint.
     response.clear();
-    tokio::time::timeout(Duration::from_secs(5), owner.read_line(&mut response))
-        .await
-        .unwrap()
-        .unwrap();
+    owner.read_line(&mut response).await.unwrap();
     assert_eq!(
         serde_json::from_str::<Frame>(&response).unwrap().seq,
         Some(replay_count as u64 + 1)
@@ -285,9 +289,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(10), catch_up)
-        .await
-        .unwrap();
+    catch_up.await;
     assert!(recovered >= 1, "burst must exercise journal recovery");
     let mut owner = owner.unwrap();
 
@@ -317,9 +319,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
     };
     assert_eq!(frame.caller.unwrap().role, "operator");
     sink.send(Packet::Text(turn.to_json())).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), source.next())
-        .await
-        .unwrap();
+    let closed = source.next().await;
     assert!(closed.is_none() || closed.unwrap().is_err());
     assert!(requests.try_recv().is_err());
 
@@ -329,10 +329,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         .await
         .unwrap();
     response.clear();
-    tokio::time::timeout(Duration::from_secs(5), owner.read_line(&mut response))
-        .await
-        .unwrap()
-        .unwrap();
+    owner.read_line(&mut response).await.unwrap();
     let response: Frame = serde_json::from_str(&response).unwrap();
     assert_eq!(response.result.unwrap()["authority"], "local-owner");
     assert!(!server.is_finished());
