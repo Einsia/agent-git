@@ -237,13 +237,14 @@ fn a_private_key_in_memory_is_replaced_as_one_block_or_refused() {
     );
 }
 
-/// Memory reaches a branch only as content that passed protection in full. A file too large for
-/// one protection unit stays local as "privacy check pending"; a file withheld while the worker
-/// cannot run is collected, unchanged, by the next sync that can protect it; and a session branch
-/// file that holds the body and END line of a key an earlier line-by-line projection left behind
-/// does not distill into main. An implementation that published what the worker did not process,
-/// recorded a withheld file as seen, or looked only for BEGIN lines would put the credential on a
-/// branch, drop the file for good, or carry the key body into main.
+/// Memory reaches a branch only as UTF-8 text that passed protection in full. A file too large
+/// for one protection unit stays local as "privacy check pending"; a file that is not UTF-8 stays
+/// local whatever it holds; a file withheld while the worker cannot run is collected, unchanged,
+/// by the next sync that can protect it; and a session branch file that holds the body and END
+/// line of a key whose BEGIN line was replaced on its own does not distill into main. An
+/// implementation that published what the worker did not process or could not read, recorded a
+/// withheld file as seen, or looked only for BEGIN lines would put the credential on a branch,
+/// drop the file for good, or carry the key body into main.
 #[test]
 fn memory_that_did_not_pass_protection_stays_off_every_branch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -254,12 +255,22 @@ fn memory_that_did_not_pass_protection_stays_off_every_branch() {
         big.push_str("a filler line that carries this file past one protection unit\n");
     }
     fs::write(mem.join("big.md"), &big).unwrap();
+    fs::write(
+        mem.join("latin.md"),
+        b"---\nname: latin\n---\ncaf\xe9 aws AKIA4X7QZ2M5RT6VW3JH\n",
+    )
+    .unwrap();
     let synced = agit(&home, &claude, &["memory", "sync", "--into", &into]);
     ok(&synced);
     assert!(repo.show("refs/heads/s1", "memory/big.md").is_none());
     let warnings = String::from_utf8_lossy(&synced.stderr);
     assert!(
         warnings.contains("memory/big.md: privacy check pending"),
+        "{warnings}"
+    );
+    assert!(repo.show("refs/heads/s1", "memory/latin.md").is_none());
+    assert!(
+        warnings.contains("memory/latin.md: not UTF-8 text"),
         "{warnings}"
     );
 

@@ -151,6 +151,8 @@ pub struct Report {
     /// Files not collected because their privacy check did not complete; the next collection
     /// tries them again.
     pub pending: Vec<String>,
+    /// Files not collected because they are not UTF-8 text.
+    pub not_text: Vec<String>,
     /// Memory files rejected before content scanning by the repository privacy policy.
     pub privacy_excluded: Vec<String>,
     /// The commit that landed.
@@ -473,6 +475,9 @@ enum Withheld {
     Secret(&'static str),
     /// Its privacy check did not complete, so the next collection tries again.
     Pending,
+    /// It is not UTF-8 text. Memory is text, and bytes the detector cannot read are never
+    /// published.
+    NotText,
 }
 
 impl std::fmt::Display for Withheld {
@@ -480,27 +485,22 @@ impl std::fmt::Display for Withheld {
         match self {
             Self::Secret(rule) => write!(f, "suspected secret ({rule})"),
             Self::Pending => f.write_str("privacy check pending"),
+            Self::NotText => f.write_str("not UTF-8 text"),
         }
     }
 }
 
-/// A memory file reaches a branch only as content that passed protection in full; otherwise it
-/// is withheld. Withholding is never a lasting cost: the file stays local and is collected once
-/// its check completes.
+/// A memory file reaches a branch only as UTF-8 text that passed protection in full; otherwise it
+/// is withheld. A withheld file stays local, and the next collection considers it again.
 ///
 /// A memory file is projected as one text, not line by line: a key spans lines, and only a
 /// projection that sees the whole block replaces it from BEGIN through END. A BEGIN line without
-/// its END line, or an END line without its BEGIN line (the body a line-by-line projection left
-/// behind), has no boundary to replace up to, so the file is refused rather than guessed at, and
-/// so is a file whose key the projection left in place.
+/// its END line, or an END line without its BEGIN line (a key body whose BEGIN line was replaced
+/// on its own), has no boundary to replace up to, so the file is refused rather than guessed at,
+/// and so is a file whose key the projection left in place.
 fn protect_memory_bytes(repo: &Repo, bytes: &[u8]) -> crate::Result<Result<Vec<u8>, Withheld>> {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        if private_key_marker().is_match(bytes) {
-            return Ok(Err(Withheld::Secret(
-                "private key in a file that is not UTF-8 text",
-            )));
-        }
-        return Ok(Ok(bytes.to_vec()));
+        return Ok(Err(Withheld::NotText));
     };
     if unbalanced_private_key(text) {
         return Ok(Err(Withheld::Secret(
@@ -663,6 +663,7 @@ pub fn materialize_with(
         report.warnings.extend(collected.warnings);
         report.refused.extend(collected.refused);
         report.pending.extend(collected.pending);
+        report.not_text.extend(collected.not_text);
         report.privacy_excluded.extend(collected.privacy_excluded);
         report.withheld = collected.withheld;
     }
@@ -861,6 +862,10 @@ pub fn collect_with(
             }
             Err(Withheld::Pending) => {
                 report.pending.push(name.clone());
+                refused_names.insert(name.clone());
+            }
+            Err(Withheld::NotText) => {
+                report.not_text.push(name.clone());
                 refused_names.insert(name.clone());
             }
         }
@@ -1543,6 +1548,11 @@ pub fn report_collect(report: &Report, branch: &str) {
             "memory/{pending}: privacy check pending, not collected; retried next time"
         ));
     }
+    for name in &report.not_text {
+        ui::warning(&format!(
+            "memory/{name}: not UTF-8 text, not collected (memory files are text)"
+        ));
+    }
     for excluded in &report.privacy_excluded {
         ui::warning(&format!(
             "memory/{excluded}: not collected by the repository privacy policy"
@@ -1577,6 +1587,11 @@ pub fn report_materialize(report: &Report) {
     for pending in &report.pending {
         ui::warning(&format!(
             "memory/{pending}: privacy check pending, not collected; retried next time"
+        ));
+    }
+    for name in &report.not_text {
+        ui::warning(&format!(
+            "memory/{name}: not UTF-8 text, not collected (memory files are text)"
         ));
     }
     for excluded in &report.privacy_excluded {
