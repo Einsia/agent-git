@@ -382,6 +382,8 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // legacy local ref that the completed startup scan would otherwise never revisit.
     let history_update = super::migration::begin_startup_recovery_for_path(&dest, "clone-history")?;
 
+    // Whether the refs under `origin/` are what the Hub holds now rather than a stale copy.
+    let mut remote_current = true;
     if existed {
         progress.notice(format_args!("updating {}…", ui::bold(&slug)));
         let store = Repo::at(&dest);
@@ -400,6 +402,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Err(error) => return local_transport_failure(error),
         };
         if !out.ok() {
+            remote_current = false;
             ui::warning("fetch failed — continuing with the local copy.");
         } else if let Some((ahead, behind)) = store.ahead_behind() {
             if ahead > 0 && behind > 0 {
@@ -470,6 +473,22 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // git checkout X`). Every branch of an agent repo is a session that can be carried on, so
     // create all of them, not only the one the remote HEAD points at.
     track_all_remote_branches(&store);
+
+    // A repository created on the Hub has no refs until its first push. Laying main down here
+    // gives the first file commit its line and the first push something to publish; left
+    // unborn, `commit <repo>@main -m` reads as a session settlement and push finds no metadata.
+    if remote_current
+        && store.remote_branches().is_empty()
+        && store
+            .git_opt(&["for-each-ref", "--count=1", "refs/tags/"])
+            .is_some_and(|tags| tags.trim().is_empty())
+        && super::init::lay_down_form_only_file_line(&store)?
+    {
+        progress.notice(format_args!(
+            "  {} {slug} is empty on the hub — main is its file line; commit files with `agit commit {slug}@main -m <message> -- <paths>`",
+            ui::ok(s.check)
+        ));
+    }
 
     // ── 5. Check out the version/branch that was asked for ──
     //
@@ -658,9 +677,17 @@ fn checkout_target(repo: &Repo, target: &str, reset_branch: Option<&str>) -> cra
         Some(branch) => {
             repo.git(&["checkout", "--quiet", "-B", branch, target])?;
         }
-        None => {
-            repo.git(&["checkout", "--quiet", target])?;
-        }
+        // A local branch is checked out by name so HEAD stays attached: a full refname detaches
+        // it, and from a detached main checkout every file commit on main lands in a separate
+        // worktree instead of the checkout the user writes in.
+        None => match target.strip_prefix("refs/heads/") {
+            Some(branch) => {
+                repo.git(&["checkout", "--quiet", branch, "--"])?;
+            }
+            None => {
+                repo.git(&["checkout", "--quiet", target])?;
+            }
+        },
     }
     Ok(())
 }

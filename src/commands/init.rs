@@ -360,9 +360,7 @@ pub(super) fn scaffold(root: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(root.join("skills"))?;
     std::fs::write(root.join("memory/.gitkeep"), "")?;
     std::fs::write(root.join("skills/.gitkeep"), "")?;
-    meta::write(root, &Meta::new_file_line())
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-    storage::ensure_attributes(root).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    write_file_line_form(root).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
     std::fs::write(
         root.join("AGENTS.md"),
         "# Team memory\n\nShared instructions for this repo. Every session started with `agit new` carries it.\n\n\
@@ -370,6 +368,41 @@ pub(super) fn scaffold(root: &Path) -> Result<(), std::io::Error> {
          - skills/  reusable skills\n",
     )?;
     Ok(())
+}
+
+/// The files that make a branch a file line: its form in the meta, and the storage attributes.
+fn write_file_line_form(root: &Path) -> crate::Result<()> {
+    meta::write(root, &Meta::new_file_line())?;
+    storage::ensure_attributes(root)?;
+    Ok(())
+}
+
+/// Lay down main as a file line carrying only its form, none of the scaffolding, in a checkout
+/// with no history and nothing staged. This is the first commit of a repository that exists on
+/// the Hub with no refs yet: its content belongs to whoever writes the first page, and without
+/// the form a `-m` commit on main is taken for a session settlement and push finds no metadata.
+///
+/// Untracked files stay untracked: only the form's own paths are staged, so pages written before
+/// the line existed are left for the user's first file commit. A checkout that already holds a
+/// meta of its own is not taken over. Returns whether the line was laid down.
+pub(super) fn lay_down_form_only_file_line(repo: &Repo) -> crate::Result<bool> {
+    let nothing_staged = repo
+        .git_opt(&["ls-files"])
+        .is_some_and(|listing| listing.trim().is_empty());
+    if repo.commit_count() > 0
+        || !repo.local_branches().is_empty()
+        || !nothing_staged
+        || repo.root().join(meta::FILE).symlink_metadata().is_ok()
+    {
+        return Ok(false);
+    }
+    if repo.current_branch().as_deref() != Some("main") {
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    }
+    write_file_line_form(repo.root())?;
+    repo.git(&["add", "--", meta::FILE, meta::ATTRS_FILE])?;
+    repo.commit("agit: init (main file line)")?;
+    Ok(true)
 }
 
 /// Known asset locations → target paths.
