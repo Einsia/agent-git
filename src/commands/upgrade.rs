@@ -124,7 +124,7 @@ pub fn run(args: Args) -> CmdResult {
     if let Err(e) = download_and_replace(&latest) {
         ui::error(&format!("upgrade failed: {e:#}"));
         ui::hint(
-            "fallback: `npx create-agit` again, or `cargo install --path .` from a fresh clone.",
+            "fallback: `npx -y create-agit@latest`, or `cargo install --path .` from a fresh clone.",
         );
         return Ok(ExitCode::Network);
     }

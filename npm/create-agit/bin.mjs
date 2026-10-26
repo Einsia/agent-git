@@ -15,11 +15,12 @@
 import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir, platform, arch } from 'node:os'
 import { join, delimiter } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { installBinary } from './install-binary.mjs'
+import { freshness } from './freshness.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -30,7 +31,7 @@ function fail(m) { console.error(`\x1b[31m✗ ${m}\x1b[0m`) }
 
 const { packageKey, binaryName } = require('@einsia/agent-git/npm/lib/platform.js')
 
-function main() {
+async function main() {
   const args = process.argv.slice(2)
   const attributionIndex = args.indexOf('--acquisition-id')
   const acquisitionId = attributionIndex >= 0 ? args[attributionIndex + 1] : undefined
@@ -68,16 +69,60 @@ function main() {
 
   say('agent-git installer')
 
+  const own = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
+  const fresh = await freshness({
+    env: process.env, own, args, execPath: process.execPath, note: dim,
+    run: (program, programArgs, env) => {
+      const handedOver = spawnSync(program, programArgs, { stdio: 'inherit', env })
+      return handedOver.error ? null : handedOver.status
+    },
+  })
+  if (typeof fresh === 'object') process.exit(fresh.exit)
+
   const yes = ['1', 'true'].includes(process.env.npm_config_yes?.toLowerCase()) || args.some(a => a === '--yes' || a === '-y')
   const installerEnv = { ...process.env, AGIT_INSTALL_CHANNEL: 'create_agit', AGIT_INSTALLER_YES: yes ? '1' : '0',
     ...(acquisitionId ? { AGIT_ACQUISITION_ID: acquisitionId } : {}),
     ...(campaignUrl ? { AGIT_CAMPAIGN_URL: campaignUrl } : {}) }
   const attemptId = randomUUID()
   const started = performance.now()
+  // Stages between start and finish are reported when the installer finishes, one after
+  // another in order, each by a child the installer waits for rather than kills: a report waits
+  // for the telemetry lock, which an upload holds, and a report killed before it queued its event
+  // would lose it. One bound covers them all, so a lock that never frees cannot hold the
+  // installer; the terminal report follows, and its upload usually carries every stage.
+  const pending = []
   const report = (stage, outcome, since = started, errorCategory = 'none') => {
-    spawnSync(bin, ['--internal-install-stage', JSON.stringify({
+    const payload = JSON.stringify({
       attempt_id: attemptId, stage, outcome, elapsed_ms: Math.round(performance.now() - since), error_category: errorCategory,
-    })], { stdio: 'inherit', env: installerEnv, ...(stage === 'started' ? {} : { timeout: 2000 }) })
+      ...(stage === 'started' ? { installer_freshness: fresh } : {}),
+    })
+    if (stage === 'started') {
+      spawnSync(bin, ['--internal-install-stage', payload], { stdio: 'inherit', env: installerEnv })
+      return
+    }
+    pending.push(payload)
+  }
+  const deliver = payload => new Promise(resolve => {
+    const child = spawn(bin, ['--internal-install-stage', payload], { stdio: 'ignore', env: installerEnv, windowsHide: true })
+    child.once('exit', resolve)
+    child.once('error', resolve)
+    child.unref()
+  })
+  const finish = async (outcome, errorCategory = 'none') => {
+    const delivered = (async () => {
+      for (const payload of pending.splice(0)) await deliver(payload)
+    })()
+    // The reporting children are unreferenced, so this timer is what keeps the process alive
+    // while it waits; an unreferenced one would let a still-running report end the installer.
+    let bound
+    try {
+      await Promise.race([delivered, new Promise(resolve => { bound = setTimeout(resolve, 10000) })])
+    } finally {
+      clearTimeout(bound)
+    }
+    spawnSync(bin, ['--internal-install-stage', JSON.stringify({
+      attempt_id: attemptId, stage: 'finished', outcome, elapsed_ms: Math.round(performance.now() - started), error_category: errorCategory,
+    })], { stdio: 'inherit', env: installerEnv, timeout: 2000 })
   }
   report('started', 'started')
   installerEnv.AGIT_INSTALLER_ONBOARDING_HANDLED = '1'
@@ -89,7 +134,7 @@ function main() {
     report('binary_copy', 'ok', copying)
   } catch (error) {
     report('binary_copy', 'error', copying, 'filesystem')
-    report('finished', 'error', started, 'filesystem')
+    await finish('error', 'filesystem')
     fail(`could not install the binary: ${error.message}`)
     process.exit(1)
   }
@@ -98,7 +143,7 @@ function main() {
   const check = spawnSync(target, ['--version'], { encoding: 'utf8', env: { ...process.env, AGIT_TELEMETRY_DEFER: '1' } })
   if (check.error || check.status !== 0) {
     report('verification', 'error', verifying, 'binary')
-    report('finished', 'error', started, 'binary')
+    await finish('error', 'binary')
     fail(`the binary did not run: ${(check.stderr || check.error?.message || `exit ${check.status}`).trim()}`)
     process.exit(1)
   }
@@ -144,7 +189,7 @@ function main() {
   const skipSetup = process.env.AGIT_SKIP_SETUP && !['0', 'false'].includes(process.env.AGIT_SKIP_SETUP.toLowerCase())
   if (skipSetup) {
     report('setup', 'skipped', performance.now())
-    report('finished', 'ok')
+    await finish('ok')
     dim('Setup skipped by AGIT_SKIP_SETUP. Run `agit setup` when ready.')
     return
   }
@@ -154,7 +199,7 @@ function main() {
     env: installerEnv,
   })
   report('setup', setup.status === 0 ? 'ok' : 'error', integrating, setup.status === 0 ? 'none' : 'integration')
-  report('finished', setup.status === 0 ? 'ok' : 'partial', started, setup.status === 0 ? 'none' : 'integration')
+  await finish(setup.status === 0 ? 'ok' : 'partial', setup.status === 0 ? 'none' : 'integration')
   if (setup.status === 0) {
     ok('integrations installed (skills · hooks · MCP · AGENTS.md)')
   } else {
@@ -169,4 +214,4 @@ function main() {
   dim('docs: https://agent-git.com/docs')
 }
 
-main()
+await main()

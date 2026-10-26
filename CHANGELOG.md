@@ -16,6 +16,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `npx create-agit` served from npx's cache, or a `create-agit` installed globally, no longer
+  installs an old agit: when the registry publishes a newer installer, the old one hands the
+  install to it once, and when the registry does not answer it installs its own version. The
+  install instructions and the upgrade fallback name `npx -y create-agit@latest`.
 - A project never publishes a conversation that started outside its folder, or a session
   excluded from it, whatever its claim says: automatic upload and `agit push` both refuse the
   branch. Conversations captured that way by an earlier version are dropped on the first run, and

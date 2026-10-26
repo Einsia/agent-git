@@ -145,7 +145,7 @@ https://github.com/<owner>/<repo>/releases/download/agit-v<VERSION>/SHA256SUMS
    `create-agit`, installing the main package's tarball globally for real
    along the way as the preflight.
 3. Verify afterwards: install with `npm i -g @einsia/agent-git` (or
-   `npx -y create-agit`) and check the version with `agit --version`; check the
+   `npx -y create-agit@latest`) and check the version with `agit --version`; check the
    archive checksums as above.
 
 An npm version, once published, is taken forever, so the automatic chain is

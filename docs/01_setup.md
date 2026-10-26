@@ -9,7 +9,7 @@ Several paths, the same binary either way:
 
 | Who                      | How                                                          | Notes                                               |
 | ------------------------ | ------------------------------------------------------------ | --------------------------------------------------- |
-| Users (one-shot)         | `npx -y create-agit`                                         | one-shot install to `~/.local/bin/agit`, then setup |
+| Users (one-shot)         | `npx -y create-agit@latest`                                  | one-shot install to `~/.local/bin/agit`, then setup |
 | Users (global)           | `npm install -g @einsia/agent-git`                           | prebuilt binary, no Rust toolchain needed           |
 | People changing the code | `./setup.sh`                                                 | builds from source, installs to `~/.local/bin/agit` |
 

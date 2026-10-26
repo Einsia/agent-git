@@ -1108,17 +1108,21 @@ fn installer_stages_preserve_consent_and_do_not_claim_a_verified_install() {
         );
         assert!(!fixture.path("preferences.json").exists());
     }
-    for (phase, outcome) in [
-        ("started", "started"),
-        ("binary_copy", "error"),
-        ("finished", "error"),
+    // The start carries the installer's freshness, so a stale npx cache is not read as an install
+    // problem; only the start does.
+    let mut start: Value = serde_json::from_str(&stage("started", "started")).unwrap();
+    start["installer_freshness"] = json!("stale");
+    for payload in [
+        start.to_string(),
+        stage("binary_copy", "error"),
+        stage("finished", "error"),
     ] {
         assert!(
             fixture
                 .command()
                 .env("AGIT_INSTALLER_YES", "1")
                 .env("AGIT_ACQUISITION_ID", acquisition.to_string())
-                .args(["--internal-install-stage", &stage(phase, outcome)])
+                .args(["--internal-install-stage", &payload])
                 .output()
                 .unwrap()
                 .status
@@ -1144,8 +1148,15 @@ fn installer_stages_preserve_consent_and_do_not_claim_a_verified_install() {
         serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
     assert_ne!(preferences["install_reported"], true);
     assert_eq!(events[0]["distinct_id"], events[2]["distinct_id"]);
+    let freshness: Vec<&Value> = events
+        .iter()
+        .filter_map(|event| event["properties"].get("installer_freshness"))
+        .collect();
+    assert_eq!(freshness, [&json!("stale")]);
     let invalid = stage("private-path-canary", "error");
     fixture.run(&["--internal-install-stage", &invalid]);
+    start["installer_freshness"] = json!("private-path-canary");
+    fixture.run(&["--internal-install-stage", &start.to_string()]);
     assert_eq!(fixture.events().len(), events.len());
     fixture.disable();
     fixture.run(&["--internal-install-stage", &stage("started", "started")]);

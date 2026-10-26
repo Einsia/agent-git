@@ -12,6 +12,9 @@ struct Stage {
     outcome: Outcome,
     elapsed_ms: u64,
     error_category: ErrorCategory,
+    /// Sent with the start: whether the installer was the newest its registry publishes.
+    #[serde(default)]
+    installer_freshness: Option<Freshness>,
 }
 
 #[derive(Clone, Copy, Deserialize, serde::Serialize, PartialEq)]
@@ -32,6 +35,17 @@ enum Outcome {
     Error,
     Skipped,
     Partial,
+}
+
+/// How fresh the installer was: an old installer installs an old agit, so a funnel that cannot
+/// tell them apart reads a stale cache as an install problem.
+#[derive(Clone, Copy, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Freshness {
+    Current,
+    Stale,
+    Unknown,
+    Reexec,
 }
 
 #[derive(Clone, Copy, Deserialize, serde::Serialize)]
@@ -106,6 +120,9 @@ pub fn record(raw: &str) -> anyhow::Result<()> {
         "coverage": "visible_installer_after_package_fetch",
         "$process_person_profile": false, "$geoip_disable": true
     }).as_object().unwrap().clone();
+    if let Some(freshness) = stage.installer_freshness {
+        properties.insert("installer_freshness".into(), json!(freshness));
+    }
     acquisition::extend_properties(&preferences, &mut properties);
     let event = Event {
         event: EventName::InstallStage,

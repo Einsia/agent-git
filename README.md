@@ -58,7 +58,7 @@ The full command list is in `agit --help`.
 ### Users: npm
 
 ```sh
-npx -y create-agit                 # one-shot: installs agit + wires skills/hooks/MCP
+npx -y create-agit@latest          # one-shot: installs agit + wires skills/hooks/MCP
 # or as a global package:
 npm install -g @einsia/agent-git   # pnpm add -g @einsia/agent-git works too
 agit --version
@@ -193,7 +193,7 @@ gh release download agit-v0.1.0 -p 'agit-*.tar.gz' -D /tmp/agit-dist
 node npm/publish.mjs /tmp/agit-dist        # platform packages → main → create-agit
 ```
 
-`npm/create-agit/` is the one-shot installer behind `npx -y create-agit` — it
+`npm/create-agit/` is the one-shot installer behind `npx -y create-agit@latest` — it
 depends on the main package and turns the npx cache copy into a durable
 `~/.local/bin/agit`, then wires skills/hooks/MCP via `agit setup`. There is
 deliberately no unscoped alias package: `agit` on npm belongs to an unrelated

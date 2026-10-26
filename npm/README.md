@@ -3,7 +3,7 @@
 This package ships the prebuilt **`agit`** CLI — no Rust toolchain needed.
 
 ```sh
-npx -y create-agit                 # one-shot install: binary + skills/hooks/MCP
+npx -y create-agit@latest          # one-shot install: binary + skills/hooks/MCP
 # or as a global package:
 npm install -g @einsia/agent-git   # pnpm add -g @einsia/agent-git — same CLI
 agit --help
