@@ -109,17 +109,10 @@ impl Destination {
         let (slug, owner, name, branch) = crate::input_argument(Self::arguments(args))?;
         let directory = std::env::current_dir()?.join(config::repo_dir(&owner, &name)?);
         let probe = repo::Repo::at(std::env::current_dir()?);
-        let (status, _, _) =
-            probe.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
-        if status != Some(0) {
-            let failure = Err(anyhow::anyhow!(
+        if !super::ref_format_accepts(&probe, &format!("refs/heads/{branch}"), false)? {
+            return crate::input_argument(Err(anyhow::anyhow!(
                 "the destination session branch is not a valid Git ref"
-            ));
-            return if status == Some(1) {
-                crate::input_argument(failure)
-            } else {
-                failure
-            };
+            )));
         }
         Ok(Self {
             slug,

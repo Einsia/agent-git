@@ -56,6 +56,28 @@ use std::path::{Path, PathBuf};
 
 mod lineage;
 
+/// Whether `git check-ref-format` accepts `name` (as a branch name with `branch`). Git rejects a
+/// full ref name with status 1 and a branch name with status 128. The shell that starts Git can
+/// exit with one of those statuses when Git itself cannot run, so a rejection counts only when
+/// the same Git then answers `--version`; anything else stays an ordinary failure, and a Git that
+/// cannot run is never reported as a bad name from the command line.
+fn ref_format_accepts(repo: &Repo, name: &str, branch: bool) -> crate::Result<bool> {
+    let (args, rejected): (&[&str], i32) = if branch {
+        (&["check-ref-format", "--branch", name], 128)
+    } else {
+        (&["check-ref-format", name], 1)
+    };
+    match repo.git_status_local(args)?.0 {
+        Some(0) => Ok(true),
+        Some(code) if code == rejected && repo.git_status_local(&["--version"])?.0 == Some(0) => {
+            Ok(false)
+        }
+        other => {
+            anyhow::bail!("git check-ref-format could not check `{name}` (exit status {other:?})")
+        }
+    }
+}
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// Session id or prefix; omitted: list candidates for an explicit interactive choice.
@@ -987,14 +1009,11 @@ fn prepare_target(
     // Raw ref syntax and branch-only rules must pass before any local writes; raw validation
     // also prevents branch shorthand from being expanded against the caller's checkout.
     let validator = Repo::at(std::env::current_dir()?);
-    let (status, _, _) =
-        validator.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
-    if status != Some(0) {
+    if !ref_format_accepts(&validator, &format!("refs/heads/{branch}"), false)? {
         ui::error("the destination session branch is not a valid Git ref");
         return Ok(TargetSelection::Refused(ExitCode::Usage));
     }
-    let (status, _, _) = validator.git_status_local(&["check-ref-format", "--branch", &branch])?;
-    if status != Some(0) {
+    if !ref_format_accepts(&validator, &branch, true)? {
         ui::error("the destination session branch is not a valid Git ref for a branch");
         return Ok(TargetSelection::Refused(ExitCode::Usage));
     }
