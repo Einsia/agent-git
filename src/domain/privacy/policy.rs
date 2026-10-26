@@ -227,13 +227,19 @@ mod tests {
     /// assignment detection to entropy would leave the password; one whose assignment rule
     /// ignored code would replace the configuration lookup, the type annotations, the document
     /// tokens and a search result's file name; one that read every camel-shaped value as code
-    /// would leave the shell passwords.
+    /// would leave the shell passwords. Published artifacts keep their checksums, embedded data
+    /// URIs, links and build commands byte for byte: a policy that replaced any of them would
+    /// publish files that no longer open or verify.
     #[test]
     fn default_tier_replaces_credentials_and_reports_entropy_only_on_request() {
         let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         let password = "c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0";
         let opaque = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
         let posthog = "phx_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2Tq";
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let font = "AAEAAAASAQAABAAgR0RFRrRCsIIAAjWsAAACYkdQT1N/KyYBAAI4EAAAMkxHU1VCQyNA0QACaVwAAAJ4T1MvMmq7WyEAAADUAAAAYGNtYXA=";
+        let link = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2";
+        let deploy = "npx wrangler pages deploy dist --project-name cloudflare-brief --commit-hash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
         let text = format!(
             "export GH_TOKEN={token}; password = \"{password}\"; trace {opaque}; \
              secret_key = settings.SECRET_KEY_BASE; api_key = $OPENAI_API_KEY; \
@@ -257,7 +263,11 @@ mod tests {
              let mut secret = AuthenticationProvider ; \n \
              class Session {{ static token = AuthorizationProvider; }} \n \
              PostHog Key: {posthog}; \
-             lastPrompt: DB_PASSWORD=\"Pf3P7wexdB!60zEEZ…"
+             lastPrompt: DB_PASSWORD=\"Pf3P7wexdB!60zEEZ…\" \n \
+             {digest}  artifacts/app.zip \n \
+             src: url(data:font/ttf;base64,{font}) format(\"truetype\"); \n \
+             <link href=\"{link}\" rel=\"stylesheet\"> \n \
+             {deploy} \n"
         );
         let span = |batch: &Batch, value: &str| {
             let start = text.find(value).unwrap();
@@ -305,6 +315,16 @@ mod tests {
             assert!(span(&default, shell), "{shell} is a credential");
         }
         assert!(span(&default, "Pf3P7wexdB!60zEEZ…"));
+        for artifact in [digest, font, link, deploy] {
+            let start = text.find(artifact).unwrap();
+            assert!(
+                !default
+                    .findings
+                    .iter()
+                    .any(|hit| hit.start < start + artifact.len() && hit.end > start),
+                "{artifact} is published unchanged"
+            );
+        }
         let opted_in = Snapshot::compile(&[], &[], false)
             .unwrap()
             .with_entropy(detector::Entropy::Include)
