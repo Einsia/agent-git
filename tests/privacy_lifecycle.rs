@@ -57,11 +57,16 @@ impl Hub {
                     assert!(header.len() < 16384);
                 }
                 let header = String::from_utf8(header).unwrap();
-                assert!(
-                    header
-                        .to_ascii_lowercase()
-                        .contains("authorization: bearer fixture-access")
-                );
+                if !header
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer fixture-access")
+                {
+                    // A signed-out device's requests carry no account, and the Hub refuses them.
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
                 let mut request = header.lines().next().unwrap().split_whitespace();
                 let (method, path) = (request.next().unwrap(), request.next().unwrap());
                 let length = header
@@ -164,15 +169,26 @@ struct Device {
 
 impl Device {
     fn new(hub: &str) -> Self {
+        let device = Self::signed_out(hub);
+        device.sign_in(None);
+        device
+    }
+
+    fn signed_out(hub: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("agit");
-        let device = Self {
+        Self {
             _root: root,
             home,
             hub: hub.into(),
-        };
+        }
+    }
+
+    /// Save the credential a login saves; a real login's carries the account id.
+    fn sign_in(&self, account_id: Option<&str>) {
+        let hub = &self.hub;
         let credential = agit::infra::credentials::HubCredential {
-            account_id: None,
+            account_id: account_id.map(str::to_owned),
             username: "fixture".into(),
             email: None,
             hub: Some(hub.into()),
@@ -182,14 +198,13 @@ impl Device {
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
         agit::infra::credentials::save_at(
-            &device.home.join("credentials").join(format!(
+            &self.home.join("credentials").join(format!(
                 "{}.json",
                 agit::infra::config::hub_host_key(hub).unwrap()
             )),
             &credential,
         )
         .unwrap();
-        device
     }
 
     fn command(&self) -> Command {
@@ -251,6 +266,20 @@ impl Device {
 
 struct Worker(Child);
 impl Worker {
+    /// `text` protected once the journal is free: a worker that starts while the previous
+    /// command's worker is still closing the journal answers `store_busy`, and like any caller
+    /// the test asks again.
+    fn protect(&mut self, text: &str) -> Value {
+        for _ in 0..50 {
+            let outcome = self.call("protect_text", text);
+            if outcome["reason"] != "store_busy" {
+                return outcome;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the privacy journal stayed busy");
+    }
+
     fn call(&mut self, mode: &str, text: &str) -> Value {
         let bytes = serde_json::to_vec(&json!({"repo":null,"mode":mode,"text":text})).unwrap();
         let input = self.0.stdin.as_mut().unwrap();
@@ -283,6 +312,94 @@ fn journals(home: &Path) -> Vec<PathBuf> {
         .filter(|entry| entry.file_name() == "journal.sqlite")
         .map(|entry| entry.into_path())
         .collect()
+}
+
+/// A value registered on this device stays protected whoever is signed in. Registered while signed
+/// out, it is protected from the first request after signing in, before synchronization has
+/// carried anything to the Hub, and its placeholder is restored; after signing out, or in to
+/// another account, it is still protected; and a value another process registers for another Hub
+/// is protected by a worker that was already running. A worker that reads only the journal the
+/// current credential selects passes the registered value through as Complete on every switch, and
+/// one that reloads only when its own journal changes keeps passing the later value through.
+#[test]
+fn a_rule_registered_on_this_device_protects_under_any_sign_in() {
+    let hub = Hub::new();
+    let device = Device::signed_out(&hub.url);
+    let value = "purple-otter-meadow-7731";
+    let mut add = device
+        .command()
+        .args(["secrets", "add", "otter", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(value.as_bytes())
+        .unwrap();
+    let added = add.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+    let text = format!("the value is {value}");
+    let signed_out = device.worker().protect(&text);
+    let placeholder = signed_out["content"].as_str().unwrap().to_owned();
+    assert!(!placeholder.contains(value), "{signed_out}");
+
+    device.sign_in(Some("fixture-account"));
+    let mut worker = device.worker();
+    let signed_in = worker.protect(&text);
+    assert_eq!(signed_in["status"], "complete");
+    assert_eq!(signed_in["content"], signed_out["content"]);
+    assert_eq!(worker.call("hydrate_text", &placeholder)["content"], text);
+    drop(worker);
+
+    device.sync();
+    assert_eq!(
+        device.worker().protect(&text)["content"],
+        signed_out["content"]
+    );
+
+    for account in [None, Some("another-account")] {
+        match account {
+            None => std::fs::remove_dir_all(device.home.join("credentials")).unwrap(),
+            Some(_) => device.sign_in(account),
+        }
+        let switched = device.worker().protect(&text);
+        assert_eq!(switched["status"], "complete");
+        assert!(
+            !switched["content"].as_str().unwrap().contains(value),
+            "{account:?}: {switched}"
+        );
+    }
+
+    // A worker that keeps running sees a rule another process registers for another Hub.
+    let later = "amber-heron-lake-2048";
+    let mut running = device.worker();
+    let text = format!("the value is {later}");
+    assert_eq!(running.protect(&text)["content"], text);
+    let mut add = device
+        .command()
+        .env("AGIT_HUB_URL", "http://127.0.0.1:9")
+        .args(["secrets", "add", "heron", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(later.as_bytes())
+        .unwrap();
+    let added = add.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+    let checked = running.protect(&text);
+    assert_eq!(checked["status"], "complete");
+    assert!(
+        !checked["content"].as_str().unwrap().contains(later),
+        "{checked}"
+    );
 }
 
 /// Separate homes must recover every opaque alias after an interrupted upload. A worker that

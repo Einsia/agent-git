@@ -84,6 +84,8 @@ struct Loaded {
     repo: Option<PathBuf>,
     route: PathBuf,
     stamp: Vec<(u64, Option<std::time::SystemTime>)>,
+    /// The other journals on the device, as of this load; their blocks are part of the policy.
+    device: Option<DeviceStamp>,
     cursor: i64,
     policy_generation: i64,
     projector: Projector,
@@ -125,6 +127,216 @@ fn route(
         keys::pending_directory(root, hub, credential.map(|cred| cred.username.as_str()))?
     };
     Ok((route, owner))
+}
+
+/// Rules this device registered while signed out, which live in the Hub's pending journals,
+/// taken over by the account the device is signed in to.
+struct Adoption<'a> {
+    root: &'a Path,
+    hub: &'a str,
+    username: &'a str,
+    owner: &'a super::crypto::Owner,
+    /// The account key, when known: adopted records are then encrypted, and otherwise wait for
+    /// synchronization to encrypt them.
+    key: Option<&'a super::crypto::UserKey>,
+}
+
+impl Adoption<'_> {
+    /// The pending journals this account takes over: the signed-out one and the one kept for this
+    /// username. A journal bound to another account is that account's, and is left alone.
+    fn journals(&self) -> crate::Result<Vec<(PathBuf, Option<super::crypto::Owner>)>> {
+        let mut journals = Vec::new();
+        for name in [Some(self.username), None] {
+            for path in keys::pending_generations(self.root, self.hub, name)? {
+                let binding = storage::Store::binding(&path)?;
+                if binding.as_ref().is_none_or(|bound| bound == self.owner) {
+                    journals.push((path, binding));
+                }
+            }
+        }
+        Ok(journals)
+    }
+
+    /// Bind each pending journal to the account, copy the records `store` lacks into it, and
+    /// adopt its decisions wherever the account has not decided the same rule. Signing in thus
+    /// carries every rule over at once, without waiting for the network: until it has, the
+    /// account journal is empty, and a check against it would pass what the user registered.
+    /// `false` when `deadline` passed first.
+    fn adopt(
+        &self,
+        store: &mut storage::Store,
+        known: &mut Dictionary,
+        deadline: Option<Instant>,
+    ) -> crate::Result<bool> {
+        for (path, _) in self.journals()? {
+            let mut pending = storage::Store::open(&path, None)
+                .or_else(|_| storage::Store::open(&path, Some(self.owner.clone())))?;
+            pending.bind(self.owner)?;
+            let mut records = Dictionary::default();
+            pending.load_since(&mut records, 0, |version| {
+                keys::cached(self.root, self.owner, Some(version))
+            })?;
+            let missing: Vec<_> = records
+                .records()
+                .filter(|record| known.get(&record.token).is_none())
+                .cloned()
+                .collect();
+            for batch in missing.chunks(64) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(false);
+                }
+                store.append(batch, self.key)?;
+                for record in batch {
+                    known.accept(record.clone())?;
+                }
+            }
+            for decision in pending.decisions()? {
+                store.adopt_decision(&decision)?;
+            }
+            if let Some(key) = self.key {
+                pending.encrypt_pending(key)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// The records of the pending journals, read without changing them, so placeholders made
+    /// while signed out are restored before adoption has run. `false` when one cannot be read.
+    fn read(&self, dictionary: &mut Dictionary) -> bool {
+        let read = (|| -> crate::Result<bool> {
+            let mut complete = true;
+            for (path, binding) in self.journals()? {
+                let store = storage::Store::read_only(&path, binding)?;
+                let mut records = Dictionary::default();
+                complete &= store
+                    .load_since(&mut records, 0, |version| {
+                        keys::cached(self.root, self.owner, Some(version))
+                    })?
+                    .1;
+                for record in records.records() {
+                    if dictionary.get(&record.token).is_none() {
+                        dictionary.accept(record.clone())?;
+                    }
+                }
+            }
+            Ok(complete)
+        })();
+        read.unwrap_or(false)
+    }
+}
+
+/// Every journal on this device other than `current`: each Hub's pending journals and every
+/// account's dictionary.
+fn device_journals(root: &Path, current: &Path) -> crate::Result<Vec<PathBuf>> {
+    let entries = |directory: PathBuf| -> crate::Result<Vec<PathBuf>> {
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .map(|entry| Ok(entry?.path()))
+                .collect::<crate::Result<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let mut journals = Vec::new();
+    for mut directory in entries(root.join("pending"))? {
+        for _ in 0..64 {
+            if !directory.join("journal.sqlite").try_exists()? {
+                break;
+            }
+            journals.push(directory.clone());
+            directory = directory.join("next");
+        }
+    }
+    for account in entries(root.join("accounts"))? {
+        let directory = account.join("dictionary");
+        if directory.join("journal.sqlite").try_exists()? {
+            journals.push(directory);
+        }
+    }
+    journals.retain(|directory| directory != current);
+    Ok(journals)
+}
+
+/// Each of the device's other journals and the state of its database files. A rule added to any of
+/// them changes this, so a running worker reloads before it checks again instead of passing the
+/// value through under the policy it loaded earlier.
+type DeviceStamp = Vec<(PathBuf, [(u64, Option<std::time::SystemTime>); 2])>;
+
+fn device_stamp(journals: &[PathBuf]) -> DeviceStamp {
+    let state = |path: PathBuf| {
+        std::fs::metadata(path)
+            .map(|meta| (meta.len(), meta.modified().ok()))
+            .unwrap_or_default()
+    };
+    journals
+        .iter()
+        .map(|directory| {
+            (
+                directory.clone(),
+                [
+                    state(directory.join("journal.sqlite")),
+                    state(directory.join("journal.sqlite-wal")),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// The values `journals` block, in global scope or in `repository`'s, with where each applies.
+/// A rule registered on this device protects whatever the device publishes, signed in to any
+/// account or Hub or signed out: switching never lets through a value the user blocked, while
+/// only the current journal's own decisions allow one. The second value is `false` when a journal,
+/// or the record a block names, cannot be read, so the check is incomplete and callers withhold
+/// instead of publishing what it may block.
+fn device_blocks(
+    root: &Path,
+    journals: &[PathBuf],
+    repository: &str,
+) -> (Vec<(zeroize::Zeroizing<String>, policy::Source)>, bool) {
+    let mut blocks = Vec::new();
+    let mut complete = true;
+    for directory in journals {
+        let read = (|| -> crate::Result<bool> {
+            let owner = storage::Store::binding(directory)?;
+            let store = storage::Store::read_only(directory, owner.clone())?;
+            let decisions: Vec<_> = store
+                .decisions()?
+                .into_iter()
+                .filter(|decision| {
+                    decision.block == Some(true)
+                        && (decision.scope == "global" || decision.scope == repository)
+                })
+                .collect();
+            if decisions.is_empty() {
+                return Ok(true);
+            }
+            let mut records = Dictionary::default();
+            store.load_since(&mut records, 0, |version| {
+                keys::cached(
+                    root,
+                    owner.as_ref().context("privacy owner is not available")?,
+                    Some(version),
+                )
+            })?;
+            let mut whole = true;
+            for decision in decisions {
+                match records.get(&decision.token) {
+                    Some(record) => blocks.push((
+                        zeroize::Zeroizing::new(record.original.clone()),
+                        if decision.scope == "global" {
+                            policy::Source::GlobalUser
+                        } else {
+                            policy::Source::RepositoryUser
+                        },
+                    )),
+                    None => whole = false,
+                }
+            }
+            Ok(whole)
+        })();
+        complete &= read.unwrap_or(false);
+    }
+    (blocks, complete)
 }
 
 fn stamp(repo: Option<&Path>) -> Vec<(u64, Option<std::time::SystemTime>)> {
@@ -172,6 +384,16 @@ fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
                     )
                 })?
                 .1;
+        }
+        if let (Some(owner), Some(credential)) = (&owner, &credential) {
+            complete &= Adoption {
+                root: &root,
+                hub: &hub,
+                username: &credential.username,
+                owner,
+                key: None,
+            }
+            .read(&mut dictionary);
         }
         Ok(())
     })();
@@ -341,6 +563,9 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
     let credential = crate::infra::credentials::load(&hub);
     let (route, owner) = route(&root, &hub, credential.as_ref())?;
     let stamp = stamp(request.repo.as_deref());
+    let device = device_journals(&root, &route)
+        .ok()
+        .map(|journals| device_stamp(&journals));
     // How long each loading phase took, reported to the caller of a `Prepare` request.
     let mut phases = serde_json::Map::new();
     let mut phase = Instant::now();
@@ -352,6 +577,8 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         loaded.repo == request.repo
             && loaded.route == route
             && loaded.stamp == stamp
+            && device.is_some()
+            && loaded.device == device
             && loaded.projector.store.policy_generation().ok() == Some(loaded.policy_generation)
     }) {
         let key = owner
@@ -366,6 +593,22 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                 Some(version),
             )
         })?;
+        if let Some(owner) = &owner {
+            let adopted = credential
+                .as_ref()
+                .context("a privacy owner without a credential")
+                .and_then(|credential| {
+                    Adoption {
+                        root: &root,
+                        hub: &hub,
+                        username: &credential.username,
+                        owner,
+                        key: key.as_ref(),
+                    }
+                    .adopt(&mut store, &mut dictionary, None)
+                });
+            complete &= adopted.unwrap_or(false);
+        }
         lap("journal_ms", &mut phases);
         let global = (|| -> crate::Result<crate::domain::secret_filter::Matcher> {
             if !crate::infra::config::secret_filter_vault_path()?.try_exists()? {
@@ -443,6 +686,14 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             value,
             source: policy::Source::RepositoryUser,
         }));
+        let (device_rules, whole) = device_journals(&root, &route)
+            .map(|journals| device_blocks(&root, &journals, &repository_scope))
+            .unwrap_or_default();
+        complete &= whole;
+        blocks.extend(device_rules.iter().map(|(value, source)| policy::Literal {
+            value: value.as_str(),
+            source: *source,
+        }));
         lap("legacy_ms", &mut phases);
         let global_allows = crate::infra::config::agit_home()
             .map(|home| crate::domain::secrets::load_allowlist(&home))
@@ -470,6 +721,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             repo: request.repo.clone(),
             route,
             stamp,
+            device,
             cursor,
             policy_generation,
             projector,
@@ -613,38 +865,19 @@ fn synchronize(hub: &str) -> crate::Result<()> {
     store.load_since(&mut known, 0, |version| {
         keys::cached(&root, &key.owner, Some(version))
     })?;
-    for name in [Some(credential.username.as_str()), None] {
-        for pending_path in keys::pending_generations(&root, hub, name)? {
-            let mut pending = match storage::Store::open(&pending_path, None)
-                .or_else(|_| storage::Store::open(&pending_path, Some(key.owner.clone())))
-            {
-                Ok(store) => store,
-                Err(_) => continue,
-            };
-            pending.bind(&key.owner)?;
-            let mut records = Dictionary::default();
-            pending.load_since(&mut records, 0, |version| {
-                keys::cached(&root, &key.owner, Some(version))
-            })?;
-            let missing: Vec<_> = records
-                .records()
-                .filter(|record| known.get(&record.token).is_none())
-                .cloned()
-                .collect();
-            for batch in missing.chunks(64) {
-                if started.elapsed() >= Duration::from_secs(15) {
-                    return Ok(());
-                }
-                store.append(batch, Some(&key))?;
-                for record in batch {
-                    known.accept(record.clone())?;
-                }
-            }
-            for decision in pending.decisions()? {
-                store.adopt_decision(&decision)?;
-            }
-            pending.encrypt_pending(&key)?;
-        }
+    let adoption = Adoption {
+        root: &root,
+        hub,
+        username: &credential.username,
+        owner: &key.owner,
+        key: Some(&key),
+    };
+    if !adoption.adopt(
+        &mut store,
+        &mut known,
+        Some(started + Duration::from_secs(15)),
+    )? {
+        return Ok(());
     }
     let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
     let _ = sync::run(&mut store, &key, &root, &client, remaining)?;

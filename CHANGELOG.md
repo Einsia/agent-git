@@ -29,6 +29,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   "[privacy check pending: …]" in place of withheld text, and the text arrives once it passes.
 - Remote-control session lists protect each session's opening prompt and title before they leave
   the device.
+- A value registered with `agit secrets add` or `agit secrets block add` before `agit login` is
+  replaced from the first command after signing in; until now it was not replaced until agit had
+  synchronized your rules in the background. Registered values also stay replaced after you sign
+  out or switch to another account or Hub on the same computer.
 
 ### Changed
 
