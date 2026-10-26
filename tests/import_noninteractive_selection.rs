@@ -2034,3 +2034,56 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     );
     assert!(!has_branch("partial"), "{partial:?}");
 }
+
+/// A repository created by an import takes the memory and skills assets of the session's own
+/// folder, wherever the command runs, and so does one created from a privacy copy. Discovery
+/// finds a session outside the current folder without its cwd, so an import that fell back to the
+/// command's folder, or a privacy copy that recorded it as its own, would put that folder's
+/// personal memory on the main line, which the first push publishes.
+#[test]
+fn an_import_seeds_the_main_line_from_the_session_folder_not_the_command_folder() {
+    let lab = Lab::new(1);
+    let (id, _) = &lab.sources[0];
+    fs::write(lab.work.join("AGENTS.md"), "SYNTHETIC-PROJECT-RULES\n").unwrap();
+    let elsewhere = lab.home.join("elsewhere");
+    fs::create_dir_all(elsewhere.join(".claude/skills/private")).unwrap();
+    fs::write(elsewhere.join("CLAUDE.md"), "SYNTHETIC-PERSONAL-MEMORY\n").unwrap();
+    fs::write(
+        elsewhere.join(".claude/skills/private/SKILL.md"),
+        "SYNTHETIC-PERSONAL-SKILL\n",
+    )
+    .unwrap();
+    for (repo, privacy) in [("fresh", None), ("copied", Some("--privacy"))] {
+        let import = lab
+            .command()
+            .current_dir(&elsewhere)
+            .args(["import", "--from", "claude-code", "--into"])
+            .arg(format!("me/{repo}@line"))
+            .args(privacy)
+            .args(["--independent", "-y", "--", id])
+            .output()
+            .unwrap();
+        assert!(import.status.success(), "{repo}: {import:?}");
+        let main = |path: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(lab.store.join("repos/me").join(repo))
+                .args(["show", &format!("main:{path}")])
+                .output()
+                .unwrap()
+        };
+        let rules = main("AGENTS.md");
+        assert!(rules.status.success(), "{repo}: {rules:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&rules.stdout),
+            "SYNTHETIC-PROJECT-RULES\n",
+            "{repo}"
+        );
+        for personal in ["CLAUDE.md", "skills/private/SKILL.md"] {
+            assert!(
+                !main(personal).status.success(),
+                "{repo}: {personal} was adopted"
+            );
+        }
+    }
+}

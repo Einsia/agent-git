@@ -24,6 +24,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `agit import -y` run outside the session's folder could add that folder's `CLAUDE.md`,
+  `AGENTS.md` and skills to the repository it created, on the `main` line a push publishes. A
+  repository created by an import now takes them from the session's own folder.
+
 - `npx create-agit` served from npx's cache, or a `create-agit` installed globally, no longer
   installs an old agit: when the registry publishes a newer installer, the old one hands the
   install to it once, and when the registry does not answer it installs its own version. The

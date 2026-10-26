@@ -1490,8 +1490,9 @@ pub(super) fn birth_base(repo: &Repo) -> Option<String> {
     (repo.commit_count() > 0).then(|| "HEAD".to_string())
 }
 
-/// The `main` file line of a repo created here: the scaffold plus the current project's memory /
-/// skills assets.
+/// The `main` file line of a repo created here: the scaffold plus the memory / skills assets of
+/// the session's own folder ([`session_cwd`]), wherever the command runs; taking them from the
+/// command's folder would put another folder's personal memory on a line that is published.
 ///
 /// Asset discovery and the confirmation discipline both reuse what `init --seed` does (confirm
 /// item by item, take nothing when non-interactive) — personal memory can hold private things,
@@ -1507,13 +1508,9 @@ pub(super) fn create_main_file_line(repo: &Repo, owner: &str, lk: &Link) -> crat
         ui::dim("  creating the main file line (shared memory / skills live there)")
     );
     super::init::scaffold(repo.root())?;
-    let project = lk
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
-    if let Some(p) = &project {
-        super::init::seed_into(repo.root(), p)?;
+    let project = session_cwd(lk);
+    if !project.is_empty() {
+        super::init::seed_into(repo.root(), Path::new(&project))?;
     }
     // The author fields come from the credentials, the same as on the settlement path.
     repo.git(&["config", "user.name", owner])?;
@@ -1557,7 +1554,7 @@ pub(super) fn declare_session_line(
     let mut born = Meta::new(
         super::fork::mint_claim(&head, branch),
         lk.source.clone(),
-        claim_cwd(lk),
+        session_cwd(lk),
     );
     born.kind = meta::Kind::File;
     born.committer_account = crate::infra::credentials::current_account()?;
@@ -1583,17 +1580,18 @@ pub(super) fn declare_session_line(
     Ok(Some(commit))
 }
 
-/// The working directory a claim records when the link does not know it yet: the transcript's own
-/// cwd, then the process directory, the order settlement uses to fill the link. The claim is a
-/// claimed session line in published history, and the Hub refuses any session line whose cwd is
-/// empty, so leaving it blank makes the whole branch unpublishable.
-fn claim_cwd(lk: &Link) -> String {
-    lk.cwd
-        .clone()
+/// The session's working directory: `known` (what the link or discovery recorded), else the
+/// transcript's own cwd, then the process directory, the order settlement uses to fill the link.
+/// Discovery leaves the cwd of a session found outside the current folder empty, so the
+/// transcript decides before the process directory: a new repository's main line adopts this
+/// folder's memory and skills, and the command's folder may be another one with personal files.
+fn session_folder(known: Option<&str>, runtime: &str, session_id: &str) -> String {
+    known
         .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
         .or_else(|| {
-            let adapter = adapter::get(&lk.source).ok()?;
-            let path = adapter.resolve(&lk.session_id, None)?;
+            let adapter = adapter::get(runtime).ok()?;
+            let path = adapter.resolve(session_id, None)?;
             adapter
                 .parse_at(&path)
                 .ok()?
@@ -1606,6 +1604,13 @@ fn claim_cwd(lk: &Link) -> String {
                 .map(|path| path.to_string_lossy().into_owned())
         })
         .unwrap_or_default()
+}
+
+/// The working directory of the session `lk` names ([`session_folder`]). A claim records it: a
+/// claimed session line is published history, and the Hub refuses any session line whose cwd is
+/// empty, so leaving it blank makes the whole branch unpublishable.
+fn session_cwd(lk: &Link) -> String {
+    session_folder(lk.cwd.as_deref(), &lk.source, &lk.session_id)
 }
 
 /// Find a session by id, prefix or Codex deep link. **Does not open the transcript file.**
@@ -1723,14 +1728,13 @@ fn privacy_copy(found: &Found) -> crate::Result<Option<Found>> {
         text.push('\n');
     }
 
-    let cwd = found
-        .cwd
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("can't determine a working directory for the scrubbed copy")
-        })?;
+    // The copy's cwd becomes its link's, which decides the folder a new repository adopts assets
+    // from.
+    let cwd = session_folder(found.cwd.as_deref(), found.runtime, &found.session_id);
+    if cwd.is_empty() {
+        anyhow::bail!("can't determine a working directory for the scrubbed copy");
+    }
+    let cwd = std::path::PathBuf::from(cwd);
     let home = config::user_home().ok_or_else(|| {
         anyhow::anyhow!("the user home is not set — can't place the scrubbed copy")
     })?;
