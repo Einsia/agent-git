@@ -589,6 +589,20 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
     let hub = crate::infra::config::hub_url();
     let credential = crate::infra::credentials::load(&hub);
     let (route, owner) = route(&root, &hub, credential.as_ref())?;
+    // Start-up only loads what exists. Opening the journal creates it, and a read-only command
+    // that merely starts the worker (`agit doctor`, `agit status`) must leave the privacy
+    // directory as it found it; the first request that needs the journal creates it.
+    if matches!(request.mode, Mode::Prepare) && !route.join("journal.sqlite").try_exists()? {
+        return Ok(Outcome {
+            content: "{}".into(),
+            status: super::projector::Status::Complete,
+            replacements: 0,
+            unresolved: 0,
+            consumed: None,
+            unprocessed: 0,
+            reason: None,
+        });
+    }
     let stamp = stamp(request.repo.as_deref());
     let device = device_journals(&root, &route)
         .ok()

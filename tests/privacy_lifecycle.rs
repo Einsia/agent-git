@@ -473,7 +473,23 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
     );
 }
 
-/// Separate homes must recover every opaque alias after an interrupted upload./// Separate homes must recover every opaque alias after an interrupted upload. A worker that
+/// Inspecting a device writes no privacy state: `agit doctor` starts the privacy worker to ask its
+/// status, and a device that has no journal yet still has none afterwards. A worker that opened
+/// its journal at start-up would create one, so a read-only command would change the device.
+#[test]
+fn read_only_inspection_creates_no_privacy_journal() {
+    let hub = Hub::new();
+    let device = Device::new(&hub.url);
+    let doctor = device.doctor();
+    assert!(doctor.contains("secret keystore"), "{doctor}");
+    assert!(
+        journals(&device.home).is_empty(),
+        "{:?}",
+        journals(&device.home)
+    );
+}
+
+/// Separate homes must recover every opaque alias after an interrupted upload. A worker that
 /// keeps originals only in memory, sends plaintext, or loses retry state cannot satisfy this flow.
 #[test]
 fn independent_devices_recover_durable_aliases_after_cloud_failure() {
