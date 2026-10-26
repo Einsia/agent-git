@@ -50,6 +50,7 @@ use std::process::{Command, Stdio};
 
 mod frozen;
 pub mod inspection_summary;
+mod ref_read;
 pub use crate::domain::secrets::publication::InspectionFailure;
 pub use frozen::{
     BlockedContentInspection, BlockedInspection, CapturedPublication, CompleteContentInspection,
@@ -1027,82 +1028,7 @@ fn capture_transport(
     args: &[&str],
     transport: Option<&TransportIdentity>,
 ) -> Option<String> {
-    let once = || -> Option<(bool, String, String)> {
-        let mut cmd = match transport {
-            Some(transport) => transport.command(Some(dir)),
-            None => {
-                let mut command = transport_command();
-                command.arg("-C").arg(dir);
-                command
-            }
-        };
-        cmd.args(args);
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(transport) = transport {
-            for (k, v) in transport
-                .environment_in(transport.execution.as_ref(), args.first() == Some(&"lfs"))
-                .ok()?
-            {
-                cmd.env(k, v);
-            }
-        }
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let mut child = cmd.spawn().ok()?;
-        // The pipes go to reader threads **immediately**, with nothing between the spawn and
-        // here: from this moment on, whatever git writes has someone taking it, so it never
-        // fails to exit because it cannot write.
-        let (Some(out_pipe), Some(err_pipe)) = (child.stdout.take(), child.stderr.take()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        };
-        let out_rx = drain(out_pipe);
-        let err_rx = drain(err_pipe);
-
-        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        // Kill and then wait: without the wait a zombie is left, and
-                        // `Child::drop` does not wait.
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        };
-        // git has exited → the write ends it held are closed → both reader threads see EOF and
-        // deliver. Still bounded: should another process still hold a write end, this must not
-        // become a second unbounded wait.
-        let stdout = out_rx.recv_timeout(PROBE_TIMEOUT).ok()?;
-        let stderr = err_rx.recv_timeout(PROBE_TIMEOUT).unwrap_or_default();
-        Some((
-            status.success(),
-            String::from_utf8_lossy(&stdout).into_owned(),
-            String::from_utf8_lossy(&stderr).into_owned(),
-        ))
-    };
-    let (ok, stdout, stderr) = once()?;
-    if ok {
-        return Some(stdout);
-    }
-    let transport = transport?;
-    if !looks_like_auth_failure(&stderr) || !transport.refresh().ok()? {
-        return None;
-    }
-    let (ok, stdout, _) = once()?;
-    ok.then_some(stdout)
+    ref_read::capture(dir, args, transport).ok()
 }
 
 /// Start a thread that **drains** this pipe, and hand the whole byte run back over a channel.

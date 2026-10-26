@@ -25,7 +25,10 @@
 //! File targets keep shared-file history on their target and exploration on a visible session branch.
 
 pub mod archive;
+mod file_pull;
 mod file_reconciliation;
+
+pub(super) use file_pull::reconcile as pull_files;
 
 use super::CmdResult;
 use crate::domain::mergetx::{self, Tx};
@@ -1034,12 +1037,14 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
         &tx.target_head[..9.min(tx.target_head.len())],
         &src_head[..9.min(src_head.len())]
     ));
-    println!(
-        "{}",
-        ui::dim(
-            "  after the next resume, the agent on the target sees itself as the main body, plus the marked merge block"
-        )
-    );
+    if !target_is_file_line {
+        println!(
+            "{}",
+            ui::dim(
+                "  after the next resume, the agent on the target sees itself as the main body, plus the marked merge block"
+            )
+        );
+    }
     Ok(ExitCode::Ok)
 }
 

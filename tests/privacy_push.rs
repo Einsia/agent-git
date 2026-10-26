@@ -121,8 +121,10 @@ impl Hub {
                 let target = words.next().unwrap();
                 let mut length = 0;
                 let mut content_type = String::new();
+                let mut compressed = false;
                 let mut user_agent = String::new();
                 let mut authenticated = false;
+                let mut collaborator_account = false;
                 let mut receipt_id = None;
                 let mut receiver_scope = None;
                 loop {
@@ -138,6 +140,7 @@ impl Hub {
                     if let Some(value) = lower.strip_prefix("content-type:") {
                         content_type = value.trim().to_owned();
                     }
+                    compressed |= lower.trim() == "content-encoding: gzip";
                     if let Some(value) = lower.strip_prefix("user-agent:") {
                         user_agent = value.trim().to_owned();
                     }
@@ -146,6 +149,8 @@ impl Hub {
                         "fixture body must be bounded"
                     );
                     authenticated |= lower.trim() == "authorization: bearer synthetic-access";
+                    collaborator_account |=
+                        lower.trim() == "authorization: bearer synthetic-collaborator";
                     if let Some(value) = lower.strip_prefix("x-agentgit-privacy-preview-id:") {
                         receipt_id = Some(value.trim().to_owned());
                     }
@@ -153,10 +158,20 @@ impl Hub {
                         receiver_scope = Some(value.trim().to_owned());
                     }
                 }
-                assert!(authenticated || target == "/api/auth/refresh", "{first}");
+                assert!(
+                    authenticated || collaborator_account || target == "/api/auth/refresh",
+                    "{first}"
+                );
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 drop(reader);
+                if compressed {
+                    let mut decoded = Vec::new();
+                    flate2::read::GzDecoder::new(body.as_slice())
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    body = decoded;
+                }
                 if target == "/api/agents/alice/app" && !root.join("alice/app.git").is_dir() {
                     let body = r#"{"error":"repository is unavailable"}"#;
                     write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -175,6 +190,12 @@ impl Hub {
                     continue;
                 }
                 let json = match (method, target) {
+                    ("POST", path)
+                        if path.starts_with("/api/agents/alice/app/sessions/")
+                            && path.ends_with("/reuses") =>
+                    {
+                        Some(json!({"ok":true}))
+                    }
                     (method, path)
                         if path.starts_with("/api/agents/alice/app/sessions/")
                             && path.ends_with("/privacy-config") =>
@@ -270,9 +291,11 @@ impl Hub {
                             json!({"account_id":"account-1","username":"alice","access_token":"synthetic-access","refresh_token":"synthetic-refresh","access_expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-01T00:00:00Z"}),
                         )
                     }
-                    ("GET", "/api/auth/me") => {
-                        Some(json!({"account_id":"account-1","username":"alice"}))
-                    }
+                    ("GET", "/api/auth/me") => Some(if collaborator_account {
+                        json!({"account_id":"account-2","username":"bob"})
+                    } else {
+                        json!({"account_id":"account-1","username":"alice"})
+                    }),
                     ("POST", "/api/agents") => {
                         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                         assert_eq!(request["name"], "app");
@@ -530,7 +553,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         },
     )
     .unwrap();
-    let run = |args: &[&str], automatic: bool| {
+    let run_home = |args: &[&str], automatic: bool, selected_home: &Path| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear();
@@ -541,7 +564,9 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         }
         command
             .current_dir(temp.path())
-            .env("AGIT_HOME", &home)
+            .env("AGIT_HOME", selected_home)
+            .env("CODEX_HOME", selected_home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", selected_home.join("claude"))
             .env("AGIT_HUB_URL", &hub.base)
             .env("CI", "1")
             .env("AGIT_TUI", "0")
@@ -557,6 +582,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         }
         command.output().unwrap()
     };
+    let run = |args: &[&str], automatic: bool| run_home(args, automatic, &home);
     let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
     repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
         .unwrap();
@@ -1270,4 +1296,207 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         "{refused:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
+
+    // A fresh checkout publishes only inherited public history and its own cross-runtime turns.
+    let collaborator = temp.path().join("collaborator");
+    startup_cache::seed(&collaborator);
+    let credential_name = format!("{}.json", config::hub_host_key(&hub.base).unwrap());
+    fs::create_dir_all(collaborator.join("credentials")).unwrap();
+    save_at(
+        &collaborator.join("credentials").join(&credential_name),
+        &HubCredential {
+            account_id: Some("account-2".into()),
+            username: "bob".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-collaborator".into(),
+            refresh_token: "synthetic-collaborator-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    assert_success(&run_home(
+        &["clone", "alice/app", "--no-bind"],
+        false,
+        &collaborator,
+    ));
+    let collaborator_repo = Repo::at(collaborator.join("repos/alice/app"));
+    assert!(
+        !collaborator_repo
+            .root()
+            .join(".git/agit/privacy-accepted")
+            .exists()
+    );
+    collaborator_repo
+        .git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    let local_main = git(collaborator_repo.root(), &["rev-parse", "refs/heads/main"]);
+    let teammate = temp.path().join("teammate");
+    let cloned = git_command(temp.path())
+        .args(["clone", "--quiet", "--single-branch", "--branch", "main"])
+        .arg(&remote)
+        .arg(&teammate)
+        .output()
+        .unwrap();
+    assert_success(&cloned);
+    git(&teammate, &["config", "user.name", "Teammate"]);
+    git(
+        &teammate,
+        &["config", "user.email", "teammate@example.invalid"],
+    );
+    fs::write(teammate.join("shared-update.md"), "New shared knowledge\n").unwrap();
+    git(&teammate, &["add", "shared-update.md"]);
+    git(
+        &teammate,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "Update shared knowledge",
+        ],
+    );
+    git(&teammate, &["push", "origin", "main"]);
+    let remote_main = git(&remote, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_main, local_main);
+    let fork_target = "alice/app@collaborator-fork";
+    let fork_source = format!(
+        "alice/app@{}",
+        git(&remote, &["rev-parse", "refs/heads/legacy"])
+    );
+    assert_success(&run_home(
+        &[
+            "run",
+            &fork_source,
+            "--no-launch",
+            "--as",
+            "codex",
+            "-b",
+            "collaborator-fork",
+        ],
+        false,
+        &collaborator,
+    ));
+    assert_success(&run_home(
+        &["resume", fork_target, "--as", "claude-code", "--no-launch"],
+        false,
+        &collaborator,
+    ));
+    let live = walkdir::WalkDir::new(collaborator.join("claude/projects"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .expect("cross-runtime resume installs a Claude transcript")
+        .into_path();
+    let native_id = live.file_stem().unwrap().to_str().unwrap();
+    let mut parent = fs::read_to_string(&live)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record.get("uuid").cloned())
+        .next_back()
+        .unwrap_or(serde_json::Value::Null);
+    let mut appended = fs::OpenOptions::new().append(true).open(&live).unwrap();
+    for mut record in [
+        json!({"type":"user","sessionId":native_id,"uuid":uuid::Uuid::now_v7(),"message":{"role":"user","content":"Collaborator continuation"}}),
+        json!({"type":"assistant","sessionId":native_id,"uuid":uuid::Uuid::now_v7(),"message":{"role":"assistant","content":[{"type":"text","text":"Collaborator reply"}]}}),
+    ] {
+        record["parentUuid"] = parent;
+        parent = record["uuid"].clone();
+        record["cwd"] = json!(temp.path());
+        writeln!(appended, "{record}").unwrap();
+    }
+    drop(appended);
+    assert_success(&run_home(&["commit", fork_target], false, &collaborator));
+    let pushed = run_home(&["--yes", "push", fork_target], false, &collaborator);
+    assert_success(&pushed);
+    let notice = String::from_utf8_lossy(&pushed.stdout);
+    assert_eq!(
+        notice.matches("main left as on the Hub").count(),
+        1,
+        "{notice}"
+    );
+    assert!(notice.contains("agit pull alice/app@main"), "{notice}");
+    assert_success(&run_home(
+        &["push", fork_target, "--dry-run"],
+        false,
+        &collaborator,
+    ));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), remote_main);
+    assert_eq!(
+        git(collaborator_repo.root(), &["rev-parse", "refs/heads/main"]),
+        local_main
+    );
+    assert_eq!(
+        git(&remote, &["show", "main:shared-update.md"]),
+        "New shared knowledge"
+    );
+    for args in [
+        vec!["push", "alice/app@main", "--dry-run"],
+        vec!["push", "alice/app", "--all", "--dry-run"],
+    ] {
+        let explicit = run_home(&args, false, &collaborator);
+        assert!(!explicit.status.success(), "{explicit:?}");
+        assert!(
+            String::from_utf8_lossy(&explicit.stderr).contains("agit pull alice/app@main"),
+            "{explicit:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&explicit.stdout).contains("main left as on the Hub"),
+            "{explicit:?}"
+        );
+    }
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), remote_main);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/legacy"]),
+        fork_source.strip_prefix("alice/app@").unwrap()
+    );
+    let published_meta: meta::Meta = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("collaborator-fork:{}", meta::FILE)],
+    ))
+    .unwrap();
+    assert_eq!(published_meta.runtime, "claude-code");
+    assert_eq!(
+        published_meta.committer_account.unwrap().account_id,
+        "account-2"
+    );
+
+    // A shallow boundary cannot hide a locally available parent from implicit-main selection.
+    assert_success(&run_home(&["pull", "alice/app@main"], false, &collaborator));
+    fs::write(
+        collaborator_repo.root().join("local-main-update.md"),
+        "Local shared knowledge\n",
+    )
+    .unwrap();
+    git(collaborator_repo.root(), &["add", "local-main-update.md"]);
+    git(
+        collaborator_repo.root(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "Local shared knowledge",
+        ],
+    );
+    let local_ahead = git(collaborator_repo.root(), &["rev-parse", "refs/heads/main"]);
+    let shallow = collaborator_repo.root().join(".git/shallow");
+    fs::write(&shallow, format!("{local_ahead}\n")).unwrap();
+    let published = run_home(&["--yes", "push", fork_target], false, &collaborator);
+    fs::remove_file(shallow).unwrap();
+    assert_success(&published);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), local_ahead);
+    assert!(
+        !String::from_utf8_lossy(&published.stdout).contains("main left as on the Hub"),
+        "{published:?}"
+    );
 }

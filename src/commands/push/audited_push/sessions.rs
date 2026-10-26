@@ -2,13 +2,14 @@
 
 use super::*;
 use crate::domain::privacy_git::sessions::SessionPublicationPlan;
-use crate::domain::repo::publication::PublicationPlan;
+use crate::domain::repo::publication::{PublicationPlan, raw_ancestors};
 
 pub(super) fn run(
     args: &Args,
     client: Client,
     repo: Repo,
     branches: &[String],
+    retry_command: &str,
     destination: Destination,
 ) -> CmdResult {
     let Destination {
@@ -99,19 +100,35 @@ pub(super) fn run(
     };
     let identity = RemoteIdentity::new(&intent.hub, &remote.agent_id)?;
     intent.verify_write_access(&client, &identity.agent_id)?;
-    let selected_branches = original
-        .heads()
-        .iter()
-        .map(|head| {
-            head.name()
-                .strip_prefix("refs/heads/")
-                .context("invalid publication branch")
-                .map(str::to_owned)
-        })
-        .collect::<Result<Vec<_>>>()?;
     let remote =
         crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
             .context("cannot establish accepted publication history")?;
+    let implicit_main = !args.all && !branches.iter().any(|branch| branch == "main");
+    let mut selected_branches = Vec::new();
+    for head in original.heads() {
+        let branch = head
+            .name()
+            .strip_prefix("refs/heads/")
+            .context("invalid publication branch")?;
+        // A session push cannot require reconciling an independently advanced shared-file line.
+        // Explicit selections still admit main through the ordinary publication checks.
+        if branch == "main"
+            && implicit_main
+            && let Some(remote_head) = remote.refs.get(head.name())
+            && !raw_ancestors(&repo, head.oid())?.contains(remote_head)
+        {
+            #[cfg(windows)]
+            use crate::ui::quote_powershell_argument as quote_arg;
+            #[cfg(not(windows))]
+            use crate::ui::session::shell_arg as quote_arg;
+            let target = quote_arg(&format!("{repository}@main"));
+            ui::info(format_args!(
+                "main left as on the Hub; run `agit pull {target}` to update it"
+            ));
+            continue;
+        }
+        selected_branches.push(branch.to_owned());
+    }
     let selected = SessionPublicationPlan::resolve(
         &repo,
         &selected_branches,
@@ -122,8 +139,18 @@ pub(super) fn run(
         !args.dry_run,
     )?;
     let _ = warmed.join();
-    let mut projected =
-        ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])?;
+    let mut projected = ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])
+        .map_err(|error| {
+            if error.downcast_ref::<crate::domain::privacy_git::MissingAcceptedObjects>().is_some() {
+                #[cfg(windows)]
+                use crate::ui::quote_powershell_argument as quote_arg;
+                #[cfg(not(windows))]
+                use crate::ui::session::shell_arg as quote_arg;
+                error.context(format!("fetch the accepted public history with `agit fetch {}` and retry `{retry_command}`; keep this checkout to preserve unpublished commits", quote_arg(&repository)))
+            } else {
+                error
+            }
+        })?;
     let receipts = projected.session_receipts(&repository, &identity, &intent.url)?;
     let mut supervisor = SupervisorReply::from_env()?;
     let supervised = supervisor
@@ -283,11 +310,11 @@ pub(super) fn run(
         projected.policy_digest(),
         projected.session_manifest(),
         &intent.visibility,
-    )?;
+    ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
     projected.confirm_acceptance(&report)?;
     show_publication(&report);
     if !report.ok() {
-        ui::error("publication did not complete; unconfirmed attempts may have taken effect");
+        ui::error(&publication_recovery(&report, retry_command, &repository));
         return Ok(publication_failure_code(&report));
     }
     verify_receipt_acknowledgements(&report, &receipts)?;

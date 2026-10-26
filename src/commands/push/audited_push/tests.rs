@@ -238,6 +238,100 @@ fn incomplete_inspection_and_native_failures_keep_their_exit_categories() {
     }
 }
 
+/// Recovery promises depend on acknowledged effects, rather than which later phase failed.
+#[test]
+fn publication_recovery_distinguishes_unattempted_acknowledged_and_unknown_ref_updates() {
+    let cli = crate::commands::Cli::try_parse_from([
+        "agit",
+        "push",
+        "me/qa@work",
+        "--audit",
+        "--to",
+        "team/wiki",
+    ])
+    .unwrap();
+    let crate::commands::Commands::Push(args) = cli.command.unwrap() else {
+        panic!("push command")
+    };
+    let retry = retry_push_command(&args, "me/qa", &["work".into()]);
+    assert_eq!(
+        retry,
+        "agit push me/qa --branch=work --to=team/wiki --audit"
+    );
+    let mut report = PublicationReport {
+        lfs: None,
+        heads: Some(crate::hub::git::PublicationPhase::default()),
+        tags: None,
+        error: Some("destination ref read failed".into()),
+    };
+    let recovery = publication_recovery(&report, &retry, "team/wiki");
+    assert!(recovery.contains("no branch or tag refs were updated") && recovery.contains(&retry));
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&temp.path().join("repo")).unwrap();
+    repo.git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        "Publication root",
+    ])
+    .unwrap();
+    let branch = repo.current_branch().unwrap();
+    let plan = crate::domain::repo::publication::PublicationPlan::freeze_selected(&repo, &[branch])
+        .unwrap();
+    let reference = plan.heads()[0].clone();
+    report
+        .heads
+        .as_mut()
+        .unwrap()
+        .attempts
+        .push(crate::hub::git::PublicationAttempt {
+            batch: 0,
+            outcome: crate::hub::git::Outcome {
+                code: 0,
+                stderr: String::new(),
+            },
+            refs: vec![crate::hub::git::PublishedRef {
+                reference: reference.clone(),
+                status: PublicationStatus::Updated,
+                detail: None,
+            }],
+            complete: true,
+            error: None,
+        });
+    let recovery = publication_recovery(&report, &retry, "team/wiki");
+    assert!(
+        recovery.contains("some ref updates were acknowledged") && recovery.contains("is safe")
+    );
+    assert!(!recovery.contains("no branch or tag refs were updated"));
+    report
+        .heads
+        .as_mut()
+        .unwrap()
+        .attempts
+        .push(crate::hub::git::PublicationAttempt {
+            batch: 1,
+            outcome: crate::hub::git::Outcome {
+                code: 1,
+                stderr: String::new(),
+            },
+            refs: vec![crate::hub::git::PublishedRef {
+                reference,
+                status: PublicationStatus::Unconfirmed,
+                detail: None,
+            }],
+            complete: false,
+            error: Some("lost acknowledgement".into()),
+        });
+    let recovery = publication_recovery(&report, &retry, "team/wiki");
+    assert!(recovery.contains("unconfirmed") && recovery.contains("agit fetch team/wiki"));
+    assert!(
+        !recovery.contains("is safe") && !recovery.contains("no branch or tag refs were updated")
+    );
+}
+
 #[test]
 fn inherited_git_routing_is_refused_without_reporting_its_value() {
     for key in [

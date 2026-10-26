@@ -395,6 +395,75 @@ mod frozen_publication_http {
         println!("{COMPLETE}");
     }
 
+    /// Read retries are bounded and retain the prepared endpoint and original account.
+    #[test]
+    fn destination_ref_reads_retry_only_transient_failures_without_changing_authority() {
+        if !isolated(
+            "destination_ref_reads_retry_only_transient_failures_without_changing_authority",
+        ) {
+            return;
+        }
+        let home = IsolatedHome::new();
+        let other = FakeHub::new(|_| panic!("prepared reads cannot move to another Hub"));
+        let other_base = other.base.clone();
+        let source_root = home.workspace().to_path_buf();
+        let mut statuses =
+            std::collections::VecDeque::from([503, 429, 200, 503, 503, 503, 404, 503]);
+        let hub = FakeHub::new(move |request| {
+            assert_eq!(request.path, GIT_PATH);
+            let base = format!("http://{}", request.header("host").unwrap());
+            if statuses.len() == 8 {
+                rewrite(
+                    &source_root,
+                    &format!("{base}/alice/example.git"),
+                    &format!("{other_base}/other/repo.git"),
+                );
+                config::set_global("hub.url", Some(&other_base)).unwrap();
+            }
+            let status = statuses.pop_front().expect("read retry budget exceeded");
+            if statuses.is_empty() {
+                credentials::save(&base, &pair(&base, "bob")).unwrap();
+            }
+            if status == 200 {
+                advertisement()
+            } else {
+                Reply {
+                    status,
+                    content_type: "text/plain",
+                    body: b"synthetic server detail".to_vec(),
+                    headers: vec![],
+                }
+            }
+        });
+        let (repo, plan, url, identity) = source(&home, &hub.base);
+        let publication = FrozenPublication::prepare(&repo, &plan, &url, &identity).unwrap();
+        let refs = publication.privacy_remote_refs().unwrap();
+        assert_eq!(refs.get("refs/heads/main").unwrap(), FAKE_OID);
+        let error = publication.privacy_remote_refs().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("after bounded retries") && message.contains("HTTP 503"),
+            "{message}"
+        );
+        let error = publication.privacy_remote_refs().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not found") && !message.contains("bounded retries"),
+            "{message}"
+        );
+        let error = publication.privacy_remote_refs().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("account changed"), "{message}");
+        assert!(!message.contains("fake-alice-access") && !message.contains("fake-bob-access"));
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 8);
+        for request in &requests {
+            assert_request(request, GIT_PATH, "fake-alice-access");
+        }
+        assert!(other.finish().is_empty());
+        println!("{COMPLETE}");
+    }
+
     #[test]
     fn push_retry_keeps_prepared_endpoint_and_preserves_failure() {
         if !isolated("push_retry_keeps_prepared_endpoint_and_preserves_failure") {

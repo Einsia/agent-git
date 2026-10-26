@@ -1,4 +1,4 @@
-//! `agit pull` — fetch + fast-forward only.
+//! `agit pull` — fetch, fast-forward, or reconcile explicitly declared file branches.
 //!
 //! A non-fast-forward means the same session continued in two places — a **true divergence**.
 //! Each branch reports how far ahead either side is and prints the two ways out verbatim
@@ -184,6 +184,31 @@ pub fn run(args: Args) -> CmdResult {
                         "{b} is {ahead} turns ahead — publish with `agit push`"
                     )),
                     (ahead, behind) => {
+                        let local_head = repo.git(&["rev-parse", &format!("refs/heads/{b}")])?;
+                        let remote_head =
+                            repo.git(&["rev-parse", &format!("refs/remotes/origin/{b}")])?;
+                        if crate::domain::meta::is_file_line_at(&repo, &local_head)
+                            && crate::domain::meta::is_file_line_at(&repo, &remote_head)
+                        {
+                            drop(_branch_guard);
+                            let result = super::merge::pull_files(
+                                &repo,
+                                &store,
+                                &slug,
+                                b,
+                                &local_head,
+                                &remote_head,
+                            );
+                            match result {
+                                Ok(ExitCode::Ok) => {}
+                                Ok(_) => diverged = true,
+                                Err(error) => {
+                                    ui::error(&format!("{b}: {error:#}"));
+                                    diverged = true;
+                                }
+                            }
+                            continue;
+                        }
                         diverged = true;
                         ui::error(&format!(
                             "{b} truly diverged: this session continued in two places (local +{ahead} / remote +{behind})."

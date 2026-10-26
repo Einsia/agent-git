@@ -5,6 +5,30 @@ description: Publish saved history using registered session privacy settings and
 
 # agit push
 
+Session pushes may include local `main` when the Hub has no `main` or its current tip is an
+ancestor of local `main`. If implicit `main` cannot fast-forward the Hub, push leaves it as on
+the Hub, prints `agit pull <owner/repo>@main`, and publishes the selected session branches.
+Explicit `@main`, `--branch main` and `--all` keep `main` selected and require synchronization
+when it is behind or divergent.
+
+If the destination branch has advanced beyond the local accepted history, push keeps local
+unpublished commits and prints `agit pull <owner/repo>@<branch>` to synchronize first. A remote
+advance is different from a missing or inconsistent local privacy mapping. Preserve the checkout
+containing unpublished work when recovering a genuinely damaged mapping.
+
+A collaborator with write access can publish a new fork after continuing a teammate's session,
+including after switching runtimes. Published ancestors keep their existing commit IDs; the
+collaborator does not need the original publisher's local privacy state. If a retained published
+snapshot is unavailable locally, push names the missing commit and prints a fetch and retry
+command. Keep the checkout containing unpublished work while recovering the public snapshot.
+
+Destination-ref queries retry temporary connection failures and HTTP 408, 429, 500, 502, 503
+and 504 with bounded backoff. Authentication keeps its separate refresh path; other failures
+stop without a transient retry. Reads keep the prepared Hub, repository and account.
+If publication stops, the diagnostic includes a command that retains the selected local
+repository, branches and destination. It distinguishes no ref updates, acknowledged updates,
+and unconfirmed effects. For unconfirmed effects, fetch and inspect status before rerunning.
+
 Publish existing saved branches with their registered privacy settings. Plain sessions and file
 lines retain their original Git objects unless initial plain selection requires publication metadata
 to be normalized. Encrypted sessions publish a sanitized projection and

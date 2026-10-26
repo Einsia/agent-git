@@ -543,14 +543,24 @@ not placed again, and no file of your own is touched. `resume` the same branch o
 and Claude reads that memory immediately. Both sides look only at first-level `*.md` (the shape of
 Claude memory); subdirectories and other extensions do not enter the branch.
 
-Every `agit commit` (the Stop hook's automatic settlement included) collects the changes
+Memory is private by default: the repository's memory allowlist starts empty. Authorize each
+intended filename or pattern before collection, for example:
+
+```sh
+agit privacy policy allow-memory decisions.md --repo alice/payments
+```
+
+Repository, branch and mandatory exclusions still apply. `agit memory status` shows excluded
+changes and gives the authorization command when the allowlist is missing an entry.
+
+Every `agit commit` (the Stop hook's automatic settlement included) collects authorized changes
 **relative to the baseline taken at launch** into the session branch, as one file commit: what was
 newly written, modified or deleted at the top level, plus the agent's edits and deletions inside
 the mirrored subdirectories. Personal memory that was already there at launch and was not touched
-this time does not enter the branch. Secret matches receive reversible local replacements when possible; unavailable privacy
-processing leaves the affected content unchanged and does not stop collection. A session not launched through agit has no
+this time does not enter the branch. Secret matches receive reversible local replacements when possible;
+content that cannot be protected stays off the branch and is retried later. A session not launched through agit has no
 baseline: settlement establishes the baseline and collects nothing, and an explicit
-`agit memory sync` is what pulls in everything currently at the top level.
+`agit memory sync` considers authorized files currently at the top level.
 `agit config memory.track off` turns local collection off.
 
 `main` does not move on its own — it gets pushed and inherited by a colleague's `agit new`, while

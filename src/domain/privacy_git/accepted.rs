@@ -7,7 +7,7 @@ use crate::hub::{
 };
 use zeroize::Zeroizing;
 
-pub(super) const RECOVERY: &str = "accepted publication mapping is unavailable or inconsistent; restore this checkout's privacy state or clone the accepted remote into a fresh checkout before continuing";
+pub(super) const RECOVERY: &str = "accepted publication mapping is unavailable or inconsistent; keep this checkout to preserve unpublished commits; restore its saved privacy state or clone the accepted remote into a separate checkout before continuing";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +25,37 @@ pub(super) struct Mapping {
     pub recipient: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plain: bool,
+}
+
+impl Mapping {
+    pub fn object_source(&self, source: &Repo, parent: &Path, branch: &str) -> Result<Repo> {
+        let source = source.clone().local_objects_only();
+        // An identity mapping refers to the public source graph. Its bytes do not depend
+        // on a separate projection store being retained.
+        if self.source == self.public {
+            return Ok(source);
+        }
+        let cached = Repo::at(parent.join(&self.store)).local_objects_only();
+        if cached.root().join(".git/config").is_file()
+            && !cached.root().join(".git/objects/info/alternates").exists()
+            && cached
+                .git_opt(&["cat-file", "-e", &format!("{}^{{commit}}", self.public)])
+                .is_some()
+        {
+            return Ok(cached);
+        }
+        if source
+            .git_opt(&["cat-file", "-e", &format!("{}^{{commit}}", self.public)])
+            .is_some()
+        {
+            return Ok(source);
+        }
+        Err(MissingAcceptedObjects {
+            branch: branch.into(),
+            published: self.public.clone(),
+        }
+        .into())
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -97,6 +128,12 @@ impl Ledger {
 
     pub fn get(&self, branch: &str, source: &str) -> Option<&Mapping> {
         self.branches.get(branch)?.accepted.get(source)
+    }
+
+    pub fn has_accepted_branch(&self, branch: &str) -> bool {
+        self.branches
+            .get(branch)
+            .is_some_and(|state| !state.accepted.is_empty())
     }
 
     pub fn selected(&self, branch: Option<&str>, source: &str) -> Result<Option<&Mapping>> {

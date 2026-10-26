@@ -32,6 +32,7 @@ agit distill [<file>…] [-y]          # alias of `agit memory distill`
 ## Examples
 
 ```bash
+agit privacy policy allow-memory decisions.md --repo szh/p1
 agit memory status
 agit memory diff refund-path.md
 agit distill                      # everything that differs from main, one confirmation each
@@ -47,5 +48,7 @@ agit memory sync --into szh/p1@refund-fix
   add an explicit pattern with `agit privacy policy allow-memory <pattern> --repo <owner/repo>`
   before a file can enter a branch. A branch restriction can narrow that allowlist, and rejected
   candidates remain eligible for a later retry after the policy changes.
+- `status` labels policy-excluded changes as not collected and prints the authorization command
+  for a missing allowlist entry. Eligible changes still need to pass content privacy checks.
 - `memory.track = off` (`agit config`) turns collection off for this machine, on every path including `sync`.
 - A session not started through agit has no baseline: `commit` only records one; `memory sync` collects every top-level file.

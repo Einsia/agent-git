@@ -41,6 +41,15 @@ mod receipt_tests;
 pub mod sessions;
 mod state;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "accepted published commit {published} on branch {branch} is unavailable in this checkout's retained object cache"
+)]
+pub(crate) struct MissingAcceptedObjects {
+    pub branch: String,
+    pub published: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cache {
@@ -229,7 +238,7 @@ pub(crate) fn publication_envelope(
     let mapping = ledger.selected(branch, commit)?;
     let (repo, public) = if let Some(mapping) = mapping {
         (
-            Repo::at(parent.join(&mapping.store)).local_objects_only(),
+            mapping.object_source(source, &parent, branch.unwrap_or("selected history"))?,
             mapping.public.as_str(),
         )
     } else {

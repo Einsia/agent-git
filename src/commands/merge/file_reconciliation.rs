@@ -129,13 +129,7 @@ fn command(repo: &Repo) -> Command {
     command
 }
 
-pub(super) fn tree(
-    repo: &Repo,
-    target: &str,
-    source: &str,
-    shared: &[String],
-    resolved: &[String],
-) -> Result<String> {
+fn draft(repo: &Repo, target: &str, source: &str) -> Result<Draft> {
     let mut child = command(repo)
         .args([
             "merge-tree",
@@ -165,6 +159,25 @@ pub(super) fn tree(
         repo.git(&["cat-file", "-t", &draft.tree])? == "tree",
         "file merge result is not a tree"
     );
+    Ok(draft)
+}
+
+pub(super) fn conflicts(repo: &Repo, target: &str, source: &str) -> Result<BTreeSet<String>> {
+    Ok(draft(repo, target, source)?
+        .conflicts
+        .into_iter()
+        .filter(|path| !meta::is_storage_path(path))
+        .collect())
+}
+
+pub(super) fn tree(
+    repo: &Repo,
+    target: &str,
+    source: &str,
+    shared: &[String],
+    resolved: &[String],
+) -> Result<String> {
+    let draft = draft(repo, target, source)?;
     let conflicts: Vec<_> = draft
         .conflicts
         .iter()

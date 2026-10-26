@@ -62,6 +62,7 @@ pub(super) fn run(
     repo: Repo,
     branches: &[String],
 ) -> CmdResult {
+    let retry_command = retry_push_command(args, &checkout.slug(), branches);
     ensure!(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing publication"
@@ -87,11 +88,77 @@ pub(super) fn run(
         client,
         repo,
         branches,
+        &retry_command,
         Destination {
             intent,
             local_target,
         },
     )
+}
+
+fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    let mut command = format!("agit push {}", quote_arg(slug));
+    for branch in branches {
+        command.push_str(&format!(" --branch={}", quote_arg(branch)));
+    }
+    if let Some(destination) = &args.to {
+        command.push_str(&format!(" --to={}", quote_arg(destination)));
+    }
+    for (selected, flag) in [
+        (args.audit, "--audit"),
+        (args.dry_run, "--dry-run"),
+        (args.show_preview, "--show-preview"),
+        (args.public, "--public"),
+        (args.private, "--private"),
+    ] {
+        if selected {
+            command.push(' ');
+            command.push_str(flag);
+        }
+    }
+    command
+}
+
+fn publication_recovery(report: &PublicationReport, retry: &str, repository: &str) -> String {
+    let attempts: Vec<_> = [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .flat_map(|phase| &phase.attempts)
+        .collect();
+    let unknown = attempts.iter().any(|attempt| {
+        !attempt.complete
+            || attempt
+                .refs
+                .iter()
+                .any(|reference| reference.status == PublicationStatus::Unconfirmed)
+    });
+    if unknown {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        return format!(
+            "publication did not complete; some ref updates are unconfirmed; run `agit fetch {}` and inspect `agit status` before rerunning `{retry}`",
+            quote_arg(repository)
+        );
+    }
+    if attempts
+        .iter()
+        .flat_map(|attempt| &attempt.refs)
+        .any(|reference| reference.status == PublicationStatus::Updated)
+    {
+        format!(
+            "publication did not complete; some ref updates were acknowledged; rerunning `{retry}` is safe and rechecks the destination"
+        )
+    } else {
+        format!(
+            "publication did not complete; no branch or tag refs were updated; rerunning `{retry}` is safe after resolving the reported error"
+        )
+    }
 }
 
 fn verify_receipt_acknowledgements(

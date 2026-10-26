@@ -81,6 +81,37 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, repo, claude, mem) = fixture(tmp.path());
     let into = format!("{REPO}@s1");
+    agit::domain::privacy::PrivacyPolicy::default()
+        .save(&repo)
+        .unwrap();
+    let policy_path = agit::domain::privacy::PrivacyPolicy::path(&repo).unwrap();
+    let policy_bytes = fs::read(&policy_path).unwrap();
+    fs::write(&policy_path, b"{ invalid policy").unwrap();
+    let unreadable = agit(&home, &claude, &["memory", "status", "--into", &into]);
+    assert!(!unreadable.status.success(), "{unreadable:?}");
+    assert!(
+        String::from_utf8_lossy(&unreadable.stderr)
+            .contains("cannot read repository memory privacy policy"),
+        "{unreadable:?}"
+    );
+    let display = String::from_utf8_lossy(&unreadable.stdout);
+    assert!(
+        !display.contains("repository memory allowlist is empty"),
+        "{display}"
+    );
+    assert!(!display.contains("eligible for collection"), "{display}");
+    assert_eq!(fs::read(&policy_path).unwrap(), b"{ invalid policy");
+    fs::write(&policy_path, policy_bytes).unwrap();
+    let status = ok(&agit(
+        &home,
+        &claude,
+        &["memory", "status", "--into", &into],
+    ));
+    assert!(
+        status.contains("repository memory allowlist is empty"),
+        "{status}"
+    );
+    assert!(!status.contains("eligible for collection"), "{status}");
     fs::write(mem.join("mine.md"), "---\nname: mine\n---\nlocal fact\n").unwrap();
     fs::write(
         mem.join("MEMORY.md"),
@@ -88,7 +119,54 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     )
     .unwrap();
 
-    // sync: the new local file enters the branch; the branch's team.md (inherited from main)
+    let denied = agit(&home, &claude, &["memory", "sync", "--into", &into]);
+    ok(&denied);
+    let refusal = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        refusal.contains("agit privacy policy allow-memory --repo drh/qa -- mine.md"),
+        "{refusal}"
+    );
+    assert!(repo.show("refs/heads/s1", "memory/mine.md").is_none());
+    let status = ok(&agit(
+        &home,
+        &claude,
+        &["memory", "status", "--into", &into],
+    ));
+    assert!(
+        status.contains("not collected (privacy policy)"),
+        "{status}"
+    );
+    assert!(
+        status.contains("allow-memory --repo drh/qa -- mine.md"),
+        "{status}"
+    );
+    assert!(!status.contains("eligible for collection"), "{status}");
+    assert!(!status.contains("everything in sync"), "{status}");
+    ok(&agit(
+        &home,
+        &claude,
+        &[
+            "privacy",
+            "policy",
+            "allow-memory",
+            "--repo",
+            REPO,
+            "--",
+            "mine.md",
+        ],
+    ));
+    let status = ok(&agit(
+        &home,
+        &claude,
+        &["memory", "status", "--into", &into],
+    ));
+    assert!(status.contains("eligible for collection"), "{status}");
+    assert!(
+        !status.contains("repository memory allowlist is empty"),
+        "{status}"
+    );
+
+    // sync: the authorized local file enters the branch; the branch's team.md (inherited from main)
     // enters the mirror subdirectory and is indexed.
     ok(&agit(&home, &claude, &["memory", "sync", "--into", &into]));
     assert!(repo.show("refs/heads/s1", "memory/mine.md").is_some());

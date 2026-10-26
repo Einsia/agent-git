@@ -51,6 +51,16 @@ agit privacy policy show --repo alice/project
 agit privacy policy file --repo alice/project
 ```
 
+Memory collection requires an explicit repository allowlist entry. The default list is empty:
+
+```bash
+agit privacy policy allow-memory decisions.md --repo alice/project
+```
+
+Use a filename relative to the memory directory, or an intentionally chosen pattern. Branch
+and mandatory exclusions can still refuse it. `agit memory status` explains policy exclusions;
+`agit memory sync` retries eligible files after authorization. Content privacy checks also apply.
+
 The relevant fields are:
 
 ```json

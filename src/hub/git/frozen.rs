@@ -410,14 +410,50 @@ impl FrozenPublication {
         )
     }
 
-    fn privacy_remote_refs(&self) -> Result<BTreeMap<String, String>> {
-        let output = super::capture_transport(
-            self.directory.path(),
-            &["ls-remote", "--refs", "--", &self.url],
-            Some(&self.transport),
-        )
-        .context("cannot read the complete publication destination refs")?;
-        crate::hub::privacy::publication::parse_refs(&output)
+    pub(super) fn privacy_remote_refs(&self) -> Result<BTreeMap<String, String>> {
+        let delays = [
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(1),
+        ];
+        for attempt in 0..=delays.len() {
+            if attempt > 0
+                && let Some(client) = &self.transport.client
+                && let Some(expected) = client.credential_snapshot()
+            {
+                let current = crate::infra::credentials::load_checked(client.base())?
+                    .context("publication account is unavailable during destination-ref retry")?;
+                ensure!(
+                    expected.username == current.username
+                        && expected
+                            .account_id
+                            .as_ref()
+                            .is_none_or(|id| current.account_id.as_ref() == Some(id)),
+                    "publication account changed during destination-ref retry"
+                );
+            }
+            match super::ref_read::capture(
+                self.directory.path(),
+                &["ls-remote", "--refs", "--", &self.url],
+                Some(&self.transport),
+            ) {
+                Ok(output) => {
+                    return crate::hub::privacy::publication::parse_refs(&output)
+                        .context("publication destination returned malformed refs");
+                }
+                Err(error) if error.transient && attempt < delays.len() => {
+                    std::thread::sleep(delays[attempt])
+                }
+                Err(error) => {
+                    let context = if error.transient {
+                        "cannot read the complete publication destination refs after bounded retries: temporary Hub or network failure"
+                    } else {
+                        "cannot read the complete publication destination refs"
+                    };
+                    return Err(anyhow::Error::new(error).context(context));
+                }
+            }
+        }
+        unreachable!()
     }
 
     /// Divergent projections cannot replace the server strategy before an explicit migration.

@@ -203,6 +203,31 @@ fn tree_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
 }
 
+fn memory_exclusion(
+    name: &str,
+    decision: &crate::domain::privacy::CandidateDecision,
+    slug: &str,
+) -> String {
+    let reason = decision
+        .reason
+        .as_deref()
+        .unwrap_or("privacy policy excluded the candidate");
+    let authorization = if decision.rule == "repository.memory_allow" {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        format!(
+            "; allow with `agit privacy policy allow-memory --repo {} -- {}`",
+            quote_arg(slug),
+            quote_arg(name)
+        )
+    } else {
+        String::new()
+    };
+    format!("{name} ({reason}{authorization})")
+}
+
 /// Only top-level Markdown is a managed memory file.
 fn is_memory_file(name: &str) -> bool {
     name.ends_with(".md") && name != INDEX_FILE && !name.starts_with('.')
@@ -841,14 +866,9 @@ pub fn collect_with(
     for (name, bytes) in plan.top_changed.iter().chain(plan.mirror_changed.iter()) {
         let privacy_decision = privacy.evaluate_memory(name, Some(branch));
         if privacy_decision.action != crate::domain::privacy::CandidateAction::Allowed {
-            report.privacy_excluded.push(format!(
-                "{} ({})",
-                name,
-                privacy_decision
-                    .reason
-                    .as_deref()
-                    .unwrap_or("privacy policy excluded the candidate")
-            ));
+            report
+                .privacy_excluded
+                .push(memory_exclusion(name, &privacy_decision, slug));
             refused_names.insert(name.clone());
             continue;
         }
@@ -1195,6 +1215,9 @@ fn runtime_of(target: &Target) -> Option<(String, PathBuf)> {
 fn status(target: &Target) -> CmdResult {
     let primary = &target.primary;
     let branch = target.branch.as_str();
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary).context(
+        "cannot read repository memory privacy policy; memory collection status is unavailable",
+    )?;
     let ours = branch_files(primary, &tree_ref(branch))?;
     let main = if primary.has_ref("refs/heads/main") {
         branch_files(primary, "refs/heads/main")?
@@ -1246,12 +1269,32 @@ fn status(target: &Target) -> CmdResult {
         ),
     }
 
+    if privacy.memory_allow.is_empty() {
+        println!(
+            "  repository memory allowlist is empty — new and edited memory files stay private until explicitly allowed"
+        );
+    }
+    let track = Policy::from_config(Scope::SinceBaseline).track;
+    let decisions: BTreeMap<_, _> = plan
+        .top_changed
+        .keys()
+        .chain(plan.mirror_changed.keys())
+        .map(|name| (name, privacy.evaluate_memory(name, Some(branch))))
+        .collect();
+    let excluded: Vec<_> = decisions
+        .iter()
+        .filter(|(_, decision)| decision.action != crate::domain::privacy::CandidateAction::Allowed)
+        .collect();
     let mut names: BTreeSet<&String> = ours.keys().collect();
     names.extend(main.keys());
     names.extend(top.keys());
     names.extend(mirror.keys());
     let mut rows = Vec::new();
-    let pending_sync = plan.top_changed.len() + plan.mirror_changed.len() + plan.deleted.len();
+    let pending_sync = if track {
+        decisions.len() - excluded.len() + plan.deleted.len()
+    } else {
+        0
+    };
     for name in names {
         let in_branch = ours.get(name);
         let in_main = main.get(name);
@@ -1269,6 +1312,12 @@ fn status(target: &Target) -> CmdResult {
             String::new()
         } else if dir_missing {
             "—".to_string()
+        } else if !track && (decisions.contains_key(name) || plan.deleted.contains(name)) {
+            "not collected (memory.track = off)".to_string()
+        } else if decisions.get(name).is_some_and(|decision| {
+            decision.action != crate::domain::privacy::CandidateAction::Allowed
+        }) {
+            "not collected (privacy policy)".to_string()
         } else if plan.deleted.contains(name) {
             "deleted locally → will delete".to_string()
         } else if plan.top_changed.contains_key(name) {
@@ -1325,9 +1374,17 @@ fn status(target: &Target) -> CmdResult {
     }
     if pending_sync > 0 {
         println!(
-            "  {pending_sync} local change{} not yet on `{branch}` — collected at the next `agit commit` (or `agit memory sync`)",
+            "  {pending_sync} local change{} not yet on `{branch}` — eligible for collection at the next `agit commit` (or `agit memory sync`), subject to content privacy checks",
             if pending_sync == 1 { "" } else { "s" }
         );
+    }
+    if track {
+        for (name, decision) in &excluded {
+            println!(
+                "  memory/{}: not collected by the repository privacy policy",
+                memory_exclusion(name, decision, &target.slug)
+            );
+        }
     }
     let conflicts = pending
         .iter()
@@ -1347,7 +1404,12 @@ fn status(target: &Target) -> CmdResult {
             target.slug
         );
     }
-    if pending_sync == 0 && pending.is_empty() && !rows.is_empty() {
+    if pending_sync == 0
+        && decisions.is_empty()
+        && plan.deleted.is_empty()
+        && pending.is_empty()
+        && !rows.is_empty()
+    {
         println!(
             "  {} everything in sync",
             ui::ok(ui::theme::symbols().check)
@@ -1941,8 +2003,20 @@ mod tests {
         assert_eq!(rejected.collected, 0);
         assert_eq!(rejected.privacy_excluded.len(), 1);
         assert!(file(&repo, "refs/heads/s1", "private.md").is_none());
+        assert!(rejected.privacy_excluded[0].contains("allow-memory"));
 
         privacy.memory_allow.push("private.md".into());
+        privacy
+            .branches
+            .entry("s1".into())
+            .or_default()
+            .memory_exclude
+            .push("private.md".into());
+        privacy.save(&repo).unwrap();
+        let restricted = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
+        assert!(restricted.privacy_excluded[0].contains("branch policy"));
+        assert!(!restricted.privacy_excluded[0].contains("allow-memory"));
+        privacy.branches.clear();
         privacy.save(&repo).unwrap();
         let accepted = collect_with(&repo, "s1", SLUG, &mem, ON).unwrap();
         assert_eq!(accepted.collected, 1);

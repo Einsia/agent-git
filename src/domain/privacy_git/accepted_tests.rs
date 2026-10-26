@@ -28,6 +28,204 @@ fn remote(history: &ProjectedHistory) -> RemoteRefs {
     }
 }
 
+/// Identity mappings retain public Git bytes without requiring a separate projection cache.
+#[test]
+fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() {
+    use super::sessions::SessionPublicationPlan;
+    use crate::domain::session_privacy::{AccountIdentity, SessionPrivacy, SessionPrivacyConfig};
+    use crate::hub::privacy::sessions::SessionPrivacyResponse;
+    let temp = tempfile::tempdir().unwrap();
+    let source = Repo::init(&temp.path().join("collaborator")).unwrap();
+    source
+        .git(&["config", "user.name", "Collaborator"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "collaborator@example.invalid"])
+        .unwrap();
+    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    source.git(&["checkout", "-b", "teammate"]).unwrap();
+    let original_meta = Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "codex".into(),
+        String::new(),
+    );
+    meta::write(source.root(), &original_meta).unwrap();
+    storage::write_snapshot(source.root(), "", "").unwrap();
+    source.add_all().unwrap();
+    source.commit("Published teammate snapshot").unwrap();
+    let base = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let identity = RemoteIdentity::new(
+        "https://hub.invalid",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    .unwrap();
+    let mapping = accepted::Mapping {
+        source: base.clone(),
+        public: base.clone(),
+        source_parents: vec![],
+        public_parents: vec![],
+        store: "c".repeat(64),
+        source_session: original_meta.session.clone(),
+        public_session: original_meta.session,
+        policy: PrivacyPolicy::default().digest().unwrap(),
+        recipient: None,
+        plain: false,
+    };
+    accepted::Ledger::open(&source, &identity)
+        .unwrap()
+        .prepare(&BTreeMap::from([(
+            "teammate".into(),
+            accepted::Candidate {
+                source_head: base.clone(),
+                public_head: base.clone(),
+                mappings: BTreeMap::from([(base.clone(), mapping)]),
+            },
+        )]))
+        .unwrap();
+    source.git(&["checkout", "-b", "fork"]).unwrap();
+    let mut metadata = Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    metadata.session_privacy = Some(
+        SessionPrivacy::new(Some(
+            AccountIdentity::new(&identity.hub, "collaborator").unwrap(),
+        ))
+        .unwrap(),
+    );
+    meta::write(source.root(), &metadata).unwrap();
+    source.add_all().unwrap();
+    source.commit("Cross-runtime fork").unwrap();
+    let head = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let selected = SessionPublicationPlan {
+        identity: identity.clone(),
+        remote: RemoteRefs {
+            heads: vec![base.clone()],
+            refs: BTreeMap::from([("refs/heads/teammate".into(), base.clone())]),
+            ..Default::default()
+        },
+        configs: BTreeMap::from([(
+            metadata.session.clone(),
+            SessionPrivacyResponse {
+                config: SessionPrivacyConfig {
+                    repository_id: identity.agent_id,
+                    session_id: metadata.session,
+                    privacy: metadata.session_privacy.unwrap(),
+                    revision: 1,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                },
+                owner_key: None,
+            },
+        )]),
+    };
+    accepted::Ledger::open(&source, &selected.identity)
+        .unwrap()
+        .reconcile(&selected.remote)
+        .unwrap();
+    assert_eq!(
+        publication_envelope(&source, Some("teammate"), &base, &selected.identity).unwrap(),
+        (base.clone(), None)
+    );
+    let mut published = ProjectedHistory::prepare_sessions_with_redactor(
+        &source,
+        &["fork".into()],
+        &selected,
+        &[],
+        &Redactor::new(Default::default()),
+    )
+    .unwrap();
+    assert_eq!(published.plan.heads()[0].oid(), head);
+    assert_eq!(
+        published
+            .repo
+            .git(&["rev-parse", &format!("{head}^")])
+            .unwrap(),
+        base
+    );
+    published.prepare_acceptance().unwrap();
+}
+
+/// A collaborator's new tip requires synchronization, including when its objects are not local.
+#[test]
+fn remote_advances_report_pull_without_discarding_local_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = Repo::init(&temp.path().join("source")).unwrap();
+    source.git(&["config", "user.name", "Writer"]).unwrap();
+    source
+        .git(&["config", "user.email", "writer@example.invalid"])
+        .unwrap();
+    source.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    source.git(&["checkout", "-b", "wiki"]).unwrap();
+    meta::write(source.root(), &Meta::new_file_line()).unwrap();
+    source.add_all().unwrap();
+    source.commit("Base").unwrap();
+    let base = source.git(&["rev-parse", "HEAD"]).unwrap();
+    source.git(&["checkout", "-b", "peer"]).unwrap();
+    fs::write(source.root().join("peer.md"), "Peer page\n").unwrap();
+    source.add_all().unwrap();
+    source.commit("Peer page").unwrap();
+    let peer = source.git(&["rev-parse", "HEAD"]).unwrap();
+    source.git(&["checkout", "wiki"]).unwrap();
+    let identity = RemoteIdentity::new(
+        "https://hub.invalid",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    .unwrap();
+    let ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    let check = |remote_head: &str| {
+        let plan = PublicationPlan::freeze_selected(&source, &["wiki".into()]).unwrap();
+        sessions::require_remote_ancestry(
+            &source,
+            &plan,
+            &ledger,
+            &RemoteRefs {
+                refs: BTreeMap::from([("refs/heads/wiki".into(), remote_head.into())]),
+                heads: vec![remote_head.into()],
+                ..Default::default()
+            },
+            "team/wiki",
+        )
+    };
+    assert!(check(&base).is_ok());
+    let error = check(&peer).unwrap_err().to_string();
+    assert!(error.contains("ahead of this checkout"), "{error}");
+    fs::write(source.root().join("local.md"), "Local page\n").unwrap();
+    source.add_all().unwrap();
+    source.commit("Local page").unwrap();
+    let local = source.git(&["rev-parse", "HEAD"]).unwrap();
+    for (tip, diagnosis) in [(&peer, "has diverged"), (&"f".repeat(40), "has changed")] {
+        let error = check(tip).unwrap_err().to_string();
+        assert!(error.contains(diagnosis), "{error}");
+        assert!(error.contains("agit pull team/wiki@wiki"), "{error}");
+        assert!(
+            error.contains("local unpublished commits are kept"),
+            "{error}"
+        );
+        assert!(!error.contains(accepted::RECOVERY), "{error}");
+    }
+    assert_eq!(source.git(&["rev-parse", "wiki"]).unwrap(), local);
+    assert_eq!(
+        source.git(&["show", "wiki:local.md"]).unwrap(),
+        "Local page"
+    );
+    // A checkout that has never published this branch has no private mapping state to restore.
+    meta::write(
+        source.root(),
+        &Meta::new(
+            "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "codex".into(),
+            String::new(),
+        ),
+    )
+    .unwrap();
+    source.add_all().unwrap();
+    source.commit("Session").unwrap();
+    let error = check(&peer).unwrap_err().to_string();
+    assert!(error.contains("agit pull team/wiki@wiki"), "{error}");
+    assert!(!error.contains(accepted::RECOVERY), "{error}");
+}
+
 /// Mixed admission preserves accepted bytes and scopes each new ciphertext to its own session.
 #[test]
 fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
@@ -434,6 +632,21 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     assert!(altered.validate().is_err());
     source.git(&["checkout", "work"]).unwrap();
     save(&owned, "Private continuation by Bob");
+    let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    ledger.reconcile(&selected.remote).unwrap();
+    let plan = PublicationPlan::freeze_selected(&source, &branches).unwrap();
+    sessions::require_remote_ancestry(&source, &plan, &ledger, &selected.remote, "team/app")
+        .unwrap();
+    let mut advanced = selected.remote.clone();
+    advanced
+        .refs
+        .insert("refs/heads/work".into(), "f".repeat(40));
+    let error = sessions::require_remote_ancestry(&source, &plan, &ledger, &advanced, "team/app")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("agit pull team/app@work"),
+        "{error:#}"
+    );
     let mut next = prepare(&branches, &selected).unwrap();
     let second_public = next.repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
     assert_eq!(
@@ -814,6 +1027,25 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         published::retain_accepted(&retained, same.repo(), &public, &["f".repeat(40)]).is_err()
     );
     drop(same);
+
+    let unavailable = retained.root().with_extension("unavailable");
+    fs::rename(retained.root(), &unavailable).unwrap();
+    initialize_with_format(retained.root(), 40).unwrap();
+    let error = prepare(&selected).err().unwrap();
+    let missing = error.downcast_ref::<MissingAcceptedObjects>().unwrap();
+    assert_eq!(missing.branch, "work");
+    assert_eq!(missing.published, public);
+    crate::commands::plumbing::import_commit_graph(&source, &Repo::at(&unavailable), &public)
+        .unwrap();
+    let fetched = prepare(&selected).unwrap();
+    assert_eq!(fetched.plan.heads()[0].oid(), public);
+    assert_eq!(
+        read(fetched.repo(), &["cat-file", "commit", &public], MAX_COMMIT).unwrap(),
+        public_bytes.as_bytes()
+    );
+    drop(fetched);
+    fs::remove_dir_all(retained.root()).unwrap();
+    fs::rename(&unavailable, retained.root()).unwrap();
 
     let key = SecretKey::from([44; 32]);
     selected.configs.insert(

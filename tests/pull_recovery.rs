@@ -189,6 +189,142 @@ impl Lab {
             .output()
             .unwrap()
     }
+
+    fn file_checkout(&self) -> PathBuf {
+        fs::create_dir_all(&self.source).unwrap();
+        self.git(&self.source, &["init", "--quiet", "--initial-branch=main"]);
+        self.git(
+            &self.source,
+            &["config", "receive.denyCurrentBranch", "updateInstead"],
+        );
+        meta::write(&self.source, &meta::Meta::new_file_line()).unwrap();
+        fs::write(self.source.join("page.md"), "Title\n\nMiddle\n\nEnd\n").unwrap();
+        self.git(&self.source, &["add", "-A"]);
+        self.git(&self.source, &["commit", "-qm", "Base files"]);
+        let selected = self.home.join("repos/alice/notes");
+        fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        let output = self
+            .command("git", None)
+            .args(["clone", "--quiet"])
+            .arg(&self.source)
+            .arg(&selected)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        selected
+    }
+
+    fn agit(&self, args: &[&str]) -> Output {
+        self.command(env!("CARGO_BIN_EXE_agit"), None)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+}
+
+/// File pulls preserve both parents and reconcile ordinary content without a native runtime.
+#[test]
+fn file_pull_reconciles_disjoint_changes_and_can_publish_the_result() {
+    let lab = Lab::new();
+    let local = lab.file_checkout();
+    fs::write(local.join("local.md"), "Local page\n").unwrap();
+    fs::write(local.join("page.md"), "Local title\n\nMiddle\n\nEnd\n").unwrap();
+    lab.git(&local, &["add", "-A"]);
+    lab.git(&local, &["commit", "-qm", "Local changes"]);
+    let left = lab.git(&local, &["rev-parse", "HEAD"]);
+    fs::write(lab.source.join("remote.md"), "Remote page\n").unwrap();
+    fs::write(
+        lab.source.join("page.md"),
+        "Title\n\nMiddle\n\nRemote end\n",
+    )
+    .unwrap();
+    lab.git(&lab.source, &["add", "-A"]);
+    lab.git(&lab.source, &["commit", "-qm", "Remote changes"]);
+    let right = lab.git(&lab.source, &["rev-parse", "HEAD"]);
+    let output = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("after the next resume"),
+        "{output:?}"
+    );
+    assert_eq!(lab.git(&local, &["rev-parse", "HEAD^1"]), left);
+    assert_eq!(lab.git(&local, &["rev-parse", "HEAD^2"]), right);
+    assert_eq!(
+        fs::read_to_string(local.join("page.md")).unwrap(),
+        "Local title\n\nMiddle\n\nRemote end\n"
+    );
+    for name in ["local.md", "remote.md"] {
+        assert!(local.join(name).is_file());
+    }
+    assert!(meta::read(&local).unwrap().is_file_line());
+    assert!(!local.join(".git/AGIT_MERGE_TX").exists());
+    assert!(!lab.home.join("store/codex").exists());
+    lab.git(&local, &["push", "origin", "main"]);
+    assert_eq!(
+        lab.git(&local, &["rev-parse", "HEAD"]),
+        lab.git(&lab.source, &["rev-parse", "HEAD"])
+    );
+}
+
+/// Conflict recovery is a persistent manual transaction; refusing dirty input cannot consume it.
+#[test]
+fn file_pull_preserves_dirty_input_and_conflicts_can_be_completed_or_aborted() {
+    let lab = Lab::new();
+    let local = lab.file_checkout();
+    fs::write(local.join("page.md"), "Local text\n").unwrap();
+    lab.git(&local, &["add", "-A"]);
+    lab.git(&local, &["commit", "-qm", "Local text"]);
+    let left = lab.git(&local, &["rev-parse", "HEAD"]);
+    lab.git(&lab.source, &["rm", "page.md"]);
+    lab.git(&lab.source, &["commit", "-qm", "Remote deletion"]);
+    fs::write(local.join("draft.md"), "Uncommitted draft\n").unwrap();
+    lab.git(&local, &["add", "draft.md"]);
+    let index = fs::read(local.join(".git/index")).unwrap();
+    let refused = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("uncommitted or staged"),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(local.join(".git/index")).unwrap(), index);
+    assert!(!local.join(".git/AGIT_MERGE_TX").exists());
+    lab.git(&local, &["reset", "--", "draft.md"]);
+    fs::remove_file(local.join("draft.md")).unwrap();
+    let conflicted = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(!conflicted.status.success(), "{conflicted:?}");
+    let text = String::from_utf8_lossy(&conflicted.stderr);
+    assert!(
+        text.contains("--continue --resolved page.md"),
+        "{conflicted:?}"
+    );
+    assert_eq!(lab.git(&local, &["rev-parse", "HEAD"]), left);
+    let tx = agit::domain::mergetx::read(&local).unwrap().unwrap();
+    assert_eq!(tx.mode, Some(agit::domain::mergetx::Mode::Manual));
+    assert_eq!(tx.exploration, None);
+    let aborted = lab.agit(&["merge", "--into", "alice/notes@main", "--abort"]);
+    assert!(aborted.status.success(), "{aborted:?}");
+    assert_eq!(lab.git(&local, &["rev-parse", "HEAD"]), left);
+    assert_eq!(
+        fs::read_to_string(local.join("page.md")).unwrap(),
+        "Local text\n"
+    );
+    let conflicted = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(!conflicted.status.success(), "{conflicted:?}");
+    fs::write(local.join("page.md"), "Resolved text\n").unwrap();
+    let completed = lab.agit(&[
+        "merge",
+        "--into",
+        "alice/notes@main",
+        "--continue",
+        "--resolved",
+        "page.md",
+    ]);
+    assert!(completed.status.success(), "{completed:?}");
+    assert_eq!(
+        fs::read_to_string(local.join("page.md")).unwrap(),
+        "Resolved text\n"
+    );
+    assert!(agit::domain::mergetx::read(&local).unwrap().is_none());
 }
 
 #[test]

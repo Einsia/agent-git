@@ -37,7 +37,9 @@ impl SessionPublicationPlan {
         );
         let plan = PublicationPlan::freeze_selected(source, branches)?;
         let history = sources::History::read(source, &plan)?;
-        let ledger = accepted::Ledger::open(source, &identity)?;
+        let mut ledger = accepted::Ledger::open(source, &identity)?;
+        ledger.reconcile(&remote)?;
+        require_remote_ancestry(source, &plan, &ledger, &remote, repository)?;
         let accepted = plan.accepted_commits(source, &remote.heads)?;
         let enveloped = enveloped_commits(source, plan.commit_objects())?;
         let mut sessions = BTreeSet::new();
@@ -178,6 +180,79 @@ impl SessionPublicationPlan {
     }
 }
 
+pub(super) fn require_remote_ancestry(
+    source: &Repo,
+    plan: &PublicationPlan,
+    ledger: &accepted::Ledger,
+    remote: &RemoteRefs,
+    repository: &str,
+) -> Result<()> {
+    let source = source.clone().local_objects_only();
+    let parents = commit_parent_map(&source, plan.commit_objects())?;
+    for head in plan.heads() {
+        let branch = head
+            .name()
+            .strip_prefix("refs/heads/")
+            .context("invalid publication branch")?;
+        let Some(remote_head) = remote.refs.get(head.name()) else {
+            continue;
+        };
+        let reachable = ancestors(head.oid(), &parents)?;
+        if reachable.contains(remote_head) {
+            continue;
+        }
+        let mut mapped = false;
+        let mut contained = false;
+        for oid in &reachable {
+            if let Some(entry) = ledger.inherited_immutable(branch, oid)? {
+                mapped = true;
+                contained |= &entry.public == remote_head;
+            }
+        }
+        if contained {
+            continue;
+        }
+        // A valid accepted ancestor establishes the publication baseline. Its remote successor
+        // need not exist locally; absence of that object does not invalidate the local ledger.
+        ensure!(
+            mapped || !ledger.has_accepted_branch(branch),
+            "{}",
+            accepted::RECOVERY
+        );
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        let target = quote_arg(&format!("{repository}@{branch}"));
+        let difference = source
+            .git_opt(&[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{}...{remote_head}", head.oid()),
+            ])
+            .and_then(|counts| {
+                let mut counts = counts.split_whitespace();
+                Some((
+                    counts.next()?.parse::<usize>().ok()?,
+                    counts.next()?.parse::<usize>().ok()?,
+                ))
+            });
+        let state = match difference {
+            Some((0, behind)) => format!("is ahead of this checkout by {behind} commits"),
+            Some((ahead, behind)) if behind > 0 => {
+                format!("has diverged (local +{ahead} / remote +{behind})")
+            }
+            _ => "has changed beyond this checkout's accepted history".into(),
+        };
+        let tip = remote_head.chars().take(12).collect::<String>();
+        anyhow::bail!(
+            "remote branch {branch} {state} (Hub tip {tip}); run `agit pull {target}` before pushing; local unpublished commits are kept"
+        );
+    }
+    Ok(())
+}
+
 impl ProjectedHistory {
     pub fn prepare_sessions(
         source: &Repo,
@@ -295,16 +370,7 @@ impl ProjectedHistory {
                             "{}",
                             accepted::RECOVERY
                         );
-                        let retained = Repo::at(parent.join(&entry.store)).local_objects_only();
-                        ensure!(
-                            retained.root().join(".git/config").is_file()
-                                && !retained
-                                    .root()
-                                    .join(".git/objects/info/alternates")
-                                    .exists(),
-                            "{}",
-                            accepted::RECOVERY
-                        );
+                        let retained = entry.object_source(&source, &parent, branch)?;
                         let plain = entry.plain;
                         if plain {
                             let metadata = crate::domain::storage::metadata_local(
