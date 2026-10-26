@@ -2552,7 +2552,92 @@ fn finish_local_sessions(
             );
         }
     }
+    protect_session_labels(&mut sessions);
     sessions
+}
+
+/// Session labels leave the device in the session list, and they carry the opening prompt and
+/// the runtime's title, so they are protected like any other remote-control text, under the rules
+/// of the repository each session belongs to: a value registered in that repository is replaced
+/// as it would be in the session's transcript. The repository comes from the session's own link,
+/// never from the label or its working directory alone. The labels of each repository go to the
+/// privacy worker in one request; if its check does not complete, or a session's repository
+/// cannot be resolved or loaded, those labels show the failure marker instead of their text.
+pub fn protect_session_labels(sessions: &mut [LocalSession]) {
+    protect_labels_with(
+        sessions,
+        &crate::domain::redact::Redactor::this_machine(),
+        |item| {
+            crate::rc::protection::native_repository(
+                &item.runtime,
+                &item.runtime_session_id,
+                std::path::Path::new(&item.cwd),
+            )
+        },
+    );
+}
+
+fn protect_labels_with(
+    sessions: &mut [LocalSession],
+    base: &crate::domain::redact::Redactor,
+    repository: impl Fn(&LocalSession) -> crate::Result<Option<std::path::PathBuf>>,
+) {
+    let mut groups = std::collections::BTreeMap::<Option<std::path::PathBuf>, Vec<usize>>::new();
+    let mut unresolved = Vec::new();
+    for (index, item) in sessions.iter().enumerate() {
+        match repository(item) {
+            Ok(root) => groups.entry(root).or_default().push(index),
+            Err(_) => unresolved.push(index),
+        }
+    }
+    for (root, indexes) in groups {
+        let redactor = match root {
+            Some(root) => base.clone().with_repository(&root),
+            None => Ok(base.clone()),
+        };
+        match redactor {
+            Ok(redactor) => protect_label_group(sessions, &indexes, &redactor),
+            Err(_) => unresolved.extend(indexes),
+        }
+    }
+    for index in unresolved {
+        let item = &mut sessions[index];
+        for label in item.gist.iter_mut().chain(item.title.iter_mut()) {
+            *label = crate::domain::redact::PROTECTION_ERROR_TEXT.to_owned();
+        }
+    }
+}
+
+/// Protect the labels of `sessions[indexes]` in one request.
+fn protect_label_group(
+    sessions: &mut [LocalSession],
+    indexes: &[usize],
+    redactor: &crate::domain::redact::Redactor,
+) {
+    let labels: Vec<serde_json::Value> = indexes
+        .iter()
+        .flat_map(|&index| {
+            let item = &sessions[index];
+            item.gist.iter().chain(item.title.iter())
+        })
+        .map(|label| serde_json::Value::String(label.clone()))
+        .collect();
+    if labels.is_empty() {
+        return;
+    }
+    let protected = redactor.scrub_json(&serde_json::Value::Array(labels)).value;
+    let mut protected = protected.as_array().map(|labels| labels.iter());
+    for &index in indexes {
+        let item = &mut sessions[index];
+        for label in item.gist.iter_mut().chain(item.title.iter_mut()) {
+            *label = protected
+                .as_mut()
+                .and_then(Iterator::next)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(crate::domain::redact::PROTECTION_ERROR_TEXT)
+                .to_owned();
+        }
+    }
 }
 
 /// Resolve one already-enumerated local session.

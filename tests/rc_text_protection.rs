@@ -67,6 +67,10 @@ fn main() {
             "a value whose context left earlier",
             a_value_is_protected_when_its_context_left_earlier,
         ),
+        (
+            "a session label in its repository",
+            a_session_label_is_protected_under_its_repository_rules,
+        ),
         ("an unprocessed text", unprocessed_text_is_withheld),
     ];
     for (name, case) in cases {
@@ -381,6 +385,58 @@ fn a_value_is_protected_when_its_context_left_earlier(_home: &Path) {
         .scrub(&format!("{long}\nafter the long line\n"))
         .text;
     assert_eq!(shape(&delivered), shape(&whole));
+}
+
+/// A session's labels in the session list are protected under the rules of the repository its
+/// link names: a phrase registered in that repository is replaced in the title and opening
+/// prompt, while the same phrase in a session no repository claims stays, since only that
+/// repository registered it. A listing protected with the device's rules alone would send the
+/// registered phrase raw.
+fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
+    let phrase = "cedar lantern";
+    let repo = agit::domain::repo::Repo::init(&home.join("repos/alice/notes")).unwrap();
+    agit::domain::secret_filter::RepositoryDictionary::open(repo.root())
+        .unwrap()
+        .block_add(
+            "Private phrase",
+            zeroize::Zeroizing::new(phrase.into()),
+            true,
+        )
+        .unwrap();
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let store = agit::domain::store::Store::open_or_init().unwrap();
+    let native = "6b3f2c1e-0000-4000-8000-000000000001";
+    let mut link = agit::domain::link::Link::new("claude-code", native, Some(&work));
+    link.owner = Some("alice".into());
+    link.agent = Some("notes".into());
+    agit::domain::link::write(&store, &link).unwrap();
+    let row = |id: &str| agit::protocol::LocalSession {
+        runtime_session_id: id.into(),
+        runtime: "claude-code".into(),
+        cwd: work.display().to_string(),
+        modified_at: "2026-10-26T00:00:00Z".into(),
+        gist: Some(format!("ask about the {phrase}")),
+        title: Some(format!("{phrase} plan")),
+        adopted: true,
+        agent: None,
+        likely_active: false,
+    };
+    let mut sessions = vec![row(native), row("6b3f2c1e-0000-4000-8000-000000000002")];
+    agit::rc::daemon::protect_session_labels(&mut sessions);
+    for label in [&sessions[0].gist, &sessions[0].title] {
+        let label = label.as_deref().unwrap();
+        assert!(!label.contains(phrase), "{label}");
+        assert_eq!(
+            agit::domain::privacy::projector::tokens(label).count(),
+            1,
+            "{label}"
+        );
+    }
+    assert_eq!(
+        sessions[1].gist.as_deref(),
+        Some(format!("ask about the {phrase}").as_str())
+    );
 }
 
 /// Text, stream output and JSON values the worker cannot process are withheld: the marker

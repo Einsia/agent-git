@@ -1514,6 +1514,55 @@ fn local_session_wire_previews_bound_indexed_and_parsed_prompts() {
     );
 }
 
+/// Every session label that leaves in the session list, the opening-prompt gist and the runtime's
+/// title, passes through the redactor, and each keeps its own row. A listing that sent labels
+/// as read would publish the opening prompt and a home path raw; one that misaligned the protected
+/// labels would show one session's prompt on another; one that sent a session's labels when its
+/// repository could not be resolved would skip the rules registered there.
+#[test]
+fn session_labels_leave_only_through_the_redactor() {
+    let redactor = crate::domain::redact::Redactor::new(crate::domain::redact::Persona {
+        home: Some("/cluster/home/nana".into()),
+        ..Default::default()
+    });
+    let row = |gist: Option<&str>, title: Option<&str>| LocalSession {
+        title: title.map(str::to_owned),
+        runtime_session_id: "native".into(),
+        runtime: "codex".into(),
+        cwd: "/fixture".into(),
+        modified_at: "2026-09-14T00:00:00Z".into(),
+        gist: gist.map(str::to_owned),
+        adopted: false,
+        agent: None,
+        likely_active: false,
+    };
+    let mut rows = vec![
+        row(Some("fix /cluster/home/nana/app"), None),
+        row(None, Some("title in /cluster/home/nana/docs")),
+        row(Some("second prompt"), Some("second title")),
+    ];
+    let mut unattributable = row(Some("third prompt"), Some("third title"));
+    unattributable.runtime_session_id = "unattributable".into();
+    rows.push(unattributable);
+    protect_labels_with(&mut rows, &redactor, |item| {
+        anyhow::ensure!(
+            item.runtime_session_id != "unattributable",
+            "the session's repository cannot be resolved"
+        );
+        Ok(None)
+    });
+    assert_eq!(rows[0].gist.as_deref(), Some("fix ~/app"));
+    assert_eq!(rows[1].title.as_deref(), Some("title in ~/docs"));
+    assert_eq!(rows[2].gist.as_deref(), Some("second prompt"));
+    assert_eq!(rows[2].title.as_deref(), Some("second title"));
+    for label in [&rows[3].gist, &rows[3].title] {
+        assert_eq!(
+            label.as_deref(),
+            Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
+        );
+    }
+}
+
 #[test]
 fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
     let temp = tempfile::tempdir().unwrap();
