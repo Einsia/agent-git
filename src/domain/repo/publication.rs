@@ -17,6 +17,10 @@ const MAX_TAG_DEPTH: usize = 32;
 const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READS: usize = 8192;
+/// Commits of the destination's history read to decide which captured commits it already holds.
+/// It only stops a runaway walk: the destination's history is not the selected history, so the
+/// selected-history bound does not apply to it.
+const MAX_ACCEPTED_HISTORY: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct FrozenRef {
@@ -175,13 +179,10 @@ impl PublicationPlan {
                 Ok(())
             },
         )?;
-        let accepted = reader.ancestry(roots)?;
-        Ok(self
-            .commit_objects
-            .iter()
-            .filter(|oid| accepted.contains(*oid))
-            .cloned()
-            .collect())
+        if roots.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        reader.reachable_among(&roots, &self.commit_objects)
     }
 
     /// Every annotated tag object in the selected chains, including unreferenced inner tags.
@@ -454,13 +455,79 @@ impl Reader {
             }
             ensure!(
                 commits.len() < MAX_COMMITS,
-                "audit publication history limit exceeded"
+                "this branch has more history than one publication can carry ({MAX_COMMITS} \
+                 commits); it cannot be published until agit lifts this limit"
             );
             let body = self.object(&oid, "commit")?;
             pending.extend(commit_parents(&body)?);
             commits.insert(oid);
         }
         Ok(commits)
+    }
+
+    /// The commits of `among`, which is sorted, that are reachable from `roots`.
+    ///
+    /// Every ancestor of the roots is listed, under its own bound rather than the selected
+    /// history's: a walk of every advertised branch under the selected-history bound refuses a
+    /// short session once the repository's published branches together outgrow it. Git is not
+    /// asked to exclude history (`--not`), because that stops early on commit dates and misses an
+    /// ancestor older than its descendants. Replacement objects, grafts, the shallow file and the
+    /// commit-graph cache are ignored, so Git sees the same raw parents as the captured ancestry.
+    fn reachable_among(&mut self, roots: &[String], among: &[String]) -> Result<BTreeSet<String>> {
+        use std::io::{BufRead, Seek, Write};
+        let mut input = tempfile::tempfile()?;
+        for root in roots {
+            writeln!(input, "{root}")?;
+        }
+        input.rewind()?;
+        let mut command = self.repo.inspection_command(&[]);
+        crate::infra::git_runtime::disable_grafts(&mut command);
+        command
+            .args([
+                "--no-replace-objects",
+                "--shallow-file",
+                "/dev/null",
+                "-c",
+                "core.commitGraph=false",
+            ])
+            .args(&self.prefix)
+            .args(["rev-list", "--stdin"])
+            .stdin(input)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .context("local Git inspection could not start")?;
+        let stdout = child.stdout.take().expect("piped inspection stdout");
+        let mut reachable = BTreeSet::new();
+        let mut walked = 0usize;
+        let read = std::io::BufReader::new(stdout)
+            .lines()
+            .try_for_each(|line| -> Result<()> {
+                let oid = line.context("accepted publication history could not be read")?;
+                ensure!(valid_oid(&oid), "invalid accepted object identity");
+                walked += 1;
+                ensure!(
+                    walked <= MAX_ACCEPTED_HISTORY,
+                    "accepted publication history limit exceeded"
+                );
+                if among.binary_search(&oid).is_ok() {
+                    reachable.insert(oid);
+                }
+                Ok(())
+            });
+        if read.is_err() {
+            let _ = child.kill();
+        }
+        let status = child
+            .wait()
+            .context("local Git inspection could not be reaped")?;
+        read?;
+        ensure!(
+            status.success(),
+            "audit publication data is unavailable locally"
+        );
+        Ok(reachable)
     }
 
     fn read(&mut self, args: &[&str], limit: usize) -> Result<Vec<u8>> {
@@ -838,6 +905,47 @@ mod tests {
                 .accepted_commits(&repo, &["f".repeat(40)])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A short branch's accepted history is decided however much history the destination's other
+    /// branches hold. A raw walk of every advertised tip under the history bound refuses here, and
+    /// with it every session of a repository whose published branches together outgrow the bound.
+    #[test]
+    fn accepted_history_ignores_the_length_of_unrelated_published_branches() {
+        use std::io::Write;
+        let (_directory, repo, base) = repository();
+        let root = repo.root();
+        let mut stream = String::new();
+        for index in 0..=MAX_COMMITS {
+            stream.push_str("commit refs/heads/published\n");
+            stream.push_str("committer Writer <writer@example.invalid> 1700000000 +0000\n");
+            stream.push_str(&format!("data {}\n{index}\n", index.to_string().len() + 1));
+            if index == 0 {
+                stream.push_str(&format!("from {base}\n"));
+            }
+        }
+        let mut import = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["fast-import", "--quiet"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        import
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(import.wait().unwrap().success());
+        let published = git(root, &["rev-parse", "refs/heads/published"]);
+        git(root, &["checkout", "-qb", "short", &base]);
+        git(root, &["commit", "--allow-empty", "-qm", "short session"]);
+        let plan = PublicationPlan::freeze_selected(&repo, &["short".into()]).unwrap();
+        assert_eq!(
+            plan.accepted_commits(&repo, &[published]).unwrap(),
+            BTreeSet::from([base])
         );
     }
 

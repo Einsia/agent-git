@@ -241,7 +241,6 @@ pub(crate) fn parse_refs(output: &str) -> Result<BTreeMap<String, String>> {
                 && name.split('/').all(|part| !part.is_empty()
                     && !part.starts_with('.')
                     && !part.ends_with(".lock"))
-                && refs.len() < 4096
                 && refs.insert(name.into(), oid.into()).is_none(),
             "invalid or duplicate publication ref advertisement"
         );
@@ -465,5 +464,22 @@ mod tests {
             refs_digest(&BTreeMap::new()),
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// Every published turn leaves a version tag, so a repository's sessions together can hold
+    /// more refs than any one session has turns. Only the listing's byte bound limits a receipt's
+    /// ref map: a count bound refuses every receipt of the repository once its sessions together
+    /// pass it, however short the session being pushed.
+    #[test]
+    fn receipt_ref_listing_is_bounded_by_bytes_not_by_ref_count() {
+        let listing = |refs: usize| -> String {
+            (0..refs)
+                .map(|index| format!("{index:040x}\trefs/tags/agit-{index:040x}\n"))
+                .collect()
+        };
+        assert_eq!(parse_refs(&listing(10_000)).unwrap().len(), 10_000);
+        let oversized = listing(50_000);
+        assert!(oversized.len() > 4 * 1024 * 1024);
+        assert!(parse_refs(&oversized).is_err());
     }
 }
