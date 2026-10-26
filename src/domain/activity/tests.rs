@@ -65,6 +65,17 @@ fn record(sid: &str, role: &str, text: &str) -> String {
     )
 }
 
+fn sent(sid: &str, role: &str, text: &str, at: &str) -> String {
+    transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":role,"message":{"role":role,"content":text},"timestamp":at})
+        ),
+        "claude-code",
+        sid,
+    )
+}
+
 fn query() -> Query {
     Query {
         author: "ALICE".into(),
@@ -544,4 +555,69 @@ fn oversized_contributions_continue_inside_the_commit_without_repeating_tools_or
         assert_eq!(restored, answer);
         assert!(tail.last().unwrap().text_complete);
     }
+}
+
+/// Pins message-time selection: a message counts in the window it was sent in, whenever it was
+/// saved. A reader that still bounded saves by `before` would drop the late save; one that
+/// filtered by save time would return the message sent before `since` and the one sent after
+/// `before`. A record without a time counts as sent when it was saved.
+#[test]
+fn messages_are_selected_by_the_time_their_harness_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(temp.path()).unwrap();
+    let sid = format!("agit-{}", "e".repeat(40));
+    let mut log = sent(&sid, "user", "sent before range", "2026-09-30T23:00:00Z");
+    log += &record(&sid, "assistant", "untimed answer");
+    let early = save(
+        &repo,
+        &log,
+        &sid,
+        "alice",
+        "2026-10-01T00:30:00Z",
+        meta::LayoutVersion::V1,
+        1,
+    );
+    log += &sent(
+        &sid,
+        "user",
+        "sent in range, saved late",
+        "2026-10-02T10:00:00.5Z",
+    );
+    log += &sent(
+        &sid,
+        "assistant",
+        "sent after range",
+        "2026-10-03T08:00:00Z",
+    );
+    let late = save(
+        &repo,
+        &log,
+        &sid,
+        "alice",
+        "2026-10-05T00:00:00Z",
+        meta::LayoutVersion::V1,
+        2,
+    );
+    let pages = pages(&repo, &mut Fixed::default(), query(), || {});
+    assert!(pages.iter().all(|page| !page.incomplete));
+    assert_eq!(
+        texts(&pages),
+        [
+            (early, "untimed answer".into()),
+            (late, "sent in range, saved late".into()),
+        ]
+    );
+    let messages: Vec<_> = pages
+        .iter()
+        .flat_map(|page| &page.contributions)
+        .flat_map(|c| &c.messages)
+        .map(|m| (m.sent_at.as_str(), m.sent_basis))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            ("2026-10-01T00:30:00Z", SentBasis::Saved),
+            ("2026-10-02T10:00:00.500Z", SentBasis::Recorded),
+        ]
+    );
 }

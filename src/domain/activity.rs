@@ -1,6 +1,10 @@
 //! Saved conversation contributions share selection, extraction and pagination across local and
 //! Hub readers.
 //!
+//! Messages are selected by the time their harness recorded them, falling back to save time.
+//! Nothing is saved before it is sent, so only saves from `since` on are read; a save after
+//! `before` can still carry messages sent inside the window.
+//!
 //! Contributions are ordered by save time, session, turn and commit. A continuation resumes after
 //! the last emitted position, so a save that lands later in that order extends the result instead
 //! of invalidating the cursor.
@@ -24,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 const MAX_PAGE_TEXT: usize = 256 * 1024;
@@ -188,11 +192,23 @@ pub struct Contribution {
     pub messages: Vec<Message>,
 }
 
+/// Where a message's `sent_at` comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentBasis {
+    /// The time the harness wrote into the message's record.
+    Recorded,
+    /// The record has no time; its contribution's `saved_at` stands in.
+    Saved,
+}
+
 /// A chunk of a long message carries its byte offset; the last chunk is `text_complete`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
     pub line: usize,
+    pub sent_at: String,
+    pub sent_basis: SentBasis,
     pub text: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub text_offset: usize,
@@ -390,15 +406,7 @@ pub fn page(
         reasons.insert("unmapped_publication_author".into(), facts.unmapped.clone());
     }
     let who = history::Who::new(&selection.author, facts.account.as_ref());
-    let walked = history::walk(
-        store,
-        &scope,
-        &publications,
-        &who,
-        floor,
-        (since, before),
-        first,
-    )?;
+    let walked = history::walk(store, &scope, &publications, &who, floor, since, first)?;
     if walked.truncated {
         let truncated = reasons.entry("history_truncated".into()).or_default();
         truncated.count = truncated.count.max(1);
@@ -509,7 +517,12 @@ pub fn page(
                     stop = Some(Stop::Budget);
                     break 'groups;
                 }
-                let window = match extractor.window(&candidate, record, selection.assistant) {
+                let window = match extractor.window(
+                    &candidate,
+                    record,
+                    selection.assistant,
+                    (since, before),
+                ) {
                     Ok(window) => window,
                     Err(error) if error.is::<extract::Exhausted>() => {
                         ensure!(
@@ -555,6 +568,15 @@ pub fn page(
                         Message {
                             role: source.role.into(),
                             line: source.line,
+                            sent_at: source
+                                .sent_at
+                                .unwrap_or(candidate.key.at)
+                                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                            sent_basis: if source.sent_at.is_some() {
+                                SentBasis::Recorded
+                            } else {
+                                SentBasis::Saved
+                            },
                             text: source.text[text..end].into(),
                             text_offset: text,
                             text_complete: end == source.text.len(),

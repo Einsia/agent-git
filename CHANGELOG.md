@@ -14,6 +14,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   local history stays. Without a target it drops the conversation the command runs in. The
   conversation stops recording into that branch and the project no longer captures it.
 
+### Changed
+
+- `agit activity` and its MCP tool select messages by when they were sent: the time Claude Code,
+  Codex or OpenCode recorded for each message, or its save time when none was recorded. A
+  conversation saved or pushed later still counts on the day it happened. Each message carries
+  `sent_at` and `sent_basis`. Encrypted publications are still selected by acceptance time. The
+  Hub must be upgraded together with the CLI.
+
 ### Fixed
 
 - `npx create-agit` served from npx's cache, or a `create-agit` installed globally, no longer

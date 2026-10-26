@@ -6,7 +6,7 @@ use crate::{
     domain::{
         activity::{
             self, Alias, Assistant, Attribution, AttributionBody, AttributionRequest, Facts,
-            FactsRequest, Page, Query, Reason, TimeBasis,
+            FactsRequest, Page, Query, Reason, SentBasis, TimeBasis,
         },
         repo::Repo,
     },
@@ -33,10 +33,10 @@ pub struct Args {
     /// Hub username/account ID, or exact legacy Git author name/email.
     #[arg(long)]
     pub author: String,
-    /// Inclusive save time: commit time locally, acceptance time for encrypted publications.
+    /// Inclusive send time: the time the harness recorded each message, or its save time.
     #[arg(long)]
     pub since: String,
-    /// Exclusive save time, as YYYY-MM-DD (UTC) or RFC3339 with a timezone.
+    /// Exclusive send time, as YYYY-MM-DD (UTC) or RFC3339 with a timezone.
     #[arg(long)]
     pub before: String,
     /// Branch name or exact AgentGit session ID.
@@ -154,7 +154,7 @@ fn run_query(args: Args) -> CmdResult {
 
 fn markdown(source: &str, page: &Page) {
     println!(
-        "# Conversation activity: {}\n\nSource: {source}. Times are save times in UTC.\n",
+        "# Conversation activity: {}\n\nSource: {source}. Times are in UTC.\n",
         page.repo
     );
     for contribution in &page.contributions {
@@ -194,9 +194,14 @@ fn markdown(source: &str, page: &Page) {
                     if complete { "" } else { ", continues" }
                 ),
             };
+            let saved = if message.sent_basis == SentBasis::Saved {
+                ", time saved"
+            } else {
+                ""
+            };
             println!(
-                "**{role}** (line {}{part})\n\n{}\n",
-                message.line, message.text
+                "**{role}** {}{saved} (line {}{part})\n\n{}\n",
+                message.sent_at, message.line, message.text
             );
         }
     }

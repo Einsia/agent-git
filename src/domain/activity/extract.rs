@@ -6,6 +6,7 @@ use crate::adapter::EventKind;
 use crate::domain::transcript::Envelope;
 use crate::domain::{meta, storage, transcript};
 use anyhow::{Context, Result, anyhow, ensure};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -100,6 +101,22 @@ pub(super) struct Text {
     /// One-based source record.
     pub line: usize,
     pub text: String,
+    /// When the harness recorded the message, if its record says.
+    pub sent_at: Option<DateTime<Utc>>,
+}
+
+/// The time a harness wrote into its own record: `timestamp` for Claude Code and Codex,
+/// `time_created` in milliseconds for OpenCode.
+pub(super) fn sent_at(envelope: &Envelope) -> Option<DateTime<Utc>> {
+    let content = &envelope.content;
+    if let Some(raw) = content["timestamp"].as_str() {
+        return DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|at| at.with_timezone(&Utc));
+    }
+    content["time_created"]
+        .as_i64()
+        .and_then(DateTime::from_timestamp_millis)
 }
 
 pub(super) struct Window {
@@ -233,14 +250,16 @@ impl<'s, S: Store> Extractor<'s, S> {
         Ok(sequence)
     }
 
-    /// Records appended since the first parent, from `record` on (zero starts after the parent).
-    /// Windows and their filtering depend only on immutable content, so a continuation sees the
-    /// same messages at the same indexes.
+    /// Records appended since the first parent, from `record` on (zero starts after the parent),
+    /// keeping messages sent inside `[since, before)`. A message without a recorded time counts
+    /// as sent when it was saved. Windows and their filtering depend only on immutable content,
+    /// so a continuation sees the same messages at the same indexes.
     pub(super) fn window(
         &mut self,
         candidate: &Candidate,
         record: usize,
         assistant: Assistant,
+        (since, before): (DateTime<Utc>, DateTime<Utc>),
     ) -> Result<Window> {
         let peeked = self
             .peeked
@@ -288,6 +307,12 @@ impl<'s, S: Store> Extractor<'s, S> {
                 }
             }
         }
+        // The answer to a request stays selected by its own time, so filtering follows the
+        // choice of last assistant messages rather than preceding it.
+        window.texts.retain(|text| {
+            let at = text.sent_at.unwrap_or(candidate.key.at);
+            at >= since && at < before
+        });
         Ok(window)
     }
 
@@ -385,6 +410,7 @@ impl<'s, S: Store> Extractor<'s, S> {
                     role,
                     line: absolute + 1,
                     text,
+                    sent_at: sent_at(envelope),
                 });
             }
         }

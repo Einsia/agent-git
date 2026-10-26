@@ -332,7 +332,7 @@ fn header(line: &str) -> Result<Header> {
 }
 
 pub(super) struct Walked {
-    /// Plain commits in the window from the resume position on, of every author.
+    /// Plain commits saved from the resume position on, of every author.
     plain: Vec<Header>,
     /// Listed publications reachable from the scope, with their first parents.
     published: HashMap<String, Option<String>>,
@@ -352,7 +352,7 @@ pub(super) fn walk(
     publications: &[(DateTime<Utc>, Publication)],
     who: &Who,
     floor: DateTime<Utc>,
-    (since, before): (DateTime<Utc>, DateTime<Utc>),
+    since: DateTime<Utc>,
     coverage: bool,
 ) -> Result<Walked> {
     let wanted: HashSet<&str> = publications
@@ -403,7 +403,7 @@ pub(super) fn walk(
             header.commit.clone(),
             who.signs(&header.name, &header.email),
         ));
-        if header.at >= floor.max(since) && header.at < before {
+        if header.at >= floor.max(since) {
             walked.plain.push(header);
         }
         Ok(true)
