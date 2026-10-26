@@ -120,9 +120,32 @@ impl Lab {
         agit::domain::repo::Repo::open(self.store.join("repos/me/quiet")).unwrap()
     }
 
+    /// Declare a session line `empty` that has not settled a turn.
+    fn declare_empty_session(&self) {
+        let repo = self.repo();
+        repo.git(&["switch", "--create", "empty", "main"]).unwrap();
+        let meta = agit::domain::meta::Meta::new_session_line(
+            "codex".into(),
+            self.root.path().to_string_lossy().into_owned(),
+        );
+        agit::domain::meta::write(repo.root(), &meta).unwrap();
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-m", "agit: declare empty session"])
+            .unwrap();
+    }
+
     fn seed_claude_memory(&self) -> PathBuf {
         self.signed_in();
         success(self.run(&["init", "quiet", "--no-bind"]));
+        // Memory is private by default; only the runtime file these labs write is collectable.
+        success(self.run(&[
+            "privacy",
+            "policy",
+            "allow-memory",
+            "mine.md",
+            "--repo",
+            "me/quiet",
+        ]));
         let repo = self.repo();
         std::fs::create_dir_all(repo.root().join("memory")).unwrap();
         std::fs::write(repo.root().join("memory/team.md"), "SYNTHETIC-SHARED\n").unwrap();
@@ -302,7 +325,9 @@ fn setup_config_command(lab: &Lab, args: &[&str], mode: &str) -> Command {
     command
 }
 
-fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str) {
+/// `independent` names setup items that succeed alongside the refused one; ordinary output may
+/// confirm them, and quiet output confirms nothing.
+fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str, independent: &[&str]) {
     assert_eq!(output.status.code(), Some(4), "{output:?}");
     let rendered = format!(
         "{}{}",
@@ -319,8 +344,25 @@ fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str) {
         assert_eq!(value["exit_code"], 4);
         assert_eq!(value["ok"], false);
     } else {
-        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).lines().all(|line| {
+                mode == "ordinary" && independent.iter().any(|item| line.ends_with(item))
+            }),
+            "{output:?}"
+        );
     }
+}
+
+/// Files outside the native Claude control plugin, which `setup --hooks` installs as its own item.
+fn outside_native_plugin(
+    mut files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let skills = std::path::Path::new("home/.claude/skills");
+    files.retain(|path, _| {
+        !path.starts_with(skills.join("agit-native-control"))
+            && *path != skills.join(".agit-native-control.lock")
+    });
+    files
 }
 
 #[test]
@@ -353,6 +395,7 @@ fn json_mcp_setup_refuses_invalid_configuration_and_preserves_other_fields() {
                     setup_config_command(&lab, &args, mode).output().unwrap(),
                     diagnostic,
                     mode,
+                    &[],
                 );
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 assert_eq!(setup_files(&lab), before);
@@ -364,6 +407,7 @@ fn json_mcp_setup_refuses_invalid_configuration_and_preserves_other_fields() {
                 setup_config_command(&lab, &args, mode).output().unwrap(),
                 "failed to read",
                 mode,
+                &[],
             );
             assert!(path.is_dir());
             assert_eq!(setup_files(&lab), before);
@@ -419,6 +463,7 @@ fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
                 setup_config_command(&lab, &args, mode).output().unwrap(),
                 diagnostic,
                 mode,
+                &[],
             );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             assert_eq!(setup_files(&lab), before);
@@ -430,6 +475,7 @@ fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
             setup_config_command(&lab, &args, mode).output().unwrap(),
             "failed to read",
             mode,
+            &[],
         );
         assert!(path.is_dir());
         assert_eq!(setup_files(&lab), before);
@@ -490,6 +536,9 @@ fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
     }
 }
 
+/// A non-array hook event refuses the Claude settings item without editing that file or any other
+/// configuration, and setup reports itself incomplete. The native control plugin is an independent
+/// item and may install alongside the refusal.
 #[test]
 fn hook_setup_refuses_non_array_events_before_editing_configuration() {
     for mode in ["ordinary", "quiet", "1", "2"] {
@@ -505,14 +554,15 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
             })
             .to_string();
             std::fs::write(&path, &bytes).unwrap();
-            let before = setup_files(&lab);
+            let before = outside_native_plugin(setup_files(&lab));
             setup_config_refusal(
                 setup_config_command(&lab, &args, mode).output().unwrap(),
                 &format!("`{event}`"),
                 mode,
+                &["Claude native shared control"],
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
-            assert_eq!(setup_files(&lab), before);
+            assert_eq!(outside_native_plugin(setup_files(&lab)), before);
         }
         let original = serde_json::json!({
             "userPreference": "retained",
@@ -795,26 +845,30 @@ fn quiet_mcp_preserves_noop_and_settlement_results() {
     }
 }
 
+/// A push whose session branch, inferred from `AGIT_SESSION`, has settled nothing is a successful
+/// no-op that changes no ref: its notice is informational, so quiet suppresses it. An unknown
+/// explicit branch still refuses under quiet.
 #[test]
 fn successful_push_noop_is_informational_and_quiet_suppresses_it() {
     let lab = Lab::new();
     lab.seed();
     let repo = lab.repo();
-    for branch in repo.local_branches() {
-        let head = repo
-            .git(&["rev-parse", &format!("refs/heads/{branch}")])
-            .unwrap();
-        repo.git(&[
-            "update-ref",
-            &format!("refs/remotes/origin/{branch}"),
-            head.trim(),
-        ])
-        .unwrap();
-    }
-    let ordinary = success(lab.run(&["push", "me/quiet", "--all"]));
-    assert!(String::from_utf8_lossy(&ordinary.stdout).contains("nothing to push"));
+    lab.declare_empty_session();
+    let before = repo.git(&["show-ref"]).unwrap();
+    let push = |args: &[&str]| {
+        lab.command(args)
+            .env("AGIT_SESSION", "me/quiet@empty")
+            .output()
+            .unwrap()
+    };
+    let ordinary = success(push(&["push", "me/quiet"]));
+    assert!(
+        String::from_utf8_lossy(&ordinary.stdout).contains("nothing to publish yet"),
+        "{ordinary:?}"
+    );
     assert!(!String::from_utf8_lossy(&ordinary.stderr).contains("error"));
-    silent(lab.run(&["-q", "push", "me/quiet", "--all"]));
+    silent(push(&["-q", "push", "me/quiet"]));
+    assert_eq!(repo.git(&["show-ref"]).unwrap(), before);
     let refused = lab.run(&["-q", "push", "me/quiet", "-b", "missing"]);
     assert_eq!(refused.status.code(), Some(3), "{refused:?}");
     assert!(String::from_utf8_lossy(&refused.stderr).contains("no local branch"));
@@ -920,35 +974,14 @@ fn quiet_retains_the_half_written_tail_diagnostic_without_settling_it() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
+/// Naming a session branch that has settled nothing refuses in both target spellings, under quiet
+/// too, instead of reporting a silent success, and changes no ref.
 #[test]
 fn explicit_empty_branches_refuse_for_both_target_spellings() {
     let lab = Lab::new();
     lab.seed();
     let repo = lab.repo();
-    repo.git(&["switch", "--create", "empty", "main"]).unwrap();
-    let meta = agit::domain::meta::Meta::new_session_line(
-        "codex".into(),
-        lab.root.path().to_string_lossy().into_owned(),
-    );
-    agit::domain::meta::write(repo.root(), &meta).unwrap();
-    repo.git(&["add", "-A"]).unwrap();
-    repo.git(&["commit", "-m", "agit: declare empty session"])
-        .unwrap();
-    for branch in repo
-        .local_branches()
-        .into_iter()
-        .filter(|name| name != "empty")
-    {
-        let head = repo
-            .git(&["rev-parse", &format!("refs/heads/{branch}")])
-            .unwrap();
-        repo.git(&[
-            "update-ref",
-            &format!("refs/remotes/origin/{branch}"),
-            head.trim(),
-        ])
-        .unwrap();
-    }
+    lab.declare_empty_session();
     let before = repo.git(&["show-ref"]).unwrap();
     for args in [
         vec!["-q", "push", "me/quiet@empty"],
@@ -961,7 +994,6 @@ fn explicit_empty_branches_refuse_for_both_target_spellings() {
             "{output:?}"
         );
     }
-    silent(lab.run(&["-q", "push", "me/quiet", "--all"]));
     assert_eq!(repo.git(&["show-ref"]).unwrap(), before);
 }
 
@@ -1300,6 +1332,11 @@ fn quiet_memory_sync_commit_and_distill_preserve_their_landings() {
     }
 }
 
+/// Quiet keeps memory diagnostics. With tracking off a sync is a silent no-op that collects
+/// nothing. With tracking on, a memory file holding a private key block without its END line is
+/// refused with a "suspected secret" warning that quiet still prints, and neither the branch nor
+/// the runtime file changes. A quiet mode that silences warnings, or a sync that collects the
+/// partly replaced file, fails here.
 #[test]
 fn quiet_memory_tracking_noop_preserves_policy_and_secret_diagnostics() {
     for mode in ["flag", "", "1"] {
@@ -1323,11 +1360,7 @@ fn quiet_memory_tracking_noop_preserves_policy_and_secret_diagnostics() {
         assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), before);
         assert!(repo.show("refs/heads/work", "memory/mine.md").is_none());
         success(lab.run(&["config", "memory.track", "session"]));
-        let secret = [
-            "-----BEGIN ",
-            "RSA PRIVATE KEY-----\nSYNTHETIC\n-----END RSA PRIVATE KEY-----\n",
-        ]
-        .concat();
+        let secret = ["-----BEGIN ", "RSA PRIVATE KEY-----\nSYNTHETIC\n"].concat();
         std::fs::write(memory.join("mine.md"), &secret).unwrap();
         let refused = success(
             lab.quiet_command(&["memory", "sync", "--into", "me/quiet@work"], mode)
@@ -1335,8 +1368,9 @@ fn quiet_memory_tracking_noop_preserves_policy_and_secret_diagnostics() {
                 .unwrap(),
         );
         assert!(refused.stdout.is_empty(), "{refused:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("suspected secret"),
+            stderr.contains("memory/mine.md") && stderr.contains("suspected secret"),
             "{refused:?}"
         );
         assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), before);

@@ -207,6 +207,23 @@ impl Lab {
         source.commit("Seed resumable promotion fixture").unwrap();
         source.git(&["branch", "-m", "work"]).unwrap();
         let original_head = source.git(&["rev-parse", "refs/heads/work"]).unwrap();
+        // The source was exchanged with the Hub: its origin is the advertised clone URL and
+        // tracks `work`, so the copy keeps that published history as its source evidence.
+        source
+            .git(&[
+                "remote",
+                "add",
+                "origin",
+                &format!("{}/alice/qa.git", hub.url),
+            ])
+            .unwrap();
+        source
+            .git(&[
+                "update-ref",
+                "refs/remotes/origin/work",
+                original_head.trim(),
+            ])
+            .unwrap();
         identity::pin(&source, &RemoteIdentity::new(&hub.url, SOURCE).unwrap()).unwrap();
         Self {
             temporary,

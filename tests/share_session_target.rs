@@ -1,6 +1,8 @@
 use agit::domain::{meta, repo::Repo, storage, transcript};
 use std::{fs, process::Command};
 
+/// A share names the session `AGIT_SESSION` or an explicit target selects, not the repository's
+/// most recent branch, and stops at its consent gate before contacting the unreachable Hub.
 #[test]
 fn sharing_follows_the_selected_branch_instead_of_repo_recency() {
     let tmp = tempfile::tempdir().unwrap();
@@ -65,12 +67,13 @@ fn sharing_follows_the_selected_branch_instead_of_repo_recency() {
         }
         let output = command.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(6), "{target:?}: {stderr}");
-        assert!(stderr.contains("cannot reach hub"), "{target:?}: {stderr}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(8), "{target:?}: {stderr}");
         assert!(
-            stdout.contains(&format!("VIEW of me/paper@{}", &selected[..12])),
-            "{target:?}: {stdout}"
+            stderr.contains(&format!(
+                "share for VIEW of me/paper@{} requires confirmation",
+                &selected[..12]
+            )),
+            "{target:?}: {stderr}"
         );
     }
 }

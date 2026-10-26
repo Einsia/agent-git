@@ -300,15 +300,19 @@ mod unix {
         .unwrap();
         assert!(exported.status.success(), "{exported:?}");
         let public = String::from_utf8(exported.stdout).unwrap();
-        for marker in ["settle this turn", "Readable reply", "done"] {
+        // Shell calls stay visible by default, so the secret check below also covers the
+        // credential inside a tool input and a tool result.
+        for marker in [
+            "settle this turn",
+            "Readable reply",
+            "Readable command",
+            "Readable output",
+            "done",
+        ] {
             assert!(
                 public.contains(marker),
                 "public projection omitted {marker}"
             );
-        }
-        // Unclassified shell calls have no file-scope authority in the public projection.
-        for marker in ["Readable command", "Readable output"] {
-            assert!(!public.contains(marker));
         }
         assert!(!public.contains(secret));
         assert!(!public.contains("content unavailable"));

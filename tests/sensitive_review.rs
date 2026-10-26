@@ -386,7 +386,8 @@ fn sensitive_review_uses_only_committed_selected_view_and_returns_guarded_local_
     assert_eq!(envelope["result"]["value"]["complete"], true);
 }
 
-/// Completing shallow history must not change the meaning of an already issued remedy.
+/// Completing shallow history must not change the meaning of an already issued remedy, and a
+/// local graft cannot change the stored history its guard compares.
 #[cfg(any(unix, windows))]
 #[test]
 fn a_shallow_scan_refuses_before_review_and_unshallowing_keeps_the_guarded_locator_correct() {
@@ -488,11 +489,6 @@ fn a_shallow_scan_refuses_before_review_and_unshallowing_keeps_the_guarded_locat
     let grafts = fixture.repo.git_path("info/grafts").unwrap();
     std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
     std::fs::write(&grafts, format!("{reviewed}\n")).unwrap();
-    let before = fixture.files();
-    let rejected = fixture.run(&args);
-    assert_eq!(rejected.status.code(), Some(4), "{rejected:?}");
-    assert_eq!(fixture.files(), before);
-    std::fs::remove_file(grafts).unwrap();
     assert_eq!(fixture.head(), reviewed);
     let reverted = fixture.run(&args);
     assert!(reverted.status.success(), "{reverted:?}");
@@ -513,6 +509,9 @@ fn a_shallow_scan_refuses_before_review_and_unshallowing_keeps_the_guarded_locat
     );
 }
 
+/// A guarded revert of another branch's event reads that branch's stored history: a shallow
+/// source refuses without writes, and a graft that clips the source leaves the event the locator
+/// names unchanged.
 #[test]
 fn a_guarded_revert_checks_the_frozen_history_of_another_source_branch() {
     let fixture = Fixture::new();
@@ -532,19 +531,27 @@ fn a_guarded_revert_checks_the_frozen_history_of_another_source_branch() {
         "--expected-head",
         &reviewed,
     ];
-    for relative in ["shallow", "info/grafts"] {
-        let path = fixture.repo.git_path(relative).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{source}\n")).unwrap();
-        let before = fixture.files();
-        let output = fixture.run(&args);
-        assert_eq!(output.status.code(), Some(4), "{output:?}");
-        assert_eq!(fixture.files(), before);
-        std::fs::remove_file(path).unwrap();
-    }
+    let shallow = fixture.repo.git_path("shallow").unwrap();
+    std::fs::write(&shallow, format!("{source}\n")).unwrap();
+    let before = fixture.files();
+    let output = fixture.run(&args);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(fixture.files(), before);
+    std::fs::remove_file(shallow).unwrap();
+
+    let grafts = fixture.repo.git_path("info/grafts").unwrap();
+    std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+    std::fs::write(&grafts, format!("{source}\n")).unwrap();
     let original = storage::materialize_pair_at(fixture.repo.root(), &reviewed).unwrap();
     let output = fixture.run(&args);
     assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fixture
+            .repo
+            .git(&["show", "-s", "--format=%P", "HEAD"])
+            .unwrap(),
+        reviewed
+    );
     let (log, view) = storage::materialize_pair_at(fixture.repo.root(), &fixture.head()).unwrap();
     assert!(log.starts_with(&original.0));
     assert!(view.contains("SELECTED-SYNTHETIC-EVIDENCE"));

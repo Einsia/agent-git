@@ -784,12 +784,11 @@ fn shallow_boundaries_cannot_hide_unpublished_ancestors() {
     );
 }
 
+/// A local graft that clips the topic's ancestry for plain Git leaves its sync counts unchanged:
+/// status reads stored parents, so the commit the graft hides is still counted.
 #[test]
 fn graft_boundaries_cannot_hide_unpublished_ancestors() {
-    truncated_graph(
-        "info/grafts",
-        "comparison unavailable: complete immutable ancestry is unavailable locally",
-    );
+    truncated_graph("info/grafts", "ahead 2, behind 0");
 }
 
 #[test]

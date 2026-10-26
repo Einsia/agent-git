@@ -9,6 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+/// A missing, malformed or stale session identity cannot be replaced by the only local repository
+/// or branch: those pushes refuse before any publication request. Every explicit selection passes
+/// the target gate and reaches the dry-run boundary of a destination the Hub does not have yet.
 #[test]
 fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
     let temporary = tempfile::tempdir().unwrap();
@@ -145,11 +148,13 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
         );
     }
     for output in allowed {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
         assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains(
+                "a new destination needs an immutable repository identity before a session publication preview"
+            ),
+            "{stderr}"
         );
     }
 }

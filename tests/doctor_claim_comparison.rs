@@ -337,6 +337,8 @@ fn doctor_compares_exact_owner_and_committed_branch_without_changing_claims() {
     );
 }
 
+/// Missing claim evidence makes the comparison unavailable. A claimed branch that no longer
+/// exists is reported as gone even when a tag has its name, and no transcript is compared.
 #[test]
 fn doctor_reports_missing_claim_evidence_without_falling_back_to_other_refs() {
     let lab = Lab::new(false);
@@ -352,10 +354,12 @@ fn doctor_reports_missing_claim_evidence_without_falling_back_to_other_refs() {
     claim["branch"] = json!("absent");
     lab.git(&lab.repo(), &["tag", "absent", "work"]);
     lab.write_claim(&claim);
+    let out = lab.assert_status("unavailable");
     assert!(
-        lab.assert_status("unavailable")
-            .contains("claimed local branch cannot be read")
+        out.contains("the claimed branch alice/qa@absent no longer exists"),
+        "{out}"
     );
+    assert!(out.contains("0 live transcripts"), "{out}");
     lab.write_claim(&original);
     fs::rename(&lab.live, lab.live.with_extension("saved")).unwrap();
     assert!(

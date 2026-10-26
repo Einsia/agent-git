@@ -16,11 +16,15 @@ use std::{fs, process::Command};
 const REPO: &str = "drh/qa";
 const BRANCH: &str = "first-session";
 
-/// A local Agent repo with one turn commit, on branch [`BRANCH`]; returns `AGIT_HOME`.
+/// A local Agent repo with one turn commit, on branch [`BRANCH`]; returns `AGIT_HOME`. The commit
+/// carries a fixed identity, so the host's global Git identity never enters the scanned history.
 fn fixture(tmp: &Path) -> PathBuf {
     let home = tmp.join("home");
     let repo = Repo::init(&home.join("repos").join(REPO)).unwrap();
     repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    repo.git(&["config", "user.name", "agit"]).unwrap();
+    repo.git(&["config", "user.email", "agit@localhost"])
+        .unwrap();
     fs::write(repo.root().join("README.md"), "fixture").unwrap();
     repo.add_all().unwrap();
     repo.commit("first turn").unwrap();

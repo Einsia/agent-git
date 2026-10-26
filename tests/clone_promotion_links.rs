@@ -162,7 +162,12 @@ fn promotion(name: &str) {
                 .unwrap();
             let (request, body) =
                 read_request(&mut stream).expect("local hub request is incomplete or invalid");
-            if request.starts_with("GET /api/cli/version ") {
+            // A signed-in command starts background privacy synchronization, which is outside
+            // the promotion protocol, so the fixture declines it like the version probe.
+            if request.starts_with("GET /api/cli/version ")
+                || request.starts_with("GET /api/me/privacy/")
+                || request.starts_with("POST /api/me/privacy/key ")
+            {
                 write!(
                     stream,
                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

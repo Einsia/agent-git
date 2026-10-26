@@ -75,6 +75,15 @@ impl Hub {
                 let request = String::from_utf8_lossy(&request);
                 let line = request.lines().next().unwrap_or_default();
                 let path = line.split_whitespace().nth(1).unwrap_or_default();
+                // A signed-in clone starts background privacy synchronization, which is outside
+                // repository discovery and acquisition, so it is declined and not recorded.
+                if path.starts_with("/api/me/privacy/") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
                 seen.lock().unwrap().push(path.to_owned());
                 assert!(line.starts_with("GET "), "unexpected Hub mutation: {line}");
                 assert!(

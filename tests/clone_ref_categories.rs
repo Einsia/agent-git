@@ -100,6 +100,18 @@ impl Hub {
                     headers.to_ascii_lowercase().contains("authorization:"),
                     expected_auth.load(Ordering::Acquire)
                 );
+                // A signed-in clone starts background privacy synchronization, which is outside
+                // repository acquisition and counts toward neither metadata nor Git requests.
+                if headers.starts_with("GET /api/me/privacy/")
+                    || headers.starts_with("POST /api/me/privacy/key HTTP/1.1\r\n")
+                {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 if headers.starts_with("GET /api/agents/alice/paper HTTP/1.1\r\n") {
                     count += 1;
                     assert_eq!(count, 1, "the metadata request was replayed");

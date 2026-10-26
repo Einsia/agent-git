@@ -1558,7 +1558,11 @@ mod unix {
         let value = lab.json(&hub.base, &["--json", "scan", "--secrets", "me/qa@main"], 7);
         assert_eq!(value["fix"], json!([]), "{value}");
         assert!(value.to_string().contains("aws-access-token"), "{value}");
-        assert!(value.to_string().contains("secret-like patterns found"));
+        assert!(
+            value
+                .to_string()
+                .contains("high-confidence secret findings")
+        );
         assert!(!value.to_string().contains(SECRET_PATTERN));
         assert!(!value.to_string().contains("synthetic scan probe"));
         let terminal = lab.json(&hub.base, &["--json", "fetch", "me/qa"], 5);

@@ -10,6 +10,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct Lab {
     root: tempfile::TempDir,
@@ -143,7 +144,25 @@ impl Lab {
         command
     }
 
+    /// Export's privacy worker outlives the command and removes its SQLite sidecars when it
+    /// closes the journal, so a snapshot first waits for that teardown; a sidecar that stays
+    /// behind fails the snapshot instead of being ignored.
     fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while walkdir::WalkDir::new(&self.home)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                name.ends_with(".sqlite-wal") || name.ends_with(".sqlite-shm")
+            })
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the privacy worker left its journal sidecars behind"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         walkdir::WalkDir::new(self.root.path())
             .into_iter()
             .map(|entry| {
