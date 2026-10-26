@@ -158,7 +158,7 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
                 let (status, content_type, body) = if path == "/api/agents/alice/work/activity" {
                     activity_calls.fetch_add(1, Ordering::Relaxed);
                     assert!(query.contains("author=alice"));
-                    ("200 OK".into(), "application/json".into(), json!({"schema_version":3,"repo":"alice/work","applied_filters":{"author":"alice","since":"2026-10-01T00:00:00Z","before":"2100-01-01T00:00:00Z","session":null},"contributions":[],"has_more":false,"next_cursor":null,"incomplete":false,"reasons":{},"warnings":[]}).to_string().into_bytes())
+                    ("200 OK".into(), "application/json".into(), json!({"schema_version":agit::domain::activity::SCHEMA_VERSION,"repo":"alice/work","applied_filters":{"author":"alice","since":"2026-10-01T00:00:00Z","before":"2100-01-01T00:00:00Z","session":null},"contributions":[],"has_more":false,"next_cursor":null,"incomplete":false,"reasons":{},"warnings":[]}).to_string().into_bytes())
                 } else if path == "/api/agents/alice/work/activity/attribution" {
                     assert_eq!(method, "POST");
                     assert_eq!(header("x-agentgit-expected-agent-id"), id);
@@ -174,7 +174,7 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
                     (
                         "200 OK".into(),
                         "application/json".into(),
-                        json!({"schema_version":3,"repository_id":id,"body":body})
+                        json!({"schema_version":agit::domain::activity::SCHEMA_VERSION,"repository_id":id,"body":body})
                             .to_string()
                             .into_bytes(),
                     )
