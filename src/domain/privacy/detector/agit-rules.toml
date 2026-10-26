@@ -12,14 +12,36 @@ regexes = [
     '''^(?:/9j/|iVBORw0KGgo|R0lGOD[dl]h|UklGR|JVBERi0|H4sI|UEsDB)[A-Za-z0-9+/]{16,}={0,2}$''',
 ]
 
+# Every credential the Hub issues: a prefix naming its kind, then 32 random bytes in hex. Agents
+# run agit and paste its output, configuration files included, into the transcripts agit
+# publishes.
 [[rules]]
 id = "agit-token"
-description = "AgentGit access, refresh, or artifact download credential"
-regex = '''\bagit_(?:at|rt|lfs)_[0-9a-f]{64}\b'''
-keywords = [
-    "agit_at_",
-    "agit_rt_",
-    "agit_lfs_",
+description = "AgentGit access, refresh, personal access, device, controller or artifact download credential"
+regex = '''\bagit_(?:at|rt|lfs|pat|rc|wc|wct|pc)_[0-9a-f]{64}\b'''
+keywords = ["agit_"]
+
+# A sign-up or web sign-in code: short-lived, but it signs in whoever holds it first.
+[[rules]]
+id = "agit-login-code"
+description = "AgentGit sign-up or web sign-in code"
+regex = '''\b(agit_(?:su|wh)_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+keywords = ["agit_su_", "agit_wh_"]
+
+# A bearer credential wherever it is written: a configuration file's headers, a log line, a
+# pasted request. gitleaks recognises one only inside `curl -H`. The capture group frames the
+# credential, so the scheme name stays readable.
+[[rules]]
+id = "agit-bearer-token"
+description = "bearer credential in an authorization value"
+regex = '''(?i)\bbearer[ \t]+([A-Za-z0-9._~+/-]{24,}=*)'''
+entropy = 3.0
+keywords = ["bearer"]
+[[rules.allowlists]]
+# Words and placeholders written in their place, never a value with digits or symbols mixed in.
+regexes = [
+    '''^[A-Za-z]+$''',
+    '''^[A-Za-z]+(?:[._-][A-Za-z]+)+$''',
 ]
 
 # A PostHog personal API key reads and writes a project's data. gitleaks has no PostHog rule;

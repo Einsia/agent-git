@@ -37,6 +37,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   replaced from the first command after signing in; until now it was not replaced until agit had
   synchronized your rules in the background. Registered values also stay replaced after you sign
   out or switch to another account or Hub on the same computer.
+- AgentGit's own credentials (personal access, device and controller tokens, and sign-in codes)
+  and bearer tokens written outside a `curl` command are replaced before a conversation is
+  published, in addition to the access and refresh tokens already covered.
 
 ### Changed
 
