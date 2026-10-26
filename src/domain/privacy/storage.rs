@@ -587,6 +587,7 @@ mod tests {
             policy,
             key: None,
             complete: true,
+            missing: None,
         };
         let input =
             serde_json::json!({"_session_id": secret, "content": [secret, long]}).to_string();
@@ -642,6 +643,7 @@ mod tests {
             policy: policy::Snapshot::compile(&[], &[], true).unwrap(),
             key: Some(key()),
             complete: true,
+            missing: None,
         };
         let hydrated = restored.transform(&protected.content, Mode::HydrateJsonl);
         assert_eq!(

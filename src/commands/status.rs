@@ -610,10 +610,12 @@ fn uncaptured(links: &[link::Link], complete: bool) -> Discovery {
 /// where such a wait becomes visible.
 fn print_privacy_waits(links: &[crate::domain::link::Link]) {
     let waiting = crate::domain::privacy::pending::load();
+    let mut unreadable = false;
     for link in links {
         let Some(entry) = waiting.get(&link.session_id) else {
             continue;
         };
+        unreadable |= entry.reason == "device_rules";
         let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
         ui::warning(&format!(
             "{}: privacy check pending ({}) since {}; {} turn{} wait, and the next settlement tries again",
@@ -623,6 +625,13 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
             entry.turns,
             if entry.turns == 1 { "" } else { "s" },
         ));
+    }
+    if unreadable {
+        for hint in crate::domain::privacy::service::unreadable_rule_hints().unwrap_or_else(|_| {
+            vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
+        }) {
+            ui::hint(&hint);
+        }
     }
 }
 

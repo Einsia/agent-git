@@ -63,6 +63,9 @@ pub enum Reason {
     SourceIncomplete,
     /// One field held more findings than a single pass replaces.
     FindingsCap,
+    /// A rule this device registered under another account or Hub could not be read, so a value
+    /// it blocks could pass unreplaced.
+    DeviceRules,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,6 +159,9 @@ pub struct Projector {
     pub policy: Snapshot,
     pub key: Option<UserKey>,
     pub complete: bool,
+    /// Why the loaded policy is incomplete, when the loader knows: reported in place of the
+    /// generic [`Reason::SourceIncomplete`].
+    pub missing: Option<Reason>,
 }
 
 /// Recognition validates bounded token syntax before treating any text as opaque.
@@ -859,7 +865,7 @@ impl Projector {
             } else if !stored {
                 Reason::StoreBusy
             } else {
-                Reason::SourceIncomplete
+                self.missing.unwrap_or(Reason::SourceIncomplete)
             });
         }
         outcome
@@ -947,6 +953,7 @@ mod tests {
             policy: Snapshot::compile(&[], &[], false).unwrap(),
             key: None,
             complete: true,
+            missing: None,
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let quoted = "quoted \" private value\nwith \\ escapes";
@@ -1059,6 +1066,7 @@ mod tests {
             policy: Snapshot::compile(&[], &[], false).unwrap(),
             key: None,
             complete: true,
+            missing: None,
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let calls = json!([{"id":id,"function":{"name":"read","arguments":{"id":id}}}]);
@@ -1101,6 +1109,7 @@ mod tests {
             policy: Snapshot::compile(&[], &[], false).unwrap(),
             key: None,
             complete: true,
+            missing: None,
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let secret = "registered-private-value";
@@ -1204,6 +1213,7 @@ mod tests {
             policy: Snapshot::compile(&[], &[], false).unwrap(),
             key: None,
             complete: true,
+            missing: None,
         };
         let first = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let second = "call_n8Rp2Va6Jx4Bt9Ls3Wq7Mc1Z";
@@ -1294,6 +1304,7 @@ mod tests {
             policy: Snapshot::compile(&[], &[], false).unwrap(),
             key: None,
             complete: true,
+            missing: None,
         };
         let password = "c7Zq4xR2mNv8LpT3;mNv8L\"pT3!wYb6Ks1Hd9Fg5Jt0";
         let record = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"passwd":password,"file_path":"/tmp/c7Zq4xR2.cfg"}}]}});
@@ -1329,6 +1340,7 @@ mod tests {
                 .with_entropy(crate::domain::privacy::detector::Entropy::Include),
             key: None,
             complete: true,
+            missing: None,
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let fixtures = [

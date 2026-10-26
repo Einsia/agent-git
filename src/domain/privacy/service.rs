@@ -455,6 +455,7 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
         Some(Reason::StoreBusy) => "store_busy",
         Some(Reason::SourceIncomplete) => "source_incomplete",
         Some(Reason::FindingsCap) => "findings_cap",
+        Some(Reason::DeviceRules) => "device_rules",
         None => "unknown",
     }
 }
@@ -876,6 +877,37 @@ pub fn manage(
         "privacy management is temporarily unavailable; recording and upload remain available"
     );
     Ok(serde_json::from_str(&outcome.content)?)
+}
+
+/// One line for each journal of rules this device registered under another account or Hub that
+/// it cannot read, naming the account and how to make the rules readable again; empty when every
+/// rule reads. An error when the worker cannot say, which is not the same as nothing to report.
+pub fn unreadable_rule_hints() -> crate::Result<Vec<String>> {
+    let command = super::management::Command {
+        action: "status".into(),
+        global: true,
+        id: None,
+        name: None,
+        secret: None,
+    };
+    let status = manage(None, command)?;
+    let rows = status["unreadable_rules"]
+        .as_array()
+        .context("privacy status did not list unreadable rules")?;
+    Ok(rows
+        .iter()
+        .map(|row| match (row["hub"].as_str(), row["account"].as_str()) {
+            (Some(hub), Some(account)) => format!(
+                "rules this computer registered for account {account} on {hub} cannot be read; \
+                 sign in to that account once with `agit login --hub {hub}` so agit can read them, \
+                 then sign back in"
+            ),
+            _ => format!(
+                "the privacy rules in {} cannot be read; the file may be damaged",
+                row["path"].as_str().unwrap_or("an unreadable journal")
+            ),
+        })
+        .collect())
 }
 
 /// Reload requests invalidate only the optional worker; its next caller gets a fresh snapshot.

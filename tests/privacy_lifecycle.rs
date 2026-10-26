@@ -402,7 +402,78 @@ fn a_rule_registered_on_this_device_protects_under_any_sign_in() {
     );
 }
 
-/// Separate homes must recover every opaque alias after an interrupted upload. A worker that
+/// A journal of rules this device registered under another account, which the device can no
+/// longer read, leaves every check incomplete with the reason `device_rules`, and `agit doctor`
+/// names the account to sign in to; journals that cannot even be listed do the same, and doctor
+/// warns instead of reporting every rule readable. A worker that skipped the unreadable journal
+/// would pass the value it blocks through as Complete; one that reported the generic reason would
+/// leave the user no way to tell what to fix; a doctor that read a failed listing as an empty one
+/// would contradict the withheld content.
+#[test]
+fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
+    let hub = Hub::new();
+    let device = Device::signed_out(&hub.url);
+    device.sign_in(Some("fixture-account"));
+    let value = "copper-finch-harbor-5520";
+    let mut add = device
+        .command()
+        // Signed in, the CLI would also ask the Hub for its latest version; that is not this test.
+        .env("AGIT_QUIET", "1")
+        .args(["secrets", "add", "finch", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(value.as_bytes())
+        .unwrap();
+    let added = add.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+    // Synchronization encrypts the rule under the account's key and caches the key.
+    device.sync();
+    device.sign_in(Some("another-account"));
+    let text = format!("the value is {value}");
+    let readable = device.worker().protect(&text);
+    assert_eq!(readable["status"], "complete");
+    assert!(!readable["content"].as_str().unwrap().contains(value));
+
+    // The key that rule is encrypted under is no longer on this device.
+    for account in std::fs::read_dir(device.home.join("privacy/accounts")).unwrap() {
+        let keys = account.unwrap().path().join("keys");
+        if keys.exists() {
+            std::fs::remove_dir_all(keys).unwrap();
+        }
+    }
+    let unreadable = device.worker().protect(&text);
+    assert_ne!(unreadable["status"], "complete", "{unreadable}");
+    assert_eq!(unreadable["reason"], "device_rules", "{unreadable}");
+    let doctor = device.doctor();
+    assert!(doctor.contains("fixture-account"), "{doctor}");
+    assert!(doctor.contains("agit login"), "{doctor}");
+
+    // Journals that cannot even be listed hold content back too, and doctor says so rather than
+    // reporting every rule readable.
+    // An entry where an account directory belongs, which is a plain file.
+    std::fs::write(
+        device.home.join("privacy/accounts/unlistable"),
+        "not a directory",
+    )
+    .unwrap();
+    let unlisted = device.worker().protect(&text);
+    assert_ne!(unlisted["status"], "complete", "{unlisted}");
+    assert_eq!(unlisted["reason"], "device_rules", "{unlisted}");
+    let doctor = device.doctor();
+    assert!(doctor.contains("cannot be read"), "{doctor}");
+    assert!(
+        !doctor.contains("every rule registered on this computer can be read"),
+        "{doctor}"
+    );
+}
+
+/// Separate homes must recover every opaque alias after an interrupted upload./// Separate homes must recover every opaque alias after an interrupted upload. A worker that
 /// keeps originals only in memory, sends plaintext, or loses retry state cannot satisfy this flow.
 #[test]
 fn independent_devices_recover_durable_aliases_after_cloud_failure() {

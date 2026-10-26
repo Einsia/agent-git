@@ -40,6 +40,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - AgentGit's own credentials (personal access, device and controller tokens, and sign-in codes)
   and bearer tokens written outside a `curl` command are replaced before a conversation is
   published, in addition to the access and refresh tokens already covered.
+- When rules this computer registered under another account or Hub cannot be read, for example
+  because that account's key is no longer cached here, agit keeps new content back and says which
+  account to sign in to once (in settlement, `agit status` and `agit doctor`), instead of a generic
+  "privacy check pending".
 
 ### Changed
 

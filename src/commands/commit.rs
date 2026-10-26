@@ -1208,6 +1208,15 @@ fn privacy_pending(
             "privacy check pending ({reason}): {turns} turn{} stay unsettled; the next settlement tries again",
             if turns == 1 { "" } else { "s" }
         ));
+        if reason == "device_rules" {
+            for hint in
+                crate::domain::privacy::service::unreadable_rule_hints().unwrap_or_else(|_| {
+                    vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
+                })
+            {
+                ui::hint(&hint);
+            }
+        }
     }
     Ok(ExitCode::Ok)
 }

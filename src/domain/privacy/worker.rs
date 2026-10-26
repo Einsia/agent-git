@@ -282,29 +282,36 @@ fn device_stamp(journals: &[PathBuf]) -> DeviceStamp {
         .collect()
 }
 
-/// The values `journals` block, in global scope or in `repository`'s, with where each applies.
-/// A rule registered on this device protects whatever the device publishes, signed in to any
-/// account or Hub or signed out: switching never lets through a value the user blocked, while
-/// only the current journal's own decisions allow one. The second value is `false` when a journal,
-/// or the record a block names, cannot be read, so the check is incomplete and callers withhold
-/// instead of publishing what it may block.
-fn device_blocks(
-    root: &Path,
-    journals: &[PathBuf],
-    repository: &str,
-) -> (Vec<(zeroize::Zeroizing<String>, policy::Source)>, bool) {
-    let mut blocks = Vec::new();
-    let mut complete = true;
+/// What the device's other journals contribute to a policy.
+#[derive(Default)]
+struct DeviceRules {
+    /// The values they block, with where each applies.
+    blocks: Vec<(zeroize::Zeroizing<String>, policy::Source)>,
+    /// Each journal that cannot be read, or that blocks a record it cannot read, with the account
+    /// it is bound to when that much can be read.
+    unreadable: Vec<(PathBuf, Option<super::crypto::Owner>)>,
+}
+
+/// The values `journals` block, in global scope or in `repository`'s (in any scope when
+/// `repository` is `None`), with where each applies. A rule registered on this device protects
+/// whatever the device publishes, signed in to any account or Hub or signed out: switching never
+/// lets through a value the user blocked, while only the current journal's own decisions allow
+/// one. A journal that cannot be read, or the record a block names, is listed as unreadable, so
+/// the check is incomplete and callers withhold instead of publishing what it may block.
+fn device_blocks(root: &Path, journals: &[PathBuf], repository: Option<&str>) -> DeviceRules {
+    let mut rules = DeviceRules::default();
     for directory in journals {
+        let owner = storage::Store::binding(directory).ok().flatten();
         let read = (|| -> crate::Result<bool> {
-            let owner = storage::Store::binding(directory)?;
             let store = storage::Store::read_only(directory, owner.clone())?;
             let decisions: Vec<_> = store
                 .decisions()?
                 .into_iter()
                 .filter(|decision| {
                     decision.block == Some(true)
-                        && (decision.scope == "global" || decision.scope == repository)
+                        && repository.is_none_or(|scope| {
+                            decision.scope == "global" || decision.scope == scope
+                        })
                 })
                 .collect();
             if decisions.is_empty() {
@@ -321,7 +328,7 @@ fn device_blocks(
             let mut whole = true;
             for decision in decisions {
                 match records.get(&decision.token) {
-                    Some(record) => blocks.push((
+                    Some(record) => rules.blocks.push((
                         zeroize::Zeroizing::new(record.original.clone()),
                         if decision.scope == "global" {
                             policy::Source::GlobalUser
@@ -334,9 +341,11 @@ fn device_blocks(
             }
             Ok(whole)
         })();
-        complete &= read.unwrap_or(false);
+        if !read.unwrap_or(false) {
+            rules.unreadable.push((directory.clone(), owner));
+        }
     }
-    (blocks, complete)
+    rules
 }
 
 fn stamp(repo: Option<&Path>) -> Vec<(u64, Option<std::time::SystemTime>)> {
@@ -416,6 +425,7 @@ fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
         policy: policy::Snapshot::compile(&[], &[], false)?,
         key: None,
         complete,
+        missing: None,
     })
 }
 
@@ -516,9 +526,26 @@ fn status() -> crate::Result<Outcome> {
             )
         })?;
     }
+    // Rules registered under another account or Hub that this device cannot read, so the user can
+    // be told which account to sign in to once.
+    // A device whose journals cannot be listed is one unreadable entry, its privacy directory, so no
+    // caller reads a failed listing as "every rule is readable".
+    let unreadable: Vec<_> = match device_journals(&root, &directory) {
+        Ok(journals) => device_blocks(&root, &journals, None).unreadable,
+        Err(_) => vec![(root.clone(), None)],
+    }
+    .into_iter()
+    .map(|(path, owner)| {
+        serde_json::json!({
+            "path": path,
+            "hub": owner.as_ref().map(|owner| owner.hub.clone()),
+            "account": owner.map(|owner| owner.account),
+        })
+    })
+    .collect();
     Ok(Outcome {
         content: serde_json::json!({"initialized":initialized,"encrypted":encrypted,
-        "records":dictionary.records().count()})
+        "records":dictionary.records().count(),"unreadable_rules":unreadable})
         .to_string(),
         status: super::projector::Status::Complete,
         replacements: 0,
@@ -686,14 +713,22 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             value,
             source: policy::Source::RepositoryUser,
         }));
-        let (device_rules, whole) = device_journals(&root, &route)
-            .map(|journals| device_blocks(&root, &journals, &repository_scope))
-            .unwrap_or_default();
-        complete &= whole;
-        blocks.extend(device_rules.iter().map(|(value, source)| policy::Literal {
-            value: value.as_str(),
-            source: *source,
-        }));
+        let device_rules = device_journals(&root, &route)
+            .map(|journals| device_blocks(&root, &journals, Some(&repository_scope)));
+        let device_whole = device_rules
+            .as_ref()
+            .is_ok_and(|rules| rules.unreadable.is_empty());
+        complete &= device_whole;
+        let device_rules = device_rules.unwrap_or_default();
+        blocks.extend(
+            device_rules
+                .blocks
+                .iter()
+                .map(|(value, source)| policy::Literal {
+                    value: value.as_str(),
+                    source: *source,
+                }),
+        );
         lap("legacy_ms", &mut phases);
         let global_allows = crate::infra::config::agit_home()
             .map(|home| crate::domain::secrets::load_allowlist(&home))
@@ -707,6 +742,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             policy: policy::Snapshot::compile(&[], &[], true)?,
             key,
             complete,
+            missing: (!device_whole).then_some(super::projector::Reason::DeviceRules),
         };
         projector.policy =
             management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?

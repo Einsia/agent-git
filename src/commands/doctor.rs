@@ -324,6 +324,7 @@ pub fn run(args: Args) -> CmdResult {
     // key the configured store does not hold, fails the first commit that finds a secret — on
     // a machine with no desktop session, that is the first sign anything is wrong.
     checks.push(("secret keystore".into(), keystore_row()));
+    checks.push(("privacy rules".into(), device_rules_row()));
     if let Some(refusal) = crate::domain::privacy::sync::recorded_refusal(&hub) {
         let (said, next) = refusal.describe(chrono::Utc::now().timestamp());
         checks.push((
@@ -655,6 +656,20 @@ fn keystore_row() -> Check {
         Ok(status) if status["encrypted"] == true => Check::Ok("privacy dictionary uses a cached cloud key".into()),
         Ok(_) => Check::Warn("privacy dictionary is temporarily stored locally without encryption; cloud synchronization will retry".into()),
         Err(_) => Check::Warn("privacy is temporarily unavailable; recording and upload remain available".into()),
+    }
+}
+
+/// Rules this device registered under another account or Hub must stay readable: while one is
+/// not, every privacy check is incomplete and nothing new is committed or published.
+fn device_rules_row() -> Check {
+    match crate::domain::privacy::service::unreadable_rule_hints() {
+        Ok(hints) if hints.is_empty() => {
+            Check::Ok("every rule registered on this computer can be read".into())
+        }
+        Ok(hints) => Check::Warn(hints.join("; ")),
+        Err(_) => {
+            Check::Warn("the privacy rules registered on this computer could not be checked".into())
+        }
     }
 }
 
