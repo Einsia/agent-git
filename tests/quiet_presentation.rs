@@ -1071,13 +1071,22 @@ fn quiet_secret_creation_preserves_identifiers_and_followup_behavior() {
     }
 }
 
+/// `secrets status` is data the user asked for: quiet prints it unchanged, and it says whether a
+/// vault exists and how many records it holds. A status that called every vault healthy would
+/// hide that nothing was ever stored.
 #[cfg(unix)]
 #[test]
 fn initialized_vault_status_remains_requested_data_under_quiet() {
     let lab = Lab::new();
+    let empty = success(lab.run(&["secrets", "status"]));
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("not initialized"));
+    assert_eq!(
+        success(lab.run(&["-q", "secrets", "status"])).stdout,
+        empty.stdout
+    );
     add_secret(&lab, &["secrets", "add", "quiet-status", "--stdin"]);
     let regular = success(lab.run(&["secrets", "status"]));
-    assert!(String::from_utf8_lossy(&regular.stdout).contains("vault is healthy"));
+    assert!(String::from_utf8_lossy(&regular.stdout).contains("vault is healthy (1 record;"));
     assert_eq!(
         success(lab.run(&["-q", "secrets", "status"])).stdout,
         regular.stdout

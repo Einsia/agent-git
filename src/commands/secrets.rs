@@ -110,6 +110,7 @@ pub fn run(args: Args) -> CmdResult {
     };
     let mut repository = None;
     let mut json_output = false;
+    let mut report = Report::Records;
     match args.command {
         Action::Add {
             name,
@@ -125,6 +126,7 @@ pub fn run(args: Args) -> CmdResult {
             command.action = "add".into();
             command.name = Some(name);
             command.secret = Some(secret.to_string());
+            report = Report::Created("registered");
         }
         Action::List { json } => {
             command.action = "list".into();
@@ -133,6 +135,7 @@ pub fn run(args: Args) -> CmdResult {
         Action::Status { json } => {
             command.action = "status".into();
             json_output = json;
+            report = Report::Status;
         }
         Action::Remove { id_or_name, yes } => {
             if !yes {
@@ -150,6 +153,7 @@ pub fn run(args: Args) -> CmdResult {
             }
             command.action = "remove".into();
             command.id = Some(id_or_name);
+            report = Report::Changed("removed");
         }
         Action::Review { repo, json } => {
             command.action = "review".into();
@@ -165,6 +169,7 @@ pub fn run(args: Args) -> CmdResult {
             command.action = "allow".into();
             command.id = Some(record_id);
             command.global = global;
+            report = Report::Changed("allowed");
             if !global {
                 repository = Some(repository_path(repo)?);
             }
@@ -177,6 +182,7 @@ pub fn run(args: Args) -> CmdResult {
             command.action = "unallow".into();
             command.id = Some(record_id);
             command.global = global;
+            report = Report::Changed("restored default protection for");
             if !global {
                 repository = Some(repository_path(repo)?);
             }
@@ -200,11 +206,13 @@ pub fn run(args: Args) -> CmdResult {
                     command.name = Some(name);
                     command.secret = Some(secret.to_string());
                     repository = Some(repository_path(repo)?);
+                    report = Report::Created("repository block rule");
                 }
                 BlockAction::Remove { record_id, repo } => {
                     command.action = "remove".into();
                     command.id = Some(record_id);
                     repository = Some(repository_path(repo)?);
+                    report = Report::Changed("cleared the explicit block for");
                 }
             }
         }
@@ -212,23 +220,59 @@ pub fn run(args: Args) -> CmdResult {
     let result = service::manage(repository.as_deref(), command)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
-    } else if let Some(records) = result.as_array() {
-        if records.is_empty() {
-            println!("no matching privacy records");
+        return Ok(ExitCode::Ok);
+    }
+    let rule = || {
+        format!(
+            "{} ({})",
+            result["name"].as_str().unwrap_or_default(),
+            result["id"].as_str().unwrap_or_default()
+        )
+    };
+    match report {
+        Report::Records => {
+            let records = result.as_array().map(Vec::as_slice).unwrap_or_default();
+            if records.is_empty() {
+                println!("no matching privacy records");
+            }
+            for record in records {
+                println!(
+                    "{}\t{}\tblocked={}\tallowed={}",
+                    record["id"].as_str().unwrap_or(""),
+                    record["name"].as_str().unwrap_or(""),
+                    record["explicit_block"],
+                    record["allowed"]
+                );
+            }
         }
-        for record in records {
-            println!(
-                "{}\t{}\tblocked={}\tallowed={}",
-                record["id"].as_str().unwrap_or(""),
-                record["name"].as_str().unwrap_or(""),
-                record["explicit_block"],
-                record["allowed"]
-            );
+        Report::Status if result["initialized"] == true => {
+            let records = result["records"].as_u64().unwrap_or_default();
+            ui::success_result(&format!(
+                "privacy vault is healthy ({records} record{}; account key {})",
+                if records == 1 { "" } else { "s" },
+                if result["encrypted"] == true {
+                    "cached"
+                } else {
+                    "not cached yet"
+                }
+            ));
         }
-    } else {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        Report::Status => println!("privacy vault is not initialized (0 records)"),
+        Report::Created(what) => ui::success_result(&format!("{what} {}", rule())),
+        Report::Changed(what) => ui::success(&format!("{what} {}", rule())),
     }
     Ok(ExitCode::Ok)
+}
+
+/// How a worker result reaches the terminal. Listings and status are data the user asked for
+/// and print under quiet output. A policy change is acknowledged through the quiet-aware channel,
+/// so a quiet script sees no output for it — except a new rule, whose id the user needs in order
+/// to manage that rule later.
+enum Report {
+    Records,
+    Status,
+    Created(&'static str),
+    Changed(&'static str),
 }
 
 fn read_new_secret(stdin: bool) -> crate::Result<Zeroizing<String>> {
