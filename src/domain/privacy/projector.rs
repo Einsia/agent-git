@@ -35,6 +35,34 @@ pub enum Mode {
     FreezeHydration,
     HydrateFrozenJsonl,
     HydrationValues,
+    /// Load the dictionary and the policy for a repository, under the start-up deadline, so
+    /// that later requests spend their budget on content only.
+    Prepare,
+}
+
+/// Why an outcome is not Complete. Callers report and count it; no reason lets a caller use
+/// content the worker did not protect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// The caller's budget ran out before the worker processed everything.
+    Deadline,
+    /// Another caller in this process was using the worker.
+    LockBusy,
+    /// The worker failed and is not started again until its back-off ends.
+    Backoff,
+    /// The worker could not be started or did not become ready within its start-up deadline.
+    SpawnFailed,
+    /// The worker's reply was missing or malformed.
+    ProtocolError,
+    /// One unit was larger than the worker accepts.
+    Oversize,
+    /// The worker could not read or write its dictionary store.
+    StoreBusy,
+    /// The worker applied only the part of the policy this device could load.
+    SourceIncomplete,
+    /// One field held more findings than a single pass replaces.
+    FindingsCap,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +73,13 @@ pub struct Outcome {
     pub unresolved: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed: Option<usize>,
+    /// How many bytes at the end of `content` are input the worker did not process, copied
+    /// unchanged. Only the service sets it, for the text and record protection modes.
+    #[serde(skip)]
+    pub unprocessed: usize,
+    /// Why the outcome is not Complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
 }
 
 impl Outcome {
@@ -55,6 +90,8 @@ impl Outcome {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         }
     }
 }
@@ -275,6 +312,8 @@ impl Projector {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         for line in text.split_inclusive('\n') {
             let body = line.strip_suffix('\n').unwrap_or(line);
@@ -287,6 +326,8 @@ impl Projector {
                     replacements: 0,
                     unresolved: 0,
                     consumed: None,
+                    unprocessed: 0,
+                    reason: None,
                 };
                 self.record(&mut value, hydrate, &mut next, preserve_protocol_ids);
                 next.content = if next.replacements > 0 {
@@ -308,6 +349,7 @@ impl Projector {
             outcome.unresolved += next.unresolved;
             if next.status != Status::Complete {
                 outcome.status = Status::Partial;
+                outcome.reason = outcome.reason.or(next.reason);
             }
         }
         outcome
@@ -326,6 +368,8 @@ impl Projector {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         for (value, pointers) in batch.records.iter_mut().zip(batch.pointers) {
             let mut mask = crate::domain::secrets::identity::native_record_mask(
@@ -411,6 +455,8 @@ impl Projector {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         self.record(
             &mut envelope.content,
@@ -470,6 +516,7 @@ impl Projector {
                 outcome.unresolved += next.unresolved;
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
+                    outcome.reason = outcome.reason.or(next.reason);
                 }
                 text = next.content;
                 if let Some(field) = value.pointer_mut(pointer) {
@@ -488,6 +535,7 @@ impl Projector {
                 outcome.unresolved += next.unresolved;
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
+                    outcome.reason = outcome.reason.or(next.reason);
                 }
                 if let Some(field) = value.pointer_mut(pointer) {
                     *field = Value::String(next.content);
@@ -581,6 +629,7 @@ impl Projector {
                 outcome.unresolved += next.unresolved;
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
+                    outcome.reason = outcome.reason.or(next.reason);
                 }
             }
             Value::Array(values) => {
@@ -748,6 +797,7 @@ impl Projector {
     }
 
     fn protect_batch(&mut self, text: &str, batch: Batch) -> Outcome {
+        let batch_complete = batch.complete;
         let mut complete = self.complete && batch.complete;
         let findings = batch.findings;
         let mut new = Vec::<Record>::new();
@@ -769,21 +819,25 @@ impl Projector {
                 }
             }
         }
+        let mut stored = true;
         if !new.is_empty() {
             if self.store.append(&new, self.key.as_ref()).is_ok() {
                 for record in new {
-                    complete &= self.dictionary.accept(record).is_ok();
+                    stored &= self.dictionary.accept(record).is_ok();
                 }
             } else {
-                complete = false;
+                stored = false;
             }
         }
+        complete &= stored;
         let mut outcome = Outcome {
             content: String::with_capacity(text.len()),
             status: Status::Complete,
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         let mut cursor = 0;
         for finding in findings {
@@ -800,6 +854,13 @@ impl Projector {
         outcome.content.push_str(&text[cursor..]);
         if !complete {
             outcome.status = Status::Partial;
+            outcome.reason = Some(if !batch_complete {
+                Reason::FindingsCap
+            } else if !stored {
+                Reason::StoreBusy
+            } else {
+                Reason::SourceIncomplete
+            });
         }
         outcome
     }
@@ -811,6 +872,8 @@ impl Projector {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         let mut seen = std::collections::HashSet::new();
         while whole_token(&outcome.content) {
@@ -826,6 +889,7 @@ impl Projector {
             outcome.unresolved += next.unresolved;
             if next.status != Status::Complete {
                 outcome.status = Status::Partial;
+                outcome.reason = outcome.reason.or(next.reason);
             }
             if !progress {
                 break;
@@ -841,6 +905,8 @@ impl Projector {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
         let mut cursor = 0;
         for (start, end, token) in tokens(text) {

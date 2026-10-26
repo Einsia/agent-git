@@ -50,7 +50,13 @@ pub(super) fn land_resolved(
     let repo = request.repo.root();
     land_with_resolved(
         request,
-        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
+        &|text| {
+            Ok(privacy::protect_for_commit(
+                Some(repo),
+                text,
+                Mode::ProtectJsonl,
+            )?)
+        },
         read_native,
         |_| Ok(()),
         resolved,
@@ -320,7 +326,7 @@ fn require_transaction(control: &mergetx::ControlGuard, json: &str) -> Result<()
 
 fn land_with_resolved(
     request: LandingRequest<'_>,
-    protect: &dyn Fn(&str) -> String,
+    protect: &dyn Fn(&str) -> Result<String>,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
     resolved: &[String],
@@ -449,7 +455,7 @@ fn land_with_resolved(
     let protected = if capture.record_count == 0 {
         String::new()
     } else {
-        protect(&capture.records)
+        protect(&capture.records)?
     };
     ensure!(
         protected.len() <= storage::MAX_MATERIALIZED_BYTES,
@@ -1001,12 +1007,7 @@ fn land_fixture<K: KeyStore>(
 ) -> Result<LandingOutcome> {
     land_with_resolved(
         request,
-        &|text| {
-            dictionary
-                .protect_jsonl(text, global)
-                .map(|r| r.text)
-                .unwrap_or_else(|_| text.to_owned())
-        },
+        &|text| dictionary.protect_jsonl(text, global).map(|r| r.text),
         read_native,
         checkpoint,
         resolved,

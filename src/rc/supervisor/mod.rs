@@ -3914,10 +3914,14 @@ pub(crate) const HELD_TAIL_NOTICE: std::time::Duration = std::time::Duration::fr
 const _: () = assert!(
     HELD_TAIL_NOTICE.as_millis() > crate::domain::privacy::service::RETRY_WINDOW.as_millis()
 );
-/// How long the first held line is retried before it is given up and shown as the marker, so a
-/// record that never passes holds nothing after it: several worker back-offs.
+/// How long the first held line is retried before it may be given up and shown as the marker,
+/// so a record that never passes holds nothing after it: several worker back-offs.
 pub(crate) const HELD_TAIL_GIVE_UP: std::time::Duration =
     std::time::Duration::from_secs(3 * HELD_TAIL_NOTICE.as_secs());
+/// How many times the first held line's own check must have failed, with a deadline or a
+/// protocol error, before it may be given up. Lock contention and back-offs never give a line up:
+/// it waits, bounded by [`HELD_TAIL_BYTES`].
+const HELD_TAIL_GIVE_UP_FAILURES: u32 = 3;
 /// How much tailed text may wait for its privacy check before it is given up and shown as the
 /// marker.
 pub(crate) const HELD_TAIL_BYTES: usize = 16 * 1024 * 1024;
@@ -3938,7 +3942,7 @@ pub(crate) enum Release {
 /// so this is their only copy: they are held from the first line whose check may pass on a later
 /// try and projected again with the next poll, so a busy or slow privacy worker delays them
 /// instead of losing them. A record that can never pass is shown as its marker and not held, and
-/// so is a first line that has not passed within [`HELD_TAIL_GIVE_UP`].
+/// so is a first line whose own check kept failing through [`HELD_TAIL_GIVE_UP`].
 #[derive(Default)]
 pub(crate) struct HeldTail {
     lines: Vec<crate::rc::tail::TailedLine>,
@@ -3948,10 +3952,12 @@ pub(crate) struct HeldTail {
     timing: Option<(std::time::Duration, std::time::Duration)>,
 }
 
-/// The first held line, since when it waits, and whether its marker was shown.
+/// The first held line, since when it waits, how often its own check failed, and whether its
+/// marker was shown.
 struct HeldHead {
     line: (Option<String>, u64),
     since: std::time::Instant,
+    failures: u32,
     noticed: bool,
 }
 
@@ -4065,6 +4071,7 @@ impl HeldTail {
             lines
                 .first()
                 .is_some_and(|first| head.line == held_key(first))
+                && head.failures >= HELD_TAIL_GIVE_UP_FAILURES
                 && head.since.elapsed() >= give_up
         });
         let given_up = if release == Release::Finish {
@@ -4085,10 +4092,12 @@ impl HeldTail {
                     self.head = Some(HeldHead {
                         line,
                         since: std::time::Instant::now(),
+                        failures: 0,
                         noticed: false,
                     });
                 }
                 let head = self.head.as_mut().expect("the first held line is tracked");
+                head.failures += u32::from(projected.first_withheld_failed);
                 // Its marker shows once, while the line is still retried.
                 if !head.noticed && (release == Release::Notice || head.since.elapsed() >= notice) {
                     head.noticed = true;
@@ -4159,6 +4168,8 @@ pub(crate) struct ProjectedLines {
     /// a later try. A record that can never pass, or one given up, shows its marker and does not
     /// count here.
     pub first_withheld: Option<usize>,
+    /// Whether that line's check ran and failed, rather than not running for contention.
+    pub first_withheld_failed: bool,
 }
 
 /// Records from lines before `given_up` whose privacy check did not complete are given up: each
@@ -4177,6 +4188,7 @@ pub(crate) fn items_from_lines_tracked(
         registered: vec![],
         item_lines: vec![],
         first_withheld: None,
+        first_withheld_failed: false,
     };
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return projected;
@@ -4242,7 +4254,10 @@ pub(crate) fn items_from_lines_tracked(
             } else if index < given_up {
                 redact::GIVEN_UP_TEXT.to_owned()
             } else {
-                projected.first_withheld.get_or_insert(index);
+                if projected.first_withheld.is_none() {
+                    projected.first_withheld = Some(index);
+                    projected.first_withheld_failed = scrubbed.failed;
+                }
                 if pending_marker_emitted {
                     continue;
                 }

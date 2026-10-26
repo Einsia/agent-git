@@ -333,8 +333,11 @@ fn complete_pending_content_is_settled_before_manual_merge() {
     assert!(String::from_utf8_lossy(&view.stdout).contains("SYNTHETIC-PENDING"));
 }
 
-/// Settlement retains its exact committed prefix through worker timeout and recovery loss.
-/// A privacy error must neither veto a new turn nor reproject previously settled content.
+/// Settlement retains its exact committed prefix through worker timeout and recovery loss. While
+/// the privacy check cannot run, a commit still returns within its bound and leaves the new turn
+/// unsettled; the next commit that can protect it settles it protected, and settled content is
+/// never projected again. A settlement that committed the unprotected turn would put the
+/// credential on the branch; one that waited on the worker would hold the runtime's hook.
 #[test]
 fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
     use std::io::Write as _;
@@ -395,7 +398,7 @@ fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success());
@@ -409,14 +412,15 @@ fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     drop(lock);
+    // The stand-in vault exists only to be held locked; privacy recovers once it is gone.
+    fs::remove_file(legacy.join("vault.json")).unwrap();
     let degraded = agit::domain::storage::materialize_at(
         &lab.repo(),
         "refs/heads/work",
         agit::domain::meta::LOG_FILE,
     )
     .unwrap();
-    assert!(degraded.starts_with(&saved));
-    assert!(degraded.contains("AKIA5RJ2NV7MQXP3TC6Z"));
+    assert_eq!(degraded, saved);
     let native = format!(
         "{native}{}{}",
         message("user", "AKIA4X7QZ2M5RT6VW3JH"),
@@ -431,6 +435,8 @@ fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
     )
     .unwrap();
     assert!(recovered.starts_with(&degraded));
+    assert!(recovered.contains("reply while privacy is unavailable"));
+    assert!(!recovered.contains("AKIA5RJ2NV7MQXP3TC6Z"));
     assert!(!recovered.contains("AKIA4X7QZ2M5RT6VW3JH"));
     fs::remove_file(lab.credential()).unwrap();
     fs::rename(lab.store.join("privacy"), lab.home.join("saved-privacy")).unwrap();

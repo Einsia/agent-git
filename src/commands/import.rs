@@ -1551,7 +1551,7 @@ pub(super) fn declare_session_line(
     // The birth metadata is already part of publishable history, so it must use the same
     // reversible projection as later settlement metadata. Leaving `cwd` in this commit gives the
     // publication scan an older cleartext object to inspect even when the first turn is protected.
-    crate::domain::privacy::service::protect_metadata(repo.root(), &mut born);
+    crate::domain::privacy::service::protect_metadata(repo.root(), &mut born)?;
     let born_text = meta::to_text(&born)?;
     let tree = super::new::fresh_session_tree(repo, &head, &born_text)?;
     let commit = super::plumbing::commit_tree(

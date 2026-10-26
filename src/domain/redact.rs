@@ -105,6 +105,10 @@ pub(crate) struct NativeJson {
     pub registered_ids: Vec<String>,
     /// Whether a withheld record can never pass, so retrying it is pointless.
     pub permanent: bool,
+    /// Whether the privacy check ran on this withheld record and failed, with a deadline or a
+    /// protocol error, rather than not running for contention or a back-off. Only such failures
+    /// count toward giving a record up.
+    pub failed: bool,
 }
 
 #[cfg(feature = "rc")]
@@ -116,6 +120,7 @@ impl NativeJson {
             secret_projection: true,
             registered_ids: Vec::new(),
             permanent: false,
+            failed: false,
         }
     }
 
@@ -470,7 +475,7 @@ impl Redactor {
                 .collect(),
         };
         let projected = serde_json::to_string(&batch).ok().map(|input| {
-            crate::domain::privacy::service::transform(
+            crate::domain::privacy::service::transform_live(
                 self.repo.as_deref(),
                 &input,
                 crate::domain::privacy::projector::Mode::ProtectNative,
@@ -486,6 +491,17 @@ impl Redactor {
                         .iter()
                         .any(|record| record.to_string().contains(text))
                 })
+        });
+        // Only a check that ran and ended with a deadline or a protocol error is this group's
+        // failure; contention, a back-off or a busy dictionary only delays it.
+        let failed = projected.as_ref().is_none_or(|outcome| {
+            matches!(
+                outcome.reason,
+                Some(
+                    crate::domain::privacy::projector::Reason::Deadline
+                        | crate::domain::privacy::projector::Reason::ProtocolError
+                )
+            )
         });
         let values = projected
             .filter(crate::domain::privacy::service::passed)
@@ -505,7 +521,10 @@ impl Redactor {
                     self.protect_native_group(native, records, &[index], out);
                 }
             } else {
-                out[group[0]] = Some(NativeJson::withheld());
+                out[group[0]] = Some(NativeJson {
+                    failed,
+                    ..NativeJson::withheld()
+                });
             }
             return;
         };
@@ -517,6 +536,7 @@ impl Redactor {
                 secret_projection,
                 registered_ids: Vec::new(),
                 permanent: false,
+                failed: false,
             });
         }
     }
@@ -557,7 +577,7 @@ impl Redactor {
     fn protect_text_in(&self, context: &str, text: &str) -> Option<Report> {
         #[cfg(feature = "cli")]
         let protected = if context.is_empty() {
-            crate::domain::privacy::service::transform(
+            crate::domain::privacy::service::transform_live(
                 self.repo.as_deref(),
                 text,
                 crate::domain::privacy::projector::Mode::ProtectText,
@@ -611,8 +631,13 @@ impl Redactor {
             "the privacy check for `{name}` could not complete; retrying the push usually works"
         );
         for attempt in 0..2 {
-            if let Some(report) = self.protect_text(name) {
-                return Ok(report.text == name);
+            let protected = crate::domain::privacy::service::transform(
+                self.repo.as_deref(),
+                name,
+                crate::domain::privacy::projector::Mode::ProtectText,
+            );
+            if crate::domain::privacy::service::passed(&protected) {
+                return Ok(protected.content == name);
             }
             if attempt == 0 {
                 crate::domain::privacy::service::wait_for_retry();
@@ -753,7 +778,7 @@ impl Redactor {
     /// The value with every string protected, or `None` when its privacy check did not complete.
     fn protect_json(&self, value: &serde_json::Value) -> Option<JsonReport> {
         #[cfg(feature = "cli")]
-        let protected = crate::domain::privacy::service::transform(
+        let protected = crate::domain::privacy::service::transform_live(
             self.repo.as_deref(),
             &serde_json::to_string(value).ok()?,
             crate::domain::privacy::projector::Mode::ProtectJsonl,

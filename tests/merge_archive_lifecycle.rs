@@ -285,6 +285,9 @@ impl Lab {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
             .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+            // The completion driver runs archive code inside this test binary, which cannot
+            // host the privacy worker.
+            .env("AGIT_TEST_PRIVACY_WORKER", env!("CARGO_BIN_EXE_agit"))
             .env("GIT_CONFIG_GLOBAL", self.home.join("empty-gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")

@@ -20,6 +20,21 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   excluded from it, whatever its claim says: automatic upload and `agit push` both refuse the
   branch. Conversations captured that way by an earlier version are dropped on the first run, and
   agit says once which ones; their local history stays. A copy already on the Hub is not removed.
+- A PEM private key is replaced as one block from BEGIN through END in memory files and in
+  remote-control text, instead of only on its BEGIN line. A memory file whose key block lacks its
+  BEGIN or END line, or that is not UTF-8 text, stays off the branch with a warning.
+- Content the privacy check did not protect in full is never committed, published or shown to a
+  remote-control viewer. Settlement commits the turns that passed and leaves the rest for the
+  next settlement; `agit status` shows a session whose settlement waits, and why. A viewer sees
+  "[privacy check pending: …]" in place of withheld text, and the text arrives once it passes.
+- Remote-control session lists protect each session's opening prompt and title before they leave
+  the device.
+
+### Changed
+
+- The privacy check no longer counts its own start-up against a command's time budget, and
+  saving, importing, pushing and collecting memory allow seconds instead of a fraction of a
+  second, so large transcripts and large allowlists are protected instead of passed through.
 
 ## [0.2.27] - 2026-10-25
 

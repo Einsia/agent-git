@@ -2784,11 +2784,11 @@ fn assistant_line(lineno: u64, text: &str) -> crate::rc::tail::TailedLine {
 /// nothing from the first such line on shows until it has waited the notice, then its marker
 /// shows once while it is still retried, and once it passes the held lines show in order. The
 /// notice belongs to the first held line, so a later line that stalls gets its own; a first line
-/// that never passes is given up alone after its retry window, so the lines after it show; and
-/// once the held lines pass the byte bound, also while the first one is retried alone, whatever
-/// has not passed shows the given-up marker. A tail that gave up after a count of polls, kept one
-/// notice for the whole tail, let one record hold everything after it, or held without bound
-/// would lose, hide, stall or pile up records.
+/// whose own check keeps failing is given up alone after its retry window, so the lines after it
+/// show; and once the held lines pass the byte bound, also while the first one is retried alone,
+/// whatever has not passed shows the given-up marker. A tail that gave up after a count of polls,
+/// kept one notice for the whole tail, let one record hold everything after it, or held without
+/// bound would lose, hide, stall or pile up records.
 #[test]
 fn held_tail_lines_wait_for_their_privacy_check_and_then_show() {
     let notice = std::time::Duration::from_millis(100);
@@ -2837,6 +2837,8 @@ fn held_tail_lines_wait_for_their_privacy_check_and_then_show() {
         shown(2, redact::PROTECTION_ERROR_TEXT)
     );
     std::thread::sleep(notice * 4);
+    // Waiting alone gives nothing up: the line's own check has to have failed often enough too.
+    assert!(project(Vec::new(), Release::Retry).is_empty());
     let mut after = shown(2, redact::GIVEN_UP_TEXT);
     after.extend(shown(3, "third reply"));
     assert_eq!(project(Vec::new(), Release::Retry), after);

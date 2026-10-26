@@ -61,7 +61,13 @@ pub fn settle_tail(destination: TailDestination<'_>) -> Result<TailOutcome> {
     let repo = destination.repo.root();
     settle_tail_mode(
         destination,
-        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
+        &|text| {
+            Ok(privacy::protect_for_commit(
+                Some(repo),
+                text,
+                Mode::ProtectJsonl,
+            )?)
+        },
         read_native,
         |_| Ok(()),
         None,
@@ -77,7 +83,13 @@ pub(crate) fn settle_final_tail(
     let repo = destination.repo.root();
     settle_tail_mode(
         destination,
-        &|text| privacy::transform(Some(repo), text, Mode::ProtectJsonl).content,
+        &|text| {
+            Ok(privacy::protect_for_commit(
+                Some(repo),
+                text,
+                Mode::ProtectJsonl,
+            )?)
+        },
         read_native,
         |_| Ok(()),
         Some(binding),
@@ -237,7 +249,6 @@ fn settle_tail_with<K: KeyStore>(
             dictionary
                 .protect_jsonl(text, global)
                 .map(|report| report.text)
-                .unwrap_or_else(|_| text.to_owned())
         },
         read_native,
         checkpoint,
@@ -247,7 +258,7 @@ fn settle_tail_with<K: KeyStore>(
 
 fn settle_tail_mode(
     destination: TailDestination<'_>,
-    protect: &dyn Fn(&str) -> String,
+    protect: &dyn Fn(&str) -> Result<String>,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
     final_binding: Option<&ExplorationBinding>,
@@ -338,7 +349,7 @@ fn settle_tail_mode(
         );
         return Ok(TailOutcome::Noop { pending_bytes });
     }
-    let protected = protect(&captured.records);
+    let protected = protect(&captured.records)?;
     ensure!(
         protected.len() <= storage::MAX_MATERIALIZED_BYTES,
         "protected archive records exceed their byte limit"
@@ -611,12 +622,7 @@ fn settle_tail_fixture<K: KeyStore>(
 ) -> Result<TailOutcome> {
     settle_tail_mode(
         destination,
-        &|text| {
-            dictionary
-                .protect_jsonl(text, global)
-                .map(|r| r.text)
-                .unwrap_or_else(|_| text.to_owned())
-        },
+        &|text| dictionary.protect_jsonl(text, global).map(|r| r.text),
         read_native,
         checkpoint,
         final_binding,

@@ -1193,6 +1193,25 @@ pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Res
         .map(|chunk| chunk.end_byte as u64))
 }
 
+/// Settlement waits while the privacy worker has not protected what it would commit: nothing is
+/// committed, and the next settlement tries again.
+fn privacy_pending(
+    session: &str,
+    quiet: bool,
+    turns: usize,
+    reason: Option<crate::domain::privacy::projector::Reason>,
+) -> CmdResult {
+    let reason = crate::domain::privacy::service::reason_name(reason);
+    crate::domain::privacy::pending::record(session, reason, turns);
+    if !quiet {
+        ui::warning(&format!(
+            "privacy check pending ({reason}): {turns} turn{} stay unsettled; the next settlement tries again",
+            if turns == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(ExitCode::Ok)
+}
+
 /// Tell the user why the trailing turn is not in this settlement and when it will be.
 ///
 /// Saying so is required: `agit status` reports `in sync` and `agit push` publishes without
@@ -2037,7 +2056,7 @@ fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
             continue;
         }
         let bytes = read_protected_file_blob(repo, &entry.oid, &path)?;
-        if let Some(protected) = protect_shared_file_text(repo, &path, &bytes) {
+        if let Some(protected) = protect_shared_file_text(repo, &path, &bytes)? {
             edits.push((path, Some(protected.into_bytes())));
         }
     }
@@ -2388,7 +2407,7 @@ fn settle_bytes(
         turn_chunks(&region, &ir, &open_calls)
     };
 
-    let new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
+    let mut new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
         // The retained prefix proves exact content, including a partially captured user turn.
         // Ordinals cannot skip continuations because several native turns can share one prompt.
         chunks
@@ -2432,7 +2451,9 @@ fn settle_bytes(
             metadata.runtime_instances.push(binding.thread_id.clone());
             metadata.kind = Kind::File;
             metadata.milestone = None;
-            privacy::protect_metadata(repo.root(), &mut metadata);
+            if let Err(pending) = privacy::protect_metadata(repo.root(), &mut metadata) {
+                return privacy_pending(&lk.session_id, quiet, 0, pending.reason);
+            }
             let tree = super::plumbing::tree_apply_owned(
                 repo,
                 tip,
@@ -2524,11 +2545,48 @@ fn settle_bytes(
         native_prefix.0
     };
     let privacy_end = region_start + new_chunks.last().expect("non-empty chunks").end_byte;
-    let protected_increment = privacy::transform(
+    let mut protected_increment = privacy::transform(
         Some(repo.root()),
         &text[privacy_start..privacy_end],
         PrivacyMode::ProtectJsonl,
     );
+    // Only turns the privacy worker processed under the whole policy settle; the rest waits for
+    // the next settlement. A backlog larger than one budget therefore settles over several
+    // settlements, and no byte the worker did not protect reaches the branch.
+    let (processed, processed_len) =
+        privacy::processed(&protected_increment, &text[privacy_start..privacy_end]);
+    let processed_end = if protected_increment.status == PrivacyStatus::Partial {
+        privacy_start
+    } else {
+        privacy_start + processed_len
+    };
+    let settled = new_chunks
+        .iter()
+        .take_while(|chunk| {
+            let end = region_start + chunk.end_byte;
+            end <= processed_end && (processed_end == privacy_end || text[..end].ends_with('\n'))
+        })
+        .count();
+    let unsettled = new_chunks.len() - settled;
+    if settled == 0 {
+        return privacy_pending(&lk.session_id, quiet, unsettled, protected_increment.reason);
+    }
+    let privacy_end = if unsettled > 0 {
+        new_chunks.truncate(settled);
+        let end = region_start + new_chunks.last().expect("settled chunks").end_byte;
+        // Protection keeps one output line for each native input line.
+        let lines = text[privacy_start..end].split_inclusive('\n').count();
+        let kept = processed
+            .split_inclusive('\n')
+            .take(lines)
+            .map(str::len)
+            .sum();
+        protected_increment.content.truncate(kept);
+        protected_increment.unprocessed = 0;
+        end
+    } else {
+        privacy_end
+    };
     let mut protected_full = if materialized_mode {
         text[..region_start].to_owned()
     } else {
@@ -2745,7 +2803,9 @@ fn settle_bytes(
             home.as_deref(),
         )
     });
-    privacy::protect_metadata(repo.root(), &mut observations);
+    if let Err(pending) = privacy::protect_metadata(repo.root(), &mut observations) {
+        return privacy_pending(&lk.session_id, quiet, new_chunks.len(), pending.reason);
+    }
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
             &text,
@@ -2796,9 +2856,20 @@ fn settle_bytes(
             })
         };
         if milestone_here {
-            snap.milestone = opts.milestone.as_ref().map(|value| {
-                privacy::transform(Some(repo.root()), value, PrivacyMode::ProtectText).content
-            });
+            snap.milestone = match opts.milestone.as_deref().map(|value| {
+                privacy::protect_for_commit(Some(repo.root()), value, PrivacyMode::ProtectText)
+            }) {
+                None => None,
+                Some(Ok(value)) => Some(value),
+                Some(Err(pending)) => {
+                    return privacy_pending(
+                        &lk.session_id,
+                        quiet,
+                        new_chunks.len(),
+                        pending.reason,
+                    );
+                }
+            };
         }
         let subject = {
             let one = c.gist.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2820,7 +2891,17 @@ fn settle_bytes(
             msg.push_str(&format!("\n\ncode: {a}"));
         }
         let protected_message =
-            privacy::transform(Some(repo.root()), &msg, PrivacyMode::ProtectText);
+            match privacy::protect_for_commit(Some(repo.root()), &msg, PrivacyMode::ProtectText) {
+                Ok(message) => message,
+                Err(pending) => {
+                    return privacy_pending(
+                        &lk.session_id,
+                        quiet,
+                        new_chunks.len(),
+                        pending.reason,
+                    );
+                }
+            };
         let snap_text = meta::to_text(&snap)?;
         let base = pending_parent
             .as_deref()
@@ -2879,13 +2960,12 @@ fn settle_bytes(
             repo,
             &tree,
             &parents,
-            &protected_message.content,
+            &protected_message,
             (owner, &email),
             authored_at,
         )?;
         pending_parent = Some(last_sha.clone());
         let protected_subject = protected_message
-            .content
             .lines()
             .next()
             .unwrap_or(&subject)
@@ -2911,6 +2991,15 @@ fn settle_bytes(
             super::plumbing::update_absent_branch_cas_and_refresh(repo, branch, new)?;
         }
         (_, None) => unreachable!("new_chunks is non-empty, so settlement built a commit"),
+    }
+    if unsettled > 0 {
+        crate::domain::privacy::pending::record(
+            &lk.session_id,
+            crate::domain::privacy::service::reason_name(protected_increment.reason),
+            unsettled,
+        );
+    } else {
+        crate::domain::privacy::pending::clear(&lk.session_id);
     }
     if !quiet {
         for (turn_no, subject, sha) in &landed {
@@ -2980,10 +3069,12 @@ fn settle_bytes(
                 protected_increment.replacements
             ));
         }
-        if protected_increment.status != PrivacyStatus::Complete {
-            ui::warning(
-                "privacy processing was incomplete; settlement continued with the available content",
-            );
+        if unsettled > 0 {
+            ui::warning(&format!(
+                "privacy check pending ({}): {unsettled} later turn{} stay unsettled; the next settlement tries again",
+                privacy::reason_name(protected_increment.reason),
+                if unsettled == 1 { "" } else { "s" }
+            ));
         }
         if fresh {
             ui::info(format_args!(
@@ -3800,12 +3891,11 @@ fn file_commit_inner(
     validate_file_commit_tree(repo, base, tree.trim(), layout, expected_meta.as_deref())?;
     let tree = protect_file_commit_index(repo, base, tree.trim(), layout, original)?;
     validate_file_commit_tree(repo, base, tree.trim(), layout, expected_meta.as_deref())?;
-    let message = crate::domain::privacy::service::transform(
+    let message = crate::domain::privacy::service::protect_for_commit(
         Some(repo.root()),
         &message,
         crate::domain::privacy::projector::Mode::ProtectText,
-    )
-    .content;
+    )?;
 
     // Build an unreachable commit with the frozen tip as its only parent, then publish it with
     // expected-old CAS. `git commit` cannot express that final CAS and may otherwise silently
@@ -3855,7 +3945,7 @@ fn protect_file_commit_index(
             continue;
         }
         let bytes = read_protected_file_blob(repo, &entry.oid, &path)?;
-        let Some(protected) = protect_shared_file_text(repo, &path, &bytes) else {
+        let Some(protected) = protect_shared_file_text(repo, &path, &bytes)? else {
             continue;
         };
         worktree_updates.push((path.clone(), bytes, protected.as_bytes().to_vec()));
@@ -3915,21 +4005,31 @@ fn read_protected_file_blob(repo: &Repo, oid: &str, _path: &str) -> crate::Resul
     Ok(bytes)
 }
 
-fn protect_shared_file_text(repo: &Repo, path: &str, bytes: &[u8]) -> Option<String> {
+/// A shared file's text protected for a commit, `None` when it needs no change, or [`Pending`]
+/// (as an error) while it has not passed protection in full. A file commit is explicit and can be
+/// retried, so it waits rather than committing what the worker did not protect.
+fn protect_shared_file_text(
+    repo: &Repo,
+    path: &str,
+    bytes: &[u8],
+) -> crate::Result<Option<String>> {
     if matches!(crate::domain::lfs::Pointer::parse(bytes), Ok(Some(_))) {
-        return None;
+        return Ok(None);
     }
-    let text = std::str::from_utf8(bytes).ok()?;
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(None);
+    };
     if text.contains('\0') {
-        return None;
+        return Ok(None);
     }
     let mode = if path.ends_with(".json") || path.ends_with(".jsonl") {
         crate::domain::privacy::projector::Mode::ProtectJsonl
     } else {
         crate::domain::privacy::projector::Mode::ProtectText
     };
-    let outcome = crate::domain::privacy::service::transform(Some(repo.root()), text, mode);
-    (outcome.replacements > 0).then_some(outcome.content)
+    let protected =
+        crate::domain::privacy::service::protect_for_commit(Some(repo.root()), text, mode)?;
+    Ok((protected != text).then_some(protected))
 }
 
 fn staged_paths(repo: &Repo, base: &str) -> crate::Result<Vec<String>> {

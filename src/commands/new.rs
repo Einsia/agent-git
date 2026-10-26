@@ -277,7 +277,7 @@ pub fn run(args: Args) -> CmdResult {
     snap.milestone = Some(format!("new session (from {from_ref})"));
     // The birth metadata is already part of publishable history, so project workspace
     // observations before writing the branch tip just as settlement does.
-    crate::domain::privacy::service::protect_metadata(repo.root(), &mut snap);
+    crate::domain::privacy::service::protect_metadata(repo.root(), &mut snap)?;
     let snap_text = meta::to_text(&snap)?;
     // The new session's tree = the shared files at from, with a `line: session` meta swapped in,
     // and empty LOG / VIEW written once every old session carrier is cleared: an empty VIEW is

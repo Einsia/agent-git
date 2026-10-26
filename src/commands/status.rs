@@ -138,6 +138,7 @@ pub fn run(args: Args) -> CmdResult {
         if remaining > 0 {
             println!("{}", ui::dim(&format!("… {remaining} more")));
         }
+        print_privacy_waits(&links);
     }
 
     if !inventory_complete {
@@ -603,6 +604,26 @@ fn uncaptured(links: &[link::Link], complete: bool) -> Discovery {
         }
     }
     out
+}
+
+/// Sessions whose settlement waits for the privacy check. A hook settles quietly, so this is
+/// where such a wait becomes visible.
+fn print_privacy_waits(links: &[crate::domain::link::Link]) {
+    let waiting = crate::domain::privacy::pending::load();
+    for link in links {
+        let Some(entry) = waiting.get(&link.session_id) else {
+            continue;
+        };
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
+        ui::warning(&format!(
+            "{}: privacy check pending ({}) since {}; {} turn{} wait, and the next settlement tries again",
+            crate::domain::link::short(&link.session_id),
+            entry.reason,
+            ui::ago(since),
+            entry.turns,
+            if entry.turns == 1 { "" } else { "s" },
+        ));
+    }
 }
 
 #[cfg(test)]

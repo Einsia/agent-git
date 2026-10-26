@@ -657,12 +657,72 @@ pub enum Observation {
     WorkspaceBound(bool),
     SettledTurns(u64),
     Parse(clap::error::ErrorKind),
+    /// Privacy protection that did not complete: which budget and why. Names only.
+    PrivacyPending {
+        budget: &'static str,
+        reason: &'static str,
+    },
+    /// How long a new privacy worker took to start and to load each part of its policy.
+    PrivacyStartup {
+        spawn_ms: u128,
+        ready_ms: u128,
+        phases: Vec<(String, u128)>,
+    },
 }
 pub fn observe(observation: Observation) {
     if let Ok(mut run) = RUN.lock()
         && let Some(run) = run.as_mut()
     {
-        let (key, value) = match observation {
+        let properties: Vec<(String, serde_json::Value)> = match observation {
+            Observation::PrivacyPending { budget, reason } => vec![
+                ("privacy_pending_budget".into(), json!(budget)),
+                ("privacy_pending_reason".into(), json!(reason)),
+            ],
+            Observation::PrivacyStartup {
+                spawn_ms,
+                ready_ms,
+                phases,
+            } => {
+                let mut properties = vec![
+                    (
+                        "privacy_spawn_bucket".to_owned(),
+                        json!(duration_bucket(spawn_ms)),
+                    ),
+                    (
+                        "privacy_ready_bucket".to_owned(),
+                        json!(duration_bucket(ready_ms)),
+                    ),
+                ];
+                for (phase, ms) in phases {
+                    if let Some(name) = match phase.as_str() {
+                        "journal_ms" => Some("privacy_journal_bucket"),
+                        "legacy_ms" => Some("privacy_legacy_bucket"),
+                        "allowlist_ms" => Some("privacy_allowlist_bucket"),
+                        "compile_ms" => Some("privacy_compile_bucket"),
+                        _ => None,
+                    } {
+                        properties.push((name.into(), json!(duration_bucket(ms))));
+                    }
+                }
+                properties
+            }
+            other => {
+                let (key, value) = single(other);
+                vec![(key.into(), value)]
+            }
+        };
+        for (key, value) in properties {
+            run.seed.properties.insert(key.clone(), value.clone());
+            if let Some(context) = run.context.as_mut() {
+                context.properties.insert(key, value);
+            }
+        }
+    }
+}
+
+fn single(observation: Observation) -> (&'static str, serde_json::Value) {
+    {
+        match observation {
             Observation::Prompt => ("prompt_shown", json!(true)),
             Observation::Tui => ("output_mode", json!("tui")),
             Observation::Managed(managed) => (
@@ -702,10 +762,9 @@ pub fn observe(observation: Observation) {
                     _ => "other",
                 }),
             ),
-        };
-        run.seed.properties.insert(key.into(), value.clone());
-        if let Some(context) = run.context.as_mut() {
-            context.properties.insert(key.into(), value);
+            Observation::PrivacyPending { .. } | Observation::PrivacyStartup { .. } => {
+                unreachable!("handled with several properties")
+            }
         }
     }
 }

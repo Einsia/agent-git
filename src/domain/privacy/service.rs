@@ -1,6 +1,6 @@
 //! Business callers receive content even when the isolated privacy worker is unavailable.
 
-use super::projector::{MAX_UNIT_BYTES, Mode, Outcome, Status};
+use super::projector::{MAX_UNIT_BYTES, Mode, Outcome, Reason, Status};
 use super::worker::{self, Request};
 use anyhow::{Context, ensure};
 use std::path::Path;
@@ -9,26 +9,83 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-const FOREGROUND_BUDGET: Duration = Duration::from_millis(750);
+const LIVE_BUDGET: Duration = Duration::from_millis(750);
+const DURABLE_BASE: Duration = Duration::from_secs(5);
+const DURABLE_PER_MIB: Duration = Duration::from_secs(1);
+const DURABLE_CAP: Duration = Duration::from_secs(60);
+/// How long a new worker may take to load a repository's dictionary and policy. It is spent
+/// before, and apart from, any caller's budget.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 /// How long a caller can go without an answer through ordinary trouble: a worker back-off and
 /// one budget.
 pub(crate) const RETRY_WINDOW: Duration =
-    Duration::from_millis((RETRY_DELAY.as_millis() + FOREGROUND_BUDGET.as_millis()) as u64);
+    Duration::from_millis((RETRY_DELAY.as_millis() + LIVE_BUDGET.as_millis()) as u64);
 const BATCH_BYTES: usize = 128 * 1024;
+
+/// How long a caller lets the worker take, from the moment the worker is ready.
+#[derive(Clone, Copy)]
+pub(crate) enum Budget {
+    /// Remote-control text a viewer is waiting for.
+    Live,
+    /// Saving, importing, pushing, memory and share or export: seconds, more for more bytes.
+    Durable,
+}
+
+impl Budget {
+    fn for_input(self, bytes: usize) -> Duration {
+        match self {
+            Self::Live => LIVE_BUDGET,
+            Self::Durable => {
+                let mib = u32::try_from(bytes.div_ceil(1024 * 1024)).unwrap_or(u32::MAX);
+                DURABLE_BASE
+                    .saturating_add(DURABLE_PER_MIB.saturating_mul(mib))
+                    .min(DURABLE_CAP)
+            }
+        }
+    }
+}
+
+/// Why one request to the worker produced no reply for its caller.
+#[derive(Debug, thiserror::Error)]
+enum Failure {
+    /// An earlier request is still in flight.
+    #[error("privacy worker is busy")]
+    Busy,
+    /// The caller's deadline passed; the worker keeps the request and its late reply is discarded.
+    #[error("privacy worker deadline expired")]
+    Deadline,
+    /// The reply was missing or malformed; the worker cannot be trusted with another request.
+    #[error("privacy worker failed: {0:#}")]
+    Protocol(anyhow::Error),
+}
 
 struct Process {
     child: Child,
     #[cfg(windows)]
     job: Option<crate::rc::windows_job::Job>,
     send: mpsc::SyncSender<Zeroizing<Vec<u8>>>,
-    receive: mpsc::Receiver<crate::Result<Outcome>>,
+    receive: mpsc::Receiver<crate::Result<worker::Response>>,
     io: Option<std::thread::JoinHandle<()>>,
+    next_id: u64,
+    /// The repository the worker last loaded its dictionary and policy for.
+    prepared: Option<Option<std::path::PathBuf>>,
+}
+
+/// The executable that hosts the worker: this one. A debug build lets a test that runs privacy
+/// code inside its own test binary, which cannot host the worker, name the agit executable
+/// instead; a release build ignores the variable.
+fn worker_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("AGIT_TEST_PRIVACY_WORKER") {
+        return Ok(path.into());
+    }
+    std::env::current_exe()
 }
 
 impl Process {
     fn start() -> crate::Result<Self> {
-        let mut command = Command::new(std::env::current_exe()?);
+        let mut command = Command::new(worker_executable()?);
         command
             .arg(worker::WORKER)
             .stdin(Stdio::piped())
@@ -71,15 +128,15 @@ impl Process {
                     libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
                 }
                 while let Ok(bytes) = requests.recv() {
-                    let result = (|| -> crate::Result<Outcome> {
+                    let result = (|| -> crate::Result<worker::Response> {
                         worker::write_frame(&mut input, &bytes)?;
                         let response = worker::read_frame(&mut output)?;
-                        let outcome: Outcome = serde_json::from_slice(&response)?;
+                        let response: worker::Response = serde_json::from_slice(&response)?;
                         ensure!(
-                            outcome.content.len() <= MAX_UNIT_BYTES + 1024 * 1024,
+                            response.outcome.content.len() <= MAX_UNIT_BYTES + 1024 * 1024,
                             "privacy output exceeds its byte budget"
                         );
-                        Ok(outcome)
+                        Ok(response)
                     })();
                     let failed = result.is_err();
                     if responses.send(result).is_err() || failed {
@@ -104,6 +161,8 @@ impl Process {
             send,
             receive,
             io: Some(io),
+            next_id: 0,
+            prepared: None,
         })
     }
 
@@ -114,20 +173,46 @@ impl Process {
         text: &str,
         mode: Mode,
         remaining: Duration,
-    ) -> crate::Result<Outcome> {
+    ) -> Result<Outcome, Failure> {
+        // A reply that arrived after its caller stopped waiting belongs to no one now.
+        while let Ok(stale) = self.receive.try_recv() {
+            if let Err(error) = stale {
+                return Err(Failure::Protocol(error));
+            }
+        }
+        self.next_id += 1;
+        let id = self.next_id;
         let request = Request {
+            id,
+            deadline_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
             repo: repo.map(Path::to_owned),
             mode,
             text: text.to_owned(),
             context: context.to_owned(),
         };
-        let bytes = Zeroizing::new(serde_json::to_vec(&request)?);
-        self.send
-            .try_send(bytes)
-            .map_err(|_| anyhow::anyhow!("privacy worker is busy"))?;
-        self.receive
-            .recv_timeout(remaining)
-            .context("privacy worker deadline expired")?
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(&request).map_err(|e| Failure::Protocol(e.into()))?);
+        self.send.try_send(bytes).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => Failure::Busy,
+            mpsc::TrySendError::Disconnected(_) => {
+                Failure::Protocol(anyhow::anyhow!("privacy worker is gone"))
+            }
+        })?;
+        let started = Instant::now();
+        loop {
+            match self
+                .receive
+                .recv_timeout(remaining.saturating_sub(started.elapsed()))
+            {
+                Ok(Ok(response)) if response.id == id => return Ok(response.outcome),
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => return Err(Failure::Protocol(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(Failure::Deadline),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Failure::Protocol(anyhow::anyhow!("privacy worker is gone")));
+                }
+            }
+        }
     }
 
     fn terminate(&mut self) {
@@ -224,7 +309,10 @@ impl PublicationHydrator {
             !remaining.is_zero(),
             "publication hydration timed out; retry before publishing"
         );
-        let outcome = self.process.request(Some(&self.repo), "", text, mode, remaining)
+        let outcome = self
+            .process
+            .request(Some(&self.repo), "", text, mode, remaining)
+            .map_err(anyhow::Error::new)
             .context("publication hydration failed; restore the source dictionary or retry before publishing")?;
         ensure!(
             outcome.status == Status::Complete && outcome.unresolved == 0,
@@ -299,27 +387,135 @@ impl Drop for PublicationHydrator {
 /// an unprocessed outcome also counts and unit tests keep exercising their own logic; the
 /// integration tests drive the real worker, where only a complete outcome counts.
 pub fn passed(outcome: &Outcome) -> bool {
-    outcome.status == Status::Complete || (cfg!(test) && outcome.status == Status::Skipped)
+    (outcome.status == Status::Complete && outcome.unprocessed == 0)
+        || (cfg!(test) && outcome.status == Status::Skipped)
 }
 
-/// One bounded attempt per operation; lock contention immediately uses the caller's input.
+/// The leading part of `outcome.content` that the worker processed, and how many input bytes it
+/// stands for. The rest of the content, if any, is the input unchanged and must not be committed
+/// or published. As in [`passed`], a unit-test binary counts an unprocessed outcome as processed.
+pub fn processed<'a>(outcome: &'a Outcome, input: &str) -> (&'a str, usize) {
+    if cfg!(test) && outcome.status == Status::Skipped {
+        return (&outcome.content, input.len());
+    }
+    let unprocessed = if outcome.status == Status::Skipped {
+        input.len()
+    } else {
+        outcome.unprocessed.min(input.len())
+    };
+    let content = outcome.content.len().saturating_sub(unprocessed);
+    (&outcome.content[..content], input.len() - unprocessed)
+}
+
+/// Content the privacy worker did not protect in full is not committed; the operation waits and
+/// can be retried.
+#[derive(Debug)]
+pub struct Pending {
+    pub reason: Option<Reason>,
+}
+
+impl Pending {
+    pub fn of(outcome: &Outcome) -> Self {
+        Self {
+            reason: outcome.reason,
+        }
+    }
+}
+
+impl std::fmt::Display for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "privacy check pending ({}); nothing was committed, and the next attempt tries again",
+            reason_name(self.reason)
+        )
+    }
+}
+
+impl std::error::Error for Pending {}
+
+/// `text` protected for a commit, or [`Pending`] while it has not passed protection in full.
+pub fn protect_for_commit(repo: Option<&Path>, text: &str, mode: Mode) -> Result<String, Pending> {
+    let outcome = transform(repo, text, mode);
+    if !passed(&outcome) {
+        return Err(Pending::of(&outcome));
+    }
+    Ok(outcome.content)
+}
+
+/// The name a reason is reported and counted under.
+pub fn reason_name(reason: Option<Reason>) -> &'static str {
+    match reason {
+        Some(Reason::Deadline) => "deadline",
+        Some(Reason::LockBusy) => "lock_busy",
+        Some(Reason::Backoff) => "backoff",
+        Some(Reason::SpawnFailed) => "spawn_failed",
+        Some(Reason::ProtocolError) => "protocol_error",
+        Some(Reason::Oversize) => "oversize",
+        Some(Reason::StoreBusy) => "store_busy",
+        Some(Reason::SourceIncomplete) => "source_incomplete",
+        Some(Reason::FindingsCap) => "findings_cap",
+        None => "unknown",
+    }
+}
+
+fn skipped(text: &str, reason: Reason) -> Outcome {
+    let mut outcome = Outcome::skipped(text);
+    outcome.reason = Some(reason);
+    outcome
+}
+
+/// Protection for content that is saved, imported, pushed, collected into memory, shared or
+/// exported: a durable budget that grows with the input.
 pub fn transform(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        worker::inline(repo, text, mode).unwrap_or_else(|| transform_inner(repo, "", text, mode))
-    }))
-    .unwrap_or_else(|_| Outcome::skipped(text))
+    transform_with(repo, "", text, mode, Budget::Durable)
 }
 
-/// [`transform`] for text that continues `context`, text a stream already released: the
+/// Protection for remote-control text a viewer is waiting for: the live budget.
+pub(crate) fn transform_live(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
+    transform_with(repo, "", text, mode, Budget::Live)
+}
+
+/// [`transform_live`] for text that continues `context`, text a stream already released: the
 /// worker's rules match across the context, and only `text` is protected and returned.
 pub fn transform_in(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -> Outcome {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        transform_inner(repo, context, text, mode)
-    }))
-    .unwrap_or_else(|_| Outcome::skipped(text))
+    transform_with(repo, context, text, mode, Budget::Live)
 }
 
-fn transform_inner(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -> Outcome {
+fn transform_with(
+    repo: Option<&Path>,
+    context: &str,
+    text: &str,
+    mode: Mode,
+    budget: Budget,
+) -> Outcome {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context
+            .is_empty()
+            .then(|| worker::inline(repo, text, mode))
+            .flatten()
+            .unwrap_or_else(|| transform_inner(repo, context, text, mode, budget))
+    }))
+    .unwrap_or_else(|_| skipped(text, Reason::ProtocolError));
+    if outcome.status != Status::Complete || outcome.unprocessed > 0 {
+        crate::telemetry::observe(crate::telemetry::Observation::PrivacyPending {
+            budget: match budget {
+                Budget::Live => "live",
+                Budget::Durable => "durable",
+            },
+            reason: reason_name(outcome.reason),
+        });
+    }
+    outcome
+}
+
+fn transform_inner(
+    repo: Option<&Path>,
+    context: &str,
+    text: &str,
+    mode: Mode,
+    budget: Budget,
+) -> Outcome {
     if matches!(
         mode,
         Mode::HydrateText | Mode::HydrateJsonl | Mode::HydrateEnvelopes
@@ -331,46 +527,90 @@ fn transform_inner(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         };
     }
-    let started = Instant::now();
     let Ok(mut state) = shared().try_lock() else {
-        return Outcome::skipped(text);
+        return skipped(text, Reason::LockBusy);
     };
     if let Some(until) = state.failed_until {
         if Instant::now() < until {
-            return Outcome::skipped(text);
+            return skipped(text, Reason::Backoff);
         }
         if state
             .process
             .as_mut()
             .is_some_and(|process| !process.reaped())
         {
-            return Outcome::skipped(text);
+            return skipped(text, Reason::Backoff);
         }
         state.process = None;
         state.failed_until = None;
     }
+    let mut spawn_ms = 0;
     if state.process.is_none() {
+        let spawning = Instant::now();
         match Process::start() {
             Ok(process) => state.process = Some(process),
             Err(_) => {
                 state.failed_until = Some(Instant::now() + RETRY_DELAY);
-                return Outcome::skipped(text);
+                return skipped(text, Reason::SpawnFailed);
+            }
+        }
+        spawn_ms = spawning.elapsed().as_millis();
+    }
+    // Loading the repository's dictionary and policy has its own deadline; the caller's budget
+    // starts once the worker is ready.
+    let target = repo.map(Path::to_path_buf);
+    let process = state.process.as_mut().expect("worker started");
+    if process.prepared.as_ref() != Some(&target) {
+        let preparing = Instant::now();
+        match process.request(repo, "", "", Mode::Prepare, STARTUP_DEADLINE) {
+            Ok(ready) => {
+                process.prepared = Some(target);
+                let phases = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                    &ready.content,
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, ms)| Some((name, u128::from(ms.as_u64()?))))
+                .collect();
+                crate::telemetry::observe(crate::telemetry::Observation::PrivacyStartup {
+                    spawn_ms,
+                    ready_ms: preparing.elapsed().as_millis(),
+                    phases,
+                });
+            }
+            Err(Failure::Busy | Failure::Deadline) => return skipped(text, Reason::SpawnFailed),
+            Err(Failure::Protocol(_)) => {
+                process.terminate();
+                state.failed_until = Some(Instant::now() + RETRY_DELAY);
+                return skipped(text, Reason::SpawnFailed);
             }
         }
     }
+    let protects = matches!(
+        mode,
+        Mode::ProtectText | Mode::ProtectJsonl | Mode::ProtectEnvelopes
+    );
+    let budget = budget.for_input(text.len());
+    let started = Instant::now();
     let mut outcome = Outcome {
         content: String::with_capacity(text.len()),
         status: Status::Complete,
         replacements: 0,
         unresolved: 0,
         consumed: None,
+        unprocessed: 0,
+        reason: None,
     };
+    let mut stopped = None;
     let mut cursor = 0;
     while cursor < text.len() {
-        let remaining = FOREGROUND_BUDGET.saturating_sub(started.elapsed());
+        let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
+            stopped = Some(Reason::Deadline);
             break;
         }
         let end = if matches!(
@@ -397,49 +637,85 @@ fn transform_inner(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -
         // The worker counts the context against the same bound, so the check here does too.
         let carried = if cursor == 0 { context.len() } else { 0 };
         if carried + end - cursor > MAX_UNIT_BYTES {
+            stopped = Some(Reason::Oversize);
+            if protects {
+                break;
+            }
             outcome.content.push_str(&text[cursor..end]);
             outcome.status = Status::Partial;
             cursor = end;
             continue;
         }
-        let result = state.process.as_mut().expect("worker started").request(
-            repo,
-            if cursor == 0 { context } else { "" },
-            &text[cursor..end],
-            mode,
-            remaining,
-        );
-        let result = result.and_then(|batch| {
-            validate(&text[cursor..end], &batch, mode)?;
-            Ok(batch)
-        });
+        let result = state
+            .process
+            .as_mut()
+            .expect("worker started")
+            .request(
+                repo,
+                if cursor == 0 { context } else { "" },
+                &text[cursor..end],
+                mode,
+                remaining,
+            )
+            .and_then(|batch| {
+                validate(&text[cursor..end], &batch, mode).map_err(Failure::Protocol)?;
+                Ok(batch)
+            });
         match result {
             Ok(batch) => {
                 if matches!(mode, Mode::ProtectStream) {
                     return batch;
+                }
+                // A batch the worker answered without processing it ends the processed prefix.
+                if protects && batch.status == Status::Skipped {
+                    stopped = batch.reason.or(Some(Reason::StoreBusy));
+                    break;
                 }
                 outcome.content.push_str(&batch.content);
                 outcome.replacements += batch.replacements;
                 outcome.unresolved += batch.unresolved;
                 if batch.status != Status::Complete {
                     outcome.status = Status::Partial;
+                    outcome.reason = outcome
+                        .reason
+                        .or(batch.reason)
+                        .or(Some(Reason::SourceIncomplete));
                 }
                 cursor = end;
             }
-            Err(_) => {
+            // A request an earlier one keeps from reaching the worker is contention, not this
+            // input's failure.
+            Err(Failure::Busy) => {
+                stopped = Some(Reason::LockBusy);
+                break;
+            }
+            // The worker keeps the request it was given; its late reply is recognized by id and
+            // discarded, so a deadline costs neither the worker nor a back-off.
+            Err(Failure::Deadline) => {
+                stopped = Some(Reason::Deadline);
+                break;
+            }
+            Err(Failure::Protocol(_)) => {
                 state.process.as_mut().expect("worker started").terminate();
                 state.failed_until = Some(Instant::now() + RETRY_DELAY);
+                stopped = Some(Reason::ProtocolError);
                 break;
             }
         }
     }
     if cursor < text.len() {
         outcome.content.push_str(&text[cursor..]);
-        outcome.status = if cursor == 0 {
-            Status::Skipped
+        if cursor == 0 {
+            outcome.status = Status::Skipped;
+        } else if protects {
+            // The status describes what the worker processed; `unprocessed` marks the rest.
+            outcome.unprocessed = text.len() - cursor;
         } else {
-            Status::Partial
-        };
+            outcome.status = Status::Partial;
+        }
+        outcome.reason = stopped.or(outcome.reason);
+    } else if stopped.is_some() {
+        outcome.reason = outcome.reason.or(stopped);
     }
     outcome
 }
@@ -612,21 +888,27 @@ pub fn invalidate() {
     }
 }
 
-/// Observations are optional privacy input; canonical IDs retain their exact values.
-pub fn protect_metadata(repo: &Path, metadata: &mut crate::domain::meta::Meta) {
+/// Observations are optional privacy input; canonical IDs retain their exact values. The
+/// metadata changes only once every observation passed protection; until then this returns
+/// [`Pending`] and the caller must not commit the metadata.
+pub fn protect_metadata(
+    repo: &Path,
+    metadata: &mut crate::domain::meta::Meta,
+) -> Result<(), Pending> {
     let fields = observation_fields(metadata);
-    let Ok(input) = serde_json::to_string(&fields) else {
-        return;
+    let malformed = || Pending {
+        reason: Some(Reason::ProtocolError),
     };
-    let protected = transform(Some(repo), &input, Mode::ProtectJsonl);
-    let Ok(values) = serde_json::from_str::<Vec<String>>(&protected.content) else {
-        return;
-    };
-    if fields.len() == values.len() {
-        for (field, value) in fields.into_iter().zip(values) {
-            *field = value;
-        }
+    let input = serde_json::to_string(&fields).map_err(|_| malformed())?;
+    let protected = protect_for_commit(Some(repo), &input, Mode::ProtectJsonl)?;
+    let values = serde_json::from_str::<Vec<String>>(&protected)
+        .ok()
+        .filter(|values| values.len() == fields.len())
+        .ok_or_else(malformed)?;
+    for (field, value) in fields.into_iter().zip(values) {
+        *field = value;
     }
+    Ok(())
 }
 
 fn observation_fields(metadata: &mut crate::domain::meta::Meta) -> Vec<&mut String> {

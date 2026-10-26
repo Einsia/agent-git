@@ -206,6 +206,8 @@ pub(crate) fn project_worker(
         replacements: projection.report.replacements,
         unresolved: 0,
         consumed: None,
+        unprocessed: 0,
+        reason: None,
     })
 }
 

@@ -1960,3 +1960,77 @@ fn imported_and_live_metadata_remain_publishable() {
         "{candidates:?}"
     );
 }
+
+/// Imported turns reach the session branch only as content the privacy worker protected with
+/// the whole policy. While the worker cannot process anything, import commits nothing and says
+/// the privacy check is pending; once it can, the same import lands. While the device cannot load
+/// its whole policy (here an unreadable legacy vault), import commits nothing either, because a
+/// value the user blocked may be left in place. An implementation that committed what the worker
+/// returned unchanged, or settled under a partial policy, would put the transcript on the branch
+/// without the protection the user configured.
+#[test]
+fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
+    let lab = Lab::new(2);
+    let repo = lab.store.join("repos/me/qa");
+    let import = |source: usize, branch: &str| {
+        lab.command()
+            .args([
+                "import",
+                &lab.sources[source].0,
+                "--from",
+                "claude-code",
+                "--into",
+                &format!("me/qa@{branch}"),
+                "--independent",
+            ])
+            .output()
+            .unwrap()
+    };
+    let has_branch = |branch: &str| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+
+    // A plain file where the privacy directory belongs keeps the worker from processing anything.
+    let privacy = lab.store.join("privacy");
+    let aside = lab.store.join("privacy.aside");
+    let existed = privacy.exists();
+    if existed {
+        fs::rename(&privacy, &aside).unwrap();
+    }
+    fs::write(&privacy, "not a directory").unwrap();
+    let blocked = import(0, "pending");
+    fs::remove_file(&privacy).unwrap();
+    if existed {
+        fs::rename(&aside, &privacy).unwrap();
+    }
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("privacy check pending"),
+        "{blocked:?}"
+    );
+    assert!(!has_branch("pending"), "{blocked:?}");
+    let landed = import(0, "pending");
+    assert!(landed.status.success(), "{landed:?}");
+    assert!(!target_git(&lab, &repo, &["show", "pending:LOG"]).is_empty());
+
+    let vault = lab.store.join("secret-filter/vault.json");
+    fs::create_dir_all(vault.parent().unwrap()).unwrap();
+    fs::write(&vault, "not a vault").unwrap();
+    let partial = import(1, "partial");
+    assert!(
+        String::from_utf8_lossy(&partial.stderr).contains("privacy check pending"),
+        "{partial:?}"
+    );
+    assert!(!has_branch("partial"), "{partial:?}");
+}

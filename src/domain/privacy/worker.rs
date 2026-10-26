@@ -22,6 +22,13 @@ pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
+    /// Echoed in the response, so a reply that arrives after its caller stopped waiting is
+    /// recognized and discarded instead of answering the next request.
+    #[serde(default)]
+    pub id: u64,
+    /// How long the caller waits; the worker's own watchdog allows this much and a margin.
+    #[serde(default)]
+    pub deadline_ms: u64,
     pub repo: Option<PathBuf>,
     pub mode: Mode,
     pub text: String,
@@ -29,6 +36,19 @@ pub(crate) struct Request {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub context: String,
 }
+
+/// One worker reply.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Response {
+    pub id: u64,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
+/// The least time a request may take before the worker's watchdog ends the process.
+const WATCHDOG_FLOOR: Duration = Duration::from_secs(3);
+/// What the watchdog allows beyond the caller's own deadline.
+const WATCHDOG_MARGIN: Duration = Duration::from_secs(2);
 
 static IN_WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -47,6 +67,8 @@ pub(crate) fn inline(repo: Option<&Path>, text: &str, mode: Mode) -> Option<Outc
         };
         execute(
             &Request {
+                id: 0,
+                deadline_ms: 0,
                 repo: repo.map(Path::to_owned),
                 text: text.to_owned(),
                 mode,
@@ -246,6 +268,8 @@ fn frozen_hydration(request: &Request) -> crate::Result<Outcome> {
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         })
     })
 }
@@ -278,6 +302,8 @@ fn status() -> crate::Result<Outcome> {
         replacements: 0,
         unresolved: 0,
         consumed: None,
+        unprocessed: 0,
+        reason: None,
     })
 }
 
@@ -315,6 +341,13 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
     let credential = crate::infra::credentials::load(&hub);
     let (route, owner) = route(&root, &hub, credential.as_ref())?;
     let stamp = stamp(request.repo.as_deref());
+    // How long each loading phase took, reported to the caller of a `Prepare` request.
+    let mut phases = serde_json::Map::new();
+    let mut phase = Instant::now();
+    let mut lap = |name: &str, phases: &mut serde_json::Map<String, serde_json::Value>| {
+        phases.insert(name.into(), (phase.elapsed().as_millis() as u64).into());
+        phase = Instant::now();
+    };
     if !loaded.as_ref().is_some_and(|loaded| {
         loaded.repo == request.repo
             && loaded.route == route
@@ -333,6 +366,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                 Some(version),
             )
         })?;
+        lap("journal_ms", &mut phases);
         let global = (|| -> crate::Result<crate::domain::secret_filter::Matcher> {
             if !crate::infra::config::secret_filter_vault_path()?.try_exists()? {
                 return Ok(Default::default());
@@ -409,9 +443,11 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             value,
             source: policy::Source::RepositoryUser,
         }));
+        lap("legacy_ms", &mut phases);
         let global_allows = crate::infra::config::agit_home()
             .map(|home| crate::domain::secrets::load_allowlist(&home))
             .unwrap_or_default();
+        lap("allowlist_ms", &mut phases);
         let mut allows: Vec<_> = global_allows.iter().map(String::as_str).collect();
         allows.extend(legacy.allows.iter().map(|value| value.as_str()));
         let mut projector = Projector {
@@ -428,6 +464,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                 } else {
                     super::detector::Entropy::Exclude
                 });
+        lap("compile_ms", &mut phases);
         let policy_generation = projector.store.policy_generation()?;
         *loaded = Some(Loaded {
             repo: request.repo.clone(),
@@ -436,6 +473,17 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             cursor,
             policy_generation,
             projector,
+        });
+    }
+    if matches!(request.mode, Mode::Prepare) {
+        return Ok(Outcome {
+            content: serde_json::Value::Object(phases).to_string(),
+            status: super::projector::Status::Complete,
+            replacements: 0,
+            unresolved: 0,
+            consumed: None,
+            unprocessed: 0,
+            reason: None,
         });
     }
     let loaded = loaded
@@ -466,6 +514,8 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             replacements: 0,
             unresolved: 0,
             consumed: None,
+            unprocessed: 0,
+            reason: None,
         });
     }
     Ok(loaded
@@ -479,8 +529,16 @@ fn serve(clock: Instant, deadline: &AtomicU64) -> crate::Result<()> {
     let mut output = std::io::stdout().lock();
     loop {
         let bytes = read_frame(&mut input)?;
-        deadline.store(clock.elapsed().as_millis() as u64 + 3000, Ordering::Release);
+        deadline.store(
+            (clock.elapsed() + WATCHDOG_FLOOR).as_millis() as u64,
+            Ordering::Release,
+        );
         let request: Request = serde_json::from_slice(&bytes)?;
+        let allowed = Duration::from_millis(request.deadline_ms) + WATCHDOG_MARGIN;
+        deadline.store(
+            (clock.elapsed() + allowed.max(WATCHDOG_FLOOR)).as_millis() as u64,
+            Ordering::Release,
+        );
         if matches!(
             request.mode,
             Mode::FreezeHydration | Mode::HydrateFrozenJsonl | Mode::HydrationValues
@@ -497,9 +555,14 @@ fn serve(clock: Instant, deadline: &AtomicU64) -> crate::Result<()> {
         .and_then(Result::ok)
         .unwrap_or_else(|| {
             loaded = None;
-            Outcome::skipped(&request.text)
+            let mut outcome = Outcome::skipped(&request.text);
+            outcome.reason = Some(super::projector::Reason::StoreBusy);
+            outcome
         });
-        let encoded = Zeroizing::new(serde_json::to_vec(&outcome)?);
+        let encoded = Zeroizing::new(serde_json::to_vec(&Response {
+            id: request.id,
+            outcome,
+        })?);
         write_frame(&mut output, &encoded)?;
         deadline.store(0, Ordering::Release);
     }

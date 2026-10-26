@@ -13,6 +13,8 @@ pub mod keys;
 pub(crate) mod legacy;
 #[cfg(feature = "secret-vault")]
 pub mod management;
+#[cfg(feature = "cli")]
+pub mod pending;
 pub mod policy;
 #[cfg(feature = "secret-vault")]
 pub mod projector;
