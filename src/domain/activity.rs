@@ -48,6 +48,26 @@ pub struct Query {
     pub limit: Option<usize>,
     #[serde(default)]
     pub assistant: Assistant,
+    #[serde(default, skip_serializing_if = "SelectBy::is_sent")]
+    pub select_by: SelectBy,
+}
+
+/// Which time `since` and `before` bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectBy {
+    /// Each message's `sent_at`.
+    #[default]
+    Sent,
+    /// Each contribution's `saved_at`, for a reader that chooses commits by when they were saved:
+    /// under `Sent`, messages written before their save fall outside a window drawn around it.
+    Saved,
+}
+
+impl SelectBy {
+    fn is_sent(&self) -> bool {
+        *self == SelectBy::Sent
+    }
 }
 
 /// Which assistant messages a page carries; user messages are always included.
@@ -70,6 +90,8 @@ pub struct Selection {
     pub session: Option<String>,
     #[serde(default)]
     pub assistant: Assistant,
+    #[serde(default, skip_serializing_if = "SelectBy::is_sent")]
+    pub select_by: SelectBy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +144,7 @@ impl Query {
             before: before.to_rfc3339_opts(SecondsFormat::AutoSi, true),
             session: self.session.clone(),
             assistant: self.assistant,
+            select_by: self.select_by,
         })
     }
 }
@@ -406,7 +429,16 @@ pub fn page(
         reasons.insert("unmapped_publication_author".into(), facts.unmapped.clone());
     }
     let who = history::Who::new(&selection.author, facts.account.as_ref());
-    let walked = history::walk(store, &scope, &publications, &who, floor, since, first)?;
+    let saved_before = (selection.select_by == SelectBy::Saved).then_some(before);
+    let walked = history::walk(
+        store,
+        &scope,
+        &publications,
+        &who,
+        floor,
+        (since, saved_before),
+        first,
+    )?;
     if walked.truncated {
         let truncated = reasons.entry("history_truncated".into()).or_default();
         truncated.count = truncated.count.max(1);
@@ -521,7 +553,7 @@ pub fn page(
                     &candidate,
                     record,
                     selection.assistant,
-                    (since, before),
+                    (since, before, selection.select_by),
                 ) {
                     Ok(window) => window,
                     Err(error) if error.is::<extract::Exhausted>() => {

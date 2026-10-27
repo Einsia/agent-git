@@ -251,15 +251,15 @@ impl<'s, S: Store> Extractor<'s, S> {
     }
 
     /// Records appended since the first parent, from `record` on (zero starts after the parent),
-    /// keeping messages sent inside `[since, before)`. A message without a recorded time counts
-    /// as sent when it was saved. Windows and their filtering depend only on immutable content,
+    /// keeping messages whose `by` time falls inside `[since, before)`. A message without a
+    /// recorded time counts as sent when it was saved. Windows and their filtering depend only on immutable content,
     /// so a continuation sees the same messages at the same indexes.
     pub(super) fn window(
         &mut self,
         candidate: &Candidate,
         record: usize,
         assistant: Assistant,
-        (since, before): (DateTime<Utc>, DateTime<Utc>),
+        (since, before, by): (DateTime<Utc>, DateTime<Utc>, super::SelectBy),
     ) -> Result<Window> {
         let peeked = self
             .peeked
@@ -310,7 +310,10 @@ impl<'s, S: Store> Extractor<'s, S> {
         // The answer to a request stays selected by its own time, so filtering follows the
         // choice of last assistant messages rather than preceding it.
         window.texts.retain(|text| {
-            let at = text.sent_at.unwrap_or(candidate.key.at);
+            let at = match by {
+                super::SelectBy::Sent => text.sent_at.unwrap_or(candidate.key.at),
+                super::SelectBy::Saved => candidate.key.at,
+            };
             at >= since && at < before
         });
         Ok(window)

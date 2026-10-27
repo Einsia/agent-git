@@ -85,6 +85,7 @@ fn query() -> Query {
         cursor: None,
         limit: Some(1),
         assistant: Assistant::All,
+        select_by: SelectBy::Sent,
     }
 }
 
@@ -560,7 +561,8 @@ fn oversized_contributions_continue_inside_the_commit_without_repeating_tools_or
 /// Pins message-time selection: a message counts in the window it was sent in, whenever it was
 /// saved. A reader that still bounded saves by `before` would drop the late save; one that
 /// filtered by save time would return the message sent before `since` and the one sent after
-/// `before`. A record without a time counts as sent when it was saved.
+/// `before`. A record without a time counts as sent when it was saved. Selecting by save time
+/// instead returns the whole save made inside the window and nothing of the later one.
 #[test]
 fn messages_are_selected_by_the_time_their_harness_recorded() {
     let temp = tempfile::tempdir().unwrap();
@@ -603,7 +605,7 @@ fn messages_are_selected_by_the_time_their_harness_recorded() {
     assert_eq!(
         texts(&pages),
         [
-            (early, "untimed answer".into()),
+            (early.clone(), "untimed answer".into()),
             (late, "sent in range, saved late".into()),
         ]
     );
@@ -618,6 +620,18 @@ fn messages_are_selected_by_the_time_their_harness_recorded() {
         [
             ("2026-10-01T00:30:00Z", SentBasis::Saved),
             ("2026-10-02T10:00:00.500Z", SentBasis::Recorded),
+        ]
+    );
+    let by_save = Query {
+        select_by: SelectBy::Saved,
+        ..query()
+    };
+    let saved = self::pages(&repo, &mut Fixed::default(), by_save, || {});
+    assert_eq!(
+        texts(&saved),
+        [
+            (early.clone(), "sent before range".into()),
+            (early, "untimed answer".into()),
         ]
     );
 }

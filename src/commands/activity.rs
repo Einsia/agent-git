@@ -89,6 +89,7 @@ fn run_query(args: Args) -> CmdResult {
         cursor: args.cursor,
         limit: Some(args.limit),
         assistant: args.assistant,
+        select_by: Default::default(),
     };
     crate::input_argument(query.selection())?;
     let client = super::require_login()?;
