@@ -448,9 +448,11 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
     );
     let response: serde_json::Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("SessionStart must return one hook response: {e}"));
-    assert_eq!(
-        response["hookSpecificOutput"]["sessionTitle"],
-        "agit einsia/qa@work"
+    // The identity reaches the agent and the environment, never the conversation's title: agit
+    // does not name a Claude Code conversation, with or without a title of its own.
+    assert!(
+        response["hookSpecificOutput"].get("sessionTitle").is_none(),
+        "{response}"
     );
     let context = response["hookSpecificOutput"]["additionalContext"]
         .as_str()
