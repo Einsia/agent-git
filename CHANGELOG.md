@@ -22,6 +22,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   session starts with, `agit status`, the skill and the `AGENTS.md` section now say to publish
   only when the person asks; the session context and status also leave saving new turns to the
   person's request. A forked Codex session had pushed mid-turn because the context told it to.
+- `agit rc` rebuilds its index of this device's conversations when that index cannot be opened,
+  for example after a power loss damages one of its files, instead of failing every conversation
+  list with an internal error. The index holds only what `agit rc` read from Claude Code, Codex
+  and OpenCode, so nothing is lost: the damaged copy is moved aside next to it for inspection and
+  removed after seven days. It rebuilds once per start; if the index still cannot be opened, the
+  list reports `catalog_unreadable` and asks the device owner to restart `agit rc`, and the
+  daemon log names the underlying error.
 
 ## [0.2.28] - 2026-10-27
 

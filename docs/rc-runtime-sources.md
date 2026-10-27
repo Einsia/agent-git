@@ -78,6 +78,17 @@ pages, independently of browser connections. It enrolls the configured default
 Codex home when that directory exists. Automatic enrollment does not re-enable a
 removed source or accept a replacement directory under the old identity.
 
+The index holds only what the worker read from the sources: no exclusions, titles,
+pins or bindings that exist nowhere else. When it cannot be opened (a damaged
+database or companion file, a file not private to the OS account, or an unknown
+schema), the executor moves the directory aside to
+`AGIT_HOME/runtime-catalog.unreadable-<UTC time>`, logs a warning with the cause,
+and rebuilds the index from the sources. It does this at most once per start, and
+removes moved-aside copies after seven days. A busy database or a full disk is not
+treated as damage. If the index still cannot be opened, catalog requests fail with
+code 305 and reason `catalog_unreadable`, which asks the device owner to restart
+`agit rc`.
+
 The worker also checks native processes every 15 seconds on Linux and macOS.
 Only processes owned by the executor's OS account are eligible. Inspection keeps
 the executable path and `CODEX_HOME` (or `HOME/.codex`), rechecks process identity,

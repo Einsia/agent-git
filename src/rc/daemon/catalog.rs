@@ -133,7 +133,40 @@ impl Prepared {
     }
 }
 
-fn internal(_error: impl std::fmt::Display) -> RpcError {
+/// The reply to a catalog failure names no cause, so the daemon log does. A cause that persists is
+/// written once rather than once per request.
+fn log_cause(what: &str, error: &dyn std::fmt::Display) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let line = format!("agitd: {what}: {error:#}");
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.as_deref() != Some(line.as_str()) {
+        eprintln!("{line}");
+        *last = Some(line);
+    }
+}
+
+/// The catalog of this device's own conversations cannot be opened, and a rebuild in this run
+/// failed too or was already spent, so nothing in it can be listed or resolved. Restarting
+/// `agit rc` allows one more rebuild; one that keeps failing points at the device's disk.
+fn unreadable(error: &anyhow::Error) -> RpcError {
+    log_cause("the runtime catalog cannot be opened", error);
+    classified(
+        RpcError::new(
+            ErrorCode::RuntimeUnavailable,
+            "this device's conversation catalog cannot be opened",
+        )
+        .with_hint(
+            "restart `agit rc` on this device, which rebuilds the catalog from the runtimes' own records; if it keeps failing, check the device's disk",
+        ),
+        false,
+        "catalog_unreadable",
+    )
+}
+
+fn internal(error: impl std::fmt::Display) -> RpcError {
+    log_cause("the runtime catalog failed", &error);
     classified(
         RpcError::new(
             ErrorCode::Internal,
@@ -151,7 +184,7 @@ fn failed(error: anyhow::Error, request_names_source: bool) -> RpcError {
 /// Catalog conditions with their own meaning: a vanished conversation, a source the catalog is
 /// still catching up with, and a transcript or index that is busy for a moment.
 pub(super) fn known(error: &anyhow::Error, request_names_source: bool) -> Option<RpcError> {
-    use crate::rc::runtime_catalog::{SourceChanged, Unavailable};
+    use crate::rc::runtime_catalog::{SourceChanged, Unavailable, Unreadable};
     let busy = |message: &str, reason: &str| {
         Some(classified(
             RpcError::new(ErrorCode::SessionBusy, message),
@@ -197,6 +230,9 @@ pub(super) fn known(error: &anyhow::Error, request_names_source: bool) -> Option
     }) {
         return busy("the runtime catalog is busy; retry shortly", "catalog_busy");
     }
+    if error.downcast_ref::<Unreadable>().is_some() {
+        return Some(unreadable(error));
+    }
     None
 }
 
@@ -205,8 +241,9 @@ mod tests {
     use super::*;
 
     /// A catalog that is catching up with its source clears by itself, a request that names an
-    /// old source never does, and a vanished conversation is not an internal fault. Folding all
-    /// three into one code leaves the web either retrying forever or giving up on a transient.
+    /// old source never does, a vanished conversation is not an internal fault, and a catalog
+    /// that cannot be opened is the device owner's to fix. Folding these into one code leaves
+    /// the web either retrying forever, giving up on a transient, or asking the wrong person.
     #[test]
     fn catalog_conditions_keep_their_codes_and_say_whether_they_clear() {
         use crate::rc::runtime_catalog::Unavailable;
@@ -234,6 +271,23 @@ mod tests {
         assert_eq!(
             known(&restoring, false).unwrap().data.unwrap()["reason"],
             "transcript_restoring"
+        );
+        let unreadable = anyhow::anyhow!("file is not a database")
+            .context(crate::rc::runtime_catalog::Unreadable);
+        let unreadable = known(&unreadable, false).unwrap();
+        assert_eq!(unreadable.code, ErrorCode::RuntimeUnavailable as i32);
+        let data = unreadable.data.unwrap();
+        assert_eq!(
+            (&data["retryable"], &data["reason"]),
+            (
+                &serde_json::json!(false),
+                &serde_json::json!("catalog_unreadable")
+            )
+        );
+        assert!(
+            data["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("agit rc"))
         );
         assert!(known(&anyhow::anyhow!("unexplained"), false).is_none());
     }

@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const SCAN_PAGE: usize = 100;
+/// A catalog moved aside because it could not be opened is kept this long for inspection, then
+/// removed the next time one is moved aside.
+const UNREADABLE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+const UNREADABLE_PREFIX: &str = "runtime-catalog.unreadable-";
+/// One rebuild per process: a disk that keeps damaging the catalog is reported, not looped on.
+static REBUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Both how often restoration temporaries are swept and how old one must be to be removed.
 const RESTORATION_SWEEP: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 mod deltas;
@@ -17,6 +23,59 @@ mod deltas;
 #[derive(Debug, thiserror::Error)]
 #[error("{0}; refresh the catalog")]
 pub(crate) struct SourceChanged(pub(crate) &'static str);
+
+/// This device's catalog database cannot be opened or prepared (a damaged file or companion file,
+/// a file not private to this account, or a schema this build does not know) and this process
+/// has already spent its one rebuild. Nothing in the catalog can be read until `agit rc` restarts.
+#[derive(Debug, thiserror::Error)]
+#[error("the runtime catalog cannot be opened")]
+pub(crate) struct Unreadable;
+
+/// A catalog another connection holds for a moment, or a disk that is full, is not damaged:
+/// rebuilding it would discard a working index and fail the same way.
+fn transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let sqlite = cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy
+                        | rusqlite::ErrorCode::DatabaseLocked
+                        | rusqlite::ErrorCode::DiskFull
+                )
+            });
+        let io = cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull);
+        sqlite || io
+    })
+}
+
+/// Removes catalogs moved aside longer ago than [`UNREADABLE_RETENTION`]. Removal is best effort:
+/// a copy on a damaged disk may not come out, and it is tried again next time.
+fn prune_unreadable(home: &std::path::Path, now: chrono::DateTime<chrono::Utc>) {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(moved) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(UNREADABLE_PREFIX))
+            .and_then(|stamp| {
+                chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.6fZ").ok()
+            })
+        else {
+            continue;
+        };
+        let age = now.naive_utc() - moved;
+        if age.to_std().is_ok_and(|age| age > UNREADABLE_RETENTION) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 /// The conversation is gone from the source or the place the catalog points to.
 #[derive(Debug, thiserror::Error)]
@@ -118,10 +177,48 @@ pub(crate) struct Catalog {
 
 impl Catalog {
     pub fn open() -> crate::Result<Self> {
-        Self::at(
+        Self::open_in(
             Registry::open()?,
-            crate::infra::config::agit_home()?.join("runtime-catalog"),
+            &crate::infra::config::agit_home()?,
+            &REBUILT,
         )
+    }
+
+    /// The catalog holds only what discovery read from the runtimes' own records (sources, their
+    /// sessions and the change log), so one that cannot be opened is moved aside, kept for
+    /// inspection, and rebuilt by the next scan; nothing a person wrote lives in it. A transient
+    /// failure leaves the catalog alone, and once this process has spent its rebuild, any later
+    /// failure reports the catalog as unreadable instead of moving another one aside.
+    fn open_in(
+        registry: Registry,
+        home: &std::path::Path,
+        rebuilt: &std::sync::atomic::AtomicBool,
+    ) -> crate::Result<Self> {
+        let directory = home.join("runtime-catalog");
+        let error = match Self::at(registry.clone(), directory.clone()) {
+            Ok(catalog) => return Ok(catalog),
+            Err(error) => error,
+        };
+        if transient(&error) {
+            return Err(error);
+        }
+        if rebuilt.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(error.context(Unreadable));
+        }
+        let moved = chrono::Utc::now();
+        let aside = home.join(format!(
+            "{UNREADABLE_PREFIX}{}",
+            moved.format("%Y%m%dT%H%M%S%.6fZ")
+        ));
+        if let Err(rename) = std::fs::rename(&directory, &aside) {
+            return Err(error.context(rename).context(Unreadable));
+        }
+        eprintln!(
+            "agitd: warning: the runtime catalog could not be opened ({error:#}); moved it aside to {} and rebuilding it from the runtimes' own records",
+            aside.display()
+        );
+        prune_unreadable(home, moved);
+        Self::at(registry, directory).map_err(|error| error.context(Unreadable))
     }
 
     fn at(registry: Registry, directory: PathBuf) -> crate::Result<Self> {
@@ -706,6 +803,80 @@ mod tests {
         changes.after_revision = Some(moved.changes_cursor);
         registry.remove(&source.source_id).unwrap();
         assert!(catalog.list(&roots, &changes).unwrap().reset);
+    }
+
+    /// A catalog that cannot be opened is moved aside intact and rebuilt, once per process: a later
+    /// failure is reported as unreadable and leaves that catalog where it is, so a disk that keeps
+    /// damaging it is not looped on. Only copies past their retention are pruned; removing the
+    /// copy just moved, or every copy, would leave nothing to inspect.
+    #[test]
+    fn an_unopenable_catalog_is_kept_aside_and_rebuilt_once_per_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let registry = Registry::at(home.join("registry")).unwrap();
+        let directory = home.join("runtime-catalog");
+        let garbage = "not a database ".repeat(100);
+        let damage = || {
+            Catalog::at(registry.clone(), directory.clone()).unwrap();
+            for companion in ["catalog.sqlite-wal", "catalog.sqlite-shm"] {
+                let _ = std::fs::remove_file(directory.join(companion));
+            }
+            std::fs::write(directory.join("catalog.sqlite"), &garbage).unwrap();
+        };
+        let set_aside = || {
+            let mut names: Vec<_> = std::fs::read_dir(home)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(UNREADABLE_PREFIX))
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let moved_days_ago = |days| {
+            let moved = chrono::Utc::now() - chrono::Duration::days(days);
+            let path = home.join(format!(
+                "{UNREADABLE_PREFIX}{}",
+                moved.format("%Y%m%dT%H%M%S%.6fZ")
+            ));
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let expired = moved_days_ago(8);
+        let recent = moved_days_ago(1);
+        damage();
+
+        let rebuilt = std::sync::atomic::AtomicBool::new(false);
+        let catalog = Catalog::open_in(registry.clone(), home, &rebuilt).unwrap();
+        let roots = CanonicalRoots::from_untrusted([home.to_path_buf()]);
+        assert!(
+            catalog
+                .list(&roots, &request(None))
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let kept = set_aside();
+        assert!(!expired.exists());
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&recent));
+        let damaged = kept.iter().find(|path| **path != recent).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(damaged.join("catalog.sqlite")).unwrap(),
+            garbage
+        );
+
+        damage();
+        let error = Catalog::open_in(registry, home, &rebuilt).err().unwrap();
+        assert!(error.downcast_ref::<Unreadable>().is_some());
+        assert_eq!(set_aside(), kept);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("catalog.sqlite")).unwrap(),
+            garbage
+        );
     }
 
     fn native_store(home: &std::path::Path, project: &std::path::Path, model: &str) -> Connection {
