@@ -153,6 +153,38 @@ thread_local! {
     /// records; unit tests cannot host the privacy worker.
     pub(crate) static WITHHOLD_NATIVE: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    /// Makes the text and JSON checks on this thread whose input contains this text come back
+    /// incomplete for this reason, as they do while the privacy worker is busy or backing off.
+    pub(crate) static WITHHOLD_LIVE: std::cell::Cell<
+        Option<(&'static str, crate::domain::privacy::projector::Reason)>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "rc"))]
+fn withheld_live(input: &str) -> Option<Withheld> {
+    WITHHOLD_LIVE
+        .with(std::cell::Cell::get)
+        .filter(|(needle, _)| input.contains(needle))
+        .map(|(_, reason)| Withheld {
+            reason: Some(reason),
+        })
+}
+
+/// A text or value whose privacy check did not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Withheld {
+    /// What the worker reported; none when it gave no reason.
+    #[cfg(feature = "cli")]
+    pub(crate) reason: Option<crate::domain::privacy::projector::Reason>,
+}
+
+impl Withheld {
+    #[cfg(feature = "cli")]
+    fn of(outcome: &crate::domain::privacy::projector::Outcome) -> Self {
+        Self {
+            reason: outcome.reason,
+        }
+    }
 }
 
 /// The device-local persona: "who this machine is", read out of the environment.
@@ -322,13 +354,13 @@ impl Redactor {
     /// instead of withheld.
     pub fn try_scrub(&self, text: &str) -> crate::Result<Report> {
         self.protect_text(text)
-            .ok_or_else(|| anyhow::anyhow!("privacy check pending; the text was not protected"))
+            .map_err(|_| anyhow::anyhow!("privacy check pending; the text was not protected"))
     }
     /// [`Self::scrub_json`], with a value whose privacy check did not complete reported as an
     /// error instead of withheld.
     pub fn try_scrub_json(&self, value: &serde_json::Value) -> crate::Result<JsonReport> {
         self.protect_json(value)
-            .ok_or_else(|| anyhow::anyhow!("privacy check pending; the value was not protected"))
+            .map_err(|_| anyhow::anyhow!("privacy check pending; the value was not protected"))
     }
 
     #[cfg(feature = "rc")]
@@ -562,19 +594,24 @@ impl Redactor {
     /// Redact one text. Deterministic: same input, same persona ⇒ same output. Text whose
     /// privacy check does not complete becomes [`WITHHELD`].
     pub fn scrub(&self, text: &str) -> Report {
-        self.protect_text(text).unwrap_or_else(withheld_report)
+        self.protect_text(text)
+            .unwrap_or_else(|_| withheld_report())
     }
 
-    /// The text protected as one whole, or `None` when its privacy check did not complete. Text
-    /// is not records: a credential such as a PEM private key spans lines, and only a pass that
-    /// sees the whole text replaces it from BEGIN through END.
-    fn protect_text(&self, text: &str) -> Option<Report> {
+    /// The text protected as one whole, or why its privacy check did not complete. Text is not
+    /// records: a credential such as a PEM private key spans lines, and only a pass that sees the
+    /// whole text replaces it from BEGIN through END.
+    pub(crate) fn protect_text(&self, text: &str) -> Result<Report, Withheld> {
         self.protect_text_in("", text)
     }
 
     /// [`Self::protect_text`] for text that continues `context`, text a stream already
     /// released: rules match across the context, and only `text` is protected.
-    fn protect_text_in(&self, context: &str, text: &str) -> Option<Report> {
+    fn protect_text_in(&self, context: &str, text: &str) -> Result<Report, Withheld> {
+        #[cfg(all(test, feature = "rc"))]
+        if let Some(withheld) = withheld_live(text) {
+            return Err(withheld);
+        }
         #[cfg(feature = "cli")]
         let protected = if context.is_empty() {
             crate::domain::privacy::service::transform_live(
@@ -594,7 +631,7 @@ impl Redactor {
         let _ = context;
         #[cfg(feature = "cli")]
         if !crate::domain::privacy::service::passed(&protected) {
-            return None;
+            return Err(Withheld::of(&protected));
         }
         #[cfg(feature = "cli")]
         let (out, secrets) = (protected.content, protected.replacements);
@@ -608,7 +645,7 @@ impl Redactor {
                 .map(|(_, _, token)| token.to_owned())
                 .collect();
         }
-        Some(report)
+        Ok(report)
     }
 
     /// Whether `name` can be published as it is: neither the detector, nor persona masking, nor
@@ -769,26 +806,31 @@ impl Redactor {
         #[cfg(feature = "cli")]
         return self
             .protect_json(value)
-            .unwrap_or_else(JsonReport::withheld);
+            .unwrap_or_else(|_| JsonReport::withheld());
         #[cfg(not(feature = "cli"))]
         self.protect_json(value)
             .expect("without the privacy service every value passes")
     }
 
-    /// The value with every string protected, or `None` when its privacy check did not complete.
-    fn protect_json(&self, value: &serde_json::Value) -> Option<JsonReport> {
+    /// The value with every string protected, or why its privacy check did not complete.
+    pub(crate) fn protect_json(&self, value: &serde_json::Value) -> Result<JsonReport, Withheld> {
+        #[cfg(all(test, feature = "rc"))]
+        if let Some(withheld) = withheld_live(&value.to_string()) {
+            return Err(withheld);
+        }
         #[cfg(feature = "cli")]
         let protected = crate::domain::privacy::service::transform_live(
             self.repo.as_deref(),
-            &serde_json::to_string(value).ok()?,
+            &value.to_string(),
             crate::domain::privacy::projector::Mode::ProtectJsonl,
         );
         #[cfg(feature = "cli")]
         if !crate::domain::privacy::service::passed(&protected) {
-            return None;
+            return Err(Withheld::of(&protected));
         }
         #[cfg(feature = "cli")]
-        let mut value: serde_json::Value = serde_json::from_str(&protected.content).ok()?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&protected.content).map_err(|_| Withheld { reason: None })?;
         #[cfg(not(feature = "cli"))]
         let mut value = value.clone();
         let mut totals = JsonTotals::default();
@@ -803,7 +845,7 @@ impl Redactor {
             }
         }
         self.scrub_json_inner(&mut value, &mut totals);
-        Some(JsonReport {
+        Ok(JsonReport {
             value,
             secrets: totals.secrets,
             paths: totals.paths,
@@ -940,12 +982,12 @@ impl StreamRedactor {
             }
             self.redactor
                 .protect_text_in(&released, &ready)
-                .unwrap_or_else(|| self.withhold())
+                .unwrap_or_else(|_| self.withhold())
         }
         #[cfg(not(feature = "cli"))]
         self.redactor
             .protect_text(&ready)
-            .unwrap_or_else(|| self.withhold())
+            .unwrap_or_else(|_| self.withhold())
     }
 
     /// [`WITHHELD`], once: the stream delivers nothing more for this item.

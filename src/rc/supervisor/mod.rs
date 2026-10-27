@@ -648,7 +648,49 @@ struct PendingApproval {
     /// the execution side can require a durable danger permit before echoing a
     /// bypass suggestion.
     suggested_permission_mode: Option<PermissionMode>,
+    /// Its card went out without its content, which never passed the privacy check, so it can be
+    /// denied but not allowed.
+    unseen: bool,
 }
+
+/// An approval whose card has not passed its privacy check. The card stays on this machine: a
+/// card sent with its command withheld asks someone to approve what they cannot see. The harness
+/// keeps waiting meanwhile, so nothing runs unanswered.
+struct UnshownApproval {
+    /// The card as the harness raised it, with this machine's verdict and before redaction.
+    request: crate::protocol::ApprovalRequest,
+    authority: PendingApproval,
+    /// How long it waited before its latest check; zero before the first.
+    waited: std::time::Duration,
+    next: tokio::time::Instant,
+    /// Consecutive checks that came back with only part of this device's policy applied.
+    incomplete: u32,
+    /// False once its check cannot pass: it then waits for an answer on the computer.
+    retrying: bool,
+}
+
+/// What a viewer reads while an approval card waits for its privacy check. It names no part of
+/// the request.
+const UNSHOWN_APPROVAL_NOTE: &str =
+    "An approval request is waiting for its privacy check before it can be shown";
+
+/// What a viewer reads when a card cannot pass its check in a session whose runtime asks on this
+/// computer. It names no part of the request.
+const UNSHOWABLE_APPROVAL_NOTE: &str =
+    "An approval request can't be shown here; answer it on the computer";
+
+/// The first retry of a card's privacy check. A check misses while another caller holds the
+/// worker, which passes quickly, so the first retry comes soon; the delay then doubles up to the
+/// worker's own retry window and stays there.
+const UNSHOWN_APPROVAL_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many retries in a row may still apply only part of this device's policy before a card is
+/// taken to be one that cannot pass: content still being written can clear it in between.
+const PARTIAL_POLICY_RETRIES: u32 = 3;
+
+/// The summary of a card that cannot pass its check, sent with none of its content.
+const UNCHECKED_APPROVAL_SUMMARY: &str =
+    "This request can't be shown here, so it can be denied but not allowed";
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageAttribution {
@@ -776,6 +818,11 @@ pub struct Session {
     /// miss). It stays in this machine's memory and never reaches the wire — the copy sent to
     /// viewers is scrubbed before emit.
     pending: std::collections::HashMap<String, PendingApproval>,
+    /// Approvals the harness raised whose card has not passed its privacy check. They are not in
+    /// `pending`, so an answer naming one is refused like any approval never sent.
+    unshown: Vec<UnshownApproval>,
+    /// The note viewers were last told about cards waiting on this machine.
+    unshown_note: Option<&'static str>,
     /// The **byte** position consumed from the transcript. Used only to decide whether the file
     /// is still growing.
     ///
@@ -1244,6 +1291,142 @@ impl Session {
         self.driver.shared_executor()
     }
 
+    /// Send the card once its summary, paths and input all pass the privacy check, and only then
+    /// accept an answer to it; until then it waits in `unshown`. Callers settle the note after.
+    async fn offer_approval(&mut self, mut unshown: UnshownApproval) {
+        let (card, registered) = match self.protect_card(&unshown.request) {
+            Ok(protected) => protected,
+            Err(withheld) => {
+                use crate::domain::privacy::projector::Reason;
+                unshown.incomplete = match withheld.reason {
+                    Some(Reason::SourceIncomplete) => unshown.incomplete.saturating_add(1),
+                    _ => 0,
+                };
+                // These name the content or this device's rules, which waiting does not change;
+                // every other reason is the worker's state, so the check is retried for good.
+                if matches!(
+                    withheld.reason,
+                    Some(Reason::Oversize | Reason::FindingsCap | Reason::DeviceRules)
+                ) || unshown.incomplete > PARTIAL_POLICY_RETRIES
+                {
+                    return self.cannot_show(unshown).await;
+                }
+                unshown.waited = if unshown.waited.is_zero() {
+                    UNSHOWN_APPROVAL_RETRY
+                } else {
+                    unshown
+                        .waited
+                        .saturating_mul(2)
+                        .min(crate::domain::privacy::service::RETRY_WINDOW)
+                };
+                unshown.next = tokio::time::Instant::now() + unshown.waited;
+                self.unshown.push(unshown);
+                return;
+            }
+        };
+        self.alert_registered(registered, "approval").await;
+        self.pending
+            .insert(card.approval_id.clone(), unshown.authority);
+        self.emit(method::APPROVAL_REQUEST, card).await;
+    }
+
+    /// A card that cannot pass its check. A runtime that shows approvals in a terminal on this
+    /// computer asks there too, so the approval waits for that answer behind a note; any other
+    /// session gets a card with none of the request's content, which can be denied while allowing
+    /// what nobody could read is refused.
+    async fn cannot_show(&mut self, mut unshown: UnshownApproval) {
+        if self.driver.asks_on_this_computer() {
+            unshown.retrying = false;
+            self.unshown.push(unshown);
+            return;
+        }
+        let mut card = unshown.request;
+        card.summary = UNCHECKED_APPROVAL_SUMMARY.into();
+        card.tool = String::new();
+        card.paths = Vec::new();
+        card.input = serde_json::json!({});
+        card.can_allow_for_session = false;
+        card.suggested_permission_mode = None;
+        self.pending.insert(
+            card.approval_id.clone(),
+            PendingApproval {
+                unseen: true,
+                ..unshown.authority
+            },
+        );
+        self.emit(method::APPROVAL_REQUEST, card).await;
+    }
+
+    async fn retry_unshown_approvals(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due = |unshown: &UnshownApproval| unshown.retrying && unshown.next <= now;
+        if !self.unshown.iter().any(due) {
+            return;
+        }
+        let (due, waiting) = std::mem::take(&mut self.unshown)
+            .into_iter()
+            .partition(|unshown| due(unshown));
+        self.unshown = waiting;
+        for unshown in due {
+            self.offer_approval(unshown).await;
+        }
+        self.settle_unshown_note().await;
+    }
+
+    /// A note stands exactly while some card waits on this machine; one left standing tells
+    /// viewers an approval is coming after it was answered or dropped.
+    async fn settle_unshown_note(&mut self) {
+        let note = if self.unshown.iter().any(|unshown| unshown.retrying) {
+            Some(UNSHOWN_APPROVAL_NOTE)
+        } else if !self.unshown.is_empty() {
+            Some(UNSHOWABLE_APPROVAL_NOTE)
+        } else {
+            None
+        };
+        if note == self.unshown_note {
+            return;
+        }
+        self.unshown_note = note;
+        self.emit(
+            "session.progress",
+            serde_json::json!({ "text": note.unwrap_or_default() }),
+        )
+        .await;
+    }
+
+    /// The card a viewer may see, or why some part of it is withheld. A command line is exactly
+    /// where a token ends up, so every string on the card is protected.
+    fn protect_card(
+        &self,
+        request: &crate::protocol::ApprovalRequest,
+    ) -> Result<(crate::protocol::ApprovalRequest, Vec<String>), redact::Withheld> {
+        let mut card = request.clone();
+        let summary = self.redactor.protect_text(&request.summary)?;
+        let mut registered = summary.registered_ids;
+        card.summary = summary.text;
+        // **`paths` is raw material on the same card, not metadata.** What
+        // `harness::paths_of` puts here is the **absolute** `file_path`, so an unprotected path
+        // gives everyone who sees the card the machine owner's username and home directory. The
+        // verdict never reads it (see `policy::approval_owner_reason`).
+        card.paths = request
+            .paths
+            .iter()
+            .map(|path| {
+                let report = self.redactor.protect_text(path)?;
+                registered.extend(report.registered_ids);
+                Ok(report.text)
+            })
+            .collect::<Result<_, _>>()?;
+        // `input` is structured, so what gets protected is its **decoded strings**: matching
+        // wire bytes misses every registered literal containing `"`, `\` or a newline, and its
+        // re-parse can fail into sending the unprotected input. The verdict is unaffected; it
+        // reads the unredacted input kept in the authority.
+        let input = self.redactor.protect_json(&request.input)?;
+        registered.extend(input.registered_ids);
+        card.input = input.value;
+        Ok((card, registered))
+    }
+
     /// Drop both halves of every approval the harness can no longer answer.
     ///
     /// The supervisor copy is the machine-side authorization evidence; the
@@ -1252,8 +1435,10 @@ impl Session {
     /// turn boundary must clear both in the same production function.
     async fn abandon_pending_approvals(&mut self) -> bool {
         let pending = std::mem::take(&mut self.pending);
+        let unshown = std::mem::take(&mut self.unshown);
         let driver = self.driver.abandon_pending_approvals();
-        let abandoned = !pending.is_empty() || driver != 0;
+        let abandoned = !pending.is_empty() || !unshown.is_empty() || driver != 0;
+        self.settle_unshown_note().await;
         // Every viewer must retire the same cards when native requests become unanswerable.
         for approval_id in pending.into_keys() {
             self.emit(
@@ -1406,6 +1591,8 @@ impl Session {
             redactor,
             out,
             pending: Default::default(),
+            unshown: Vec::new(),
+            unshown_note: None,
             consumed_bytes: 0,
             landed_thread: None,
             landing: None,
@@ -2100,7 +2287,7 @@ impl Session {
     async fn publish_turn_started(&mut self, prepared: PreparedTurnStarted) {
         self.alert_registered(prepared.registered_ids, "turn_prompt")
             .await;
-        if prepared.mark_running && self.pending.is_empty() {
+        if prepared.mark_running && self.pending.is_empty() && self.unshown.is_empty() {
             self.set_status(SessionStatus::Running).await;
         }
         self.emit(method::TURN_STARTED, prepared.frame).await;
@@ -2445,6 +2632,17 @@ impl Session {
                             // The free text a refusal carries is another matter and is replaced
                             // below (`sanitize_for_non_owner`) — that is what a refusal really
                             // has to be guarded against, not the refusal itself.
+                            if pending.unseen
+                                && response.decision == crate::protocol::ApprovalDecision::Allow
+                            {
+                                // Put it back: a denial can still answer it.
+                                self.pending.insert(response.approval_id.clone(), pending);
+                                reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
+                                    message: "this request's command never passed its privacy check, so nobody could see it; it can be denied, not allowed".into(),
+                                    retained: true,
+                                }));
+                                continue;
+                            }
                             if approval_answer_is_blocked(
                                 needs_owner,
                                 caller_is_owner,
@@ -2534,7 +2732,7 @@ impl Session {
                                         session_id: self.info.session_id.clone(),
                                         approval_id: response.approval_id.clone(),
                                     }).await;
-                                    if self.pending.is_empty() {
+                                    if self.pending.is_empty() && self.unshown.is_empty() {
                                         self.set_status(SessionStatus::Running).await;
                                     }
                                     // Answering "allow, and stop asking" moves
@@ -2680,6 +2878,7 @@ impl Session {
                 }
 
                 _ = ticker.tick() => {
+                    self.retry_unshown_approvals().await;
                     self.finish_local_settlement(false).await;
                     self.finish_publication(false).await;
                     if self.idle_settlement_ready() {
@@ -3051,7 +3250,13 @@ impl Session {
                 self.flush_initial_turn_if_ready().await;
             }
             HarnessEvent::ApprovalResolved { approval_id } => {
-                if self.pending.remove(&approval_id).is_some() {
+                let shown = self.pending.remove(&approval_id).is_some();
+                let held = self.unshown.len();
+                // No viewer saw a card that never left this machine, so none has one to retire.
+                self.unshown
+                    .retain(|unshown| unshown.request.approval_id != approval_id);
+                self.settle_unshown_note().await;
+                if shown {
                     self.emit(
                         method::APPROVAL_RESOLVED,
                         crate::protocol::ApprovalResolved {
@@ -3060,11 +3265,13 @@ impl Session {
                         },
                     )
                     .await;
-                    if self.pending.is_empty()
-                        && self.info.status == SessionStatus::AwaitingApproval
-                    {
-                        self.set_status(SessionStatus::Running).await;
-                    }
+                }
+                if (shown || self.unshown.len() < held)
+                    && self.pending.is_empty()
+                    && self.unshown.is_empty()
+                    && self.info.status == SessionStatus::AwaitingApproval
+                {
+                    self.set_status(SessionStatus::Running).await;
                 }
             }
             HarnessEvent::Approval(mut req) => {
@@ -3117,53 +3324,48 @@ impl Session {
                 // the allowlist as it stands then, see `Session::pending`. So this input is
                 // taken before redaction — the scrubbed copy does not compare against the
                 // allowlist.
-                self.pending.insert(
-                    req.approval_id.clone(),
-                    PendingApproval {
-                        tool: req.tool.clone(),
-                        input: req.input.clone(),
-                        suggested_permission_mode: req.suggested_permission_mode,
-                    },
-                );
-                // Scrub the card: a command line is exactly where a token ends up.
-                let report = self.redactor.scrub(&req.summary);
-                req.summary = self.finish_scrub(report, "approval").await;
-                // **`paths` is the third piece of raw material on the same card, not
-                // metadata.**
-                //
-                // What `harness::paths_of` puts here is the **absolute** `file_path` —
-                // `/Users/alice/secret/src/main.rs`. With summary and input scrubbed, it still
-                // lies unchanged in the same struct and leaves the machine with
-                // `approval.request`: everyone in the workspace who sees this card gets the
-                // machine owner's username and home directory. The verdict is unaffected: that
-                // step is above and uses the unredacted `input`, and `paths` never takes part
-                // in it (see `policy::approval_owner_reason`).
-                let mut path_ids = vec![];
-                req.paths = req
-                    .paths
-                    .iter()
-                    .map(|p| {
-                        let report = self.redactor.scrub(p);
-                        path_ids.extend(report.registered_ids);
-                        report.text
-                    })
-                    .collect();
-                self.alert_registered(path_ids, "approval").await;
-                // `input` is structured, so what gets scrubbed is its **decoded strings**.
-                // Serializing first and matching wire bytes misses every registered literal
-                // containing `"`, `\` or a newline — and an approval card carries exactly the
-                // command line about to run, which is where such a value is most likely to
-                // appear. Rewriting in place also removes the re-parse step, whose failure
-                // branch leaves the **unredacted** input in place.
-                //
-                // The verdict is unaffected: `self.pending` above already took the
-                // **unredacted** input, and the moment of the answer decides against that.
-                let report = self.redactor.scrub_json(&req.input);
-                req.input = report.value;
-                self.alert_registered(report.registered_ids, "approval")
-                    .await;
+                let authority = PendingApproval {
+                    tool: req.tool.clone(),
+                    input: req.input.clone(),
+                    suggested_permission_mode: req.suggested_permission_mode,
+                    unseen: false,
+                };
                 self.set_status(SessionStatus::AwaitingApproval).await;
-                self.emit(method::APPROVAL_REQUEST, req).await;
+                // A harness can deliver the same request again; its newer copy replaces the held
+                // one. One already sent stays answerable whatever this copy's check says, and it is
+                // shown again only once that check passes.
+                self.unshown
+                    .retain(|held| held.request.approval_id != req.approval_id);
+                if self.pending.contains_key(&req.approval_id) {
+                    let protected = self.protect_card(&req).ok();
+                    let unseen = protected.is_none()
+                        && self
+                            .pending
+                            .get(&req.approval_id)
+                            .is_some_and(|shown| shown.unseen);
+                    self.pending.insert(
+                        req.approval_id.clone(),
+                        PendingApproval {
+                            unseen,
+                            ..authority
+                        },
+                    );
+                    if let Some((card, registered)) = protected {
+                        self.alert_registered(registered, "approval").await;
+                        self.emit(method::APPROVAL_REQUEST, card).await;
+                    }
+                } else {
+                    self.offer_approval(UnshownApproval {
+                        request: req,
+                        authority,
+                        waited: std::time::Duration::ZERO,
+                        next: tokio::time::Instant::now(),
+                        incomplete: 0,
+                        retrying: true,
+                    })
+                    .await;
+                }
+                self.settle_unshown_note().await;
             }
             HarnessEvent::Notice { text } => {
                 tracing_note(&format!("[{}] {text}", self.info.session_id));

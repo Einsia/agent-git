@@ -14,6 +14,7 @@ async fn shared_approval_resolution_preserves_other_pending_requests() {
                 tool: "shell".into(),
                 input: serde_json::json!({}),
                 suggested_permission_mode: None,
+                unseen: false,
             },
         );
     }
@@ -103,6 +104,8 @@ pub(super) fn harness_test_session_with_channels(
         redactor: redact::Redactor::this_machine(),
         out,
         pending: Default::default(),
+        unshown: Vec::new(),
+        unshown_note: None,
         consumed_bytes: 0,
         resuming: false,
         agit_session: None,
@@ -1391,6 +1394,7 @@ async fn run_ambiguous_claude_approval(
             tool: "Bash".into(),
             input: serde_json::json!({"command": "cargo test"}),
             suggested_permission_mode: suggested_mode,
+            unseen: false,
         },
     );
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
@@ -1711,6 +1715,7 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
             tool: "shell".into(),
             input: serde_json::json!({}),
             suggested_permission_mode: None,
+            unseen: false,
         },
     );
     let (commands, mut command_rx) = mpsc::channel(1);
@@ -2187,6 +2192,226 @@ async fn an_approval_cards_input_is_scrubbed_without_ever_losing_its_json_shape(
             .input,
         input
     );
+}
+
+/// The approval request a held-card test raises.
+fn held_request(id: &str, command: &str) -> crate::protocol::ApprovalRequest {
+    crate::protocol::ApprovalRequest {
+        approval_id: id.into(),
+        session_id: String::new(),
+        turn_id: format!("turn-{id}"),
+        kind: crate::protocol::ApprovalKind::Exec,
+        tool: "Bash".into(),
+        input: serde_json::json!({ "command": command }),
+        summary: command.into(),
+        paths: vec![],
+        timeout_secs: 0,
+        requires_owner: false,
+        owner_reason: None,
+        can_allow_for_session: true,
+        suggested_permission_mode: None,
+        requested_at: "now".into(),
+    }
+}
+
+fn drained(out: &mut mpsc::Receiver<Frame>) -> Vec<Frame> {
+    std::iter::from_fn(|| out.try_recv().ok()).collect()
+}
+
+/// An approval card whose privacy check does not pass never leaves the machine, since a viewer
+/// could only approve a command it cannot see: the approval waits behind a note that names
+/// nothing and is not answerable. A check missed for the worker's state is retried for as long as
+/// it takes, and once it passes the card goes out with its command. Sending the withheld card
+/// fails the first half; giving up on a busy or backing-off worker, or never retrying, the second.
+#[tokio::test(start_paused = true)]
+async fn an_approval_card_stays_on_the_machine_until_its_command_can_be_shown() {
+    use crate::domain::privacy::projector::Reason;
+    let driver = AnyDriver::ClaudeCode(Box::new(
+        crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
+    ));
+    let (mut session, mut out, _notes) =
+        harness_test_session_with_channels(driver, "claude-code", SessionStatus::Idle);
+    let command = "./web/check.sh";
+    redact::WITHHOLD_LIVE.with(|w| w.set(Some((command, Reason::LockBusy))));
+    session
+        .on_harness_event(HarnessEvent::Approval(held_request(
+            "approval-held",
+            command,
+        )))
+        .await;
+    let window = crate::domain::privacy::service::RETRY_WINDOW;
+    let held = tokio::time::Instant::now();
+    while held.elapsed() < window * 3 {
+        tokio::time::advance(std::time::Duration::from_millis(super::TAIL_POLL_MS)).await;
+        session.retry_unshown_approvals().await;
+    }
+    let frames = drained(&mut out);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.method.as_deref() != Some(method::APPROVAL_REQUEST)),
+        "a card whose check did not pass was sent: {frames:?}"
+    );
+    assert!(frames.iter().any(|frame| {
+        frame.method.as_deref() == Some("session.progress")
+            && frame
+                .params
+                .as_ref()
+                .is_some_and(|params| params["text"] == super::UNSHOWN_APPROVAL_NOTE)
+    }));
+    assert!(
+        !serde_json::to_string(&frames).unwrap().contains(command),
+        "the held request reached a viewer: {frames:?}"
+    );
+    assert!(
+        !session.pending.contains_key("approval-held"),
+        "an approval nobody could see must not be answerable"
+    );
+    assert_eq!(
+        session.unshown.len(),
+        1,
+        "a busy worker never gives a card up"
+    );
+    assert_eq!(session.info.status, SessionStatus::AwaitingApproval);
+
+    redact::WITHHOLD_LIVE.with(|w| w.set(None));
+    tokio::time::advance(window).await;
+    session.retry_unshown_approvals().await;
+    let shown = drained(&mut out);
+    let card = shown
+        .iter()
+        .find(|frame| frame.method.as_deref() == Some(method::APPROVAL_REQUEST))
+        .and_then(|frame| frame.params.clone())
+        .expect("the card goes out once its check passes");
+    assert_eq!(card["approval_id"], "approval-held");
+    assert_eq!(card["input"]["command"], command);
+    assert_eq!(card["summary"], command);
+    assert!(shown.iter().any(|frame| {
+        frame.method.as_deref() == Some("session.progress")
+            && frame
+                .params
+                .as_ref()
+                .is_some_and(|params| params["text"] == "")
+    }));
+    assert!(session.pending.contains_key("approval-held"));
+    assert!(session.unshown.is_empty());
+}
+
+/// A card whose check cannot pass, for a reason that names its content or this device's rules,
+/// is not held until the turn ends: in a session the daemon runs it goes out with none of the
+/// request's content, not even the tool's name, and the machine refuses to allow it while a
+/// denial can still answer it. Content too large to check does so on its first result; a policy
+/// applied only in part does so only after it repeats on retries, since content still being
+/// written can clear it. Holding either for good leaves only an interrupt; sending the withheld
+/// text lets someone allow what nobody could read.
+#[tokio::test(start_paused = true)]
+async fn an_approval_card_that_cannot_pass_its_check_can_only_be_denied() {
+    use crate::domain::privacy::projector::Reason;
+    let mut driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    driver.add_test_approval("approval-oversize", None);
+    let (mut session, mut out, _notes) = harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Idle,
+    );
+    let partial = "./deploy.sh --token-file ~/.secrets";
+    redact::WITHHOLD_LIVE.with(|w| w.set(Some((partial, Reason::SourceIncomplete))));
+    session
+        .on_harness_event(HarnessEvent::Approval(held_request(
+            "approval-partial",
+            partial,
+        )))
+        .await;
+    assert_eq!(
+        session.unshown.len(),
+        1,
+        "a partial policy is retried first"
+    );
+    let held = tokio::time::Instant::now();
+    while !session.unshown.is_empty() {
+        assert!(
+            held.elapsed() < crate::domain::privacy::service::RETRY_WINDOW * 4,
+            "a policy applied in part on every retry is given up"
+        );
+        tokio::time::advance(std::time::Duration::from_millis(super::TAIL_POLL_MS)).await;
+        session.retry_unshown_approvals().await;
+    }
+    assert!(
+        held.elapsed() >= std::time::Duration::from_millis(250 + 500 + 1000),
+        "given up before its retries: {:?}",
+        held.elapsed()
+    );
+    let oversize = "cat <<EOF > build/everything.json";
+    redact::WITHHOLD_LIVE.with(|w| w.set(Some((oversize, Reason::Oversize))));
+    session
+        .on_harness_event(HarnessEvent::Approval(held_request(
+            "approval-oversize",
+            oversize,
+        )))
+        .await;
+    redact::WITHHOLD_LIVE.with(|w| w.set(None));
+    assert!(
+        session.unshown.is_empty(),
+        "content too large is never retried"
+    );
+    let frames = drained(&mut out);
+    let cards: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.method.as_deref() == Some(method::APPROVAL_REQUEST))
+        .filter_map(|frame| frame.params.clone())
+        .collect();
+    assert_eq!(cards.len(), 2, "{frames:?}");
+    for card in &cards {
+        assert_eq!(card["summary"], super::UNCHECKED_APPROVAL_SUMMARY);
+        assert_eq!(card["tool"], "");
+        assert_eq!(card["input"], serde_json::json!({}));
+        assert_eq!(card["can_allow_for_session"], false);
+    }
+    let wire = serde_json::to_string(&frames).unwrap();
+    assert!(
+        !wire.contains(partial) && !wire.contains(oversize) && !wire.contains("Bash"),
+        "an unchecked request reached a viewer: {frames:?}"
+    );
+
+    let (ticket, mut receipt) = crate::rc::ticket::ticket();
+    let (commands, mut command_rx) = mpsc::channel(1);
+    commands
+        .send(Command::Approve {
+            response: crate::protocol::ApprovalResponse {
+                approval_id: "approval-oversize".into(),
+                session_id: "session-turn-test".into(),
+                decision: crate::protocol::ApprovalDecision::Allow,
+                scope: crate::protocol::ApprovalScope::Once,
+                message: None,
+                answers: None,
+                by: Some("owner".into()),
+            },
+            caller_is_owner: true,
+            danger: DangerAuthorization::NotRequired,
+            reply: ticket,
+        })
+        .await
+        .unwrap();
+    drop(commands);
+    let worker = tokio::spawn(async move {
+        session.run_inner(&mut command_rx).await;
+        session
+    });
+    let outcome = receipt
+        .wait(std::time::Duration::from_secs(5))
+        .await
+        .expect("the answer is settled")
+        .expect("ticket stays open")
+        .expect("typed outcome is delivered");
+    assert!(
+        matches!(
+            outcome,
+            ApprovalOutcome::ExplicitRefusal { retained: true, .. }
+        ),
+        "allowing an unchecked request must be refused and leave it deniable: {outcome:?}"
+    );
+    let mut session = worker.await.unwrap();
+    session.driver.shutdown().await.unwrap();
 }
 
 /// The live `item.completed` must carry the *same* object hash the

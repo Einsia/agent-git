@@ -843,6 +843,17 @@ impl AnyDriver {
         }
     }
 
+    /// Whether the runtime shows this session's approvals in its own terminal on this computer.
+    /// Only a native Claude Code session runs in one; a shared executor may serve a session that
+    /// was started remotely and has no terminal at all.
+    pub(crate) fn asks_on_this_computer(&self) -> bool {
+        #[cfg(unix)]
+        let native = matches!(self, Self::ClaudeNative(_));
+        #[cfg(not(unix))]
+        let native = false;
+        native
+    }
+
     pub fn shared_executor(&self) -> bool {
         match self {
             Self::Codex(driver) => driver.shared_executor(),

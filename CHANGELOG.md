@@ -30,6 +30,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   Token written after a vendor prefix (`hsk_eyJ…`) are now replaced wherever they appear, also
   without a credential name in front. Sessions already published keep what they published:
   rotate a token that appears in one.
+- Remote Control never asks anyone to approve a command they cannot see. An approval request whose
+  privacy check had not finished went out as "[privacy check pending: text withheld]" and could be
+  allowed blind. The device now holds the request, says that an approval is waiting for its
+  privacy check, and shows the card with its command once the check passes; until then the
+  approval cannot be answered. A request whose check cannot pass, such as content too large to
+  check, is shown without its command and can only be denied; in a session running in a terminal
+  on the computer, it is answered there.
 - agit no longer renames conversations in Claude Code: a new conversation keeps the title Claude
   Code gives it. A conversation an earlier agit renamed "agit: unnamed" or
   "agit owner/repo@branch" gets Claude Code's own title back when it is opened again, or its first

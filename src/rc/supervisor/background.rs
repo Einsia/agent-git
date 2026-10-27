@@ -141,7 +141,10 @@ impl Session {
             });
             if waiting {
                 self.set_status(SessionStatus::AwaitingApproval).await;
-            } else if self.pending.is_empty() && self.driver.has_active_turn() {
+            } else if self.pending.is_empty()
+                && self.unshown.is_empty()
+                && self.driver.has_active_turn()
+            {
                 self.set_status(SessionStatus::Running).await;
             }
         }
