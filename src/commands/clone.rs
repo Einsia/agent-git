@@ -565,10 +565,20 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         ui::dim(&ui::tilde(&dest))
     ));
     if heads.is_empty() {
-        // The remote has branches and not one came down locally: the fetch itself went wrong,
-        // and it must not read as "this agent is empty".
-        ui::warning("no branches came down — nothing to continue from.");
-        ui::hint(&format!("check what the hub has: `agit log {slug}`"));
+        // The binding routes this directory to the repository, which exists whether or not it
+        // has a branch yet; returning before it leaves the directory routed to the old one.
+        bind_current_dir(&args, &slug, progress)?;
+        if store.remote_branches().is_empty() {
+            ui::warning(&format!(
+                "{slug} has no branches yet — nothing to continue from."
+            ));
+            ui::hint("the first session saved into it starts its first branch");
+        } else {
+            // The remote has branches and not one came down locally: the fetch itself went
+            // wrong, and it must not read as "this agent is empty".
+            ui::warning("no branches came down — nothing to continue from.");
+            ui::hint(&format!("check what the hub has: `agit log {slug}`"));
+        }
         return Ok(ExitCode::Ok);
     }
     progress.line(format_args!(
@@ -577,17 +587,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     ));
 
     // ── 6. Bind the current directory ──
-    //
-    // The persisted binding records the workspace's repository for creation routing and status;
-    // it never selects an existing session for a later command.
-    if !args.no_bind {
-        let here = std::env::current_dir()?;
-        workspace::bind(&here, &slug, args.rebind)?;
-        progress.line(format_args!(
-            "{}",
-            ui::dim(&format!("  bound to {}", ui::tilde(&here)))
-        ));
-    }
+    bind_current_dir(&args, &slug, progress)?;
 
     // An unreadable session/meta.json means something else (a plain git push) put this repo up.
     // Later commits treat the current branch as one no session has taken yet and claim it under
@@ -633,6 +633,21 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         })
     ));
     Ok(ExitCode::Ok)
+}
+
+/// The persisted binding records the workspace's repository for creation routing and status;
+/// it never selects an existing session for a later command.
+fn bind_current_dir(args: &Args, slug: &str, progress: ProgressOutput) -> anyhow::Result<()> {
+    if args.no_bind {
+        return Ok(());
+    }
+    let here = std::env::current_dir()?;
+    workspace::bind(&here, slug, args.rebind)?;
+    progress.line(format_args!(
+        "{}",
+        ui::dim(&format!("  bound to {}", ui::tilde(&here)))
+    ));
+    Ok(())
 }
 
 /// Change the active checkout only after proving that a v1 target cannot claim user-owned v0

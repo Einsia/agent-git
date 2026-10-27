@@ -14,6 +14,7 @@ explicit session target; a project binding never selects a branch for them.
 agit project bind /work/app --repo team/app --history all --auto-upload --dry-run
 agit project bind /work/app --repo team/app --history all --auto-upload
 agit project bind /work/new-app --repo team/new-app --history none --auto-upload
+agit project bind /work/app --repo team/other-app --history none --rebind
 agit project sync /work/app --dry-run
 agit project sync /work/app
 agit project status /work/app
@@ -26,6 +27,10 @@ Run configuration from the device's terminal, outside an RC supervisor. The repo
 must already exist and grant the current account write access. Binding clones it locally
 without changing project code. Review the proposed source directory, destination and
 publication policy before confirming; unattended use requires explicit `--yes`.
+
+A directory routes to one repository. Binding it to another repository than its workspace
+binding (from `init` or `clone`) or its project policy names is refused; `--rebind` moves it,
+replacing both. The previous repository's history is left unchanged.
 
 `--history all` imports and publishes native Codex and Claude Code sessions discovered
 under the directory, including subdirectories without their own binding. Unclaimed

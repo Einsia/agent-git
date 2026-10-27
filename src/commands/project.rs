@@ -42,6 +42,9 @@ pub enum Action {
         /// List candidates without changing bindings, preferences or remote state.
         #[arg(long)]
         dry_run: bool,
+        /// Move a directory routed to another repository, replacing its binding and project policy.
+        #[arg(long)]
+        rebind: bool,
     },
     /// Import and publish eligible sessions again; existing claims are reused.
     Sync {
@@ -415,7 +418,8 @@ pub fn run(args: Args) -> CmdResult {
             history,
             auto_upload,
             dry_run,
-        } => bind(&path, &repo, history, auto_upload, dry_run),
+            rebind,
+        } => bind(&path, &repo, history, auto_upload, dry_run, rebind),
         Action::Status { path } => {
             let root = root(&path)?;
             let project = read(&root)?.context("directory has no project policy")?;
@@ -465,23 +469,28 @@ pub fn run(args: Args) -> CmdResult {
 }
 
 /// A directory routes to one repository: its workspace binding and any existing project policy
-/// must already name the requested one. Returns that existing policy.
-fn assignable(root: &Path, repository: &str) -> Result<Option<Project>> {
+/// must already name the requested one, unless `rebind` replaces them. Returns the existing
+/// policy for that repository; a policy for another repository carries nothing over.
+fn assignable(root: &Path, repository: &str, rebind: bool) -> Result<Option<Project>> {
     if let Some(binding) = workspace::read(root) {
         ensure!(
-            binding.repo == repository,
-            "directory is bound to {}; rebind it explicitly first",
+            rebind || binding.repo == repository,
+            "directory is bound to {}; add `--rebind` to this command to move it to {repository}",
             binding.repo
         );
     }
-    let existing = read(root)?;
-    if let Some(existing) = &existing {
-        ensure!(
-            existing.repository == repository,
-            "project is already assigned to another repository"
-        );
+    let Some(existing) = read(root)? else {
+        return Ok(None);
+    };
+    if existing.repository == repository {
+        return Ok(Some(existing));
     }
-    Ok(existing)
+    ensure!(
+        rebind,
+        "project is already assigned to {}; add `--rebind` to this command to move it to {repository}",
+        existing.repository
+    );
+    Ok(None)
 }
 
 fn bind(
@@ -490,6 +499,7 @@ fn bind(
     history: History,
     automatic: bool,
     dry_run: bool,
+    rebind: bool,
 ) -> CmdResult {
     let root = root(path)?;
     let (owner, name) = super::parse_slug(repository)?;
@@ -517,7 +527,7 @@ fn bind(
     };
     let rows = candidates(&project)?;
     // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
-    assignable(&root, repository)?;
+    assignable(&root, repository, rebind)?;
     if dry_run {
         println!(
             "{}",
@@ -530,7 +540,7 @@ fn bind(
         "configure project capture in a device terminal outside the RC supervisor"
     );
     let _guard = lock(&root)?;
-    if let Some(existing) = assignable(&root, repository)? {
+    if let Some(existing) = assignable(&root, repository, rebind)? {
         project.last_result = existing.last_result;
         if history == History::None {
             project.excluded = existing.excluded;
@@ -618,7 +628,7 @@ fn bind(
         consent.save(&repo)?;
         repo.set_auto_push(Some(true))?;
     }
-    workspace::bind(&root, repository, false)?;
+    workspace::bind(&root, repository, rebind)?;
     save(&project)?;
     if history == History::All {
         sync(&mut project)
@@ -1410,8 +1420,9 @@ mod tests {
     }
 
     /// A dry run refuses what the bind refuses: a directory its workspace binding or an existing
-    /// project policy already routes to another repository. A dry run that lists candidates
-    /// before these checks reports a bind that cannot happen.
+    /// project policy already routes to another repository, unless `--rebind` moves it. A dry run
+    /// that lists candidates before these checks reports a bind that cannot happen, and a
+    /// `--rebind` that still honors either route leaves the directory with no way to move.
     #[test]
     fn dry_run_refuses_a_directory_routed_to_another_repository() {
         if !isolated("dry_run_refuses_a_directory_routed_to_another_repository") {
@@ -1419,20 +1430,50 @@ mod tests {
         }
         let bound = tempfile::tempdir().unwrap();
         workspace::bind(bound.path(), "alice/other", false).unwrap();
-        let error = bind(bound.path(), "alice/app", History::None, false, true).unwrap_err();
+        let error = bind(bound.path(), "alice/app", History::None, false, true, false).unwrap_err();
         assert!(
-            format!("{error:#}").contains("rebind it explicitly first"),
+            format!("{error:#}").contains("add `--rebind` to this command to move it to alice/app"),
             "{error:#}"
         );
+        assert!(bind(bound.path(), "alice/app", History::None, false, true, true).is_ok());
 
         let enrolled = tempfile::tempdir().unwrap();
         save(&project(enrolled.path())).unwrap();
-        let error = bind(enrolled.path(), "alice/other", History::None, false, true).unwrap_err();
+        let error = bind(
+            enrolled.path(),
+            "alice/other",
+            History::None,
+            false,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(
-            format!("{error:#}").contains("already assigned to another repository"),
+            format!("{error:#}").contains("already assigned to alice/app"),
             "{error:#}"
         );
-        assert!(bind(enrolled.path(), "alice/app", History::None, false, true).is_ok());
+        assert!(
+            bind(
+                enrolled.path(),
+                "alice/app",
+                History::None,
+                false,
+                true,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            bind(
+                enrolled.path(),
+                "alice/other",
+                History::None,
+                false,
+                true,
+                true
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -90,7 +90,7 @@
     "privacy status": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "privacy unlock": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},
     "project": {"aliases":[],"args":{}},
-    "project bind": {"aliases":[],"args":{"auto_upload":{"action":"SetTrue","policy":"boolean"},"dry_run":{"action":"SetTrue","policy":"boolean"},"history":{"action":"Set","policy":"enum","values":["all","none"]},"path":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},
+    "project bind": {"aliases":[],"args":{"auto_upload":{"action":"SetTrue","policy":"boolean"},"dry_run":{"action":"SetTrue","policy":"boolean"},"history":{"action":"Set","policy":"enum","values":["all","none"]},"path":{"action":"Set","policy":"presence"},"rebind":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "project capture": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
     "project drop": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "project status": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
