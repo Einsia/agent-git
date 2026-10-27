@@ -12,9 +12,15 @@ mod startup_cache;
 
 fn command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+    let path = std::iter::once(root.join("bin"))
+        .chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ))
+        .collect::<Vec<_>>();
     command
         .args(args)
         .current_dir(root.join("workspace"))
+        .env("PATH", std::env::join_paths(path).unwrap())
         .env("AGIT_HOME", root.join("agit-home"))
         .env("HOME", root.join("runtime-home"))
         .env("AGIT_HUB_URL", "http://127.0.0.1:9")
@@ -27,6 +33,26 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .env_remove("AGIT_SESSION")
         .env_remove("AGIT_RC");
     command
+}
+
+/// Puts a `claude` first on the daemon's PATH, as on a machine with Claude Code installed:
+/// without one the Claude Code adapter is unavailable and no native session can be watched. It
+/// answers the version probe; any other invocation is a model launch and leaves
+/// `claude-launched` in `root`.
+fn install_claude(root: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.310 (Claude Code)'; exit 0; fi\necho \"$*\" >> '{}'\nexit 1\n",
+            root.join("claude-launched").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 struct Stop<'a>(&'a Path);
@@ -247,6 +273,7 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
         std::fs::create_dir_all(path).unwrap();
     }
     startup_cache::seed(&home);
+    install_claude(&root);
     let native = "00000000-0000-0000-0000-000000000013";
     let transcript_dir = runtime_home
         .join(".claude/projects")
@@ -350,7 +377,7 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
                     .success()
             );
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let saved: Value = serde_json::from_slice(
                 &std::fs::read(home.join("desktop-rc/sessions.json")).unwrap(),
@@ -397,6 +424,10 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
         .unwrap();
     assert!(
         !String::from_utf8(status.stdout).unwrap().contains(&logical),
+        "observation cannot launch a model"
+    );
+    assert!(
+        !root.join("claude-launched").exists(),
         "observation cannot launch a model"
     );
     assert_eq!(

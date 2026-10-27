@@ -1,7 +1,12 @@
 //! JSON recovery is typed advisory data, while explicit version 1 keeps its closed envelope.
 
 #[cfg(unix)]
+#[path = "support/local_state.rs"]
+mod local_state;
+
+#[cfg(unix)]
 mod unix {
+    use super::local_state;
     use serde_json::Value;
     use std::path::PathBuf;
     use std::process::{Command, Output};
@@ -61,12 +66,21 @@ mod unix {
             (output, value)
         }
 
+        /// Every file's bytes, with SQLite databases by their rows (see
+        /// `support/local_state.rs`).
         fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
             walkdir::WalkDir::new(self._tmp.path())
                 .into_iter()
                 .map(Result::unwrap)
                 .filter(|entry| entry.file_type().is_file())
-                .map(|entry| (entry.path().to_path_buf(), fs::read(entry.path()).unwrap()))
+                .filter(|entry| !local_state::is_sidecar(entry.path()))
+                .map(|entry| {
+                    let content = match local_state::rows(entry.path()) {
+                        Some(rows) => rows.join("\n").into_bytes(),
+                        None => fs::read(entry.path()).unwrap(),
+                    };
+                    (entry.path().to_path_buf(), content)
+                })
                 .collect()
         }
 

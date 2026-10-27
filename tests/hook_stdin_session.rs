@@ -10,8 +10,17 @@ use agit::domain::repo::Repo;
 use std::process::{Command, Stdio};
 use std::{fs, io::Write as _};
 
+#[path = "support/local_state.rs"]
+mod local_state;
+
 const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum State {
+    Rows(Vec<String>),
+    File(u64, std::time::SystemTime),
+}
 
 struct Lab {
     _tmp: tempfile::TempDir,
@@ -153,24 +162,25 @@ impl Lab {
         );
     }
 
-    /// A snapshot of local agit state: the path, size and modification time of every file under
-    /// `AGIT_HOME` and the runtime memory directory. Two equal snapshots mean "nothing was
-    /// touched".
-    fn local_state(&self) -> Vec<(String, u64, std::time::SystemTime)> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<(String, u64, std::time::SystemTime)>) {
+    /// A snapshot of local agit state under `AGIT_HOME` and the runtime memory directory: the
+    /// size and modification time of every file, and the rows of every SQLite database (see
+    /// `support/local_state.rs`). Two equal snapshots mean "nothing was touched".
+    fn local_state(&self) -> Vec<(String, State)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, State)>) {
             let Ok(entries) = fs::read_dir(dir) else {
                 return;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
+                let name = path.to_string_lossy().into_owned();
                 if path.is_dir() {
                     walk(&path, out);
-                } else if let Ok(md) = fs::metadata(&path) {
-                    out.push((
-                        path.to_string_lossy().into_owned(),
-                        md.len(),
-                        md.modified().unwrap(),
-                    ));
+                } else if let Some(rows) = local_state::rows(&path) {
+                    out.push((name, State::Rows(rows)));
+                } else if let Ok(md) = fs::metadata(&path)
+                    && !local_state::is_sidecar(&path)
+                {
+                    out.push((name, State::File(md.len(), md.modified().unwrap())));
                 }
             }
         }
