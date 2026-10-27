@@ -46,7 +46,7 @@ pub(crate) struct Response {
 }
 
 /// The least time a request may take before the worker's watchdog ends the process.
-const WATCHDOG_FLOOR: Duration = Duration::from_secs(3);
+pub(crate) const WATCHDOG_FLOOR: Duration = Duration::from_secs(3);
 /// What the watchdog allows beyond the caller's own deadline.
 const WATCHDOG_MARGIN: Duration = Duration::from_secs(2);
 

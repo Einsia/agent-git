@@ -266,18 +266,10 @@ impl Device {
 
 struct Worker(Child);
 impl Worker {
-    /// `text` protected once the journal is free: a worker that starts while the previous
-    /// command's worker is still closing the journal answers `store_busy`, and like any caller
-    /// the test asks again.
+    /// `text` protected. A command's worker has closed the journal by the time the command
+    /// returns, so the first answer is the one to check.
     fn protect(&mut self, text: &str) -> Value {
-        for _ in 0..50 {
-            let outcome = self.call("protect_text", text);
-            if outcome["reason"] != "store_busy" {
-                return outcome;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("the privacy journal stayed busy");
+        self.call("protect_text", text)
     }
 
     fn call(&mut self, mode: &str, text: &str) -> Value {

@@ -86,8 +86,12 @@ fn worker_executable() -> std::io::Result<std::path::PathBuf> {
 impl Process {
     fn start() -> crate::Result<Self> {
         let mut command = Command::new(worker_executable()?);
+        command.arg(worker::WORKER);
+        Self::spawn(command)
+    }
+
+    fn spawn(mut command: Command) -> crate::Result<Self> {
         command
-            .arg(worker::WORKER)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -143,6 +147,8 @@ impl Process {
                         break;
                     }
                 }
+                drop(input);
+                let _ = std::io::copy(&mut output, &mut std::io::sink());
             });
         let io = match io {
             Ok(io) => io,
@@ -220,14 +226,43 @@ impl Process {
         if let Some(job) = self.job.take() {
             let _ = job.terminate_and_close();
         }
+        // A reaped worker's id may already name another process group.
         #[cfg(unix)]
-        unsafe {
-            libc::killpg(self.child.id() as i32, libc::SIGKILL);
+        if matches!(self.child.try_wait(), Ok(None)) {
+            unsafe {
+                libc::killpg(self.child.id() as i32, libc::SIGKILL);
+            }
         }
         let _ = self.child.kill();
         let (closed, receiver) = mpsc::sync_channel(0);
         drop(receiver);
         self.send = closed;
+    }
+
+    /// Ends the worker's input and waits for it to exit, which closes its journal. An idle worker
+    /// exits as soon as its input ends. One still working on a request whose caller gave up gets
+    /// the least time the watchdog gives any request and is then killed: nobody reads that
+    /// result, and SQLite recovers whatever the kill interrupts.
+    fn close(&mut self) {
+        let until = Instant::now() + worker::WATCHDOG_FLOOR;
+        let (closed, receiver) = mpsc::sync_channel(0);
+        drop(receiver);
+        self.send = closed;
+        // The io thread's replies end once the worker's output does, when the worker exits.
+        loop {
+            match self
+                .receive
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.terminate();
+                    break;
+                }
+            }
+        }
+        let _ = self.child.wait();
     }
 
     fn reaped(&mut self) -> bool {
@@ -910,6 +945,23 @@ pub fn unreadable_rule_hints() -> crate::Result<Vec<String>> {
         .collect())
 }
 
+/// Ends this process's worker before the process exits, unless another thread is using it. No
+/// caller is waiting on a request then, so one still in flight was abandoned.
+///
+/// The worker holds the privacy journal open. One that outlives its command is still closing the
+/// journal when the next command opens it: that command's worker answers `store_busy` and a
+/// settlement leaves its turn unsettled, and a running worker reading the device's rules finds
+/// that journal unreadable and withholds what it checks.
+pub fn shutdown() {
+    let process = shared()
+        .try_lock()
+        .ok()
+        .and_then(|mut state| state.process.take());
+    if let Some(mut process) = process {
+        process.close();
+    }
+}
+
 /// Reload requests invalidate only the optional worker; its next caller gets a fresh snapshot.
 pub fn invalidate() {
     if let Ok(mut state) = shared().try_lock() {
@@ -977,4 +1029,35 @@ pub fn hydrate_metadata(repo: &Path, metadata: &mut crate::domain::meta::Meta) -
         *field = value;
     }
     unresolved
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Exit does not wait out a request whose caller gave up. A hydration request may run for its
+    /// whole watchdog allowance, far longer than the floor; a close that waited for the reply, or
+    /// for the worker to leave on its own, would hold the command's exit that long for a result
+    /// nobody reads.
+    #[test]
+    fn closing_kills_a_worker_still_on_an_abandoned_hydration_request() {
+        // A worker that never answers and ignores the end of its input.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let mut process = Process::spawn(command).unwrap();
+        assert!(matches!(
+            process.request(
+                None,
+                "",
+                "",
+                Mode::HydrationValues,
+                Duration::from_millis(10)
+            ),
+            Err(Failure::Deadline)
+        ));
+        let started = Instant::now();
+        process.close();
+        assert!(started.elapsed() < worker::WATCHDOG_FLOOR + Duration::from_secs(2));
+        assert!(matches!(process.child.try_wait(), Ok(Some(_))));
+    }
 }

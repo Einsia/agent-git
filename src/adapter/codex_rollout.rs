@@ -68,6 +68,29 @@ impl Drop for Turn {
     }
 }
 
+/// The turn [`begin_restore`] claimed for a background restoration. Its failure is recorded in
+/// the same step that releases the turn: a caller that found the carrier neither restoring nor
+/// failed in between would start a second attempt, and that attempt's failure would reach the
+/// caller after the one the first failure was returned to.
+#[cfg(feature = "rc")]
+struct Background {
+    plain: PathBuf,
+    failure: Option<(io::ErrorKind, String)>,
+}
+
+#[cfg(feature = "rc")]
+impl Drop for Background {
+    fn drop(&mut self) {
+        let mut state = restorations();
+        if let Some(failure) = self.failure.take() {
+            state.failed.insert(self.plain.clone(), failure);
+        }
+        state.running.remove(&self.plain);
+        drop(state);
+        RESTORED.notify_all();
+    }
+}
+
 /// Removes restoration temporaries a crash left behind under a Codex home.
 ///
 /// Only this module's own temporaries are removed, and only once their status has not changed
@@ -162,17 +185,21 @@ pub(crate) fn begin_restore(path: &Path) -> io::Result<bool> {
     if !is_cold(&plain) {
         return Ok(false);
     }
-    if !state.running.contains(&plain) {
+    // The turn is claimed before the lock is released, so no other caller starts an attempt.
+    if state.running.insert(plain.clone()) {
         drop(state);
-        let target = plain.clone();
+        let claim = Background {
+            plain,
+            failure: None,
+        };
         std::thread::Builder::new()
             .name("rollout-restore".into())
             .spawn(move || {
-                if let Err(error) = restore(&target) {
-                    restorations()
-                        .failed
-                        .insert(target, (error.kind(), error.to_string()));
-                }
+                let mut claim = claim;
+                claim.failure = restore_held(&claim.plain)
+                    .err()
+                    .map(|error| (error.kind(), error.to_string()));
+                drop(claim);
             })?;
     }
     Ok(true)
@@ -189,6 +216,12 @@ pub(crate) fn restore(path: &Path) -> io::Result<PathBuf> {
         return Ok(plain);
     }
     let _turn = Turn::take(&plain);
+    restore_held(&plain)
+}
+
+/// [`restore`] for a caller that holds the carrier's turn.
+fn restore_held(plain: &Path) -> io::Result<PathBuf> {
+    let plain = plain.to_owned();
     if std::fs::symlink_metadata(&plain).is_ok() {
         return Ok(plain);
     }

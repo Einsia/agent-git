@@ -650,14 +650,21 @@ mod tests {
         assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
     }
 
+    /// Of two transactions contending for the lock, at least one allocates, and every allocation
+    /// is distinct, saved, and above the number an imported alias holds. A transaction that
+    /// reloaded nothing under the lock would hand both the same number; one that ignored imported
+    /// aliases would allocate that number again. Only the contending pair takes the lock: a child
+    /// process another test forks holds an earlier holder's lock until it execs, so a transaction
+    /// before or after the pair could find the lock taken and fail.
     #[test]
     fn successful_allocations_preserve_imported_numbers_under_contention() {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repo::init(&temp.path().join("agent")).unwrap();
-        PathAliasStore::transact(&repo, |store| {
-            store.reserve_aliases("Imported <private-file-7>")
-        })
-        .unwrap();
+        let mut imported = PathAliasStore::default();
+        imported
+            .reserve_aliases("Imported <private-file-7>")
+            .unwrap();
+        imported.save(&repo).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let threads: Vec<_> = ["/private/first.txt", "/private/second.txt"]
             .into_iter()
@@ -679,14 +686,11 @@ mod tests {
         let distinct: std::collections::BTreeSet<_> =
             assigned.iter().map(|(_, alias)| alias).collect();
         assert_eq!(distinct.len(), assigned.len());
-        PathAliasStore::transact(&repo, |store| {
-            for (path, alias) in &assigned {
-                assert_eq!(&store.private_alias_for(path)?, alias);
-                assert!(private_id(alias).unwrap() > 7);
-            }
-            Ok(())
-        })
-        .unwrap();
+        let mut saved = PathAliasStore::load(&repo).unwrap();
+        for (path, alias) in &assigned {
+            assert_eq!(&saved.private_alias_for(path).unwrap(), alias);
+            assert!(private_id(alias).unwrap() > 7);
+        }
         assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
     }
 

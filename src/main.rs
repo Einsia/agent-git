@@ -76,6 +76,7 @@ fn main() {
     }
     agit::telemetry::begin(&raw_args, telemetry_restart.as_deref());
     let code = run(raw_args);
+    agit::domain::privacy::service::shutdown();
     agit::telemetry::finish(code);
     exit(code);
 }
