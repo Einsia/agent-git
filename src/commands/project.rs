@@ -108,6 +108,44 @@ fn home() -> Result<PathBuf> {
 fn state_path(root: &Path) -> Result<PathBuf> {
     Ok(home()?.join(format!("{}.json", hash(&root.to_string_lossy()))))
 }
+/// Who can see the repository, as the Hub last reported it, kept beside the policy so a policy
+/// file stays readable by every version.
+fn audience_path(root: &Path) -> Result<PathBuf> {
+    Ok(state_path(root)?.with_extension("audience"))
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Audience {
+    visibility: Option<String>,
+    /// Whether the owner is an organization; `None` until the Hub has said.
+    org: Option<bool>,
+}
+
+fn recorded_audience(root: &Path) -> Audience {
+    audience_path(root)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn record_audience(root: &Path, audience: &Audience) -> Result<()> {
+    config::create_state_dir(&home()?)?;
+    let mut file = tempfile::NamedTempFile::new_in(home()?)?;
+    file.write_all(&serde_json::to_vec(audience)?)?;
+    file.persist(audience_path(root)?).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Whether `owner` is an organization, from the account's point of view: its own namespace is
+/// not, an organization the Hub shows it is, and anything else is unknown. The Hub answers "not
+/// found" for an organization the account is not a member of, so that answer settles nothing.
+fn owner_is_org(client: &crate::hub::Client, owner: &str, account: &str) -> Option<bool> {
+    if owner == account {
+        return Some(false);
+    }
+    client.get_org(owner).ok().map(|_| true)
+}
 
 fn root(path: &Path) -> Result<PathBuf> {
     let path = path
@@ -578,6 +616,10 @@ fn bind(
     let me = super::remote_request(client.me())?;
     project.account = me.username;
     project.account_id = me.account_id;
+    let audience = Audience {
+        visibility: Some(remote.visibility.clone()),
+        org: owner_is_org(&client, &owner, &project.account),
+    };
     println!(
         "Project: {} -> {repository} ({})",
         root.display(),
@@ -630,6 +672,7 @@ fn bind(
     }
     workspace::bind(&root, repository, rebind)?;
     save(&project)?;
+    record_audience(&root, &audience)?;
     if history == History::All {
         sync(&mut project)
     } else {
@@ -1228,6 +1271,79 @@ fn drop_command(target: Option<&str>) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// Where a project uploads a conversation by itself, and who can see that repository.
+pub(crate) struct AutomaticUpload {
+    pub(crate) repository: String,
+    /// `None` when neither the Hub nor an earlier answer from it says.
+    pub(crate) visibility: Option<String>,
+    /// Whether the owner is an organization, when known.
+    pub(crate) org: Option<bool>,
+}
+
+/// The repository a project uploads this conversation to by itself, judged by the folder the
+/// conversation started in. `None` when no project there uploads automatically, the conversation
+/// is excluded, or it records into another repository. Who can see it is the Hub's answer within
+/// `wait`, recorded for later, or else the last recorded answer; the requests never renew
+/// credentials, so a caller may run them inside a hook.
+pub(crate) fn automatic_upload(
+    runtime: &str,
+    session: &str,
+    origin: &Path,
+    wait: std::time::Duration,
+) -> Option<AutomaticUpload> {
+    let project = nearest(origin).ok()??;
+    if !project.enabled
+        || !project.auto_upload
+        || !includes(&project, origin).ok()?
+        || project.excluded.contains(&key(runtime, session))
+    {
+        return None;
+    }
+    let claimed_elsewhere = Store::open()
+        .ok()
+        .flatten()
+        .and_then(|store| link::get(&store, runtime, session))
+        .is_some_and(|link| {
+            link.branch.is_some()
+                && format!(
+                    "{}/{}",
+                    link.owner.as_deref().unwrap_or_default(),
+                    link.agent.as_deref().unwrap_or_default()
+                ) != project.repository
+        });
+    if claimed_elsewhere {
+        return None;
+    }
+    let recorded = recorded_audience(&project.root);
+    let answered = crate::hub::Client::from_env_with_live_access(wait)
+        .filter(|client| {
+            identity::normalize_hub(client.base()).ok().as_deref()
+                == Some(project.identity.hub.as_str())
+        })
+        .and_then(|client| {
+            let (owner, name) = super::parse_slug(&project.repository).ok()?;
+            let remote = client.get_agent(&owner, &name).ok()?;
+            (remote.agent_id == project.identity.agent_id).then(|| Audience {
+                visibility: Some(remote.visibility),
+                org: recorded
+                    .org
+                    .or_else(|| owner_is_org(&client, &owner, &project.account)),
+            })
+        });
+    let audience = match answered {
+        Some(audience) => {
+            let _ = record_audience(&project.root, &audience);
+            audience
+        }
+        None => recorded,
+    };
+    Some(AutomaticUpload {
+        repository: project.repository,
+        visibility: audience.visibility.filter(|v| !v.is_empty()),
+        org: audience.org,
+    })
+}
+
 pub(crate) fn registration_scope(cwd: &Path) -> bool {
     nearest(cwd)
         .ok()
@@ -1317,6 +1433,54 @@ mod tests {
             excluded: BTreeSet::new(),
             last_result: None,
         }
+    }
+
+    /// A conversation is announced as uploading only where the project would upload it: started
+    /// inside an automatic project, not excluded, not recording into another repository. The
+    /// visibility comes from the Hub or its last recorded answer, never a default; this policy's
+    /// Hub is not the configured one, so no request is sent.
+    #[test]
+    fn only_a_conversation_the_project_uploads_is_announced() {
+        if !isolated("only_a_conversation_the_project_uploads_is_announced") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        let inside = policy.root.join("src");
+        fs::create_dir_all(&inside).unwrap();
+        policy.excluded.insert(key("codex", "excluded"));
+        save(&policy).unwrap();
+        let wait = std::time::Duration::from_millis(1);
+        let announced = |id: &str, origin: &Path| {
+            automatic_upload("codex", id, origin, wait).map(|upload| upload.repository)
+        };
+        assert_eq!(announced("fresh", &inside).as_deref(), Some("alice/app"));
+        assert!(announced("excluded", &inside).is_none());
+        assert!(announced("fresh", policy.root.parent().unwrap()).is_none());
+        let store = Store::at(config::store_root().unwrap());
+        let mut claim = link::Link::new("codex", "elsewhere", Some(&inside));
+        claim.owner = Some("bob".into());
+        claim.agent = Some("notes".into());
+        claim.branch = Some("work".into());
+        link::write(&store, &claim).unwrap();
+        assert!(announced("elsewhere", &inside).is_none());
+
+        let audience =
+            || automatic_upload("codex", "fresh", &inside, wait).map(|u| (u.visibility, u.org));
+        assert_eq!(audience(), Some((None, None)));
+        record_audience(
+            &policy.root,
+            &Audience {
+                visibility: Some("private".into()),
+                org: Some(true),
+            },
+        )
+        .unwrap();
+        assert_eq!(audience(), Some((Some("private".into()), Some(true))));
+
+        policy.auto_upload = false;
+        save(&policy).unwrap();
+        assert!(announced("fresh", &inside).is_none());
     }
 
     /// A foreign claim cannot become a new import or silently change publication authority.

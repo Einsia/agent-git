@@ -565,7 +565,69 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
         existing.push_str("\n\n");
         existing.push_str(&context);
     }
+    if announces_upload(rt, ev.source, has_binding)
+        && let Some(upload) = origin.and_then(|origin| {
+            super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
+        })
+    {
+        response["systemMessage"] = serde_json::Value::String(upload_notice(&upload));
+        let automatic = format!(
+            "This folder uploads this conversation to {} at the end of each turn. If the user does not want it uploaded, run `agit project drop` before the turn ends.",
+            upload.repository
+        );
+        // An unclaimed conversation is told how to import itself; one the project uploads must not
+        // be imported a second time, so that advice is replaced rather than contradicted.
+        let context = match env_value.as_deref() {
+            Some(_) => response["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(|existing| format!("{existing}\n\n{automatic}")),
+            None => Some(format!(
+                "This {rt} session ({}) is saved automatically; do not import it. {automatic}",
+                sh_quote(&ev.session_id)
+            )),
+        };
+        if let Some(context) = context {
+            response["hookSpecificOutput"]["additionalContext"] =
+                serde_json::Value::String(context);
+        }
+    }
     Some(response)
+}
+
+/// How long a SessionStart waits for the Hub to confirm who can see the destination.
+const UPLOAD_VISIBILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The person learns that a conversation will be uploaded before its first turn ends: when it
+/// starts, fresh or as a fork of another (a fork is a new conversation the project uploads on its
+/// own), and when it is resumed before anything was uploaded. Both runtimes show a hook's
+/// `systemMessage` to the person rather than to the agent.
+fn announces_upload(runtime: &str, source: Source, uploading: bool) -> bool {
+    matches!(runtime, "claude-code" | "codex")
+        && match source {
+            Source::Startup | Source::Clear | Source::Fork => true,
+            Source::Resume => !uploading,
+            _ => false,
+        }
+}
+
+/// One line naming the destination, who can see it, and both ways to stop the upload.
+fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
+    let owner = upload.repository.split('/').next().unwrap_or_default();
+    let audience = match (upload.visibility.as_deref(), upload.org) {
+        (Some("public"), _) => "public: anyone can read it".to_owned(),
+        (Some("private"), Some(true)) => {
+            format!("private to {owner}: its owners and granted teams can read it")
+        }
+        (Some("private"), Some(false)) => {
+            "private: only you and people you add can read it".to_owned()
+        }
+        (Some(visibility), _) => visibility.to_owned(),
+        (None, _) => "visibility not confirmed".to_owned(),
+    };
+    format!(
+        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn. Not this one? Say so, or run `agit project drop`.",
+        upload.repository
+    )
 }
 
 /// The SessionStart response the runtime may show or add to the conversation.
@@ -1212,6 +1274,45 @@ mod tests {
             super::restored_title("claude-code", &event("agit: unnamed", "resume")).as_deref(),
             Some("Add a dark mode")
         );
+    }
+
+    /// The person is told before the first upload, once: a new conversation (a fork included) and
+    /// a resumed one that has not uploaded yet are announced, an uploading one is not announced
+    /// again, and a runtime that shows no hook message gets none. The line names who can see the repository
+    /// without guessing, and both ways to stop.
+    #[test]
+    fn an_automatic_upload_is_announced_before_it_happens() {
+        for runtime in ["claude-code", "codex"] {
+            assert!(super::announces_upload(runtime, Source::Startup, false));
+            assert!(super::announces_upload(runtime, Source::Clear, false));
+            assert!(super::announces_upload(runtime, Source::Fork, false));
+            assert!(super::announces_upload(runtime, Source::Resume, false));
+            assert!(!super::announces_upload(runtime, Source::Resume, true));
+            assert!(!super::announces_upload(runtime, Source::Compact, false));
+        }
+        assert!(!super::announces_upload(
+            "workbuddy",
+            Source::Startup,
+            false
+        ));
+        let notice = |visibility: Option<&str>, org: Option<bool>| {
+            super::upload_notice(&crate::commands::project::AutomaticUpload {
+                repository: "acme/widget".into(),
+                visibility: visibility.map(str::to_owned),
+                org,
+            })
+        };
+        assert_eq!(
+            notice(Some("private"), Some(true)),
+            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and granted teams can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`."
+        );
+        assert!(
+            notice(Some("private"), Some(false))
+                .contains("(private: only you and people you add can read it)")
+        );
+        assert!(notice(Some("private"), None).contains("(private)"));
+        assert!(notice(Some("public"), Some(true)).contains("(public: anyone can read it)"));
+        assert!(notice(None, None).contains("(visibility not confirmed)"));
     }
 
     #[test]

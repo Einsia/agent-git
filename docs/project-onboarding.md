@@ -68,6 +68,19 @@ conversation that started inside the folder is adopted: one started elsewhere th
 into it is offered, never adopted or uploaded. Keep using
 Claude Code or Codex normally. Rebind with `--history all` if you later want the old sessions.
 
+Each new conversation in the folder opens with one line from agit, shown to you rather than
+the agent, before anything is uploaded:
+
+```text
+agit: this conversation is uploaded to team/app (private to team: its owners and granted teams can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`.
+```
+
+The line says who can read the repository: anyone for a public one; for a private one, the
+organization's owners and granted teams, or only you and people you add when it is in your
+own namespace. The visibility is the Hub's answer when the conversation starts, or its last
+recorded answer when the Hub cannot be reached in time; when neither exists the line says so. A resumed
+conversation that has not been uploaded yet shows the line again.
+
 The command installs hooks for available supported runtimes. Codex must report an enabled
 hooks feature and may ask you to trust the installed commands. A runtime without working
 hooks cannot provide automatic capture; its sessions are published by `project sync`, and

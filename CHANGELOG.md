@@ -16,6 +16,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   selected Hub. Delivery verifies the source session creator, maps only the signed-in source
   account, and leaves collaborator commits unattributed. Sessions with another or an unverified
   creator are refused until the Hub supports creatorless registration.
+- In a folder that uploads its conversations automatically, each new conversation in Claude Code
+  or Codex now opens with one line saying where it will be uploaded and who can see that
+  repository, before its first turn is uploaded, and how to stop it: say so, or run
+  `agit project drop`.
 
 ### Fixed
 
