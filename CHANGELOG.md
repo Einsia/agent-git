@@ -16,6 +16,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   Hooks and MCP entries now run agit by its link or launcher script on `PATH`, and `agit setup`
   leaves a hook that already runs this agit exactly as it is, also when it runs for another
   AGIT_HOME. The first `agit setup` after updating rewrites them once.
+- AgentGit no longer tells an agent to push a saved session on its own. The context a saved
+  session starts with, `agit status`, the skill and the `AGENTS.md` section now say to publish
+  only when the person asks; the session context and status also leave saving new turns to the
+  person's request. A forked Codex session had pushed mid-turn because the context told it to.
 
 ## [0.2.28] - 2026-10-27
 

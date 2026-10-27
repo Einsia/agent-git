@@ -557,7 +557,7 @@ fn session_annotation(
 
     let additional_context = match binding {
         Some(binding) => format!(
-            "This {runtime} session ({}) is already under agit version control at {binding}. Save its new turns with `agit commit {quoted}` and publish them with `agit push {quoted}`; use that explicit repo and branch for session commands, since a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again, and do not import another session in its place.",
+            "This {runtime} session ({}) is already under agit version control at {binding}. When the user asks to save its new turns, run `agit commit {quoted}`; publish them with `agit push {quoted}` only when the user asks to. Use that explicit repo and branch for session commands, since a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again, and do not import another session in its place.",
             sh_quote(session_id),
             quoted = sh_quote(binding)
         ),
@@ -1009,7 +1009,8 @@ mod tests {
     }
 
     /// A managed session exposes its exact destination without adding instructions that could
-    /// make an agent attempt to adopt it again.
+    /// make an agent attempt to adopt it again, or save or publish it without being asked: an
+    /// agent told to publish pushes mid-turn without being asked.
     #[test]
     fn a_managed_session_is_labeled_with_its_binding() {
         let response = super::session_annotation(
@@ -1029,6 +1030,11 @@ mod tests {
             .unwrap();
         assert!(context.contains("'einsia/payments@flaky-test'"));
         assert!(context.contains("Do not import this session again"));
+        assert!(
+            context.contains("When the user asks to save its new turns")
+                && context.contains("only when the user asks to"),
+            "{context}"
+        );
     }
 
     /// An unmanaged session gets both the visible state and a command containing its real runtime

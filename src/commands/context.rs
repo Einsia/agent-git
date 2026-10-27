@@ -242,7 +242,7 @@ pub fn runtime_session_note(sessions: &[RuntimeSession]) -> Option<String> {
         [] => None,
         [one] => Some(match &one.target {
             Some(target) => format!(
-                "this conversation ({} {}, from {}) is already saved at {target}; save its new turns with `agit commit {quoted}` and publish them with `agit push {quoted}` — do not import another session in its place",
+                "this conversation ({} {}, from {}) is already saved at {target}; when the user asks, save its new turns with `agit commit {quoted}`, and publish them with `agit push {quoted}` only when the user asks to — do not import another session in its place",
                 one.runtime,
                 one.session_id,
                 one.variable,
