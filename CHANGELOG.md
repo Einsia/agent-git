@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex keeps trusting AgentGit's hooks after an update. `agit setup` wrote the file an installer's
+  link resolves to into the hook commands, and Codex trusts a hook by its exact command, so every
+  update made Codex ask to review the hooks again, and they saved nothing until someone did.
+  Hooks and MCP entries now run agit by its link or launcher script on `PATH`, and `agit setup`
+  leaves a hook that already runs this agit exactly as it is, also when it runs for another
+  AGIT_HOME. The first `agit setup` after updating rewrites them once.
+
 ## [0.2.28] - 2026-10-27
 
 ### Added

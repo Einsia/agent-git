@@ -593,7 +593,16 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments:
                 .is_some_and(|command| command == cmd || is_our_hook(command, arguments))
     };
     let exact = |entry: &serde_json::Value| {
-        entry.get("command").and_then(|value| value.as_str()) == Some(cmd)
+        entry
+            .get("command")
+            .and_then(|value| value.as_str())
+            .is_some_and(|command| {
+                command == cmd
+                    || command
+                        .strip_suffix(arguments)
+                        .map(str::trim_end)
+                        .is_some_and(runs_this_agit)
+            })
     };
     // Prefer an entry that already carries the current command, so a settled file stays as is.
     let keep = arr
@@ -1263,11 +1272,224 @@ fn home() -> Option<PathBuf> {
     crate::infra::config::user_home()
 }
 
+/// The path hooks and MCP entries run agit by: the `agit` on `PATH` that is this executable, such
+/// as an installer's link in `~/.local/bin`, rather than the file the link resolves to. Codex
+/// trusts a hook by its exact command, so a command that names the resolved file loses that trust
+/// whenever an update moves the file, and an untrusted hook saves nothing. Without such a link the
+/// executable's own path is used, except one a cache cleanup or temporary directory removes, for
+/// which another `agit` on `PATH` is preferred; setup says which path it wrote either way.
 fn exe_str() -> String {
-    std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "agit".into())
+    static CHOSEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CHOSEN
+        .get_or_init(|| {
+            let Ok(current) = std::env::current_exe() else {
+                return "agit".into();
+            };
+            let path = std::env::var_os("PATH");
+            match hook_executable(&current, path.as_deref()) {
+                Chosen::Link(link) => link.display().to_string(),
+                Chosen::Itself => {
+                    if !ui::quiet() {
+                        ui::hint(&format!(
+                        "hooks and MCP run {}, which is not on PATH; run `agit setup` again if you move it",
+                            current.display()
+                        ));
+                    }
+                    current.display().to_string()
+                }
+                Chosen::OtherOnPath(other) => {
+                    ui::warning(&format!(
+                        "this agit runs from {}, which a cache cleanup removes; hooks and MCP run {} from PATH instead",
+                        current.display(),
+                        other.display()
+                    ));
+                    other.display().to_string()
+                }
+                Chosen::Ephemeral => {
+                    ui::warning(&format!(
+                        "hooks and MCP run {}, which a cache cleanup removes, and then nothing is saved; install agit with `npx -y create-agit@latest` and run `agit setup` again",
+                        current.display()
+                    ));
+                    current.display().to_string()
+                }
+            }
+        })
+        .clone()
+}
+
+#[derive(Debug, PartialEq)]
+enum Chosen {
+    /// An entry on `PATH` that resolves to this executable.
+    Link(PathBuf),
+    /// This executable, at a path that survives an update.
+    Itself,
+    /// Another `agit` on `PATH`, because this one sits where a cleanup removes it.
+    OtherOnPath(PathBuf),
+    /// This executable, in a temporary or cache directory, with no other `agit` on `PATH`.
+    Ephemeral,
+}
+
+fn hook_executable(current: &Path, path: Option<&std::ffi::OsStr>) -> Chosen {
+    choose_executable(current, path, &ephemeral)
+}
+
+fn choose_executable(
+    current: &Path,
+    path: Option<&std::ffi::OsStr>,
+    ephemeral: &dyn Fn(&Path) -> bool,
+) -> Chosen {
+    if let Some(link) = launcher_on_path(current, path, ephemeral) {
+        return Chosen::Link(link);
+    }
+    if !ephemeral(current) {
+        return Chosen::Itself;
+    }
+    let name = current.file_name().unwrap_or_default();
+    path.map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file() && !ephemeral(candidate))
+        .map_or(Chosen::Ephemeral, Chosen::OtherOnPath)
+}
+
+/// Whether a path lies where a cleanup removes it: a temporary directory or npm's caches, such as
+/// the copy `npx` runs.
+fn ephemeral(path: &Path) -> bool {
+    // The directory decides, not where a link in it points: a link that npx puts on PATH lives
+    // in its cache, and an installer's link lives in a directory that stays.
+    let path = match (
+        path.parent().and_then(|dir| dir.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    };
+    let temp = std::env::temp_dir();
+    let temp = temp.canonicalize().unwrap_or(temp);
+    let text = path.to_string_lossy().replace('\\', "/");
+    path.starts_with(&temp)
+        || ["/tmp/", "/private/tmp/", "/var/folders/"]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+        || ["/_npx/", "/.npm/", "/npm-cache/"]
+            .iter()
+            .any(|part| text.contains(part))
+}
+
+fn launcher_on_path(
+    current: &Path,
+    path: Option<&std::ffi::OsStr>,
+    ephemeral: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let target = current.canonicalize().ok()?;
+    let name = current.file_name()?;
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            !ephemeral(candidate)
+                && (candidate.canonicalize().ok().as_ref() == Some(&target)
+                    || launches(candidate, current, &target))
+        })
+}
+
+/// Whether an existing hook's executable runs the agit setup would write, so the hook stays byte
+/// for byte as it is: a runtime that trusts a hook by its command (Codex) keeps trusting it when
+/// setup runs again by another path to the same program, for example from a second AGIT_HOME.
+fn runs_this_agit(existing: &str) -> bool {
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    same_program(Path::new(existing), &current, &ephemeral)
+}
+
+fn same_program(existing: &Path, current: &Path, ephemeral: &dyn Fn(&Path) -> bool) -> bool {
+    if !existing.is_absolute() || ephemeral(existing) {
+        return false;
+    }
+    let Ok(target) = current.canonicalize() else {
+        return false;
+    };
+    let Ok(resolved) = existing.canonicalize() else {
+        return false;
+    };
+    // Only a lasting entry is kept: a link to this program or a launcher script that runs it. A
+    // hook naming the file itself, even the file a wanted link leads to, moves to the link, or it
+    // would keep running the old build once the link points elsewhere. A link is told from the
+    // file by resolving only its directory: a file in a linked directory (`/var` on macOS) is
+    // still the file.
+    let unlinked = existing
+        .parent()
+        .and_then(|dir| dir.canonicalize().ok())
+        .zip(existing.file_name())
+        .map(|(dir, name)| dir.join(name));
+    (resolved == target && unlinked.as_ref() != Some(&resolved))
+        || launches(existing, current, &target)
+}
+
+/// Whether `candidate` is a launcher script that runs this executable: a short file starting with
+/// `#!` whose `exec` line runs it, such as `exec /opt/agit/stable/agit "$@"`. Only the program an
+/// `exec` line names counts, resolved to its file; a path in a comment or inside another word does
+/// not. The script stays where it is when an update points it at another build, so hooks that run
+/// it keep their command.
+fn launches(candidate: &Path, current: &Path, target: &Path) -> bool {
+    const LAUNCHER_LIMIT: u64 = 4096;
+    if !candidate
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.len() <= LAUNCHER_LIMIT)
+    {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(candidate) else {
+        return false;
+    };
+    text.starts_with("#!")
+        && text.lines().filter_map(exec_program).any(|program| {
+            let program = Path::new(&program);
+            program == current || program.canonicalize().ok().as_deref() == Some(target)
+        })
+}
+
+/// The program a shell `exec` line runs: its first word, with quotes and backslashes removed the
+/// way the shell removes them. `None` when the word depends on an expansion (`$`, a backtick, a
+/// glob), whose result cannot be read from the text.
+fn exec_program(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("exec ")?.trim_start();
+    let mut word = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => break,
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    c => word.push(c),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    // Inside double quotes a backslash escapes only these; before any other
+                    // character it stays.
+                    '\\' => match chars.next()? {
+                        c @ ('$' | '`' | '"' | '\\') => word.push(c),
+                        c => {
+                            word.push('\\');
+                            word.push(c);
+                        }
+                    },
+                    '$' | '`' => return None,
+                    c => word.push(c),
+                }
+            },
+            '\\' => word.push(chars.next()?),
+            '$' | '`' | '*' | '?' | '[' | '~' => return None,
+            c => word.push(c),
+        }
+    }
+    (!word.is_empty()).then_some(word)
 }
 
 /// Bundle writes report failures individually; successful files contribute to the runtime summary.
@@ -1400,6 +1622,113 @@ fn print_completions(shell: &str) -> SetupReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An installer's link or launcher script on PATH is what hooks run, not the file behind it,
+    /// so moving that file (an update) leaves the hook command, and a runtime's trust in it,
+    /// unchanged. A link or a
+    /// binary in a directory a cleanup removes (npx's cache) is never written while a lasting
+    /// `agit` is on PATH, and a relative PATH entry is never chosen.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_run_agit_by_a_path_that_outlives_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let (release, bin, cache, other) =
+            (dir("release"), dir("bin"), dir("npx-cache"), dir("other"));
+        let binary = release.join("agit");
+        std::fs::write(&binary, b"").unwrap();
+        std::os::unix::fs::symlink(&binary, bin.join("agit")).unwrap();
+        let cached = cache.join("agit");
+        std::fs::write(&cached, b"").unwrap();
+        let in_cache = |path: &Path| path.starts_with(&cache);
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+
+        let with_link = path(&[Path::new("bin"), &cache, &bin]);
+        assert_eq!(
+            choose_executable(&binary, Some(&with_link), &in_cache),
+            Chosen::Link(bin.join("agit"))
+        );
+        let launcher = dir("launcher");
+        std::fs::write(
+            launcher.join("agit"),
+            format!("#!/bin/sh\nexec {} \"$@\"\n", binary.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            choose_executable(&binary, Some(&path(&[&launcher])), &in_cache),
+            Chosen::Link(launcher.join("agit"))
+        );
+        assert_eq!(
+            choose_executable(&binary, Some(&path(&[&other])), &in_cache),
+            Chosen::Itself
+        );
+        std::fs::write(other.join("agit"), b"").unwrap();
+        assert_eq!(
+            choose_executable(&cached, Some(&path(&[&cache, &other])), &in_cache),
+            Chosen::OtherOnPath(other.join("agit"))
+        );
+        assert_eq!(
+            choose_executable(&cached, Some(&path(&[&cache])), &in_cache),
+            Chosen::Ephemeral
+        );
+        // A hook that already runs this program by a lasting entry, a link or a launcher, is kept
+        // as written; one that names the file itself moves to the link, and one that runs another
+        // program, or sits in the cache, is not kept.
+        let launcher_agit = launcher.join("agit");
+        assert!(same_program(&bin.join("agit"), &binary, &in_cache));
+        assert!(same_program(&launcher_agit, &binary, &in_cache));
+        assert!(
+            !same_program(&binary, &binary, &in_cache),
+            "a hook naming the file behind a link moves to the link"
+        );
+        assert!(!same_program(&other.join("agit"), &binary, &in_cache));
+        assert!(!same_program(&cached, &cached, &in_cache));
+        // Only the program an `exec` line runs makes a launcher: a comment naming this build, or
+        // a longer name that contains it, does not.
+        let moved = dir("moved");
+        std::fs::write(
+            moved.join("agit"),
+            format!(
+                "#!/bin/sh\n# previous build: {}\nexec {}-next \"$@\"\n",
+                binary.display(),
+                binary.display()
+            ),
+        )
+        .unwrap();
+        assert!(!launches(
+            &moved.join("agit"),
+            &binary,
+            &binary.canonicalize().unwrap()
+        ));
+        assert_eq!(
+            exec_program("exec '/opt/agit/a b/agit' \"$@\""),
+            Some("/opt/agit/a b/agit".into())
+        );
+        // A quoted part and what follows it are one word, the program the shell runs.
+        assert_eq!(
+            exec_program("exec \"/opt/agit/agit\"-next \"$@\""),
+            Some("/opt/agit/agit-next".into())
+        );
+        assert_eq!(exec_program("exec \"$AGIT_BIN\" \"$@\""), None);
+        // Inside double quotes a backslash before an ordinary character is part of the path.
+        assert_eq!(
+            exec_program("exec \"/opt/a\\b/agit\" \"$@\""),
+            Some("/opt/a\\b/agit".into())
+        );
+        assert_eq!(
+            exec_program("exec \"/opt/\\\"q\\\"/agit\""),
+            Some("/opt/\"q\"/agit".into())
+        );
+        assert!(ephemeral(&std::env::temp_dir().join("agit")));
+        assert!(ephemeral(Path::new(
+            "/Users/me/.npm/_npx/0a1b/node_modules/.bin/agit"
+        )));
+        assert!(!ephemeral(Path::new("/usr/local/bin/agit")));
+    }
 
     #[test]
     fn hook_registration_matches_native_arguments_instead_of_serialized_substrings() {
