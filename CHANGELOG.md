@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.28] - 2026-10-27
+
 ### Added
 
 - `agit project drop [OWNER/REPO@BRANCH]` stops uploading a conversation from this computer; its
@@ -19,8 +21,18 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - `agit activity` and its MCP tool select messages by when they were sent: the time Claude Code,
   Codex or OpenCode recorded for each message, or its save time when none was recorded. A
   conversation saved or pushed later still counts on the day it happened. Each message carries
-  `sent_at` and `sent_basis`. Encrypted publications are still selected by acceptance time. The
-  Hub must be upgraded together with the CLI.
+  `sent_at` and `sent_basis`. Encrypted publications are still selected by acceptance time.
+  `agit activity` and the MCP tool do not work against agent-git.com in this release, on a local
+  clone either: this release needs activity contract 4, and the Hub answers it with contract 3.
+  A later agit release reads both.
+- The privacy check no longer counts its own start-up against a command's time budget, and
+  saving, importing, pushing and collecting memory allow seconds instead of a fraction of a
+  second, so large transcripts and large allowlists are protected instead of passed through.
+- `agit scan --secrets` lists only high-confidence findings (provider signatures, private keys,
+  credential assignments), each with the record id that `agit secrets allow` accepts, and states
+  how many there are. Entropy-only values such as runtime ids, hashes and encrypted carriers are
+  counted, and listed with `--low-confidence`. The report no longer suggests rewriting Agent
+  history or repeating a push with `--allow-secrets`.
 
 ### Fixed
 
@@ -56,12 +68,16 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   because that account's key is no longer cached here, agit keeps new content back and says which
   account to sign in to once (in settlement, `agit status` and `agit doctor`), instead of a generic
   "privacy check pending".
-
-### Changed
-
-- The privacy check no longer counts its own start-up against a command's time budget, and
-  saving, importing, pushing and collecting memory allow seconds instead of a fraction of a
-  second, so large transcripts and large allowlists are protected instead of passed through.
+- `agit push` works again in a repository whose published sessions together pass the history
+  bound of one publication. Deciding which commits the Hub already holds walked every published
+  branch under that bound, so no session in such a repository could push.
+- `agit clone` of a Hub repository that has no history yet lays down `main` as a file line, so
+  `agit commit … -m` and `agit push` work in it, as the Hub's empty-wiki prompt describes.
+- `agit secrets` mutations print nothing under `--quiet`, `add` and `block add` print the
+  `registered NAME (ID)` line scripts read the new id from, and `status` prints a status line
+  instead of the worker's raw result.
+- `agit import` reports a Git that cannot run as a failure (exit 1) instead of calling the
+  destination branch an invalid Git ref (exit 2).
 
 ## [0.2.27] - 2026-10-25
 
