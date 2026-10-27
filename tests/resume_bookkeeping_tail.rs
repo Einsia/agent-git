@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
-//! Runtime bookkeeping written after the last settled turn does not count as unsettled work.
-//! A runtime switch materializes the settled branch and leaves such records behind; a tail that
-//! carries a turn still refuses, because materializing would drop that turn.
+//! `agit commit`, a runtime switch and a merge into the branch agree on what is unsettled.
+//! Records a runtime writes after the last settled turn without starting a new one leave commit
+//! nothing to settle, so the switch and the merge must proceed; a tail carrying a turn refuses
+//! the switch until commit settles it. If they disagree, the refusal's own advice
+//! (`agit commit`) cannot clear it.
 
 use serde_json::json;
 use std::{
@@ -14,32 +16,97 @@ use std::{
 
 const SID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 
+/// A turn's stop and exit, in the order Claude Code writes them.
+const EXIT: &[&str] = &[
+    "stop_hook_summary",
+    "turn_duration",
+    "cost-state",
+    "last-prompt",
+    "cost-state",
+    "file-history-snapshot",
+];
+
+/// A settled session left, reopened without a prompt and left again, record types in the order
+/// a real Claude Code transcript has them.
+const EXIT_AND_REOPEN: &[&str] = &[
+    "cost-state",
+    "last-prompt",
+    "cost-state",
+    "file-history-snapshot",
+    "custom-title",
+    "agent-name",
+    "mode",
+    "permission-mode",
+    "atis-latch",
+    "custom-title",
+    "agent-name",
+    "cost-state",
+    "cost-state",
+    "file-history-snapshot",
+];
+
 #[test]
-fn a_bookkeeping_tail_does_not_block_a_runtime_switch_but_a_turn_does() {
-    let lab = Lab::new();
-    lab.append(
-        &(json!({"type":"file-history-snapshot", "messageId":"m-tail", "sessionId":SID,
-            "snapshot":{"trackedFileBackups":{}}, "isSnapshotUpdate":false})
-        .to_string()
-            + "\n"),
-    );
-    let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
-    let text = combined(&switched);
-    assert!(switched.status.success(), "{text}");
-    assert!(
-        text.contains("no new turn since the last settlement"),
-        "{text}"
-    );
-    assert!(!text.contains("already has unsettled content"), "{text}");
-    assert_eq!(walk(&lab.home.join(".codex/sessions")).len(), 1, "{text}");
+fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
+    for tail in [EXIT, EXIT_AND_REOPEN] {
+        let lab = Lab::new();
+        lab.append(&lab.tail(tail));
+        let commit = lab.output(&["commit", SID]);
+        let text = combined(&commit);
+        assert!(commit.status.success(), "{tail:?}: {text}");
+        assert!(text.contains("nothing new since"), "{tail:?}: {text}");
+        let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+        let text = combined(&switched);
+        assert!(switched.status.success(), "{tail:?}: {text}");
+        assert!(
+            text.contains("no new turn since the last settlement"),
+            "{tail:?}: {text}"
+        );
+        assert!(
+            !text.contains("already has unsettled content"),
+            "{tail:?}: {text}"
+        );
+        assert_eq!(
+            walk(&lab.home.join(".codex/sessions")).len(),
+            1,
+            "{tail:?}: {text}"
+        );
+    }
+
+    for tail in [EXIT, EXIT_AND_REOPEN] {
+        let lab = Lab::new();
+        lab.append(&lab.tail(tail));
+        let commit = lab.output(&["commit", SID]);
+        let text = combined(&commit);
+        assert!(text.contains("nothing new since"), "{tail:?}: {text}");
+        let merged = lab.merge();
+        let text = combined(&merged);
+        assert!(merged.status.success(), "{tail:?}: {text}");
+        assert!(
+            !text.contains("unsettled or unverifiable"),
+            "{tail:?}: {text}"
+        );
+        assert!(
+            lab.repo().join(".git/AGIT_MERGE_TX").exists(),
+            "{tail:?}: {text}"
+        );
+    }
 
     let lab = Lab::new();
-    lab.append(&lab.turn(3));
+    lab.append(&(lab.turn(3) + &lab.tail(EXIT)));
     let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
     let text = combined(&refused);
     assert!(!refused.status.success(), "{text}");
     assert!(text.contains("already has unsettled content"), "{text}");
+    assert!(text.contains(&format!("agit commit {SID}")), "{text}");
     assert!(walk(&lab.home.join(".codex/sessions")).is_empty(), "{text}");
+    let commit = lab.output(&["commit", SID]);
+    let text = combined(&commit);
+    assert!(commit.status.success(), "{text}");
+    assert!(!text.contains("nothing new since"), "{text}");
+    let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&switched);
+    assert!(switched.status.success(), "{text}");
+    assert_eq!(walk(&lab.home.join(".codex/sessions")).len(), 1, "{text}");
 }
 
 fn combined(output: &Output) -> String {
@@ -130,6 +197,36 @@ impl Lab {
         self.command().args(args).output().unwrap()
     }
 
+    fn repo(&self) -> PathBuf {
+        self.store.join("repos/alice/qa")
+    }
+
+    /// A manual merge into the session's branch from a branch at the same head.
+    fn merge(&self) -> Output {
+        let repo = self.repo();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", combined(&out));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let head = git(&["rev-parse", "refs/heads/work"]);
+        git(&["branch", "source", &head]);
+        self.output(&[
+            "merge",
+            "alice/qa@source",
+            "--into",
+            "alice/qa@work",
+            "--manual",
+        ])
+    }
+
     fn run(&self, args: &[&str]) -> String {
         let out = self.output(args);
         assert!(out.status.success(), "{args:?}: {}", combined(&out));
@@ -143,6 +240,46 @@ impl Lab {
             .unwrap()
             .write_all(text.as_bytes())
             .unwrap();
+    }
+
+    /// Records Claude Code writes in the given order, by type (`system` records by subtype):
+    /// fields as the runtime writes them, synthetic values.
+    fn tail(&self, kinds: &[&str]) -> String {
+        let system = |subtype: &str, extra: serde_json::Value| {
+            let mut record = json!({"type":"system", "subtype":subtype, "sessionId":SID,
+                "cwd":self.work, "uuid":"s", "parentUuid":"a", "timestamp":"2026-10-25T22:39:00.000Z",
+                "version":"2.1.310", "isSidechain":false, "userType":"external",
+                "entrypoint":"cli", "gitBranch":"main"});
+            record
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            record
+        };
+        kinds
+            .iter()
+            .map(|kind| match *kind {
+                "stop_hook_summary" => system(kind, json!({"hookCount":1, "hookInfos":[],
+                    "hookErrors":[], "hookAdditionalContext":[], "preventedContinuation":false,
+                    "stopReason":"", "hasOutput":false, "level":"suggestion", "toolUseID":"t"})),
+                "turn_duration" => system(kind, json!({"durationMs":1, "messageCount":2, "isMeta":false})),
+                "cost-state" => json!({"type":kind, "sessionId":SID, "totalCostUSD":0.0,
+                    "totalAPIDuration":0, "totalAPIDurationWithoutRetries":0, "totalToolDuration":0,
+                    "totalDuration":0, "totalLinesAdded":0, "totalLinesRemoved":0, "startTime":0,
+                    "hasUnknownModelCost":false, "modelUsage":{}}),
+                "last-prompt" => json!({"type":kind, "sessionId":SID, "lastPrompt":"synthetic prompt", "leafUuid":"a"}),
+                "file-history-snapshot" => json!({"type":kind, "messageId":"m-tail",
+                    "snapshot":{"messageId":"m-tail", "trackedFileBackups":{}, "timestamp":"2026-10-25T22:39:00.000Z"},
+                    "isSnapshotUpdate":true}),
+                "custom-title" => json!({"type":kind, "sessionId":SID, "customTitle":"synthetic title"}),
+                "agent-name" => json!({"type":kind, "sessionId":SID, "agentName":"synthetic name"}),
+                "mode" => json!({"type":kind, "sessionId":SID, "mode":"normal"}),
+                "permission-mode" => json!({"type":kind, "sessionId":SID, "permissionMode":"default"}),
+                "atis-latch" => json!({"type":kind, "sessionId":SID, "atis":"synthetic"}),
+                other => panic!("no fixture for {other}"),
+            })
+            .map(|record| format!("{record}\n"))
+            .collect()
     }
 
     fn turn(&self, n: usize) -> String {

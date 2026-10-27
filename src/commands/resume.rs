@@ -1645,11 +1645,15 @@ fn tail_is_bookkeeping(committed_log: &str, link: &Link) -> crate::Result<bool> 
     let Ok(live) = link.read() else {
         return Ok(false);
     };
+    live_tail_is_bookkeeping(committed_log, link, &live)
+}
+
+fn live_tail_is_bookkeeping(committed_log: &str, link: &Link, live: &str) -> crate::Result<bool> {
     let tail = match link.baseline_bytes {
         Some(baseline) => usize::try_from(baseline)
             .ok()
             .and_then(|offset| live.get(offset..)),
-        None => Some(unsettled_native_tail(committed_log, &live)),
+        None => Some(unsettled_native_tail(committed_log, live)),
     };
     let Some(tail) = tail else {
         return Ok(false);
@@ -1757,6 +1761,12 @@ pub(crate) fn require_merge_claim_with_bytes(
         native_claim_activity(repo, committed, text)?
     };
     if activity == ClaimActivity::Untouched {
+        return Ok(());
+    }
+    // Settlement leaves a bookkeeping-only tail where it was, so the check after it must accept
+    // the same tail that a runtime switch accepts, or merge asks for a commit that has nothing
+    // to settle.
+    if activity == ClaimActivity::Appended && live_tail_is_bookkeeping(committed, claim, text)? {
         return Ok(());
     }
     if activity == ClaimActivity::Appended && allow_settlement {

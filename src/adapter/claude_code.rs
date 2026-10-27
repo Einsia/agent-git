@@ -350,11 +350,33 @@ impl Adapter for ClaudeCode {
             .collect())
     }
 
+    /// Claude Code writes these around every start, stop and exit without a turn to settle: hook
+    /// and duration summaries, cost counters, a copy of the last prompt, the session's mode and
+    /// titles. If one is missing here, a session that merely ended after its last settlement
+    /// refuses a runtime switch while `agit commit` finds nothing to settle. Attachments and the
+    /// remaining `system` subtypes can carry context the model saw, so they stay unsettled work.
     fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
-        matches!(
-            record["type"].as_str(),
-            Some("file-history-snapshot" | "custom-title" | "agent-name" | "summary")
-        )
+        match record["type"].as_str() {
+            Some("system") => matches!(
+                record["subtype"].as_str(),
+                Some("stop_hook_summary" | "turn_duration")
+            ),
+            Some(
+                "file-history-snapshot"
+                | "custom-title"
+                | "ai-title"
+                | "agent-name"
+                | "summary"
+                | "cost-state"
+                | "last-prompt"
+                | "mode"
+                | "permission-mode"
+                | "atis-latch"
+                | "pr-link"
+                | "bridge-session",
+            ) => true,
+            _ => false,
+        }
     }
 
     /// Prefer the physical project directory, retaining lexical and global lookup for old files.
