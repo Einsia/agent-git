@@ -261,3 +261,53 @@ fn file_commit_preserves_code_and_artifact_references() {
         );
     }
 }
+
+/// A repository whose `main` the Hub or plain Git wrote, with no AgentGit metadata in its tree
+/// (an organization wiki started on the Hub), still takes file commits on `main`: the pages named
+/// are committed, not left out by a session settlement that has nothing to settle.
+#[test]
+fn a_file_commit_on_a_main_without_agentgit_metadata_takes_the_named_pages() {
+    let lab = Lab::new();
+    let repo = lab.repo_dir("wiki");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+    std::fs::write(repo.join("README.md"), "# wiki\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=hub",
+            "-c",
+            "user.email=hub@example.test",
+            "commit",
+            "-qm",
+            "start the wiki",
+        ],
+    );
+
+    std::fs::write(
+        repo.join("run.md"),
+        "# Running\n\nStart the database first.\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("README.md"), "# wiki\n\n- [Running](run.md)\n").unwrap();
+    lab.ok(&[
+        "commit",
+        "me/wiki@main",
+        "-m",
+        "wiki: how to run",
+        "--",
+        "run.md",
+        "README.md",
+    ]);
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s", "refs/heads/main"]),
+        "wiki: how to run"
+    );
+    assert_eq!(
+        git(&repo, &["show", "refs/heads/main:run.md"]),
+        "# Running\n\nStart the database first."
+    );
+    assert!(git(&repo, &["show", "refs/heads/main:README.md"]).contains("[Running](run.md)"));
+}

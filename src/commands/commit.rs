@@ -1583,9 +1583,11 @@ fn append_envelopes(base: &str, suffix: &str) -> String {
 /// line**.
 ///
 /// Three things must hold at once: the caller passed `-m`, the branch already exists, and the
-/// meta at its tip declares it a file line. Missing any one returns `None` and leaves the caller
-/// to treat it as a session line (reporting the missing link) — a session line with no link is
-/// someone else's history, not something to take over here.
+/// meta at its tip declares it a file line, or it is `main` and its tip carries no AgentGit
+/// metadata, as a `main` the Hub or plain Git wrote does (an organization wiki started on the
+/// Hub). Missing any one returns `None` and leaves the caller to treat it as a session line
+/// (reporting the missing link) — a session line with no link is someone else's history, not
+/// something to take over here.
 fn file_line_target(
     repo_dir: &Path,
     slug: &str,
@@ -1598,7 +1600,7 @@ fn file_line_target(
     }
     let repo = Repo::open(repo_dir)?;
     let tip = format!("refs/heads/{branch}");
-    if !repo.has_ref(&tip) || !meta::read_at_ref(&repo, &tip)?.is_file_line() {
+    if !repo.has_ref(&tip) || !file_line_at(meta::read_at_ref(&repo, &tip).as_ref(), branch) {
         return None;
     }
     Some(Target::FileLine {
@@ -1607,6 +1609,12 @@ fn file_line_target(
         branch: branch.to_string(),
         via,
     })
+}
+
+/// Whether a branch whose tip carries `meta` is the file line: its meta says so, or it is
+/// `main` with no AgentGit metadata at all.
+fn file_line_at(meta: Option<&Meta>, branch: &str) -> bool {
+    meta.map_or(branch == "main", Meta::is_file_line)
 }
 
 /// A `-m` commit on the file line: the same branch / lock / seal checks as [`settle`], then
@@ -1652,7 +1660,7 @@ fn settle_file_line(
         None => None,
     };
     anyhow::ensure!(
-        head_meta.as_ref().is_some_and(|m| m.is_file_line()),
+        file_line_at(head_meta.as_ref(), branch),
         "`{branch}` is not a file line — only the file line takes a session-less `-m` commit"
     );
 

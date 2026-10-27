@@ -10,6 +10,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `agit commit <org>/wiki@main -m … -- <paths>` commits the named pages also when the wiki's
+  `main` was started on the Hub or written with plain Git and carries no AgentGit metadata.
 - Codex keeps trusting AgentGit's hooks after an update. `agit setup` wrote the file an installer's
   link resolves to into the hook commands, and Codex trusts a hook by its exact command, so every
   update made Codex ask to review the hooks again, and they saved nothing until someone did.
