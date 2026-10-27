@@ -204,6 +204,18 @@ pub fn run(args: Args) -> CmdResult {
     // The repo is already chosen above; the ref here is a ref **inside that repo**, and a branch
     // name may contain `/`. The shared parser reads a bare `topic/foo` as the owner/repo form,
     // so the local-ref entry point is required.
+    //
+    // A repository created on the Hub has no history at all; its main file line would otherwise
+    // come only from `agit init`, which cannot target an organization's repo. Inheriting from
+    // the default then means inheriting from the scaffolding, so the line is laid down here.
+    // Only an empty checkout qualifies: a repo with any history but no main has lost something,
+    // and inventing a main there would hide that.
+    if from_ref == DEFAULT_FROM && super::init::is_empty_checkout(&repo) {
+        super::init::lay_down_main(&repo)?;
+        ui::info(ui::dim(&format!(
+            "  {slug} is empty — laid down its main file line (the session's first push publishes it)"
+        )));
+    }
     let from_spec = crate::commands::target::parse_local(&from_ref)?;
     let from_head = match crate::domain::refs::resolve(&repo, &from_spec) {
         Ok(resolved) => resolved.sha,

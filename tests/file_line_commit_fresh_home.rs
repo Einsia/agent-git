@@ -164,6 +164,42 @@ fn init_refuses_to_scaffold_over_untracked_user_content() {
     );
 }
 
+/// A repository created on the Hub clones into a checkout with no commit at all, and `agit new`
+/// on it starts from a main file line it lays down itself. An implementation that resolves
+/// `main` first fails with "no ref `main`"; one that branches the session off nothing leaves the
+/// repo without the file line every later `agit new` inherits from.
+#[test]
+fn new_on_an_empty_checkout_lays_down_the_main_file_line() {
+    let lab = Lab::new();
+    let repo = lab.agit_home.join("repos").join("simco").join("lumen");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+
+    lab.ok(&[
+        "new",
+        "simco/lumen",
+        "-b",
+        "first",
+        "--as",
+        "codex",
+        "--no-launch",
+        "--fresh",
+    ]);
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s", "refs/heads/main"]),
+        "agit: init (main file line)"
+    );
+    assert!(
+        git(&repo, &["show", "refs/heads/main:session/meta.json"]).contains(r#""line": "file""#),
+        "the laid-down main must declare itself a file line"
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/heads/first^"]),
+        git(&repo, &["rev-parse", "refs/heads/main"]),
+        "the first session must inherit from the laid-down main"
+    );
+}
+
 /// File commits preserve code symbols and artifact references in the canonical Git tree.
 #[test]
 fn file_commit_preserves_code_and_artifact_references() {

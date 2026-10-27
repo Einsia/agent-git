@@ -171,10 +171,7 @@ pub fn run(args: Args) -> CmdResult {
             // is already recorded in `.git/config`, only the main file line is missing. Lay the
             // line down in this checkout — refusing leaves a repo that can neither be init'd
             // ("already exists") nor start a session (no main).
-            if existing.current_branch().as_deref() != Some("main") {
-                existing.git(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
-            }
-            existing.ensure_committer()?;
+            prepare_empty_checkout(&existing)?;
             ui::info(ui::dim(&format!(
                 "  {owner}/{name} is an empty checkout — laying down its main file line in place"
             )));
@@ -288,7 +285,9 @@ enum CheckoutState {
     /// overwrites files of the same name, so this is refused.
     Unborn,
     /// Commits exist. Even one other branch is history of its own, and `init` does not decide
-    /// for the user.
+    /// for the user. A remote-tracking branch or a tag counts too: a clone whose remote HEAD
+    /// names a missing `main` has an unborn HEAD and an empty worktree over real history, and a
+    /// main laid down there would share nothing with it.
     HasHistory,
 }
 
@@ -296,7 +295,11 @@ enum CheckoutState {
 /// not prove the worktree is empty — a checkout that was cloned and then hand-written with an
 /// AGENTS.md has no commits either.
 fn checkout_state(repo: &Repo) -> CheckoutState {
-    if repo.commit_count() > 0 || !repo.local_branches().is_empty() {
+    // Unreadable refs count as history, for the same reason unreadable entries count as content.
+    let has_refs = repo
+        .git_opt(&["for-each-ref", "--count=1", "--format=%(refname)"])
+        .is_none_or(|listing| !listing.trim().is_empty());
+    if repo.commit_count() > 0 || has_refs {
         return CheckoutState::HasHistory;
     }
     // An unreadable directory, or an unreadable entry inside it, counts as content: refusing
@@ -317,6 +320,39 @@ fn checkout_state(repo: &Repo) -> CheckoutState {
     } else {
         CheckoutState::Empty
     }
+}
+
+/// Whether `repo` is the shell a repository created on the Hub clones into: no history and no
+/// content, so the main file line can be laid down in place without overwriting anything.
+pub(super) fn is_empty_checkout(repo: &Repo) -> bool {
+    checkout_state(repo) == CheckoutState::Empty
+}
+
+/// Lay the bare main file line (scaffolding only, nothing adopted) into an empty checkout.
+///
+/// `agit new` comes through here for a repository that has no main yet. It must produce the same
+/// line `agit init` does, or a repo that started on the Hub is a different kind of thing from one
+/// that started locally.
+pub(super) fn lay_down_main(repo: &Repo) -> crate::Result<()> {
+    anyhow::ensure!(
+        is_empty_checkout(repo),
+        "the main file line is laid down only in an empty checkout"
+    );
+    prepare_empty_checkout(repo)?;
+    scaffold(repo.root())?;
+    repo.add_all()?;
+    repo.commit("agit: init (main file line)")?;
+    Ok(())
+}
+
+/// Point an empty checkout's unborn HEAD at `main` and give it a committer, so the first commit
+/// lands on the main file line.
+fn prepare_empty_checkout(repo: &Repo) -> crate::Result<()> {
+    if repo.current_branch().as_deref() != Some("main") {
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    }
+    repo.ensure_committer()?;
+    Ok(())
 }
 
 /// Collect the project's existing memory / skills assets into the repo root (confirmed item by
@@ -622,6 +658,23 @@ mod tests {
             "a staged file is user content even after the worktree copy is gone"
         );
         r.git(&["rm", "-q", "--cached", "memory.md"]).unwrap();
+        assert_eq!(checkout_state(&r), CheckoutState::Empty);
+
+        // History reachable only from a remote-tracking ref is still history.
+        let other = Repo::init(&d.path().join("agents/alice/other")).unwrap();
+        std::fs::write(other.root().join("notes.md"), "x\n").unwrap();
+        other.add_all().unwrap();
+        other.commit("topic").unwrap();
+        let other_path = other.root().to_string_lossy().into_owned();
+        r.git(&["fetch", "-q", &other_path, "HEAD:refs/remotes/origin/topic"])
+            .unwrap();
+        assert_eq!(
+            checkout_state(&r),
+            CheckoutState::HasHistory,
+            "a remote-tracking branch is history even with no local branch"
+        );
+        r.git(&["update-ref", "-d", "refs/remotes/origin/topic"])
+            .unwrap();
         assert_eq!(checkout_state(&r), CheckoutState::Empty);
 
         scaffold(r.root()).unwrap();
