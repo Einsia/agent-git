@@ -22,10 +22,16 @@ foreach ($tool in @('git', 'bundledLfs')) {
 & python scripts/prepare-git-runtime.py $target .cache/git-runtime/payload.tar.gz --cache .cache/test-lfs
 if ($LASTEXITCODE -ne 0) { throw 'Git runtime preparation failed' }
 $env:AGIT_GIT_RUNTIME_ARCHIVE = (Resolve-Path '.cache/git-runtime/payload.tar.gz').Path
+# The release-mode bundled Git test runs for the channel that ships, staging. Building a test target
+# writes an agit binary compiled with the dev-dependency features to the same path as the release
+# build, so the test runs first and the release build is the file the checks below verify and the
+# archive packages.
+if ($env:AGIT_RELEASE_CHANNEL -eq 'staging') {
+    & cargo test --locked --release --features bundled-git --target $target --test bundled_git
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled CLI integration failed' }
+}
 & cargo build --locked --release --features bundled-git --target $target --bin agit
 if ($LASTEXITCODE -ne 0) { throw 'Bundled CLI build failed' }
-& cargo test --locked --release --features bundled-git --target $target --test bundled_git
-if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & node scripts/verify-windows-cli.mjs $binary
 if ($LASTEXITCODE -ne 0) { throw 'Windows executable verification failed' }
