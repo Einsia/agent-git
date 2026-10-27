@@ -1,18 +1,28 @@
 //! Owner RPC uses local named pipes with the same framing as Unix sockets.
 
 use crate::infra::windows_security as security;
-use std::{io, os::windows::io::AsRawHandle, path::PathBuf, time::Duration};
+use std::{
+    io,
+    os::windows::io::AsRawHandle,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
-use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
+use windows_sys::Win32::System::Pipes::{
+    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, WaitNamedPipeW,
+};
 
 pub type Stream = NamedPipeServer;
+
+/// How long attaching waits for the daemon's pipe, both for it to appear and for a free instance.
+const READY: Duration = Duration::from_secs(15);
 
 pub struct Listener {
     pending: Stream,
@@ -72,14 +82,45 @@ pub fn authenticate_client(socket: &Stream) -> io::Result<()> {
     security::require_process_user(pid, &security::current_sid()?)
 }
 
-fn connect() -> crate::Result<NamedPipeClient> {
-    connect_at(&super::rpc_path()?)
+fn connect(deadline: Instant) -> crate::Result<NamedPipeClient> {
+    connect_at(&super::rpc_path()?, deadline)
 }
 
-fn connect_at(path: &std::path::Path) -> crate::Result<NamedPipeClient> {
-    let client = ClientOptions::new()
-        .security_qos_flags(SECURITY_IDENTIFICATION)
-        .open(path)?;
+/// Every instance is busy from the moment a client takes the listening one until the daemon
+/// arms the next, so a client that arrives in between is early, not refused: it waits for an
+/// instance until `deadline`, as a Unix client waits in the listen backlog. If busy failed the
+/// open, a bridge attaching right after the readiness probe's own connection would close its
+/// output with the request unanswered.
+fn connect_at(path: &std::path::Path, deadline: Instant) -> crate::Result<NamedPipeClient> {
+    let client = loop {
+        match ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(path)
+        {
+            Err(busy) if busy.raw_os_error().map(|code| code as u32) == Some(ERROR_PIPE_BUSY) => {
+                // Zero asks for the pipe's default wait and u32::MAX waits forever; the deadline
+                // allows neither.
+                let wait = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(u128::from(u32::MAX - 1)) as u32;
+                if wait == 0 {
+                    return Err(busy.into());
+                }
+                // A free instance can still go to another client first; the next open decides.
+                if unsafe { WaitNamedPipeW(security::wide(path)?.as_ptr(), wait) } == 0 {
+                    let failure = io::Error::last_os_error();
+                    match failure.raw_os_error().map(|code| code as u32) {
+                        // The last instance closed while waiting; the next open reports it.
+                        Some(ERROR_FILE_NOT_FOUND) => {}
+                        Some(ERROR_SEM_TIMEOUT) => return Err(busy.into()),
+                        _ => return Err(failure.into()),
+                    }
+                }
+            }
+            result => break result?,
+        }
+    };
     let mut pid = 0;
     if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid) } == 0 {
         return Err(io::Error::last_os_error().into());
@@ -89,18 +130,15 @@ fn connect_at(path: &std::path::Path) -> crate::Result<NamedPipeClient> {
 }
 
 async fn wait_ready() -> crate::Result<NamedPipeClient> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + READY;
     loop {
-        match connect() {
+        match connect(deadline) {
             Ok(client) => return Ok(client),
             Err(error) => {
                 let retryable = error.downcast_ref::<io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.raw_os_error().map(|code| code as u32),
-                        Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)
-                    )
+                    error.raw_os_error().map(|code| code as u32) == Some(ERROR_FILE_NOT_FOUND)
                 });
-                if !retryable || tokio::time::Instant::now() >= deadline {
+                if !retryable || Instant::now() >= deadline {
                     return Err(error.context(format!(
                         "agitd did not become ready; inspect agitd-*.log in {}",
                         super::super::rc_dir()?.display()
@@ -247,7 +285,7 @@ pub(super) fn bridge() -> crate::Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let socket = connect()?;
+        let socket = connect(Instant::now() + READY)?;
         forward(socket, tokio::io::stdin(), tokio::io::stdout()).await?;
         Ok(())
     });
@@ -295,7 +333,7 @@ mod tests {
         let path = PathBuf::from(format!(r"\\.\pipe\agit-rpc-eof-{}", uuid::Uuid::new_v4()));
         let sid = security::current_sid().unwrap();
         let mut server = create(&path, &sid, true).unwrap();
-        let client = connect_at(&path).unwrap();
+        let client = connect_at(&path, Instant::now() + Duration::from_secs(5)).unwrap();
         let (output, mut output_reader) = tokio::io::duplex(64);
         tokio::time::timeout(Duration::from_secs(5), async {
             let peer = async {
@@ -323,7 +361,8 @@ mod tests {
         };
         for _ in 0..2 {
             let client = async {
-                let mut socket = connect_at(&path).unwrap();
+                let mut socket =
+                    connect_at(&path, Instant::now() + Duration::from_secs(5)).unwrap();
                 socket.write_all(b"request\n").await.unwrap();
                 let mut output = [0; 9];
                 socket.read_exact(&mut output).await.unwrap();

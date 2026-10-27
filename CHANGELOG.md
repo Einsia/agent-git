@@ -23,6 +23,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   Code gives it. A conversation an earlier agit renamed "agit: unnamed" or
   "agit owner/repo@branch" gets Claude Code's own title back when it is opened again, or its first
   prompt when it never had a title of its own.
+- On Windows, attaching to the device daemon no longer fails with "All pipe instances are busy"
+  (os error 231) when another client connects at the same moment, which closed the bridge
+  before it answered; it waits for the daemon's next pipe instance instead.
 - `agit commit <org>/wiki@main -m … -- <paths>` commits the named pages also when the wiki's
   `main` was started on the Hub or written with plain Git and carries no AgentGit metadata.
 - Codex keeps trusting AgentGit's hooks after an update. `agit setup` wrote the file an installer's
