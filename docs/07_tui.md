@@ -187,13 +187,17 @@ the session in the inbox for next time. `x` records a persistent dismissal, for
 sessions that should never enter version control. The runtime is part of every
 identity, so equal ids from two runtime indexes are never conflated.
 
-SessionStart hooks also make the state visible while the runtime owns the
-terminal. Claude titles managed sessions `agit <owner/repo>@<branch>` and
-unmanaged sessions `agit: unnamed`; both Claude and Codex give the agent the
-explicit `agit import` form for an unmanaged session if the user asks to save
-the conversation. Codex exposes no SessionStart title field, so its managed
-sessions need no response. Compacting an existing conversation does not reapply
-the Claude title, because that would replace a later name chosen by the user.
+SessionStart hooks also tell the agent the state while the runtime owns the
+terminal: a managed session learns its `<owner/repo>@<branch>`, and an
+unmanaged one gets the explicit `agit import` form in case the user asks to save
+the conversation. The hooks never name a session. The runtime's own title, the
+one it generates or the one the user chose, is the session's name everywhere
+agit shows it. A Claude Code session that an earlier agit named `agit: unnamed`
+or `agit <owner/repo>@<branch>` gets Claude Code's own title back the next time
+it is opened: a name chosen before the placeholder, the title Claude Code
+generated, or its summary. A session that never had a title of its own gets the
+label Claude Code lists untitled sessions by, its first prompt on one line, so
+no session keeps the placeholder.
 
 `●` / `○` is "the transcript file has grown within the last 90 seconds". A live
 session must not be taken over by a second writer — once two streams of appends
@@ -531,8 +535,8 @@ All zero-argument interface forms in this document now use the shared shell.
 Native session changes are tracked through the runtime's SessionStart event.
 An existing adopted session is resolved by its runtime identity, including when
 it is resumed from another directory; its recorded repo and branch are supplied
-to the agent explicitly. Claude titles are preserved during startup, resume and
-fork handling. Clear and compact events do not repeatedly ask for a title.
+to the agent explicitly. Runtime titles are never changed; only an agit
+placeholder title left by an earlier version gives way to the runtime's own.
 Unadopted conversations remain available in the naming inbox.
 
 Turn commits retain a bounded description of the working directory's Git state.

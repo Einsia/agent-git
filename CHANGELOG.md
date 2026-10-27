@@ -19,6 +19,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- agit no longer renames conversations in Claude Code: a new conversation keeps the title Claude
+  Code gives it. A conversation an earlier agit renamed "agit: unnamed" or
+  "agit owner/repo@branch" gets Claude Code's own title back when it is opened again, or its first
+  prompt when it never had a title of its own.
 - `agit commit <org>/wiki@main -m … -- <paths>` commits the named pages also when the wiki's
   `main` was started on the Hub or written with plain Git and carries no AgentGit metadata.
 - Codex keeps trusting AgentGit's hooks after an update. `agit setup` wrote the file an installer's

@@ -428,15 +428,55 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
         return None;
     }
     let ev = read_event(runtime)?;
+    let rt = runtime_of(runtime, ev.transcript_path.as_deref());
+    let restored = restored_title(rt, &ev);
+    let response = session_start(rt, &ev);
+    let Some(title) = restored else {
+        return response;
+    };
+    let mut response = response.unwrap_or_else(
+        || serde_json::json!({"hookSpecificOutput": {"hookEventName": "SessionStart"}}),
+    );
+    response["hookSpecificOutput"]["sessionTitle"] = serde_json::Value::String(title);
+    Some(response)
+}
+
+/// Claude Code's own title for a session that an earlier agit renamed with a placeholder: a name
+/// chosen before the placeholder, the title Claude Code generated, its summary, or else the label
+/// Claude Code lists an untitled session by. Hook input names the current title, so any other
+/// title is left alone, whether or not agit manages the session now.
+fn restored_title(rt: &str, ev: &Event) -> Option<String> {
+    if rt != "claude-code"
+        || !matches!(ev.source, Source::Startup | Source::Resume | Source::Fork)
+        || !ev
+            .session_title
+            .as_deref()
+            .is_some_and(crate::adapter::native_title::agit_placeholder)
+    {
+        return None;
+    }
+    let transcript = std::fs::read(ev.transcript_path.as_deref()?).ok()?;
+    let transcript = String::from_utf8_lossy(&transcript);
+    crate::adapter::native_title::native_title(rt, &ev.session_id, &transcript, None).or_else(
+        || {
+            Some(crate::adapter::native_title::claude_untitled_label(
+                &transcript,
+                crate::adapter::native_title::claude_user_config().as_deref(),
+            ))
+        },
+    )
+}
+
+/// Record which session started and describe its state to the agent.
+fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     let env_session = super::context::from_session_env();
 
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
-    let origin = session_origin(&ev);
+    let origin = session_origin(ev);
     let origin = origin.as_deref().map(std::path::Path::new);
     let bound = origin
         .map(|d| workspace::read(d).is_some() || super::project::registration_scope(d))
         .unwrap_or(false);
-    let rt = runtime_of(runtime, ev.transcript_path.as_deref());
     if rt == "codex" && ev.source != Source::Compact {
         let _ = crate::rc::runtime_sources::Registry::open()
             .and_then(|registry| registry.enroll_default());
@@ -515,13 +555,7 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(&ev.session_id, env_value.as_deref());
-    let mut response = session_annotation(
-        rt,
-        ev.source,
-        &ev.session_id,
-        env_value.as_deref(),
-        ev.session_title.as_deref(),
-    )?;
+    let mut response = session_annotation(rt, ev.source, &ev.session_id, env_value.as_deref())?;
     if matches!(ev.source, Source::Startup | Source::Resume)
         && let (Some(binding), Some(cwd)) = (env_value.as_deref(), dir)
         && let Some(context) = recorded_environment_context(binding, cwd)
@@ -536,9 +570,9 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
 
 /// The SessionStart response the runtime may show or add to the conversation.
 ///
-/// Titles are defaults: a runtime title supplied by the user must survive resuming. Claude
-/// ignores titles on clear, while Codex and WorkBuddy take no title from this response. All three
-/// accept binding context. The context names the native session id: a runtime that exports no
+/// It never names the session: the runtime's own title, generated or chosen by the user, is the
+/// session's name, and agit reads it from the runtime. Claude Code, Codex and WorkBuddy accept
+/// binding context. The context names the native session id: a runtime that exports no
 /// session variable to its tool shell leaves the agent no other way to learn which conversation
 /// it is, and an agent that cannot tell imports whichever session looks unsaved.
 fn session_annotation(
@@ -546,7 +580,6 @@ fn session_annotation(
     source: Source,
     session_id: &str,
     binding: Option<&str>,
-    session_title: Option<&str>,
 ) -> Option<serde_json::Value> {
     if !matches!(
         source,
@@ -578,15 +611,6 @@ fn session_annotation(
         "hookEventName".into(),
         serde_json::Value::String("SessionStart".into()),
     );
-    if runtime == "claude-code"
-        && source != Source::Clear
-        && session_title.is_none_or(|title| title.trim().is_empty())
-    {
-        let title = binding
-            .map(|binding| format!("agit {binding}"))
-            .unwrap_or_else(|| "agit: unnamed".to_string());
-        output.insert("sessionTitle".into(), serde_json::Value::String(title));
-    }
     output.insert(
         "additionalContext".into(),
         serde_json::Value::String(additional_context),
@@ -1012,19 +1036,14 @@ mod tests {
     /// make an agent attempt to adopt it again, or save or publish it without being asked: an
     /// agent told to publish pushes mid-turn without being asked.
     #[test]
-    fn a_managed_session_is_labeled_with_its_binding() {
+    fn a_managed_session_learns_its_binding() {
         let response = super::session_annotation(
             "claude-code",
             Source::Resume,
             "SID-A",
             Some("einsia/payments@flaky-test"),
-            None,
         )
         .unwrap();
-        assert_eq!(
-            response["hookSpecificOutput"]["sessionTitle"],
-            "agit einsia/payments@flaky-test"
-        );
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
@@ -1043,7 +1062,7 @@ mod tests {
     #[test]
     fn an_unmanaged_session_gets_actionable_adoption_context() {
         let response =
-            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None, None)
+            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None)
                 .unwrap();
         let output = &response["hookSpecificOutput"];
         assert_eq!(output["hookEventName"], "SessionStart");
@@ -1063,7 +1082,7 @@ mod tests {
     #[test]
     fn an_unmanaged_codex_session_gets_context_without_a_title() {
         assert_eq!(
-            super::session_annotation("codex", Source::Startup, "SID-C", None, None),
+            super::session_annotation("codex", Source::Startup, "SID-C", None),
             Some(serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
@@ -1073,13 +1092,13 @@ mod tests {
         );
     }
 
-    /// Reapplying a title after the user can rename the session loses their explicit choice.
-    /// Unknown runtimes also stay silent rather than receiving another runtime's JSON schema.
+    /// Compacting continues the same conversation, so it gets no context again. Unknown runtimes
+    /// also stay silent rather than receiving another runtime's JSON schema.
     #[test]
     fn annotation_is_limited_to_verified_session_entry_events() {
         for source in [Source::Compact, Source::Other] {
             assert!(
-                super::session_annotation("claude-code", source, "SID-A", None, None).is_none(),
+                super::session_annotation("claude-code", source, "SID-A", None).is_none(),
                 "{source:?}"
             );
         }
@@ -1088,19 +1107,15 @@ mod tests {
             Source::Startup,
             "SID-A",
             Some("einsia/payments@work"),
-            None,
         )
         .unwrap();
-        assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
         assert!(
             response["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap()
                 .contains("einsia/payments@work")
         );
-        assert!(
-            super::session_annotation("cursor", Source::Startup, "SID-A", None, None).is_none()
-        );
+        assert!(super::session_annotation("cursor", Source::Startup, "SID-A", None).is_none());
     }
 
     /// WorkBuddy consumes the Claude-compatible `hookSpecificOutput` envelope. Its context must
@@ -1113,7 +1128,6 @@ mod tests {
             Source::Startup,
             "SID-W",
             Some("einsia/payments@work"),
-            None,
         )
         .unwrap();
         let output = &response["hookSpecificOutput"];
@@ -1127,36 +1141,76 @@ mod tests {
         );
     }
 
+    /// The runtime names the conversation; a title in this response would replace the one Claude
+    /// Code generates and stop it from generating one. Every entry event of every runtime, with
+    /// or without a binding, carries context and no title.
     #[test]
-    fn runtime_titles_survive_resuming_and_forking() {
-        let event = super::parse_event(
-            r#"{"session_id":"SID-A","source":"resume","session_title":"User chosen title"}"#,
+    fn no_session_start_names_the_conversation() {
+        for runtime in ["claude-code", "codex", "workbuddy"] {
+            for source in [Source::Startup, Source::Resume, Source::Clear, Source::Fork] {
+                for binding in [None, Some("einsia/payments@work")] {
+                    let response =
+                        super::session_annotation(runtime, source, "SID-A", binding).unwrap();
+                    let output = &response["hookSpecificOutput"];
+                    assert!(output.get("sessionTitle").is_none(), "{runtime} {source:?}");
+                    assert!(output.get("additionalContext").is_some());
+                }
+            }
+        }
+    }
+
+    /// A session an earlier agit renamed gets Claude Code's own title back, or the label Claude
+    /// Code lists it by when it never had one, and only that session: a title the user chose is
+    /// never replaced, and Codex is never sent a title.
+    #[test]
+    fn only_an_agit_placeholder_gives_way_to_claude_codes_own_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("SID.jsonl");
+        let event = |runtime_title: &str, source: &str| {
+            super::parse_event(
+                &serde_json::json!({
+                    "session_id": "SID",
+                    "source": source,
+                    "session_title": runtime_title,
+                    "transcript_path": transcript,
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        std::fs::write(
+            &transcript,
+            [
+                serde_json::json!({"type":"ai-title","aiTitle":"Fix the login page"}),
+                serde_json::json!({"type":"custom-title","customTitle":"agit alice/app@work"}),
+            ]
+            .map(|record| format!("{record}\n"))
+            .concat(),
         )
         .unwrap();
-        assert_eq!(event.session_title.as_deref(), Some("User chosen title"));
-        for source in [Source::Startup, Source::Resume, Source::Fork] {
-            let response = super::session_annotation(
-                "claude-code",
-                source,
-                "SID-A",
-                Some("einsia/payments@work"),
-                event.session_title.as_deref(),
-            )
-            .unwrap();
-            assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
-            assert!(
-                response["hookSpecificOutput"]
-                    .get("additionalContext")
-                    .is_some()
+        for source in ["startup", "resume", "fork"] {
+            assert_eq!(
+                super::restored_title("claude-code", &event("agit alice/app@work", source))
+                    .as_deref(),
+                Some("Fix the login page"),
+                "{source}"
             );
         }
-        let fork =
-            super::session_annotation("claude-code", Source::Fork, "SID-F", None, None).unwrap();
-        assert!(
-            fork["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .unwrap()
-                .contains("agit import 'SID-F'")
+        assert!(super::restored_title("claude-code", &event("Login page", "resume")).is_none());
+        assert!(super::restored_title("codex", &event("agit: unnamed", "resume")).is_none());
+        std::fs::write(
+            &transcript,
+            [
+                serde_json::json!({"type":"custom-title","customTitle":"agit: unnamed"}),
+                serde_json::json!({"type":"user","message":{"content":"Add a dark mode"}}),
+            ]
+            .map(|record| format!("{record}\n"))
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::restored_title("claude-code", &event("agit: unnamed", "resume")).as_deref(),
+            Some("Add a dark mode")
         );
     }
 
