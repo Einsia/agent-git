@@ -52,6 +52,38 @@ description = "PostHog personal API key"
 regex = '''\bphx_[A-Za-z0-9]{32,64}\b'''
 keywords = ["phx_"]
 
+# A JSON Web Token written straight after a vendor's prefix (`hsk_eyJ…`). gitleaks' JWT rule needs
+# a word boundary before `eyJ`, and the prefix's underscore leaves none, so neither it nor a
+# credential assignment, which reads a dotted value as code, sees the token.
+[[rules]]
+id = "agit-prefixed-jwt"
+description = "JSON Web Token behind a vendor prefix"
+regex = '''\b[A-Za-z][A-Za-z0-9]{1,15}_ey[A-Za-z0-9_-]{17,}\.ey[A-Za-z0-9_-]{17,}\.[A-Za-z0-9_-]{10,}'''
+keywords = ["_ey"]
+
+# A model provider key in the `sk-` format: OpenAI's legacy keys and the OpenAI-compatible
+# providers that copied them. gitleaks names only OpenAI's own prefixed shapes, so such a key
+# written anywhere but after a credential name is published. Lowercase words joined by hyphens
+# are a name, not a key; a run of mixed-case letters with no separator is random, so it is a key.
+[[rules]]
+id = "agit-sk-api-key"
+description = "model provider API key in the sk- format"
+regex = '''\bsk-[A-Za-z0-9_-]{32,}'''
+entropy = 3.5
+keywords = ["sk-"]
+[[rules.allowlists]]
+regexes = [
+    '''^sk-[a-z]+(?:-[a-z]+)+$''',
+]
+
+# `hrk_` and `hsk_` tokens: a fixed prefix and a long token, the shape gitleaks gives its vendor
+# rules. Agents print them from a task runner's configuration and its tool output.
+[[rules]]
+id = "agit-hrk-hsk-token"
+description = "hrk_ or hsk_ access token"
+regex = '''\bh[rs]k_[A-Za-z0-9_-]{20,}'''
+keywords = ["hrk_", "hsk_"]
+
 # A private-key header, in any letter case, opens a sensitive region. The shared scanner
 # extends this match through the matching footer or the end of an incomplete carrier.
 [[rules]]

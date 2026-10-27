@@ -230,9 +230,15 @@ mod tests {
     /// would leave the shell passwords. AgentGit's own credentials and a bearer value outside a
     /// curl command are replaced, while a word or placeholder written after "Bearer" is not: a
     /// policy relying on gitleaks alone would publish the token an agent printed from its
-    /// configuration. Published artifacts keep their checksums, embedded data URIs, links and
-    /// build commands byte for byte: a policy that replaced any of them would publish files that
-    /// no longer open or verify.
+    /// configuration. A provider token is replaced to its end, also where it runs past the length
+    /// its rule names: a policy that replaced only the match would publish the rest of a current
+    /// GitLab token after a placeholder. Vendor tokens gitleaks does not name are replaced where
+    /// they stand, with no credential name before them: a model key in the `sk-` format, `hrk_`
+    /// and `hsk_` tokens, and a JSON Web Token behind a vendor prefix, which gitleaks' JWT rule
+    /// cannot see; lowercase words joined by hyphens after `sk-` are a name and stay, while random
+    /// letters with no digit are still a key. Published artifacts keep their checksums, embedded
+    /// data URIs, links and build commands byte for byte: a policy that replaced any of them would
+    /// publish files that no longer open or verify.
     #[test]
     fn default_tier_replaces_credentials_and_reports_entropy_only_on_request() {
         let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
@@ -243,6 +249,13 @@ mod tests {
         let device = "agit_rc_0b4d8f2a6c1e5b9d3f7a2c6e0b4d8f1a5c9e3b7d2f6a0c4e8b1d5f9a3c7e2b6d";
         let code = "agit_su_Qk3vX9mT2pL7wR4nZ8cY1bH6sD0fJ5gE9aK2uM7tV3x";
         let bearer = "eW91LmNhbm5vdC5ndWVzcy50aGlzLjIwMjYtMTAtMjY.Zk9q3vR";
+        let gitlab = "glpat-R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let routable = "glpat-bzox79Of-M4BaT6acSh-VW86MQp1OmVxdzZoNWozYQ.01.0y1cvbr6x";
+        let model = "sk-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let compatible = "sk-R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKrQc7xnvKb8lwpZj6truMvxAb3Cd4E";
+        let letters = "sk-RkQmXvLpZtNcWjFbHysVdaGeuKrQcXnvKblwpZjtruMvxAbCdE";
+        let runner = "hrk_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let prefixed_jwt = "hsk_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJydW5uZXItNDIiLCJpYXQiOjE3NjE1NTAwMDB9.Zk9q3vR7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let font = "AAEAAAASAQAABAAgR0RFRrRCsIIAAjWsAAACYkdQT1N/KyYBAAI4EAAAMkxHU1VCQyNA0QACaVwAAAJ4T1MvMmq7WyEAAADUAAAAYGNtYXA=";
         let link = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2";
@@ -269,7 +282,10 @@ mod tests {
              const token = AuthenticationProvider \n \
              let mut secret = AuthenticationProvider ; \n \
              class Session {{ static token = AuthorizationProvider; }} \n \
-             PostHog Key: {posthog}; \
+             PostHog Key: {posthog}; ci uses {gitlab} and {routable} \n \
+             model key {model} or {compatible} or {letters}; runner {runner} \n \
+             TOKEN={prefixed_jwt} \n \
+             see sk-hyphenated-words-that-name-a-thing-at-length \n \
              http_headers = {{ \"X-Agit\" = \"1\" }} \n Bearer {pat} \n \
              AGIT_DEVICE_TOKEN={device}; sign-up link ?code={code}&next=/ \n \
              Authorization: Bearer {bearer} \n \
@@ -317,12 +333,25 @@ mod tests {
             assert!(!span(&default, code), "{code} is not a credential");
         }
         assert!(span(&default, posthog));
-        for credential in [pat, device, code, bearer] {
+        for credential in [
+            pat,
+            device,
+            code,
+            bearer,
+            gitlab,
+            routable,
+            model,
+            compatible,
+            letters,
+            runner,
+            prefixed_jwt,
+        ] {
             assert!(span(&default, credential), "{credential} is a credential");
         }
         for word in [
             "AuthenticationMiddlewareConfiguration",
             "YOUR_PERSONAL_ACCESS_TOKEN_HERE",
+            "sk-hyphenated-words-that-name-a-thing-at-length",
         ] {
             assert!(!span(&default, word), "{word} is not a credential");
         }

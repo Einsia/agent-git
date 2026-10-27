@@ -315,6 +315,8 @@ pub(crate) fn raw_hits_capped_in(
                     if !rule.accepts(secret, whole.as_str(), line) {
                         continue;
                     }
+                    let e = token_run_end(view, e);
+                    let secret = &view[s..e];
                     if !keep(secret, s) {
                         continue;
                     }
@@ -346,6 +348,12 @@ pub(crate) fn raw_hits_capped_in(
                     if !rule.accepts(secret, secret, line) {
                         continue;
                     }
+                    let end = if rule.id == "agit-private-key-header" {
+                        end
+                    } else {
+                        token_run_end(view, end)
+                    };
+                    let secret = &view[m.start()..end];
                     if !keep(secret, m.start()) {
                         continue;
                     }
@@ -414,6 +422,30 @@ pub(crate) fn raw_hits_capped_in(
     out.sort_by_key(|h| (h.start, h.end));
     dedupe_same_span(&mut out);
     (out, budget.exhausted || failed)
+}
+
+/// Where the token a rule's match starts ends. A rule that names a token by its length stops at
+/// that length, so for a longer token of the same family (GitLab's current tokens, the dotted
+/// segments of a routable one) replacing the match alone publishes the rest of the token in plain
+/// text. The span therefore runs on over the characters tokens are written with, and over a dot
+/// that another such character follows; a match that ends at a boundary keeps its end.
+fn token_run_end(view: &str, end: usize) -> usize {
+    let bytes = view.as_bytes();
+    let token = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    let mut at = end;
+    loop {
+        if token(at) {
+            at += 1;
+        } else if bytes.get(at) == Some(&b'.') && token(at + 1) {
+            at += 2;
+        } else {
+            return at;
+        }
+    }
 }
 
 /// A credential-named field or variable supplies the evidence that a value's characters cannot:

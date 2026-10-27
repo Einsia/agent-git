@@ -23,6 +23,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- A credential is replaced to its end in what agit publishes. A GitLab token longer than the
+  20 characters its rule names had only its start replaced, and the rest of the token was
+  published after the placeholder; every rule that names a token by its length now replaces the
+  whole token. Model provider keys in the `sk-` format, `hrk_` and `hsk_` tokens, and a JSON Web
+  Token written after a vendor prefix (`hsk_eyJ…`) are now replaced wherever they appear, also
+  without a credential name in front. Sessions already published keep what they published:
+  rotate a token that appears in one.
 - agit no longer renames conversations in Claude Code: a new conversation keeps the title Claude
   Code gives it. A conversation an earlier agit renamed "agit: unnamed" or
   "agit owner/repo@branch" gets Claude Code's own title back when it is opened again, or its first
