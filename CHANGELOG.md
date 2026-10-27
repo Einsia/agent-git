@@ -8,6 +8,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Added
+
+- `agit push <owner/repo@branch> --to-hub <url>` explicitly migrates a repository publication to
+  another Hub using credentials already saved for that Hub. The destination is reviewed before
+  the local immutable Hub binding and `origin` are updated; ordinary pushes remain bound to the
+  selected Hub. Delivery verifies the source session creator, maps only the signed-in source
+  account, and leaves collaborator commits unattributed. Sessions with another or an unverified
+  creator are refused until the Hub supports creatorless registration.
+
 ### Fixed
 
 - `agit commit <org>/wiki@main -m … -- <paths>` commits the named pages also when the wiki's

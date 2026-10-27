@@ -43,6 +43,41 @@ pub(super) fn run(
     intent.verify_account(&client)?;
     intent.verify_before_mutation(&client, &repo)?;
     let original = PublicationPlan::freeze(&repo, branches)?;
+    if intent.explicit_hub {
+        for commit in original.commit_objects() {
+            let metadata = crate::domain::storage::metadata_local(repo.root(), commit)?;
+            ensure!(
+                repo.show_result(commit, "privacy/envelope.json")?.is_none()
+                    && metadata
+                        .session_privacy
+                        .as_ref()
+                        .is_none_or(|privacy| privacy.scheme
+                            == crate::domain::session_privacy::SessionScheme::Plain),
+                "cross-Hub delivery requires local plain session history"
+            );
+        }
+    }
+    let delivery_confirmed = if intent.explicit_hub && !args.dry_run && !args.audit {
+        let prompt = format!(
+            "Deliver branches {} as plain sessions to {repository} on {} ({}) and switch this checkout's Hub binding after upload?",
+            branches.join(", "),
+            intent.hub,
+            intent.visibility
+        );
+        let confirmed = std::env::var_os("AGIT_YES").is_some()
+            || ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
+                crate::commands::InteractionRequired(
+                    "cross-Hub delivery requires confirmation; use --yes or an interactive terminal".into()
+                )
+            })?;
+        if !confirmed {
+            ui::info("Cross-Hub delivery cancelled.");
+            return Ok(ExitCode::Ok);
+        }
+        true
+    } else {
+        false
+    };
     if matches!(intent.action, Action::Create) {
         ensure!(
             !args.dry_run,
@@ -59,7 +94,8 @@ pub(super) fn run(
             "Create the {} repository {repository} on {} to prepare its session publication preview?",
             intent.visibility, intent.hub
         );
-        let confirmed = if automatic || std::env::var_os("AGIT_YES").is_some() {
+        let confirmed = if automatic || delivery_confirmed || std::env::var_os("AGIT_YES").is_some()
+        {
             true
         } else {
             ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
@@ -137,6 +173,7 @@ pub(super) fn run(
         identity.clone(),
         remote,
         !args.dry_run,
+        intent.explicit_hub,
     )?;
     let _ = warmed.join();
     let mut projected = ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])
@@ -215,6 +252,10 @@ pub(super) fn run(
             selection.verify(&repo)?;
         }
         selected.verify_configs(&client, &repository)?;
+        let (repo, remote) = intent.materialize(&client, repo)?;
+        if intent.explicit_hub {
+            intent.bind_delivered_origin(&repo, &remote)?;
+        }
         if let (Some(mut reply), Some(candidate)) = (supervisor, supervised) {
             reply.prepare(&repo, &candidate)?;
             reply.complete(&repo, candidate)?;
@@ -242,7 +283,8 @@ pub(super) fn run(
         reviewed.as_ref().is_none_or(|review| review.complete()),
         args.dry_run,
         || {
-            if automatic
+            if delivery_confirmed
+                || automatic
                 || (!args.audit
                     && (std::env::var_os("AGIT_YES").is_some()
                         || (!encrypted && !ui::prompt::can_ask())))
@@ -318,6 +360,9 @@ pub(super) fn run(
         return Ok(publication_failure_code(&report));
     }
     verify_receipt_acknowledgements(&report, &receipts)?;
+    if intent.explicit_hub {
+        intent.bind_delivered_origin(&repo, &remote)?;
+    }
     for receipt in &receipts {
         receipt.save(&repo)?;
     }

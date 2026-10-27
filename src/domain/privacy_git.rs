@@ -34,6 +34,7 @@ mod accepted;
 mod accepted_tests;
 #[cfg(test)]
 mod commit_tests;
+mod delivery;
 pub(crate) mod modes;
 mod published;
 #[cfg(test)]

@@ -25,6 +25,7 @@ use crate::hub::PublishRequest;
 use crate::hub::identity::{self, RemoteIdentity};
 use crate::infra::{config, credentials};
 use crate::{ExitCode, ui};
+use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
@@ -40,6 +41,14 @@ pub struct Args {
     /// Select the retained Hub publication target for a device-local RC repository.
     #[arg(long, value_name = "owner/repo")]
     pub to: Option<String>,
+
+    /// Explicitly deliver this repository to another Hub.
+    ///
+    /// This is a temporary migration escape hatch. It requires credentials already saved for
+    /// the destination Hub and deliberately changes the checkout's immutable publication
+    /// binding only after the destination has been reviewed and accepted.
+    #[arg(long, value_name = "hub-url", conflicts_with = "to")]
+    pub to_hub: Option<String>,
 
     /// Branch to publish (repeatable). Default: the context branch.
     #[arg(short = 'b', long, value_name = "branch")]
@@ -98,6 +107,16 @@ pub fn run(mut args: Args) -> CmdResult {
     if crate::rc::harness::settlement_is_delegated() {
         ui::error(crate::rc::harness::SUPERVISED_SETTLEMENT_MESSAGE);
         ui::hint("finish the turn and let agitd push it under the live identity lease");
+        return Ok(ExitCode::Precondition);
+    }
+    if args.to_hub.is_some()
+        && (std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some()
+            || std::env::var_os(identity::EXPECTED_AGENT_ID_ENV).is_some()
+            || std::env::var_os(crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV).is_some())
+    {
+        ui::error(
+            "--to-hub requires a direct, interactive publication and cannot be used by automatic or supervised push",
+        );
         return Ok(ExitCode::Precondition);
     }
     // The context resolves once: it answers both "which repo" and "which branch", and both
@@ -308,7 +327,32 @@ pub fn run(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    audited_push::run(&args, client, &me, checkout, repo, &branches)
+    let (publication_client, publication_account) = if let Some(destination) = &args.to_hub {
+        let hub = identity::normalize_hub(destination)?;
+        ensure!(
+            hub != identity::normalize_hub(client.base())?,
+            "--to-hub must name a different Hub"
+        );
+        let credential = credentials::load_checked(&hub)?.context(format!(
+            "no saved credentials for {hub}; sign in first with `AGIT_HUB_URL={hub} agit login`"
+        ))?;
+        let account = credential.username.clone();
+        (
+            crate::hub::Client::for_credential(&hub, &credential),
+            account,
+        )
+    } else {
+        (client, me.clone())
+    };
+
+    audited_push::run(
+        &args,
+        publication_client,
+        &publication_account,
+        checkout,
+        repo,
+        &branches,
+    )
 }
 
 /// Normalize the unified human-facing target.  The old bare repo spelling is
@@ -758,6 +802,7 @@ mod tests {
     fn visibility_flags_are_read_from_the_args() {
         let base = || Args {
             to: None,
+            to_hub: None,
             agent: None,
             branch: vec![],
             all: false,

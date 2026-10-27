@@ -35,6 +35,8 @@ const TRANSPORT_USER_AGENT: &str = "synthetic-publisher-transport";
 struct Hub {
     base: String,
     posts: Arc<AtomicUsize>,
+    manifests: Arc<Mutex<Vec<serde_json::Value>>>,
+    registrations: Arc<AtomicUsize>,
     deny: Arc<AtomicBool>,
     unsupported_policy: Arc<AtomicBool>,
     corrupt_receipt: Arc<AtomicBool>,
@@ -64,6 +66,10 @@ impl Hub {
         let stopping = Arc::clone(&stop);
         let posts = Arc::new(AtomicUsize::new(0));
         let received = Arc::clone(&posts);
+        let manifests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_manifests = Arc::clone(&manifests);
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let registered = Arc::clone(&registrations);
         let deny = Arc::new(AtomicBool::new(false));
         let denied = Arc::clone(&deny);
         let unsupported_policy = Arc::new(AtomicBool::new(false));
@@ -206,6 +212,7 @@ impl Hub {
                             .strip_suffix("/privacy-config")
                             .unwrap();
                         if method == "POST" {
+                            registered.fetch_add(1, Ordering::AcqRel);
                             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                             assert_eq!(request["expected_repository_id"], AGENT_ID);
                             let config = json!({"repository_id":AGENT_ID,"session_id":session,"privacy":request["privacy"],"revision":1,"created_at":"2026-01-01T00:00:00Z"});
@@ -335,6 +342,10 @@ impl Hub {
                         let manifest: agit::domain::session_privacy::SessionPublicationManifest =
                             serde_json::from_value(preview["manifest"].clone()).unwrap();
                         manifest.validate().unwrap();
+                        recorded_manifests
+                            .lock()
+                            .unwrap()
+                            .push(preview["manifest"].clone());
                         assert_eq!(
                             preview["snapshot_digest"],
                             agit::domain::privacy_envelope::digest_bytes(
@@ -448,6 +459,8 @@ impl Hub {
         Self {
             base,
             posts,
+            manifests,
+            registrations,
             deny,
             unsupported_policy,
             corrupt_receipt,
@@ -1499,4 +1512,318 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         !String::from_utf8_lossy(&published.stdout).contains("main left as on the Hub"),
         "{published:?}"
     );
+}
+
+/// A migration must send the registered target identity in real Git objects and retain it
+/// when a later ordinary push extends native source history. Same-identity pushes repair origin.
+/// Collaborator commits stay unattributed; unprovable creators fail before any registration.
+/// Legacy birth attribution survives continuation recorded under the destination account.
+#[test]
+fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push() {
+    use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy};
+    use agit::hub::identity::{self, RemoteIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let source_root = temp.path().join("source");
+    let target_root = temp.path().join("target");
+    let source = Hub::start(&source_root, [25; 32]);
+    let target = Hub::start(&target_root, [26; 32]);
+    for hub in [&source, &target] {
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+    let run = |hub: &Hub, args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    for (key, value) in [
+        ("http.userAgent", TRANSPORT_USER_AGENT),
+        ("user.name", "Source Writer"),
+        ("user.email", "source@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ] {
+        repo.git(&["config", key, value]).unwrap();
+    }
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    repo.git(&["checkout", "-b", "work"]).unwrap();
+    let source_account = AccountIdentity::new(&source.base, "account-1").unwrap();
+    let mut metadata = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        "/work".into(),
+    );
+    metadata.session_privacy = None;
+    metadata.committer_account = Some(source_account);
+    fs::write(repo.root().join("artifact.txt"), "Delivered artifact\n").unwrap();
+    let mut claim = metadata.clone();
+    claim.session.clear();
+    storage::write_snapshot(repo.root(), "", "").unwrap();
+    meta::write(repo.root(), &claim).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Claim session").unwrap();
+    let save = |metadata: &meta::Meta, contents: &[&str], message: &str| {
+        let log = transcript::wrap_lines(
+            &contents
+                .iter()
+                .map(|content| {
+                    format!(
+                        "{}\n",
+                        json!({"type":"user","message":{"role":"user","content":content}})
+                    )
+                })
+                .collect::<String>(),
+            "claude-code",
+            &metadata.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), metadata).unwrap();
+        repo.add_all().unwrap();
+        assert!(
+            repo.commit(message).unwrap(),
+            "fixture must create {message}"
+        );
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let first = save(&metadata, &["First turn"], "Subject\n\nMilestone details.");
+    repo.git(&["config", "author.name", "Other Author"])
+        .unwrap();
+    repo.git(&["config", "author.email", "other@example.invalid"])
+        .unwrap();
+    save(
+        &metadata,
+        &["First turn", "Other author's turn"],
+        "Other author, own committer",
+    );
+    repo.git(&["config", "--unset", "author.name"]).unwrap();
+    repo.git(&["config", "--unset", "author.email"]).unwrap();
+    let mut collaborator = metadata.clone();
+    collaborator.committer_account = Some(AccountIdentity::new(&source.base, "account-2").unwrap());
+    save(&collaborator, &["First turn"], "Collaborator contribution");
+    assert_success(&run(&source, &["--yes", "push", "alice/app@work"]));
+    let source_refs = git(&source_root.join("alice/app.git"), &["show-ref"]);
+    for (branch, hub, creator) in [
+        ("foreign", source.base.as_str(), "account-2"),
+        ("unknown", "https://unknown.example", "account-1"),
+    ] {
+        repo.git(&["checkout", "-b", branch]).unwrap();
+        let mut foreign = metadata.clone();
+        foreign.session = format!("agit-{}", "c".repeat(40));
+        foreign.session_privacy =
+            Some(SessionPrivacy::new(Some(AccountIdentity::new(hub, creator).unwrap())).unwrap());
+        save(&foreign, &["Foreign session"], "Foreign creator");
+        let refused = run(
+            &source,
+            &[
+                "--yes",
+                "push",
+                &format!("alice/app@{branch}"),
+                "--to-hub",
+                &target.base,
+            ],
+        );
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("cannot verify this session's creator"),
+            "{refused:?}"
+        );
+        assert_eq!(target.registrations.load(Ordering::Acquire), 0);
+        assert_eq!(target.posts.load(Ordering::Acquire), 0);
+        repo.git(&["checkout", "work"]).unwrap();
+    }
+    let refused = run(&target, &["--yes", "push", "alice/app@work"]);
+    assert!(!refused.status.success());
+    assert_eq!(target.posts.load(Ordering::Acquire), 0);
+    target.corrupt_receipt.store(true, Ordering::Release);
+    let failed = run(
+        &source,
+        &["--yes", "push", "alice/app@work", "--to-hub", &target.base],
+    );
+    assert!(!failed.status.success());
+    assert_eq!(
+        identity::read(&repo).unwrap(),
+        Some(RemoteIdentity::new(&source.base, AGENT_ID).unwrap())
+    );
+    assert_eq!(
+        repo.remote_url().unwrap(),
+        format!("{}/alice/app.git", source.base)
+    );
+    assert_eq!(target.posts.load(Ordering::Acquire), 0);
+    target.corrupt_receipt.store(false, Ordering::Release);
+    let unconfirmed = run(
+        &source,
+        &["push", "alice/app@work", "--to-hub", &target.base],
+    );
+    assert!(!unconfirmed.status.success());
+    assert_eq!(target.posts.load(Ordering::Acquire), 0);
+    assert_success(&run(
+        &source,
+        &["--yes", "push", "alice/app@work", "--to-hub", &target.base],
+    ));
+    let remote = target_root.join("alice/app.git");
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert_ne!(published, first);
+    assert_eq!(
+        git(&remote, &["show", &format!("{published}:artifact.txt")]),
+        "Delivered artifact"
+    );
+    let published_meta: serde_json::Value = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("{published}:session/meta.json")],
+    ))
+    .unwrap();
+    let target_session = published_meta["session"].as_str().unwrap().to_owned();
+    assert_ne!(target_session, metadata.session);
+    let public_log = storage::materialize_at(&remote, &published, meta::LOG_FILE).unwrap();
+    assert!(!public_log.contains(&metadata.session));
+    assert!(public_log.contains(&target_session));
+    assert!(
+        !git_command(&remote)
+            .arg("-C")
+            .arg(&remote)
+            .args(["cat-file", "-e", &first])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(published_meta["session_privacy"]["hub"], target.base);
+    assert!(published_meta["committer_account"].is_null());
+    assert_eq!(published_meta["session_privacy"]["creator"], "account-1");
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%B", &published]),
+        "Collaborator contribution"
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%ae", &published]),
+        "unmapped@agentgit.local"
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%ce", &published]),
+        "unmapped@agentgit.local"
+    );
+    let authored = format!("{published}^");
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%ae", &authored]),
+        "unmapped@agentgit.local"
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%ce", &authored]),
+        "account-1@agentgit.local"
+    );
+    let owned = format!("{published}~2");
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%ae", &owned]),
+        "account-1@agentgit.local"
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%B", &owned]),
+        "Subject\n\nMilestone details."
+    );
+    assert_eq!(
+        identity::read(&repo).unwrap(),
+        Some(RemoteIdentity::new(&target.base, AGENT_ID).unwrap())
+    );
+    let source_after = meta::read_at_ref_result(&repo, &first).unwrap().unwrap();
+    assert_eq!(source_after.session, metadata.session);
+    metadata.committer_account = Some(AccountIdentity::new(&target.base, "account-1").unwrap());
+    metadata.turn = Some(2);
+    let second = save(
+        &metadata,
+        &["First turn", "Second turn"],
+        "Second subject\n\nSecond body.",
+    );
+    repo.git(&["remote", "remove", "origin"]).unwrap();
+    assert_success(&run(&target, &["--yes", "push", "alice/app@work"]));
+    assert_eq!(
+        repo.remote_url().as_deref(),
+        Some(format!("{}/alice/app.git", target.base).as_str())
+    );
+    let continued = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert_ne!(continued, second);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{continued}^")]),
+        published
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%B", &continued]),
+        "Second subject\n\nSecond body."
+    );
+    let continued_meta: serde_json::Value = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("{continued}:session/meta.json")],
+    ))
+    .unwrap();
+    assert_eq!(continued_meta["session"], target_session);
+    assert_eq!(continued_meta["committer_account"]["hub"], target.base);
+    let received = target.posts.load(Ordering::Acquire);
+    repo.set_remote("https://obsolete.example/alice/app.git")
+        .unwrap();
+    assert_success(&run(&target, &["--yes", "push", "alice/app@work"]));
+    assert_eq!(target.posts.load(Ordering::Acquire), received);
+    assert_eq!(
+        repo.remote_url().unwrap(),
+        format!("{}/alice/app.git", target.base)
+    );
+    assert_success(&run(&target, &["push", "alice/app@work", "--dry-run"]));
+    assert_eq!(target.posts.load(Ordering::Acquire), received);
+    assert_eq!(
+        git(&source_root.join("alice/app.git"), &["show-ref"]),
+        source_refs
+    );
+    for manifest in target.manifests.lock().unwrap().iter() {
+        for snapshot in manifest["snapshots"].as_array().unwrap() {
+            if let Some(session) = snapshot.get("session_id") {
+                let commit = snapshot["commit"].as_str().unwrap();
+                let actual: serde_json::Value = serde_json::from_str(&git(
+                    &remote,
+                    &["show", &format!("{commit}:session/meta.json")],
+                ))
+                .unwrap();
+                assert_eq!(&actual["session"], session);
+                assert_eq!(session, &target_session);
+            }
+        }
+    }
 }

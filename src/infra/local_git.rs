@@ -656,8 +656,18 @@ mod tests {
     fn internal_input_failure_preserves_the_default_terminal_sigpipe_policy() {
         let root = tempfile::tempdir().unwrap();
         let pid = root.path().join("sigpipe-parent");
-        let output = Deadline::new()
-            .output(child("sigpipe-parent", &pid), None, 4096)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The fixture supervises a nested query, so its own deadline includes that query's cleanup.
+        let output = runtime
+            .block_on(execute_with_input(
+                child("sigpipe-parent", &pid),
+                None,
+                4096,
+                Instant::now() + SEARCH_TIMEOUT,
+            ))
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_reaped(std::fs::read_to_string(pid).unwrap().parse().unwrap());

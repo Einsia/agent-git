@@ -34,6 +34,52 @@ mapped parents when their birth metadata declares encryption; event bytes and fi
 unchanged. Accepted history retains its exact commits. Custom tags targeting rewritten commits
 must be removed before publication or recreated on the accepted public commits.
 
+## Deliver a bound repository to another Hub
+
+A repository first registered on one Hub remains bound to that Hub for ordinary pushes. During a
+deliberate migration, use the explicit destination flag with credentials already saved for the
+destination:
+
+```sh
+agit push alice/project@work --to-hub https://agent-git.example
+```
+
+The command reviews and confirms the destination before publishing. It then replaces the local
+immutable Hub and agent binding and updates `origin`. For later ordinary pushes, select that Hub
+with `AGIT_HUB_URL` (or `agit config --global hub.url`). No destination credential is inferred
+from `AGIT_HUB_URL`, and the flag cannot be combined with the device-local `--to` publication
+target. Sign in to the destination first when needed:
+
+```sh
+AGIT_HUB_URL=https://agent-git.example agit login
+```
+
+This is an explicit migration operation; automatic and supervised publication cannot invoke it.
+Use `--yes` when authorizing the migration from an agent or script. The target receives independent
+plain session identities and newly protected session snapshots; encrypted source sessions are
+refused. The source history remains local and the source Hub is unchanged.
+
+Delivery requires evidence that the session creator is your signed-in account on the source Hub.
+Keep that Hub's saved sign-in with an immutable account ID available on this device. A different
+creator, a missing source account, or an unresolved creator stops the operation before any
+destination session is registered. The Hub registration API does not yet support creating a
+session owned by the delivering account without claiming that account as its creator.
+
+Only your source committer account is mapped to your target account. Other source accounts are
+omitted, and their Git signatures use `AgentGit <unmapped@agentgit.local>`. A Git author different
+from the committer also remains unmapped. Account identities already belonging to the target Hub
+stay on that Hub. The saved delivery belongs to its original target account; switching accounts
+cannot silently change attribution.
+
+This migration keeps the destination-specific session IDs and refuses encrypted history. Stable
+plain session IDs, creatorless registrations, named Hub remotes, and selectively publishing
+encrypted sessions from local plaintext remain separate design and protocol decisions.
+
+Session and account mappings are retained privately under the checkout's Git common directory,
+scoped to the target Hub and immutable repository identity. Keep this local state: after recording
+more turns, an ordinary push to the target Hub continues the delivered session. A failed delivery
+keeps the source Hub binding, and retrying the explicit command reuses the prepared target identity.
+
 ## Tool and attachment publication
 
 Privacy projections show tool calls and results by default, and retain recorded attachments in

@@ -53,7 +53,11 @@ if ($Suite -ne 'integration') {
     }
 }
 & cargo @cargoArgs
-if ($LASTEXITCODE -ne 0) { throw "Windows $Suite tests failed" }
+$testExitCode = $LASTEXITCODE
+if ($testExitCode -ne 0) {
+    $testExitHex = '{0:X8}' -f ($testExitCode -band 0xffffffffL)
+    throw "Windows $Suite tests failed: cargo nextest exited with $testExitCode (0x$testExitHex)"
+}
 if ($Suite -ne 'unit') {
     $env:AGIT_NPM_SMOKE_BINARY = (Resolve-Path "target/$target/debug/agit.exe").Path
     & node npm/smoke.mjs

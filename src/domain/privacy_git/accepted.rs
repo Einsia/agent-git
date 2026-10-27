@@ -25,6 +25,8 @@ pub(super) struct Mapping {
     pub recipient: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plain: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered: bool,
 }
 
 impl Mapping {
@@ -203,7 +205,7 @@ impl Ledger {
             (receipt.mode == crate::domain::privacy_receipt::PublicationMode::SessionPlain
                 && entry.plain
                 && entry.recipient.is_none()
-                && entry.source_session == entry.public_session
+                && (entry.delivered || entry.source_session == entry.public_session)
                 && Some(&entry.public_session) == receipt.projected_session_id.as_ref())
                 || receipt.mode.is_encrypted()
                     && ((Some(entry.policy.as_str()) == receipt.policy_digest.as_deref()
@@ -331,8 +333,19 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
         super::super::privacy_envelope::validate_digest(&entry.policy)?;
         if entry.plain {
             ensure!(
-                entry.recipient.is_none() && entry.source_session == entry.public_session,
+                entry.recipient.is_none()
+                    && (entry.delivered || entry.source_session == entry.public_session),
                 "plain mapping cannot change session authority or carry an encryption recipient"
+            );
+        }
+        if entry.delivered {
+            ensure!(
+                entry.plain
+                    && (entry.source_session.is_empty() && entry.public_session.is_empty()
+                        || meta::is_bare_id(&entry.source_session)
+                            && meta::is_bare_id(&entry.public_session)
+                            && entry.source_session != entry.public_session),
+                "delivered mapping must retain independent plain session identities"
             );
         }
         if let Some(recipient) = &entry.recipient {
@@ -348,7 +361,7 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
 }
 
 fn compatible_recipient(left: &Mapping, right: &Mapping) -> bool {
-    if left.plain != right.plain {
+    if left.plain != right.plain || left.delivered != right.delivered {
         return false;
     }
     match (&left.recipient, &right.recipient) {

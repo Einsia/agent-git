@@ -70,6 +70,7 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
         policy: PrivacyPolicy::default().digest().unwrap(),
         recipient: None,
         plain: false,
+        delivered: false,
     };
     accepted::Ledger::open(&source, &identity)
         .unwrap()
@@ -99,6 +100,7 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     source.commit("Cross-runtime fork").unwrap();
     let head = source.git(&["rev-parse", "HEAD"]).unwrap();
     let selected = SessionPublicationPlan {
+        delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
             heads: vec![base.clone()],
@@ -291,6 +293,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     fs::write(source.root().join("README.md"), "Accepted plain file\n").unwrap();
     let base = save(&legacy, "Accepted plain conversation");
     let mut selected = SessionPublicationPlan {
+        delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
             heads: vec![base.clone()],
@@ -771,6 +774,7 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
     let original = save("Original session snapshot");
     let key = SecretKey::from([45; 32]);
     let mut selected = SessionPublicationPlan {
+        delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs::default(),
         configs: BTreeMap::from([(
@@ -970,6 +974,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         .to_owned();
     let mapping = accepted::Mapping {
         plain: false,
+        delivered: false,
         source: original.clone(),
         public: public.clone(),
         source_parents: vec![],
@@ -994,6 +999,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         )]))
         .unwrap();
     let mut selected = SessionPublicationPlan {
+        delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
             heads: vec![public.clone()],

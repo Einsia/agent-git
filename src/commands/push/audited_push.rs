@@ -67,11 +67,15 @@ pub(super) fn run(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing publication"
     );
-    let local_target = crate::rc::local_repository::publication::Selection::prepare(
-        &repo,
-        args.to.as_deref(),
-        client.base(),
-    )?;
+    let local_target = if args.to_hub.is_some() {
+        None
+    } else {
+        crate::rc::local_repository::publication::Selection::prepare(
+            &repo,
+            args.to.as_deref(),
+            client.base(),
+        )?
+    };
     let destination_checkout = local_target
         .as_ref()
         .map(|selection| selection.checkout(&checkout.path))
@@ -107,6 +111,9 @@ fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
     }
     if let Some(destination) = &args.to {
         command.push_str(&format!(" --to={}", quote_arg(destination)));
+    }
+    if let Some(destination) = &args.to_hub {
+        command.push_str(&format!(" --to-hub={}", quote_arg(destination)));
     }
     for (selected, flag) in [
         (args.audit, "--audit"),
@@ -267,6 +274,8 @@ struct Intent {
     url: String,
     visibility: String,
     accept_secret_findings: bool,
+    explicit_hub: bool,
+    source_identity: Option<RemoteIdentity>,
     action: Action,
 }
 
@@ -279,8 +288,14 @@ impl Intent {
         repo: &Repo,
     ) -> Result<Self> {
         let hub = identity::normalize_hub(client.base())?;
-        let expected = identity::expected_for_transport(repo, client.base())?;
-        let requires_existing = expected.is_some() || identity::read(repo)?.is_some();
+        let cross_hub = args.to_hub.is_some();
+        let expected = if cross_hub {
+            None
+        } else {
+            identity::expected_for_transport(repo, client.base())?
+        };
+        let requires_existing =
+            !cross_hub && (expected.is_some() || identity::read(repo)?.is_some());
         let source = if requires_existing {
             Some(super::super::remote_request(
                 client.get_agent(&checkout.owner, &checkout.name),
@@ -320,7 +335,12 @@ impl Intent {
         );
         let (owner, visibility, url, action) = if let Some(remote) = source {
             verify_agent_location(&hub, &checkout.owner, &checkout.name, &remote)?;
-            identity::verify_transport_target(repo, &RemoteIdentity::new(&hub, &remote.agent_id)?)?;
+            if !cross_hub {
+                identity::verify_transport_target(
+                    repo,
+                    &RemoteIdentity::new(&hub, &remote.agent_id)?,
+                )?;
+            }
             (
                 checkout.owner.clone(),
                 remote.visibility.clone(),
@@ -328,10 +348,12 @@ impl Intent {
                 Action::Existing(remote),
             )
         } else {
-            ensure!(
-                expected.is_none() && identity::read(repo)?.is_none(),
-                "the pinned remote is unavailable; refusing to create a replacement"
-            );
+            if !cross_hub {
+                ensure!(
+                    expected.is_none() && identity::read(repo)?.is_none(),
+                    "the pinned remote is unavailable; refusing to create a replacement"
+                );
+            }
             let public = match wanted_visibility(args, repo).value() {
                 Some(public) => public,
                 None => first_visibility(None, ask_visibility(&checkout.name)?),
@@ -350,6 +372,7 @@ impl Intent {
         verify_url(&hub, &url)?;
         if let Action::Existing(remote) = &action
             && let Some(pinned) = identity::read(repo)?
+            && !cross_hub
         {
             ensure!(
                 pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
@@ -369,6 +392,8 @@ impl Intent {
             url,
             visibility,
             accept_secret_findings,
+            explicit_hub: cross_hub,
+            source_identity: identity::read(repo)?,
             action,
         };
         intent.verify_account(client)?;
@@ -386,7 +411,7 @@ impl Intent {
     fn verify_account(&self, client: &Client) -> Result<()> {
         ensure!(
             identity::normalize_hub(client.base())? == self.hub
-                && identity::normalize_hub(&config::hub_url())? == self.hub,
+                && (self.explicit_hub || identity::normalize_hub(&config::hub_url())? == self.hub),
             "the selected Hub changed during publication"
         );
         let credential = credentials::load_checked(&self.hub)?
@@ -413,25 +438,35 @@ impl Intent {
     }
 
     fn verify_before_mutation(&self, client: &Client, repo: &Repo) -> Result<()> {
+        if self.explicit_hub {
+            ensure!(
+                identity::read(repo)? == self.source_identity,
+                "the source repository binding changed during cross-Hub review"
+            );
+        }
         match &self.action {
             Action::Existing(expected) => {
                 let observed = lookup(client, &self.owner, &self.name)?
                     .context("the publication destination disappeared")?;
                 self.verify_observed(&observed, Some(&expected.agent_id))?;
-                identity::verify_transport_target(
-                    repo,
-                    &RemoteIdentity::new(&self.hub, &observed.agent_id)?,
-                )?;
+                if !self.explicit_hub {
+                    identity::verify_transport_target(
+                        repo,
+                        &RemoteIdentity::new(&self.hub, &observed.agent_id)?,
+                    )?;
+                }
             }
             Action::Create => {
                 if let Some(observed) = lookup(client, &self.owner, &self.name)? {
                     self.verify_observed(&observed, None)?;
                     self.verify_write_access(client, &observed.agent_id)?;
                 }
-                ensure!(
-                    identity::expected_for_transport(repo, &self.hub)?.is_none(),
-                    "the RC identity forbids creating a replacement"
-                );
+                if !self.explicit_hub {
+                    ensure!(
+                        identity::expected_for_transport(repo, &self.hub)?.is_none(),
+                        "the RC identity forbids creating a replacement"
+                    );
+                }
             }
         }
         Ok(())
@@ -445,7 +480,9 @@ impl Intent {
             .context("the publication destination disappeared; refusing to create a replacement")?;
         self.verify_observed(&observed, Some(&expected.agent_id))?;
         let identity = RemoteIdentity::new(&self.hub, &observed.agent_id)?;
-        identity::verify_transport_target(&repo, &identity)?;
+        if !self.explicit_hub {
+            identity::verify_transport_target(&repo, &identity)?;
+        }
         let remote = Remote {
             owner: observed.owner,
             name: observed.name,
@@ -455,13 +492,31 @@ impl Intent {
         };
         self.verify_remote(&remote)?;
         self.verify_write_access(client, &remote.identity.agent_id)?;
-        bind_publication_origin(
-            &repo,
-            &format!("{}/{}", self.owner, self.name),
-            &remote.identity,
-            &remote.push_url,
-        )?;
+        if !self.explicit_hub {
+            bind_publication_origin(
+                &repo,
+                &format!("{}/{}", self.owner, self.name),
+                &remote.identity,
+                &remote.push_url,
+            )?;
+        }
         Ok((repo, remote))
+    }
+
+    fn bind_delivered_origin(&self, repo: &Repo, remote: &Remote) -> Result<()> {
+        self.verify_remote(remote)?;
+        super::write_checkout_config(&format!("{}/{}", self.owner, self.name), || {
+            ensure!(
+                identity::read(repo)? == self.source_identity,
+                "the source repository binding changed during cross-Hub publication"
+            );
+            if let Some(previous) = &self.source_identity {
+                identity::rebind(repo, previous, &remote.identity)?;
+            } else {
+                identity::pin(repo, &remote.identity)?;
+            }
+            repo.set_remote(&remote.push_url)
+        })
     }
 
     fn verify_write_access(&self, client: &Client, agent_id: &str) -> Result<()> {

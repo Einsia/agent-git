@@ -140,6 +140,7 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
             unrelated = snapshot.published_commit.clone();
         }
         let mapping = accepted::Mapping {
+            delivered: false,
             plain: false,
             source: source_id.clone(),
             public: canonical.published_commit.clone(),

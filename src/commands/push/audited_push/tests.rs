@@ -91,6 +91,34 @@ fn audit_json_is_rejected_without_changing_ordinary_push_json() {
     assert!(crate::commands::json::incompatible(&cli.command.unwrap()).is_none());
 }
 
+#[test]
+fn cross_hub_delivery_requires_an_explicit_destination_flag() {
+    let cli = crate::commands::Cli::try_parse_from([
+        "agit",
+        "push",
+        "me/qa@work",
+        "--to-hub",
+        "https://other.example",
+    ])
+    .unwrap();
+    let crate::commands::Commands::Push(args) = cli.command.unwrap() else {
+        panic!("push command")
+    };
+    assert_eq!(args.to_hub.as_deref(), Some("https://other.example"));
+    assert!(
+        crate::commands::Cli::try_parse_from([
+            "agit",
+            "push",
+            "me/qa@work",
+            "--to-hub",
+            "https://other.example",
+            "--to",
+            "me/qa",
+        ])
+        .is_err()
+    );
+}
+
 fn remote() -> RemoteAgent {
     RemoteAgent {
         agent_id: "11111111-1111-4111-8111-111111111111".into(),
@@ -114,6 +142,8 @@ fn intent() -> Intent {
         url: remote.clone_url.clone(),
         visibility: remote.visibility.clone(),
         accept_secret_findings: false,
+        explicit_hub: false,
+        source_identity: None,
         action: Action::Existing(remote),
     }
 }

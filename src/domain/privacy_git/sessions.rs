@@ -3,8 +3,8 @@
 use super::*;
 use crate::domain::privacy_envelope::digest_bytes;
 use crate::domain::session_privacy::{
-    AcceptedSnapshot, PublishedSnapshot, SESSION_ENVELOPE_VERSION, SessionPublicationManifest,
-    SessionScheme, SessionSnapshotBinding, SourceCommitter,
+    AcceptedSnapshot, PublishedSnapshot, SESSION_ENVELOPE_VERSION, SessionPrivacy,
+    SessionPublicationManifest, SessionScheme, SessionSnapshotBinding, SourceCommitter,
 };
 use crate::hub::{
     git::RemoteRefs, identity::RemoteIdentity, privacy::sessions::SessionPrivacyResponse,
@@ -19,9 +19,11 @@ pub struct SessionPublicationPlan {
     pub identity: RemoteIdentity,
     pub remote: RemoteRefs,
     pub configs: BTreeMap<String, SessionPrivacyResponse>,
+    pub(crate) delivery: Option<super::delivery::Delivery>,
 }
 
 impl SessionPublicationPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         source: &Repo,
         branches: &[String],
@@ -30,6 +32,7 @@ impl SessionPublicationPlan {
         identity: RemoteIdentity,
         remote: RemoteRefs,
         register: bool,
+        explicit_hub: bool,
     ) -> Result<Self> {
         ensure!(
             crate::domain::session_privacy::canonical_hub(client.base())? == identity.hub,
@@ -43,6 +46,7 @@ impl SessionPublicationPlan {
         let accepted = plan.accepted_commits(source, &remote.heads)?;
         let enveloped = enveloped_commits(source, plan.commit_objects())?;
         let mut sessions = BTreeSet::new();
+        let mut source_hubs = BTreeSet::new();
         for oid in plan.commit_objects() {
             let mut inherited = false;
             for branch in branches {
@@ -52,6 +56,16 @@ impl SessionPublicationPlan {
                 continue;
             }
             let metadata = history.metadata(source, oid)?;
+            if let Some(account) = &metadata.committer_account {
+                source_hubs.insert(account.hub.clone());
+            }
+            if let Some(hub) = metadata
+                .session_privacy
+                .as_ref()
+                .and_then(|privacy| privacy.hub.as_ref())
+            {
+                source_hubs.insert(hub.clone());
+            }
             ensure!(
                 !enveloped.contains(oid),
                 "unaccepted ciphertext requires its original publication authority"
@@ -64,16 +78,61 @@ impl SessionPublicationPlan {
                 sessions.insert(metadata.session);
             }
         }
+        for session in &sessions {
+            let birth = &history.births[session];
+            if let Some(account) = &birth.committer {
+                source_hubs.insert(account.hub.clone());
+            }
+            if let Some(hub) = birth
+                .privacy
+                .as_ref()
+                .and_then(|privacy| privacy.hub.as_ref())
+            {
+                source_hubs.insert(hub.clone());
+            }
+        }
+        let mut delivery = super::delivery::Delivery::prepare(
+            source,
+            &identity,
+            client,
+            explicit_hub,
+            &sessions,
+            register,
+        )?;
+        // Every selected source is admitted before registering any destination session.
+        if let Some(delivery) = &mut delivery {
+            delivery.load_source_accounts(&source_hubs)?;
+            for session in &sessions {
+                let birth = &history.births[session];
+                let privacy = match &birth.privacy {
+                    Some(privacy) => privacy.clone(),
+                    None => SessionPrivacy::new(birth.committer.clone())?,
+                };
+                delivery
+                    .admit_session(session, &privacy)
+                    .with_context(|| format!("cannot deliver session {session}"))?;
+            }
+        }
         let mut configs = BTreeMap::new();
         for session in sessions {
+            let target_session = match &delivery {
+                Some(delivery) => delivery.session(&session)?.to_owned(),
+                None => session.clone(),
+            };
             let _mode_lock = super::modes::lock(source, &identity.hub, &session)?;
-            let mut choice = super::modes::load(source, &identity.hub, &session)?;
+            let mut choice = if delivery.is_some() {
+                None
+            } else {
+                super::modes::load(source, &identity.hub, &session)?
+            };
             if let Some(choice) = &choice {
                 choice.verify(&identity, repository)?;
             }
-            let response = match client
-                .registered_session_privacy(repository, &identity, &session)?
-            {
+            let response = match client.registered_session_privacy(
+                repository,
+                &identity,
+                &target_session,
+            )? {
                 Some(response) => {
                     ensure!(
                         choice
@@ -99,6 +158,9 @@ impl SessionPublicationPlan {
                             birth.committer.clone(),
                         )?,
                     };
+                    if let Some(delivery) = &delivery {
+                        privacy = delivery.registration(&session)?.clone();
+                    }
                     if privacy.owner_source
                         == super::super::session_privacy::OwnerResolution::Unresolved
                     {
@@ -109,6 +171,10 @@ impl SessionPublicationPlan {
                         privacy.scheme = scheme;
                     }
                     if let Some(choice) = &mut choice {
+                        ensure!(
+                            !explicit_hub,
+                            "a cross-Hub delivery cannot reuse the source session mode"
+                        );
                         ensure!(
                             choice.actor == account
                                 && privacy.owner
@@ -130,16 +196,29 @@ impl SessionPublicationPlan {
                     {
                         client.ensure_session_key(&account)?;
                     }
-                    client.register_session_privacy(repository, &identity, &session, &privacy)?
+                    client.register_session_privacy(
+                        repository,
+                        &identity,
+                        &target_session,
+                        &privacy,
+                    )?
                 }
             };
-            configs.insert(session, response);
+            if let Some(delivery) = &delivery {
+                response.config.verify_registration(
+                    &identity.agent_id,
+                    &target_session,
+                    delivery.registration(&session)?,
+                )?;
+            }
+            configs.insert(target_session, response);
         }
         plan.verify(source, branches)?;
         Ok(Self {
             identity,
             remote,
             configs,
+            delivery,
         })
     }
 
@@ -329,7 +408,12 @@ impl ProjectedHistory {
         let mut imports = crate::commands::plumbing::CommitImports::default();
         #[cfg(test)]
         let mut preparations = 0;
-        PathAliasStore::transact(&source, |aliases| {
+        let alias_repo = if selected.delivery.is_some() {
+            &repo
+        } else {
+            &source
+        };
+        PathAliasStore::transact(alias_repo, |aliases| {
             for head in source_plan.heads() {
                 let branch = head
                     .name()
@@ -436,13 +520,18 @@ impl ProjectedHistory {
                                 policy: policy_digest.clone(),
                                 recipient: None,
                                 plain: false,
+                                delivered: false,
                             },
                         );
                         continue;
                     }
-                    let metadata = source_sessions.metadata(&source, oid).context(
+                    let original_metadata = source_sessions.metadata(&source, oid).context(
                         "introduced snapshots require declared file or session metadata",
                     )?;
+                    let metadata = match &selected.delivery {
+                        Some(delivery) => delivery.metadata(&original_metadata)?,
+                        None => original_metadata.clone(),
+                    };
                     let config = if metadata.is_file_line() {
                         None
                     } else {
@@ -464,7 +553,22 @@ impl ProjectedHistory {
                             "encrypted or obsolete ciphertext cannot be admitted as plaintext"
                         );
                         imports.add(oid, &parents[oid]);
-                        let public = if let Some(response) = config {
+                        let public = if let Some(delivery) = &selected.delivery {
+                            let (commit, report) =
+                                delivery.project_snapshot(super::delivery::Snapshot {
+                                    source: &source,
+                                    destination: &repo,
+                                    oid,
+                                    parents: &public_parents,
+                                    metadata: &original_metadata,
+                                    policy: &policy,
+                                    aliases,
+                                    branch,
+                                    redactor,
+                                })?;
+                            reports.push(report);
+                            commit
+                        } else if let Some(response) = config {
                             let mut published = metadata.clone();
                             if published
                                 .session_privacy
@@ -473,7 +577,8 @@ impl ProjectedHistory {
                             {
                                 published.session_privacy = Some(response.config.privacy.clone());
                             }
-                            if metadata.session_privacy == published.session_privacy
+                            if selected.delivery.is_none()
+                                && metadata.session_privacy == published.session_privacy
                                 && public_parents == parents[oid]
                             {
                                 oid.clone()
@@ -512,11 +617,12 @@ impl ProjectedHistory {
                                 source_parents: parents[oid].clone(),
                                 public_parents,
                                 store: store.clone(),
-                                source_session: metadata.session.clone(),
+                                source_session: original_metadata.session,
                                 public_session: metadata.session,
                                 policy: policy_digest.clone(),
                                 recipient: None,
                                 plain: rewritten,
+                                delivered: selected.delivery.is_some(),
                             },
                         );
                         continue;
@@ -649,6 +755,7 @@ impl ProjectedHistory {
                             policy: policy_digest.clone(),
                             recipient: Some(binding.owner_key.fingerprint()?),
                             plain: false,
+                            delivered: false,
                         },
                     );
                     reports.push(projection.report().clone());
