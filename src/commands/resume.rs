@@ -1176,7 +1176,7 @@ fn resume_branch_for(
         let existing = &active[0];
         match claim_activity(repo, &committed_log, existing)? {
             ClaimActivity::Untouched => active,
-            ClaimActivity::Appended if tail_is_bookkeeping(&committed_log, existing)? => {
+            ClaimActivity::Appended if tail_is_bookkeeping(&committed_log, &snap, existing)? => {
                 println!(
                     "{}",
                     ui::dim(
@@ -1641,19 +1641,44 @@ enum ClaimActivity {
 /// be settled. Every record of the tail must be one its adapter recognizes as bookkeeping: a
 /// conversational record, an unknown shape or a partial line is unsettled work and keeps the
 /// refusal. An unreadable transcript is not bookkeeping.
-fn tail_is_bookkeeping(committed_log: &str, link: &Link) -> crate::Result<bool> {
+fn tail_is_bookkeeping(committed_log: &str, snap: &meta::Meta, link: &Link) -> crate::Result<bool> {
     let Ok(live) = link.read() else {
         return Ok(false);
     };
-    live_tail_is_bookkeeping(committed_log, link, &live)
+    live_tail_is_bookkeeping(committed_log, snap, link, &live)
 }
 
-fn live_tail_is_bookkeeping(committed_log: &str, link: &Link, live: &str) -> crate::Result<bool> {
+/// The tail starts where settlement stops offering records: past the baseline and the records
+/// before the next prompt for a materialized claim; past the committed envelopes, or past the
+/// head's last turn where settlement counts turns by ordinal, for a native one.
+fn live_tail_is_bookkeeping(
+    committed_log: &str,
+    snap: &meta::Meta,
+    link: &Link,
+    live: &str,
+) -> crate::Result<bool> {
     let tail = match link.baseline_bytes {
-        Some(baseline) => usize::try_from(baseline)
+        Some(baseline) => match usize::try_from(baseline)
             .ok()
-            .and_then(|offset| live.get(offset..)),
-        None => Some(unsettled_native_tail(committed_log, live)),
+            .and_then(|offset| live.get(offset..))
+        {
+            Some(region) => {
+                let turnless = super::commit::leading_turnless_len(&link.source, region)?;
+                region.get(turnless.unwrap_or(0)..)
+            }
+            None => None,
+        },
+        None => {
+            let runtime = if snap.runtime.is_empty() {
+                link.source.as_str()
+            } else {
+                snap.runtime.as_str()
+            };
+            let committed = live.len() - unsettled_native_tail(committed_log, live).len();
+            let counted =
+                super::commit::ordinal_settled_end(runtime, live, snap.turn.unwrap_or(0))?;
+            live.get(committed.max(counted.unwrap_or(0))..)
+        }
     };
     let Some(tail) = tail else {
         return Ok(false);
@@ -1703,16 +1728,26 @@ pub(crate) fn require_merge_claims(
     }
     let snapshot = meta::read_at_ref_result(repo, head)?
         .ok_or_else(|| anyhow::anyhow!("the merge target has no session metadata"))?;
-    let committed = committed_log(repo, head, &snapshot)?;
+    let log = committed_log(repo, head, &snapshot)?;
+    let settled = SettledHead {
+        log: &log,
+        meta: &snapshot,
+    };
     for claim in active {
-        require_merge_claim(repo, &committed, &claim, slug, branch, allow_settlement)?;
+        require_merge_claim(repo, &settled, &claim, slug, branch, allow_settlement)?;
     }
     Ok(())
 }
 
+/// What a branch head has settled: its committed LOG and the metadata that counts its turns.
+pub(crate) struct SettledHead<'a> {
+    pub(crate) log: &'a str,
+    pub(crate) meta: &'a meta::Meta,
+}
+
 fn require_merge_claim(
     repo: &Repo,
-    committed: &str,
+    settled: &SettledHead<'_>,
     claim: &Link,
     slug: &str,
     branch: &str,
@@ -1721,20 +1756,12 @@ fn require_merge_claim(
     let bytes = claim.read_bytes().map_err(|_| anyhow::anyhow!(
         "cannot read the active runtime transcript; merge cannot prove {slug}@{branch} is settled"
     ))?;
-    require_merge_claim_with_bytes(
-        repo,
-        committed,
-        claim,
-        slug,
-        branch,
-        &bytes,
-        allow_settlement,
-    )
+    require_merge_claim_with_bytes(repo, settled, claim, slug, branch, &bytes, allow_settlement)
 }
 
 pub(crate) fn require_merge_claim_with_bytes(
     repo: &Repo,
-    committed: &str,
+    settled: &SettledHead<'_>,
     claim: &Link,
     slug: &str,
     branch: &str,
@@ -1758,7 +1785,7 @@ pub(crate) fn require_merge_claim_with_bytes(
             link::MaterializationActivity::Unverifiable => ClaimActivity::Unverifiable,
         }
     } else {
-        native_claim_activity(repo, committed, text)?
+        native_claim_activity(repo, settled.log, text)?
     };
     if activity == ClaimActivity::Untouched {
         return Ok(());
@@ -1766,7 +1793,9 @@ pub(crate) fn require_merge_claim_with_bytes(
     // Settlement leaves a bookkeeping-only tail where it was, so the check after it must accept
     // the same tail that a runtime switch accepts, or merge asks for a commit that has nothing
     // to settle.
-    if activity == ClaimActivity::Appended && live_tail_is_bookkeeping(committed, claim, text)? {
+    if activity == ClaimActivity::Appended
+        && live_tail_is_bookkeeping(settled.log, settled.meta, claim, text)?
+    {
         return Ok(());
     }
     if activity == ClaimActivity::Appended && allow_settlement {
@@ -2149,7 +2178,9 @@ fn materialize_and_resume(
     for (_, current) in &locked_supersede {
         if !args.force {
             let mut activity = claim_activity(repo, committed_log, current)?;
-            if activity == ClaimActivity::Appended && tail_is_bookkeeping(committed_log, current)? {
+            if activity == ClaimActivity::Appended
+                && tail_is_bookkeeping(committed_log, snap, current)?
+            {
                 activity = ClaimActivity::Untouched;
             }
             if activity != ClaimActivity::Untouched {

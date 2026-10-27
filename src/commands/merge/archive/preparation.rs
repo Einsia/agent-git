@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use super::{activation, file_agent, read_native, require_destination_routing};
 use crate::Result;
 use crate::adapter::{self, Installed};
+use crate::commands::resume::SettledHead;
 use crate::domain::link::{self, ArchiveLinkSnapshot, Link};
 use crate::domain::merge_archive::{
     self, ArchivePhase, ExplorationBinding, FrozenFileTarget, FrozenMergeSource, MergeArchiveRole,
@@ -115,7 +116,7 @@ fn require_claims(
     request: &PreparationRequest<'_>,
     branch: &str,
     selected: &[ArchiveLinkSnapshot],
-    committed: &str,
+    settled: &SettledHead<'_>,
     read: &impl Fn(&Link) -> Result<Vec<u8>>,
     recovery: bool,
     check_native: bool,
@@ -133,7 +134,7 @@ fn require_claims(
     for image in selected.iter().filter(|_| check_native) {
         crate::commands::resume::require_merge_claim_with_bytes(
             request.repo,
-            committed,
+            settled,
             &image.link,
             request.slug,
             branch,
@@ -284,6 +285,10 @@ fn prepare_with(
         .context("archive target metadata is missing")?;
     let committed =
         storage::materialize_at(request.repo.root(), &role.origin_head, meta::LOG_FILE)?;
+    let settled = SettledHead {
+        log: &committed,
+        meta: &metadata,
+    };
     let mut lossy = adapter::is_lossy_conversion(&metadata.runtime, runtime);
     let (binding, installed, previous_claims, original_json, unresolved) = if let Some(journal) =
         previous
@@ -386,7 +391,7 @@ fn prepare_with(
             &request,
             &role.branch,
             &previous_claims,
-            &committed,
+            &settled,
             &read,
             false,
             true,
@@ -475,7 +480,7 @@ fn prepare_with(
             &request,
             &role.branch,
             &previous_claims,
-            &committed,
+            &settled,
             &read,
             false,
             true,
@@ -514,7 +519,7 @@ fn prepare_with(
                 &request,
                 &binding.role.branch,
                 &previous_claims,
-                &committed,
+                &settled,
                 &read,
                 true,
                 !open_replay,

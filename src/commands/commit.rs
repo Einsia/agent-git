@@ -1163,6 +1163,77 @@ pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<boo
     Ok(in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some())
 }
 
+/// The end of the last turn that settlement by ordinal counts as landed in a native transcript
+/// whose branch head records `settled` turns; `None` when settlement selects new turns by the
+/// retained LOG prefix instead.
+///
+/// Without terminal native records, every record up to the end of the head's last turn belongs
+/// to that turn, including records written after the committed LOG ends: a reply finished after
+/// its turn was settled waits for the next turn and is not offered on its own. A check that
+/// asks whether a claim still holds settleable work must start here, or it demands a commit
+/// that reports "nothing new".
+pub(crate) fn ordinal_settled_end(
+    runtime: &str,
+    text: &str,
+    settled: u32,
+) -> crate::Result<Option<usize>> {
+    let Some(last) = (settled as usize).checked_sub(1) else {
+        return Ok(None);
+    };
+    let adapter = crate::adapter::get(runtime)?;
+    let ir = adapter.parse(text)?;
+    if adapter.requires_turn_end()
+        || ir
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::TurnEnd)
+    {
+        return Ok(None);
+    }
+    Ok(turn_chunks(text, &ir, &adapter.open_tool_calls(text))
+        .get(last)
+        .map(|chunk| chunk.end_byte))
+}
+
+/// How much of `region`, a transcript past a materialization baseline, precedes its first user
+/// prompt when settlement selects turns without terminal native records; `None` when the runtime
+/// closes turns natively.
+///
+/// Those records open no turn: settlement lands them with the next prompt and offers nothing
+/// for them alone, so a check for settleable work starts after them. A runtime that closes turns
+/// natively may be continuing a turn whose terminal record is not written yet, and a partial
+/// line may be the next prompt, so neither is skipped.
+pub(crate) fn leading_turnless_len(runtime: &str, region: &str) -> crate::Result<Option<usize>> {
+    let adapter = crate::adapter::get(runtime)?;
+    let ir = adapter.parse(region)?;
+    if adapter.requires_turn_end()
+        || ir
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::TurnEnd)
+    {
+        return Ok(None);
+    }
+    let prompt = ir
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::UserPrompt)
+        .and_then(|event| event.line)
+        .unwrap_or(usize::MAX);
+    Ok(Some(
+        region
+            .split_inclusive('\n')
+            .enumerate()
+            .take_while(|(index, line)| {
+                *index < prompt
+                    && (line.trim().is_empty()
+                        || serde_json::from_str::<serde_json::Value>(line).is_ok())
+            })
+            .map(|(_, line)| line.len())
+            .sum(),
+    ))
+}
+
 pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Result<Option<u64>> {
     if runtime == "claude-code" {
         return Ok(crate::adapter::claude_code::completed_turn_boundary(text)
@@ -4561,6 +4632,30 @@ mod tests {
         format!(
             "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{t}\"}}]}}}}\n"
         )
+    }
+
+    /// A merge or runtime switch may skip the records before the next prompt only where
+    /// settlement never offers them alone. A runtime that closes turns natively may still be
+    /// continuing its turn, and a partial line may be the next prompt: skipping either lets a new
+    /// writer replace one that holds unsettled work.
+    #[test]
+    fn leading_turnless_len_skips_only_records_settlement_never_offers_alone() {
+        let reply = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n";
+        let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"next\"}}\n";
+        let partial = "{\"type\":\"user\",\"message\":{\"content\":\"unfin";
+        for tail in [prompt, partial] {
+            assert_eq!(
+                leading_turnless_len("claude-code", &format!("{reply}{tail}")).unwrap(),
+                Some(reply.len()),
+                "{tail}"
+            );
+        }
+        assert_eq!(
+            leading_turnless_len("claude-code", reply).unwrap(),
+            Some(reply.len())
+        );
+        let call = "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec\",\"call_id\":\"call\",\"arguments\":\"{}\"}}\n";
+        assert_eq!(leading_turnless_len("codex", call).unwrap(), None);
     }
 
     #[cfg(feature = "rc")]

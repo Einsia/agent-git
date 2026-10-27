@@ -45,6 +45,23 @@ const EXIT_AND_REOPEN: &[&str] = &[
     "file-history-snapshot",
 ];
 
+/// A turn up to its first reply record, record types in the order a real Claude Code transcript
+/// has them.
+const LAST_TURN: &[&str] = &[
+    "api-request-blob",
+    "api-request-blob",
+    "api-request",
+    "user",
+    "last-prompt",
+    "custom-title",
+    "agent-name",
+    "mode",
+    "permission-mode",
+    "atis-latch",
+    "attachment",
+    "assistant",
+];
+
 #[test]
 fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
     for tail in [EXIT, EXIT_AND_REOPEN] {
@@ -91,6 +108,49 @@ fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
         );
     }
 
+    // Settlement can land a turn between its reply records. Commit offers no reply record written
+    // after that until the next prompt and reports nothing new, so merge must not ask for a commit
+    // over it either, whether the claim is the native transcript or a materialized one.
+    for materialized in [false, true] {
+        let lab = Lab::new();
+        let (live, id) = if materialized {
+            lab.run(&[
+                "resume",
+                "alice/qa@work",
+                "--as",
+                "claude-code",
+                "--no-launch",
+            ]);
+            let live = walk(&lab.home.join(".claude/projects"))
+                .into_iter()
+                .find(|path| path != &lab.live)
+                .expect("materialized transcript");
+            let id = live.file_stem().unwrap().to_str().unwrap().to_owned();
+            (live, id)
+        } else {
+            (lab.live.clone(), SID.to_owned())
+        };
+        append(&live, &lab.tail(LAST_TURN));
+        let commit = lab.output(&["commit", &id]);
+        let text = combined(&commit);
+        assert!(commit.status.success(), "{materialized}: {text}");
+        assert!(
+            !text.contains("nothing new since"),
+            "{materialized}: {text}"
+        );
+        append(&live, &(lab.tail(&["assistant"]) + &lab.tail(EXIT)));
+        let commit = lab.output(&["commit", &id]);
+        let text = combined(&commit);
+        assert!(text.contains("nothing new since"), "{materialized}: {text}");
+        let merged = lab.merge();
+        let text = combined(&merged);
+        assert!(merged.status.success(), "{materialized}: {text}");
+        assert!(
+            lab.repo().join(".git/AGIT_MERGE_TX").exists(),
+            "{materialized}: {text}"
+        );
+    }
+
     let lab = Lab::new();
     lab.append(&(lab.turn(3) + &lab.tail(EXIT)));
     let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
@@ -115,6 +175,15 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn append(path: &Path, text: &str) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -234,16 +303,12 @@ impl Lab {
     }
 
     fn append(&self, text: &str) {
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&self.live)
-            .unwrap()
-            .write_all(text.as_bytes())
-            .unwrap();
+        append(&self.live, text);
     }
 
     /// Records Claude Code writes in the given order, by type (`system` records by subtype):
-    /// fields as the runtime writes them, synthetic values.
+    /// fields as the runtime writes them, synthetic values. Request snapshots and attachments
+    /// carry only their identity, since no settlement rule reads their payload.
     fn tail(&self, kinds: &[&str]) -> String {
         let system = |subtype: &str, extra: serde_json::Value| {
             let mut record = json!({"type":"system", "subtype":subtype, "sessionId":SID,
@@ -258,7 +323,16 @@ impl Lab {
         };
         kinds
             .iter()
-            .map(|kind| match *kind {
+            .enumerate()
+            .map(|(i, kind)| match *kind {
+                "user" => json!({"type":kind, "sessionId":SID, "cwd":self.work, "uuid":"u-tail",
+                    "message":{"role":"user", "content":"synthetic prompt"}}),
+                "assistant" => json!({"type":kind, "sessionId":SID, "cwd":self.work,
+                    "uuid":format!("a-tail-{i}"), "message":{"role":"assistant",
+                    "content":[{"type":"text", "text":format!("synthetic answer {i}")}]}}),
+                "api-request-blob" | "api-request" | "attachment" => {
+                    json!({"type":kind, "sessionId":SID, "uuid":format!("r-tail-{i}")})
+                }
                 "stop_hook_summary" => system(kind, json!({"hookCount":1, "hookInfos":[],
                     "hookErrors":[], "hookAdditionalContext":[], "preventedContinuation":false,
                     "stopReason":"", "hasOutput":false, "level":"suggestion", "toolUseID":"t"})),
