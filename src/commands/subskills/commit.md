@@ -23,7 +23,7 @@ agit commit [target] [options] [-- <path>...]
 | `[-- <path>...]` | Limit a code commit or a file-line commit to these paths |
 | `--milestone <summary>` | Mark a completed phase with a short summary |
 | `--tag <name>` | Tag the commit |
-| `--code` | Also commit the code repo and cross-link both commits; outside Git, warn and settle the session turn without the code side commit |
+| `--code` | Also commit the code repo of the current directory (run it from the checkout you edited) and cross-link both commits; stages tracked changes and what is already staged, refuses while the checkout has untracked files (`git add` yours first); outside Git, warn and settle the session turn without the code side commit |
 | `-m, --message <message>` | Message for a file-only commit; new turns usually derive their message from the transcript |
 | `-n, --name <agent>` | Legacy native-ID compatibility: choose the repo name within the link's recorded owner; an ownerless link must be explicitly imported first |
 | `-b, --branch <branch>` | Legacy native-ID compatibility with a recorded owner: choose the session branch; `main` is refused for turn settlement |

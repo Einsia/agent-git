@@ -2748,14 +2748,31 @@ fn settle_bytes(
     let mut landed = Vec::with_capacity(total);
 
     // --code: commit the code repo before the last chunk, so the anchor names the new sha.
+    //
+    // The code checkout is the directory `agit commit --code` runs in, not the claim's recorded
+    // cwd: the claim records where the runtime was launched, and an agent (a fork in particular)
+    // may edit a different checkout. Committing in the launch directory puts the commit on the
+    // user's own branch there, with none of the agent's changes in it.
+    let code_dir = if opts.code {
+        std::env::current_dir()?.to_string_lossy().into_owned()
+    } else {
+        cwd.clone()
+    };
     let mut code_anchor: Option<(String, Completeness)> = None;
     if opts.code {
-        code_anchor = code_commit(&cwd, &format!("{slug}@{branch}"))?;
+        match code_commit(&code_dir, &format!("{slug}@{branch}"))? {
+            CodeCommit::Anchored(code, completeness) => code_anchor = Some((code, completeness)),
+            CodeCommit::Skipped => {}
+            CodeCommit::Untracked(paths) => {
+                refuse_untracked_code_paths(&code_dir, &paths);
+                return Ok(ExitCode::Precondition);
+            }
+        }
     }
     let cwd_state = if opts.historical {
         None
     } else {
-        meta::cwd_state_of(Path::new(&cwd))
+        meta::cwd_state_of(Path::new(&code_dir))
     };
     let unborn_base_tree = if old_head.is_none() {
         Some(unborn_worktree_tree(repo)?)
@@ -2769,7 +2786,7 @@ fn settle_bytes(
     let observed_code = code_anchor
         .as_ref()
         .map(|(code, _)| code.clone())
-        .or_else(|| meta::code_of(Path::new(&cwd)));
+        .or_else(|| meta::code_of(Path::new(&code_dir)));
     let mut observations = Meta::new(claim.clone(), source.to_string(), cwd.clone());
     observations.committer_account = credentials::current_account()?;
     observations.fork_origin = head_meta.as_ref().and_then(|head| head.fork_origin.clone());
@@ -4178,22 +4195,36 @@ impl FileSnapshot {
     }
 }
 
-/// `--code`: make one commit in the cwd's code repo and return the anchor (exact).
+/// What `--code` did in the code checkout.
+enum CodeCommit {
+    /// The anchor names the checkout's HEAD, after the commit when there was one; it is exact
+    /// unless the worktree still differs from it.
+    Anchored(String, Completeness),
+    /// A safety gate refused the automatic commit **on the code side**; the session settlement
+    /// still proceeds and records partial for a dirty worktree. Turning this expected degradation
+    /// into a refusal would throw away the transcript as well, while the warning said only
+    /// "skipping the automatic commit".
+    Skipped,
+    /// The checkout holds untracked paths. Nothing tells whose they are, so none is staged and
+    /// the whole settlement refuses before it writes anything; a code commit without them would
+    /// anchor a tree that silently lacks files the agent may have created.
+    Untracked(Vec<String>),
+}
+
+/// `--code`: make one commit in the code checkout at `cwd` and return the anchor.
 ///
-/// `Ok(None)` means a safety gate refused the automatic commit **on the code side**; the session
-/// settlement still proceeds and records partial for a dirty worktree. Turning this expected
-/// degradation into an `Err` would throw away the transcript as well, while the warning said only
-/// "skipping the automatic commit".
-fn code_commit(cwd: &str, what: &str) -> crate::Result<Option<(String, Completeness)>> {
+/// Only tracked changes and what is already staged go in: `git add -A` would sweep every stray
+/// screenshot, cache and editor file of the checkout onto whatever branch it has checked out.
+fn code_commit(cwd: &str, what: &str) -> crate::Result<CodeCommit> {
     let p = Path::new(cwd);
     let is_repo = meta::code_of(p).is_some();
     if !is_repo {
         ui::warning("--code: cwd isn’t a git repo — skipping the code commit and anchor");
-        return Ok(None);
+        return Ok(CodeCommit::Skipped);
     }
     // **The filter check comes before any git command that touches the worktree.**
     //
-    // Standing in front of `git add -A` is not enough: ahead of it sits a `git status
+    // Standing in front of `git add` is not enough: ahead of it sits a `git status
     // --porcelain`, and `status` **runs the clean filter** while working out which paths changed,
     // so that arbitrary command has already run before the gate comes down.
     //
@@ -4220,11 +4251,15 @@ fn code_commit(cwd: &str, what: &str) -> crate::Result<Option<(String, Completen
             "{}",
             ui::dim("  commit it yourself if that filter is one you set up")
         );
-        return Ok(None);
+        return Ok(CodeCommit::Skipped);
     }
 
-    let dirty = code_repo_dirty(p);
-    if dirty {
+    let untracked = untracked_code_paths(p)?;
+    if !untracked.is_empty() {
+        return Ok(CodeCommit::Untracked(untracked));
+    }
+
+    if code_repo_dirty(p) {
         let msg = format!("work: {what} (agit commit --code)");
         // The same reason as the adjacent `code_repo_dirty`, and these two need guarding more
         // than `status` does: `add` runs `core.fsmonitor` and `commit` runs hooks (`pre-commit` /
@@ -4232,35 +4267,117 @@ fn code_commit(cwd: &str, what: &str) -> crate::Result<Option<(String, Completen
         // agent has just been writing to. One line written into `.git/hooks/pre-commit` and the
         // next `agit commit --code` executes it for the agent, with no approval at all. See
         // `meta::GIT_SAFE`.
-        let out = crate::infra::git_runtime::command()
-            .args(crate::domain::meta::GIT_SAFE)
-            .args(["add", "-A"])
-            .current_dir(p)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()?;
+        let out = code_git(p, &["add", "-u"])?;
         if !out.status.success() {
             anyhow::bail!(
-                "git add -A failed: {}",
+                "git add -u failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let out = crate::infra::git_runtime::command()
-            .args(crate::domain::meta::GIT_SAFE)
-            .args(["commit", "-m", &msg])
-            .current_dir(p)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "git commit failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+        // A worktree can be dirty with nothing to stage (a submodule's own untracked files, say);
+        // `git commit` would then fail on an empty index.
+        let staged = !code_git(p, &["diff", "--cached", "--quiet"])?
+            .status
+            .success();
+        if staged {
+            let out = code_git(p, &["commit", "-m", &msg])?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git commit failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            // The commit lands on whatever this checkout has checked out, which may be a branch
+            // the user works on; say which, and where.
+            let branch = code_git(p, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .map_or_else(
+                    || "a detached HEAD".to_string(),
+                    |b| format!("branch `{b}`"),
+                );
+            ui::success(&format!(
+                "--code: committed tracked changes on {branch} in {}",
+                ui::tilde(p)
+            ));
         }
     }
     let sha = meta::code_of(p).expect("just verified it’s a repo");
-    Ok(Some((sha, Completeness::Exact)))
+    // What `git add -u` cannot record (a submodule's own uncommitted changes, say) is still in
+    // the worktree; an anchor called exact would then claim a code state HEAD cannot restore.
+    let completeness = if code_repo_dirty(p) {
+        Completeness::Partial
+    } else {
+        Completeness::Exact
+    };
+    Ok(CodeCommit::Anchored(sha, completeness))
+}
+
+/// Untracked, not ignored paths in the code checkout, as `git status` names them (an untracked
+/// directory is one entry).
+fn untracked_code_paths(p: &Path) -> crate::Result<Vec<String>> {
+    // `git status` runs `core.fsmonitor` inside the checkout the agent writes to; `code_git`
+    // applies `meta::GIT_SAFE`. The caller has already refused clean filters.
+    // An explicit mode, because `status.showUntrackedFiles=no` would otherwise hide them all.
+    // Submodule worktrees stay unread: their files never show as untracked here, and reading
+    // them would run the submodules' own clean filters.
+    let out = code_git(
+        p,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ],
+    )?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut entries = text.split('\0').filter(|e| !e.is_empty());
+    let mut untracked = Vec::new();
+    while let Some(entry) = entries.next() {
+        if let Some(path) = entry.strip_prefix("?? ") {
+            untracked.push(path.to_string());
+        } else if matches!(entry.as_bytes().first(), Some(b'R' | b'C')) {
+            // A rename or copy carries its source path as the next NUL-separated field.
+            entries.next();
+        }
+    }
+    Ok(untracked)
+}
+
+fn refuse_untracked_code_paths(code_dir: &str, paths: &[String]) {
+    const SHOWN: usize = 10;
+    ui::error(&format!(
+        "--code: {} has untracked files; agit stages only tracked changes and will not guess which of these belong to the commit:",
+        ui::tilde(Path::new(code_dir))
+    ));
+    for path in paths.iter().take(SHOWN) {
+        eprintln!("  {path}");
+    }
+    if paths.len() > SHOWN {
+        eprintln!("  … and {} more", paths.len() - SHOWN);
+    }
+    ui::hint("`git add` the ones that belong to this work, and remove or ignore the rest");
+    ui::hint(
+        "run `agit commit --code` from the checkout the agent edited, or drop --code to settle the session only",
+    );
+}
+
+fn code_git(p: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    crate::infra::git_runtime::command()
+        .args(crate::domain::meta::GIT_SAFE)
+        .args(args)
+        .current_dir(p)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
 }
 
 fn cwd_state_is_dirty(state: Option<&meta::CwdState>) -> bool {
@@ -4285,10 +4402,11 @@ fn code_repo_dirty(cwd: &Path) -> bool {
         return true;
     }
     // This runs inside **the user's own code repo**, which the agent has just written to.
-    // `git status` executes `core.fsmonitor` — see `meta::GIT_SAFE`.
+    // `git status` executes `core.fsmonitor` — see `meta::GIT_SAFE`. Submodules are compared
+    // explicitly: `submodule.<name>.ignore` would otherwise hide edits HEAD cannot restore.
     crate::infra::git_runtime::command()
         .args(crate::domain::meta::GIT_SAFE)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignore-submodules=none"])
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -5282,22 +5400,101 @@ mod tests {
             meta::configured_clean_filters(d.path()).as_deref(),
             Some("agent-controlled")
         );
-        assert!(
-            code_commit(d.path().to_str().unwrap(), "test")
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            code_commit(d.path().to_str().unwrap(), "test").unwrap(),
+            CodeCommit::Skipped
+        ));
         assert_eq!(run_code_git(d.path(), &["rev-parse", "HEAD"]), before);
         assert!(d.path().join("work.txt").exists());
+    }
+
+    /// A change `git add -u` cannot stage (inside a submodule's own worktree) leaves the parent
+    /// dirty with an empty index: the code side makes no commit, and the anchor is partial, also
+    /// when the user's config tells `git status` to ignore that submodule's dirt. An
+    /// implementation that calls every successful pass exact would anchor a HEAD that lacks it.
+    /// A clean filter the submodule configures skips the automatic commit like the parent's own
+    /// and is never run: `git add` and `git status` in the parent run it inside the submodule.
+    /// It is found from a subdirectory too, where `ls-files` alone lists nothing outside it.
+    #[test]
+    fn a_change_the_code_commit_cannot_stage_leaves_a_partial_anchor() {
+        let d = tempfile::tempdir().unwrap();
+        let (sub, parent) = (d.path().join("sub"), d.path().join("parent"));
+        for dir in [&sub, &parent] {
+            std::fs::create_dir(dir).unwrap();
+            run_code_git(dir, &["init", "-q"]);
+            run_code_git(dir, &["config", "user.name", "Test"]);
+            run_code_git(dir, &["config", "user.email", "test@example.com"]);
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            run_code_git(dir, &["add", "seed.txt"]);
+            run_code_git(dir, &["commit", "-q", "-m", "seed"]);
+        }
+        run_code_git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/code.git",
+            ],
+        );
+        run_code_git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        run_code_git(&parent, &["commit", "-q", "-m", "add submodule"]);
+        run_code_git(&parent, &["config", "submodule.sub.ignore", "dirty"]);
+        let before = run_code_git(&parent, &["rev-parse", "HEAD"]);
+        std::fs::write(parent.join("sub/seed.txt"), "changed\n").unwrap();
+
+        assert!(matches!(
+            code_commit(parent.to_str().unwrap(), "test").unwrap(),
+            CodeCommit::Anchored(_, Completeness::Partial)
+        ));
+        assert_eq!(run_code_git(&parent, &["rev-parse", "HEAD"]), before);
+
+        let marker = d.path().join("filter-ran");
+        let checkout = parent.join("sub");
+        run_code_git(
+            &checkout,
+            &[
+                "config",
+                "filter.probe.clean",
+                &format!("touch {} && cat", marker.display()),
+            ],
+        );
+        std::fs::write(checkout.join(".gitattributes"), "seed.txt filter=probe\n").unwrap();
+        // Same size as the committed content, so only re-hashing (through the filter) can tell.
+        std::fs::write(checkout.join("seed.txt"), "SEED\n").unwrap();
+        std::fs::create_dir(parent.join("nested")).unwrap();
+        for dir in [parent.clone(), parent.join("nested")] {
+            assert_eq!(
+                meta::configured_clean_filters(&dir).as_deref(),
+                Some("probe in sub")
+            );
+        }
+        assert!(matches!(
+            code_commit(parent.to_str().unwrap(), "test").unwrap(),
+            CodeCommit::Skipped
+        ));
+        assert!(meta::cwd_state_of(&parent).is_some());
+        assert!(!marker.exists(), "a submodule's clean filter ran");
     }
 
     #[test]
     fn a_non_git_cwd_skips_only_the_optional_code_side_commit() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(
+        assert!(matches!(
             code_commit(d.path().to_str().unwrap(), "test").unwrap(),
-            None
-        );
+            CodeCommit::Skipped
+        ));
     }
 
     #[test]

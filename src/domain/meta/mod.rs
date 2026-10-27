@@ -1033,28 +1033,104 @@ fn safe_remote_authority(authority: &str) -> bool {
 
 /// Query the repository-level filter configuration; where a filter exists, status capture must
 /// keep away from `git status`.
+///
+/// Checked-out submodules count, at any depth: `git status` and `git add` in the parent run
+/// `git status` inside each submodule, which runs that submodule's own clean filter. A submodule
+/// filter is named with the submodule's path.
 pub(crate) fn configured_clean_filters(cwd: &Path) -> Option<String> {
-    let out = crate::infra::git_runtime::command()
-        .args(GIT_SAFE)
-        .args([
+    let mut names = std::collections::BTreeSet::new();
+    collect_clean_filters(cwd, Path::new(""), &mut names);
+    (!names.is_empty()).then(|| names.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+/// Stands in for filters that cannot be ruled out, so the caller stays away as for a real one.
+const UNCHECKED_SUBMODULES: &str = "unchecked submodules";
+
+fn collect_clean_filters(
+    dir: &Path,
+    relative: &Path,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    let git = |dir: &Path, args: &[&str]| {
+        crate::infra::git_runtime::command()
+            .args(GIT_SAFE)
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+    };
+    if let Some(out) = git(
+        dir,
+        &[
             "config",
             "--local",
             "--get-regexp",
             r"^filter\..*\.(clean|smudge|process)$",
-        ])
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let names: std::collections::BTreeSet<&str> = text
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter_map(|key| key.strip_prefix("filter."))
-        .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name))
-        .collect();
-    (!names.is_empty()).then(|| names.into_iter().collect::<Vec<_>>().join(", "))
+        ],
+    ) {
+        let text = String::from_utf8_lossy(&out.stdout);
+        names.extend(
+            text.lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .filter_map(|key| key.strip_prefix("filter."))
+                .filter_map(|key| key.rsplit_once('.').map(|(name, _)| name))
+                .map(|name| {
+                    if relative.as_os_str().is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{name} in {}", relative.display())
+                    }
+                }),
+        );
+    }
+    // Gitlinks are listed from the top of the worktree: from a subdirectory, `ls-files` would
+    // leave out the submodules elsewhere, which the parent's `status` still enters. `ls-files`
+    // reads the index only, so finding them runs no filter.
+    let root = git(dir, &["rev-parse", "--show-cdup"])
+        .map(|out| dir.join(String::from_utf8_lossy(&out.stdout).trim()));
+    let listing = root
+        .as_deref()
+        .and_then(|root| Some((root, git(root, &["ls-files", "--stage", "-z"])?)));
+    let Some((root, out)) = listing else {
+        names.insert(UNCHECKED_SUBMODULES.to_owned());
+        return;
+    };
+    for entry in out.stdout.split(|byte| *byte == 0) {
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let Some(path) = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .and_then(|tab| path_from_git_bytes(&entry[tab + 1..]))
+        else {
+            names.insert(UNCHECKED_SUBMODULES.to_owned());
+            continue;
+        };
+        let sub = root.join(&path);
+        // A symlink at a gitlink path is not a checked-out submodule to git, and following one
+        // could walk back up the tree; real directories only ever descend.
+        let checked_out =
+            std::fs::symlink_metadata(&sub).is_ok_and(|m| m.is_dir()) && sub.join(".git").exists();
+        if checked_out {
+            collect_clean_filters(&sub, &relative.join(&path), names);
+        }
+    }
+}
+
+/// A path as git stores it, byte for byte; `None` where the platform cannot name those bytes.
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Some(std::ffi::OsStr::from_bytes(bytes).into())
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    std::str::from_utf8(bytes).ok().map(Into::into)
 }
 
 fn read_worktree_status(

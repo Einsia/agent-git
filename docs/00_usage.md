@@ -296,11 +296,14 @@ agit commit --milestone "rate limiting done, tests pass" --tag ms-ratelimit --co
 - `--milestone` writes a one-line phase summary into the last turn commit; `agit log` shows it
   as ★.
 - `--tag` tags it while you are there.
-- `--code` also commits in the **code repo** (it really commits only when there are uncommitted
-  changes; on a clean tree it records the current HEAD as the anchor) and writes the `origin@sha`
-  cross anchor into this turn. The code repo must already have an `origin` remote; when cwd is not
-  a Git repo, `--code` warns and skips the code-side commit, and the session turn still settles
-  normally.
+- `--code` also commits in the **code repo** of the directory you run it in (not the directory
+  the session was started from), on whatever branch that checkout has checked out, and writes the
+  `origin@sha` cross anchor into this turn. It stages tracked changes only, plus whatever you have
+  already staged; it really commits only when that leaves something to commit, and on a clean
+  tree it records the current HEAD as the anchor. If the checkout has untracked files, it refuses
+  and lists them: `git add` the ones that belong to the work, remove or ignore the rest, and run
+  it again. The code repo must already have an `origin` remote; when cwd is not a Git repo,
+  `--code` warns and skips the code-side commit, and the session turn still settles normally.
 
 This one is for "whoever reads the log later and wants to know how far it got". Automatic
 settlement does not write it for you.
