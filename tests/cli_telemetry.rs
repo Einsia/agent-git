@@ -70,6 +70,10 @@ impl Fixture {
     }
     fn preference(&self, enabled: bool) {
         std::fs::create_dir_all(self.path("")).unwrap();
+        // The choice is made under the state gate, as the product makes it. A flush worker left
+        // behind by an earlier run holds the gate across its read and its write of the queue;
+        // without the gate, that write can land after the removal below and restore the queue.
+        let _gate = self.gate();
         let previous: Value = std::fs::read(self.path("preferences.json"))
             .ok()
             .and_then(|body| serde_json::from_slice(&body).ok())
@@ -88,6 +92,30 @@ impl Fixture {
             }
             let _ = std::fs::remove_file(self.path(name));
         }
+    }
+    /// The product's state gate, held until the returned file is dropped.
+    fn gate(&self) -> std::fs::File {
+        std::fs::create_dir_all(self.path("")).unwrap();
+        let gate = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.path("gate.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&gate).unwrap();
+        gate
+    }
+    /// The queue file as written: every write replaces the file, so a write changes its identity
+    /// even when it writes the same bytes.
+    fn queue_file(&self) -> Option<(Vec<u8>, u64)> {
+        let path = self.path("queue.json");
+        let body = std::fs::read(&path).ok()?;
+        #[cfg(unix)]
+        let identity = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        #[cfg(not(unix))]
+        let identity = 0;
+        Some((body, identity))
     }
     fn path(&self, name: &str) -> std::path::PathBuf {
         self.home.path().join("agit/telemetry").join(name)
@@ -649,6 +677,15 @@ fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() 
         .env("AGIT_ACQUISITION_ID", uuid::Uuid::new_v4().to_string())
         .output()
         .unwrap();
+    // An opt-out cannot be undone by a flush still running from an earlier command only because
+    // every queue write happens under the gate the opt-out takes. With the gate held, a flush
+    // must leave the queue file as it is; one that wrote around the gate replaces it.
+    {
+        let _gate = f.gate();
+        let before = f.queue_file();
+        f.run(&["--internal-telemetry-flush"]);
+        assert_eq!(f.queue_file(), before);
+    }
     f.disable();
     f.run(&["--internal-install-completed"]);
     assert!(f.events().is_empty());
