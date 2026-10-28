@@ -766,6 +766,20 @@ fn bind(
     let me = super::remote_request(client.me())?;
     project.account = me.username;
     project.account_id = me.account_id;
+    if automatic && remote.visibility == "public" {
+        super::push::require_terminal_for_public(
+            repository,
+            &format!(
+                "agit project bind {} --repo {repository} --history {} --auto-upload",
+                root.display(),
+                if history == History::All {
+                    "all"
+                } else {
+                    "none"
+                }
+            ),
+        )?;
+    }
     let audience = Audience {
         visibility: Some(remote.visibility.clone()),
         org: owner_is_org(&client, &owner, &project.account),

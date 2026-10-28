@@ -1,6 +1,7 @@
 //! Project enrollment binds an account and destination; snapshots retain their own privacy modes.
 
 use crate::domain::repo::Repo;
+use crate::hub::identity::RemoteIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write};
@@ -20,16 +21,20 @@ pub(crate) struct AutoConsent {
 impl AutoConsent {
     pub fn matches(&self, repo: &Repo) -> Result<bool> {
         self.validate()?;
+        Ok(Self::saved(repo)?.is_some_and(|saved| saved == *self))
+    }
+
+    fn saved(repo: &Repo) -> Result<Option<Self>> {
         let path = repo.common_dir()?.join("agit/privacy-auto-consent.json");
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let saved: Self =
             serde_json::from_slice(&bytes).context("invalid automatic publication consent")?;
         saved.validate()?;
-        Ok(saved == *self)
+        Ok(Some(saved))
     }
 
     pub fn save(&self, repo: &Repo) -> Result<()> {
@@ -64,6 +69,54 @@ impl AutoConsent {
         );
         Ok(())
     }
+}
+
+/// Automatic upload into a public repository needs an enrollment the person made for that exact
+/// repository while it was public. A private enrollment, or one for another destination, does not
+/// carry over: otherwise a repository made public later would keep uploading unasked.
+pub(crate) fn confirms_public(repo: &Repo, destination: &RemoteIdentity) -> Result<bool> {
+    Ok(AutoConsent::saved(repo)?.is_some_and(|saved| {
+        saved.visibility == "public"
+            && saved.hub == destination.hub
+            && saved.agent_id == destination.agent_id
+    }))
+}
+
+/// Only the person switches on automatic upload into a public repository, at a terminal. Unlike
+/// a one-off push, no `--yes`, `--json` or `AGIT_YES` answers it: an agent that relays a yes would
+/// otherwise enable every later turn's upload on one sentence.
+pub(crate) fn require_terminal_for_public(repository: &str, command: &str) -> crate::Result<()> {
+    if crate::ui::prompt::can_ask() {
+        return Ok(());
+    }
+    Err(crate::commands::InteractionRequired(format!(
+        "automatic upload into the public repository {repository} is switched on only by the person: ask them to run `{command}` themselves in a terminal"
+    ))
+    .into())
+}
+
+/// Records the person's enrollment when switching automatic upload on for a checkout pinned to a
+/// public repository, and refuses the switch away from a terminal.
+///
+/// A checkout whose destination or audience cannot be read records nothing; automatic
+/// publication then refuses a public destination by itself.
+pub(crate) fn enroll_public_destination(
+    repo: &Repo,
+    repository: &str,
+    command: &str,
+) -> crate::Result<()> {
+    let Some(identity) = crate::hub::identity::read(repo)? else {
+        return Ok(());
+    };
+    let Ok(consent) = super::publication_consent(repo, repository, &identity) else {
+        return Ok(());
+    };
+    if consent.visibility != "public" {
+        return Ok(());
+    }
+    require_terminal_for_public(repository, command)?;
+    consent.save(repo)?;
+    Ok(())
 }
 
 #[cfg(test)]
