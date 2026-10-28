@@ -1234,24 +1234,21 @@ fn retain_session_mapping(
     identity: &RemoteIdentity,
     cache: &mut Cache,
 ) -> Result<()> {
-    let Some(bytes) = repo
-        .show_result(commit, "privacy/envelope.json")
-        .ok()
-        .flatten()
-    else {
+    // Callers reach here only once the commit's objects are local, so a failed read is damage, not
+    // an absent envelope: skipping it would drop the session's published identity.
+    let Some(bytes) = crate::domain::privacy_recovery::committed_envelope(repo, commit)? else {
         return Ok(());
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&bytes) else {
-        return Ok(());
-    };
-    if value
-        .get("format_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(SESSION_ENVELOPE_VERSION.into())
-    {
+    #[derive(serde::Deserialize)]
+    struct Version {
+        format_version: Option<u64>,
+    }
+    let version: Version =
+        serde_json::from_slice(&bytes).context("committed privacy envelope is malformed")?;
+    if version.format_version != Some(SESSION_ENVELOPE_VERSION.into()) {
         return Ok(());
     }
-    let envelope = PrivacyEnvelope::parse(bytes.as_bytes())?;
+    let envelope = PrivacyEnvelope::parse(&bytes)?;
     let binding = envelope
         .session_binding
         .context("accepted session has no owner binding")?;

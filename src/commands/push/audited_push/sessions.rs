@@ -48,7 +48,7 @@ pub(super) fn run(
         for commit in original.commit_objects() {
             let metadata = crate::domain::storage::metadata_local(repo.root(), commit)?;
             ensure!(
-                repo.show_result(commit, "privacy/envelope.json")?.is_none()
+                crate::domain::privacy_recovery::committed_envelope(&repo, commit)?.is_none()
                     && metadata
                         .session_privacy
                         .as_ref()
@@ -89,7 +89,7 @@ pub(super) fn run(
         for commit in original.commit_objects() {
             crate::domain::storage::metadata_local(repo.root(), commit)?;
             ensure!(
-                repo.show_result(commit, "privacy/envelope.json")?.is_none(),
+                crate::domain::privacy_recovery::committed_envelope(&repo, commit)?.is_none(),
                 "a new destination requires preserved source authority for inherited ciphertext"
             );
         }
