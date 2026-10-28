@@ -135,6 +135,7 @@ pub fn run(args: Args) -> CmdResult {
     // missing one is a warning, since a user may have installed only one runtime — but an
     // installation that exists must be complete and at the current version.
     checks.extend(skill_installation_checks());
+    checks.extend(unloadable_skill_checks());
 
     // ── git ──
     match crate::infra::git_runtime::command()
@@ -795,6 +796,28 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
                 path.display()
             )),
         ));
+    }
+    checks
+}
+
+/// Skill folders Claude Code or Codex would skip without saying so, for a conversation started
+/// here. Doctor only names them and prints the fix; the folders are the person's own.
+fn unloadable_skill_checks() -> Vec<(String, Check)> {
+    // The row's text starts after "  [x] " and a 16-column label.
+    const INDENT: &str = "                       ";
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let mut checks = Vec::new();
+    for runtime in ["claude-code", "codex"] {
+        for dir in super::team_skills::skill_dirs(runtime, &cwd) {
+            for problem in super::team_skills::unloadable(runtime, &dir) {
+                checks.push((
+                    format!("skills {runtime}"),
+                    Check::Warn(super::team_skills::describe(&problem, INDENT)),
+                ));
+            }
+        }
     }
     checks
 }
