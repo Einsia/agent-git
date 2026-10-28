@@ -8,6 +8,8 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.29] - 2026-10-29
+
 ### Added
 
 - `agit doctor` names the skill folders Claude Code or Codex would skip without saying so, for
@@ -145,6 +147,18 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   unsettled and pushes were refused, without saying why. The dictionary is now read whole and
   carried into your account's dictionary once. If it still cannot be read, the pending check is
   reported as `legacy_rules`.
+- A yes/no question takes its answer when you press Enter, so a quick `y` followed by Enter no
+  longer answers the next question too. An `agit run` that you cancel no longer leaves an empty
+  fork branch behind.
+- An agent can no longer publish to a public repository on its own: without a terminal, publishing
+  there needs an explicit `--yes` that the person has confirmed.
+- Turning on automatic upload for a public repository now needs a person at a terminal, whichever
+  way it is switched on: `agit config push.auto`, `agit init --auto-push`,
+  `agit project bind --auto-upload` or the clone menu. `--yes` and agents cannot confirm it, and
+  cancelling the menu changes nothing.
+- Disconnecting a folder with `agit project unbind` now turns automatic push back off for the
+  repository if binding it had turned it on, and binding says plainly that automatic push applies
+  to the whole repository.
 
 ## [0.2.28] - 2026-10-27
 
