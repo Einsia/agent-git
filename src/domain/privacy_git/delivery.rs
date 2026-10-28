@@ -220,6 +220,9 @@ impl Delivery {
         public.session_privacy = target.session_privacy;
         if public.is_session_line() {
             public.cwd = "/workspace".into();
+            // The target Hub labels the session by this field; its parsers key on each envelope's
+            // source, so the projected records stay readable under the producing runtime's name.
+            public.runtime = crate::adapter::normalize(&metadata.runtime)?.into();
         }
         public.title = metadata
             .title
@@ -324,4 +327,66 @@ fn attributed_commit_body(
     rewritten.push(b'\n');
     rewritten.extend_from_slice(&body[boundary + 2..]);
     Ok(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{storage, transcript};
+
+    /// The target Hub labels a delivered session by the public meta's runtime, while the projected
+    /// records always use one envelope format; a projection that names that format instead of the
+    /// producing runtime labels every delivered Codex session as Claude Code.
+    #[test]
+    fn delivered_meta_names_the_source_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = Repo::init(&temp.path().join("source")).unwrap();
+        source.git(&["config", "user.name", "Writer"]).unwrap();
+        source
+            .git(&["config", "user.email", "writer@example.invalid"])
+            .unwrap();
+        let destination = Repo::init(&temp.path().join("destination")).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let metadata = Meta::new(session.clone(), "codex".into(), "/work".into());
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"response_item","payload":{"type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"Delivered turn"}]}})
+            ),
+            "codex",
+            &session,
+        );
+        storage::write_snapshot(source.root(), &log, &log).unwrap();
+        meta::write(source.root(), &metadata).unwrap();
+        source.add_all().unwrap();
+        source.commit("Codex turn").unwrap();
+        let oid = source.git(&["rev-parse", "HEAD"]).unwrap();
+        let target = "https://target.invalid";
+        let account = AccountIdentity::new(target, "account-1").unwrap();
+        let delivery = Delivery {
+            identity: RemoteIdentity::new(target, "00000000-0000-0000-0000-000000000001").unwrap(),
+            account: account.clone(),
+            sessions: BTreeMap::from([(session.clone(), meta::mint_session_id())]),
+            source_accounts: BTreeMap::new(),
+            registrations: BTreeMap::from([(session, SessionPrivacy::new(Some(account)).unwrap())]),
+        };
+        let (commit, _) = delivery
+            .project_snapshot(Snapshot {
+                source: &source,
+                destination: &destination,
+                oid: oid.trim(),
+                parents: &[],
+                metadata: &metadata,
+                policy: &PrivacyPolicy::default(),
+                aliases: &mut PathAliasStore::default(),
+                branch: "work",
+                redactor: &Redactor::new(Default::default()),
+            })
+            .unwrap();
+        let delivered = meta::read_at_ref_result(&destination, &commit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.runtime, "codex");
+    }
 }
