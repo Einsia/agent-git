@@ -98,6 +98,7 @@ pub mod scan;
 pub mod secret_vault;
 pub mod setup;
 pub(crate) mod skill_bundle;
+pub mod team_skills;
 
 use crate::domain::secrets;
 use crate::{ExitCode, Result};

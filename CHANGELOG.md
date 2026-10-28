@@ -10,6 +10,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Added
 
+- `agit doctor` names the skill folders Claude Code or Codex would skip without saying so, for
+  a conversation started where it runs: a folder holding skills one level too deep (Claude Code
+  reads only `<skills>/<name>/SKILL.md`), a `SKILL.md` without the frontmatter Codex requires,
+  and a link whose target is gone. Each row prints the fix, such as one `mv` per nested skill,
+  and moves nothing.
 - `agit setup --hooks --installed-only` repairs the agit hooks your agent runtimes already have
   but cannot start, such as one written by an older agit whose path the shell split at a space,
   and installs none. Only the command text of those hooks changes; the rest of the file stays as

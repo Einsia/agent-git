@@ -181,7 +181,7 @@ fn custom_command(name: &str, roots: &[std::path::PathBuf]) -> bool {
 /// in and each above it up to the repository's root, the directory that holds `.git`. Outside a
 /// repository only the starting directory counts.
 #[cfg(feature = "cli")]
-fn project_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn project_dirs(start: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     for dir in start.ancestors() {
         dirs.push(dir.to_path_buf());
