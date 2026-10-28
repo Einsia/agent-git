@@ -63,9 +63,20 @@ pub struct PrMergeResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgView {
     pub name: String,
-    /// `owner` / `member` ... — only an owner can create an agent under the org.
+    /// `owner` / `member`.
     #[serde(default)]
     pub role: String,
+    /// Whether I may create a private repository under the org; members may while its owners
+    /// allow it. A Hub that predates member privileges omits it, and there only an owner creates.
+    #[serde(default)]
+    pub can_create_private_repositories: Option<bool>,
+}
+
+impl OrgView {
+    pub fn creates_repositories(&self) -> bool {
+        self.can_create_private_repositories
+            .unwrap_or(self.role == "owner")
+    }
 }
 
 /// The answer to one push-permission probe.

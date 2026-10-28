@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 #[derive(ClapArgs)]
 pub struct Args {
     /// Repo name. Omitted: the directory name is only a suggestion — typing it yourself is what makes it real.
+    /// `<org>/<name>` places it in an organization's namespace; the first push creates it there
+    /// when the organization lets you, and the checkout `agit repo create <org>/<name>` left is
+    /// completed in place.
     pub name: Option<String>,
     /// Fold the project’s existing assets (AGENTS.md, CLAUDE.md, .claude/skills/, ...)
     /// into main as its first file commit (confirmed item by item).
@@ -87,14 +90,36 @@ pub fn run(args: Args) -> CmdResult {
 
     // Name: an explicit argument > when a person can be asked, the directory name as a suggestion
     // that is retyped to confirm > an error otherwise.
+    let mut named_owner = None;
     let name = match args.name {
-        Some(n) => match repo::valid_name(&n) {
-            Ok(()) => n,
-            Err(e) => {
-                ui::error(&format!("{e:#}"));
-                return Ok(ExitCode::Usage);
+        Some(n) => {
+            let n = match n.split_once('/') {
+                // The owner names a directory under the repository store, so it must be a namespace
+                // name before anything is written: `..` or `.` would place the checkout outside it.
+                Some(_) => match super::parse_slug(&n).and_then(|(owner, name)| {
+                    super::canonical_owner(&owner)?;
+                    repo::valid_name(&owner)?;
+                    Ok((owner, name))
+                }) {
+                    Ok((owner, name)) => {
+                        named_owner = Some(owner);
+                        name
+                    }
+                    Err(e) => {
+                        ui::error(&format!("{e:#}"));
+                        return Ok(ExitCode::Usage);
+                    }
+                },
+                None => n,
+            };
+            match repo::valid_name(&n) {
+                Ok(()) => n,
+                Err(e) => {
+                    ui::error(&format!("{e:#}"));
+                    return Ok(ExitCode::Usage);
+                }
             }
-        },
+        }
         None => {
             let suggestion = cwd
                 .file_name()
@@ -116,8 +141,9 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    let existing_owner =
-        crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
+    let existing_owner = named_owner.clone().unwrap_or_else(|| {
+        crate::infra::credentials::current_user().unwrap_or_else(|| "local".into())
+    });
     // An existing checkout already carries its setting, so the question belongs only to a
     // repository this command creates.
     let existing = Repo::open(crate::infra::config::repo_dir(&existing_owner, &name)?);
@@ -150,7 +176,9 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
-    let owner = crate::infra::credentials::current_user().unwrap_or_else(|| "local".to_string());
+    let owner = named_owner.unwrap_or_else(|| {
+        crate::infra::credentials::current_user().unwrap_or_else(|| "local".to_string())
+    });
     // A binding conflict is refused before anything touches disk: refusing after the repo is
     // created leaves a complete new repo behind, and the next retry runs into "already exists".
     if !args.no_bind

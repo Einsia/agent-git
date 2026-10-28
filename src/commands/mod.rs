@@ -278,7 +278,7 @@ pub enum Writability {
     /// The agent is on the hub and you can see it, but the write gate does not allow it.
     ReadOnly,
     /// The hub has no such agent (or it is private and you cannot see it), and `owner` is an org
-    /// you own: a first push creates it under that org.
+    /// that lets you create repositories: a first push creates it under that org.
     Creatable,
     /// The hub has no such agent (or you cannot see it), and you are not entitled to create a
     /// repo under `owner` either.
@@ -292,8 +292,7 @@ pub enum Writability {
 /// writable" and "does not exist" with the same 404: first ask whether the agent exists at all
 /// with the readable `GET /api/agents/{owner}/{name}`, and if it does, probe the write gate (org
 /// owners and team members granted access to this agent all sit inside that one decision); if it
-/// does not, ask whether I am an owner of that org — only an owner can create an agent under an
-/// org.
+/// does not, ask the org whether I may create a repository under it.
 ///
 /// Network and auth errors propagate unchanged: conflating a timeout with "no permission" makes
 /// `import` land a version locally and makes `push` offer to copy the repo — both decide for the
@@ -324,7 +323,7 @@ pub fn writability(me: &str, owner: &str, name: &str) -> Result<Writability> {
             },
         ),
         Err(e) if is_not_found(&e) => match remote_request(client.get_org(owner)) {
-            Ok(org) if org.role == "owner" => Ok(Writability::Creatable),
+            Ok(org) if org.creates_repositories() => Ok(Writability::Creatable),
             Ok(_) => Ok(Writability::Missing),
             Err(e) if is_not_found(&e) => Ok(Writability::Missing),
             Err(e) => Err(e),

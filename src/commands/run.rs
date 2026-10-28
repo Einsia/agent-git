@@ -290,8 +290,8 @@ pub fn run(args: Args) -> CmdResult {
         None
     };
     // Continuable = the shapes whose first push can land on the original line: your own, the
-    // ones the hub allows, and the ones the hub does not have yet where you are the org owner
-    // (push creates it under the org) — the same set of answers push / import accept.
+    // ones the hub allows, and the ones the hub does not have yet in an org that lets you create
+    // them (push creates it under the org) — the same set of answers push / import accept.
     let can_continue = matches!(
         access,
         Some(
