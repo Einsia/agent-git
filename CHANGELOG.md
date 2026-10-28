@@ -32,6 +32,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Uploading the current conversation from an agent takes two commands instead of six to ten.
+  The agit skill no longer has the agent run status, sign-in and dry-run checks before
+  pushing: push checks the sign-in and prints the destination, count and visibility itself. The
+  agent pushes only when the person asked to upload, and runs a dry-run preview only when they
+  ask to see one first.
 - The privacy publication store kept for each published repository no longer grows without
   bound: a push compacts it once it holds many packs or loose objects and its disk has about the
   store's size free, keeping every object it holds. `agit doctor` reports a store over 1 GiB with
