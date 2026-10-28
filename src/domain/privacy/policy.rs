@@ -236,9 +236,12 @@ mod tests {
     /// they stand, with no credential name before them: a model key in the `sk-` format, `hrk_`
     /// and `hsk_` tokens, and a JSON Web Token behind a vendor prefix, which gitleaks' JWT rule
     /// cannot see; lowercase words joined by hyphens after `sk-` are a name and stay, while random
-    /// letters with no digit are still a key. Published artifacts keep their checksums, embedded
-    /// data URIs, links and build commands byte for byte: a policy that replaced any of them would
-    /// publish files that no longer open or verify.
+    /// letters with no digit are still a key. A Slack token is replaced whatever the length of its
+    /// numeric groups, and so is the user curl echoes in its password prompt: a command that
+    /// passes a credential to `-u` without a colon prints it there, a quote inside it included, as
+    /// git's prompt prints the user part of a URL a command filled with one. Published artifacts
+    /// keep their checksums, embedded data URIs, links and build commands byte for byte: a policy
+    /// that replaced any of them would publish files that no longer open or verify.
     #[test]
     fn default_tier_replaces_credentials_and_reports_entropy_only_on_request() {
         let token = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
@@ -256,6 +259,10 @@ mod tests {
         let letters = "sk-RkQmXvLpZtNcWjFbHysVdaGeuKrQcXnvKblwpZjtruMvxAbCdE";
         let runner = "hrk_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         let prefixed_jwt = "hsk_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJydW5uZXItNDIiLCJpYXQiOjE3NjE1NTAwMDB9.Zk9q3vR7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let slack = "xoxb-12345678901234-98765432109876-R7kQ2mXv9LpZ4tNc8WjF3bHy";
+        let echoed = "Qf7Lw2Xv9mRtZ3pKc8Wn4Hy6sVd1aGe5uKbN0jT2xY7qPl";
+        let quoted = "Qf7'Lw2Xv9mRtZ3pKc8Wn4Hy6sVd1aGe5uKbN0jT2xY7qPl";
+        let url_user = "Xk3vQ9mT2pL7wR4nZ8cY1bH6sD0fJ5gE7aKm";
         let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let font = "AAEAAAASAQAABAAgR0RFRrRCsIIAAjWsAAACYkdQT1N/KyYBAAI4EAAAMkxHU1VCQyNA0QACaVwAAAJ4T1MvMmq7WyEAAADUAAAAYGNtYXA=";
         let link = "https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2";
@@ -285,6 +292,10 @@ mod tests {
              PostHog Key: {posthog}; ci uses {gitlab} and {routable} \n \
              model key {model} or {compatible} or {letters}; runner {runner} \n \
              TOKEN={prefixed_jwt} \n \
+             use {slack} as the key \n \
+             Enter host password for user '{echoed}': \n \
+             Enter host password for user '{quoted}': \n \
+             Password for 'https://{url_user}@github.com': \n \
              see sk-hyphenated-words-that-name-a-thing-at-length \n \
              http_headers = {{ \"X-Agit\" = \"1\" }} \n Bearer {pat} \n \
              AGIT_DEVICE_TOKEN={device}; sign-up link ?code={code}&next=/ \n \
@@ -345,6 +356,10 @@ mod tests {
             letters,
             runner,
             prefixed_jwt,
+            slack,
+            echoed,
+            quoted,
+            url_user,
         ] {
             assert!(span(&default, credential), "{credential} is a credential");
         }
@@ -378,7 +393,7 @@ mod tests {
         let opted_in = Snapshot::compile(&[], &[], false)
             .unwrap()
             .with_entropy(detector::Entropy::Include)
-            .scan(&text, 32);
+            .scan(&text, 64);
         assert!(span(&opted_in, token));
         assert!(span(&opted_in, opaque));
     }

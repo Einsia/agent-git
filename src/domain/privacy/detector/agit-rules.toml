@@ -84,6 +84,34 @@ description = "hrk_ or hsk_ access token"
 regex = '''\bh[rs]k_[A-Za-z0-9_-]{20,}'''
 keywords = ["hrk_", "hsk_"]
 
+# A Slack token whose numeric groups are longer than gitleaks' rules allow. gitleaks caps them at
+# thirteen digits, so a token with longer team or user ids never starts to match there.
+[[rules]]
+id = "agit-slack-token"
+description = "Slack token with long numeric groups"
+regex = '''\bxox[abposr]-[0-9]{8,}-[0-9]{8,}-[A-Za-z0-9]{16,}'''
+keywords = ["xoxa-", "xoxb-", "xoxo-", "xoxp-", "xoxr-", "xoxs-"]
+
+# curl asks for a password when `-u` names a user and no password, and echoes that user in the
+# prompt. A command that passes a credential to `-u` without a colon therefore prints the
+# credential itself, inside the quotes. curl does not escape a quote in the value, so the value
+# ends at the quote and colon that close the prompt, not at its first quote.
+[[rules]]
+id = "agit-curl-echoed-user"
+description = "credential echoed by curl's password prompt"
+regex = '''Enter (?:host|proxy) password for user '([^\r\n]{6,200}?)':'''
+keywords = ["password for user"]
+
+# git asks for a password for a URL whose user part a command filled with a credential
+# (`https://<token>@host/…`) and prints that URL in the prompt. The user part is the credential;
+# only it is replaced, so the host stays readable. A `user:password` URL is
+# `agit-credentials-in-url`'s.
+[[rules]]
+id = "agit-git-prompt-url-user"
+description = "credential in the URL user git's password prompt prints"
+regex = '''Password for '[A-Za-z][A-Za-z0-9+.-]*://([^'@:/\s]{6,200})@[^'\s]*'''
+keywords = ["password for '"]
+
 # A private-key header, in any letter case, opens a sensitive region. The shared scanner
 # extends this match through the matching footer or the end of an incomplete carrier.
 [[rules]]

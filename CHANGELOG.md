@@ -23,6 +23,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- A Slack token whose numeric groups are longer than thirteen digits is now replaced in what agit
+  publishes; such a token was published unchanged. So is the value curl echoes in "Enter host
+  password for user '…'", which is the credential itself when a command passes it to `curl -u`
+  without a colon, and the user part git prints in "Password for 'https://…@host'" when a command
+  put a credential there.
 - A credential is replaced to its end in what agit publishes. A GitLab token longer than the
   20 characters its rule names had only its start replaced, and the rest of the token was
   published after the placeholder; every rule that names a token by its length now replaces the
