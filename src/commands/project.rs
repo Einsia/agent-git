@@ -87,6 +87,130 @@ struct Project {
     history: History,
     excluded: BTreeSet<String>,
     last_result: Option<serde_json::Value>,
+    /// The repository's own push.auto override as it stood before bind turned automatic push
+    /// on; absent when bind did not turn it on. Unbind puts it back, so a binding never leaves
+    /// every managed session of the repository uploading after the folder is unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_auto_before: Option<PushAutoBefore>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PushAutoBefore {
+    Unset,
+    Off,
+    On,
+}
+
+impl From<Option<bool>> for PushAutoBefore {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            None => Self::Unset,
+            Some(false) => Self::Off,
+            Some(true) => Self::On,
+        }
+    }
+}
+
+impl From<PushAutoBefore> for Option<bool> {
+    fn from(value: PushAutoBefore) -> Self {
+        match value {
+            PushAutoBefore::Unset => None,
+            PushAutoBefore::Off => Some(false),
+            PushAutoBefore::On => Some(true),
+        }
+    }
+}
+
+fn auto_push_scope(repository: &str) -> String {
+    format!(
+        "turns on automatic push for the whole repository {repository}: every managed session there uploads after each turn"
+    )
+}
+
+/// The folders that still hold automatic push on for the same repository as `project`. Their
+/// records all name the override from before the first of them was bound.
+fn auto_push_holders(project: &Project) -> Result<Vec<Project>> {
+    Ok(policies()?
+        .into_iter()
+        .filter(|other| {
+            other.root != project.root
+                && other.enabled
+                && other.push_auto_before.is_some()
+                && other.repository == project.repository
+                && other.identity == project.identity
+        })
+        .collect())
+}
+
+/// Turns on automatic push for the whole repository, recording the override from before any
+/// folder turned it on: this folder's own earlier record, another bound folder's, or the
+/// current one. A folder that recorded the override another folder set would turn automatic
+/// push back on when it is unbound last.
+fn enable_auto_push(project: &mut Project, repo: &Repo) -> Result<()> {
+    if project.push_auto_before.is_none() {
+        project.push_auto_before = Some(
+            match auto_push_holders(project)?
+                .iter()
+                .find_map(|other| other.push_auto_before)
+            {
+                Some(before) => before,
+                None => repo.auto_push_override()?.into(),
+            },
+        );
+    }
+    repo.set_auto_push(Some(true))
+}
+
+/// Restores the push.auto override bind replaced once no other bound folder holds automatic
+/// push on, and reports in words whether it stays on. The record is dropped only after this
+/// succeeds, so a failed unbind can be repeated.
+fn restore_auto_push(project: &mut Project) -> Result<()> {
+    restore_auto_push_for(project)?;
+    if project.push_auto_before.take().is_some() {
+        save(project)?;
+    }
+    Ok(())
+}
+
+fn restore_auto_push_for(project: &Project) -> Result<()> {
+    let repository = &project.repository;
+    // A repository that is not cloned here pushes nothing.
+    let Ok(repo) = checkout(project) else {
+        return Ok(());
+    };
+    // Another clone at the same path keeps its own preference; this folder's record is not
+    // about it.
+    if identity::read(&repo)?.as_ref() != Some(&project.identity) {
+        println!(
+            "automatic push for {repository} is unchanged: the local clone is not the repository this folder was bound to"
+        );
+        return Ok(());
+    }
+    let Some(before) = project.push_auto_before else {
+        if repo.auto_push_enabled()? {
+            println!(
+                "automatic push stays on for {repository}: it was not turned on by this folder's binding"
+            );
+        }
+        return Ok(());
+    };
+    if let Some(other) = auto_push_holders(project)?.first() {
+        println!(
+            "automatic push stays on for {repository}: {} still uploads into it",
+            other.root.display()
+        );
+        return Ok(());
+    }
+    repo.set_auto_push(before.into())?;
+    if repo.auto_push_enabled()? {
+        println!(
+            "automatic push stays on for {repository}: it was on before this folder was bound"
+        );
+    } else {
+        println!("automatic push is off for {repository}, as it was before this folder was bound");
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -188,15 +312,32 @@ fn save(project: &Project) -> Result<()> {
 }
 
 fn lock(root: &Path) -> Result<fs::File> {
+    lock_at(
+        state_path(root)?.with_extension("lock"),
+        "the project operation lock",
+    )
+}
+
+/// Serializes the folders of one repository while they read each other's push.auto records,
+/// change the repository's push.auto and save their own policy. Without it, a folder bound
+/// while another is between turning push.auto on and saving its record would record that on
+/// as the value from before, and the last unbind would leave automatic push on.
+fn repository_lock(repository: &str) -> Result<fs::File> {
+    lock_at(
+        home()?.join(format!("{}.repository-lock", hash(repository))),
+        "the repository's automatic push lock",
+    )
+}
+
+fn lock_at(path: PathBuf, what: &str) -> Result<fs::File> {
     config::create_state_dir(&home()?)?;
-    let path = state_path(root)?.with_extension("lock");
     let file = config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&path)?;
-    crate::infra::local_state::lock_patiently(&file, &path, "the project operation lock", true)?;
+    crate::infra::local_state::lock_patiently(&file, &path, what, true)?;
     Ok(file)
 }
 
@@ -468,11 +609,11 @@ pub fn run(args: Args) -> CmdResult {
             let root = root(&path)?;
             let _guard = lock(&root)?;
             let mut project = read(&root)?.context("directory has no project policy")?;
+            let _repository = repository_lock(&project.repository)?;
             project.enabled = false;
             save(&project)?;
-            println!(
-                "Project capture stopped. Session history and repository preferences are unchanged."
-            );
+            println!("Project capture stopped. Session history is unchanged.");
+            restore_auto_push(&mut project)?;
             Ok(ExitCode::Ok)
         }
         Action::Drop { target } => drop_command(target.as_deref()),
@@ -562,6 +703,7 @@ fn bind(
         history,
         excluded: BTreeSet::new(),
         last_result: None,
+        push_auto_before: None,
     };
     let rows = candidates(&project)?;
     // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
@@ -569,7 +711,12 @@ fn bind(
     if dry_run {
         println!(
             "{}",
-            serde_json::json!({"directory":root,"repository":repository,"history":history,"repository_auto_upload":automatic,"candidates":rows})
+            serde_json::json!({
+                "directory": root, "repository": repository, "history": history,
+                "repository_auto_upload": automatic, "repository_auto_push": automatic,
+                "repository_auto_push_scope": automatic.then(|| auto_push_scope(repository)),
+                "candidates": rows,
+            })
         );
         return Ok(ExitCode::Ok);
     }
@@ -580,6 +727,9 @@ fn bind(
     let _guard = lock(&root)?;
     if let Some(existing) = assignable(&root, repository, rebind)? {
         project.last_result = existing.last_result;
+        // The override from before the first bind stays the one unbind restores; push.auto as
+        // this bind finds it may be the value an earlier bind set.
+        project.push_auto_before = existing.push_auto_before;
         if history == History::None {
             project.excluded = existing.excluded;
         }
@@ -631,7 +781,8 @@ fn bind(
     );
     if automatic {
         println!(
-            "Automatic upload uses the repository-wide push.auto preference. Other managed sessions in this local repository inherit that preference. Each publication validates its destination, session owners and snapshot privacy."
+            "Automatic upload {}. Each publication validates its destination, session owners and snapshot privacy.",
+            auto_push_scope(repository)
         );
     }
     confirm(
@@ -643,6 +794,7 @@ fn bind(
         false,
     )?;
     let repo = verify(&project)?;
+    let mut repository_guard = None;
     if automatic {
         let runtimes = super::setup::project_hook_runtimes()?;
         ensure!(
@@ -654,7 +806,10 @@ fn bind(
             "Automatic publication destination: {}",
             serde_json::to_string(&consent)?
         );
-        confirm("Confirm this account and destination and enable repository-wide automatic push?")?;
+        confirm(&format!(
+            "Confirm this account and destination? This {}",
+            auto_push_scope(repository)
+        ))?;
         for runtime in runtimes {
             child(
                 &[
@@ -668,10 +823,12 @@ fn bind(
             )?;
         }
         consent.save(&repo)?;
-        repo.set_auto_push(Some(true))?;
+        repository_guard = Some(repository_lock(repository)?);
+        enable_auto_push(&mut project, &repo)?;
     }
     workspace::bind(&root, repository, rebind)?;
     save(&project)?;
+    drop(repository_guard);
     record_audience(&root, &audience)?;
     if history == History::All {
         sync(&mut project)
@@ -1432,6 +1589,7 @@ mod tests {
             history: History::All,
             excluded: BTreeSet::new(),
             last_result: None,
+            push_auto_before: None,
         }
     }
 
@@ -1766,6 +1924,82 @@ mod tests {
         repo.add_all().unwrap();
         repo.commit("Unavailable project directory").unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", "work").is_err());
+    }
+
+    /// Unbind leaves the repository's push.auto as it was before the first folder was bound,
+    /// whatever that was, when two folders bind the same repository and are unbound in the
+    /// order they were bound; the first unbind leaves automatic push on for the other folder.
+    /// An unbind that kept bind's override would leave every managed session of the repository
+    /// uploading; one that cleared it would turn off automatic push chosen before binding; a
+    /// second folder that recorded the override the first one set would turn it back on.
+    /// A record is never written into another clone at the same path.
+    #[test]
+    fn unbind_restores_push_auto_from_before_the_bind() {
+        if !isolated("unbind_restores_push_auto_from_before_the_bind") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = config::repo_dir("alice", "app").unwrap();
+        let unbind = |work: &Path| {
+            run(Args {
+                action: Action::Unbind { path: work.into() },
+            })
+            .unwrap();
+        };
+        for (index, (user, before)) in [
+            (None, None),
+            (None, Some(false)),
+            (None, Some(true)),
+            (Some("true"), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            config::set_global("push.auto", user).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            let repo = Repo::init(&dir).unwrap();
+            repo.set_auto_push(before).unwrap();
+            let folders: Vec<Project> = ["a", "b"]
+                .iter()
+                .map(|name| {
+                    let work = temp.path().join(format!("{index}{name}"));
+                    fs::create_dir(&work).unwrap();
+                    let mut project = project(&work);
+                    identity::pin(&repo, &project.identity).unwrap();
+                    enable_auto_push(&mut project, &repo).unwrap();
+                    save(&project).unwrap();
+                    project
+                })
+                .collect();
+            unbind(&folders[0].root);
+            assert!(repo.auto_push_enabled().unwrap());
+            unbind(&folders[1].root);
+            assert_eq!(repo.auto_push_override().unwrap(), before);
+            for folder in &folders {
+                assert_eq!(read(&folder.root).unwrap().unwrap().push_auto_before, None);
+            }
+        }
+
+        config::set_global("push.auto", None).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        let work = temp.path().join("recloned");
+        fs::create_dir(&work).unwrap();
+        let mut project = project(&work);
+        project.push_auto_before = Some(PushAutoBefore::Off);
+        save(&project).unwrap();
+        let other = Repo::init(&dir).unwrap();
+        identity::pin(
+            &other,
+            &RemoteIdentity::new(
+                "https://example.test",
+                "cccccccc-0000-4000-8000-000000000003",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        other.set_auto_push(Some(true)).unwrap();
+        unbind(&work);
+        assert_eq!(other.auto_push_override().unwrap(), Some(true));
     }
 
     /// A Claude Code transcript that starts in `start`, and the project capture claim on it.

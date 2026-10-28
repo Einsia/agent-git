@@ -49,8 +49,10 @@ repository, including a desktop RC project, keeps its source authority; sync rep
 before importing or publishing it elsewhere. Publish that session from its source repository.
 Archived or superseded instances are not published; inspect reported failures.
 
-`--auto-upload` uses the existing repository-wide `push.auto` preference. Other managed
-sessions in this local repository inherit it. The command does not alter global preferences.
+`--auto-upload` turns on automatic push for the whole repository: every managed session in
+this local repository uploads after each turn, not only the folder's. The dry run says so in
+`repository_auto_push` and `repository_auto_push_scope`. The command does not alter global
+preferences.
 Do not use `--yes` before reviewing these choices; it explicitly accepts the confirmations.
 
 ## Developer: enroll a new project
@@ -117,9 +119,11 @@ no longer captures it; its local history stays, and it is never uploaded from th
 copy already on the Hub stays there until you remove it on the Hub.
 
 Unbind stops this project's hook capture and automatic pushing, without deleting existing
-history or resetting repository preferences. Explicit manual push is still possible. Nested
-project bindings are independent. Already in-flight operations finish before unbind obtains
-the project lock; the command reports a lock error if they do not finish in time.
+history. It puts the repository's `push.auto` back to what it was before the folder was bound;
+if automatic push was already on then, it stays on and unbind says so. Explicit manual push is
+still possible. Nested project bindings are independent. Already in-flight operations finish
+before unbind obtains the project lock; the command reports a lock error if they do not finish
+in time.
 
 RC retains its own supervisor and publishing lifecycle. RC-owned sessions keep their claims and
 source publication authority.
