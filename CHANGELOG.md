@@ -123,6 +123,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   removed after seven days. It rebuilds once per start; if the index still cannot be opened, the
   list reports `catalog_unreadable` and asks the device owner to restart `agit rc`, and the
   daemon log names the underlying error.
+- A repository whose secret dictionary from before account sync holds more than 16,384 values
+  saves and uploads again. Every privacy check there stopped as incomplete, so turns stayed
+  unsettled and pushes were refused, without saying why. The dictionary is now read whole and
+  carried into your account's dictionary once. If it still cannot be read, the pending check is
+  reported as `legacy_rules`.
 
 ## [0.2.28] - 2026-10-27
 

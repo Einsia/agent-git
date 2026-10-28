@@ -1306,7 +1306,12 @@ impl Session {
                 // every other reason is the worker's state, so the check is retried for good.
                 if matches!(
                     withheld.reason,
-                    Some(Reason::Oversize | Reason::FindingsCap | Reason::DeviceRules)
+                    Some(
+                        Reason::Oversize
+                            | Reason::FindingsCap
+                            | Reason::DeviceRules
+                            | Reason::LegacyRules
+                    )
                 ) || unshown.incomplete > PARTIAL_POLICY_RETRIES
                 {
                     return self.cannot_show(unshown).await;

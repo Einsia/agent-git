@@ -491,6 +491,7 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
         Some(Reason::SourceIncomplete) => "source_incomplete",
         Some(Reason::FindingsCap) => "findings_cap",
         Some(Reason::DeviceRules) => "device_rules",
+        Some(Reason::LegacyRules) => "legacy_rules",
         None => "unknown",
     }
 }
