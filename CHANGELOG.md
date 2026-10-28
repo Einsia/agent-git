@@ -26,6 +26,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- `agit push` works again in a checkout that has fetched the version tags of more turns than one
+  publication lists (about 4,000, counted across every session of the repository); it failed
+  with "audit publication reference limit exceeded" even for a short new session. Version tags
+  no longer count against that limit; other branches and tags still do.
 - On macOS, `agit push` (and `--to-hub` above all) no longer hangs for good after the Hub
   answers. A privacy worker started at the same moment as a Git command could inherit that
   command's output pipe and keep it open, so the push waited for the end of output while the

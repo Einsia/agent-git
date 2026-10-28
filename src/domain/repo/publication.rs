@@ -211,7 +211,7 @@ impl PublicationPlan {
             "audit publication branch limit exceeded"
         );
         let mut reader = Reader::new(repo);
-        let references = reader.references()?;
+        let (references, versions) = reader.references()?;
         let mut names: BTreeSet<String> = branches
             .iter()
             .map(|branch| format!("refs/heads/{branch}"))
@@ -257,6 +257,15 @@ impl PublicationPlan {
                 tag_objects.extend(objects);
             }
         }
+        // A version tag names the commit it points at, so whether it belongs to this plan is
+        // known without reading it.
+        tags.extend(
+            versions
+                .into_iter()
+                .filter(|(_, oid)| commits.contains(oid))
+                .map(|(name, oid)| FrozenRef { name, oid }),
+        );
+        tags.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(Self {
             include_main,
             heads,
@@ -530,59 +539,62 @@ impl Reader {
         Ok(reachable)
     }
 
-    fn read(&mut self, args: &[&str], limit: usize) -> Result<Vec<u8>> {
+    /// Local branches and tags, and apart from them the version tags (see [`version_tag`]).
+    ///
+    /// Every published turn has a version tag and a fetch brings all of them, so a checkout of a
+    /// busy repository holds more of them than [`MAX_REFS`]. They are therefore streamed and
+    /// counted against neither that bound nor the read budget; every other ref still is.
+    fn references(&mut self) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
         ensure!(
             self.reads < MAX_READS,
             "audit publication read limit exceeded"
         );
         self.reads += 1;
         let mut command: Vec<&str> = self.prefix.iter().map(String::as_str).collect();
-        command.extend_from_slice(args);
-        let output = self.repo.inspection_output(&command, limit)?;
-        ensure!(
-            output.status.success() && output.stderr.is_empty(),
-            "audit publication data is unavailable locally"
-        );
-        Ok(output.stdout)
-    }
-
-    fn references(&mut self) -> Result<BTreeMap<String, String>> {
-        let bytes = self.read(
-            &[
-                "for-each-ref",
-                "--format=%(objectname) %(refname)",
-                "refs/heads",
-                "refs/tags",
-            ],
-            MAX_OBJECT_BYTES,
-        )?;
-        let text =
-            std::str::from_utf8(&bytes).context("audit publication refs are not valid UTF-8")?;
-        ensure!(
-            text.is_empty() || text.ends_with('\n'),
-            "audit publication refs are incomplete"
-        );
+        command.extend_from_slice(&[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/tags",
+        ]);
         let mut refs = BTreeMap::new();
-        for line in text.lines() {
-            ensure!(
-                refs.len() < MAX_REFS,
-                "audit publication reference limit exceeded"
-            );
-            let (oid, name) = line
-                .split_once(' ')
-                .context("audit publication refs are malformed")?;
-            ensure!(
-                valid_oid(oid)
-                    && name.len() <= 1024
-                    && (name.starts_with("refs/heads/") || name.starts_with("refs/tags/")),
-                "audit publication refs are malformed"
-            );
-            ensure!(
-                refs.insert(name.into(), oid.into()).is_none(),
-                "audit publication refs are repeated"
-            );
-        }
-        Ok(refs)
+        let mut versions = BTreeMap::new();
+        self.repo.git_stream_split_inspection(
+            &command,
+            b'\n',
+            crate::infra::local_git::Deadline::new(),
+            |line| {
+                if line.is_empty() {
+                    return Ok(());
+                }
+                let line = std::str::from_utf8(line)
+                    .context("audit publication refs are not valid UTF-8")?;
+                let (oid, name) = line
+                    .split_once(' ')
+                    .context("audit publication refs are malformed")?;
+                ensure!(
+                    valid_oid(oid)
+                        && name.len() <= 1024
+                        && (name.starts_with("refs/heads/") || name.starts_with("refs/tags/")),
+                    "audit publication refs are malformed"
+                );
+                let listed = if version_tag(name, oid) {
+                    &mut versions
+                } else {
+                    ensure!(
+                        refs.len() < MAX_REFS,
+                        "audit publication reference limit exceeded"
+                    );
+                    &mut refs
+                };
+                ensure!(
+                    listed.insert(name.to_owned(), oid.to_owned()).is_none(),
+                    "audit publication refs are repeated"
+                );
+                Ok(())
+            },
+        )?;
+        Ok((refs, versions))
     }
 
     fn object(&mut self, oid: &str, kind: &str) -> Result<Vec<u8>> {
@@ -640,6 +652,12 @@ impl Reader {
         }
         anyhow::bail!("audit tag chain limit exceeded")
     }
+}
+
+/// Whether `name` is the lightweight version tag agit gives a published commit: it is named by the
+/// object it points at. An annotated tag, or one moved to another object, is not one.
+fn version_tag(name: &str, oid: &str) -> bool {
+    name.strip_prefix("refs/tags/agit-") == Some(oid)
 }
 
 fn valid_oid(oid: &str) -> bool {
@@ -756,6 +774,89 @@ mod tests {
         let base = initialize(directory.path());
         let repo = Repo::at(directory.path());
         (directory, repo, base)
+    }
+
+    fn git_with_input(root: &std::path::Path, args: &[&str], input: &str) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "owned Git fixture command failed: {args:?}"
+        );
+    }
+
+    /// A checkout that fetched more version tags than the reference limit (one per published turn
+    /// of every session) still freezes a branch, carrying exactly the version tags of its own
+    /// commits. Every other tag still counts: a listing that exempted all tags, or none, fails
+    /// one of the two halves.
+    #[test]
+    fn version_tags_do_not_bound_a_freeze_but_other_refs_do() {
+        let (directory, repo, base) = repository();
+        let root = directory.path();
+        git(root, &["branch", "selected"]);
+        let mut turns = String::new();
+        for index in 0..=MAX_REFS {
+            let message = format!("turn {index}\n");
+            turns.push_str(&format!(
+                "commit refs/imported/turns\nmark :{}\n\
+                 committer Fixture <fixture@example.invalid> 0 +0000\ndata {}\n{message}\n",
+                index + 1,
+                message.len()
+            ));
+        }
+        let marks = root.join(".git/turn-marks");
+        git_with_input(
+            root,
+            &[
+                "fast-import",
+                "--quiet",
+                &format!("--export-marks={}", marks.display()),
+            ],
+            &turns,
+        );
+        let mut tags = format!("create refs/tags/agit-{base} {base}\n");
+        for line in std::fs::read_to_string(&marks).unwrap().lines() {
+            let oid = line.split(' ').nth(1).unwrap();
+            tags.push_str(&format!("create refs/tags/agit-{oid} {oid}\n"));
+        }
+        git_with_input(root, &["update-ref", "--stdin"], &tags);
+        git(root, &["update-ref", "-d", "refs/imported/turns"]);
+        let branches = vec!["selected".into()];
+        let plan = PublicationPlan::freeze(&repo, &branches).unwrap();
+        assert_eq!(
+            plan.tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>(),
+            [format!("refs/tags/agit-{base}")]
+        );
+
+        let releases: String = (0..MAX_REFS)
+            .map(|index| format!("create refs/tags/release-{index} {base}\n"))
+            .collect();
+        git_with_input(root, &["update-ref", "--stdin"], &releases);
+        let refused = PublicationPlan::freeze(&repo, &branches).unwrap_err();
+        assert!(
+            refused.to_string().contains("reference limit exceeded"),
+            "{refused:#}"
+        );
     }
 
     /// Relative and absolute spellings must identify the same exact repository carrier.
