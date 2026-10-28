@@ -70,15 +70,15 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   explicit publication requires `--yes`.
 - For a new repository's first push, explicitly pass `--public` or `--private`
   according to the user's visibility instruction; if none is given, use `--private`.
-- For an authorized explicit push, first run `agit push <owner/repo>@<branch>
-  --dry-run`. Check the destination, visibility and snapshot summary,
-  then run `agit push <owner/repo>@<branch> --yes` with the same target and options
-  after the preview succeeds. Also continue with the same `push --yes` if dry-run
-  reports either documented first-publication diagnostic: a new destination needs
-  an immutable repository identity, or a saved session must be registered before
-  a dry-run publication. Ordinary push creates the destination or registers the
-  session, then prepares its preview. Stop on any other dry-run error. Read
-  [push](references/commands/push.md) for the exact diagnostics and audit mode.
+- For an authorized explicit push, run `agit push <owner/repo>@<branch> --yes`
+  directly. Push prints the destination, visibility and snapshot summary as it
+  uploads; that is a record, not a preview. In an agent a plain session can
+  publish even without `--yes`, so leaving it out is no safety check: run push
+  only when the user asked to upload. When the user wants to see what would be
+  published first, run the same command with `--dry-run` and wait for their go.
+  Push also checks the sign-in itself: when it says to sign in, follow the login
+  steps above and rerun the same push. Read
+  [push](references/commands/push.md) for the dry-run diagnostics and audit mode.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
   two writers in at once. `was already adopted` is informational; the import
@@ -117,6 +117,22 @@ Name constraint: a **branch** name must not begin with `agit-`. That prefix is r
 
 ## Adopt the current session when it is not managed yet
 
+When the user asks to upload the current conversation, it takes two commands. Do not run
+`agit status --json`, `whoami`, `login`, `doctor`, `log`, `push --dry-run` or `--help` first:
+push checks the sign-in and shows the destination, count and visibility itself.
+
+- Already saved (the runtime hook named its `<owner/repo>@<branch>`): `agit commit
+  <owner/repo>@<branch>`, then `agit push <owner/repo>@<branch> --yes`.
+- Not saved yet: `agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
+  --independent`, then `agit push <owner/repo>@<branch> --private --yes`. The repo is the
+  one the user named, otherwise the `bound repo` from one plain `agit status`. Use
+  `--independent` only when this conversation does not continue a saved session; when
+  it does, pass `--onto <ref>` instead.
+
+Push only when the user asked to upload. Always pass `--private` for a new repository,
+and `--public` only when the user says public. The details below cover other runtimes,
+an unknown native ID and the lineage choice.
+
 When the user asks to upload, save, or adopt the current conversation and its native session ID is needed, find the session below. An absent `AGIT_SESSION` alone is not a reason to scan or adopt transcripts. Do not use `agit new` to upload the running conversation:
 
 ```bash
@@ -153,7 +169,7 @@ session and records its claim; it is not a read-only preview.
 | Open a branch or saved point | `agit run <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points |
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
-| Publish local history | `agit push <owner/repo>@<branch> --dry-run`, then `agit push <owner/repo>@<branch> --yes` | Continue after a successful preview or a documented first-publication diagnostic |
+| Publish local history | `agit push <owner/repo>@<branch> --yes` | Prints the destination, visibility and snapshot summary, then uploads; add `--dry-run` only when the user wants a preview first |
 
 ## Deliver files at completed milestones
 

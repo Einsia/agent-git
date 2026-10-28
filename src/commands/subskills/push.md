@@ -65,27 +65,24 @@ publication but does not select a missing target or complete an audit review.
 ## Agent publication workflow
 
 For a new repository's first push, explicitly pass `--public` or `--private` according to
-the user's visibility instruction; if none is given, use `--private`. Keep that flag in both
-the dry-run and publication commands below, which show the default private choice.
+the user's visibility instruction; if none is given, use `--private`.
 
-For an authorized ordinary publication, run a dry-run before uploading:
-
-```bash
-agit push <owner/repo>@<branch> --private --dry-run
-```
-
-Check the destination, visibility and snapshot summary. Keep the default summary output;
-the complete preview remains in the JSON file at the reported path. After the dry-run
-succeeds, or if it fails with either exact first-publication diagnostic below, publish with
-confirmation supplied by `--yes`:
+For an authorized ordinary publication, push with confirmation supplied by `--yes`:
 
 ```bash
 agit push <owner/repo>@<branch> --private --yes
 ```
 
-Keep the same account, Hub, target, branch selection and publication options in both
-invocations; replace `--dry-run` with `--yes`. If those inputs or the
-saved history change, run the preview again before publishing.
+Push prints the destination, visibility and snapshot summary as it uploads (the complete
+preview stays in the JSON file at the reported path). That is a record, not a preview: in
+an agent a plain session can publish even without `--yes`, so leaving it out is no safety
+check. Run push only when the user asked to upload, and do not run a dry-run first unless
+the user asks to see the preview. Push checks the sign-in itself; when it says to sign in,
+follow the login steps and rerun the same command.
+
+When the user does ask for a preview, run the same command with `--dry-run` in place of
+`--yes`, keeping the same account, Hub, target, branch selection and publication options.
+If those inputs or the saved history change, run the preview again before publishing.
 
 With an explicit target and registered destination and sessions, ordinary dry-run
 displays the summary without asking for publication confirmation or uploading history.
