@@ -934,11 +934,107 @@ fn synchronize(hub: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// A worker talks to its parent over stdin and stdout and needs no other descriptor it was born
+/// with. A parent that spawns it while another thread creates a pipe for a different child can
+/// hand it that pipe's write end before close-on-exec is set; kept open here, it keeps the other
+/// child's reader from ever reaching end of file, and a parent waiting on that reader waits on
+/// this worker, which waits on the parent. So every descriptor above stderr is closed before the
+/// worker opens one of its own, and a worker that cannot tell which descriptors it holds does not
+/// run: a sweep up to an estimated bound misses whatever was opened above it, and no limit this
+/// process can read bounds the descriptors it inherited.
+#[cfg(unix)]
+#[must_use]
+fn close_inherited_descriptors() -> bool {
+    #[cfg(target_os = "linux")]
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        )
+    } == 0
+    {
+        return true;
+    }
+    let Some(listed) = listed_descriptors() else {
+        return false;
+    };
+    for descriptor in listed.into_iter().filter(|descriptor| *descriptor > 2) {
+        unsafe {
+            libc::close(descriptor);
+        }
+    }
+    true
+}
+
+/// Every descriptor this process holds: from the kernel's process table where the platform
+/// offers it, which needs no file system, otherwise from a descriptor directory. `None` when
+/// neither can be read.
+#[cfg(unix)]
+fn listed_descriptors() -> Option<Vec<libc::c_int>> {
+    #[cfg(target_os = "macos")]
+    if let Some(listed) = process_table_descriptors() {
+        return Some(listed);
+    }
+    for directory in ["/dev/fd", "/proc/self/fd"] {
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            return Some(
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+/// The first call sizes the table, which only this process could grow, and it opens nothing in
+/// between. A reply that fills the buffer, spare entry included, may have been cut short, so it
+/// does not count as a listing.
+#[cfg(target_os = "macos")]
+fn process_table_descriptors() -> Option<Vec<libc::c_int>> {
+    let pid = unsafe { libc::getpid() };
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let needed =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return None;
+    }
+    let room = needed as usize / entry + 1;
+    let mut table = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        room
+    ];
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            table.as_mut_ptr().cast(),
+            libc::c_int::try_from(room * entry).ok()?,
+        )
+    };
+    if written <= 0 || written as usize >= room * entry {
+        return None;
+    }
+    table.truncate(written as usize / entry);
+    Some(table.iter().map(|info| info.proc_fd).collect())
+}
+
 /// Check before normal CLI startup so worker failure cannot run business commands.
 pub fn entry(args: &[OsString]) -> Option<i32> {
     let mode = args.get(1)?.to_str()?;
     if mode != WORKER && mode != SYNC {
         return None;
+    }
+    #[cfg(unix)]
+    if !close_inherited_descriptors() {
+        return Some(4);
     }
     IN_WORKER.store(true, Ordering::Relaxed);
     std::panic::set_hook(Box::new(|_| {}));

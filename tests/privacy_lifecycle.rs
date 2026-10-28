@@ -481,6 +481,42 @@ fn read_only_inspection_creates_no_privacy_journal() {
     );
 }
 
+/// A worker holds no descriptor it inherited beyond stdin, stdout and stderr. A parent that spawns
+/// the worker while another thread creates a pipe for a different child can hand it that pipe's
+/// write end before close-on-exec is set, and a worker that kept it would keep the other child's
+/// reader from ever reaching end of file, so the parent waiting on that reader and the worker
+/// waiting on the parent would wait on each other for good. The pipe here has no close-on-exec at
+/// all: a worker that does not close inherited descriptors keeps its write end, and the read end
+/// does not reach end of file while that worker runs.
+#[cfg(unix)]
+#[test]
+fn a_worker_holds_no_descriptor_it_inherited() {
+    let hub = Hub::new();
+    let device = Device::new(&hub.url);
+    let mut ends = [0; 2];
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    let [read_end, write_end] = ends;
+    let mut worker = device.worker();
+    unsafe { libc::close(write_end) };
+    let mut ready = libc::pollfd {
+        fd: read_end,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let read = if unsafe { libc::poll(&mut ready, 1, 5_000) } > 0 {
+        let mut byte = [0u8; 1];
+        unsafe { libc::read(read_end, byte.as_mut_ptr().cast(), 1) }
+    } else {
+        -1
+    };
+    unsafe { libc::close(read_end) };
+    assert!(
+        worker.0.try_wait().unwrap().is_none(),
+        "the worker exited before the check"
+    );
+    assert_eq!(read, 0, "the worker still holds the inherited write end");
+}
+
 /// Separate homes must recover every opaque alias after an interrupted upload. A worker that
 /// keeps originals only in memory, sends plaintext, or loses retry state cannot satisfy this flow.
 #[test]

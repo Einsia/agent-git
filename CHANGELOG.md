@@ -26,6 +26,12 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- On macOS, `agit push` (and `--to-hub` above all) no longer hangs for good after the Hub
+  answers. A privacy worker started at the same moment as a Git command could inherit that
+  command's output pipe and keep it open, so the push waited for the end of output while the
+  worker waited for the push. The worker now closes every descriptor it inherited before it
+  starts, and does not start where it cannot list them (no `close_range`, `/dev/fd` or
+  `/proc`), so a publication there stops with a privacy error instead of hanging.
 - Push reuses committed history facts within the same frozen selection, reads retained encrypted
   envelopes once per reconstruction, and prepares the JSON and expanded terminal preview together.
   Metadata-only projection changes retain validated private session content while checking changed
