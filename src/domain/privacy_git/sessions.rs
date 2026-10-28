@@ -877,6 +877,12 @@ impl ProjectedHistory {
         let plan = PublicationPlan::freeze_selected(&repo, branches)?;
         source_plan.verify(&source, branches)?;
         preparing.finish();
+        // A store that cannot be compacted still publishes; it is compacted at a later push.
+        if let Err(error) = super::compact_store(&root) {
+            crate::ui::warning(&format!(
+                "the privacy publication store could not be compacted: {error:#}"
+            ));
+        }
         Ok(Self {
             repo,
             source: source_plan,

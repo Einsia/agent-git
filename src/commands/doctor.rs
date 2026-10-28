@@ -70,6 +70,9 @@ fn parse_repo(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// A privacy publication store at least this large is reported with its cleanup command.
+const LARGE_PUBLICATION_STORE: u64 = 1 << 30;
+
 enum Check {
     Ok(String),
     Warn(String),
@@ -252,7 +255,31 @@ pub fn run(args: Args) -> CmdResult {
     for (owner, name, root) in &agents {
         let slug = format!("{owner}/{name}");
         if let Some(status) = transaction::inspect(root, &slug) {
-            checks.push((slug, Check::Warn(status)));
+            checks.push((slug.clone(), Check::Warn(status)));
+        }
+        let common = crate::domain::repo::Repo::at(root)
+            .local_objects_only()
+            .common_dir();
+        for (store, bytes) in common
+            .map(|common| crate::domain::privacy_git::publication_stores(&common))
+            .unwrap_or_default()
+        {
+            if bytes >= LARGE_PUBLICATION_STORE {
+                #[cfg(windows)]
+                use crate::ui::quote_powershell_argument as quote_arg;
+                #[cfg(not(windows))]
+                use crate::ui::session::shell_arg as quote_arg;
+                checks.push((
+                    slug.clone(),
+                    Check::Warn(format!(
+                        "its privacy publication store takes {:.1} GiB; the next `agit push` \
+                         compacts it when about that much is free on its disk, or with no agit \
+                         process running: git -C {} repack -a -d -k -l -q",
+                        bytes as f64 / (1u64 << 30) as f64,
+                        quote_arg(&store.to_string_lossy())
+                    )),
+                ));
+            }
         }
     }
     let unpushed: Vec<&String> = agents

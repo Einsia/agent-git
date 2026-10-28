@@ -22,7 +22,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Seek, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const MAX_COMMIT: usize = 1024 * 1024;
@@ -421,6 +421,78 @@ fn commit_preview(bytes: &[u8]) -> Result<serde_json::Value> {
     Ok(preview)
 }
 
+/// Packs, and loose objects, past which a publication store is compacted: the thresholds of Git's
+/// own automatic maintenance (`gc.autoPackLimit`, `gc.auto`).
+const COMPACT_PACKS: u64 = 50;
+const COMPACT_LOOSE: u64 = 6700;
+
+/// Compact the publication store at `root` once it holds many packs or loose objects, and say
+/// whether it did. Every publication imports into the store and nothing else packs it, so it would
+/// keep each import's pack and each snapshot's loose objects for good. Unreachable objects stay
+/// (`-k`): what pending candidates and outbox receipts name is not always reachable from the
+/// store's refs. Only the store's own objects are packed (`-l`): were it ever to gain an alternate,
+/// packing everything would copy the source's private objects into the publication store. Callers
+/// hold the publication lock, so no agit process writes the store meanwhile.
+pub(crate) fn compact_store(root: &Path) -> Result<bool> {
+    let repo = Repo::at(root);
+    let counts = repo.git(&["count-objects", "-v"])?;
+    let field = |name: &str| {
+        counts
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    if field("packs:") <= COMPACT_PACKS && field("count:") <= COMPACT_LOOSE {
+        return Ok(false);
+    }
+    // The new pack is written before anything it replaces is removed, so compaction needs about
+    // the store's size free; starting without it would fill the disk and then fail.
+    let needed = (field("size:") + field("size-pack:")) * 1024;
+    let available = fs2::available_space(root)?;
+    ensure!(
+        available >= needed,
+        "compacting it needs about {} MiB free on its disk and {} MiB are free",
+        needed >> 20,
+        available >> 20
+    );
+    // Its own stage, so that a long repack reads as progress rather than as a stalled push.
+    let compacting = crate::ui::publication::stage("Compacting the privacy publication store");
+    repo.git(&["repack", "-a", "-d", "-k", "-l", "-q"])?;
+    compacting.finish();
+    Ok(true)
+}
+
+/// The publication stores kept for the repository whose common Git directory is `common`, each
+/// with the bytes it occupies.
+pub(crate) fn publication_stores(common: &Path) -> Vec<(PathBuf, u64)> {
+    let Ok(entries) = fs::read_dir(common.join("agit/privacy-publication")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.join(".git").is_dir())
+        .map(|path| {
+            let bytes = directory_bytes(&path);
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn initialize_with_format(root: &Path, oid_length: usize) -> Result<()> {
     ensure!(
         matches!(oid_length, 40 | 64),
@@ -630,4 +702,76 @@ fn parent_first(parents: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>> 
         }
     }
     Ok(order)
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    /// Runs Git the way agit does for the store, so the fixture and the compaction share one Git.
+    fn git(root: &Path, args: &[&str]) -> String {
+        let identity = [
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ];
+        Repo::at(root)
+            .git(&[&identity[..], args].concat())
+            .unwrap_or_else(|error| panic!("git {args:?}: {error:#}"))
+    }
+
+    fn packs(root: &Path) -> usize {
+        fs::read_dir(root.join(".git/objects/pack"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .count()
+    }
+
+    /// A store past Git's own maintenance thresholds is compacted into one pack without losing an
+    /// object that no ref reaches any more, since pending candidates and receipts can name such
+    /// objects; below the thresholds it is left alone. A compaction that pruned (`gc`) or dropped
+    /// unreachable packed objects (`repack -a -d` without `-k`) loses the orphaned blob.
+    #[test]
+    fn a_crowded_store_is_compacted_without_losing_unreachable_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "core.logAllRefUpdates", "false"]);
+        // `git commit` past the pack threshold would start Git's own background gc, which deletes
+        // packs while this test reads them. agit writes a store only with plumbing commands.
+        git(root, &["config", "gc.auto", "0"]);
+        git(root, &["config", "maintenance.auto", "false"]);
+        git(root, &["switch", "-q", "-c", "candidate"]);
+        fs::write(
+            root.join("candidate.txt"),
+            "only a pending candidate names this\n",
+        )
+        .unwrap();
+        git(root, &["add", "candidate.txt"]);
+        git(root, &["commit", "-qm", "candidate"]);
+        let orphan = git(root, &["rev-parse", "HEAD:candidate.txt"]);
+        git(root, &["repack", "-q"]);
+        git(root, &["switch", "-q", "--orphan", "main"]);
+        git(root, &["branch", "-q", "-D", "candidate"]);
+        for index in 0..=COMPACT_PACKS {
+            fs::write(root.join("turn.txt"), format!("turn {index}\n")).unwrap();
+            git(root, &["add", "turn.txt"]);
+            git(root, &["commit", "-qm", "turn"]);
+            git(root, &["repack", "-q"]);
+        }
+        assert!(packs(root) as u64 > COMPACT_PACKS);
+
+        assert!(compact_store(root).unwrap());
+        assert_eq!(packs(root), 1);
+        git(root, &["cat-file", "-e", &orphan]);
+        assert!(!compact_store(root).unwrap());
+    }
 }

@@ -32,6 +32,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- The privacy publication store kept for each published repository no longer grows without
+  bound: a push compacts it once it holds many packs or loose objects and its disk has about the
+  store's size free, keeping every object it holds. `agit doctor` reports a store over 1 GiB with
+  its size and the command that compacts it by hand.
 - Hooks installed by `agit setup` run when agit's path contains a space, such as an app's
   `Application Support` folder or a Windows user folder with a space in its name. The hook
   command wrote that path unquoted, so the shell split it, the hook failed on every turn, and no
