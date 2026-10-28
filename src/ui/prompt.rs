@@ -11,7 +11,9 @@
 //! with `--flag`" error — safer than guessing an answer.
 
 use crate::Result;
-use dialoguer::{Confirm, Input, Password, Select};
+use dialoguer::console::{Key, Term};
+use dialoguer::theme::{SimpleTheme, Theme};
+use dialoguer::{Input, Password, Select};
 use std::io::IsTerminal;
 
 pub(crate) fn interactive() -> bool {
@@ -59,15 +61,79 @@ pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
 ///
 /// Non-interactive returns None and **not** the default — a dangerous operation with no one to
 /// ask must refuse to run rather than take the default.
+///
+/// The answer is taken on Enter, not on the `y`/`n` keystroke. If a single key answered, the
+/// Enter of a habitual `y⏎` would land on the next question and take its default unseen. Esc or
+/// `q` cancels at once, as in every other prompt: a cancel asks nothing further, so no keystroke
+/// can spill.
+///
+/// The key loop never spins: a read error or end of input cancels, and a terminal the key reader
+/// itself does not recognise is not asked, because there it returns `Key::Unknown` without
+/// waiting.
 pub fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
     if !can_ask() {
         return Ok(None);
     }
+    let term = Term::stderr();
+    if !term.is_term() {
+        return Ok(None);
+    }
     crate::telemetry::observe(crate::telemetry::Observation::Prompt);
-    Ok(Confirm::new()
-        .with_prompt(prompt)
-        .default(default)
-        .interact_opt()?)
+    let theme = SimpleTheme;
+    let draw = |value: bool| -> std::io::Result<()> {
+        let mut line = String::new();
+        let _ = theme.format_confirm_prompt(&mut line, prompt, Some(value));
+        term.clear_line()?;
+        term.write_str(&line)?;
+        term.flush()
+    };
+    let mut value = default;
+    draw(value)?;
+    term.hide_cursor()?;
+    let answer = loop {
+        match confirm_key(term.read_key()) {
+            ConfirmKey::Set(chosen) => value = chosen,
+            ConfirmKey::Answer => break Ok(Some(value)),
+            ConfirmKey::Cancel => break Ok(None),
+            ConfirmKey::Ignore => continue,
+        }
+        if let Err(error) = draw(value) {
+            break Err(error);
+        }
+    };
+    term.clear_line()?;
+    term.show_cursor()?;
+    let answer = answer?;
+    let mut line = String::new();
+    let _ = theme.format_confirm_prompt_selection(&mut line, prompt, answer);
+    term.write_line(&line)?;
+    Ok(answer)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmKey {
+    Set(bool),
+    Answer,
+    Cancel,
+    Ignore,
+}
+
+/// What one read means to [`confirm`].
+///
+/// Enter arrives as `Key::Enter` from both key readers, and as a bare `\r` or `\n` character
+/// from consoles that pass it through. Ctrl-C and Ctrl-D arrive as characters in raw mode and
+/// cancel, as a failed read does. A modifier key alone (`Key::Shift`, or `Key::Unknown` for Ctrl
+/// on Windows) is ignored, so typing `Y` does not cancel.
+fn confirm_key(key: std::io::Result<Key>) -> ConfirmKey {
+    match key {
+        Ok(Key::Char('y' | 'Y')) => ConfirmKey::Set(true),
+        Ok(Key::Char('n' | 'N')) => ConfirmKey::Set(false),
+        Ok(Key::Enter | Key::Char('\r' | '\n')) => ConfirmKey::Answer,
+        Ok(Key::Escape | Key::CtrlC | Key::Char('q' | '\u{3}' | '\u{4}')) | Err(_) => {
+            ConfirmKey::Cancel
+        }
+        Ok(_) => ConfirmKey::Ignore,
+    }
 }
 
 pub fn input(prompt: &str, default: Option<&str>) -> Result<Option<String>> {
@@ -119,6 +185,43 @@ mod tests {
         assert_eq!(confirm("x", true).unwrap(), None);
         assert_eq!(input("x", Some("d")).unwrap(), None);
         assert_eq!(password("x").unwrap(), None);
+    }
+
+    #[test]
+    fn confirmation_answers_only_on_enter() {
+        assert_eq!(confirm_key(Ok(Key::Char('y'))), ConfirmKey::Set(true));
+        assert_eq!(confirm_key(Ok(Key::Char('N'))), ConfirmKey::Set(false));
+        for enter in [Key::Enter, Key::Char('\r'), Key::Char('\n')] {
+            assert_eq!(confirm_key(Ok(enter)), ConfirmKey::Answer);
+        }
+    }
+
+    #[test]
+    fn confirmation_cancels_on_end_of_input_and_read_errors() {
+        for key in [
+            Key::Escape,
+            Key::CtrlC,
+            Key::Char('q'),
+            Key::Char('\u{3}'),
+            Key::Char('\u{4}'),
+        ] {
+            assert_eq!(confirm_key(Ok(key)), ConfirmKey::Cancel);
+        }
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(confirm_key(Err(kind.into())), ConfirmKey::Cancel);
+        }
+    }
+
+    /// Typing a capital `Y` presses Shift first, which Windows reports as its own key.
+    #[test]
+    fn confirmation_ignores_modifier_keys() {
+        for key in [Key::Shift, Key::Alt, Key::Unknown, Key::ArrowLeft] {
+            assert_eq!(confirm_key(Ok(key)), ConfirmKey::Ignore);
+        }
     }
 
     #[test]

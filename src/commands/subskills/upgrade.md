@@ -31,9 +31,9 @@ JSON mode. JSON stdout remains one complete envelope; the startup notice is sepa
 `diagnostics.stderr` inside that envelope. The CLI never installs an incidental update without
 an explicit terminal confirmation.
 
-A human terminal waits at `Update agit now? [y/N]`. Enter or `n` skips installation; `y` runs
-the existing upgrade and skill-refresh flow before restarting the requested command. Upgrade
-output also goes to stderr. An unavailable update or failed installation does not prevent the
+A human terminal waits at `Update agit now? [y/N]`. The answer is taken on Enter: Enter alone or
+`n` Enter skips installation; `y` Enter runs the existing upgrade and skill-refresh flow before
+restarting the requested command. Upgrade output also goes to stderr. An unavailable update or failed installation does not prevent the
 original command from running. After an accepted update attempt, the CLI restarts with the
 original arguments through the installation path and skips the repeated startup check. This
 uses the installed version even if installation succeeded but skill refresh failed.

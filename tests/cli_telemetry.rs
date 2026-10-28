@@ -1269,11 +1269,11 @@ fn installer_terminal_delivery_survives_a_successful_start_upload() {
     assert!(!delayed.events().is_empty());
 }
 
+/// Runs the installer's onboarding question on a pseudo-terminal, types `keys` once it is shown,
+/// and returns the terminal output after the process exits.
 #[cfg(unix)]
-#[test]
-fn cancelled_installer_onboarding_stays_unset_through_receipt_and_setup() {
+fn answer_installer_onboarding(fixture: &Fixture, keys: &[u8]) -> String {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    let fixture = Fixture::new();
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut builder = CommandBuilder::new(BIN);
     builder.env_clear();
@@ -1319,15 +1319,36 @@ fn cancelled_installer_onboarding_stays_unset_through_receipt_and_setup() {
             output.push_str(&String::from_utf8_lossy(&chunk));
         }
     }
-    writer.write_all(b"\x1b").unwrap();
+    writer.write_all(keys).unwrap();
     writer.flush().unwrap();
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            panic!("Cancellation did not finish");
+            panic!("The answer did not finish the prompt: {output}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    while let Ok(chunk) = chunks.recv_timeout(Duration::from_millis(100)) {
+        output.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    output
+}
+
+/// A `y`/`n` keystroke only selects; Enter answers. A confirmation that took the keystroke would
+/// answer No here, and a habitual `y⏎` would hand its Enter to the next question.
+#[cfg(unix)]
+#[test]
+fn installer_onboarding_takes_the_answer_on_enter() {
+    let fixture = Fixture::new();
+    let output = answer_installer_onboarding(&fixture, b"ny\r");
+    assert!(output.contains("Usage statistics are enabled"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_installer_onboarding_stays_unset_through_receipt_and_setup() {
+    let fixture = Fixture::new();
+    answer_installer_onboarding(&fixture, b"\x1b");
     assert!(!fixture.path("preferences.json").exists());
     for args in [
         vec!["--internal-install-completed", "--defer-notice"],
