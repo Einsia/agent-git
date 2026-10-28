@@ -71,7 +71,7 @@ impl PublicationSnapshot {
             .private
             .protected_values
             .extend(self.protected_values);
-        projection.private.validate()?;
+        projection.validate_private()?;
         projection.source_log = self.source_log;
         Ok(projection)
     }

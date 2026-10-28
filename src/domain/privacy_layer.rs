@@ -114,6 +114,16 @@ impl PrivateLayer {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_metadata()?;
+        let (log, view) = self.session_bytes()?;
+        storage::snapshot_files(&log, &view)
+            .map_err(|_| anyhow::anyhow!("private LOG or VIEW is not a valid session snapshot"))?;
+        Ok(())
+    }
+
+    /// Metadata-only edits preserve the validated session bytes. Callers admitting new session
+    /// bytes, including deserialized layers, must use `validate` instead.
+    pub(crate) fn validate_metadata(&self) -> Result<()> {
         ensure!(
             self.version == PRIVATE_LAYER_VERSION,
             "unsupported private layer version"
@@ -134,9 +144,6 @@ impl PrivateLayer {
                 "private committer evidence differs from snapshot metadata"
             );
         }
-        let (log, view) = self.session_bytes()?;
-        storage::snapshot_files(&log, &view)
-            .map_err(|_| anyhow::anyhow!("private LOG or VIEW is not a valid session snapshot"))?;
         ensure!(
             self.protected_values
                 .iter()

@@ -11,6 +11,7 @@
 
 pub(crate) mod privacy_preview;
 pub mod prompt;
+pub(crate) mod publication;
 pub mod semantic_prefix;
 pub mod session;
 pub mod table;

@@ -28,8 +28,11 @@ pub(super) struct Reused {
 }
 
 pub(super) fn is_legacy_envelope(bytes: &[u8]) -> Result<bool> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    Ok(value.get("format_version").and_then(Value::as_u64) == Some(1))
+    #[derive(Deserialize)]
+    struct Version {
+        format_version: Option<u64>,
+    }
+    Ok(serde_json::from_slice::<Version>(bytes)?.format_version == Some(1))
 }
 
 /// Authenticated mappings allow legacy ciphertext to remain opaque while preserving its graph.
@@ -45,7 +48,7 @@ pub(super) fn retain_accepted(
         super::super::privacy_envelope::MAX_ENVELOPE_BYTES,
     )?;
     if !is_legacy_envelope(&bytes)? {
-        return reuse(source, destination, oid, parents).map(Some);
+        return reuse_bytes(source, destination, oid, parents, bytes).map(Some);
     }
     let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
     ensure!(
@@ -68,18 +71,23 @@ pub(super) fn reuse(
     oid: &str,
     parents: &[String],
 ) -> Result<Reused> {
-    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
     let bytes = read(
         source,
         &["cat-file", "blob", &format!("{oid}:privacy/envelope.json")],
         super::super::privacy_envelope::MAX_ENVELOPE_BYTES,
     )?;
+    reuse_bytes(source, destination, oid, parents, bytes)
+}
+
+fn reuse_bytes(
+    source: &Repo,
+    destination: &Repo,
+    oid: &str,
+    parents: &[String],
+    bytes: Vec<u8>,
+) -> Result<Reused> {
+    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
     let envelope = PrivacyEnvelope::parse(&bytes)?;
-    ensure!(
-        envelope.snapshot_digest == digest_json(&envelope.public_projection)?
-            && envelope.attachments.is_empty(),
-        "published ancestry has an unsupported snapshot binding"
-    );
     let public: PublicSnapshot = serde_json::from_value(envelope.public_projection.clone())
         .context("published ancestry has an unsupported public schema")?;
     ensure!(public.version == 1, "unsupported public snapshot version");

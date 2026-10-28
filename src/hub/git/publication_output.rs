@@ -14,6 +14,8 @@ struct Pipe {
     bytes: Vec<u8>,
     closed: bool,
     error: Option<String>,
+    marker_tail: Vec<u8>,
+    checking: bool,
 }
 
 impl Pipe {
@@ -23,6 +25,8 @@ impl Pipe {
             bytes: Vec::new(),
             closed: false,
             error: None,
+            marker_tail: Vec::new(),
+            checking: false,
         }
     }
 
@@ -42,6 +46,22 @@ impl Pipe {
                     });
                 }
                 if forward {
+                    // Sideband text can arrive across pipe reads; only an observed server
+                    // message changes the local upload status to validation.
+                    if !self.checking {
+                        const MARKER: &[u8] = b"remote: Checking the publication:";
+                        self.marker_tail.extend_from_slice(&buffer[..count]);
+                        if self
+                            .marker_tail
+                            .windows(MARKER.len())
+                            .any(|bytes| bytes == MARKER)
+                        {
+                            self.checking = true;
+                            crate::ui::publication::server_checking();
+                        }
+                        let keep = self.marker_tail.len().saturating_sub(MARKER.len() - 1);
+                        self.marker_tail.drain(..keep);
+                    }
                     let mut sink = io::stderr();
                     let _ = sink.write_all(&buffer[..count]);
                     let _ = sink.flush();

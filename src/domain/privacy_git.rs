@@ -75,6 +75,11 @@ pub struct ProjectedHistory {
     _lock: fs::File,
 }
 
+pub(crate) enum PreviewEntry<'a> {
+    Snapshot(&'a serde_json::Value),
+    File(&'a serde_json::Value),
+}
+
 impl ProjectedHistory {
     pub fn repo(&self) -> &Repo {
         &self.repo
@@ -122,9 +127,22 @@ impl ProjectedHistory {
         source: &Repo,
         captured: &crate::hub::git::CapturedPublication,
     ) -> Result<std::path::PathBuf> {
+        self.write_preview_with(destination, source, captured, |_| Ok(()))
+    }
+
+    pub(crate) fn write_preview_with(
+        &self,
+        destination: &serde_json::Value,
+        source: &Repo,
+        captured: &crate::hub::git::CapturedPublication,
+        mut emit: impl FnMut(PreviewEntry<'_>) -> Result<()>,
+    ) -> Result<std::path::PathBuf> {
         self.verify_source(source)?;
         let policy = effective_policy(source, &self.additional_policies)?;
         let snapshots = self.session_preview()?;
+        for snapshot in &snapshots {
+            emit(PreviewEntry::Snapshot(snapshot))?;
+        }
         let path = self.repo.root().join(".git/publication-preview.json");
         let public_digest = self.public_digest_of(&snapshots)?;
         let summary = serde_json::to_string_pretty(
@@ -141,6 +159,7 @@ impl ProjectedHistory {
             output.write_all(if first { b"\n    " } else { b",\n    " })?;
             first = false;
             serde_json::to_writer(&mut output, &file)?;
+            emit(PreviewEntry::File(&file))?;
             Ok(())
         })?;
         output.write_all(b"\n  ]\n}\n")?;

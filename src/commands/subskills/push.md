@@ -135,6 +135,12 @@ ask. Noninteractive creation defaults to private. Existing repository visibility
 
 ## Review and publication
 
+Push reports its current preparation or upload stage and elapsed time on stderr. Snapshot
+preparation distinguishes prepared and reused snapshots, and upload stages identify their branch
+and tag counts. Redirected output retains periodic progress during long stages. `--quiet` and
+`--json` omit these progress notices. The final processing time excludes interactive review and
+confirmation waits; a stopped stage is not a publication acknowledgement.
+
 The preview identifies the account, Hub, immutable destination, audience, registered modes and
 selected refs. Stored preview JSON contains public snapshots and plain file content; each plain
 snapshot contributes the files it introduces relative to its parents. A blob appears with its

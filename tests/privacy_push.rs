@@ -652,6 +652,20 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert!(!remote.exists());
     let dry = run(&["push", "alice/app@main", "--dry-run"], false);
     assert!(!dry.status.success(), "{dry:?}");
+    assert!(String::from_utf8_lossy(&dry.stderr).contains("Publication processing time:"));
+    for flags in [vec!["--quiet"], vec!["--json"]] {
+        let mut args = flags;
+        args.extend(["push", "alice/app@main", "--dry-run"]);
+        let output = run(&args, false);
+        assert!(!output.status.success());
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(bytes).contains("Publication processing time:"));
+        }
+        if args.contains(&"--json") {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], false);
+        }
+    }
     assert_eq!(hub.creations.load(Ordering::Acquire), 0);
     assert!(!remote.exists());
     let unconfirmed = run(&["push", "alice/app@main"], false);
@@ -661,11 +675,39 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let create = ["--yes", "push", "alice/app@main"];
     let refused = run(&create, false);
     assert!(!refused.status.success(), "{refused:?}");
+    let progress = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        progress
+            .lines()
+            .any(|line| line.starts_with("Getting receipt for batch") && line.contains("stopped")),
+        "{progress}"
+    );
+    assert!(
+        !progress.contains("Uploading and awaiting acknowledgement"),
+        "{progress}"
+    );
     assert_eq!(hub.creations.load(Ordering::Acquire), 1);
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
     assert!(git(&remote, &["for-each-ref"]).is_empty());
     hub.corrupt_receipt.store(false, Ordering::Release);
-    assert_success(&run(&create, false));
+    let published = run(&create, false);
+    assert_success(&published);
+    let progress = String::from_utf8_lossy(&published.stderr);
+    for stage in [
+        "Preparing publication snapshots",
+        "Writing publication preview",
+        "Rechecking source and destination before upload",
+        "Uploading and awaiting acknowledgement",
+        "Recording publication acknowledgements",
+    ] {
+        assert!(
+            progress
+                .lines()
+                .any(|line| line.starts_with(stage) && line.contains("done (")),
+            "{stage}: {progress}"
+        );
+        assert!(!String::from_utf8_lossy(&published.stdout).contains(stage));
+    }
     assert_eq!(hub.creations.load(Ordering::Acquire), 1);
     assert!(hub.posts.load(Ordering::Acquire) > 0);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), base);

@@ -100,6 +100,7 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     source.commit("Cross-runtime fork").unwrap();
     let head = source.git(&["rev-parse", "HEAD"]).unwrap();
     let selected = SessionPublicationPlan {
+        sources: None,
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
@@ -293,6 +294,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     fs::write(source.root().join("README.md"), "Accepted plain file\n").unwrap();
     let base = save(&legacy, "Accepted plain conversation");
     let mut selected = SessionPublicationPlan {
+        sources: None,
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
@@ -774,6 +776,7 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
     let original = save("Original session snapshot");
     let key = SecretKey::from([45; 32]);
     let mut selected = SessionPublicationPlan {
+        sources: None,
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs::default(),
@@ -796,6 +799,14 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
             },
         )]),
     };
+    // A retained source observation must not pin later preparation to an earlier branch head.
+    selected.sources = Some(
+        super::sessions::SourceHistory::read(
+            &source,
+            &PublicationPlan::freeze_selected(&source, &["work".into()]).unwrap(),
+        )
+        .unwrap(),
+    );
     let prepare = |selected: &SessionPublicationPlan| {
         ProjectedHistory::prepare_sessions_with_redactor(
             &source,
@@ -999,6 +1010,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         )]))
         .unwrap();
     let mut selected = SessionPublicationPlan {
+        sources: None,
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {

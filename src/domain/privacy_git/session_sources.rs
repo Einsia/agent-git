@@ -9,6 +9,7 @@ pub(super) struct Birth {
 }
 
 pub(super) struct History {
+    pub parents: BTreeMap<String, Vec<String>>,
     pub births: BTreeMap<String, Birth>,
     aliases: BTreeMap<String, String>,
     /// Metadata of every frozen commit that has readable metadata, read once.
@@ -101,6 +102,7 @@ impl History {
             }
         }
         Ok(Self {
+            parents,
             births,
             aliases,
             metadata: cached,

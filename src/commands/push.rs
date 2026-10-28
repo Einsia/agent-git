@@ -136,6 +136,8 @@ pub fn run(mut args: Args) -> CmdResult {
             crate::tui::Verdict::Skip => {}
         }
     }
+    let _progress = ui::publication::Progress::start();
+    let reading = ui::publication::stage("Reading publication target and local history");
     let client = require_login()?;
     let Some(me) = credentials::current_user() else {
         ui::error("no account name in the stored credentials.");
@@ -345,6 +347,7 @@ pub fn run(mut args: Args) -> CmdResult {
         (client, me.clone())
     };
 
+    reading.finish();
     audited_push::run(
         &args,
         publication_client,

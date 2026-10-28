@@ -17,6 +17,7 @@ pub(super) fn run(
         local_target,
     } = destination;
     let repository = format!("{}/{}", intent.owner, intent.name);
+    let reading = ui::publication::stage("Checking destination and publication history");
     let automatic = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some();
     ensure!(
         !automatic || !args.audit,
@@ -58,6 +59,7 @@ pub(super) fn run(
         }
     }
     let delivery_confirmed = if intent.explicit_hub && !args.dry_run && !args.audit {
+        reading.finish();
         let prompt = format!(
             "Deliver branches {} as plain sessions to {repository} on {} ({}) and switch this checkout's Hub binding after upload?",
             branches.join(", "),
@@ -76,6 +78,7 @@ pub(super) fn run(
         }
         true
     } else {
+        reading.finish();
         false
     };
     if matches!(intent.action, Action::Create) {
@@ -114,6 +117,7 @@ pub(super) fn run(
         if let Some(selection) = &local_target {
             selection.verify(&repo)?;
         }
+        let creating = ui::publication::stage("Creating publication destination");
         let created = super::super::super::remote_request(client.publish(&PublishRequest {
             name: intent.name.clone(),
             owner: (intent.owner != intent.account).then(|| intent.owner.clone()),
@@ -130,7 +134,9 @@ pub(super) fn run(
             .context("created repository is unavailable")?;
         intent.verify_observed(&observed, Some(&created.agent_id))?;
         intent.action = Action::Existing(observed);
+        creating.finish();
     }
+    let resolving = ui::publication::stage("Reading remote history and session modes");
     let Action::Existing(remote) = &intent.action else {
         anyhow::bail!("session publication requires a registered repository destination");
     };
@@ -176,6 +182,23 @@ pub(super) fn run(
         intent.explicit_hub,
     )?;
     let _ = warmed.join();
+    resolving.finish();
+    ui::publication::notice(format!(
+        "Repository visibility: {}; session modes: {} encrypted, {} plain (new publication)",
+        intent.visibility,
+        selected
+            .configs
+            .values()
+            .filter(|config| config.config.privacy.scheme
+                == crate::domain::session_privacy::SessionScheme::SessionOwnerV2)
+            .count(),
+        selected
+            .configs
+            .values()
+            .filter(|config| config.config.privacy.scheme
+                == crate::domain::session_privacy::SessionScheme::Plain)
+            .count(),
+    ));
     let mut projected = ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])
         .map_err(|error| {
             if error.downcast_ref::<crate::domain::privacy_git::MissingAcceptedObjects>().is_some() {
@@ -188,6 +211,7 @@ pub(super) fn run(
                 error
             }
         })?;
+    let binding = ui::publication::stage("Reading prepared snapshot bindings");
     let receipts = projected.session_receipts(&repository, &identity, &intent.url)?;
     let mut supervisor = SupervisorReply::from_env()?;
     let supervised = supervisor
@@ -212,7 +236,8 @@ pub(super) fn run(
         .transpose()?;
     let limits = secrets::ScanLimits::DEFAULT;
     let baseline = inspection_destination(args, &intent)?;
-    let spinner = ui::spinner("inspecting outgoing session history…");
+    binding.finish();
+    let inspecting = ui::publication::stage("Checking outgoing objects and file payloads");
     let captured = CapturedPublication::capture_projected_for(
         &projected,
         limits.budget_bytes,
@@ -226,7 +251,6 @@ pub(super) fn run(
             .map(|_| selected.remote.clone()),
     )?;
     let inspected = captured.inspect(limits);
-    spinner.finish_and_clear();
     let complete = match inspected {
         ContentInspection::Complete(complete) => complete,
         ContentInspection::Blocked(blocked) => {
@@ -234,15 +258,23 @@ pub(super) fn run(
             return Ok(inspection_failure_code(blocked.reason()));
         }
     };
-    if !args.dry_run
+    inspecting.finish();
+    let status = ui::publication::stage("Checking publication status");
+    let synchronized = !args.dry_run
         && !args.audit
         && !args.show_preview
         && complete.captured().pointers().is_empty()
         && receipts_match_current(&repo, &receipts)?
         && (supervisor.is_some() || no_pending_publication_receipts(&repo, &receipts)?)
-        && FrozenPublication::advertised_refs_match(&repo, projected.plan(), &intent.url, &identity)
-            == Some(true)
-    {
+        && FrozenPublication::advertised_refs_match(
+            &repo,
+            projected.plan(),
+            &intent.url,
+            &identity,
+        ) == Some(true);
+    status.finish();
+    if synchronized {
+        let checking = ui::publication::stage("Rechecking synchronized publication");
         projected.verify_source(&repo)?;
         complete.verify_source(projected.repo())?;
         intent.verify_account(&client)?;
@@ -260,15 +292,24 @@ pub(super) fn run(
             reply.prepare(&repo, &candidate)?;
             reply.complete(&repo, candidate)?;
         }
+        checking.finish();
         ui::info(format_args!("{repository}: already up to date."));
         return Ok(ExitCode::Ok);
     }
     let displayed = intent.json();
-    let preview = projected.write_preview(&displayed, &repo, complete.captured())?;
+    let previewing = ui::publication::stage("Writing publication preview");
+    let mut preview = super::super::preview::prepare(
+        &projected,
+        &displayed,
+        &repo,
+        complete.captured(),
+        args.show_preview && !automatic,
+    )?;
+    previewing.finish();
     println!("Publication destination: {displayed}");
-    println!("Privacy preview: {}", preview.display());
+    println!("Privacy preview: {}", preview.path.display());
     if !automatic {
-        super::super::preview::show(&projected, complete.captured(), args.show_preview)?;
+        preview.show(&projected)?;
     }
     let reviewed = if args.audit {
         Some(super::super::audit::review(
@@ -319,6 +360,7 @@ pub(super) fn run(
         }
         Decision::Publish => {}
     }
+    let checking = ui::publication::stage("Rechecking source and destination before upload");
     projected.verify_source(&repo)?;
     complete.verify_source(projected.repo())?;
     intent.verify_account(&client)?;
@@ -348,11 +390,13 @@ pub(super) fn run(
     if let (Some(reply), Some(candidate)) = (&mut supervisor, &supervised) {
         reply.prepare(&repo, candidate)?;
     }
+    checking.finish();
     let report = prepared.publish_with_session_receipts(
         projected.policy_digest(),
         projected.session_manifest(),
         &intent.visibility,
     ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
+    let recording = ui::publication::stage("Recording publication acknowledgements");
     projected.confirm_acceptance(&report)?;
     show_publication(&report);
     if !report.ok() {
@@ -369,6 +413,7 @@ pub(super) fn run(
     if let (Some(reply), Some(candidate)) = (supervisor, supervised) {
         reply.complete(&repo, candidate)?;
     }
+    recording.finish();
     ui::success(&format!("Published reviewed sessions to {repository}."));
     Ok(ExitCode::Ok)
 }

@@ -26,11 +26,13 @@ impl CompleteInspection {
         manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
     ) -> Result<PublicationReport> {
+        let preparing = crate::ui::publication::stage("Preparing publication authority");
         let policy = self.prepared.publication.session_privacy_policy(
             policy_digest,
             manifest,
             visibility,
         )?;
+        preparing.finish();
         Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy)))
     }
 
@@ -78,6 +80,8 @@ impl CompleteInspection {
             phase.finish();
             return phase;
         }
+        let uploading =
+            crate::ui::publication::stage(format!("Uploading {} file payloads", selected.len()));
         let execution = match self.lfs_preflight(&selected) {
             Ok(execution) => execution,
             Err(error) => {
@@ -127,6 +131,7 @@ impl CompleteInspection {
             }
         }
         phase.finish();
+        uploading.finish();
         phase
     }
 

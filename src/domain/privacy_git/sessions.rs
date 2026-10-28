@@ -20,6 +20,31 @@ pub struct SessionPublicationPlan {
     pub remote: RemoteRefs,
     pub configs: BTreeMap<String, SessionPrivacyResponse>,
     pub(crate) delivery: Option<super::delivery::Delivery>,
+    pub(crate) sources: Option<SourceHistory>,
+}
+
+/// Committed facts belong to the same object store and frozen selection. Remote authority and
+/// accepted mappings are read separately because they can change while preparation runs.
+pub(crate) struct SourceHistory {
+    root: std::path::PathBuf,
+    plan: PublicationPlan,
+    history: sources::History,
+    enveloped: BTreeSet<String>,
+}
+
+impl SourceHistory {
+    pub(super) fn read(source: &Repo, plan: &PublicationPlan) -> Result<Self> {
+        Ok(Self {
+            root: source.common_dir()?.canonicalize()?,
+            plan: plan.clone(),
+            history: sources::History::read(source, plan)?,
+            enveloped: enveloped_commits(source, plan.commit_objects())?,
+        })
+    }
+
+    fn matches(&self, source: &Repo, plan: &PublicationPlan) -> Result<bool> {
+        Ok(self.plan == *plan && self.root == source.common_dir()?.canonicalize()?)
+    }
 }
 
 impl SessionPublicationPlan {
@@ -39,12 +64,13 @@ impl SessionPublicationPlan {
             "session publication belongs to another Hub"
         );
         let plan = PublicationPlan::freeze_selected(source, branches)?;
-        let history = sources::History::read(source, &plan)?;
+        let sources = SourceHistory::read(source, &plan)?;
+        let history = &sources.history;
         let mut ledger = accepted::Ledger::open(source, &identity)?;
         ledger.reconcile(&remote)?;
         require_remote_ancestry(source, &plan, &ledger, &remote, repository)?;
         let accepted = plan.accepted_commits(source, &remote.heads)?;
-        let enveloped = enveloped_commits(source, plan.commit_objects())?;
+        let enveloped = &sources.enveloped;
         let mut sessions = BTreeSet::new();
         let mut source_hubs = BTreeSet::new();
         for oid in plan.commit_objects() {
@@ -219,6 +245,7 @@ impl SessionPublicationPlan {
             remote,
             configs,
             delivery,
+            sources: Some(sources),
         })
     }
 
@@ -350,6 +377,7 @@ impl ProjectedHistory {
         additional: &[super::super::privacy::mandatory::MandatoryPolicy],
         redactor: &Redactor,
     ) -> Result<Self> {
+        let preparing = crate::ui::publication::stage("Preparing publication snapshots");
         let identity = &selected.identity;
         ensure!(
             RemoteIdentity::new(&identity.hub, &identity.agent_id)? == *identity,
@@ -357,6 +385,10 @@ impl ProjectedHistory {
         );
         let source = source.clone().local_objects_only();
         let source_plan = PublicationPlan::freeze_selected(&source, branches)?;
+        preparing.detail(format!(
+            "0/{} snapshots",
+            source_plan.commit_objects().len()
+        ));
         let policy = effective_policy(&source, additional)?;
         let policy_digest = policy.digest()?;
         let parent = source.common_dir()?.join("agit/privacy-publication");
@@ -395,10 +427,18 @@ impl ProjectedHistory {
         }
         let mut ledger = accepted::Ledger::open(&source, identity)?;
         ledger.reconcile(&selected.remote)?;
-        let parents = commit_parent_map(&source, source_plan.commit_objects())?;
-        let enveloped = enveloped_commits(&source, source_plan.commit_objects())?;
-        let order = parent_first(&parents)?;
-        let source_sessions = sources::History::read(&source, &source_plan)?;
+        let fresh;
+        let sources = match &selected.sources {
+            Some(cached) if cached.matches(&source, &source_plan)? => cached,
+            _ => {
+                fresh = SourceHistory::read(&source, &source_plan)?;
+                &fresh
+            }
+        };
+        let parents = &sources.history.parents;
+        let enveloped = &sources.enveloped;
+        let order = parent_first(parents)?;
+        let source_sessions = &sources.history;
         let accepted = source_plan.accepted_commits(&source, &selected.remote.heads)?;
         let mut references = BTreeMap::new();
         let mut candidates = BTreeMap::new();
@@ -406,6 +446,23 @@ impl ProjectedHistory {
         let mut preserved = BTreeSet::new();
         let mut reports = Vec::new();
         let mut imports = crate::commands::plumbing::CommitImports::default();
+        let mut completed = BTreeSet::new();
+        let mut reused = 0;
+        let mut prepared = 0;
+        let mut record_progress = |oid: &str, retained: bool| {
+            if completed.insert(oid.to_owned()) {
+                if retained {
+                    reused += 1;
+                } else {
+                    prepared += 1;
+                }
+                preparing.detail(format!(
+                    "{}/{} snapshots, {prepared} prepared, {reused} reused",
+                    completed.len(),
+                    source_plan.commit_objects().len()
+                ));
+            }
+        };
         #[cfg(test)]
         let mut preparations = 0;
         let alias_repo = if selected.delivery.is_some() {
@@ -423,7 +480,7 @@ impl ProjectedHistory {
                     redactor.publishes_unchanged(branch)?,
                     "publication branch name requires privacy rewriting; rename it before publishing"
                 );
-                let reachable = ancestors(head.oid(), &parents)?;
+                let reachable = ancestors(head.oid(), parents)?;
                 if let Some(remote_head) = selected.remote.refs.get(head.name())
                     && !reachable.contains(remote_head)
                 {
@@ -490,6 +547,7 @@ impl ProjectedHistory {
                         }
                         preserved.insert(entry.public.clone());
                         mapped.insert(oid.clone(), entry.clone());
+                        record_progress(oid, true);
                         continue;
                     }
                     if accepted.contains(oid) {
@@ -523,6 +581,7 @@ impl ProjectedHistory {
                                 delivered: false,
                             },
                         );
+                        record_progress(oid, true);
                         continue;
                     }
                     let original_metadata = source_sessions.metadata(&source, oid).context(
@@ -625,6 +684,7 @@ impl ProjectedHistory {
                                 delivered: selected.delivery.is_some(),
                             },
                         );
+                        record_progress(oid, false);
                         continue;
                     }
                     let response = config.expect("encrypted session configuration");
@@ -759,6 +819,7 @@ impl ProjectedHistory {
                         },
                     );
                     reports.push(projection.report().clone());
+                    record_progress(oid, false);
                 }
                 let public_head = mapped[head.oid()].public.clone();
                 references.insert(head.name().to_owned(), public_head.clone());
@@ -815,6 +876,7 @@ impl ProjectedHistory {
         )?;
         let plan = PublicationPlan::freeze_selected(&repo, branches)?;
         source_plan.verify(&source, branches)?;
+        preparing.finish();
         Ok(Self {
             repo,
             source: source_plan,

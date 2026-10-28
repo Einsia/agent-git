@@ -160,6 +160,9 @@ pub struct SessionProjection {
     report: ProjectionReport,
     policy_digest: String,
     private: PrivateLayer,
+    /// Only metadata changes after validation. Deserialization cannot carry this proof.
+    #[serde(skip)]
+    private_session_validated: bool,
 }
 
 mod private_text {
@@ -212,12 +215,22 @@ pub(crate) fn project_worker(
 }
 
 impl SessionProjection {
+    fn validate_private(&mut self) -> Result<()> {
+        if self.private_session_validated {
+            self.private.validate_metadata()
+        } else {
+            self.private.validate()?;
+            self.private_session_validated = true;
+            Ok(())
+        }
+    }
+
     pub(crate) fn retain_committer(
         &mut self,
         source: super::session_privacy::SourceCommitter,
     ) -> Result<()> {
         self.private.source_committer = Some(source);
-        self.private.validate()
+        self.validate_private()
     }
 
     pub fn log(&self) -> &str {
@@ -362,7 +375,11 @@ impl SessionProjection {
             config.verify_registration(&binding.repository_id, &binding.session_id, &local)?;
         }
         private.metadata["session_privacy"] = serde_json::to_value(&config.privacy)?;
-        private.validate()?;
+        if self.private_session_validated {
+            private.validate_metadata()?;
+        } else {
+            private.validate()?;
+        }
         PrivacyEnvelope::seal_session(
             self.policy_digest.clone(),
             self.public_value(),
@@ -459,9 +476,9 @@ pub fn project_frozen_with_sources(
             super::privacy::projector::Mode::ProjectPublication,
         );
         if outcome.status == super::privacy::projector::Status::Complete
-            && let Ok(projection) = serde_json::from_str::<SessionProjection>(&outcome.content)
+            && let Ok(mut projection) = serde_json::from_str::<SessionProjection>(&outcome.content)
             && projection.source_log.as_str() == log
-            && projection.private.validate().is_ok()
+            && projection.validate_private().is_ok()
             && storage::snapshot_files(&projection.log, &projection.view).is_ok()
             && projection
                 .report
@@ -680,7 +697,7 @@ pub fn project_session(
                 .iter()
                 .any(|record| contains_value(&record.content, secret))
     })?;
-    private.validate()?;
+    private.validate_metadata()?;
     Ok(SessionProjection {
         source_log: Zeroizing::new(log.to_owned()),
         log: public_log,
@@ -689,6 +706,7 @@ pub fn project_session(
         report: projector.report,
         policy_digest: policy.digest()?,
         private,
+        private_session_validated: true,
     })
 }
 
@@ -2161,6 +2179,24 @@ mod tests {
             committer: source_committer.attribution("https://hub.test").unwrap(),
             source_commit: "c".repeat(40),
         };
+        // A worker response cannot assert that its private sequences were already checked.
+        let mut serialized = serde_json::to_value(&projection).unwrap();
+        serialized["private_session_validated"] = json!(true);
+        serialized["private"]["session"]["view"] = json!(STANDARD.encode(transcript::wrap_lines(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"outside LOG\"}}",
+            "claude-code",
+            &metadata.session,
+        )));
+        let untrusted: SessionProjection = serde_json::from_value(serialized).unwrap();
+        assert!(
+            untrusted
+                .seal_session(&recipient, &config, binding.clone())
+                .is_err()
+        );
+        // Metadata edits still require validation even when the session bytes are unchanged.
+        projection.private.protected_values.insert(String::new());
+        assert!(projection.validate_private().is_err());
+        projection.private.protected_values.remove("");
         let envelope = projection
             .seal_session(&recipient, &config, binding.clone())
             .unwrap();

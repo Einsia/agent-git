@@ -538,6 +538,18 @@ impl FrozenPublication {
     ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         for (index, batch) in batches.iter().enumerate() {
+            let heads = batch
+                .iter()
+                .filter(|reference| reference.name().starts_with("refs/heads/"))
+                .count();
+            let batch_label = format!(
+                "batch {}/{} ({heads} branches, {} tags)",
+                index + 1,
+                batches.len(),
+                batch.len() - heads
+            );
+            let receipt_progress =
+                crate::ui::publication::stage(format!("Getting receipt for {batch_label}"));
             let receipt = match policy
                 .map(|policy| self.receive_receipt(policy, batch))
                 .transpose()
@@ -549,6 +561,10 @@ impl FrozenPublication {
                     break;
                 }
             };
+            receipt_progress.finish();
+            let uploading = crate::ui::publication::stage(format!(
+                "Uploading and awaiting acknowledgement for {batch_label}"
+            ));
             let specs: Vec<_> = batch.iter().map(FrozenRef::refspec).collect();
             let mut args = vec![
                 "push",
@@ -582,6 +598,7 @@ impl FrozenPublication {
                 phase.unattempted = batches[start..].iter().flatten().cloned().collect();
                 break;
             }
+            uploading.finish();
         }
         phase
     }

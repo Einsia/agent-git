@@ -10,6 +10,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Added
 
+- `agit push` reports preparation, preview, receipt and upload progress with snapshot counts and
+  elapsed time. Redirected output retains periodic progress on stderr; quiet and JSON output
+  omit these routine notices. Each upload batch reports completion only after acknowledgement.
 - `agit push <owner/repo@branch> --to-hub <url>` explicitly migrates a repository publication to
   another Hub using credentials already saved for that Hub. The destination is reviewed before
   the local immutable Hub binding and `origin` are updated; ordinary pushes remain bound to the
@@ -23,6 +26,10 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Push reuses committed history facts within the same frozen selection, reads retained encrypted
+  envelopes once per reconstruction, and prepares the JSON and expanded terminal preview together.
+  Metadata-only projection changes retain validated private session content while checking changed
+  metadata; deserialized content still receives complete validation.
 - A Slack token whose numeric groups are longer than thirteen digits is now replaced in what agit
   publishes; such a token was published unchanged. So is the value curl echoes in "Enter host
   password for user '…'", which is the credential itself when a command passes it to `curl -u`
