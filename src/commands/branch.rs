@@ -47,8 +47,12 @@ pub const SEAL_FILE: &str = ".agit-sealed";
 
 /// Checked by resume / run: whether this branch is sealed.
 pub fn is_sealed(repo: &Repo, branch: &str) -> bool {
-    repo.show(&format!("refs/heads/{branch}"), SEAL_FILE)
-        .is_some()
+    is_sealed_at(repo, &format!("refs/heads/{branch}"))
+}
+
+/// Whether the commit `git_ref` names carries the seal.
+pub fn is_sealed_at(repo: &Repo, git_ref: &str) -> bool {
+    repo.show(git_ref, SEAL_FILE).is_some()
 }
 
 /// Explicit repo arguments take precedence over the session environment for branch governance.
