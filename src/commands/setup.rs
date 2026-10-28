@@ -37,6 +37,7 @@ mod legacy;
 mod native;
 
 use clap::Args as ClapArgs;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
@@ -234,11 +235,76 @@ const HOOKS: &[(&str, &[&str])] = &[
 /// does not read stdin and can only locate the branch through a possibly stale `AGIT_SESSION`.
 const RETIRED_HOOKS: &[(&str, &str)] = &[("Stop", "commit --from-hook")];
 
-/// The command string of one hook. The exe path can contain spaces, but Claude Code hands
-/// `command` to a shell, so this stays a bare join. Quoting is a separate concern — adding it
-/// here changes the semantics.
+/// The command string of one hook. Every runtime that takes a hook as one string (Claude Code,
+/// Codex, WorkBuddy) hands it to a shell, so the executable is written as one shell word.
 fn hook_command(exe: &str, argv: &[&str], runtime: Option<&str>) -> String {
-    format!("{exe} {}", hook_arguments(argv, runtime))
+    format!("{} {}", shell_word(exe), hook_arguments(argv, runtime))
+}
+
+/// `exe` as one word of a shell command line. Left bare, a path with a space
+/// (`~/Library/Application Support/…`, a Windows user folder with a space) is split there: the
+/// shell looks for a program named by the part before the space, and the hook fails on every
+/// event without anything showing the user why.
+fn shell_word(exe: &str) -> Cow<'_, str> {
+    shell_word_for(exe, cfg!(windows))
+}
+
+/// On Windows a backslash separates directories and the hook shell may be `cmd`, which knows
+/// only double quotes; a Windows path cannot contain one. Elsewhere POSIX single quotes keep
+/// every character, with `'\''` for a quote inside.
+fn shell_word_for(exe: &str, windows: bool) -> Cow<'_, str> {
+    let plain =
+        |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c) || (windows && c == '\\');
+    if !exe.is_empty() && exe.chars().all(plain) {
+        Cow::Borrowed(exe)
+    } else if windows {
+        Cow::Owned(format!("\"{exe}\""))
+    } else {
+        Cow::Owned(format!("'{}'", exe.replace('\'', "'\\''")))
+    }
+}
+
+/// The executable a hook command runs before `arguments`, read back from the forms
+/// [`shell_word`] writes: one bare word, one double-quoted word, or one single-quoted word.
+/// `None` for anything else, such as a chain, a wrapper or a path whose space splits it, which
+/// is not one program a shell would run. A double-quoted word counts only when the shell reads
+/// it as written: a `$` or a backtick expands inside double quotes, so a hook that chooses its
+/// path at run time is the user's, and claiming it would replace their choice with ours.
+fn hook_program<'a>(command: &'a str, arguments: &str) -> Option<Cow<'a, str>> {
+    let rest = command.trim().strip_suffix(arguments)?;
+    let word = rest.trim_end();
+    // A real separator must sit between the executable and the arguments; otherwise a matching
+    // tail like `.../notagit-commit --from-hook` counts too.
+    if word.is_empty() || word.len() == rest.len() {
+        return None;
+    }
+    if let Some(inner) = word.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
+        // A backslash before an ordinary character stays literal in double quotes, which keeps a
+        // Windows path as written; before another backslash the shell drops one of the two.
+        let literal = !inner.contains(['"', '$', '`']) && !inner.contains("\\\\");
+        return literal.then_some(Cow::Borrowed(inner));
+    }
+    if word.starts_with('\'') {
+        let mut value = String::new();
+        let mut rest = word;
+        loop {
+            let body = rest.strip_prefix('\'')?;
+            let end = body.find('\'')?;
+            value.push_str(&body[..end]);
+            rest = &body[end + 1..];
+            if rest.is_empty() {
+                return Some(Cow::Owned(value));
+            }
+            rest = rest.strip_prefix("\\'")?;
+            value.push('\'');
+            if rest.is_empty() {
+                return Some(Cow::Owned(value));
+            }
+        }
+    }
+    (!word.contains(|c: char| c.is_whitespace() || c == '"' || c == '\''))
+        .then_some(Cow::Borrowed(word))
 }
 
 /// What identifies one agit hook regardless of where the executable lives: the argument string
@@ -517,22 +583,13 @@ fn install_hook_file(
 /// `agit setup`; deleting someone else's configuration is one of the hardest kinds of damage agit
 /// can do on this machine to track down.
 fn is_our_hook(command: &str, argv: &str) -> bool {
-    let Some(rest) = command.trim().strip_suffix(argv) else {
+    // It must be a single word. In `some earlier command && /bin/agit commit --from-hook` ours
+    // is one link of the chain, and deleting the entry takes the user's first half with it.
+    let Some(exe) = hook_program(command, argv) else {
         return false;
     };
-    let exe = rest.trim_end();
-    // A real separator must sit between the executable and the arguments; otherwise a matching
-    // tail like `.../notagit-commit --from-hook` counts too.
-    if exe.len() == rest.len() {
-        return false;
-    }
-    // It must be a single token. In `some earlier command && /bin/agit commit --from-hook` ours
-    // is one link of the chain, and deleting the entry takes the user's first half with it.
-    if exe.split_whitespace().count() != 1 {
-        return false;
-    }
-    let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
-    matches!(name.trim_matches(['"', '\'']), "agit" | "agit.exe")
+    let name = exe.rsplit(['/', '\\']).next().unwrap_or(&exe);
+    matches!(name, "agit" | "agit.exe")
 }
 
 fn retire_hook(hooks: &mut serde_json::Value, event: &str, argv: &str) -> usize {
@@ -585,12 +642,22 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments:
         .entry(event)
         .or_insert_with(|| serde_json::json!([]));
     let arr = arr.as_array_mut().expect("hook event must be an array");
+    // The same executable joined bare: what this command was written as before its executable
+    // was quoted. Its space split it, so it never ran; it is rewritten, not kept beside the new
+    // one. Matching its exact text claims no entry another tool wrote.
+    let unquoted = hook_program(cmd, arguments)
+        .map(|exe| format!("{exe} {arguments}"))
+        .filter(|unquoted| unquoted != cmd);
     let ours = |entry: &serde_json::Value| {
         entry.get("type").and_then(|value| value.as_str()) == Some("command")
             && entry
                 .get("command")
                 .and_then(|value| value.as_str())
-                .is_some_and(|command| command == cmd || is_our_hook(command, arguments))
+                .is_some_and(|command| {
+                    command == cmd
+                        || is_our_hook(command, arguments)
+                        || unquoted.as_deref() == Some(command.trim())
+                })
     };
     let exact = |entry: &serde_json::Value| {
         entry
@@ -598,10 +665,7 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments:
             .and_then(|value| value.as_str())
             .is_some_and(|command| {
                 command == cmd
-                    || command
-                        .strip_suffix(arguments)
-                        .map(str::trim_end)
-                        .is_some_and(runs_this_agit)
+                    || hook_program(command, arguments).is_some_and(|exe| runs_this_agit(&exe))
             })
     };
     // Prefer an entry that already carries the current command, so a settled file stays as is.
@@ -1042,7 +1106,8 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
             ));
         } else {
             ui::hint(&format!(
-                "register MCP manually with `claude mcp add agit -- {exe} mcp`"
+                "register MCP manually with `claude mcp add agit -- {} mcp`",
+                shell_word(&exe)
             ));
         }
         report.merge(SetupReport::item());
@@ -1755,6 +1820,69 @@ mod tests {
         }
     }
 
+    /// A hook command is run by a shell, so an executable whose path holds a space or a quote
+    /// still reaches it as one word naming that file. Joined bare, `sh` looks for the program
+    /// named by the text before the space and the hook fails on every event; and an entry written
+    /// that way is rewritten in place, so the broken copy does not keep failing beside the new one.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_command_runs_under_sh_from_a_path_with_a_space() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Application Support/it's");
+        std::fs::create_dir_all(&folder).unwrap();
+        let seen = dir.path().join("argv");
+        let exe = folder.join("agit");
+        std::fs::write(
+            &exe,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = exe.to_str().unwrap();
+        let (event, argv) = HOOKS[1];
+        let arguments = hook_arguments(argv, None);
+        let mut hooks = serde_json::json!({
+            event: [{"hooks": [{"type": "command", "command": format!("{exe} {arguments}")}]}]
+        });
+        // The bare join is not one program, so it never counts as already installed, not even
+        // when it names the agit that runs setup.
+        assert_eq!(
+            hook_program(&format!("{exe} {arguments}"), &arguments),
+            None
+        );
+        let command = hook_command(exe, argv, None);
+        assert_eq!(upsert_hook(&mut hooks, event, &command, &arguments), 1);
+        assert_eq!(
+            hooks[event],
+            serde_json::json!([{"hooks": [{"type": "command", "command": command}]}])
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            format!("{}\n", argv.join("\n"))
+        );
+        // A Windows path keeps its backslashes and stays one word for a POSIX hook shell too.
+        let windows = r"C:\Users\Jo Smith\AppData\Roaming\npm\agit.cmd";
+        let word = shell_word_for(windows, true);
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("set -- {word} {arguments}; printf '%s' \"$1\""),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), windows);
+        assert_eq!(
+            hook_program(&format!("{word} {arguments}"), &arguments).as_deref(),
+            Some(windows)
+        );
+    }
+
     #[test]
     fn runtime_filter_accepts_none_all_and_exact_match() {
         assert!(wants(None, "codex"));
@@ -1992,6 +2120,8 @@ mod tests {
             "~/.local/bin/agit commit --from-hook",
             "C:\\Users\\me\\agit.exe commit --from-hook",
             "  /usr/local/bin/agit commit --from-hook  ",
+            "'/opt/Agent Git/agit' commit --from-hook",
+            "\"C:\\Program Files\\agit\\agit.exe\" commit --from-hook",
         ] {
             assert!(
                 is_our_hook(ours, ARGV),
@@ -2007,6 +2137,10 @@ mod tests {
             "/bin/echo commit --from-hook",
             // the name merely ends in agit.
             "/usr/local/bin/notagit commit --from-hook",
+            // the path is chosen when the hook runs: the shell expands these in double quotes.
+            "\"${AGIT_HOME:-/opt/Agent Git}/agit\" commit --from-hook",
+            "\"$(command -v agit)\" commit --from-hook",
+            "\"`which agit`\" commit --from-hook",
             // the arguments are incomplete / not at the end.
             "/usr/local/bin/agit commit --from-hook --extra",
             "/usr/local/bin/agit hooks settle",
@@ -2016,6 +2150,17 @@ mod tests {
                 "not mistaken for our own: {theirs}"
             );
         }
+        // Installing leaves such a hook as written as well, and adds agit's own beside it.
+        let theirs = "\"${AGIT_HOME:-/opt/Agent Git}/agit\" hooks settle";
+        let mut hooks = serde_json::json!({
+            "Stop": [{"hooks": [{"type": "command", "command": theirs}]}]
+        });
+        assert_eq!(
+            upsert_hook(&mut hooks, "Stop", "agit hooks settle", "hooks settle"),
+            1
+        );
+        assert_eq!(hooks["Stop"][0]["hooks"][0]["command"], theirs);
+        assert_eq!(hooks["Stop"][1]["hooks"][0]["command"], "agit hooks settle");
     }
 
     /// Retiring must not touch the user's own hooks.

@@ -26,6 +26,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Fixed
 
+- Hooks installed by `agit setup` run when agit's path contains a space, such as an app's
+  `Application Support` folder or a Windows user folder with a space in its name. The hook
+  command wrote that path unquoted, so the shell split it, the hook failed on every turn, and no
+  conversation was saved or uploaded automatically. Running `agit setup` again rewrites such a
+  hook in place.
 - `agit push` works again in a checkout that has fetched the version tags of more turns than one
   publication lists (about 4,000, counted across every session of the repository); it failed
   with "audit publication reference limit exceeded" even for a short new session. Version tags
