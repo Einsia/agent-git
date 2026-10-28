@@ -20,10 +20,17 @@ pub struct Args {
 #[derive(clap::Subcommand)]
 pub enum Cmd {
     /// Create the repo on the hub together with its pinned local counterpart.
+    ///
+    /// `<org>/<name>` creates it under an organization that lets you create repositories there.
+    /// An organization repository is private unless `--public`, which the organization's member
+    /// privileges may reserve for its owners; a repository of your own is public unless `--private`.
     Create {
+        #[arg(value_name = "[org/]name")]
         name: String,
         #[arg(long)]
         private: bool,
+        #[arg(long, conflicts_with = "private")]
+        public: bool,
     },
     /// List repos — local (or --remote for the hub).
     List {
@@ -115,7 +122,11 @@ pub enum CollabAction {
 
 pub fn run(args: Args) -> CmdResult {
     match args.cmd {
-        Cmd::Create { name, private } => create(&name, private),
+        Cmd::Create {
+            name,
+            private,
+            public,
+        } => create(&name, private, public),
         Cmd::List { remote } => list(remote),
         Cmd::Info { repo } => info(resolve_or_ctx(repo.as_deref())),
         Cmd::Visibility { repo, visibility } => set_visibility(&repo, &visibility),
@@ -138,18 +149,30 @@ fn resolve_or_ctx(arg: Option<&str>) -> Option<String> {
     }
 }
 
-fn create(name: &str, private: bool) -> CmdResult {
+fn create(target: &str, private: bool, public: bool) -> CmdResult {
     let client = super::require_login()?;
-    crate::input_argument(crate::domain::repo::valid_name(name))?;
-    let owner = client
+    let me = client
         .credential_username()
         .ok_or_else(|| anyhow::anyhow!("the selected account is unavailable"))?;
+    let (owner, name) = if target.contains('/') {
+        let (owner, name) = crate::input_argument(super::parse_slug(target))?;
+        crate::input_argument(super::canonical_owner(&owner))?;
+        crate::input_argument(crate::domain::repo::valid_name(&owner))?;
+        (owner, name)
+    } else {
+        (me.clone(), target.to_string())
+    };
+    let name = name.as_str();
+    crate::input_argument(crate::domain::repo::valid_name(name))?;
+    // The Hub keeps an organization repository private unless asked otherwise; a personal one
+    // has always defaulted to public here.
+    let in_org = owner != me;
+    let private = if in_org { !public } else { private };
     // The local check comes before the hub mutation: with a same-name repo
     // already on disk, failing after publish would occupy the remote name
     // and leave the user with both halves broken. The post-publish check in
     // materialize_at stays — this one cannot see a race.
-    if let Some(me) = crate::infra::credentials::current_user()
-        && let Ok(dir) = crate::infra::config::repo_dir(&me, name)
+    if let Ok(dir) = crate::infra::config::repo_dir(&owner, name)
         && Repo::open(dir.clone()).is_some()
     {
         ui::error(&format!(
@@ -180,7 +203,7 @@ fn create(name: &str, private: bool) -> CmdResult {
     let auto_push = super::config::choose_repo_auto_push()?;
     match client.publish(&crate::hub::PublishRequest {
         name: name.to_string(),
-        owner: None,
+        owner: in_org.then(|| owner.clone()),
         public: !private,
         repo_origins: vec![],
     }) {
@@ -222,7 +245,14 @@ fn create(name: &str, private: bool) -> CmdResult {
                 if private { "private" } else { "public" },
             ));
             println!("  next:");
-            println!("    cd <your-project> && agit init {}", resp.name);
+            if in_org {
+                println!(
+                    "    cd <your-project> && agit init {}/{}",
+                    resp.owner, resp.name
+                );
+            } else {
+                println!("    cd <your-project> && agit init {}", resp.name);
+            }
             println!("    agit push {}/{} -b main", resp.owner, resp.name);
             Ok(ExitCode::Ok)
         }

@@ -1440,6 +1440,75 @@ mod unix {
         }
     }
 
+    /// `agit repo create <org>/<name>` asks the Hub for a private repository under the
+    /// organization and pins the checkout in the organization's directory, where
+    /// `agit init <org>/<name>` completes it in place. Omitting the owner would create the
+    /// repository in the caller's namespace, asking for public would be refused for a member,
+    /// and an init that ignored the owner would build a second, unpinned repository.
+    #[test]
+    fn an_organization_repository_is_created_private_and_completed_in_its_namespace() {
+        let lab = Lab::new();
+        let step = |method, target: &str, status, response| Step {
+            method,
+            target: target.into(),
+            bearer: Some(OLD_ACCESS),
+            status,
+            response,
+            after_response: None,
+        };
+        let hub = Hub::new(|base| {
+            let clone_url = format!("{base}/acme/notes.git");
+            vec![
+                step(
+                    "GET",
+                    "/api/agents/acme/notes",
+                    404,
+                    json!({"error":"agent not found","kind":"not_found"}),
+                ),
+                step(
+                    "POST",
+                    "/api/agents",
+                    200,
+                    json!({"agent_id":AGENT_ID,"owner":"acme","name":"notes",
+                           "push_url":clone_url,"web_url":format!("{base}/@acme/notes")}),
+                ),
+                step(
+                    "GET",
+                    "/api/agents/acme/notes",
+                    200,
+                    json!({"agent_id":AGENT_ID,"owner":"acme","name":"notes",
+                           "clone_url":clone_url,"visibility":"private"}),
+                ),
+            ]
+        });
+        lab.seed_credentials(&hub.base, true);
+        let created = run_bounded(lab.command(&hub.base, &["repo", "create", "acme/notes"]));
+        assert!(created.status.success(), "{created:?}");
+        let checkout = lab.store.join("repos/acme/notes");
+        assert!(!lab.store.join("repos/me/notes").exists());
+        let pin = lab.git(&checkout, &["config", "--local", "agit.remoteIdentity"]);
+        assert!(String::from_utf8_lossy(&pin).contains(AGENT_ID));
+
+        // An owner that is not a namespace name is refused before anything is written, so `..`
+        // cannot place a checkout outside the repository store.
+        for escape in ["../notes", "./notes"] {
+            let refused = run_bounded(lab.command(&hub.base, &["init", escape, "--no-bind"]));
+            assert!(!refused.status.success(), "{escape}: {refused:?}");
+            assert!(!lab.store.join("notes").exists() && !lab.store.join("repos/notes").exists());
+        }
+        let initialized = run_bounded(lab.command(&hub.base, &["init", "acme/notes", "--no-bind"]));
+        assert!(initialized.status.success(), "{initialized:?}");
+        assert!(!lab.store.join("repos/me/notes").exists());
+        lab.git(&checkout, &["rev-parse", "--verify", "refs/heads/main"]);
+
+        let requests = hub.finish();
+        let publish: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            (&publish["name"], &publish["owner"], &publish["public"]),
+            (&json!("notes"), &json!("acme"), &json!(false))
+        );
+    }
+
     #[test]
     fn unsupported_recipes_cannot_author_commands_or_erase_diagnostics() {
         let wire_values = [

@@ -618,6 +618,50 @@ fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
     }
 }
 
+/// A first push creates an organization repository for a member exactly when the organization's
+/// answer says it may (`can_create_private_repositories`), the same rule `agit repo create` and
+/// import follow; a member the organization does not let create is refused before any creation
+/// request. A push path that kept an owner-only check, or ignored the answer, fails here.
+#[test]
+fn a_member_first_push_creates_only_where_the_organization_lets_it() {
+    for (org, creates) in [
+        (
+            json!({"name":"team", "role":"member", "can_create_private_repositories": true}),
+            true,
+        ),
+        (
+            json!({"name":"team", "role":"member", "can_create_private_repositories": false}),
+            false,
+        ),
+        (json!({"name":"team", "role":"member"}), false),
+    ] {
+        let lab = Lab::new();
+        let path = lab.seed("team", "qa", true);
+        let before = lab.state();
+        let refs = lab.git(&path, &["show-ref"]);
+        let mut steps = vec![
+            Step::new("GET /api/agents/team/qa", Reply::Status(404)),
+            Step::new("GET /api/orgs/team", Reply::Json(org.clone())),
+        ];
+        if creates {
+            steps.extend([
+                Step::new("GET /api/agents/team/qa", Reply::Status(404)),
+                Step::new("GET /api/agents/team/qa", Reply::Status(404)),
+                Step::new("POST /api/agents", Reply::Status(503)).with_body(json!({
+                    "name":"qa", "owner":"team", "public":false, "repo_origins":[]
+                })),
+            ]);
+        }
+        let server = Server::start(&lab, steps);
+        let output = lab.push_with_visibility("team/qa", "human", false, None);
+        server.finish();
+        assert!(!output.status.success(), "{org}: {output:?}");
+        assert_eq!(lab.state(), before, "{org}");
+        assert_eq!(lab.git(&path, &["show-ref"]), refs);
+        lab.no_publication_requests();
+    }
+}
+
 #[test]
 fn organization_creation_preserves_private_defaults_and_never_retries_as_public() {
     for mode in ["human", "quiet", "json1", "json2"] {

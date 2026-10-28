@@ -320,7 +320,7 @@ impl Intent {
                 None => {
                     let org = super::super::remote_request(client.get_org(&checkout.owner))?;
                     ensure!(
-                        org.role == "owner",
+                        org.creates_repositories(),
                         "the selected namespace is not writable"
                     );
                     false

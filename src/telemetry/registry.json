@@ -138,7 +138,7 @@
     "repo collab add": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"role":{"action":"Set","policy":"enum","values":["read","write","admin"]},"user":{"action":"Set","policy":"presence"}}},
     "repo collab list": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"}}},
     "repo collab rm": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"user":{"action":"Set","policy":"presence"}}},
-    "repo create": {"aliases":[],"args":{"name":{"action":"Set","policy":"presence"},"private":{"action":"SetTrue","policy":"boolean"}}},
+    "repo create": {"aliases":[],"args":{"name":{"action":"Set","policy":"presence"},"private":{"action":"SetTrue","policy":"boolean"},"public":{"action":"SetTrue","policy":"boolean"}}},
     "repo delete": {"aliases":[],"args":{"local":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "repo info": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"}}},
     "repo invite": {"aliases":[],"args":{"branch":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"},"role":{"action":"Set","policy":"enum","values":["owner","read","write"]}}},
