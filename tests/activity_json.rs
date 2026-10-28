@@ -1,7 +1,13 @@
 //! Automatic source selection must preserve sync failures and the machine-readable contract.
 //! A continuation reads the snapshot its first page fetched; fetching again per page would let
 //! concurrent saves move the history under an open cursor.
+//!
+//! Both routes name this client's activity contract and read a Hub that ignores the name and
+//! answers in the save-time one; a reply in any other contract is refused. A client that parsed
+//! the page before checking its version would fail on the save-time Hub's messages, which carry
+//! no send times; one that accepted any version would present fields it cannot read.
 
+use agit::domain::activity::{SAVE_TIME_SCHEMA, SCHEMA_HEADER, SCHEMA_VERSION};
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -10,7 +16,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 
@@ -98,12 +104,15 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
     std::fs::write(home.join("credentials").join(format!("127.0.0.1_{}.json", listener.local_addr().unwrap().port())), json!({"username":"alice","hub":base,"access_token":"test-only","refresh_token":"test-only","access_expires_at":"2100-01-01T00:00:00Z","refresh_expires_at":"2100-01-01T00:00:00Z"}).to_string()).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let fail_fetch = Arc::new(AtomicBool::new(false));
+    // The contract the fake Hub answers in: by default the one the client names.
+    let answer = Arc::new(AtomicU32::new(SCHEMA_VERSION));
     let activity_calls = Arc::new(AtomicUsize::new(0));
     let git_calls = Arc::new(AtomicUsize::new(0));
     let server = {
-        let (stop, fail_fetch, activity_calls, git_calls, base) = (
+        let (stop, fail_fetch, answer, activity_calls, git_calls, base) = (
             stop.clone(),
             fail_fetch.clone(),
+            answer.clone(),
             activity_calls.clone(),
             git_calls.clone(),
             base.clone(),
@@ -155,10 +164,23 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
                 let method = request.next().unwrap();
                 let target = request.next().unwrap();
                 let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                if path.starts_with("/api/agents/alice/work/activity") {
+                    assert_eq!(header(SCHEMA_HEADER), SCHEMA_VERSION.to_string());
+                    assert_eq!(
+                        header("user-agent"),
+                        concat!("agit/", env!("CARGO_PKG_VERSION"))
+                    );
+                }
+                let version = answer.load(Ordering::Relaxed);
                 let (status, content_type, body) = if path == "/api/agents/alice/work/activity" {
                     activity_calls.fetch_add(1, Ordering::Relaxed);
                     assert!(query.contains("author=alice"));
-                    ("200 OK".into(), "application/json".into(), json!({"schema_version":agit::domain::activity::SCHEMA_VERSION,"repo":"alice/work","applied_filters":{"author":"alice","since":"2026-10-01T00:00:00Z","before":"2100-01-01T00:00:00Z","session":null},"contributions":[],"has_more":false,"next_cursor":null,"incomplete":false,"reasons":{},"warnings":[]}).to_string().into_bytes())
+                    let mut message = json!({"role":"user","line":1,"text":"on the Hub"});
+                    if version != SAVE_TIME_SCHEMA {
+                        message["sent_at"] = "2026-10-02T00:00:00Z".into();
+                        message["sent_basis"] = "recorded".into();
+                    }
+                    ("200 OK".into(), "application/json".into(), json!({"schema_version":version,"repo":"alice/work","applied_filters":{"author":"alice","since":"2026-10-01T00:00:00Z","before":"2100-01-01T00:00:00Z","session":null},"contributions":[{"session":"agit-hub","commit":"c0ffee","saved_at":"2026-10-03T00:00:00Z","time_basis":"committed_at","messages":[message]}],"has_more":false,"next_cursor":null,"incomplete":false,"reasons":{},"warnings":[]}).to_string().into_bytes())
                 } else if path == "/api/agents/alice/work/activity/attribution" {
                     assert_eq!(method, "POST");
                     assert_eq!(header("x-agentgit-expected-agent-id"), id);
@@ -174,7 +196,7 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
                     (
                         "200 OK".into(),
                         "application/json".into(),
-                        json!({"schema_version":agit::domain::activity::SCHEMA_VERSION,"repository_id":id,"body":body})
+                        json!({"schema_version":version,"repository_id":id,"body":body})
                             .to_string()
                             .into_bytes(),
                     )
@@ -242,8 +264,36 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
     };
     let hub = value(&activity(home, &base, &[]));
     assert_eq!(hub["source"], "hub");
+    assert_eq!(
+        hub["contributions"][0]["messages"][0]["sent_basis"],
+        "recorded"
+    );
     assert!(!home.join("repos/alice/work").exists());
     assert_eq!(activity_calls.load(Ordering::Relaxed), 1);
+    answer.store(SAVE_TIME_SCHEMA, Ordering::Relaxed);
+    let older = value(&activity(home, &base, &[]));
+    let contribution = &older["contributions"][0];
+    assert_eq!(contribution["messages"][0]["text"], "on the Hub");
+    assert_eq!(
+        contribution["messages"][0]["sent_at"],
+        contribution["saved_at"]
+    );
+    assert_eq!(contribution["messages"][0]["sent_basis"], "saved");
+    assert_eq!(older["applied_filters"]["select_by"], "saved");
+    assert_eq!(older["schema_version"], SCHEMA_VERSION);
+    answer.store(SCHEMA_VERSION + 1, Ordering::Relaxed);
+    let unknown = activity(home, &base, &[]);
+    assert!(!unknown.status.success());
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unknown.stdout),
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    assert!(
+        said.contains("did not acknowledge the requested activity contract"),
+        "{said}"
+    );
+    assert_eq!(activity_calls.load(Ordering::Relaxed), 3);
     let work = home.join("seed");
     std::fs::create_dir_all(&work).unwrap();
     git(&work, &["init", "-q", "--initial-branch=main"]);
@@ -310,11 +360,14 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
     );
     save(&log, 2);
     git(&work, &["push", "-q", "origin", "main"]);
+    // A clone reads attribution from the Hub, in either contract.
+    answer.store(SAVE_TIME_SCHEMA, Ordering::Relaxed);
     let first = value(&activity(home, &base, &["--limit", "1"]));
     assert_eq!(first["source"], "local");
     assert_eq!(texts(&first), ["original"]);
     assert_eq!(local_repo.git(&["rev-parse", "HEAD"]).unwrap(), old_head);
-    assert_eq!(activity_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(activity_calls.load(Ordering::Relaxed), 3);
+    answer.store(SCHEMA_VERSION, Ordering::Relaxed);
     let fetched = git_calls.load(Ordering::Relaxed);
     assert!(fetched > 0);
     let cursor = first["next_cursor"].as_str().unwrap();
@@ -328,7 +381,7 @@ fn absent_repository_uses_hub_and_existing_repository_fetches_without_moving_loc
     assert_eq!(git_calls.load(Ordering::Relaxed), fetched);
     fail_fetch.store(true, Ordering::Relaxed);
     assert!(!activity(home, &base, &[]).status.success());
-    assert_eq!(activity_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(activity_calls.load(Ordering::Relaxed), 3);
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
 }

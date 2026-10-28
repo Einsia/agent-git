@@ -65,6 +65,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   launcher's own bootstrap, so looking for a `python` beside the `hermes` command found none and
   setup stopped at "install Hermes before configuring its integration". agit now asks the launcher
   for its runtime command; an install that names its Python directly is unchanged.
+- `agit activity` and its MCP tool read a Hub that answers activity contract 3 as well as one
+  that answers 4, both when they query the Hub and on a local clone, where 0.2.28 refused the
+  reply. A Hub that answers 3 selects by save time: the result then says
+  `applied_filters.select_by: saved`, and each message's `sent_at` is its save time with
+  `sent_basis: saved`. agit names the contract it reads in the `x-agentgit-activity-schema`
+  request header, and its requests to the Hub name the release in their User-Agent
+  (`agit/<version>`).
 - A credential is replaced to its end in what agit publishes. A GitLab token longer than the
   20 characters its rule names had only its start replaced, and the rest of the token was
   published after the placeholder; every rule that names a token by its length now replaces the
