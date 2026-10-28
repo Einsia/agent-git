@@ -244,16 +244,29 @@ pub fn run(args: Args) -> CmdResult {
     super::migration::finish_external_history_update(&repo, history_update)?;
 
     // ── 3. Arbitration: continue or fork ──
-    let branch_exists = repo.has_ref(&format!("refs/heads/{base_name}"));
+    // A branch head is the local branch, or else the hub's branch as `origin` mirrors it: a
+    // collaborator's first checkout of someone else's repo has only the remote-tracking form,
+    // and judging that as a historic commit forks every hand-off to a new person.
+    let local_head = format!("refs/heads/{base_name}");
+    let remote_head = format!("refs/remotes/origin/{base_name}");
+    let head_ref = if repo.has_ref(&local_head) {
+        Some(local_head)
+    } else if repo.has_ref(&remote_head) {
+        Some(remote_head)
+    } else {
+        None
+    };
     // The shape comes from `meta.line`: the file line cannot be continued, and neither can a
     // point with no meta — that is not "the file line", it is "no declaration", and both can only
     // fork.
-    let is_session_line = branch_exists
-        && crate::domain::meta::line_at_ref(&repo, &format!("refs/heads/{base_name}"))
-            == Some(crate::domain::meta::Line::Session);
+    let is_session_line = head_ref.as_ref().is_some_and(|head| {
+        crate::domain::meta::line_at_ref(&repo, head) == Some(crate::domain::meta::Line::Session)
+    });
     let is_branch_head = matches!(spec.tail, refs::Tail::None)
         && is_session_line
-        && !super::branch::is_sealed(&repo, &base_name);
+        && head_ref
+            .as_ref()
+            .is_some_and(|head| !super::branch::is_sealed_at(&repo, head));
 
     // Write access decides where to go only on the branch-head path: every other shape forks
     // without asking, and asking would only add a network round trip to a `run <tag>` that could
@@ -287,6 +300,15 @@ pub fn run(args: Args) -> CmdResult {
     );
 
     if can_continue {
+        // Resume continues a local branch: a head known only from `origin` becomes the local
+        // branch tracking it, at exactly the published tip arbitration judged.
+        if let Some(remote) = head_ref
+            .as_ref()
+            .filter(|head| head.starts_with("refs/remotes/"))
+        {
+            repo.git(&["branch", &base_name, remote])?;
+            startup_notes.push(format!("  created local `{base_name}` tracking origin"));
+        }
         super::echo::emit(
             "run",
             &[super::echo::Selection::new(
@@ -354,14 +376,20 @@ pub fn run(args: Args) -> CmdResult {
     // Everything else: it forks by necessity.
     let why = if !matches!(spec.tail, refs::Tail::None) {
         "a historic point (not a branch head)"
-    } else if !repo.has_ref(&format!("refs/heads/{base_name}")) {
+    } else if head_ref.is_none() {
         // May be a tag or a sha
         "tag or historic commit"
-    } else if crate::domain::meta::is_file_line_at(&repo, &format!("refs/heads/{base_name}")) {
+    } else if head_ref
+        .as_ref()
+        .is_some_and(|head| crate::domain::meta::is_file_line_at(&repo, head))
+    {
         "the file line (no session)"
     } else if !is_session_line {
         "a point with no declared line (incomplete checkout?)"
-    } else if super::branch::is_sealed(&repo, &base_name) {
+    } else if head_ref
+        .as_ref()
+        .is_some_and(|head| super::branch::is_sealed_at(&repo, head))
+    {
         "a sealed branch"
     } else if args.mine {
         "your own copy (--mine)"

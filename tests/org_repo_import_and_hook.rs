@@ -568,9 +568,10 @@ fn an_import_the_hub_refuses_lands_nothing() {
 }
 
 /// `agit run` arbitrates an org branch by asking the hub's write gate, not by asking whether I am
-/// the owner: a granted member running the org branch head → continue (no new branch); once the
-/// hub revokes the grant, the same branch → forking is mandatory, and the suggested fork name
-/// skips an existing `-run-<n>`.
+/// the owner: a granted member running the org branch head → continue (no new branch), even when
+/// the checkout knows that head only as `origin/<b>` — a first-time collaborator's shape, which a
+/// local-branch-only check misjudges as a historic commit; once the hub revokes the grant, the
+/// same branch → forking is mandatory, and the suggested fork name skips an existing `-run-<n>`.
 #[test]
 fn run_continues_a_granted_org_branch_and_forks_once_the_gate_closes() {
     let lab = Lab::new();
@@ -586,6 +587,13 @@ fn run_continues_a_granted_org_branch_and_forks_once_the_gate_closes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let org = Repo::open(lab.repo("einsia", "qa")).expect("org checkout");
+    let tip = org.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    org.git(&["update-ref", "refs/remotes/origin/work", tip.trim()])
+        .unwrap();
+    let worktree = lab.agit_home.join("worktrees/einsia/qa/work");
+    org.git(&["worktree", "remove", "--force", worktree.to_str().unwrap()])
+        .unwrap();
+    org.git(&["branch", "-D", "work"]).unwrap();
 
     let out = lab
         .agit(&["run", "einsia/qa@work", "--no-launch"])
@@ -596,6 +604,11 @@ fn run_continues_a_granted_org_branch_and_forks_once_the_gate_closes() {
         out.status.success() && stdout.contains("→ continue (resume)"),
         "a granted member must continue the org branch, not fork it:\n{stdout}{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        org.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+        tip,
+        "continuing a remote-only head creates the local branch at the published tip"
     );
     assert!(
         !org.has_ref("refs/heads/work-run-1"),
