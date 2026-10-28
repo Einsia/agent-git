@@ -40,6 +40,12 @@ The app looks for agit, in order, at:
 It inherits the environment it was started with, so `AGIT_HOME` and `AGIT_HUB_URL` work as they
 do for the CLI.
 
+For each agit program and version it runs, the app runs `agit setup --hooks --installed-only`
+until it succeeds once. That repairs agit hooks your agent runtimes already have but cannot start,
+such as one whose path holds a space, and installs none. Only the broken command text changes; the
+file as it was is kept beside it, readable only by you, with `.agit-backup` added to its name, and
+the app tells you once what it repaired.
+
 ## What it shows
 
 | Icon | Meaning |

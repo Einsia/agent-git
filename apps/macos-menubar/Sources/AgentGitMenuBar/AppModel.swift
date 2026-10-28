@@ -26,6 +26,11 @@ struct Problem: Identifiable, Equatable {
     let fix: Fix
 }
 
+/// What `agit setup --hooks --installed-only` reports.
+private struct HookRepair: Decodable {
+    let hookFilesRepaired: Int
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var cli: AgitCLI?
@@ -52,9 +57,15 @@ final class AppModel: ObservableObject {
     private var wasSignedIn: Bool?
     private var refreshAgain = false
     private var waiting: [String: [Job]] = [:]
+    /// `AgitCLI.stamp` of the program `version` was read from.
+    private var versionStamp: String?
+    /// When a hook repair that has not finished was last tried.
+    private var repairTried: Date?
     private let defaults = UserDefaults.standard
     private static let historyKey = "uploadHistory"
     private static let pausedKey = "pausedFolders"
+    private static let hooksRepairedKey = "hooksRepairedFor"
+    private static let repairRetry: TimeInterval = 600
     private static let historyLimit = 30
     private static let pollInterval: TimeInterval = 30
 
@@ -65,10 +76,7 @@ final class AppModel: ObservableObject {
         }
         paused = defaults.dictionary(forKey: Self.pausedKey) as? [String: String] ?? [:]
         cli = AgitCLI.locate()
-        Task {
-            await refresh()
-            version = await cli?.version()
-        }
+        Task { await refresh() }
         timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
@@ -156,7 +164,56 @@ final class AppModel: ObservableObject {
             applyWhoami(who)
             applyList(list)
             lastRefresh = Date()
+            if cli.stamp != versionStamp { await readVersion(cli) }
+            await repairHooks(cli)
         } while refreshAgain
+    }
+
+    /// Reads `agit --version`. A read that fails leaves the stamp unset, so the next poll reads
+    /// again.
+    private func readVersion(_ cli: AgitCLI) async {
+        let stamp = cli.stamp
+        version = await cli.version()
+        guard version != nil else {
+            versionStamp = nil
+            return
+        }
+        versionStamp = stamp
+        repairTried = nil
+    }
+
+    /// Repairs agit's hooks once for each program path and version. A hook keeps the program path
+    /// it was installed with, so a hook that no longer starts is repaired only by an agit run
+    /// outside the hooks; `--installed-only` rewrites just the broken command text of hooks that
+    /// already exist and installs none, so no runtime gains a hook it was never given. A repair
+    /// that does not finish is tried again on a later poll, at most once per `repairRetry`. What
+    /// it repaired is announced once, because until then nothing was being saved, and a repair
+    /// that left a hook file broken says so instead of saying all is well.
+    private func repairHooks(_ cli: AgitCLI) async {
+        guard let version, versionStamp == cli.stamp else { return }
+        let key = "\(cli.executable.path)\n\(version)"
+        guard defaults.string(forKey: Self.hooksRepairedKey) != key else { return }
+        if let tried = repairTried, Date().timeIntervalSince(tried) < Self.repairRetry { return }
+        repairTried = Date()
+        guard let result = try? await cli.run(["setup", "--hooks", "--installed-only"], timeout: 60)
+        else { return }
+        let repaired = (try? result.decode(HookRepair.self))?.hookFilesRepaired ?? 0
+        if repaired > 0 && result.ok {
+            notifier.post(
+                key: "hooks-repaired",
+                title: "Conversations save again",
+                body: "AgentGit's hooks could not start, so conversations were not saved. They are repaired; "
+                    + "the previous settings are kept beside them with .agit-backup added to the name.")
+        } else if repaired > 0 {
+            notifier.post(
+                key: "hooks-partly-repaired",
+                title: "Some conversations still cannot be saved",
+                body: "AgentGit repaired some of its hooks, but not all of them. \(result.reason)")
+        }
+        if result.ok {
+            defaults.set(key, forKey: Self.hooksRepairedKey)
+            repairTried = nil
+        }
     }
 
     private func applyWhoami(_ result: CLIResult?) {
@@ -325,10 +382,7 @@ final class AppModel: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         defaults.set(url.path, forKey: AgitCLI.pathKey)
         cli = AgitCLI.locate()
-        Task {
-            version = await cli?.version()
-            await refresh()
-        }
+        Task { await refresh() }
     }
 
     func open(_ link: String?) {

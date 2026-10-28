@@ -49,8 +49,10 @@ pub struct Args {
     pub hooks: bool,
     #[arg(long)]
     pub skill: bool,
-    /// Refresh only existing native or legacy Skill installations.
-    #[arg(long, requires = "skill", conflicts_with_all = ["hooks", "mcp", "agents_md", "completions", "auto_push"])]
+    /// Refresh only what is already installed: existing native or legacy Skill installations
+    /// with `--skill`; with `--hooks`, repair the existing hooks that name this agit in a form a
+    /// shell does not run, and install none.
+    #[arg(long, conflicts_with_all = ["mcp", "agents_md", "completions", "auto_push"])]
     pub installed_only: bool,
     #[arg(long)]
     pub mcp: bool,
@@ -119,7 +121,14 @@ fn wants(filter: Option<&str>, runtime: &str) -> bool {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    ui::with_info_on_stderr(args.completions.is_some(), || run_setup(args))
+    // A hook repair answers `--json` with one value saying what it repaired, so its notices stay
+    // off stdout.
+    let data = args.completions.is_some() || (repairs_hooks(&args) && super::json::requested());
+    ui::with_info_on_stderr(data, || run_setup(args))
+}
+
+fn repairs_hooks(args: &Args) -> bool {
+    args.hooks && args.installed_only
 }
 
 fn run_setup(mut args: Args) -> CmdResult {
@@ -142,6 +151,10 @@ fn run_setup(mut args: Args) -> CmdResult {
                 .collect::<Vec<_>>()
                 .join(" / ")
         ));
+        return Ok(ExitCode::Usage);
+    }
+    if args.installed_only && !args.skill && !args.hooks {
+        ui::error("`--installed-only` refreshes `--skill` or `--hooks`; name one of them");
         return Ok(ExitCode::Usage);
     }
 
@@ -180,7 +193,16 @@ fn run_setup(mut args: Args) -> CmdResult {
 
     let rt = args.runtime.as_deref();
     let mut report = SetupReport::default();
-    if hooks {
+    if repairs_hooks(&args) {
+        let repaired = repair_hooks(rt, &exe_str());
+        report.merge(repaired);
+        if super::json::requested() {
+            println!(
+                "{}",
+                serde_json::json!({"hook_files_repaired": repaired.changed})
+            );
+        }
+    } else if hooks {
         report.merge(install_hooks(rt));
     }
     if skill {
@@ -324,13 +346,7 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
     let exe = exe_str();
 
     if wants(runtime, "claude-code") {
-        match crate::adapter::claude_code::projects_dir()
-            .ok()
-            .and_then(|projects| {
-                projects
-                    .parent()
-                    .map(|profile| profile.join("settings.json"))
-            }) {
+        match claude_settings() {
             Some(path) => report.merge(install_hook_file(&path, "Claude Code", &exe, None)),
             None => {
                 ui::warning("cannot install Claude Code hooks: HOME is not set");
@@ -402,6 +418,212 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
     }
 
     report
+}
+
+fn claude_settings() -> Option<PathBuf> {
+    crate::adapter::claude_code::projects_dir()
+        .ok()
+        .and_then(|projects| {
+            projects
+                .parent()
+                .map(|profile| profile.join("settings.json"))
+        })
+}
+
+/// `setup --hooks --installed-only`: repair, in each runtime's hook file, the agit hooks that name
+/// `exe` in a form a shell does not run as that program, such as a path with a space written
+/// bare. It runs unattended (the menu bar app runs it once per new agit), so it installs nothing,
+/// touches no native integration, and leaves alone every hook that runs another program, even
+/// another agit: pointing those at this one would replace a choice the person made.
+fn repair_hooks(runtime: Option<&str>, exe: &str) -> SetupReport {
+    let files = [
+        ("claude-code", "Claude Code", claude_settings(), None),
+        (
+            "codex",
+            "Codex",
+            codex_home_path().map(|home| home.join("hooks.json")),
+            Some("codex"),
+        ),
+        (
+            "workbuddy",
+            "WorkBuddy",
+            crate::adapter::workbuddy::home()
+                .ok()
+                .map(|root| root.join("settings.json")),
+            Some("workbuddy"),
+        ),
+    ];
+    let mut report = SetupReport::default();
+    for (id, label, path, runtime_flag) in files {
+        if wants(runtime, id)
+            && let Some(path) = path
+        {
+            report.merge(repair_hook_file(&path, label, exe, runtime_flag));
+        }
+    }
+    report
+}
+
+/// Repair one hook file in its own text: only the command strings of agit's hooks for `exe`
+/// change, and every other byte stays as it was, so nothing the person or another tool wrote is
+/// added, reordered, reformatted or removed. Parsing and writing the document back would sort its
+/// keys and reflow it. The file as it was before the first repair is kept beside it.
+fn repair_hook_file(
+    path: &Path,
+    label: &str,
+    exe: &str,
+    runtime_flag: Option<&str>,
+) -> SetupReport {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SetupReport::default();
+        }
+        Err(_) => {
+            ui::warning(&format!(
+                "cannot repair {label} hooks: failed to read {}",
+                path.display()
+            ));
+            return SetupReport::failure();
+        }
+    };
+    let Ok(mut expected) = serde_json::from_str::<serde_json::Value>(&text) else {
+        ui::warning(&format!(
+            "cannot repair {label} hooks: {} is not valid JSON",
+            path.display()
+        ));
+        return SetupReport::failure();
+    };
+    let mut present = false;
+    let mut rewrites: Vec<(String, String)> = Vec::new();
+    for (event, argv) in HOOKS {
+        let command = hook_command(exe, argv, runtime_flag);
+        let arguments = hook_arguments(argv, runtime_flag);
+        let bare = format!("{exe} {arguments}");
+        let entries = expected
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(event))
+            .and_then(|groups| groups.as_array_mut())
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group.get_mut("hooks").and_then(|list| list.as_array_mut()))
+            .flatten()
+            .filter(|entry| entry.get("type").and_then(|value| value.as_str()) == Some("command"));
+        for entry in entries {
+            let Some(current) = entry.get("command").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let names_exe = current.trim() == bare
+                || hook_program(current, &arguments).is_some_and(|program| program == exe);
+            if !names_exe {
+                continue;
+            }
+            present = true;
+            if current != command {
+                rewrites.push((current.to_owned(), command.clone()));
+                entry["command"] = serde_json::Value::String(command.clone());
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return if present {
+            SetupReport::item()
+        } else {
+            SetupReport::default()
+        };
+    }
+    let repaired = rewrite_command_values(&text, &rewrites);
+    // The same text as the value of another `command` key is rewritten too; the document would
+    // then differ from the one only agit's hooks changed in, and nothing is written.
+    if serde_json::from_str::<serde_json::Value>(&repaired)
+        .ok()
+        .as_ref()
+        != Some(&expected)
+    {
+        ui::warning(&format!(
+            "cannot repair {label} hooks: {} uses the same command outside agit's hooks",
+            path.display()
+        ));
+        return SetupReport::failure();
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".agit-backup");
+    let mut options = crate::infra::config::state_file_options();
+    options.write(true).create_new(true);
+    // The copy is for its owner only, and never more readable than the original: a hook file can
+    // hold credentials in its environment block, and group bits copied onto a file whose group
+    // differs from the original's would hand it to another group.
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(metadata.permissions().mode() & 0o600);
+    }
+    let kept = options
+        .open(&backup)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()));
+    if let Err(error) = kept
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        ui::warning(&format!(
+            "cannot repair {label} hooks: failed to keep a copy of {}",
+            path.display()
+        ));
+        return SetupReport::failure();
+    }
+    if std::fs::write(path, repaired).is_err() {
+        ui::warning(&format!("failed to write {}", path.display()));
+        return SetupReport::failure();
+    }
+    ui::info(format_args!(
+        "  {} {label} hooks repaired → {}",
+        ui::ok(ui::theme::symbols().check),
+        ui::tilde(path)
+    ));
+    SetupReport::changed_item()
+}
+
+/// `text` with each string that is the value of a `command` key and equals the left side of a
+/// rewrite replaced by its right side; every other byte is copied as is. `text` must be valid
+/// JSON, so outside strings it holds no quote, and the text between a key and its value is a
+/// colon and whitespace.
+fn rewrite_command_values(text: &str, rewrites: &[(String, String)]) -> String {
+    let bytes = text.as_bytes();
+    let mut strings = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < bytes.len() && bytes[index] != b'"' {
+            index += if bytes[index] == b'\\' { 2 } else { 1 };
+        }
+        index = (index + 1).min(bytes.len());
+        strings.push(start..index);
+    }
+    let decode =
+        |range: &std::ops::Range<usize>| serde_json::from_str::<String>(&text[range.clone()]).ok();
+    let mut repaired = String::with_capacity(text.len());
+    let mut copied = 0;
+    for pair in strings.windows(2) {
+        let (key, value) = (&pair[0], &pair[1]);
+        if text[key.end..value.start].trim() != ":" || decode(key).as_deref() != Some("command") {
+            continue;
+        }
+        let Some(current) = decode(value) else {
+            continue;
+        };
+        let Some((_, replacement)) = rewrites.iter().find(|(old, _)| *old == current) else {
+            continue;
+        };
+        repaired.push_str(&text[copied..value.start]);
+        repaired.push_str(&serde_json::Value::String(replacement.clone()).to_string());
+        copied = value.end;
+    }
+    repaired.push_str(&text[copied..]);
+    repaired
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1996,6 +2218,68 @@ mod tests {
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy")).succeeded());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+    }
+
+    /// A hook repair (`setup --hooks --installed-only`) changes only the command text of agit's
+    /// hooks for this program: the bare path the shell split becomes the quoted command, while
+    /// the file keeps its key order, its layout, the person's hooks and a hook that runs another
+    /// agit, and the first original is kept beside it, for its owner only even when the original
+    /// is group-readable. A repair that parsed and rewrote the document would sort the person's
+    /// settings, and one that installed would turn capture on where they never enabled it; the
+    /// menu bar app runs the repair without asking.
+    #[test]
+    fn a_hook_repair_changes_only_the_broken_command_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = "/opt/Agent Git/agit-dev";
+        let missing = dir.path().join("absent/settings.json");
+        assert_eq!(
+            repair_hook_file(&missing, "Claude Code", exe, None),
+            SetupReport::default()
+        );
+        assert!(!missing.exists());
+
+        let (event, argv) = HOOKS[1];
+        let broken = format!("{exe} {}", hook_arguments(argv, None));
+        let other = format!("/usr/local/bin/agit {}", hook_arguments(HOOKS[0].1, None));
+        let original = format!(
+            "{{\n  \"model\": \"opus\",\n  \"hooks\": {{\n    \"SessionStart\": [{{\"hooks\": [{{\"type\": \"command\", \"command\": \"{other}\"}}]}}],\n    \"{event}\": [ {{ \"hooks\": [ {{ \"command\": \"{broken}\", \"type\": \"command\" }}, {{\"type\": \"command\", \"command\": \"/usr/bin/user-hook\"}} ] }} ]\n  }},\n  \"env\": {{\"A\": \"1\"}}\n}}\n"
+        );
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, &original).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
+        let report = repair_hook_file(&path, "Claude Code", exe, None);
+        assert_eq!((report.items, report.changed, report.failures), (1, 1, 0));
+        let command = serde_json::Value::String(hook_command(exe, argv, None)).to_string();
+        let repaired = original.replace(&format!("\"{broken}\""), &command);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+        let backup = dir.path().join("settings.json.agit-backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&backup).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+
+        let report = repair_hook_file(&path, "Claude Code", exe, None);
+        assert_eq!((report.items, report.changed, report.failures), (1, 0, 0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        // The same text as another `command` value: rewriting it would change that setting too.
+        let shared = original.replace(
+            "\"env\": {\"A\": \"1\"}",
+            &format!("\"statusLine\": {{\"type\": \"command\", \"command\": \"{broken}\"}}"),
+        );
+        std::fs::write(&path, &shared).unwrap();
+        assert_eq!(
+            repair_hook_file(&path, "Claude Code", exe, None).failures,
+            1
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), shared);
     }
 
     /// **The command written out must parse as an agit invocation.**

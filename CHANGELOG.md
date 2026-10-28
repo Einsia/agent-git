@@ -10,6 +10,12 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ### Added
 
+- `agit setup --hooks --installed-only` repairs the agit hooks your agent runtimes already have
+  but cannot start, such as one written by an older agit whose path the shell split at a space,
+  and installs none. Only the command text of those hooks changes; the rest of the file stays as
+  it was, and the original is kept beside it with `.agit-backup` added to its name. With `--json`
+  it reports `hook_files_repaired`.
+
 - `agit push` reports preparation, preview, receipt and upload progress with snapshot counts and
   elapsed time. Redirected output retains periodic progress on stderr; quiet and JSON output
   omit these routine notices. Each upload batch reports completion only after acknowledgement.

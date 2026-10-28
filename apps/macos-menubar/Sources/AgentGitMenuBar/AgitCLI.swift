@@ -94,6 +94,14 @@ struct AgitCLI {
         return output?.isEmpty == false ? output : nil
     }
 
+    /// The resolved program and when it was last written, read without running it: it changes
+    /// when the program is replaced or another one is chosen.
+    var stamp: String {
+        let resolved = executable.resolvingSymlinksInPath()
+        let written = (try? FileManager.default.attributesOfItem(atPath: resolved.path))?[.modificationDate] as? Date
+        return "\(resolved.path)@\(written?.timeIntervalSince1970 ?? 0)"
+    }
+
     /// The one line `agit --version` prints, shown to the user as is.
     func version() async -> String? {
         guard let (data, _) = try? await launch(["--version"], timeout: 10) else { return nil }
