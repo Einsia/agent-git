@@ -13,6 +13,10 @@ pub struct Waiting {
     pub turns: usize,
     /// Seconds since the Unix epoch when the wait began.
     pub since: u64,
+    /// The size of a record the privacy check cannot divide. Such a wait does not end by
+    /// itself: settling again meets the same record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_bytes: Option<u64>,
 }
 
 fn path() -> Option<std::path::PathBuf> {
@@ -43,7 +47,7 @@ fn store(waiting: &BTreeMap<String, Waiting>) {
 }
 
 /// Note that `session`'s settlement waits; an earlier start of the same wait is kept.
-pub fn record(session: &str, reason: &str, turns: usize) {
+pub fn record(session: &str, reason: &str, turns: usize, refused_bytes: Option<u64>) {
     let mut waiting = load();
     let since = waiting
         .get(session)
@@ -59,6 +63,7 @@ pub fn record(session: &str, reason: &str, turns: usize) {
             reason: reason.to_owned(),
             turns,
             since,
+            refused_bytes,
         },
     );
     store(&waiting);

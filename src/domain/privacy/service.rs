@@ -645,8 +645,7 @@ fn transform_inner(
     let mut stopped = None;
     let mut cursor = 0;
     while cursor < text.len() {
-        let remaining = budget.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+        if budget.saturating_sub(started.elapsed()).is_zero() {
             stopped = Some(Reason::Deadline);
             break;
         }
@@ -673,7 +672,8 @@ fn transform_inner(
         };
         // The worker counts the context against the same bound, so the check here does too.
         let carried = if cursor == 0 { context.len() } else { 0 };
-        if carried + end - cursor > MAX_UNIT_BYTES {
+        let oversized = carried + end - cursor > MAX_UNIT_BYTES;
+        if oversized && !matches!(mode, Mode::ProtectJsonl | Mode::ProtectText) {
             stopped = Some(Reason::Oversize);
             if protects {
                 break;
@@ -683,21 +683,26 @@ fn transform_inner(
             cursor = end;
             continue;
         }
-        let result = state
-            .process
-            .as_mut()
-            .expect("worker started")
-            .request(
-                repo,
-                if cursor == 0 { context } else { "" },
-                &text[cursor..end],
-                mode,
-                remaining,
-            )
-            .and_then(|batch| {
-                validate(&text[cursor..end], &batch, mode).map_err(Failure::Protocol)?;
-                Ok(batch)
-            });
+        let process = state.process.as_mut().expect("worker started");
+        let remaining = || budget.saturating_sub(started.elapsed());
+        let result = if oversized && matches!(mode, Mode::ProtectText) {
+            protect_windows(process, repo, context, text, &remaining)
+        } else if oversized {
+            protect_oversized_line(process, repo, &text[cursor..end], &remaining)
+        } else {
+            process
+                .request(
+                    repo,
+                    if cursor == 0 { context } else { "" },
+                    &text[cursor..end],
+                    mode,
+                    remaining(),
+                )
+                .and_then(|batch| {
+                    validate(&text[cursor..end], &batch, mode).map_err(Failure::Protocol)?;
+                    Ok(batch)
+                })
+        };
         match result {
             Ok(batch) => {
                 if matches!(mode, Mode::ProtectStream) {
@@ -755,6 +760,288 @@ fn transform_inner(
         outcome.reason = outcome.reason.or(stopped);
     }
     outcome
+}
+
+/// How much of an oversized string one request carries, and the room an oversized record keeps
+/// below the request bound once its largest strings are taken out.
+const WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const WINDOW_CONTEXT_BYTES: usize = 16 * 1024;
+/// The smallest window a part with too many findings is divided into.
+const SMALLEST_WINDOW: usize = 64 * 1024;
+
+/// What a record keeps in place of a string no request can carry and no window can divide.
+pub(crate) const OMITTED_TEXT: &str = "[content omitted: too large for the privacy check]";
+/// What a long text keeps in place of a part with too many findings for the privacy check to
+/// finish or divide.
+pub(crate) const CROWDED_TEXT: &str = "[content omitted: too many findings for the privacy check]";
+
+/// One JSONL line too large for a request, protected in parts. Its base64 media payloads stay
+/// here, since media is never scanned, and every other string too large to travel with the record
+/// is protected on its own, window by window, each window with the text before it as context. The
+/// line keeps its bytes unless something in it was replaced.
+fn protect_oversized_line(
+    process: &mut Process,
+    repo: Option<&Path>,
+    line: &str,
+    remaining: &dyn Fn() -> Duration,
+) -> Result<Outcome, Failure> {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let newline = &line[body.len()..];
+    let Ok(mut record) = serde_json::from_str::<serde_json::Value>(body) else {
+        // Not a record: the whole line is text.
+        let mut protected = protect_windows(process, repo, "", body, remaining)?;
+        if passed(&protected) {
+            protected.content.push_str(newline);
+        }
+        return Ok(protected);
+    };
+    let mut strings = Vec::new();
+    oversized_strings(&record, &mut String::new(), None, false, &mut strings);
+    let encoded = |text: &str| serde_json::Value::from(text).to_string().len();
+    // Media always stays here; then the largest strings, until the rest fits one request.
+    strings.sort_by_key(|part| (!part.media, std::cmp::Reverse(part.bytes)));
+    let mut size = body.len();
+    let mut parts = Vec::new();
+    for (index, part) in strings.into_iter().enumerate() {
+        if !part.media && size <= MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES {
+            break;
+        }
+        let mut stub = format!("agit-oversized-part-{index}");
+        while body.contains(&stub) {
+            stub.push('-');
+        }
+        let slot = record
+            .pointer_mut(&part.pointer)
+            .expect("the pointer was collected from this record");
+        let original = std::mem::replace(slot, serde_json::Value::from(stub.as_str()));
+        size = size - part.bytes + encoded(&stub);
+        parts.push((part, stub, original));
+    }
+    let stubbed = format!("{record}{newline}");
+    if size > MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES || stubbed.len() > MAX_UNIT_BYTES {
+        return Ok(skipped(line, Reason::Oversize));
+    }
+    let batch = process.request(repo, "", &stubbed, Mode::ProtectJsonl, remaining())?;
+    validate(&stubbed, &batch, Mode::ProtectJsonl).map_err(Failure::Protocol)?;
+    if !passed(&batch) {
+        return Ok(skipped(
+            line,
+            batch.reason.unwrap_or(Reason::SourceIncomplete),
+        ));
+    }
+    let mut protected = serde_json::from_str::<serde_json::Value>(
+        batch.content.strip_suffix('\n').unwrap_or(&batch.content),
+    )
+    .map_err(|error| Failure::Protocol(error.into()))?;
+    let mut replacements = batch.replacements;
+    for (part, stub, original) in parts {
+        let slot = protected
+            .pointer_mut(&part.pointer)
+            .filter(|slot| slot.as_str() == Some(stub.as_str()))
+            .ok_or_else(|| {
+                Failure::Protocol(anyhow::anyhow!("an oversized part did not return"))
+            })?;
+        *slot = if part.media {
+            original
+        } else {
+            let text = original.as_str().unwrap_or_default();
+            // The field name leads the first window, as it would lead the value in the record.
+            let lead = part
+                .field
+                .as_deref()
+                .filter(|field| field.len() <= 128 && field.is_ascii())
+                .map(|field| format!("{field} = "))
+                .unwrap_or_default();
+            let windows = protect_windows(process, repo, &lead, text, remaining)?;
+            if windows.reason == Some(Reason::Oversize) {
+                // No cut in any window that fits a request leaves a finding whole: the string
+                // is omitted rather than holding the session back for good.
+                replacements += 1;
+                serde_json::Value::from(OMITTED_TEXT)
+            } else if !passed(&windows) {
+                return Ok(skipped(
+                    line,
+                    windows.reason.unwrap_or(Reason::SourceIncomplete),
+                ));
+            } else {
+                replacements += windows.replacements;
+                serde_json::Value::from(windows.content)
+            }
+        };
+    }
+    Ok(Outcome {
+        content: if replacements == 0 {
+            line.to_owned()
+        } else {
+            format!("{protected}{newline}")
+        },
+        status: Status::Complete,
+        replacements,
+        unresolved: 0,
+        consumed: None,
+        unprocessed: 0,
+        reason: None,
+    })
+}
+
+/// A string inside an oversized record: where it is, the field that holds it, its size as
+/// encoded in the record, and whether it is a media payload.
+struct OversizedString {
+    pointer: String,
+    field: Option<String>,
+    bytes: usize,
+    media: bool,
+}
+
+/// Strings in `value` large enough to matter for an oversized record. `in_source` says `value`
+/// sits in a base64 source object, whose `data` is media.
+fn oversized_strings(
+    value: &serde_json::Value,
+    pointer: &mut String,
+    field: Option<&str>,
+    in_source: bool,
+    out: &mut Vec<OversizedString>,
+) {
+    const SMALLEST: usize = 1024;
+    match value {
+        serde_json::Value::String(text) if text.len() >= SMALLEST => out.push(OversizedString {
+            pointer: pointer.clone(),
+            field: field.map(str::to_owned),
+            bytes: value.to_string().len(),
+            media: super::projector::media_payload(in_source && field == Some("data"), text),
+        }),
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let at = pointer.len();
+                pointer.push_str(&format!("/{index}"));
+                oversized_strings(value, pointer, None, false, out);
+                pointer.truncate(at);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let source = super::projector::base64_source(values);
+            for (key, value) in values {
+                let at = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                oversized_strings(value, pointer, Some(key), source, out);
+                pointer.truncate(at);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `text` protected in windows that each fit one request. Every window carries as context the
+/// text before it that a rule can still need, the way a live stream does
+/// ([`crate::domain::redact::context_start`]), and `lead` before the first, so a rule matches
+/// across window edges; when that context no longer fits a request, the text is not protected. A
+/// window ends where the worker's stream cut says no finding is split, and the last one is
+/// protected whole. A window with no safe cut grows, and one with too many findings for a scan
+/// shrinks to [`SMALLEST_WINDOW`]. A part that can neither shrink nor grow, the smallest window
+/// still too crowded or a window with no cut below a crowded size, becomes [`CROWDED_TEXT`], so
+/// the text always moves on and nothing in that part is published. The context's findings count
+/// toward a scan too, so the window after a crowded part can be omitted with it.
+fn protect_windows(
+    process: &mut Process,
+    repo: Option<&Path>,
+    lead: &str,
+    text: &str,
+    remaining: &dyn Fn() -> Duration,
+) -> Result<Outcome, Failure> {
+    let mut outcome = Outcome {
+        content: String::with_capacity(text.len()),
+        status: Status::Complete,
+        replacements: 0,
+        unresolved: 0,
+        consumed: None,
+        unprocessed: 0,
+        reason: None,
+    };
+    let keys = crate::domain::redact::PrivateKeys::new(text);
+    let mut start = 0;
+    let mut window = WINDOW_BYTES;
+    // The smallest window at `start` whose scan had too many findings to finish.
+    let mut crowded: Option<usize> = None;
+    while start < text.len() {
+        let context = if start == 0 {
+            lead
+        } else {
+            match crate::domain::redact::context_start(&text[..start]) {
+                Some(from) => &text[from..start],
+                None => return Ok(skipped(text, Reason::Oversize)),
+            }
+        };
+        let room = MAX_UNIT_BYTES - context.len();
+        window = window.min(room);
+        let last = text.len() - start <= window;
+        let mut end = if last { text.len() } else { start + window };
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mode = if last {
+            Mode::ProtectText
+        } else {
+            Mode::ProtectStream
+        };
+        let piece = process.request(repo, context, &text[start..end], mode, remaining())?;
+        validate(&text[start..end], &piece, mode).map_err(Failure::Protocol)?;
+        if !passed(&piece) {
+            return Ok(skipped(
+                text,
+                piece.reason.unwrap_or(Reason::SourceIncomplete),
+            ));
+        }
+        // A crowded window released nothing, or was replaced whole; either way it is divided.
+        let capped = piece.reason == Some(Reason::FindingsCap);
+        let consumed = if capped {
+            0
+        } else if last {
+            end - start
+        } else {
+            piece.consumed.unwrap_or(0)
+        };
+        // A cut inside a private key that is still open is no safe cut: the header would leave
+        // with this part and the rest of the body would reach a request that cannot recognize it.
+        let consumed = if consumed > 0 && !last && keys.end_after(start + consumed).is_some() {
+            0
+        } else {
+            consumed
+        };
+        if consumed == 0 {
+            let size = end - start;
+            if capped {
+                crowded = Some(size);
+            }
+            let stuck = if capped {
+                size <= SMALLEST_WINDOW
+            } else {
+                crowded.is_some_and(|crowded| size.saturating_mul(2) >= crowded)
+            };
+            if stuck {
+                outcome.content.push_str(CROWDED_TEXT);
+                outcome.replacements += 1;
+                // The omission covers a private key it opens to the key's footer, so no part of
+                // its body is left for a window that no longer sees the header.
+                start = keys.end_after(end).unwrap_or(end);
+                window = WINDOW_BYTES;
+                crowded = None;
+            } else if capped {
+                window = (size / 2).max(SMALLEST_WINDOW);
+            } else if window >= room {
+                return Ok(skipped(text, Reason::Oversize));
+            } else {
+                window = window.saturating_mul(2).min(room);
+            }
+            continue;
+        }
+        outcome.content.push_str(&piece.content);
+        outcome.replacements += piece.replacements;
+        start += consumed;
+        window = WINDOW_BYTES;
+        crowded = None;
+    }
+    Ok(outcome)
 }
 
 /// Admission checks prevent a bad worker response from changing carrier boundaries.

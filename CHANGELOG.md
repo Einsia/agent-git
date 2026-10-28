@@ -42,6 +42,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   pushing: push checks the sign-in and prints the destination, count and visibility itself. The
   agent pushes only when the person asked to upload, and runs a dry-run preview only when they
   ask to see one first.
+- A conversation holding a record or memory file larger than one privacy check takes is no longer
+  held back. The record is checked in parts with the text around each part, images and other
+  base64 media pass through unchanged, and a single string too large to check is published as
+  "[content omitted: too large for the privacy check]" rather than unchecked. A record that still
+  cannot be divided, because it holds only short strings, is named with its size in the
+  settlement output and in `agit status`, with the command that stops recording the
+  conversation, instead of a "pending" that never ends.
 - The privacy publication store kept for each published repository no longer grows without
   bound: a push compacts it once it holds many packs or loose objects and its disk has about the
   store's size free, keeping every object it holds. `agit doctor` reports a store over 1 GiB with

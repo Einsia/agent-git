@@ -617,6 +617,20 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
         };
         unreadable |= entry.reason == "device_rules";
         let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
+        if let Some(bytes) = entry.refused_bytes {
+            ui::warning(&format!(
+                "{}: privacy check refused a record of {} since {}; {} turn{} wait, and settling again does not change that",
+                crate::domain::link::short(&link.session_id),
+                super::mib(bytes),
+                ui::ago(since),
+                entry.turns,
+                if entry.turns == 1 { "" } else { "s" },
+            ));
+            ui::hint(&super::commit::refused_record_hint(
+                super::commit::drop_target(link).as_deref(),
+            ));
+            continue;
+        }
         ui::warning(&format!(
             "{}: privacy check pending ({}) since {}; {} turn{} wait, and the next settlement tries again",
             crate::domain::link::short(&link.session_id),

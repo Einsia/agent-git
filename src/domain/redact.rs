@@ -1025,7 +1025,7 @@ const STREAM_CONTEXT_CAP: usize =
 /// when that command lies beyond [`STREAM_CONTEXT_CAP`], so a header still to come could no
 /// longer be recognized.
 #[cfg(feature = "cli")]
-fn context_start(released: &str) -> Option<usize> {
+pub(crate) fn context_start(released: &str) -> Option<usize> {
     static COMMAND: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\bcurl\b").expect("the command pattern is valid"));
     let ceil = |mut at: usize| {
@@ -1064,18 +1064,106 @@ fn context_start(released: &str) -> Option<usize> {
     (start >= released.len().saturating_sub(STREAM_CONTEXT_CAP)).then_some(start)
 }
 
+/// A private key's header; its footer is the same line with `END` for `BEGIN`. The shortest
+/// header at each place is the one taken, so a header found in the whole text is the one found in
+/// any prefix that holds it.
+#[cfg(feature = "cli")]
+static KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}?PRIVATE KEY(?: BLOCK)?-----")
+        .expect("the private key header pattern is valid")
+});
+
+/// The private keys of one text, found once: each header's end and where its key closes, just
+/// past the first matching footer after the header, or `None` when no footer follows. A key whose
+/// footer ends the text is closed there; one with no footer is open to the end and beyond it.
+#[cfg(feature = "cli")]
+pub(crate) struct PrivateKeys {
+    /// In the order of their headers, which is also the order of the headers' ends.
+    keys: Vec<(usize, Option<usize>)>,
+    len: usize,
+}
+
+#[cfg(feature = "cli")]
+impl PrivateKeys {
+    pub(crate) fn new(text: &str) -> Self {
+        let lower = text.to_ascii_lowercase();
+        // Every footer-shaped line, by its text, at every place one starts. Each `-----end` is
+        // looked at once over a bounded stretch, so the work grows with the text, not with the
+        // number of keys times its length.
+        let mut footers: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (at, _) in lower.match_indices("-----end") {
+            let rest = &lower[at + "-----end".len()..];
+            let run = rest
+                .bytes()
+                .take(100 + "private key".len())
+                .take_while(|byte| matches!(byte, b' ' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+                .count();
+            for (middle, _) in rest[..run].match_indices("private key") {
+                let tail = &rest[middle + "private key".len()..];
+                for ending in ["-----", " block-----"] {
+                    if tail.starts_with(ending) {
+                        let length = "-----end".len() + middle + "private key".len() + ending.len();
+                        footers.entry(&lower[at..at + length]).or_default().push(at);
+                    }
+                }
+            }
+        }
+        let keys = KEY_HEADER
+            .find_iter(&lower)
+            .map(|header| {
+                let footer = header.as_str().replacen("-----begin", "-----end", 1);
+                let close = footers.get(footer.as_str()).and_then(|starts| {
+                    starts
+                        .get(starts.partition_point(|start| *start < header.end()))
+                        .map(|start| start + footer.len())
+                });
+                (header.end(), close)
+            })
+            .collect();
+        Self {
+            keys,
+            len: text.len(),
+        }
+    }
+
+    /// Where text released up to `at` may end so that no private key is left open: `None` when no
+    /// key is open at `at`, otherwise the first point past it where no key is open, or the end of
+    /// the text when one of them is never closed. A part released or omitted up to an open key's
+    /// middle leaves the rest of its body to a later request whose context no longer holds the
+    /// header, so nothing recognizes it as a key. Past one key's footer another key may be open
+    /// that began inside it, so the end moves on, over each key at most once.
+    pub(crate) fn end_after(&self, at: usize) -> Option<usize> {
+        let (mut end, mut until) = (at, None);
+        let (mut next, mut reach) = (0, 0);
+        loop {
+            while let Some(&(header_end, close)) = self.keys.get(next) {
+                if header_end > end {
+                    break;
+                }
+                // A key that never closes is open at every point after its header, the end of
+                // the text included.
+                let Some(close) = close else {
+                    return Some(self.len);
+                };
+                reach = reach.max(close);
+                next += 1;
+            }
+            if reach <= end {
+                return until;
+            }
+            end = reach;
+            until = Some(end);
+            if end == self.len {
+                return until;
+            }
+        }
+    }
+}
+
 /// Whether `text` opens a private key and does not close it.
 #[cfg(feature = "cli")]
 fn opens_key(text: &str) -> bool {
-    static HEADER: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")
-            .expect("the private key header pattern is valid")
-    });
-    let lower = text.to_ascii_lowercase();
-    HEADER.find_iter(&lower).any(|header| {
-        let footer = header.as_str().replacen("-----begin", "-----end", 1);
-        !lower[header.end()..].contains(&footer)
-    })
+    PrivateKeys::new(text).end_after(text.len()).is_some()
 }
 
 fn withheld_report() -> Report {
@@ -1242,5 +1330,68 @@ mod tests {
         let r = Redactor::new(Persona::default()).scrub("no persona here");
         assert_eq!(r.text, "no persona here");
         assert_eq!(r.paths, 0);
+    }
+
+    /// The end `PrivateKeys` gives lies outside every private key, also when a second key
+    /// begins inside the first one's body and closes after it. An end just past the first
+    /// footer would sit in the second body, which the next request would hold without its header.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn a_released_part_never_ends_inside_interleaved_private_keys() {
+        let text = "intro\n-----BEGIN RSA PRIVATE KEY-----\nAAAA\n\
+                    -----BEGIN OPENSSH PRIVATE KEY-----\nBBBB\n-----END RSA PRIVATE KEY-----\n\
+                    CCCC\n-----END OPENSSH PRIVATE KEY-----\ntail\n";
+        let keys = PrivateKeys::new(text);
+        let end = keys.end_after(text.find("AAAA").unwrap()).unwrap();
+        assert_eq!(&text[end..], "\ntail\n");
+        assert_eq!(keys.end_after(end), None);
+        assert_eq!(keys.end_after(text.find("intro").unwrap()), None);
+    }
+
+    /// A long chain of keys, each opening inside the one before it and closing after it, ends
+    /// only past its last footer. A search that rescanned the text after each footer it moved
+    /// past would give the same end, but with work growing with the square of the chain; the
+    /// chain is long enough for that work to dominate the test run.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn a_long_chain_of_interleaved_keys_ends_past_its_last_footer() {
+        let (first, second) = ("RSA", "OPENSSH");
+        let mut text = format!("-----BEGIN {first} PRIVATE KEY-----\nbody\n");
+        let mut open = first;
+        for _ in 0..20_000 {
+            let other = if open == first { second } else { first };
+            text.push_str(&format!("-----BEGIN {other} PRIVATE KEY-----\nbody\n"));
+            text.push_str(&format!("-----END {open} PRIVATE KEY-----\nbody\n"));
+            open = other;
+        }
+        text.push_str(&format!("-----END {open} PRIVATE KEY-----"));
+        let last = text.len();
+        text.push_str("\nafter\n");
+        let keys = PrivateKeys::new(&text);
+        assert_eq!(keys.end_after(text.find("body").unwrap()), Some(last));
+        assert_eq!(keys.end_after(last), None);
+    }
+
+    /// A key with no footer is open at the end of its text, so a stream that ends inside one is
+    /// withheld; a key whose footer is the text's last line is closed there. An index that
+    /// recorded "no footer" as a close at the end of the text answers both the same way, and the
+    /// unclosed key at the end of a stream goes out as ordinary text.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn a_key_without_a_footer_stays_open_at_the_end_of_its_text() {
+        for header in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----begin rsa private key-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        ] {
+            let open = format!("intro\n{header}\nSYNTHETIC\n");
+            assert!(opens_key(&open), "{open:?}");
+            assert_eq!(PrivateKeys::new(&open).end_after(2), None);
+            let footer = header
+                .replacen("BEGIN", "END", 1)
+                .replacen("begin", "end", 1);
+            let closed = format!("{open}{footer}");
+            assert!(!opens_key(&closed), "{closed:?}");
+        }
     }
 }

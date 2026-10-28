@@ -315,23 +315,54 @@ fn a_private_key_in_memory_is_replaced_as_one_block_or_refused() {
     );
 }
 
-/// Memory reaches a branch only as UTF-8 text that passed protection in full. A file too large
-/// for one protection unit stays local as "privacy check pending"; a file that is not UTF-8 stays
-/// local whatever it holds; a file withheld while the worker cannot run is collected, unchanged,
-/// by the next sync that can protect it; and a session branch file that holds the body and END
-/// line of a key whose BEGIN line was replaced on its own does not distill into main. An
-/// implementation that published what the worker did not process or could not read, recorded a
-/// withheld file as seen, or looked only for BEGIN lines would put the credential on a branch,
-/// drop the file for good, or carry the key body into main.
+/// Memory reaches a branch only as UTF-8 text that passed protection in full. A file larger than
+/// one protection unit is protected window by window and lands with its credentials replaced: one
+/// whose command a window edge separates from its user flag by more than a fixed context, and a
+/// run with too many findings for one scan, after which the rest of the file still lands. A file
+/// that is not UTF-8 stays local whatever it holds; a file withheld while the worker cannot run is
+/// collected, unchanged, by the next sync that can protect it; and a session branch file that
+/// holds the body and END line of a key whose BEGIN line was replaced on its own does not distill
+/// into main. An implementation that published what the worker did not process or could not read,
+/// carried a fixed context into the next window, kept growing a window that had too many findings,
+/// held a large file back for good, recorded a withheld file as seen, ended an omitted part inside
+/// a private key it opened, or looked only for BEGIN lines would put a credential on a branch, never collect the file, drop it, or carry the key
+/// body into main.
 #[test]
 fn memory_that_did_not_pass_protection_stays_off_every_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, repo, claude, mem) = fixture(tmp.path());
     let into = format!("{REPO}@s1");
+    const MIB: usize = 1024 * 1024;
+    let filler = "a filler line that carries this file past one protection unit\n";
     let mut big = String::from("---\nname: big\n---\naws AKIA4X7QZ2M5RT6VW3JH\n");
-    while big.len() <= 8 * 1024 * 1024 {
-        big.push_str("a filler line that carries this file past one protection unit\n");
+    while big.len() < 3 * MIB + MIB / 2 {
+        big.push_str(filler);
     }
+    // The first window's cut lands on the line of spaces, after the command and before its flag.
+    big.push_str("curl https://deploy.example.invalid/upload");
+    big.push_str(&" ".repeat(24 * 1024));
+    big.push('\n');
+    big.push_str(&" ".repeat(MIB));
+    big.push_str("-u 'deployuser:weakpass77'\n");
+    while big.len() < 6 * MIB {
+        big.push_str(filler);
+    }
+    // A private key opens just before a run too crowded for one scan and ends long after it, so
+    // the part omitted for the crowding ends inside the key's body.
+    big.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+    for _ in 0..2100 {
+        big.push_str("aws AKIA4X7QZ2M5RT6VW3JH\n");
+    }
+    let key_line = "Zq9SyntheticKeyBodyLine0123456789abcdefghijklmnopqrstuvwxyzABCDEFG\n";
+    let key_start = big.len();
+    while big.len() < key_start + MIB / 2 {
+        big.push_str(key_line);
+    }
+    big.push_str("-----END RSA PRIVATE KEY-----\n");
+    while big.len() <= 8 * MIB {
+        big.push_str(filler);
+    }
+    big.push_str("the closing fact\n");
     fs::write(mem.join("big.md"), &big).unwrap();
     fs::write(
         mem.join("latin.md"),
@@ -340,11 +371,27 @@ fn memory_that_did_not_pass_protection_stays_off_every_branch() {
     .unwrap();
     let synced = agit(&home, &claude, &["memory", "sync", "--into", &into]);
     ok(&synced);
-    assert!(repo.show("refs/heads/s1", "memory/big.md").is_none());
     let warnings = String::from_utf8_lossy(&synced.stderr);
+    let stored = repo
+        .show("refs/heads/s1", "memory/big.md")
+        .expect("a large memory file is collected");
+    assert!(!stored.contains("AKIA4X7QZ2M5RT6VW3JH"));
+    assert!(!stored.contains("weakpass77"));
     assert!(
-        warnings.contains("memory/big.md: privacy check pending"),
-        "{warnings}"
+        !stored.contains("Zq9SyntheticKeyBodyLine"),
+        "the key body behind the omitted part landed"
+    );
+    assert!(
+        stored.trim_end().ends_with("the closing fact"),
+        "{}",
+        &stored[stored.len().saturating_sub(400)..]
+    );
+    // Only the crowded part is omitted, with at most the window after it, whose context the crowded
+    // findings still fill; the rest of the file lands.
+    let lost = big.matches(filler).count() - stored.matches(filler).count();
+    assert!(
+        lost <= 2 * 64 * 1024 / filler.len() + 1,
+        "{lost} lines lost"
     );
     assert!(repo.show("refs/heads/s1", "memory/latin.md").is_none());
     assert!(
