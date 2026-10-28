@@ -50,6 +50,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   password for user '…'", which is the credential itself when a command passes it to `curl -u`
   without a colon, and the user part git prints in "Password for 'https://…@host'" when a command
   put a credential there.
+- `agit setup` configures Hermes 0.22's hooks and MCP server again, and a conversation can be
+  restored into Hermes 0.22. Hermes 0.22 starts through a shell launcher whose Python needs the
+  launcher's own bootstrap, so looking for a `python` beside the `hermes` command found none and
+  setup stopped at "install Hermes before configuring its integration". agit now asks the launcher
+  for its runtime command; an install that names its Python directly is unchanged.
 - A credential is replaced to its end in what agit publishes. A GitLab token longer than the
   20 characters its rule names had only its start replaced, and the rest of the token was
   published after the placeholder; every rule that names a token by its length now replaces the

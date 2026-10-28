@@ -3,11 +3,7 @@
 use super::{SetupReport, ui, write_if_changed};
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
-use std::{
-    io::Write,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{io::Write, path::Path, process::Stdio};
 
 fn report(label: &str, result: crate::Result<()>) -> SetupReport {
     match result {
@@ -35,10 +31,7 @@ pub(super) fn claude() -> SetupReport {
 
 pub(super) fn hermes(exe: &str, kind: &str) -> SetupReport {
     let result = (|| {
-        let python = crate::adapter::hermes::python()
-            .context("install Hermes before configuring its integration")?;
-        let mut child = Command::new(python)
-            .args(["-c", include_str!("hermes.py")])
+        let mut child = crate::adapter::hermes::python_command(include_str!("hermes.py"))?
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

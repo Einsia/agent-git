@@ -22,6 +22,21 @@ def run(argv, env, cwd, timeout=120):
     return result.stdout
 
 
+def hermes_python(native, script, repository, env):
+    """The command agit runs a script with in the Hermes CLI's environment (adapter/hermes.rs)."""
+    entry = Path(native).resolve()
+    head = entry.read_bytes()[:512]
+    words = head[2:].split(b"\n", 1)[0].decode().split() if head.startswith(b"#!") else []
+    if words and Path(words[0]).name in ("sh", "bash", "dash", "zsh"):
+        argv = json.loads(run([native, "--print-runtime-command", "--module", "agit_hermes_entry"], env, entry.parent))
+        entry_module = (repository / "src/adapter/hermes/entry.py").read_text()
+        argv[3] = f"AGIT_SCRIPT = {json.dumps(script)}\n{entry_module}\n{argv[3]}"
+        return argv
+    if len(words) > 1 and Path(words[0]).name == "env":
+        return [shutil.which(words[1]) or words[1], "-c", script]
+    return [words[0] if words else str(entry.parent / "python"), "-c", script]
+
+
 def exercise(runtime, exe, bridge, repository, source_runtime=None):
     root = Path(tempfile.mkdtemp(prefix=f"agit-{runtime}-smoke-")).resolve()
     workspace = root / "workspace"
@@ -114,8 +129,7 @@ def exercise(runtime, exe, bridge, repository, source_runtime=None):
                     return [{key: value for key, value in dict(row).items() if key not in ("id", "session_id", "display_identity")} for row in connection.execute("SELECT * FROM messages WHERE session_id=? ORDER BY id", (identity,))]
                 assert messages(sid) == messages(clone_id), "same-runtime restoration changed native fields"
             helper = (repository / "src/adapter/hermes/install.py").read_text()
-            python = str(Path(native).resolve().parent / "python")
-            collision = subprocess.run([python, "-c", helper], input=json.dumps({"content": Path(path).read_text(), "id": sid, "cwd": str(workspace)}), env=env, cwd=workspace, capture_output=True, text=True, timeout=30)
+            collision = subprocess.run(hermes_python(native, helper, repository, env), input=json.dumps({"content": Path(path).read_text(), "id": sid, "cwd": str(workspace)}), env=env, cwd=workspace, capture_output=True, text=True, timeout=30)
             assert collision.returncode and "refusing to overwrite" in collision.stderr
         elif runtime == "openclaw":
             original = [json.loads(line) for line in before.splitlines()]

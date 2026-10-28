@@ -251,14 +251,93 @@ fn parse(raw: &str) -> Result<Parsed> {
     Ok(parsed)
 }
 
-pub(crate) fn python() -> Option<PathBuf> {
-    let binary = super::which("hermes")?.canonicalize().ok()?;
-    let path = binary.parent()?.join(if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python"
-    });
-    path.is_file().then_some(path)
+/// A command that runs `script` as `__main__` in the installed Hermes CLI's Python environment.
+///
+/// A console-script install names its interpreter in the entry point's `#!` line, or keeps it
+/// beside a binary entry point. A shell launcher starts a store interpreter that needs the
+/// launcher's bootstrap to select Hermes' dependencies, so it is asked for that runtime command and
+/// the script runs where the command runs its entry module. Only a shell launcher is asked: a
+/// console-script CLI ignores the request and starts a session instead.
+pub(crate) fn python_command(script: &str) -> Result<Command> {
+    let entry = super::which("hermes").context("Hermes is not installed: no `hermes` on PATH")?;
+    let binary = entry.canonicalize()?;
+    let interpreter = match shebang(&binary)?.as_deref() {
+        Some([shell, ..]) if is_shell(shell) => return launcher_command(&entry, script),
+        Some([env, program, ..]) if Path::new(env).ends_with("env") => {
+            super::which(program).unwrap_or_else(|| PathBuf::from(program))
+        }
+        Some([interpreter, ..]) => PathBuf::from(interpreter),
+        _ => binary.with_file_name(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        }),
+    };
+    ensure!(
+        interpreter.is_file(),
+        "cannot find the Python environment of the installed Hermes CLI"
+    );
+    let mut command = Command::new(interpreter);
+    command.args(["-c", script]);
+    Ok(command)
+}
+
+/// The words of a script's `#!` line, or `None` for a binary entry point.
+fn shebang(path: &Path) -> Result<Option<Vec<String>>> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)?
+        .take(512)
+        .read_to_end(&mut head)?;
+    let Some(line) = head.strip_prefix(b"#!") else {
+        return Ok(None);
+    };
+    let line = line.split(|&byte| byte == b'\n').next().unwrap_or_default();
+    Ok(Some(
+        String::from_utf8_lossy(line)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
+fn is_shell(interpreter: &str) -> bool {
+    Path::new(interpreter)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "zsh"))
+}
+
+/// The module a launcher is asked to run; `hermes/entry.py` runs the script in its place.
+const ENTRY_MODULE: &str = "agit_hermes_entry";
+
+fn launcher_command(launcher: &Path, script: &str) -> Result<Command> {
+    let output = Command::new(launcher)
+        .args(["--print-runtime-command", "--module", ENTRY_MODULE])
+        .stdin(Stdio::null())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "Hermes did not report its runtime command: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut argv: Vec<String> = serde_json::from_slice(&output.stdout)
+        .context("Hermes reported an unreadable runtime command")?;
+    ensure!(
+        argv.len() >= 4 && argv[1] == "-I" && argv[2] == "-c" && Path::new(&argv[0]).is_absolute(),
+        "Hermes reported a runtime command this agit cannot run a script in"
+    );
+    // The bootstrap may start itself again with the same `-c` text, so the script travels in that
+    // text rather than in the arguments the bootstrap reads.
+    argv[3] = format!(
+        "AGIT_SCRIPT = {}\n{}\n{}",
+        serde_json::to_string(script)?,
+        include_str!("hermes/entry.py"),
+        argv[3]
+    );
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    Ok(command)
 }
 
 impl Adapter for Hermes {
@@ -539,10 +618,7 @@ impl Adapter for Hermes {
     }
     fn install(&self, raw: &str, id: &str, cwd: &Path) -> Result<Installed> {
         let content = self.localize(raw, id, cwd)?;
-        let python =
-            python().context("cannot find the Python environment of the installed Hermes CLI")?;
-        let mut child = Command::new(python)
-            .args(["-c", include_str!("hermes/install.py")])
+        let mut child = python_command(include_str!("hermes/install.py"))?
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
