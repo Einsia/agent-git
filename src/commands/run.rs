@@ -442,17 +442,16 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    let Some(_) = super::fork::fork_branch(&fork_base, &full_ref, &new_name)? else {
+    let Some(fork_commit) = super::fork::fork_branch(&fork_base, &full_ref, &new_name)? else {
         return Ok(ExitCode::Policy);
     };
-    let _receipt = prepare_reuse(
+    let receipt = prepare_reuse(
         &fork_base.repo,
         (&owner, &name),
         copied_from.as_ref().map(|(o, n)| (o.as_str(), n.as_str())),
         &fork_base.resolved.sha,
         ReuseMode::Fork,
-    )
-    .map(|(client, receipt)| reuse::send(client, receipt));
+    );
     ui::success(&format!("forked out {slug} @ {new_name}"));
 
     // ── 4. Materialize + launch (= resume's loading) ──
@@ -463,9 +462,50 @@ pub fn run(args: Args) -> CmdResult {
         no_launch: args.no_launch,
         force: false,
     };
-    match super::resume::resume_branch(&fork_base.repo, &slug, &new_name, &rargs)? {
-        Some(res) => super::resume::finish_pub(res, args.no_launch),
-        None => Ok(ExitCode::Precondition),
+    // The fork exists only to carry this run: a run that is cancelled or refused before the
+    // runtime comes up leaves neither the branch nor a reuse receipt behind.
+    let resumed = super::resume::resume_branch(&fork_base.repo, &slug, &new_name, &rargs);
+    let Ok(Some(res)) = resumed else {
+        discard_fork(&fork_base.repo, &slug, &new_name, &fork_commit);
+        return resumed.map(|_| ExitCode::Precondition);
+    };
+    let _receipt = receipt.map(|(client, receipt)| reuse::send(client, receipt));
+    super::resume::finish_pub(res, args.no_launch)
+}
+
+/// Removes a fork branch that no run took up.
+///
+/// The branch goes only while it still points at the fork commit and no runtime claims it: a
+/// resume that failed after installing a runtime session, another process that took the fork
+/// up, or anything that moved the branch leaves it in place, since deleting it would orphan
+/// that work.
+fn discard_fork(repo: &Repo, slug: &str, branch: &str, fork_commit: &str) {
+    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let Ok(root) = config::store_root() else {
+        return;
+    };
+    let store = crate::domain::store::Store::at(root);
+    // Resume registers its claim under this lock, so holding it from the check to the delete
+    // keeps a concurrent resume of the fork from losing its branch.
+    let Ok(_branch_guard) = crate::domain::link::lock_branch(&store, slug, branch) else {
+        return;
+    };
+    if !crate::domain::link::active_for_branch(&store, owner, agent, branch).is_empty() {
+        return;
+    }
+    match repo.git(&[
+        "update-ref",
+        "-d",
+        &format!("refs/heads/{branch}"),
+        fork_commit,
+    ]) {
+        Ok(_) => println!(
+            "{}",
+            ui::dim(&format!("  removed the unused fork branch `{branch}`"))
+        ),
+        Err(error) => ui::warning(&format!(
+            "the unused fork branch `{branch}` was not removed: {error:#}"
+        )),
     }
 }
 

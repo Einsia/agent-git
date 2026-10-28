@@ -348,7 +348,7 @@ mod terminal {
         if !agit::infra::config::is_production_release() {
             return;
         }
-        for answer in [b"n".as_slice(), b"\r".as_slice()] {
+        for answer in [b"n\r".as_slice(), b"\r".as_slice()] {
             let lab = Lab::new();
             lab.cache("999.0.0");
             let mut terminal = Terminal::start(
@@ -426,7 +426,7 @@ mod terminal {
         terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
         assert!(terminal.child.try_wait().unwrap().is_none());
         assert!(!lab.store.join("refreshed").exists());
-        terminal.writer.write_all(b"y").unwrap();
+        terminal.writer.write_all(b"y\r").unwrap();
         terminal.writer.flush().unwrap();
         terminal.finish();
         assert!(
@@ -495,7 +495,7 @@ mod terminal {
                 }
                 let mut terminal = Terminal::start(&lab, &executable, &args, &env);
                 terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-                terminal.writer.write_all(b"y").unwrap();
+                terminal.writer.write_all(b"y\r").unwrap();
                 terminal.writer.flush().unwrap();
                 terminal.finish();
                 assert_eq!(
@@ -569,7 +569,7 @@ mod terminal {
                 ],
             );
             terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-            terminal.writer.write_all(b"y").unwrap();
+            terminal.writer.write_all(b"y\r").unwrap();
             terminal.writer.flush().unwrap();
             terminal.finish();
             assert_eq!(
@@ -621,7 +621,7 @@ mod terminal {
             &[("AGIT_HUB_URL", &hub.base)],
         );
         terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-        terminal.writer.write_all(b"y").unwrap();
+        terminal.writer.write_all(b"y\r").unwrap();
         terminal.writer.flush().unwrap();
         terminal.finish();
         assert!(terminal.output.contains("continuing the requested command"));

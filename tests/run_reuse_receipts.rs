@@ -383,15 +383,27 @@ fn an_expired_access_token_sends_nothing_and_keeps_the_credentials() {
     assert_eq!(lab.credentials(), before);
 }
 
-/// A continue that resume refuses after arbitration has chosen it reuses nothing, so it sends
-/// no receipt; announcing at arbitration would record every refused attempt and each retry.
+/// A run that resume refuses after arbitration has chosen it reuses nothing, so it sends no
+/// receipt; announcing at arbitration would record every refused attempt and each retry. A fork
+/// made for the refused run is removed with it: leaving it behind makes each retry fork again
+/// under the next free name and strands an empty branch per attempt.
 #[test]
-fn a_continue_that_resume_refuses_sends_no_receipt() {
+fn a_run_that_resume_refuses_sends_no_receipt_and_leaves_no_fork() {
     let hub = Hub::new();
     let lab = Lab::new(&hub.url);
-    let output = lab.run(&["run", "qa@work", "--as", "no-such-runtime", "--no-launch"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!output.status.success(), "{output:?}");
-    assert!(stdout.contains("→ continue (resume)"), "{stdout}");
+    for (args, arbitration) in [
+        (vec!["run", "qa@work"], "→ continue (resume)"),
+        (
+            vec!["run", "qa@v1", "-b", "forked"],
+            "forked out me/qa @ forked",
+        ),
+    ] {
+        let output = lab.run(&[&args[..], &["--as", "no-such-runtime", "--no-launch"]].concat());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(stdout.contains(arbitration), "{stdout}");
+    }
     assert_eq!(*hub.receipts.lock().unwrap(), Vec::<Receipt>::new());
+    let repo = Repo::open(lab.home.join("repos/me/qa")).unwrap();
+    assert!(!repo.has_ref("refs/heads/forked"));
 }
