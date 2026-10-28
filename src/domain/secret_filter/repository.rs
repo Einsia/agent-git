@@ -171,9 +171,12 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         if !self.store.path.try_exists()? {
             return Ok(snapshot);
         }
+        // The snapshot is read whole or not at all, and while it cannot be read every protection in
+        // this repository is incomplete, so nothing in it is committed or published. A record
+        // budget below what the privacy dictionary holds would block a repository for good.
         let unlocked = self.unlock_readonly_bounded(ReadonlyDictionaryLimits {
             vault_bytes: 64 * 1024 * 1024,
-            records: 16384,
+            records: crate::domain::privacy::dictionary::MAX_RECORDS,
             pattern_bytes: 16 * 1024 * 1024,
         })?;
         for record in super::decrypt_records(&unlocked.file, &unlocked.dek)? {

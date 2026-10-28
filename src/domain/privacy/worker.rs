@@ -407,16 +407,17 @@ fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
         Ok(())
     })();
     complete &= stored.is_ok();
+    let mut missing = None;
     if let Some(repo) = repo {
         let legacy = crate::domain::secret_filter::RepositoryDictionary::open(repo)
             .and_then(|dictionary| dictionary.privacy_snapshot());
-        match legacy {
-            Ok(legacy) => {
-                for record in legacy.records {
-                    complete &= dictionary.accept(record).is_ok();
-                }
-            }
-            Err(_) => complete = false,
+        let mut whole = legacy.is_ok();
+        for record in legacy.map(|legacy| legacy.records).unwrap_or_default() {
+            whole &= dictionary.accept(record).is_ok();
+        }
+        if !whole {
+            complete = false;
+            missing = Some(super::projector::Reason::LegacyRules);
         }
     }
     Ok(Projector {
@@ -425,7 +426,7 @@ fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
         policy: policy::Snapshot::compile(&[], &[], false)?,
         key: None,
         complete,
-        missing: None,
+        missing,
     })
 }
 
@@ -666,7 +667,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                 crate::domain::secret_filter::RepositoryDictionary::open(repo)?.privacy_snapshot()
             })
             .transpose();
-        complete &= legacy.is_ok();
+        let mut legacy_whole = legacy.is_ok();
         let legacy = legacy.ok().flatten().unwrap_or_default();
         let missing: Vec<_> = legacy
             .records
@@ -676,7 +677,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         if !missing.is_empty() {
             if store.append(&missing, key.as_ref()).is_ok() {
                 for record in missing {
-                    complete &= dictionary.accept(record).is_ok();
+                    legacy_whole &= dictionary.accept(record).is_ok();
                 }
             } else {
                 complete = false;
@@ -732,7 +733,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         let device_whole = device_rules
             .as_ref()
             .is_ok_and(|rules| rules.unreadable.is_empty());
-        complete &= device_whole;
+        complete &= device_whole && legacy_whole;
         let device_rules = device_rules.unwrap_or_default();
         blocks.extend(
             device_rules
@@ -756,7 +757,9 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             policy: policy::Snapshot::compile(&[], &[], true)?,
             key,
             complete,
-            missing: (!device_whole).then_some(super::projector::Reason::DeviceRules),
+            missing: (!device_whole)
+                .then_some(super::projector::Reason::DeviceRules)
+                .or((!legacy_whole).then_some(super::projector::Reason::LegacyRules)),
         };
         projector.policy =
             management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?

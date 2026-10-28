@@ -66,6 +66,9 @@ pub enum Reason {
     /// A rule this device registered under another account or Hub could not be read, so a value
     /// it blocks could pass unreplaced.
     DeviceRules,
+    /// The repository's legacy secret dictionary could not be read whole, so a value it blocks
+    /// could pass unreplaced.
+    LegacyRules,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -931,6 +934,7 @@ impl Projector {
         outcome.content.push_str(&text[cursor..]);
         if outcome.unresolved > 0 || !self.complete {
             outcome.status = Status::Partial;
+            outcome.reason = self.missing;
         }
         outcome
     }
@@ -1622,5 +1626,25 @@ mod tests {
                 .unwrap()
                 .starts_with("{{AGIT_SECRET_V2:")
         );
+    }
+
+    /// A restoration from a dictionary that loaded incomplete is partial and carries the reason
+    /// its loader knows through the whole JSONL outcome. One that dropped it would be reported
+    /// as the generic `source_incomplete`, which suggests retrying, for a cause no retry changes.
+    #[test]
+    fn an_incomplete_restoration_carries_its_loaders_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(&[], &[], false).unwrap(),
+            key: None,
+            complete: false,
+            missing: Some(Reason::LegacyRules),
+        };
+        let restored =
+            projector.transform("{\"text\":\"plain\"}\nplain line\n", Mode::HydrateJsonl);
+        assert!(restored.status == Status::Partial);
+        assert_eq!(restored.reason, Some(Reason::LegacyRules));
     }
 }

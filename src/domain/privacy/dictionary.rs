@@ -9,6 +9,9 @@ const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V2:";
 const FRAGMENT_BYTES: usize = 32 * 1024;
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTS: usize = MAX_RECORD_BYTES / FRAGMENT_BYTES + 1;
+/// The most records one dictionary holds. A source read into it whole may hold this many.
+pub(crate) const MAX_RECORDS: usize = 65536;
+const MAX_MAPPED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,8 +164,8 @@ impl Dictionary {
             existing.origins.extend(&record.origins);
         } else {
             ensure!(
-                self.records.len() < 65536
-                    && self.mapped_bytes + record.original.len() <= 64 * 1024 * 1024,
+                self.records.len() < MAX_RECORDS
+                    && self.mapped_bytes + record.original.len() <= MAX_MAPPED_BYTES,
                 "privacy dictionary exceeds its memory budget"
             );
             self.mapped_bytes += record.original.len();

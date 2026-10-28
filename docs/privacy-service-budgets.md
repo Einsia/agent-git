@@ -35,11 +35,12 @@ to input it did not protect in full.
 | `source_incomplete` | the worker applied only the part of the policy this device could load |
 | `findings_cap` | one field held more findings than a single pass replaces |
 | `device_rules` | a rule this device registered under another account or Hub could not be read |
+| `legacy_rules` | the repository's legacy secret dictionary could not be read whole |
 
-`source_incomplete` and `device_rules` content is handled like unprocessed input, because a value
-the user blocked may be left in it, and push publishes the branch as stored. For `device_rules`,
-settlement, `agit status` and `agit doctor` name the account and Hub of the unreadable rules:
-signing in to that account once caches its key and makes them readable again.
+`source_incomplete`, `device_rules` and `legacy_rules` content is handled like unprocessed input,
+because a value the user blocked may be left in it, and push publishes the branch as stored. For
+`device_rules`, settlement, `agit status` and `agit doctor` name the account and Hub of the
+unreadable rules: signing in to that account once caches its key and makes them readable again.
 
 ## What happens to input that was not protected
 
