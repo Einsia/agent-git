@@ -1265,19 +1265,27 @@ pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Res
 }
 
 /// Settlement waits while the privacy worker has not protected what it would commit: nothing is
-/// committed, and the next settlement tries again.
+/// committed, and the next settlement tries again. A record the check cannot divide
+/// (`refused`: its size, and the `owner/repo@branch` it would settle into) is named instead,
+/// since settling again meets the same record.
 fn privacy_pending(
-    session: &str,
+    lk: &Link,
     quiet: bool,
     turns: usize,
     reason: Option<crate::domain::privacy::projector::Reason>,
+    refused: Option<(usize, String)>,
 ) -> CmdResult {
     let reason = crate::domain::privacy::service::reason_name(reason);
-    crate::domain::privacy::pending::record(session, reason, turns);
+    let bytes = refused.as_ref().map(|(bytes, _)| *bytes as u64);
+    crate::domain::privacy::pending::record(&lk.session_id, reason, turns, bytes);
     if !quiet {
+        let plural = if turns == 1 { "" } else { "s" };
+        if let Some((bytes, target)) = &refused {
+            warn_refused_record(Some(target), *bytes as u64, turns);
+            return Ok(ExitCode::Ok);
+        }
         ui::warning(&format!(
-            "privacy check pending ({reason}): {turns} turn{} stay unsettled; the next settlement tries again",
-            if turns == 1 { "" } else { "s" }
+            "privacy check pending ({reason}): {turns} turn{plural} stay unsettled; the next settlement tries again"
         ));
         if reason == "device_rules" {
             for hint in
@@ -1290,6 +1298,36 @@ fn privacy_pending(
         }
     }
     Ok(ExitCode::Ok)
+}
+
+fn warn_refused_record(target: Option<&str>, bytes: u64, turns: usize) {
+    ui::warning(&format!(
+        "privacy check refused a record of {}: it is larger than the check can divide, so {turns} turn{} stay unsettled, and settling again does not change that",
+        super::mib(bytes),
+        if turns == 1 { "" } else { "s" }
+    ));
+    ui::hint(&refused_record_hint(target));
+}
+
+/// The `owner/repo@branch` a link's conversation records into, once the link names all three.
+pub(crate) fn drop_target(lk: &Link) -> Option<String> {
+    Some(format!(
+        "{}/{}@{}",
+        lk.owner.as_deref()?,
+        lk.agent.as_deref()?,
+        lk.branch.as_deref()?
+    ))
+}
+
+/// The next step for a conversation holding a record the privacy check cannot divide.
+pub(crate) fn refused_record_hint(target: Option<&str>) -> String {
+    match target {
+        Some(target) => format!(
+            "to stop recording this conversation: `agit project drop {}`",
+            ui::session::shell_arg(target)
+        ),
+        None => "to stop recording this conversation: `agit project drop` inside it".into(),
+    }
 }
 
 /// Tell the user why the trailing turn is not in this settlement and when it will be.
@@ -2540,7 +2578,7 @@ fn settle_bytes(
             metadata.kind = Kind::File;
             metadata.milestone = None;
             if let Err(pending) = privacy::protect_metadata(repo.root(), &mut metadata) {
-                return privacy_pending(&lk.session_id, quiet, 0, pending.reason);
+                return privacy_pending(&lk, quiet, 0, pending.reason, None);
             }
             let tree = super::plumbing::tree_apply_owned(
                 repo,
@@ -2648,6 +2686,15 @@ fn settle_bytes(
     } else {
         privacy_start + processed_len
     };
+    let refused_record = (protected_increment.reason
+        == Some(crate::domain::privacy::projector::Reason::Oversize))
+    .then(|| {
+        text[processed_end..privacy_end]
+            .split_inclusive('\n')
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    });
     let settled = new_chunks
         .iter()
         .take_while(|chunk| {
@@ -2657,7 +2704,13 @@ fn settle_bytes(
         .count();
     let unsettled = new_chunks.len() - settled;
     if settled == 0 {
-        return privacy_pending(&lk.session_id, quiet, unsettled, protected_increment.reason);
+        return privacy_pending(
+            &lk,
+            quiet,
+            unsettled,
+            protected_increment.reason,
+            refused_record.map(|bytes| (bytes, format!("{slug}@{branch}"))),
+        );
     }
     let privacy_end = if unsettled > 0 {
         new_chunks.truncate(settled);
@@ -2909,7 +2962,7 @@ fn settle_bytes(
         )
     });
     if let Err(pending) = privacy::protect_metadata(repo.root(), &mut observations) {
-        return privacy_pending(&lk.session_id, quiet, new_chunks.len(), pending.reason);
+        return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
     }
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
@@ -2967,12 +3020,7 @@ fn settle_bytes(
                 None => None,
                 Some(Ok(value)) => Some(value),
                 Some(Err(pending)) => {
-                    return privacy_pending(
-                        &lk.session_id,
-                        quiet,
-                        new_chunks.len(),
-                        pending.reason,
-                    );
+                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
                 }
             };
         }
@@ -2999,12 +3047,7 @@ fn settle_bytes(
             match privacy::protect_for_commit(Some(repo.root()), &msg, PrivacyMode::ProtectText) {
                 Ok(message) => message,
                 Err(pending) => {
-                    return privacy_pending(
-                        &lk.session_id,
-                        quiet,
-                        new_chunks.len(),
-                        pending.reason,
-                    );
+                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
                 }
             };
         let snap_text = meta::to_text(&snap)?;
@@ -3102,7 +3145,11 @@ fn settle_bytes(
             &lk.session_id,
             crate::domain::privacy::service::reason_name(protected_increment.reason),
             unsettled,
+            refused_record.map(|bytes| bytes as u64),
         );
+        if let Some(bytes) = refused_record.filter(|_| !quiet) {
+            warn_refused_record(Some(&format!("{slug}@{branch}")), bytes as u64, unsettled);
+        }
     } else {
         crate::domain::privacy::pending::clear(&lk.session_id);
     }

@@ -1247,12 +1247,15 @@ fn drop_command(target: Option<&str>) -> CmdResult {
         .into_iter()
         .filter(|p| p.repository == repository)
         .collect();
-    ensure!(
-        !projects.is_empty(),
-        "no project on this machine is bound to {repository}"
-    );
     let store = Store::at(config::store_root()?);
     let claims = link::active_for_branch(&store, &owner, &agent, branch);
+    // A conversation imported by hand records into its branch without any project, and dropping
+    // it must still stop that; only a target that neither a project nor a conversation names is
+    // a mistake.
+    ensure!(
+        !projects.is_empty() || !claims.is_empty(),
+        "no project on this machine is bound to {repository}, and no conversation here records into {target}"
+    );
     for claim in &claims {
         for project in &projects {
             exclude(&project.root, &key(&claim.source, &claim.session_id))?;

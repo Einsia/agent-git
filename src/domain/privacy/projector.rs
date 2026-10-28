@@ -80,7 +80,9 @@ pub struct Outcome {
     /// unchanged. Only the service sets it, for the text and record protection modes.
     #[serde(skip)]
     pub unprocessed: usize,
-    /// Why the outcome is not Complete.
+    /// Why the outcome is not Complete. On a Complete outcome, [`Reason::FindingsCap`] says the
+    /// input held more findings than one scan finishes: a text was replaced whole, or a stream
+    /// released nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
 }
@@ -137,6 +139,34 @@ fn open_key_block(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let start = lower.rfind("-----begin")?;
     (!FOOTER.is_match(&lower[start..])).then_some(start)
+}
+
+/// Whether an object is a base64 source: its `type` is "base64" and it names a `media_type`.
+/// Only such an object's `data` is media; a `data` field anywhere else, such as in tool output,
+/// is content and is protected like any other string.
+pub(crate) fn base64_source(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("type").and_then(Value::as_str) == Some("base64")
+        && object.get("media_type").is_some_and(Value::is_string)
+}
+
+/// Whether a string value is a base64 media payload: the `data` of a base64 source
+/// (`source_data`), or a base64 data URI. Such a payload is never scanned or replaced: encoded
+/// bytes carry no readable credential, and a placeholder in them would only corrupt the image,
+/// document or font.
+pub(crate) fn media_payload(source_data: bool, text: &str) -> bool {
+    const SHORTEST: usize = 256;
+    let payload = match text.strip_prefix("data:") {
+        Some(uri) => match uri.find(";base64,") {
+            Some(at) if at <= 128 => &uri[at + ";base64,".len()..],
+            _ => return false,
+        },
+        None if source_data => text,
+        None => return false,
+    };
+    payload.len() >= SHORTEST
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+/=\r\n".contains(&byte))
 }
 
 fn floor_boundary(text: &str, mut at: usize) -> usize {
@@ -427,7 +457,8 @@ impl Projector {
         }
         let offset = context.len();
         let batch = self.policy.scan(&format!("{context}{text}"), MAX_FINDINGS);
-        if !batch.complete {
+        let capped = !batch.complete;
+        if capped {
             cut = 0;
         }
         let mut spans: Vec<(usize, usize)> = batch
@@ -448,6 +479,11 @@ impl Projector {
         let cut = at - offset;
         let mut outcome = self.protect_continuation(context, &text[..cut]);
         outcome.consumed = Some(cut);
+        // Nothing released for too many findings, as opposed to no safe cut: a caller dividing a
+        // long text tries a smaller part, where more text only makes it worse.
+        if capped {
+            outcome.reason = outcome.reason.or(Some(Reason::FindingsCap));
+        }
         outcome
     }
 
@@ -607,7 +643,7 @@ impl Projector {
                 retained.push((pointer, field.take()));
             }
         }
-        self.value(value, hydrate, outcome, None, protocol_root);
+        self.value(value, hydrate, outcome, None, protocol_root, false);
         for (pointer, original) in retained {
             if let Some(field) = value.pointer_mut(pointer) {
                 *field = original;
@@ -622,8 +658,11 @@ impl Projector {
         outcome: &mut Outcome,
         field: Option<&str>,
         protocol_root: bool,
+        in_source: bool,
     ) {
         match value {
+            Value::String(text)
+                if !hydrate && media_payload(in_source && field == Some("data"), text) => {}
             Value::String(text) => {
                 let next = if hydrate {
                     self.hydrate(text)
@@ -640,10 +679,11 @@ impl Projector {
             }
             Value::Array(values) => {
                 for value in values {
-                    self.value(value, hydrate, outcome, None, false);
+                    self.value(value, hydrate, outcome, None, false, false);
                 }
             }
             Value::Object(values) => {
+                let source = base64_source(values);
                 // Only carrier fields have identity semantics. Nested tool data remains content.
                 for (field, value) in values {
                     if protocol_root
@@ -676,7 +716,7 @@ impl Projector {
                     {
                         continue;
                     }
-                    self.value(value, hydrate, outcome, Some(field), false);
+                    self.value(value, hydrate, outcome, Some(field), false, source);
                 }
             }
             _ => {}
@@ -802,7 +842,21 @@ impl Projector {
         self.protect_batch(text, batch)
     }
 
-    fn protect_batch(&mut self, text: &str, batch: Batch) -> Outcome {
+    fn protect_batch(&mut self, text: &str, mut batch: Batch) -> Outcome {
+        // A field with more findings than one pass replaces, or one the scan could not finish,
+        // is replaced whole as one finding: a pass that stopped early would leave the rest raw.
+        let capped = !batch.complete && !text.is_empty();
+        if capped {
+            batch = Batch {
+                findings: vec![super::policy::Finding {
+                    start: 0,
+                    end: text.len(),
+                    source: Source::Default,
+                    rule: "findings-cap",
+                }],
+                complete: true,
+            };
+        }
         let batch_complete = batch.complete;
         let mut complete = self.complete && batch.complete;
         let findings = batch.findings;
@@ -867,6 +921,8 @@ impl Projector {
             } else {
                 self.missing.unwrap_or(Reason::SourceIncomplete)
             });
+        } else if capped {
+            outcome.reason = Some(Reason::FindingsCap);
         }
         outcome
     }
@@ -1324,6 +1380,63 @@ mod tests {
             serde_json::from_str::<Value>(&allowed.content).unwrap(),
             record
         );
+    }
+
+    /// A base64 media payload passes through byte for byte even when a run inside it has a
+    /// credential's shape, while the same run in a text field, or in a base64-shaped `data` field
+    /// of ordinary tool input, is replaced; and a field holding more findings than one pass
+    /// replaces becomes one placeholder, Complete. Scanning media would corrupt the image;
+    /// exempting every `data` field by its name and alphabet would publish a blocked value from
+    /// tool data; and a capped pass that stopped early would leave the rest of the field raw or
+    /// hold its record back for good.
+    #[test]
+    fn media_stays_opaque_and_a_capped_field_is_replaced_whole() {
+        let root = tempfile::tempdir().unwrap();
+        let run = "agitblockedliteral";
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &[super::super::policy::Literal {
+                    value: run,
+                    source: Source::GlobalUser,
+                }],
+                &[],
+                false,
+            )
+            .unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+        };
+        let data = format!("iVBORw0KGgo{}{run}{}", "A".repeat(300), "B".repeat(300));
+        let record = json!({"type":"user","message":{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}},
+            {"type":"text","text":format!("see {run}")},
+            {"type":"text","text":format!("data:font/ttf;base64,{data}")},
+            {"type":"tool_use","id":"toolu_1","name":"upload","input":{"data":format!("{run}{}", "A".repeat(300))}}
+        ]}});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        let value: Value = serde_json::from_str(&protected.content).unwrap();
+        assert_eq!(
+            value["message"]["content"][0],
+            record["message"]["content"][0]
+        );
+        assert_eq!(
+            value["message"]["content"][2],
+            record["message"]["content"][2]
+        );
+        for text in [
+            &value["message"]["content"][1]["text"],
+            &value["message"]["content"][3]["input"]["data"],
+        ] {
+            assert!(!text.as_str().unwrap().contains(run), "{text}");
+        }
+
+        let crowded = vec![run; MAX_FINDINGS + 1].join(" ");
+        let capped = projector.transform(&crowded, Mode::ProtectText);
+        assert!(capped.status == Status::Complete);
+        assert!(whole_token(&capped.content), "{}", capped.content);
     }
 
     /// Native linkage and runtime-opaque carriers survive every projection entry point, even

@@ -1965,12 +1965,16 @@ fn imported_and_live_metadata_remain_publishable() {
 /// the whole policy. While the worker cannot process anything, import commits nothing and says
 /// the privacy check is pending; once it can, the same import lands. While the device cannot load
 /// its whole policy (here an unreadable legacy vault), import commits nothing either, because a
-/// value the user blocked may be left in place. An implementation that committed what the worker
-/// returned unchanged, or settled under a partial policy, would put the transcript on the branch
-/// without the protection the user configured.
+/// value the user blocked may be left in place. A record larger than one request still lands,
+/// with its media payload kept byte for byte and the credential beside it replaced. One that
+/// holds only short strings cannot be divided: it is refused by its size, with the step that ends
+/// the wait, and stays off the branch. An implementation that committed what the worker returned
+/// unchanged, settled under a partial policy, or could not divide a large record would put the
+/// transcript on the branch without the protection the user configured, or never put it there;
+/// one that only said "pending" would leave such a conversation waiting with no way out.
 #[test]
 fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
-    let lab = Lab::new(2);
+    let lab = Lab::new(4);
     let repo = lab.store.join("repos/me/qa");
     let import = |source: usize, branch: &str| {
         lab.command()
@@ -2023,6 +2027,100 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     let landed = import(0, "pending");
     assert!(landed.status.success(), "{landed:?}");
     assert!(!target_git(&lab, &repo, &["show", "pending:LOG"]).is_empty());
+
+    let token = "ghp_Z9xY8wV7uT6sR5qP4oN3mL2kJ1iH0gF9eD8c";
+    let data = format!(
+        "QUdJVE1FRElBTUFSS0VS{}",
+        "A".repeat(agit::domain::privacy::projector::MAX_UNIT_BYTES)
+    );
+    let (id, path) = &lab.sources[2];
+    let mut transcript = fs::read_to_string(path).unwrap();
+    let first: serde_json::Value =
+        serde_json::from_str(transcript.lines().next().unwrap()).unwrap();
+    transcript.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"user", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-image"), "message":{"role":"user", "content":[
+            {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":data}},
+            {"type":"text", "text":format!("deploy with {token}")}
+        ]}})
+    ));
+    transcript.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-image-answer"), "message":{"role":"assistant", "content":"SYNTHETIC-ANSWER"}})
+    ));
+    fs::write(path, transcript).unwrap();
+    let large = import(2, "large");
+    assert!(large.status.success(), "{large:?}");
+    // The files on the branch that hold `pattern`.
+    let holding = |pattern: &str| {
+        let found = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["grep", "-l", "-F", "-e", pattern, "large"])
+            .output()
+            .unwrap();
+        String::from_utf8(found.stdout).unwrap()
+    };
+    let carriers = holding("QUdJVE1FRElBTUFSS0VS");
+    let carrier = carriers
+        .lines()
+        .next()
+        .expect("the record reached the branch");
+    let stored = target_git(&lab, &repo, &["show", carrier]);
+    assert!(stored.contains(&data), "the media payload changed");
+    assert!(
+        holding(token).is_empty(),
+        "the credential beside the media was not replaced"
+    );
+
+    let short = format!("CROWDED-BLOCK {}", "x".repeat(800));
+    let blocks: Vec<_> = (0..agit::domain::privacy::projector::MAX_UNIT_BYTES / short.len() + 64)
+        .map(|_| serde_json::json!({"type":"text", "text":short}))
+        .collect();
+    let (id, path) = &lab.sources[3];
+    let mut transcript = fs::read_to_string(path).unwrap();
+    let first: serde_json::Value =
+        serde_json::from_str(transcript.lines().next().unwrap()).unwrap();
+    for (role, content) in [
+        ("user", serde_json::json!(blocks)),
+        ("assistant", serde_json::json!("SYNTHETIC-ANSWER")),
+    ] {
+        transcript.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":role, "sessionId":id, "cwd":first["cwd"],
+            "uuid":format!("{id}-crowded-{role}"), "message":{"role":role, "content":content}})
+        ));
+    }
+    fs::write(path, transcript).unwrap();
+    let crowded = import(3, "crowded");
+    let said = String::from_utf8_lossy(&crowded.stderr);
+    assert!(
+        said.contains("privacy check refused a record of") && said.contains("agit project drop"),
+        "{crowded:?}"
+    );
+    let on_branch = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["grep", "-l", "-F", "-e", "CROWDED-BLOCK", "crowded"])
+        .output()
+        .unwrap();
+    assert!(
+        on_branch.stdout.is_empty(),
+        "the refused record reached the branch"
+    );
+    // The hint's command works for a conversation imported by hand, which no project captures.
+    let dropped = lab
+        .command()
+        .args(["project", "drop", "me/qa@crowded"])
+        .output()
+        .unwrap();
+    assert!(
+        dropped.status.success()
+            && String::from_utf8_lossy(&dropped.stdout).contains("will not be uploaded"),
+        "{dropped:?}"
+    );
 
     let vault = lab.store.join("secret-filter/vault.json");
     fs::create_dir_all(vault.parent().unwrap()).unwrap();

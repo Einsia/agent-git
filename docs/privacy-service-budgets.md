@@ -30,16 +30,39 @@ to input it did not protect in full.
 | `backoff` | the worker failed recently and is not started again yet |
 | `spawn_failed` | the worker could not start, or was not ready within its start-up deadline |
 | `protocol_error` | the worker's reply was missing or malformed |
-| `oversize` | one unit was larger than the worker accepts |
+| `oversize` | one unit was larger than the worker accepts and could not be divided |
 | `store_busy` | the worker could not read or write its dictionary store |
 | `source_incomplete` | the worker applied only the part of the policy this device could load |
-| `findings_cap` | one field held more findings than a single pass replaces |
+| `findings_cap` | reserved: a field whose scan cannot finish is now replaced whole (below) |
 | `device_rules` | a rule this device registered under another account or Hub could not be read |
 
 `source_incomplete` and `device_rules` content is handled like unprocessed input, because a value
 the user blocked may be left in it, and push publishes the branch as stored. For `device_rules`,
 settlement, `agit status` and `agit doctor` name the account and Hub of the unreadable rules:
 signing in to that account once caches its key and makes them readable again.
+
+## Units larger than one request
+
+A request to the worker carries at most `MAX_UNIT_BYTES`. Larger units are divided before they
+are sent, so a large record never holds a session back:
+
+- **Media is opaque.** A base64 media payload, the `data` of a base64 source or a
+  `data:…;base64,` URI, is never scanned or replaced, in any mode: encoded bytes carry no readable
+  credential, and a placeholder in them only corrupts the image, document or font.
+- **A JSONL line too large for one request** keeps its media payloads on the caller's side, and
+  every other string too large to travel with the record is protected on its own. The record
+  then goes to the worker with short stand-ins in their place, and the parts are put back. The
+  line keeps its bytes unless something in it was replaced. A line that is still too large with
+  every such string set aside, because it holds only short strings, is `oversize`: it cannot be
+  divided, and its turn is refused by size rather than left pending.
+- **Text too large for one request** (a memory file, a long string from such a line) is
+  protected window by window. Every window carries the text before it as context, so a rule
+  whose name or keyword ended the previous window still recognizes its value. A window ends
+  where the worker's stream cut splits no finding, and the last window is protected whole. A
+  string that no window can divide, with no cut point in a whole request, is replaced by
+  "[content omitted: too large for the privacy check]".
+- **A field whose scan cannot finish**, because it holds more findings than one pass replaces,
+  is replaced whole as one placeholder. It is Complete, and nothing in it is left raw.
 
 ## What happens to input that was not protected
 
@@ -51,7 +74,7 @@ signing in to that account once caches its key and makes them readable again.
 | RC live: stream | held up to 1 MiB, released once processed Complete; otherwise the rest of the item is withheld behind one marker | same | withheld at once, with the rest of the item | same as deadline | same as deadline | same as deadline | same as deadline | the completed item arrives through the tail (row above) and is retried there |
 | RC history page | page refused as busy; the cursor does not advance | same | same | same | same | same | same | the viewer requests the same page again; once the page has been refused for `HELD_TAIL_NOTICE`, it is returned with the given-up marker for each record that did not pass, and the next request for it projects it again |
 | RC session-list labels (gist = opening prompt, native title) | each label shows the marker; never raw | same | same | same | same | same | same | the next listing protects them again |
-| settle (Stop hook, `agit commit`) | commits the turn-aligned processed prefix; the remainder waits for the next settle | same | the turn holding the unit waits | same as deadline | nothing from that increment is committed; waits, shown in `agit status` with the cause | the turn waits | same as deadline; shown in `agit status` | every Stop and every `agit commit` retries on the normal cadence, with no growing back-off |
+| settle (Stop hook, `agit commit`) | commits the turn-aligned processed prefix; the remainder waits for the next settle | same | only a unit that cannot be divided (above): the turn holding it is refused by the unit's size, in the output and in `agit status`, with `agit project drop` as the way out, since settling again meets the same unit | same as deadline | nothing from that increment is committed; waits, shown in `agit status` with the cause | does not occur: the field is replaced whole | same as deadline; shown in `agit status` | every Stop and every `agit commit` retries on the normal cadence, with no growing back-off |
 | settle: metadata, milestone, message | that settlement waits; nothing is committed | same | same | same | same | same | same | as settle |
 | import | as settle; import reports how many turns are pending, and the next settle drains them | same | same | same | same | same | same | as settle |
 | push preparation: branch name | in-process detectors, then the worker for registered values: one retry after back-off, then a retryable refusal; never published unchecked | same | same | same | refused, retryable | same | same | the next push |

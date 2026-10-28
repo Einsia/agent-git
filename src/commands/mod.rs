@@ -539,7 +539,7 @@ pub fn report_unscanned(u: &secrets::Unscanned) {
     }
 }
 
-fn mib(bytes: u64) -> String {
+pub(crate) fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
