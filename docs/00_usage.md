@@ -789,6 +789,20 @@ An offline check-up: whether the runtimes are on PATH, the git version, the stor
 remote, whether the VIEW is self-consistent, whether live transcripts are still being appended to.
 Add `--check-backend` when you suspect the network.
 
+A hard stop (power loss, a killed VM) can leave empty object files in a local repository. Doctor
+then names the repository and the branches that reach them, and commands stop before writing on
+top of that history. The repair restores what the Hub has and names what only this machine had:
+
+```sh
+agit doctor --repair-objects alice/payments
+```
+
+Commits that never reached the Hub cannot come back. The repair lists them, and with your
+confirmation (or `--yes`) moves a branch that stays unreadable to
+`refs/agit/damaged/<branch>-<tip>`, so the session continues from its last published turn. A
+repair that stops early (no network, no confirmation) is picked up again by the next `agit doctor`
+and by running the repair again.
+
 ```sh
 agit upgrade --check      # report whether a new release exists, nothing else
 agit upgrade              # atomically replaces the current binary; on failure the installed one is untouched

@@ -83,8 +83,18 @@ pub fn run(args: Args) -> CmdResult {
                     copied_from = Some((o.clone(), n.clone()));
                 }
                 (format!("{me}/{n}"), true)
-            } else if Repo::open(config::repo_dir(o, n).unwrap_or_default()).is_some() {
+            } else if let Some(local) = Repo::open(config::repo_dir(o, n).unwrap_or_default()) {
                 if !fetch_quiet(o, n) {
+                    // Damaged objects fail the fetch too, and local history then fails every
+                    // later step with Git's own words; the repair is named instead.
+                    if let Ok(Some(damage)) = crate::domain::repo::integrity::assess(&local)
+                        && !damage.branches.is_empty()
+                    {
+                        ui::error(&crate::domain::repo::integrity::damaged_store_message(
+                            &local,
+                        ));
+                        return Ok(ExitCode::Precondition);
+                    }
                     ui::warning(
                         "fetch failed — continuing with local history (a network path was asked for but unavailable)",
                     );

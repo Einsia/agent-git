@@ -177,9 +177,12 @@ pub fn run(args: Args) -> CmdResult {
             );
             return Ok(ExitCode::Ok);
         }
+        // Branches a repair set aside reach unreadable objects; walking them fails the whole log.
+        let exclude = format!("--exclude={}*", crate::domain::repo::integrity::SET_ASIDE);
         let out = repo.git(&[
             "log",
             "--graph",
+            &exclude,
             "--all",
             "--oneline",
             "--decorate",

@@ -255,6 +255,12 @@ fn do_fetch(repo: &Repo, owner: &str, name: &str) -> crate::Result<()> {
         &identity,
     )?;
     if !out.ok() {
+        if crate::domain::repo::integrity::reports_damage(&out.stderr) {
+            anyhow::bail!(
+                "{}",
+                crate::domain::repo::integrity::damaged_store_message(repo)
+            );
+        }
         anyhow::bail!("{}", out.stderr.trim());
     }
     Ok(())
