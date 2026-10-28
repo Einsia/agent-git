@@ -39,6 +39,10 @@ New sessions publish plain by default. To enable encryption, run `agit privacy m
 before its first registration. This selects the logical session's mode across its branches;
 `--public` and `--private` only select repository visibility. Registered modes cannot change.
 
+Without a terminal, plain sessions publish to a private repository without `--yes`, but a public
+destination is refused until the person confirms. Never pass `--yes` for a public destination
+unless the person confirmed publishing it publicly in this conversation.
+
 ## Synopsis
 
 ```bash
@@ -75,8 +79,8 @@ agit push <owner/repo>@<branch> --private --yes
 
 Push prints the destination, visibility and snapshot summary as it uploads (the complete
 preview stays in the JSON file at the reported path). That is a record, not a preview: in
-an agent a plain session can publish even without `--yes`, so leaving it out is no safety
-check. Run push only when the user asked to upload, and do not run a dry-run first unless
+an agent a plain session can publish to a private repository even without `--yes`, so leaving
+it out is no safety check. Run push only when the user asked to upload, and do not run a dry-run first unless
 the user asks to see the preview. Push checks the sign-in itself; when it says to sign in,
 follow the login steps and rerun the same command.
 

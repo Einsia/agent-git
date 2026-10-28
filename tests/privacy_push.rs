@@ -42,6 +42,7 @@ struct Hub {
     corrupt_receipt: Arc<AtomicBool>,
     creations: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
+    visibility: Arc<Mutex<&'static str>>,
     key_version: Arc<AtomicUsize>,
     key_requests: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -80,6 +81,8 @@ impl Hub {
         let confirmed = Arc::clone(&confirmations);
         let creations = Arc::new(AtomicUsize::new(0));
         let created = Arc::clone(&creations);
+        let visibility = Arc::new(Mutex::new("private"));
+        let served_visibility = Arc::clone(&visibility);
         let resolver_hub = base.clone();
         let root = root.to_owned();
         let worker = thread::spawn(move || {
@@ -354,7 +357,7 @@ impl Hub {
                         );
                         assert_eq!(
                             preview["receiver_scope"],
-                            format!("sessions:private:{AGENT_ID}")
+                            format!("sessions:{}:{AGENT_ID}", served_visibility.lock().unwrap())
                         );
                         preview["preview_id"] =
                             json!(format!("preview-{}", confirmed.load(Ordering::Acquire)));
@@ -379,7 +382,7 @@ impl Hub {
                         Some(request)
                     }
                     ("GET", "/api/agents/alice/app") => Some(
-                        json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url,"visibility":"private"}),
+                        json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url,"visibility":*served_visibility.lock().unwrap()}),
                     ),
                     _ => None,
                 };
@@ -466,6 +469,7 @@ impl Hub {
             corrupt_receipt,
             creations,
             viewing_public,
+            visibility,
             key_version,
             key_requests,
             stop,
@@ -1560,6 +1564,103 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
 /// when a later ordinary push extends native source history. Same-identity pushes repair origin.
 /// Collaborator commits stay unattributed; unprovable creators fail before any registration.
 /// Legacy birth attribution survives continuation recorded under the destination account.
+/// Without a terminal, a plain session publishes to a private repository unasked, but a public
+/// destination takes the person's own `--yes`. A gate that only checked encryption would publish
+/// publicly here; one that refused after preparing the upload would leave refs on the receiver.
+#[test]
+fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["new", "alice/app", "-b", "work", "--no-launch"]));
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    hub.posts.store(0, Ordering::Release);
+
+    *hub.visibility.lock().unwrap() = "public";
+    let refused = run(&["push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(
+            "publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation"
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), 0);
+    assert!(git(&remote, &["for-each-ref", "refs/heads/work"]).is_empty());
+
+    assert_success(&run(&["--yes", "push", "alice/app@work"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+
+    *hub.visibility.lock().unwrap() = "private";
+    let work = home.join("worktrees/alice/app/work");
+    fs::write(work.join("README.md"), "Shared file, revised").unwrap();
+    git(&work, &["commit", "-am", "Revise file"]);
+    assert_success(&run(&["push", "alice/app@work"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+}
+
 #[test]
 fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push() {
     use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy};

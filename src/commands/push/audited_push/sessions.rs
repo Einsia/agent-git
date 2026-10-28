@@ -320,17 +320,23 @@ pub(super) fn run(
         None
     };
     let encrypted = receipts.iter().any(|receipt| receipt.mode.is_encrypted());
+    let public = intent.visibility == "public";
     let decision = confirm_publication(
         reviewed.as_ref().is_none_or(|review| review.complete()),
         args.dry_run,
         || {
+            // With nobody to ask, plain sessions publish to a private repository as before, but
+            // never to a public one: that takes the person's own confirmation (--yes or a terminal).
             if delivery_confirmed
                 || automatic
                 || (!args.audit
                     && (std::env::var_os("AGIT_YES").is_some()
-                        || (!encrypted && !ui::prompt::can_ask())))
+                        || (!encrypted && !public && !ui::prompt::can_ask())))
             {
                 return Ok(Some(true));
+            }
+            if public && !args.audit && !ui::prompt::can_ask() {
+                return Err(crate::commands::InteractionRequired("publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation".into()).into());
             }
             let answer = ui::prompt::confirm(
                 &format!(

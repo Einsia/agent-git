@@ -73,11 +73,13 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
 - For an authorized explicit push, run `agit push <owner/repo>@<branch> --yes`
   directly. Push prints the destination, visibility and snapshot summary as it
   uploads; that is a record, not a preview. In an agent a plain session can
-  publish even without `--yes`, so leaving it out is no safety check: run push
-  only when the user asked to upload. When the user wants to see what would be
-  published first, run the same command with `--dry-run` and wait for their go.
-  Push also checks the sign-in itself: when it says to sign in, follow the login
-  steps above and rerun the same push. Read
+  publish to a private repository even without `--yes`, so leaving it out is no
+  safety check: run push only when the user asked to upload. When the user wants
+  to see what would be published first, run the same command with `--dry-run` and
+  wait for their go. Never pass `--yes` for a public destination unless the person
+  confirmed publishing it publicly in this conversation. Push also checks the
+  sign-in itself: when it says to sign in, follow the login steps above and rerun
+  the same push. Read
   [push](references/commands/push.md) for the dry-run diagnostics and audit mode.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
