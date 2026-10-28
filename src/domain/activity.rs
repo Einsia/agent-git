@@ -29,6 +29,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub const SCHEMA_VERSION: u32 = 4;
+/// The contract a Hub answers in when a client names none, as every Hub that predates
+/// [`SCHEMA_HEADER`] does: messages selected by save time, without send times.
+pub const SAVE_TIME_SCHEMA: u32 = 3;
+/// The request header in which a client names the contract it reads. It cannot be a query field:
+/// a Hub refuses a query field it does not know, while it ignores a header.
+pub const SCHEMA_HEADER: &str = "x-agentgit-activity-schema";
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 const MAX_PAGE_TEXT: usize = 256 * 1024;
@@ -679,16 +685,71 @@ fn changed(reasons: &mut BTreeMap<String, Reason>, resume: &Option<Resume>) {
     }
 }
 
+/// Whether this client reads a Hub reply in `version`: the contract it names, or the save-time
+/// contract of a Hub that ignores the name. Any other version may give a field another meaning,
+/// so a reply in it means nothing to this client.
+pub fn readable(version: u32) -> bool {
+    version == SCHEMA_VERSION || version == SAVE_TIME_SCHEMA
+}
+
+const UNACKNOWLEDGED: &str = "the Hub did not acknowledge the requested activity contract; upgrade the Hub before relying on these results";
+
 impl Page {
-    /// Hub replies must echo this client's contract before their contents mean anything.
+    /// Hub replies must echo a contract this client reads before their contents mean anything.
     pub fn acknowledges(&self, repo: &str, selection: &Selection) -> Result<()> {
         ensure!(
-            self.schema_version == SCHEMA_VERSION
+            readable(self.schema_version)
                 && self.applied_filters == *selection
                 && self.repo == repo,
-            "the Hub did not acknowledge the requested activity contract; upgrade the Hub before relying on these results"
+            UNACKNOWLEDGED
         );
         Ok(())
+    }
+
+    /// Read a Hub's page in this client's contract.
+    ///
+    /// The version is checked before the fields: a page in another contract may spell them
+    /// differently, and a parse error would hide that the Hub answered in it. A save-time page
+    /// carries no send times, and its Hub bounded the window by save time. Each of its messages
+    /// therefore reads as sent at its contribution's `saved_at` with [`SentBasis::Saved`], and
+    /// its filters as [`SelectBy::Saved`]; read as recorded send times, or under the default
+    /// selection, they would claim a window the Hub did not apply.
+    pub fn from_hub(
+        mut value: serde_json::Value,
+        repo: &str,
+        selection: &Selection,
+    ) -> Result<Page> {
+        let version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok());
+        ensure!(version.is_some_and(readable), UNACKNOWLEDGED);
+        if version == Some(SAVE_TIME_SCHEMA) {
+            let basis = serde_json::to_value(SentBasis::Saved)?;
+            let contributions = value
+                .get_mut("contributions")
+                .and_then(serde_json::Value::as_array_mut);
+            for contribution in contributions.into_iter().flatten() {
+                let saved_at = contribution.get("saved_at").cloned().unwrap_or_default();
+                let messages = contribution
+                    .get_mut("messages")
+                    .and_then(serde_json::Value::as_array_mut);
+                for message in messages.into_iter().flatten() {
+                    if let Some(message) = message.as_object_mut() {
+                        message.insert("sent_at".into(), saved_at.clone());
+                        message.insert("sent_basis".into(), basis.clone());
+                    }
+                }
+            }
+        }
+        let mut page: Page =
+            serde_json::from_value(value).context("the Hub's activity page could not be read")?;
+        page.acknowledges(repo, selection)?;
+        if page.schema_version == SAVE_TIME_SCHEMA {
+            page.schema_version = SCHEMA_VERSION;
+            page.applied_filters.select_by = SelectBy::Saved;
+        }
+        Ok(page)
     }
 }
 

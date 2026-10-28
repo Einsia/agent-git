@@ -19,6 +19,9 @@ use ureq::unversioned::transport::{
 };
 use ureq::{Error, Proxy, ProxyProtocol};
 
+/// Names this agit's release to the servers it calls, so a Hub can tell its clients apart.
+pub(crate) const USER_AGENT: &str = concat!("agit/", env!("CARGO_PKG_VERSION"));
+
 pub(crate) fn agent(config: ureq::config::Config) -> ureq::Agent {
     agent_with_idle(config, IDLE_TIMEOUT)
 }

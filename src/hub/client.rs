@@ -220,7 +220,9 @@ impl Client {
             .as_ref()
             .is_none_or(|cred| credential_matches_hub(&base, cred));
         let cred = cred.filter(|_| credential_binding_valid);
-        let cfg = ureq::Agent::config_builder().accept_encoding("identity");
+        let cfg = ureq::Agent::config_builder()
+            .accept_encoding("identity")
+            .user_agent(super::transport::USER_AGENT);
         // Every wait is bounded: hanging on an unresponsive hub buys nothing, and the user reads
         // it as agit being dead. A total deadline would also cut a large upload that is still
         // moving, so commands bound the connection and each wait instead.
@@ -365,8 +367,21 @@ impl Client {
         path: &str,
         expected_agent_id: Option<&str>,
     ) -> Result<T> {
+        self.get_with(path, expected_agent_id, &[])
+    }
+
+    /// [`Self::get_expected`] that also sends `headers`.
+    fn get_with<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.get(self.url(path));
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
             if let Some(id) = expected_agent_id {
                 req = req
                     .config()
@@ -399,8 +414,22 @@ impl Client {
         body: &B,
         expected_agent_id: Option<&str>,
     ) -> Result<T> {
+        self.post_with(path, body, expected_agent_id, &[])
+    }
+
+    /// [`Self::post_expected`] that also sends `headers`.
+    fn post_with<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        expected_agent_id: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.post(self.url(path));
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
             if let Some(id) = expected_agent_id {
                 req = req
                     .config()
@@ -1277,6 +1306,8 @@ impl Client {
     }
 
     /// Accepted publication facts for a local query, bound to the pinned repository identity.
+    /// Attribution replies are the same under every contract this client reads; only the echo
+    /// differs.
     pub fn activity_attribution(
         &self,
         owner: &str,
@@ -1284,7 +1315,8 @@ impl Client {
         expected_agent_id: &str,
         request: &crate::domain::activity::AttributionRequest,
     ) -> Result<crate::domain::activity::AttributionBody> {
-        let reply: crate::domain::activity::AttributionReply = self.post_expected(
+        let schema = crate::domain::activity::SCHEMA_VERSION.to_string();
+        let reply: crate::domain::activity::AttributionReply = self.post_with(
             &format!(
                 "api/agents/{}/{}/activity/attribution",
                 urlencode(owner),
@@ -1292,9 +1324,10 @@ impl Client {
             ),
             request,
             Some(expected_agent_id),
+            &[(crate::domain::activity::SCHEMA_HEADER, schema.as_str())],
         )?;
         anyhow::ensure!(
-            reply.schema_version == crate::domain::activity::SCHEMA_VERSION
+            crate::domain::activity::readable(reply.schema_version)
                 && reply.repository_id == expected_agent_id,
             "the Hub did not acknowledge the requested activity attribution contract"
         );
@@ -1325,9 +1358,13 @@ impl Client {
         if selection.assistant == crate::domain::activity::Assistant::Last {
             path.push_str("&assistant=last");
         }
-        let page: crate::domain::activity::Page = self.get(&path)?;
-        page.acknowledges(&format!("{owner}/{name}"), &selection)?;
-        Ok(page)
+        let schema = crate::domain::activity::SCHEMA_VERSION.to_string();
+        let page: serde_json::Value = self.get_with(
+            &path,
+            None,
+            &[(crate::domain::activity::SCHEMA_HEADER, schema.as_str())],
+        )?;
+        crate::domain::activity::Page::from_hub(page, &format!("{owner}/{name}"), &selection)
     }
 
     /// Cross-session search (the legacy shape, a bare array).
