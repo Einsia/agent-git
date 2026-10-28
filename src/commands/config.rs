@@ -225,6 +225,17 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     let repo = Repo::open(config::repo_dir(&owner, &name)?).ok_or_else(|| {
         anyhow::anyhow!("{owner}/{name} is not a local Agent repository; clone it first")
     })?;
+    let switching_on = match args.value.as_deref() {
+        Some(value) => value == "true",
+        None => args.unset && config::auto_push_default()?,
+    };
+    if switching_on {
+        super::push::enroll_public_destination(
+            &repo,
+            &format!("{owner}/{name}"),
+            &format!("agit config --repo {owner}/{name} push.auto true"),
+        )?;
+    }
     let operation = if args.unset {
         repo.set_auto_push(None)?;
         "unset"
@@ -277,6 +288,9 @@ pub(super) struct RepoAutoPush {
     pub(super) value: Option<bool>,
     /// Nobody could be asked, so creation names the inherited preference and its override.
     unasked: bool,
+    /// A person picked an option in the menu, so inheriting an enabled user preference is their
+    /// choice too; a cancelled menu is not an answer.
+    asked: bool,
 }
 
 impl RepoAutoPush {
@@ -285,6 +299,7 @@ impl RepoAutoPush {
         Self {
             value,
             unasked: false,
+            asked: false,
         }
     }
 
@@ -293,7 +308,22 @@ impl RepoAutoPush {
     /// The line about an unasked question is printed here rather than where the question was
     /// skipped: a refusal between the two creates nothing, and only the final owner names the
     /// repository that exists.
+    ///
+    /// A choice that turns automatic upload on for a public destination records the person's
+    /// enrollment, which only a terminal choice can make; without it every later automatic upload
+    /// into that repository is refused.
     pub(super) fn apply(&self, repo: &crate::domain::repo::Repo, slug: &str) -> crate::Result<()> {
+        let enabling = match self.value {
+            Some(value) => value,
+            None => self.asked && config::auto_push_default()?,
+        };
+        if enabling {
+            super::push::enroll_public_destination(
+                repo,
+                slug,
+                &format!("agit config --repo {slug} push.auto true"),
+            )?;
+        }
         if let Some(value) = self.value {
             return repo.set_auto_push(Some(value));
         }
@@ -323,6 +353,7 @@ pub(super) fn choose_repo_auto_push() -> crate::Result<RepoAutoPush> {
         return Ok(RepoAutoPush {
             value: None,
             unasked: true,
+            asked: false,
         });
     }
     let inherited = config::auto_push_default()?;
@@ -334,11 +365,24 @@ pub(super) fn choose_repo_auto_push() -> crate::Result<RepoAutoPush> {
         "Automatically push settled turns from this repository?",
         &[&label, "On", "Off"],
     )? {
+        Some(0) => None,
         Some(1) => Some(true),
         Some(2) => Some(false),
-        _ => None,
+        // Esc or q answered nothing: the repository inherits as if nobody had been asked, and no
+        // enrollment of a public destination is recorded.
+        _ => {
+            return Ok(RepoAutoPush {
+                value: None,
+                unasked: true,
+                asked: false,
+            });
+        }
     };
-    Ok(RepoAutoPush::explicit(value))
+    Ok(RepoAutoPush {
+        value,
+        unasked: false,
+        asked: true,
+    })
 }
 
 fn structured_entry(operation: &str, key: &str) -> CmdResult {

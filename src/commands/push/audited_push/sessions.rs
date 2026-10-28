@@ -27,6 +27,21 @@ pub(super) fn run(
         !automatic || repo.auto_push_enabled()?,
         "automatic publication is disabled for this repository"
     );
+    if automatic && intent.visibility == "public" {
+        let enrolled = match &intent.action {
+            Action::Existing(remote) => super::super::consent::confirms_public(
+                &repo,
+                &RemoteIdentity::new(&intent.hub, &remote.agent_id)?,
+            )?,
+            Action::Create => false,
+        };
+        if !enrolled {
+            return Err(crate::commands::InteractionRequired(format!(
+                "automatic upload into the public repository {repository} was not switched on by the person; ask them to run `agit config --repo {repository} push.auto true` themselves in a terminal, or publish this once with `agit push {repository}@<branch>`"
+            ))
+            .into());
+        }
+    }
     // Starting the local privacy worker overlaps its startup with the destination checks. It is
     // joined before preparation, so the preparation's own branch-name check never contends for it.
     let warmed = {

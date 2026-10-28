@@ -461,6 +461,13 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     plan.report(&src_owner, &src_name, progress);
 
     if let Some(value) = args.auto_push {
+        if value {
+            super::push::enroll_public_destination(
+                &store,
+                &format!("{owner}/{name}"),
+                &format!("agit config --repo {owner}/{name} push.auto true"),
+            )?;
+        }
         store.set_auto_push(Some(value))?;
     } else if !existed {
         super::config::choose_repo_auto_push()?.apply(&store, &format!("{owner}/{name}"))?;

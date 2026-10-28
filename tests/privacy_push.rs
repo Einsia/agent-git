@@ -1970,3 +1970,377 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
         }
     }
 }
+
+/// Automatic upload into a public repository is switched on only by the person, at a terminal.
+/// Each row names an entry point, the destination's audience, whether `--yes` was given and
+/// whether a terminal is attached. Without a terminal a public switch-on is refused with or without
+/// `--yes` and leaves automatic upload off; private, and user-wide or destination-less switches,
+/// stay allowed, but an automatic push into a public repository that nobody enrolled is refused
+/// before upload. A gate that accepted `--yes` would let an agent enroll a public repository on
+/// a relayed sentence; a gate only at the entry points would let an inherited user preference
+/// publish publicly. Choosing "On", or inheriting an enabled preference, in a first checkout's
+/// menu at a terminal records the same enrollment as `--auto-push=true` there; a menu that only
+/// stored the switch would leave every later automatic upload refused.
+#[cfg(unix)]
+#[test]
+fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [28; 32]);
+    let sign_in = |home: &Path| {
+        startup_cache::seed(home);
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    };
+    sign_in(&home);
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let run_in = |home: &Path, args: &[&str], automatic: bool| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args);
+        if automatic {
+            command.env("AGIT_AUTO_PUSH", "1");
+        }
+        command.output().unwrap()
+    };
+    let run = |args: &[&str], automatic: bool| run_in(&home, args, automatic);
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(
+        &["new", "alice/app", "-b", "work", "--no-launch"],
+        false,
+    ));
+    assert_success(&run(&["--yes", "push", "alice/app@main"], false));
+    let work = home.join("worktrees/alice/app/work");
+    let enrollment = repo.root().join(".git/agit/privacy-auto-consent.json");
+    // A terminal with no agent session: the person typing the command. When `answer` is given,
+    // it is typed once the automatic-upload menu is drawn.
+    let run_terminal = |home: &Path, args: &[&str], answer: Option<&str>| {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        builder.env_clear();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                builder.env(name, value);
+            }
+        }
+        builder.env("AGIT_HOME", home);
+        builder.env("CODEX_HOME", home.join("codex"));
+        builder.env("CLAUDE_CONFIG_DIR", home.join("claude"));
+        builder.env("AGIT_HUB_URL", &hub.base);
+        builder.env("AGIT_TUI", "0");
+        builder.env("AGIT_USE_SYSTEM_GIT", "1");
+        builder.env("AGIT_SECRETS_KEYSTORE", "file");
+        builder.env("TERM", "xterm");
+        builder.cwd(temp.path());
+        builder.args(args);
+        let mut child = pair.slave.spawn_command(builder).unwrap();
+        drop(pair.slave);
+        let mut keyboard = pair.master.take_writer().unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (sender, chunks) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut answer = answer;
+        let mut screen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            while let Ok(chunk) = chunks.try_recv() {
+                screen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if let Some(keys) = answer
+                && screen.contains("Automatically push settled turns")
+            {
+                keyboard.write_all(keys.as_bytes()).unwrap();
+                keyboard.flush().unwrap();
+                answer = None;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(answer.is_none(), "agit {args:?} never asked: {screen}");
+                break status.success();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agit {args:?} waited at a terminal: {screen}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let effective = |home: &Path| {
+        let out = run_in(
+            home,
+            &["--json", "config", "--repo", "alice/app", "push.auto"],
+            false,
+        );
+        assert_success(&out);
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["result"]["value"]["setting"]["effective"] == "true"
+    };
+    let project_dir = project.to_str().unwrap();
+    let repo_switch: &[&str] = &["config", "--repo", "alice/app", "push.auto", "true"];
+    let clone_switch: &[&str] = &["clone", "alice/app", "--auto-push=true"];
+    let bind_switch: &[&str] = &[
+        "project",
+        "bind",
+        project_dir,
+        "--repo",
+        "alice/app",
+        "--history",
+        "none",
+        "--auto-upload",
+    ];
+    let user_switch: &[&str] = &["config", "push.auto", "true"];
+    let init_switch: &[&str] = &["init", "fresh", "--no-bind", "--auto-push=true"];
+    let menu_clone: &[&str] = &["clone", "alice/app"];
+    const ON: &str = "\x1b[B\r";
+    const INHERIT: &str = "\r";
+    const ESCAPE: &str = "\x1b";
+    const QUIT: &str = "q";
+    struct Row<'a> {
+        entry: &'a [&'a str],
+        audience: &'static str,
+        yes: bool,
+        terminal: bool,
+        /// Keys typed at the automatic-upload menu of a first checkout in a fresh home.
+        menu: Option<&'static str>,
+        /// The user preference the menu offers to inherit is on.
+        inherits_on: bool,
+        /// The menu records the person's enrollment of the public destination.
+        enrolls: bool,
+        switched_on: bool,
+        /// Whether an automatic push from the main checkout then publishes.
+        publishes: Option<bool>,
+    }
+    let row = |entry, audience, yes, terminal, switched_on, publishes| Row {
+        entry,
+        audience,
+        yes,
+        terminal,
+        menu: None,
+        inherits_on: false,
+        enrolls: false,
+        switched_on,
+        publishes,
+    };
+    let menu = |keys, audience, inherits_on, enrolls, publishes| Row {
+        entry: menu_clone,
+        audience,
+        yes: false,
+        terminal: true,
+        menu: Some(keys),
+        inherits_on,
+        enrolls,
+        switched_on: true,
+        publishes,
+    };
+    let rows = [
+        row(repo_switch, "public", false, false, false, None),
+        row(repo_switch, "public", true, false, false, None),
+        row(repo_switch, "public", false, true, true, Some(true)),
+        row(repo_switch, "private", false, false, true, Some(true)),
+        row(clone_switch, "public", false, false, false, None),
+        row(clone_switch, "public", true, false, false, None),
+        row(clone_switch, "private", false, false, true, None),
+        row(bind_switch, "public", true, false, false, None),
+        row(user_switch, "public", true, false, true, Some(false)),
+        row(init_switch, "public", false, false, true, None),
+        menu(ON, "public", false, true, Some(true)),
+        menu(INHERIT, "public", true, true, Some(true)),
+        menu(ON, "private", false, false, None),
+        // A cancelled menu is not an answer: the inherited preference stays the user's, and
+        // nothing enrolls the public destination, so the next automatic upload is refused.
+        menu(ESCAPE, "public", true, false, Some(false)),
+        menu(QUIT, "public", true, false, Some(false)),
+    ];
+    for (index, row) in rows.into_iter().enumerate() {
+        let Row {
+            entry,
+            audience,
+            yes,
+            terminal,
+            menu,
+            inherits_on,
+            enrolls,
+            switched_on,
+            publishes,
+        } = row;
+        let case = format!(
+            "{entry:?} {audience} yes={yes} terminal={terminal} menu={menu:?} inherits_on={inherits_on}"
+        );
+        repo.git(&["config", "--local", "--unset-all", "agit.autoPush"])
+            .ok();
+        assert_success(&run(&["config", "--unset", "push.auto"], false));
+        let _ = fs::remove_file(&enrollment);
+        *hub.visibility.lock().unwrap() = audience;
+
+        if let Some(keys) = menu {
+            // A first checkout is where the menu is asked; the main checkout already exists.
+            let fresh = temp.path().join(format!("fresh-{index}"));
+            sign_in(&fresh);
+            if inherits_on {
+                assert_success(&run_in(&fresh, &["config", "push.auto", "true"], false));
+            }
+            assert!(run_terminal(&fresh, entry, Some(keys)), "{case}");
+            assert_eq!(effective(&fresh), switched_on, "{case}");
+            assert_eq!(
+                fresh
+                    .join("repos/alice/app/.git/agit/privacy-auto-consent.json")
+                    .exists(),
+                enrolls,
+                "{case}"
+            );
+            if let Some(publishes) = publishes {
+                let branch = format!("menu-{index}");
+                git(
+                    &fresh.join("repos/alice/app"),
+                    &["config", "http.userAgent", TRANSPORT_USER_AGENT],
+                );
+                assert_success(&run_in(
+                    &fresh,
+                    &["new", "alice/app", "-b", &branch, "--no-launch"],
+                    false,
+                ));
+                let work = fresh.join("worktrees/alice/app").join(&branch);
+                fs::write(work.join("README.md"), format!("Revision {index}")).unwrap();
+                git(
+                    &work,
+                    &[
+                        "-c",
+                        "user.name=Source Writer",
+                        "-c",
+                        "user.email=source@example.invalid",
+                        "commit",
+                        "-am",
+                        "Revise file",
+                    ],
+                );
+                let local = git(&work, &["rev-parse", "HEAD"]);
+                hub.posts.store(0, Ordering::Release);
+                let pushed = run_in(
+                    &fresh,
+                    &["--json", "push", &format!("alice/app@{branch}")],
+                    true,
+                );
+                assert_eq!(pushed.status.success(), publishes, "{case}: {pushed:?}");
+                let published = git(&remote, &["for-each-ref", &format!("refs/heads/{branch}")]);
+                if publishes {
+                    assert_eq!(
+                        git(&remote, &["rev-parse", &format!("refs/heads/{branch}")]),
+                        local
+                    );
+                } else {
+                    assert!(
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&pushed.stdout),
+                            String::from_utf8_lossy(&pushed.stderr)
+                        )
+                        .contains("was not switched on by the person"),
+                        "{case}: {pushed:?}"
+                    );
+                    assert_eq!(hub.posts.load(Ordering::Acquire), 0, "{case}");
+                    assert_eq!(published, "", "{case}");
+                }
+            }
+            continue;
+        }
+
+        let mut args = Vec::new();
+        if yes {
+            args.push("--yes");
+        }
+        args.extend_from_slice(entry);
+        if terminal {
+            assert_eq!(run_terminal(&home, &args, None), switched_on, "{case}");
+        } else {
+            let out = run(&args, false);
+            assert_eq!(out.status.success(), switched_on, "{case}: {out:?}");
+            if !switched_on {
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("themselves in a terminal"),
+                    "{case}: {out:?}"
+                );
+            }
+        }
+        if entry[0] != "init" {
+            assert_eq!(effective(&home), switched_on, "{case}");
+        }
+
+        if let Some(publishes) = publishes {
+            fs::write(work.join("README.md"), format!("Revision {index}")).unwrap();
+            git(&work, &["commit", "-am", "Revise file"]);
+            let local = git(&work, &["rev-parse", "HEAD"]);
+            let before = git(&remote, &["for-each-ref", "refs/heads/work"]);
+            hub.posts.store(0, Ordering::Release);
+            let pushed = run(&["--json", "push", "alice/app@work"], true);
+            assert_eq!(pushed.status.success(), publishes, "{case}: {pushed:?}");
+            if publishes {
+                assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), local);
+            } else {
+                assert!(
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&pushed.stdout),
+                        String::from_utf8_lossy(&pushed.stderr)
+                    )
+                    .contains("was not switched on by the person"),
+                    "{case}: {pushed:?}"
+                );
+                assert_eq!(hub.posts.load(Ordering::Acquire), 0, "{case}");
+                assert_eq!(git(&remote, &["for-each-ref", "refs/heads/work"]), before);
+            }
+        }
+    }
+}
