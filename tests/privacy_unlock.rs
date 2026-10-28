@@ -6,7 +6,7 @@ use agit::domain::{
     meta,
     privacy_envelope::{PrivacyEnvelope, ViewingRecipient, digest_bytes},
     privacy_layer::PrivateLayer,
-    repo::Repo,
+    repo::{MAX_INSPECTION_OUTPUT_BYTES, Repo},
     session_privacy::{
         AcceptedSnapshot, AccountIdentity, CommitterAttribution, OwnerKeyBinding, SessionPrivacy,
         SessionSnapshotBinding, SourceCommitter,
@@ -289,10 +289,16 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     } else {
         original.clone()
     };
+    // Evidence the LOG alone keeps outgrows a local inspection read, so unlock and resume reach
+    // the original only by reading the envelope up to the envelope's own limit.
+    let evidence = format!(
+        "SYNTHETIC_LOG_ONLY_EVIDENCE {}",
+        "x".repeat(MAX_INSPECTION_OUTPUT_BYTES)
+    );
     let log_only = if source == "codex" {
-        json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"SYNTHETIC_LOG_ONLY_EVIDENCE"}]}})
+        json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":evidence}]}})
     } else {
-        json!({"type":"assistant","message":{"role":"assistant","model":"glm-5.3","content":[{"type":"text","text":"SYNTHETIC_LOG_ONLY_EVIDENCE"}]}})
+        json!({"type":"assistant","message":{"role":"assistant","model":"glm-5.3","content":[{"type":"text","text":evidence}]}})
     };
     let log = format!(
         "{original}{}",
@@ -367,12 +373,10 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         )
         .unwrap(),
     );
+    let envelope_file = serde_json::to_vec(&envelope).unwrap();
+    assert!(envelope_file.len() > MAX_INSPECTION_OUTPUT_BYTES);
     std::fs::create_dir_all(repo.root().join("privacy")).unwrap();
-    std::fs::write(
-        repo.root().join("privacy/envelope.json"),
-        serde_json::to_vec(&envelope).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(repo.root().join("privacy/envelope.json"), &envelope_file).unwrap();
     let public_session = format!("agit-{}", "b".repeat(40));
     let public_log = transcript::wrap_lines(
         "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"sanitized\"}}\n",
@@ -394,7 +398,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         version: 2,
         binding: envelope.session_binding.clone().unwrap(),
         published_commit: before.clone(),
-        envelope_digest: digest_bytes(&serde_json::to_vec(&envelope).unwrap()),
+        envelope_digest: digest_bytes(&envelope_file),
     };
     let key_response = json!({"snapshot": expected, "content_key": content_key});
     let automatic_recovery = source == "codex" && runtime == "codex";

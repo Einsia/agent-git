@@ -377,7 +377,9 @@ pub struct Worktree {
     pub primary: bool,
 }
 
-const MAX_INSPECTION_OUTPUT_BYTES: usize = 1024 * 1024;
+/// The most a local inspection read returns unless its caller names a larger bound. A reader of
+/// an object whose own format admits more must pass that format's limit instead.
+pub const MAX_INSPECTION_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_INSPECTION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "cli", test))]
 const MAX_INSPECTION_WORKTREES: usize = 4096;

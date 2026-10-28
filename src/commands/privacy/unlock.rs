@@ -3,7 +3,7 @@
 use super::super::CmdResult;
 use crate::domain::{
     privacy::PrivacyPolicy,
-    privacy_envelope::{MAX_ENVELOPE_BYTES, PrivacyEnvelope, digest_bytes},
+    privacy_envelope::{PrivacyEnvelope, digest_bytes},
     privacy_layer::PrivateLayer,
     privacy_recovery::RecoveredSnapshot,
     refs,
@@ -83,30 +83,7 @@ pub(crate) fn recover_session(
 }
 
 pub(crate) fn envelope_bytes(repo: &Repo, commit: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    crate::domain::session_privacy::validate_oid(commit)?;
-    let repo = repo.clone().local_objects_only();
-    let object = format!("{commit}:privacy/envelope.json");
-    let entry = repo.git_bytes_result(&[
-        "ls-tree",
-        "-z",
-        "--full-name",
-        commit,
-        "--",
-        "privacy/envelope.json",
-    ])?;
-    if entry.is_empty() {
-        return Ok(None);
-    }
-    ensure!(
-        entry.starts_with(b"100644 blob "),
-        "privacy envelope must be a regular file"
-    );
-    let size: usize = repo.git(&["cat-file", "-s", &object])?.trim().parse()?;
-    ensure!(
-        size <= MAX_ENVELOPE_BYTES,
-        "privacy envelope exceeds the size limit"
-    );
-    Ok(Some(repo.git_bytes_result(&["cat-file", "blob", &object])?))
+    crate::domain::privacy_recovery::committed_envelope(repo, commit)
 }
 
 fn recover_selected(

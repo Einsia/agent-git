@@ -45,6 +45,12 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   publication lists (about 4,000, counted across every session of the repository); it failed
   with "audit publication reference limit exceeded" even for a short new session. Version tags
   no longer count against that limit; other branches and tags still do.
+- An encrypted session whose publication envelope is larger than 1 MiB can be unlocked and
+  resumed again: `agit privacy unlock` and resume read the committed envelope up to the size an
+  envelope may have, instead of failing with "local Git inspection exceeds its output limit", and
+  a large encrypted session's original is no longer refused by the local recovery cache.
+  Delivering such a session to another Hub, or pushing it to a new repository, is refused for its
+  encryption, as for any encrypted session, instead of for the envelope's size.
 - On macOS, `agit push` (and `--to-hub` above all) no longer hangs for good after the Hub
   answers. A privacy worker started at the same moment as a Git command could inherit that
   command's output pipe and keep it open, so the push waited for the end of output while the

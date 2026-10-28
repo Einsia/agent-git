@@ -3,7 +3,7 @@
 use super::{
     link::PrivacyRecovery,
     meta,
-    privacy_envelope::{MAX_ENVELOPE_BYTES, PrivacyEnvelope, digest_bytes},
+    privacy_envelope::{MAX_ENVELOPE_BYTES, MAX_PRIVATE_BYTES, PrivacyEnvelope, digest_bytes},
     privacy_layer::{EVIDENCE_FIELD, EVIDENCE_PREFIX, EvidenceReference},
     repo::Repo,
     storage, transcript,
@@ -15,7 +15,46 @@ use std::{collections::BTreeMap, fs, path::Path};
 use zeroize::Zeroizing;
 
 const MANIFEST: &str = "recovery.json";
-const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Everything the cache holds is restored from one private layer, bounded by the envelope's
+/// private payload: the snapshot's events, once each, are no larger than the layer, and their
+/// sequence files no larger than the events. A smaller budget refuses to recover an envelope that
+/// was published.
+const MAX_CACHE_BYTES: usize = 2 * MAX_PRIVATE_BYTES;
+
+/// The publication envelope `commit` carries, read from local objects only, or `None` when the
+/// commit carries none. It is read up to [`MAX_ENVELOPE_BYTES`], the size an envelope may have:
+/// this is the only way back to a published original, so a smaller read loses it.
+pub(crate) fn committed_envelope(repo: &Repo, commit: &str) -> Result<Option<Vec<u8>>> {
+    super::session_privacy::validate_oid(commit)?;
+    let repo = repo.clone().local_objects_only();
+    let object = format!("{commit}:privacy/envelope.json");
+    let entry = repo.git_bytes_result(&[
+        "ls-tree",
+        "-z",
+        "--full-name",
+        commit,
+        "--",
+        "privacy/envelope.json",
+    ])?;
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        entry.starts_with(b"100644 blob "),
+        "privacy envelope must be a regular file"
+    );
+    let size: usize = repo.git(&["cat-file", "-s", &object])?.trim().parse()?;
+    ensure!(
+        size <= MAX_ENVELOPE_BYTES,
+        "privacy envelope exceeds the size limit"
+    );
+    let output = repo.inspection_output(&["cat-file", "blob", &object], MAX_ENVELOPE_BYTES)?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "privacy envelope is unavailable"
+    );
+    Ok(Some(output.stdout))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,11 +79,11 @@ impl RecoveredSnapshot {
             matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "recovery requires an immutable commit"
         );
-        let repo = repo.clone().local_objects_only();
-        let Some(envelope) = repo.show_result(commit, "privacy/envelope.json")? else {
+        let Some(envelope) = committed_envelope(repo, commit)? else {
             return Ok(None);
         };
-        PrivacyEnvelope::parse(envelope.as_bytes())?;
+        let repo = repo.clone().local_objects_only();
+        PrivacyEnvelope::parse(&envelope)?;
         let common = repo.common_dir()?.canonicalize()?;
         let parent = common.join("agit/privacy-recovery");
         let root = parent.join(commit);
@@ -63,8 +102,7 @@ impl RecoveredSnapshot {
         let manifest: Manifest =
             serde_json::from_slice(&bytes).context("invalid private recovery manifest")?;
         ensure!(
-            manifest.version == 1
-                && manifest.publication_digest == digest_bytes(envelope.as_bytes()),
+            manifest.version == 1 && manifest.publication_digest == digest_bytes(&envelope),
             "recovery data belongs to another publication"
         );
         let files = read_files(&root)?;
