@@ -20,6 +20,7 @@
 //! Every conclusion points straight at the next action.
 
 mod history;
+mod objects;
 #[cfg(unix)]
 mod permissions;
 mod transaction;
@@ -43,6 +44,16 @@ pub struct Args {
     /// Repair permissions of one named Agit state carrier and its managed ancestors (Unix only)
     #[arg(long, value_name = "PATH", conflicts_with_all = ["repo", "check_backend", "deep"])]
     pub repair_permissions: Option<PathBuf>,
+
+    /// Restore a local repository whose Git objects a hard stop left empty: refetch what the Hub
+    /// has, and name what only this machine had
+    #[arg(
+        long,
+        value_name = "OWNER/REPO",
+        value_parser = parse_repo,
+        conflicts_with_all = ["repair_permissions", "repo", "check_backend", "deep"]
+    )]
+    pub repair_objects: Option<String>,
 
     /// Restrict repository and adopted-session checks to this local owner/repo
     #[arg(long, value_name = "OWNER/REPO", value_parser = parse_repo)]
@@ -80,6 +91,9 @@ enum Check {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if let Some(slug) = args.repair_objects.as_deref() {
+        return objects::repair(slug);
+    }
     if let Some(path) = args.repair_permissions.as_deref() {
         #[cfg(unix)]
         return permissions::run(path);
@@ -280,6 +294,34 @@ pub fn run(args: Args) -> CmdResult {
                     )),
                 ));
             }
+        }
+        match crate::domain::repo::integrity::assess(&crate::domain::repo::Repo::at(root)) {
+            Ok(None) => {}
+            Ok(Some(damage)) => {
+                fatal = true;
+                let branches = if damage.branches.is_empty() {
+                    "none".to_owned()
+                } else {
+                    damage.branches.join(", ")
+                };
+                checks.push((
+                    slug.clone(),
+                    Check::Err(format!(
+                        "{} (a hard stop or crash can leave loose objects empty); branches that \
+                         reach them: {branches}; run `agit doctor --repair-objects {slug}`",
+                        crate::domain::repo::integrity::damaged_objects_phrase(
+                            damage.objects.len()
+                        )
+                    )),
+                ));
+            }
+            Err(error) => checks.push((
+                slug,
+                Check::Warn(format!(
+                    "Git objects could not be listed: {}",
+                    first_line(&format!("{error:#}"))
+                )),
+            )),
         }
     }
     let unpushed: Vec<&String> = agents

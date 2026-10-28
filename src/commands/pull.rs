@@ -98,9 +98,25 @@ pub fn run(args: Args) -> CmdResult {
         &identity,
     )?;
     if !out.ok() {
+        if crate::domain::repo::integrity::reports_damage(&out.stderr) {
+            ui::error(&crate::domain::repo::integrity::damaged_store_message(
+                &repo,
+            ));
+            return Ok(ExitCode::Precondition);
+        }
         ui::error(&format!("fetch failed: {}", out.stderr.trim()));
         ui::hint("network or auth. Check credentials with `agit whoami --check`");
         return Ok(ExitCode::Network);
+    }
+    // A merge on top of damaged history cannot be written; stopping here leaves no merge
+    // transaction open behind the refusal.
+    if let Some(damage) = crate::domain::repo::integrity::assess(&repo)?
+        && !damage.branches.is_empty()
+    {
+        ui::error(&crate::domain::repo::integrity::damaged_store_message(
+            &repo,
+        ));
+        return Ok(ExitCode::Precondition);
     }
 
     // 2. Fast-forward branch by branch.

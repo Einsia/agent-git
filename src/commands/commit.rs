@@ -3644,6 +3644,7 @@ fn commit_file_commit_tree(
     message: &str,
 ) -> crate::Result<String> {
     repo.ensure_committer()?;
+    crate::domain::repo::integrity::refuse_damaged_parents(repo, parents)?;
     let mut args = vec!["commit-tree", tree];
     for parent in parents {
         args.push("-p");

@@ -3695,6 +3695,7 @@ fn commit_tree_with_env(
     message: &str,
     env: &[(&str, &str)],
 ) -> Result<String> {
+    crate::domain::repo::integrity::refuse_damaged_parents(repo, parents)?;
     let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
     for p in parents {
         args.push("-p".into());

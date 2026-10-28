@@ -413,3 +413,131 @@ fn divergence_hints_keep_the_explicit_repo_without_or_with_foreign_process_ident
         }
     }
 }
+
+/// A store whose loose objects a hard stop left empty is named rather than passed through: doctor
+/// names the damaged branches and the repair, a pull refuses to commit on top of the damaged
+/// history, and the repair refetches what the Hub has, names the commit only this machine had and
+/// sets that branch aside. A repair that ran a plain fetch would leave the published object
+/// unreadable, since this store claims the commits that reach it. A repair that stops early (here
+/// the set-aside is declined) has already removed the empty files, so only its record lets doctor
+/// still find the branch that cannot read; and a readable tip is kept under a ref named by that
+/// tip before its branch goes, so when that ref cannot be written the branch stays. The damage is
+/// settled only when no other ref reaches it: a tag on the set-aside history keeps the record and
+/// is named.
+#[test]
+fn damaged_objects_are_named_refused_and_restored_from_the_hub() {
+    let lab = Lab::new();
+    let local = lab.file_checkout();
+    fs::write(local.join("published.md"), "On the Hub\n").unwrap();
+    lab.git(&local, &["add", "published.md"]);
+    lab.git(&local, &["commit", "-qm", "Published page"]);
+    lab.git(&local, &["push", "-q", "origin", "main"]);
+    lab.git(&local, &["switch", "-qc", "draft"]);
+    fs::write(local.join("draft.md"), "Only here\n").unwrap();
+    lab.git(&local, &["add", "draft.md"]);
+    lab.git(&local, &["commit", "-qm", "Draft only on this machine"]);
+    lab.git(&local, &["switch", "-q", "main"]);
+    fs::write(local.join("note.md"), "Local note\n").unwrap();
+    lab.git(&local, &["add", "note.md"]);
+    lab.git(&local, &["commit", "-qm", "Local note"]);
+    let published = lab.git(&local, &["rev-parse", "main:published.md"]);
+    let draft = lab.git(&local, &["rev-parse", "draft:draft.md"]);
+    for object in [&published, &draft] {
+        empty_object(&local, object);
+    }
+
+    let doctor = lab.agit(&["doctor"]);
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        report.contains("2 damaged Git objects")
+            && report.contains("branches that reach them: draft, main")
+            && report.contains("agit doctor --repair-objects alice/notes"),
+        "{doctor:?}"
+    );
+
+    fs::write(lab.source.join("remote.md"), "Remote page\n").unwrap();
+    lab.git(&lab.source, &["add", "remote.md"]);
+    lab.git(&lab.source, &["commit", "-qm", "Remote page"]);
+    let before = lab.git(&local, &["rev-parse", "main"]);
+    let pull = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(!pull.status.success(), "{pull:?}");
+    assert!(
+        String::from_utf8_lossy(&pull.stderr).contains("agit doctor --repair-objects alice/notes"),
+        "{pull:?}"
+    );
+    assert_eq!(lab.git(&local, &["rev-parse", "main"]), before);
+
+    let draft_tip = lab.git(&local, &["rev-parse", "draft"]);
+    let declined = lab.agit(&["doctor", "--repair-objects", "alice/notes"]);
+    assert!(!declined.status.success(), "{declined:?}");
+    assert!(
+        String::from_utf8_lossy(&declined.stdout).contains("Draft only on this machine"),
+        "{declined:?}"
+    );
+    assert_eq!(
+        lab.git(&local, &["cat-file", "-p", &published]),
+        "On the Hub"
+    );
+    let doctor = lab.agit(&["doctor"]);
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("branches that reach them: draft;"),
+        "{doctor:?}"
+    );
+
+    let colliding = format!("refs/agit/damaged/draft-{}", &draft_tip[..12]);
+    let main_tip = lab.git(&local, &["rev-parse", "main"]);
+    lab.git(&local, &["update-ref", &colliding, &main_tip]);
+    let blocked = lab.agit(&["--yes", "doctor", "--repair-objects", "alice/notes"]);
+    assert!(!blocked.status.success(), "{blocked:?}");
+    assert_eq!(
+        lab.git(&local, &["rev-parse", "refs/heads/draft"]),
+        draft_tip
+    );
+    lab.git(&local, &["update-ref", "-d", &colliding]);
+
+    lab.git(&local, &["tag", "keep-draft", &draft_tip]);
+    let held = lab.agit(&["--yes", "doctor", "--repair-objects", "alice/notes"]);
+    assert!(!held.status.success(), "{held:?}");
+    assert!(
+        String::from_utf8_lossy(&held.stderr).contains("refs/tags/keep-draft"),
+        "{held:?}"
+    );
+    assert_eq!(
+        lab.git(
+            &local,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/agit/damaged/"
+            ]
+        ),
+        format!("refs/agit/damaged/draft-{} {draft_tip}", &draft_tip[..12])
+    );
+    let doctor = lab.agit(&["doctor"]);
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("damaged Git object"),
+        "{doctor:?}"
+    );
+    lab.git(&local, &["tag", "-d", "keep-draft"]);
+    let repair = lab.agit(&["--yes", "doctor", "--repair-objects", "alice/notes"]);
+    assert!(repair.status.success(), "{repair:?}");
+    let doctor = lab.agit(&["doctor"]);
+    assert!(
+        !String::from_utf8_lossy(&doctor.stdout).contains("damaged Git object"),
+        "{doctor:?}"
+    );
+    let pull = lab.agit(&["pull", "alice/notes@main"]);
+    assert!(pull.status.success(), "{pull:?}");
+}
+
+/// Leave `oid`'s loose file in place with no content, as a crash before the data reached the disk
+/// does.
+fn empty_object(repo: &Path, oid: &str) {
+    let file = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+    assert!(file.is_file(), "{oid} is not a loose object");
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&file, permissions).unwrap();
+    fs::File::create(&file).unwrap();
+}

@@ -56,6 +56,8 @@
 //! [`crate::hub::git`] — authentication is the hub's business.
 
 #[cfg(feature = "cli")]
+pub mod integrity;
+#[cfg(feature = "cli")]
 pub(crate) mod object_reader;
 mod preferences;
 #[cfg(feature = "cli")]
@@ -2029,7 +2031,7 @@ impl Repo {
     }
 
     /// Probe local objects without allowing a transport to supply missing history.
-    #[cfg(any(feature = "secret-vault", test))]
+    #[cfg(any(feature = "secret-vault", feature = "cli", test))]
     pub(crate) fn git_status_local(&self, args: &[&str]) -> Result<(Option<i32>, String, String)> {
         self.git_status_with_transport(args, false)
     }

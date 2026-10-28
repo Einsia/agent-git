@@ -51,6 +51,11 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   a large encrypted session's original is no longer refused by the local recovery cache.
   Delivering such a session to another Hub, or pushing it to a new repository, is refused for its
   encryption, as for any encrypted session, instead of for the envelope's size.
+- After a hard stop (power loss, a killed machine) left empty Git object files in a local
+  repository, `agit doctor` names the repository and its damaged branches, and `fetch`, `pull`,
+  `run` and commits stop with the repair to run instead of Git's own errors.
+  `agit doctor --repair-objects OWNER/REPO` restores what the Hub has, lists the commits only this
+  machine had, and with confirmation sets an unreadable branch aside.
 - On macOS, `agit push` (and `--to-hub` above all) no longer hangs for good after the Hub
   answers. A privacy worker started at the same moment as a Git command could inherit that
   command's output pipe and keep it open, so the push waited for the end of output while the
