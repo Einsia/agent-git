@@ -1121,10 +1121,11 @@ impl Client {
     /// Whether `<owner>/<name>` can be pushed to.
     ///
     /// It asks the first step of a push — `info/refs?service=git-receive-pack` — which already
-    /// has to pass the hub's write gate (an org owner and a team member granted this agent both
-    /// fall under that one decision). The CLI does not infer from "which orgs I am in": org
-    /// membership and "can write this agent" are different things. Ordinary receive advertisement
-    /// can validate and durably register existing history before returning its status.
+    /// has to pass the hub's write gate (an org owner, a member writing through the organization's
+    /// base permission and a person granted write on this agent all fall under that one
+    /// decision). The CLI does not infer from "which orgs I am in": org membership and "can write
+    /// this agent" are different things. Ordinary receive advertisement can validate and durably
+    /// register existing history before returning its status.
     ///
     /// Behind the write gate sits an identity fence: whoever can write must also carry
     /// Expected-Agent-Id — missing is 428, mismatched is 412. The probe asks "can I write", not

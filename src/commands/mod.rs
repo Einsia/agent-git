@@ -292,8 +292,9 @@ pub enum Writability {
 /// The two questions are asked separately, because the hub's write gate answers "exists but not
 /// writable" and "does not exist" with the same 404: first ask whether the agent exists at all
 /// with the readable `GET /api/agents/{owner}/{name}`, and if it does, probe the write gate (org
-/// owners and team members granted access to this agent all sit inside that one decision); if it
-/// does not, ask the org whether I may create a repository under it.
+/// owners, members writing through the base permission and people granted write on this agent
+/// all sit inside that one decision); if it does not, ask the org whether I may create a
+/// repository under it.
 ///
 /// Network and auth errors propagate unchanged: conflating a timeout with "no permission" makes
 /// `import` land a version locally and makes `push` offer to copy the repo — both decide for the

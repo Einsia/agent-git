@@ -340,7 +340,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
                     "cannot import into `{repo}`: the hub does not let you push to it."
                 ));
                 ui::hint(
-                    "organization repos take pushes from the org owner and from team members granted on that repo — ask an org owner, or import into your own namespace",
+                    "organization repos take pushes from org owners, from members while the organization's base permission is write, and from people granted write on that repo — ask an org owner, or import into your own namespace",
                 );
                 return Ok(ExitCode::Policy);
             }

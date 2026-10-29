@@ -651,7 +651,7 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
             format!("private to {owner}: every member of {owner} can read it")
         }
         (Some("private"), Some(true)) => {
-            format!("private to {owner}: its owners and granted teams can read it")
+            format!("private to {owner}: its owners and the people granted access can read it")
         }
         (Some("private"), Some(false)) => {
             "private: only you and people you add can read it".to_owned()
@@ -1354,7 +1354,7 @@ mod tests {
         );
         assert_eq!(
             notice(Some("private"), Some(true)),
-            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and granted teams can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`."
+            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`."
         );
         assert!(
             notice(Some("private"), Some(false))
