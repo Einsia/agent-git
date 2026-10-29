@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+### Fixed
+
+- `agit push` publishes a session that another account registered first in the repository, or
+  that a different local choice recorded, under the configuration the Hub holds for it instead
+  of stopping with "session publication mode is already registered and differs from the local
+  choice". A session first published on another Hub publishes as a new plain session of your
+  account instead of stopping with "session creator belongs to another Hub".
+
 ## [0.2.29] - 2026-10-29
 
 ### Added

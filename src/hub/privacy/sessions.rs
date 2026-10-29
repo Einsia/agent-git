@@ -185,10 +185,6 @@ impl Client {
         local: &SessionPrivacy,
     ) -> Result<SessionPrivacyResponse> {
         local.validate()?;
-        ensure!(
-            local.hub.as_deref().is_none_or(|hub| hub == identity.hub),
-            "session creator belongs to another Hub"
-        );
         let response: SessionPrivacyResponse =
             self.with_repository_route(repository, identity, |repository| {
                 let path =

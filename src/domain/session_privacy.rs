@@ -321,7 +321,9 @@ impl SessionPrivacyConfig {
         Ok(())
     }
 
-    /// A retry or another signed-in account cannot replace an already recorded creator.
+    /// The Hub's stored configuration answers every registration of a session, whoever
+    /// registered it first and whatever this client recorded, so the client checks only that the
+    /// answer is about this repository and session and uses it as it is.
     pub fn verify_registration(
         &self,
         repository: &str,
@@ -334,22 +336,6 @@ impl SessionPrivacyConfig {
             self.repository_id == repository && self.session_id == session,
             "session registration belongs to another repository or session"
         );
-        ensure!(
-            self.privacy.scheme == local.scheme,
-            "session encryption mode differs from registered history"
-        );
-        if local.hub.is_some() {
-            ensure!(
-                self.privacy.hub == local.hub,
-                "session registration belongs to another Hub"
-            );
-        }
-        if local.owner_source != OwnerResolution::Unresolved {
-            ensure!(
-                self.privacy == *local,
-                "session registration cannot replace recorded ownership"
-            );
-        }
         Ok(())
     }
 }
@@ -653,9 +639,12 @@ mod tests {
         }
     }
 
-    /// Ownership survives account switches; unresolved legacy principals remain representable.
+    /// A registration answer is used as the Hub stored it, even when another account registered
+    /// the session first; a client that refused it could never publish that session again. Only
+    /// an answer about another repository is refused. Unresolved legacy principals remain
+    /// representable.
     #[test]
-    fn registration_preserves_birth_identity_and_legacy_fallback() {
+    fn registration_uses_the_stored_answer_and_keeps_legacy_fallback() {
         let privacy = SessionPrivacy::new(Some(
             AccountIdentity::new("https://hub.test", "alice").unwrap(),
         ))
@@ -674,9 +663,16 @@ mod tests {
             AccountIdentity::new("https://hub.test", "bob").unwrap(),
         ))
         .unwrap();
+        config
+            .verify_registration(&config.repository_id, &config.session_id, &privacy)
+            .unwrap();
         assert!(
             config
-                .verify_registration(&config.repository_id, &config.session_id, &privacy)
+                .verify_registration(
+                    "00000000-0000-0000-0000-000000000002",
+                    &config.session_id,
+                    &privacy
+                )
                 .is_err()
         );
         config.privacy = SessionPrivacy {
