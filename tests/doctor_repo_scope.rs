@@ -155,15 +155,46 @@ fn formats() -> Vec<Vec<&'static str>> {
 }
 
 #[test]
-fn global_doctor_does_not_contact_the_update_service() {
+fn global_doctor_reports_cross_hub_bindings_without_contacting_or_changing_them() {
     let lab = Lab::new();
-    lab.repo("alice/chosen");
+    let repo = lab.repo("alice/chosen");
+    agit::hub::identity::pin(
+        &repo,
+        &agit::hub::identity::RemoteIdentity::new(
+            "https://old-hub.example.test",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let before = files(&lab.home);
     let output = lab.doctor(&hub, &["doctor"]);
-    assert!(output.status.success(), "{}", text(&output));
+    let rendered = text(&output);
+    assert!(output.status.success(), "{rendered}");
+    assert!(
+        rendered.contains("this checkout belongs to https://old-hub.example.test"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("alice/chosen"), "{rendered}");
+    assert!(rendered.contains("--to-hub"), "{rendered}");
+    assert!(rendered.contains(&hub), "{rendered}");
+    let source_assignment = if cfg!(windows) {
+        "$env:AGIT_HUB_URL = 'https://old-hub.example.test'"
+    } else {
+        "AGIT_HUB_URL='https://old-hub.example.test'"
+    };
+    assert!(rendered.contains(source_assignment), "{rendered}");
+    assert!(
+        rendered.contains(&format!("'push' 'alice/chosen' '--all' '--to-hub' '{hub}'")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("omitting --local deletes the remote repository"),
+        "{rendered}"
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,

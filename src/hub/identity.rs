@@ -18,6 +18,79 @@ pub struct RemoteIdentity {
     pub agent_id: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct HubMismatch {
+    message: String,
+    delivery: Option<crate::commands::fix::FixCommand>,
+}
+
+impl HubMismatch {
+    pub(crate) fn new(repo: &Repo, identity: &RemoteIdentity, current: &str) -> Self {
+        let mut message = format!(
+            "this checkout belongs to {}, but the current hub is {}; refusing to send it to a different hub. Keep this checkout to preserve its saved work",
+            identity.hub, current
+        );
+        let slug = managed_slug(repo);
+        let delivery = slug.as_deref().and_then(|slug| {
+            crate::commands::fix::FixCommand::at_hub(
+                &["push", slug, "--all", "--to-hub", current],
+                &identity.hub,
+                true,
+            )
+        });
+        if let Some(command) = delivery.as_ref().and_then(|fix| fix.human_command()) {
+            message.push_str(&format!(
+                "\nTo deliver all its saved branches to the current Hub, review them and run: `{command}`"
+            ));
+        } else {
+            message.push_str(
+                "; select its recorded Hub to continue, or run `agit doctor` for managed-checkout recovery commands",
+            );
+        }
+        if let Some(slug) = slug
+            && let Some(command) = crate::commands::fix::FixCommand::at_hub(
+                &["repo", "delete", &slug, "--local"],
+                &identity.hub,
+                true,
+            )
+            .and_then(|fix| fix.human_command())
+        {
+            message.push_str(&format!(
+                    "\nOnly if you no longer need its local work, free the local name with `{command}`, then clone or bind it on the current Hub. This leaves the remote untouched; omitting --local deletes the remote repository"
+                ));
+        }
+        Self { message, delivery }
+    }
+
+    pub(crate) fn fix(&self) -> Option<crate::commands::fix::FixCommand> {
+        self.delivery.clone()
+    }
+}
+
+/// Only the managed store's own path selects a recovery target; a remote URL or working
+/// directory name must not turn a diagnostic into a command for another local repository.
+fn managed_slug(repo: &Repo) -> Option<String> {
+    let root = crate::infra::config::repos_dir()
+        .ok()?
+        .canonicalize()
+        .ok()?;
+    let common = repo.common_dir().ok()?.canonicalize().ok()?;
+    let relative = common.parent()?.strip_prefix(root).ok()?;
+    let parts = relative.components().collect::<Vec<_>>();
+    let [owner, name] = parts.as_slice() else {
+        return None;
+    };
+    let owner = owner.as_os_str().to_str()?;
+    let name = name.as_os_str().to_str()?;
+    if owner.trim() != owner || name.trim() != name {
+        return None;
+    }
+    crate::domain::repo::valid_name(owner).ok()?;
+    crate::domain::repo::valid_name(name).ok()?;
+    Some(format!("{owner}/{name}"))
+}
+
 impl RemoteIdentity {
     pub fn new(hub: &str, agent_id: &str) -> crate::Result<Self> {
         let agent_id = agent_id.trim();
@@ -131,11 +204,7 @@ pub fn require_current(repo: &Repo, hub: &str) -> crate::Result<RemoteIdentity> 
     })?;
     let current = normalize_hub(hub)?;
     if identity.hub != current {
-        bail!(
-            "this checkout belongs to {}, but the current hub is {}; refusing to send it to a different hub",
-            identity.hub,
-            current
-        );
+        return Err(HubMismatch::new(repo, &identity, &current).into());
     }
     Ok(identity)
 }
@@ -323,7 +392,13 @@ mod tests {
             &RemoteIdentity::new("https://one.test", &id(1)).unwrap(),
         )
         .unwrap();
-        assert!(require_current(&repo, "https://two.test").is_err());
+        let error = require_current(&repo, "https://two.test").unwrap_err();
+        assert!(error.is::<HubMismatch>());
+        assert!(error.to_string().contains("Keep this checkout"));
+        assert_eq!(
+            require_current(&repo, "HTTPS://ONE.TEST/").unwrap().hub,
+            "https://one.test"
+        );
     }
 
     #[test]

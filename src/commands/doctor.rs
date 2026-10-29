@@ -267,8 +267,28 @@ pub fn run(args: Args) -> CmdResult {
         Some(repo) => vec![repo.clone()],
         None => super::clone::list_local()?,
     };
+    let hub = config::hub_url();
+    let current_hub = crate::hub::identity::normalize_hub(&hub);
     for (owner, name, root) in &agents {
         let slug = format!("{owner}/{name}");
+        let repo = Repo::at(root).local_objects_only();
+        match (crate::hub::identity::read(&repo), &current_hub) {
+            (Ok(Some(pinned)), Ok(current)) if pinned.hub != *current => checks.push((
+                slug.clone(),
+                Check::Warn(
+                    crate::hub::identity::HubMismatch::new(&repo, &pinned, current).to_string(),
+                ),
+            )),
+            (Err(error), _) => checks.push((
+                slug.clone(),
+                Check::Warn(format!("remote identity could not be inspected: {error:#}")),
+            )),
+            (Ok(Some(_)), Err(error)) => checks.push((
+                slug.clone(),
+                Check::Warn(format!("Hub binding could not be inspected: {error:#}")),
+            )),
+            _ => {}
+        }
         if let Some(status) = transaction::inspect(root, &slug) {
             checks.push((slug.clone(), Check::Warn(status)));
         }
@@ -354,7 +374,6 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── Sign-in ──
-    let hub = config::hub_url();
     checks.push((
         "sign-in".into(),
         match credentials::load_checked(&hub) {

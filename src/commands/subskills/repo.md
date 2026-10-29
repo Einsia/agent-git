@@ -46,6 +46,10 @@ agit repo invite szh/p1@refund-fix --role write # lands on that branch's session
 agit repo delete szh/p1 --local
 ```
 
+`repo delete` without `--local` deletes the remote repository. Use `--local` only when the local
+copy and any unpublished work in it are no longer needed. A checkout pinned to an old Hub can
+hold the only copy of saved turns; review and explicitly deliver those turns before discarding it.
+
 ## Repository identity and session privacy
 
 Creation selects the repository's name and visibility, then installs a local checkout pinned to
