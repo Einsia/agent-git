@@ -94,6 +94,34 @@ pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
     boundaries
 }
 
+/// Whether conversation follows the last completed turn: a prompt, or a reply whose terminal
+/// record is not written yet. Bookkeeping and the records Claude Code writes for its own commands
+/// do not count, so a session that ended after its last reply awaits nothing.
+#[cfg(feature = "cli")]
+pub(crate) fn awaits_reply(text: &str) -> bool {
+    let end = completed_turn_boundary(text).unwrap_or(0);
+    text[end..].split_inclusive('\n').any(|line| {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        if record["isSidechain"] == true || record["isMeta"] == true {
+            return false;
+        }
+        let content = record.pointer("/message/content");
+        match record["type"].as_str() {
+            Some("assistant") => record["message"]["model"] != SYNTHETIC_MODEL,
+            Some("user") => {
+                extract_tool_results(content).is_some()
+                    || !is_system_generated(
+                        &record,
+                        extract_text(content).as_deref().unwrap_or_default(),
+                    )
+            }
+            _ => false,
+        }
+    })
+}
+
 /// A generated assistant without a source model must not select a model on resume.
 pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 
