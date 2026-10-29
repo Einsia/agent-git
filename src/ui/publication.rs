@@ -167,9 +167,12 @@ fn render(receiver: Receiver<Event>, tty: bool) {
     let mut active: Option<Active> = None;
     let mut last_notice = Instant::now();
     let mut elapsed = Duration::ZERO;
+    // Every line ends in a newline of its own. The bar's own printing pads to the terminal width
+    // it reads and leaves the cursor on that row, so whatever is written next, the command's
+    // final error included, continues the same row and is lost wherever the real width differs.
     let emit = |message: String| {
         if let Some(bar) = &spinner {
-            bar.println(message);
+            bar.suspend(|| eprintln!("{message}"));
         } else {
             eprintln!("{message}");
         }

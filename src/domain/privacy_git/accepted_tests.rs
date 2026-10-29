@@ -171,9 +171,10 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     published.prepare_acceptance().unwrap();
 }
 
-/// A collaborator's new tip requires synchronization, including when its objects are not local.
+/// A collaborator's new tip sends a checkout that is only behind to `pull` and a diverged one to
+/// `fork` or `merge`, including when the tip's objects are not local.
 #[test]
-fn remote_advances_report_pull_without_discarding_local_commits() {
+fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
     let temp = tempfile::tempdir().unwrap();
     let source = Repo::init(&temp.path().join("source")).unwrap();
     source.git(&["config", "user.name", "Writer"]).unwrap();
@@ -219,16 +220,43 @@ fn remote_advances_report_pull_without_discarding_local_commits() {
     source.add_all().unwrap();
     source.commit("Local page").unwrap();
     let local = source.git(&["rev-parse", "HEAD"]).unwrap();
-    for (tip, diagnosis) in [(&peer, "has diverged"), (&"f".repeat(40), "has changed")] {
+    for (tip, diagnosis) in [
+        (&peer, "local +1 / Hub +1"),
+        (&"f".repeat(40), "each side has commits the other does not"),
+    ] {
         let error = check(tip).unwrap_err().to_string();
         assert!(error.contains(diagnosis), "{error}");
-        assert!(error.contains("agit pull team/wiki@wiki"), "{error}");
+        assert!(
+            error.contains(
+                "`agit fork team/wiki@wiki -b wiki-local`, then `agit push team/wiki@wiki-local`"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "`agit fetch team/wiki`, then `agit merge team/wiki@{} --into team/wiki@wiki`",
+                &tip[..12]
+            )),
+            "{error}"
+        );
         assert!(
             error.contains("local unpublished commits are kept"),
             "{error}"
         );
+        assert!(!error.contains("agit pull"), "{error}");
         assert!(!error.contains(accepted::RECOVERY), "{error}");
     }
+    // A Hub tip that is not here leaves this checkout merely behind when the last fetched remote
+    // branch already holds its head; reading every unknown tip as divergence would hide `pull`.
+    source
+        .git(&["update-ref", "refs/remotes/origin/wiki", &local])
+        .unwrap();
+    let error = check(&"f".repeat(40)).unwrap_err().to_string();
+    assert!(error.contains("nothing new on it"), "{error}");
+    assert!(error.contains("`agit pull team/wiki@wiki`"), "{error}");
+    source
+        .git(&["update-ref", "-d", "refs/remotes/origin/wiki"])
+        .unwrap();
     assert_eq!(source.git(&["rev-parse", "wiki"]).unwrap(), local);
     assert_eq!(
         source.git(&["show", "wiki:local.md"]).unwrap(),
@@ -247,7 +275,7 @@ fn remote_advances_report_pull_without_discarding_local_commits() {
     source.add_all().unwrap();
     source.commit("Session").unwrap();
     let error = check(&peer).unwrap_err().to_string();
-    assert!(error.contains("agit pull team/wiki@wiki"), "{error}");
+    assert!(error.contains("agit fork team/wiki@wiki"), "{error}");
     assert!(!error.contains(accepted::RECOVERY), "{error}");
 }
 
@@ -660,20 +688,33 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     altered.source = "f".repeat(40);
     assert!(altered.validate().is_err());
     source.git(&["checkout", "work"]).unwrap();
+    let mut advanced = selected.remote.clone();
+    advanced
+        .refs
+        .insert("refs/heads/work".into(), "f".repeat(40));
+    // An encrypted publication with nothing new here is not offered `pull`: its source head is
+    // not an ancestor of the Hub's line, so a fast-forward would refuse it as diverged.
+    let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    ledger.reconcile(&selected.remote).unwrap();
+    let plan = PublicationPlan::freeze_selected(&source, &branches).unwrap();
+    let error = sessions::require_remote_ancestry(&source, &plan, &ledger, &advanced, "team/app")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nothing new on it"), "{error}");
+    assert!(!error.contains("`agit pull team/app@work`"), "{error}");
+    assert!(!error.contains("diverged"), "{error}");
     save(&owned, "Private continuation by Bob");
     let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
     ledger.reconcile(&selected.remote).unwrap();
     let plan = PublicationPlan::freeze_selected(&source, &branches).unwrap();
     sessions::require_remote_ancestry(&source, &plan, &ledger, &selected.remote, "team/app")
         .unwrap();
-    let mut advanced = selected.remote.clone();
-    advanced
-        .refs
-        .insert("refs/heads/work".into(), "f".repeat(40));
     let error = sessions::require_remote_ancestry(&source, &plan, &ledger, &advanced, "team/app")
         .unwrap_err();
     assert!(
-        error.to_string().contains("agit pull team/app@work"),
+        error
+            .to_string()
+            .contains("agit fork team/app@work -b work-local"),
         "{error:#}"
     );
     let mut next = prepare(&branches, &selected).unwrap();

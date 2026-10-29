@@ -456,11 +456,6 @@ pub(super) fn require_remote_ancestry(
             "{}",
             accepted::RECOVERY
         );
-        #[cfg(windows)]
-        use crate::ui::quote_powershell_argument as quote_arg;
-        #[cfg(not(windows))]
-        use crate::ui::session::shell_arg as quote_arg;
-        let target = quote_arg(&format!("{repository}@{branch}"));
         let difference = source
             .git_opt(&[
                 "rev-list",
@@ -475,19 +470,90 @@ pub(super) fn require_remote_ancestry(
                     counts.next()?.parse::<usize>().ok()?,
                 ))
             });
-        let state = match difference {
-            Some((0, behind)) => format!("is ahead of this checkout by {behind} commits"),
-            Some((ahead, behind)) if behind > 0 => {
-                format!("has diverged (local +{ahead} / remote +{behind})")
-            }
-            _ => "has changed beyond this checkout's accepted history".into(),
+        // The ledger decides first: a head it accepted has nothing to publish whatever the commit
+        // counts say, and one whose public copy is a different commit is never a Git ancestor of
+        // the Hub's line, so `pull` cannot fast-forward it. Otherwise the counts decide, or,
+        // without the Hub's tip here, whether the last fetched remote branch holds the head.
+        let accepted = ledger.inherited_immutable(branch, head.oid())?;
+        let position = if accepted.is_some_and(|entry| entry.public != entry.source) {
+            Position::BehindProjected
+        } else if accepted.is_some()
+            || difference.is_some_and(|(ahead, _)| ahead == 0)
+            || source
+                .git_opt(&[
+                    "merge-base",
+                    "--is-ancestor",
+                    head.oid(),
+                    &format!("refs/remotes/origin/{branch}"),
+                ])
+                .is_some()
+        {
+            Position::Behind
+        } else {
+            Position::Diverged
         };
-        let tip = remote_head.chars().take(12).collect::<String>();
         anyhow::bail!(
-            "remote branch {branch} {state} (Hub tip {tip}); run `agit pull {target}` before pushing; local unpublished commits are kept"
+            "{}",
+            remote_movement(repository, branch, remote_head, position, difference)
         );
     }
     Ok(())
+}
+
+/// Where this checkout stands against a Hub branch that its head does not contain.
+#[derive(Clone, Copy)]
+enum Position {
+    /// Nothing here is unpublished, and the Hub's commits can be fast-forwarded onto it.
+    Behind,
+    /// Nothing here is unpublished, but its published copy is a projection of it.
+    BehindProjected,
+    /// Both sides have commits the other does not.
+    Diverged,
+}
+
+/// Why the Hub refused this branch, followed by the commands that resolve it, one `→` line each.
+/// A behind checkout only needs the Hub's turns; a diverged one must either publish its own line
+/// under a new branch or merge the Hub's line in, and a merge needs the Hub's objects first.
+fn remote_movement(
+    repository: &str,
+    branch: &str,
+    remote_head: &str,
+    position: Position,
+    counts: Option<(usize, usize)>,
+) -> String {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    let target = quote_arg(&format!("{repository}@{branch}"));
+    let tip = remote_head.chars().take(12).collect::<String>();
+    match position {
+        Position::Behind => {
+            let state = match counts {
+                Some((0, behind)) => format!("is {behind} commits ahead of this checkout"),
+                _ => "has commits this checkout does not have".into(),
+            };
+            format!(
+                "remote branch {branch} {state} (Hub tip {tip}), and this checkout has nothing new on it\n  → bring the Hub's turns here: `agit pull {target}`"
+            )
+        }
+        Position::BehindProjected => format!(
+            "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and this checkout has nothing new on it; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
+        ),
+        Position::Diverged => {
+            let state = match counts {
+                Some((ahead, behind)) => format!("local +{ahead} / Hub +{behind}"),
+                None => "each side has commits the other does not".into(),
+            };
+            let fork_branch = quote_arg(&format!("{branch}-local"));
+            let fork = quote_arg(&format!("{repository}@{branch}-local"));
+            let merge_source = quote_arg(&format!("{repository}@{tip}"));
+            let peer = quote_arg(repository);
+            format!(
+                "remote branch {branch} has diverged from this checkout ({state}; Hub tip {tip}); local unpublished commits are kept\n  → keep both: `agit fork {target} -b {fork_branch}`, then `agit push {fork}`\n  → or merge the Hub's line in: `agit fetch {peer}`, then `agit merge {merge_source} --into {target}`, then `agit push {target}`"
+            )
+        }
+    }
 }
 
 impl ProjectedHistory {
