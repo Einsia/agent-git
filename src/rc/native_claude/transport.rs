@@ -30,6 +30,11 @@ const MAX_PEERS: usize = 128;
 const MAX_OPERATIONS: usize = 4096;
 const MAX_EVENTS: usize = 1024;
 const FRESH: Duration = Duration::from_secs(3);
+/// How long an ask a settings hook offers stays pending without the hook checking in again. The
+/// hook checks in well inside it while it waits, so an ask disappears soon after the terminal
+/// answers it and ends the hook.
+const OFFER_LEASE: Duration = Duration::from_secs(5);
+const MAX_OFFERS: usize = 64;
 static HUB: OnceLock<Mutex<Weak<Hub>>> = OnceLock::new();
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -151,6 +156,42 @@ struct PeerState {
     operations: HashMap<String, Operation>,
     next_operation: u64,
     decisions: HashMap<String, Value>,
+    /// The asks and permission mode the module last reported; `snapshot` adds what the
+    /// session's settings hooks report, which a module cannot see where Claude Code passes
+    /// user plugins over on its classic events.
+    module_approvals: Vec<Value>,
+    module_mode: Option<String>,
+    /// Asks a settings PermissionRequest hook holds open, by id, with its last check-in.
+    offered: HashMap<String, (Value, Instant)>,
+    /// Asks a hook has checked in with that are not taken yet, by id: how many module reports
+    /// had arrived at its first check-in, and its last check-in.
+    sighted: HashMap<String, (u64, Instant)>,
+    /// Module reports received for this generation.
+    reports: u64,
+    reported_mode: Option<String>,
+}
+
+impl PeerState {
+    fn overlay(&mut self) {
+        self.offered
+            .retain(|_, (_, seen)| seen.elapsed() < OFFER_LEASE);
+        self.sighted
+            .retain(|_, (_, seen)| seen.elapsed() < OFFER_LEASE);
+        let mut approvals = self.module_approvals.clone();
+        for (wire, _) in self.offered.values() {
+            if !approvals
+                .iter()
+                .any(|approval| approval["id"] == wire["id"])
+            {
+                approvals.push(wire.clone());
+            }
+        }
+        self.snapshot.approvals = approvals;
+        self.snapshot.permission_mode = self
+            .module_mode
+            .clone()
+            .or_else(|| self.reported_mode.clone());
+    }
 }
 
 fn pending_commands(operations: &HashMap<String, Operation>) -> Vec<Value> {
@@ -354,6 +395,20 @@ impl Hub {
                 && body["cwd"].as_str() == state.snapshot.cwd.to_str(),
             "native target changed"
         );
+        if path == "/mode" {
+            let mode = body["permission_mode"]
+                .as_str()
+                .filter(|mode| !mode.is_empty() && mode.len() <= 64)
+                .context("missing permission mode")?;
+            let changed = state.reported_mode.as_deref() != Some(mode);
+            state.reported_mode = Some(mode.to_owned());
+            state.overlay();
+            drop(state);
+            if changed {
+                peer.changed.notify_waiters();
+            }
+            return Ok(json!({"generation":generation}));
+        }
         let id = body
             .get("id")
             .and_then(Value::as_str)
@@ -388,6 +443,62 @@ impl Hub {
                 };
                 Ok(json!({"generation":generation, "id":id, "decision":decision}))
             }
+            "/permission" => {
+                let tool = body["tool"].as_str().context("missing tool name")?;
+                // An ask joins the turn the module reports running, read from a report the
+                // module began after the ask arrived. The module sends one report at a time, so
+                // the second report to arrive after the ask's first check-in began after that
+                // check-in; an earlier one may carry the turn before, or none. Until then the ask
+                // is not taken and its hook checks in again: an ask taken from an earlier report
+                // would keep that turn, and shared control would show it under the wrong one.
+                let reports = state.reports;
+                let fresh = if let Some((_, seen)) = state.offered.get_mut(id) {
+                    *seen = Instant::now();
+                    false
+                } else {
+                    let count = state.offered.len() + state.sighted.len();
+                    let first = match state.sighted.get_mut(id) {
+                        Some((first, seen)) => {
+                            *seen = Instant::now();
+                            *first
+                        }
+                        None => {
+                            ensure!(count < MAX_OFFERS, "native asks exceed their bound");
+                            state
+                                .sighted
+                                .insert(id.to_owned(), (reports, Instant::now()));
+                            reports
+                        }
+                    };
+                    match state.snapshot.turn.clone() {
+                        Some(turn) if reports >= first + 2 => {
+                            state.sighted.remove(id);
+                            let wire =
+                                json!({"id":id, "turn":turn, "tool":tool, "input":body["input"]});
+                            state.offered.insert(id.to_owned(), (wire, Instant::now()));
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if let Some(mode) = body["permission_mode"]
+                    .as_str()
+                    .filter(|mode| !mode.is_empty() && mode.len() <= 64)
+                {
+                    state.reported_mode = Some(mode.to_owned());
+                }
+                state.overlay();
+                let turn = state
+                    .offered
+                    .get(id)
+                    .map_or(Value::Null, |(wire, _)| wire["turn"].clone());
+                let decision = state.decisions.get(id).cloned();
+                drop(state);
+                if fresh {
+                    peer.changed.notify_waiters();
+                }
+                Ok(json!({"generation":generation, "id":id, "turn":turn, "decision":decision}))
+            }
             _ => anyhow::bail!("unknown native control endpoint"),
         }
     }
@@ -418,6 +529,12 @@ impl Hub {
                     operations: HashMap::new(),
                     next_operation: 0,
                     decisions: HashMap::new(),
+                    module_approvals: Vec::new(),
+                    module_mode: None,
+                    offered: HashMap::new(),
+                    sighted: HashMap::new(),
+                    reports: 0,
+                    reported_mode: None,
                 };
                 peers.insert(
                     snapshot.generation.clone(),
@@ -467,15 +584,24 @@ impl Hub {
         }
         state.events.extend(events);
         state.acknowledged = acknowledged;
-        state.decisions.retain(|id, _| {
+        snapshot.events.clear();
+        snapshot.results.clear();
+        state.module_approvals = std::mem::take(&mut snapshot.approvals);
+        state.module_mode = snapshot.permission_mode.take();
+        state.snapshot = snapshot;
+        state.reports += 1;
+        state.overlay();
+        let PeerState {
+            decisions,
+            snapshot,
+            ..
+        } = &mut *state;
+        decisions.retain(|id, _| {
             snapshot
                 .approvals
                 .iter()
                 .any(|approval| approval["id"].as_str() == Some(id))
         });
-        snapshot.events.clear();
-        snapshot.results.clear();
-        state.snapshot = snapshot;
         state.seen = Instant::now();
         let commands = pending_commands(&state.operations);
         let reply = json!({"generation":state.snapshot.generation, "ack_seq":acknowledged,
@@ -1175,6 +1301,168 @@ mod tests {
                     assert!(registration.transcript_target().is_err());
                 });
         });
+    }
+
+    /// A settings PermissionRequest hook's ask reaches shared control the way the module's did,
+    /// and decides only with an answer given there: the ask joins the live snapshot with the turn
+    /// it was raised in and the mode the hook reports, and an allow answered in shared control is
+    /// the hook's decision. An ask is taken only from a module report begun after it arrived; one
+    /// taken from the report before would keep the previous turn. A mode reported from a hook's
+    /// own thread reaches the snapshot; a report that needed a running runtime would end the hook
+    /// before it settles the turn. A subagent's ask, and an ask whose daemon is gone, decide
+    /// nothing, so the terminal's dialog answers alone; a hook that fell back to allowing or
+    /// denying there would answer for the person.
+    #[test]
+    fn a_settings_hook_ask_decides_only_with_an_answer_from_shared_control() {
+        if crate::rc::in_isolated_test(
+            "rc::native_claude::transport::tests::a_settings_hook_ask_decides_only_with_an_answer_from_shared_control",
+        ) {
+            return;
+        }
+        use crate::protocol::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+        }
+        // The daemon's handlers run on blocking threads, so the home comes from the process
+        // environment of this isolated test, which every thread shares.
+        {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cwd = root.path().canonicalize().unwrap();
+                    let registry = cwd.join("sessions");
+                    let socket = cwd.join("native.sock");
+                    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                    let (process, _) = super::super::process(std::process::id()).unwrap();
+                    let session = uuid::Uuid::new_v4().to_string();
+                    crate::rc::claude_inbox::fixture::register(
+                        &registry,
+                        process.pid,
+                        &session,
+                        &socket,
+                        None,
+                    );
+                    let record_path = registry.join(format!("{}.json", process.pid));
+                    let mut record: Value =
+                        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                    record["cwd"] = json!(cwd);
+                    std::fs::write(&record_path, record.to_string()).unwrap();
+                    let endpoint = Endpoint::start().unwrap();
+                    let registration = Registration {
+                        version: 1,
+                        session: session.clone(),
+                        cwd: cwd.clone(),
+                        generation: uuid::Uuid::new_v4().to_string(),
+                        revision: process.birth.clone(),
+                        process,
+                        registry,
+                        descriptor: descriptor_path().unwrap(),
+                    };
+                    super::super::publish(&directory().unwrap(), &registration).unwrap();
+                    let snapshot: Snapshot = serde_json::from_value(json!({
+                        "registration":registration, "session":session, "cwd":cwd,
+                        "generation":registration.generation, "version":1, "saturated":false,
+                        "last_seq":0, "events":[], "results":[], "approvals":[], "tools":[],
+                        "compacting":false, "permission_mode":null, "turn":"raised-in"
+                    }))
+                    .unwrap();
+                    let mut earlier = snapshot.clone();
+                    earlier.turn = Some("earlier".into());
+                    endpoint.hub.poll(earlier).unwrap();
+                    let client = Client::attach(&session, &cwd).unwrap();
+
+                    let ask = json!({"session_id":session, "tool_name":"Bash",
+                        "tool_input":{"command":"ls"}, "permission_mode":"acceptEdits"});
+                    let mut subagent = ask.clone();
+                    subagent["agent_id"] = json!("helper");
+                    assert_eq!(super::super::permission::decide(&subagent), None);
+
+                    let hook = {
+                        let (registration, ask) = (registration.clone(), ask.clone());
+                        std::thread::spawn(move || {
+                            super::super::permission::decide_for(&registration, &ask)
+                        })
+                    };
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    assert!(client.snapshot().unwrap().approvals.is_empty());
+                    // The module keeps reporting, now from the turn the ask was raised in.
+                    let offered = loop {
+                        endpoint.hub.poll(snapshot.clone()).unwrap();
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        if let Some(approval) = client.snapshot().unwrap().approvals.first() {
+                            break approval.clone();
+                        }
+                    };
+                    assert_eq!(offered["turn"], "raised-in");
+                    assert_eq!(offered["tool"], "Bash");
+                    assert_eq!(offered["input"], json!({"command":"ls"}));
+                    endpoint.hub.poll(snapshot.clone()).unwrap();
+                    assert_eq!(
+                        client.snapshot().unwrap().permission_mode.as_deref(),
+                        Some("acceptEdits"),
+                        "the module reports no mode, so the hook's report stands"
+                    );
+                    client
+                        .answer(&ApprovalResponse {
+                            approval_id: offered["id"].as_str().unwrap().into(),
+                            session_id: session.clone(),
+                            decision: ApprovalDecision::Allow,
+                            scope: ApprovalScope::Once,
+                            message: None,
+                            by: None,
+                            answers: None,
+                        })
+                        .unwrap();
+                    let decided = loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        if hook.is_finished() {
+                            break hook.join().unwrap();
+                        }
+                    };
+                    assert_eq!(decided, Some(json!({"behavior":"allow"})));
+                    let reporter = {
+                        let registration = registration.clone();
+                        std::thread::spawn(move || {
+                            super::super::permission::report_mode_to(&registration, "plan")
+                        })
+                    };
+                    while !reporter.is_finished() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    reporter.join().unwrap();
+                    assert_eq!(
+                        client.snapshot().unwrap().permission_mode.as_deref(),
+                        Some("plan")
+                    );
+
+                    drop(client);
+                    drop(endpoint);
+                    let hook = {
+                        let (registration, ask) = (registration.clone(), ask.clone());
+                        std::thread::spawn(move || {
+                            super::super::permission::decide_for(&registration, &ask)
+                        })
+                    };
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    assert!(
+                        !hook.is_finished(),
+                        "an unreachable daemon is waited on, not answered for"
+                    );
+                    record["sessionId"] = json!(uuid::Uuid::new_v4().to_string());
+                    std::fs::write(record_path, record.to_string()).unwrap();
+                    let left = loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        if hook.is_finished() {
+                            break hook.join().unwrap();
+                        }
+                    };
+                    assert_eq!(left, None);
+                });
+        }
     }
 
     #[test]

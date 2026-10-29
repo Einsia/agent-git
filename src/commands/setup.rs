@@ -249,6 +249,18 @@ const HOOKS: &[(&str, &[&str])] = &[
     ("Stop", &["hooks", "settle"]),
 ];
 
+/// Hooks installed for Claude Code alone, each with its timeout in seconds. A PermissionRequest
+/// hook waits for an answer a person gives in shared control while the terminal's dialog stays
+/// up beside it, and Claude Code ends the hook as soon as the terminal answers; its timeout only
+/// bounds how long a remote answer may still arrive. Claude Code passes user plugins over on its
+/// classic events where an organization's security default is seated, so this ask reaches agit
+/// only through settings.
+#[cfg(unix)]
+const CLAUDE_HOOKS: &[(&str, &[&str], u64)] =
+    &[("PermissionRequest", &["hooks", "native-permission"], 86_400)];
+#[cfg(not(unix))]
+const CLAUDE_HOOKS: &[(&str, &[&str], u64)] = &[];
+
 /// Hooks agit no longer installs and must retire. **Matched by argv, without the exe path** —
 /// once the install location moves (npm's `/usr/local/bin` ↔ `setup.sh`'s `~/.local/bin`),
 /// matching on the whole command string retires nothing, and one Stop settles twice.
@@ -347,7 +359,13 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
 
     if wants(runtime, "claude-code") {
         match claude_settings() {
-            Some(path) => report.merge(install_hook_file(&path, "Claude Code", &exe, None)),
+            Some(path) => report.merge(install_hook_file(
+                &path,
+                "Claude Code",
+                &exe,
+                None,
+                CLAUDE_HOOKS,
+            )),
             None => {
                 ui::warning("cannot install Claude Code hooks: HOME is not set");
                 report.merge(SetupReport::failure());
@@ -362,7 +380,7 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
         match codex_hooks_capability() {
             Some(capability) => match codex_home_path().map(|h| h.join("hooks.json")) {
                 Some(path) => {
-                    let installed = install_hook_file(&path, "Codex", &exe, Some("codex"));
+                    let installed = install_hook_file(&path, "Codex", &exe, Some("codex"), &[]);
                     report.merge(installed);
                     if installed.succeeded() {
                         if capability.enabled {
@@ -400,6 +418,7 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
                 "WorkBuddy",
                 &exe,
                 Some("workbuddy"),
+                &[],
             )),
             Err(_) => report.merge(SetupReport::failure()),
         }
@@ -546,24 +565,7 @@ fn repair_hook_file(
         ));
         return SetupReport::failure();
     }
-    let mut backup = path.as_os_str().to_owned();
-    backup.push(".agit-backup");
-    let mut options = crate::infra::config::state_file_options();
-    options.write(true).create_new(true);
-    // The copy is for its owner only, and never more readable than the original: a hook file can
-    // hold credentials in its environment block, and group bits copied onto a file whose group
-    // differs from the original's would hand it to another group.
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(path) {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        options.mode(metadata.permissions().mode() & 0o600);
-    }
-    let kept = options
-        .open(&backup)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()));
-    if let Err(error) = kept
-        && error.kind() != std::io::ErrorKind::AlreadyExists
-    {
+    if keep_original(path, &text).is_err() {
         ui::warning(&format!(
             "cannot repair {label} hooks: failed to keep a copy of {}",
             path.display()
@@ -580,6 +582,32 @@ fn repair_hook_file(
         ui::tilde(path)
     ));
     SetupReport::changed_item()
+}
+
+/// Keeps `text`, the hook file at `path` as read, beside it with `.agit-backup` added to the name,
+/// before agit rewrites it. An existing copy is never replaced, so the copy is the file as it was
+/// before agit first changed it and may predate later edits. Without the copy, a rewrite the person
+/// did not expect has nothing to compare against.
+fn keep_original(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".agit-backup");
+    let mut options = crate::infra::config::state_file_options();
+    options.write(true).create_new(true);
+    // The copy is for its owner only, and never more readable than the original: a hook file can
+    // hold credentials in its environment block, and group bits copied onto a file whose group
+    // differs from the original's would hand it to another group.
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(metadata.permissions().mode() & 0o600);
+    }
+    match options
+        .open(&backup)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        kept => kept,
+    }
 }
 
 /// `text` with each string that is the value of a `command` key and equals the left side of a
@@ -683,27 +711,35 @@ fn parse_codex_hooks_capability(output: &str) -> Option<CodexHooksCapability> {
 
 /// Add agit's hooks to one runtime-owned JSON file without replacing malformed or non-object
 /// user configuration. `runtime_flag` makes the payload parser independent of transcript paths.
+/// The file is written back whole, so its keys come back sorted; the file as it was before agit
+/// first changed it is kept beside it, and a rewrite that cannot keep it does not happen.
 fn install_hook_file(
     path: &Path,
     label: &str,
     exe: &str,
     runtime_flag: Option<&str>,
+    extra: &[(&str, &[&str], u64)],
 ) -> SetupReport {
-    let mut doc = match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(doc) => doc,
-            Err(_) => {
-                ui::warning(&format!(
-                    "cannot install {label} hooks: {} is not valid JSON",
-                    path.display()
-                ));
-                return SetupReport::failure();
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+    let original = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => {
             ui::warning(&format!(
                 "cannot install {label} hooks: failed to read {}",
+                path.display()
+            ));
+            return SetupReport::failure();
+        }
+    };
+    let mut doc = match original
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        None => serde_json::json!({}),
+        Some(Ok(doc)) => doc,
+        Some(Err(_)) => {
+            ui::warning(&format!(
+                "cannot install {label} hooks: {} is not valid JSON",
                 path.display()
             ));
             return SetupReport::failure();
@@ -729,6 +765,7 @@ fn install_hook_file(
         .iter()
         .map(|(event, _)| *event)
         .chain(RETIRED_HOOKS.iter().map(|(event, _)| *event))
+        .chain(extra.iter().map(|(event, _, _)| *event))
     {
         if hooks.get(event).is_some_and(|value| !value.is_array()) {
             ui::warning(&format!(
@@ -749,9 +786,28 @@ fn install_hook_file(
             event,
             &hook_command(exe, argv, runtime_flag),
             &hook_arguments(argv, runtime_flag),
+            None,
+        );
+    }
+    for (event, argv, timeout) in extra {
+        added += upsert_hook(
+            hooks,
+            event,
+            &hook_command(exe, argv, runtime_flag),
+            &hook_arguments(argv, runtime_flag),
+            Some(*timeout),
         );
     }
     if added > 0 {
+        if let Some(text) = &original
+            && keep_original(path, text).is_err()
+        {
+            ui::warning(&format!(
+                "cannot install {label} hooks: failed to keep a copy of {}",
+                path.display()
+            ));
+            return SetupReport::failure();
+        }
         if write_json(path, &doc).is_err() {
             ui::warning(&format!("failed to write {}", path.display()));
             return SetupReport::failure();
@@ -857,7 +913,13 @@ fn retire_hook(hooks: &mut serde_json::Value, event: &str, argv: &str) -> usize 
 /// same entry: the first one found is pointed at the current executable and the others are
 /// removed. Keeping them would run the same hook once per stale path, concurrently, on every
 /// event. Other entries, including ones that merely mention the arguments, are left untouched.
-fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments: &str) -> usize {
+fn upsert_hook(
+    hooks: &mut serde_json::Value,
+    event: &str,
+    cmd: &str,
+    arguments: &str,
+    timeout: Option<u64>,
+) -> usize {
     let arr = hooks
         .as_object_mut()
         .expect("hooks must be an object")
@@ -907,9 +969,11 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments:
         .min_by_key(|(_, _, exact)| !exact)
         .map(|(group, index, _)| (group, index));
     let Some((keep_group, keep_index)) = keep else {
-        arr.push(serde_json::json!({
-            "hooks": [{"type": "command", "command": cmd}]
-        }));
+        let mut entry = serde_json::json!({"type": "command", "command": cmd});
+        if let Some(timeout) = timeout {
+            entry["timeout"] = timeout.into();
+        }
+        arr.push(serde_json::json!({ "hooks": [entry] }));
         return 1;
     };
     let mut changed = 0;
@@ -939,6 +1003,12 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str, arguments:
         .expect("the kept hook entry remains in its group");
     if !exact(kept) {
         kept["command"] = serde_json::Value::String(cmd.to_owned());
+        changed += 1;
+    }
+    if let Some(timeout) = timeout
+        && kept.get("timeout").and_then(|value| value.as_u64()) != Some(timeout)
+    {
+        kept["timeout"] = timeout.into();
         changed += 1;
     }
     // Only groups this call emptied go away; every other group stays as it was.
@@ -2027,7 +2097,7 @@ mod tests {
             ]);
             let mut hooks = serde_json::json!({"SessionStart": original.clone()});
             assert_eq!(
-                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest"),
+                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest", None),
                 1
             );
             let groups = hooks["SessionStart"].as_array().unwrap();
@@ -2035,7 +2105,7 @@ mod tests {
             assert_eq!(groups[3]["hooks"][0]["command"], command);
             let installed = hooks.clone();
             assert_eq!(
-                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest"),
+                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest", None),
                 0
             );
             assert_eq!(hooks, installed);
@@ -2074,7 +2144,10 @@ mod tests {
             None
         );
         let command = hook_command(exe, argv, None);
-        assert_eq!(upsert_hook(&mut hooks, event, &command, &arguments), 1);
+        assert_eq!(
+            upsert_hook(&mut hooks, event, &command, &arguments, None),
+            1
+        );
         assert_eq!(
             hooks[event],
             serde_json::json!([{"hooks": [{"type": "command", "command": command}]}])
@@ -2151,17 +2224,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).succeeded());
+        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex"), &[]).succeeded());
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(once.contains("/usr/bin/user-hook"), "{once}");
         assert!(once.contains("agit hooks ingest --runtime codex"), "{once}");
         assert!(once.contains("agit hooks settle --runtime codex"), "{once}");
-        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).succeeded());
+        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex"), &[]).succeeded());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
 
         std::fs::write(&path, "not json\n").unwrap();
         assert_eq!(
-            install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).failures,
+            install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex"), &[]).failures,
             1
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json\n");
@@ -2169,7 +2242,9 @@ mod tests {
 
     /// Installs from different executable paths keep one entry per hook: the stale path is
     /// replaced and extra copies are removed, while a user's hook sharing the group stays. Matching
-    /// on the whole command string instead adds one more concurrent hook per install location.
+    /// on the whole command string instead adds one more concurrent hook per install location. The
+    /// install that rewrites the file keeps the file it read beside it; one that wrote without it
+    /// would leave the person no copy of the settings it sorted.
     #[test]
     fn hooks_installed_from_another_path_are_replaced_instead_of_stacked() {
         let dir = tempfile::tempdir().unwrap();
@@ -2191,8 +2266,13 @@ mod tests {
         )
         .unwrap();
 
+        let original = std::fs::read_to_string(&path).unwrap();
         let exe = "/home/me/.local/bin/agit";
-        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy")).succeeded());
+        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy"), &[]).succeeded());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.json.agit-backup")).unwrap(),
+            original
+        );
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let commands = |event: &str| -> Vec<String> {
@@ -2216,7 +2296,7 @@ mod tests {
             ["/home/me/.local/bin/agit hooks settle --runtime workbuddy"]
         );
         let once = std::fs::read_to_string(&path).unwrap();
-        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy")).succeeded());
+        assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy"), &[]).succeeded());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
     }
 
@@ -2291,7 +2371,8 @@ mod tests {
     #[test]
     fn every_installed_hook_command_parses_as_a_real_agit_invocation() {
         use clap::Parser as _;
-        for (event, argv) in HOOKS {
+        let claude = CLAUDE_HOOKS.iter().map(|(event, argv, _)| (*event, *argv));
+        for (event, argv) in HOOKS.iter().copied().chain(claude) {
             let mut cli: Vec<&str> = vec!["agit"];
             cli.extend_from_slice(argv);
             crate::commands::Cli::try_parse_from(&cli).unwrap_or_else(|e| {
@@ -2324,7 +2405,8 @@ mod tests {
                     &mut hooks,
                     event,
                     &hook_command("agit", argv, None),
-                    &hook_arguments(argv, None)
+                    &hook_arguments(argv, None),
+                    None
                 ),
                 1
             );
@@ -2339,7 +2421,8 @@ mod tests {
                     &mut hooks,
                     event,
                     &hook_command("agit", argv, None),
-                    &hook_arguments(argv, None)
+                    &hook_arguments(argv, None),
+                    None
                 ),
                 0
             );
@@ -2373,6 +2456,7 @@ mod tests {
                 event,
                 &hook_command("agit", argv, None),
                 &hook_arguments(argv, None),
+                None,
             );
         }
         let text = hooks.to_string();
@@ -2440,7 +2524,13 @@ mod tests {
             "Stop": [{"hooks": [{"type": "command", "command": theirs}]}]
         });
         assert_eq!(
-            upsert_hook(&mut hooks, "Stop", "agit hooks settle", "hooks settle"),
+            upsert_hook(
+                &mut hooks,
+                "Stop",
+                "agit hooks settle",
+                "hooks settle",
+                None
+            ),
             1
         );
         assert_eq!(hooks["Stop"][0]["hooks"][0]["command"], theirs);

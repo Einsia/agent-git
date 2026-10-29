@@ -1,5 +1,6 @@
 //! Await native decisions without charging the runtime hook's execution budget.
 
+use super::Registration;
 use super::transport::{Descriptor, MAX_BODY};
 use anyhow::{Context, ensure};
 use http_body_util::{BodyExt, Full, Limited};
@@ -34,48 +35,10 @@ pub(crate) fn wait_approval(session: &str, generation: &str, id: &str) -> crate:
         .block_on(async {
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline && registration.is_registered() {
-                let reply = tokio::time::timeout(Duration::from_secs(2), async {
-                    // Reopen the same descriptor so a daemon restart cannot strand a native dialog.
-                    let descriptor: Descriptor = serde_json::from_reader(
-                        crate::rc::native_inbox::open_regular(&registration.descriptor)?
-                            .take(super::RECORD_LIMIT),
-                    )?;
-                    ensure!(
-                        super::process(descriptor.owner.pid)
-                            .is_some_and(|(process, _)| process == descriptor.owner),
-                        "native approval listener changed"
-                    );
-                    let stream = tokio::net::UnixStream::connect(&descriptor.socket).await?;
-                    ensure!(
-                        stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
-                        "native approval listener has a different owner"
-                    );
-                    let (mut sender, connection) =
-                        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-                    let connection = tokio::spawn(connection);
-                    let request = Request::post("http://localhost/approval")
-                        .header("Authorization", format!("Bearer {}", descriptor.token))
-                        .header("Content-Type", "application/json")
-                        .header("Connection", "close")
-                        .body(Full::new(Bytes::from(serde_json::to_vec(&body)?)))?;
-                    let response = sender.send_request(request).await;
-                    let result = async {
-                        let response = response?;
-                        ensure!(
-                            response.status().is_success(),
-                            "native approval is reconnecting"
-                        );
-                        let bytes = Limited::new(response.into_body(), MAX_BODY)
-                            .collect()
-                            .await
-                            .map_err(anyhow::Error::msg)?
-                            .to_bytes();
-                        Ok::<Value, anyhow::Error>(serde_json::from_slice(&bytes)?)
-                    }
-                    .await;
-                    connection.abort();
-                    result
-                })
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    post(&registration, "/approval", &body),
+                )
                 .await;
                 if let Ok(Ok(reply)) = reply
                     && reply["generation"] == generation
@@ -88,4 +51,51 @@ pub(crate) fn wait_approval(session: &str, generation: &str, id: &str) -> crate:
             }
             Ok(json!({"generation":generation,"id":id,"decision":null}))
         })
+}
+
+/// One request to the daemon that owns `registration`'s descriptor. The descriptor is read again
+/// for each request, so a daemon restart cannot strand a caller that waits on it.
+pub(super) async fn post(
+    registration: &Registration,
+    path: &str,
+    body: &Value,
+) -> crate::Result<Value> {
+    let descriptor: Descriptor = serde_json::from_reader(
+        crate::rc::native_inbox::open_regular(&registration.descriptor)?.take(super::RECORD_LIMIT),
+    )?;
+    ensure!(
+        super::process(descriptor.owner.pid)
+            .is_some_and(|(process, _)| process == descriptor.owner),
+        "native control listener changed"
+    );
+    let stream = tokio::net::UnixStream::connect(&descriptor.socket).await?;
+    ensure!(
+        stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
+        "native control listener has a different owner"
+    );
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    let connection = tokio::spawn(connection);
+    let request = Request::post(format!("http://localhost{path}"))
+        .header("Authorization", format!("Bearer {}", descriptor.token))
+        .header("Content-Type", "application/json")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::from(serde_json::to_vec(body)?)))?;
+    let response = sender.send_request(request).await;
+    let result = async {
+        let response = response?;
+        ensure!(
+            response.status().is_success(),
+            "native control is reconnecting"
+        );
+        let bytes = Limited::new(response.into_body(), MAX_BODY)
+            .collect()
+            .await
+            .map_err(anyhow::Error::msg)?
+            .to_bytes();
+        Ok::<Value, anyhow::Error>(serde_json::from_slice(&bytes)?)
+    }
+    .await;
+    connection.abort();
+    result
 }

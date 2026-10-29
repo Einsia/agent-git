@@ -538,7 +538,8 @@ fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
 
 /// A non-array hook event refuses the Claude settings item without editing that file or any other
 /// configuration, and setup reports itself incomplete. The native control plugin is an independent
-/// item and may install alongside the refusal.
+/// item and may install alongside the refusal. An install that does edit the file keeps the file it
+/// read beside it.
 #[test]
 fn hook_setup_refuses_non_array_events_before_editing_configuration() {
     for mode in ["ordinary", "quiet", "1", "2"] {
@@ -592,6 +593,13 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
             path.strip_prefix(lab.root.path()).unwrap().to_owned(),
             installed,
         );
+        let mut backup = path
+            .strip_prefix(lab.root.path())
+            .unwrap()
+            .as_os_str()
+            .to_owned();
+        backup.push(".agit-backup");
+        expected_files.insert(backup.into(), original.to_string().into_bytes());
         assert_eq!(setup_files(&lab), expected_files);
         success(setup_config_command(&lab, &args, mode).output().unwrap());
         assert_eq!(setup_files(&lab), expected_files);

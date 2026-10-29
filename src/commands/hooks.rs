@@ -101,6 +101,10 @@ pub enum Action {
         #[arg(long)]
         id: String,
     },
+    /// PermissionRequest: offer a native Claude Code permission ask to shared control and print
+    /// the answer given there; print nothing to leave the ask to the terminal.
+    #[command(hide = true)]
+    NativePermission,
     /// Spool native lifecycle metadata while its control channel is disconnected.
     #[command(hide = true)]
     NativeEvents {
@@ -166,6 +170,10 @@ pub fn run(args: Args) -> CmdResult {
         Action::NativeApproval { .. } => {
             anyhow::bail!("Native Claude Code shared control is not supported on this platform")
         }
+        Action::NativePermission => {
+            native_permission();
+            Ok(ExitCode::Ok)
+        }
         #[cfg(unix)]
         Action::NativeEvents {
             session,
@@ -228,6 +236,30 @@ impl Source {
             Some("fork") => Source::Fork,
             Some("compact") => Source::Compact,
             _ => Source::Other,
+        }
+    }
+}
+
+/// A permission ask's answer from shared control, as the PermissionRequest hook output; nothing
+/// when shared control gives none, so a failure never turns into an answer the person did not
+/// give. A payload over the bound does not parse, and so decides nothing.
+fn native_permission() {
+    #[cfg(unix)]
+    {
+        const PAYLOAD_LIMIT: u64 = 4 * 1024 * 1024;
+        let mut buf = String::new();
+        if std::io::stdin()
+            .take(PAYLOAD_LIMIT)
+            .read_to_string(&mut buf)
+            .is_ok()
+            && let Ok(payload) = serde_json::from_str(&buf)
+            && let Some(decision) = crate::rc::native_claude::permission::decide(&payload)
+        {
+            println!(
+                "{}",
+                serde_json::json!({"hookSpecificOutput":
+                    {"hookEventName":"PermissionRequest","decision":decision}})
+            );
         }
     }
 }
@@ -790,6 +822,13 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
         && starts_inbox_relay(runtime, ev)
     {
         crate::rc::claude_inbox::start_relay(&ev.session_id);
+    }
+    #[cfg(unix)]
+    if let Some(ev) = &event
+        && let Some(mode) = &ev.permission_mode
+        && runtime_of(runtime, ev.transcript_path.as_deref()) == "claude-code"
+    {
+        crate::rc::native_claude::permission::report_mode(&ev.session_id, mode);
     }
     if super::config::get("commit.auto").as_deref() == Some("false") {
         return Ok(());

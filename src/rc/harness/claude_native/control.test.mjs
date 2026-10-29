@@ -13,7 +13,6 @@ async function fixture() {
   const calls = [];
   const requests = [];
   const replies = [];
-  const approvalReplies = [];
   const claims = new Map();
   const pages = new Map();
   let acknowledged = 0;
@@ -32,19 +31,12 @@ async function fixture() {
       if (claimed) claims.set(key, null);
       return { generation: body.generation, id: body.id, claimed, result: claims.get(key) };
     }
-    if (path === "/approval") return approvalReplies.shift()(body);
     for (const result of body.results) claims.set(body.generation + ":" + result.id, result);
     const reply = replies.shift();
     return reply ? reply(body) : { generation: body.generation, ack_seq: body.events.at(-1)?.seq ?? 0 };
   };
   api.env = { get: async () => null };
   api.process = { run: async (argv, init) => {
-    if (argv[2] === "native-approval") {
-      const reply = await request(api, "/approval", {
-        session: argv[4], generation: argv[6], id: argv[8],
-      });
-      return { exitCode: 0, stdout: JSON.stringify(reply) };
-    }
     if (argv[2] === "native-events") {
       const request = JSON.parse(init.stdin);
       if (request.events?.length) {
@@ -69,7 +61,7 @@ async function fixture() {
   const next = async () => ({});
   next.signal = new AbortController().signal;
   return {
-    calls, requests, replies, approvalReplies, control, api,
+    calls, requests, replies, control, api, hooks,
     fire: (name, input = {}, downstream = next, context = api) => hooks.get(name)(context, input, downstream),
     setSession: value => { session = value; },
     poll: () => control.poll(api),
@@ -79,18 +71,19 @@ async function fixture() {
 
 test("session ABA, lost replies, and stale turn IDs never repeat or retarget native effects", async () => {
   const f = await fixture();
+  // Claude Code passes user plugins over on classic events where an organization's security
+  // default is seated, so a classic handler here would silently never run.
+  assert.deepEqual([...f.hooks.keys()].filter(name => name.startsWith("classic.")), []);
   await f.fire("session.start");
   const delayed = deferred();
   f.replies.push(() => delayed.promise);
   const polling = f.poll();
   await flush();
   const first = f.latest();
-  await f.fire("classic.SessionEnd", { session_id: "a" });
+  await f.fire("session.end", { sessionId: "a", reason: "resume" });
   f.setSession("b");
-  await f.fire("classic.SessionStart", { session_id: "b", cwd: "/project" });
-  await f.fire("classic.SessionEnd", { session_id: "b" });
+  await f.fire("session.end", { sessionId: "b", reason: "resume" });
   f.setSession("a");
-  await f.fire("classic.SessionStart", { session_id: "a", cwd: "/project" });
   const prompt = { ...first, id: "send", method: "prompt", text: "One native message" };
   delayed.resolve({ generation: first.generation, commands: [prompt] });
   await polling;
@@ -298,63 +291,6 @@ test("model changes remain pending until native confirmation and honor live poli
   assert.ok(f.latest().results.some(result => result.id === "locked" && result.outcome === "not_sent"));
 });
 
-test("a native approval answer retires remote control outside the cancelled hook context", async () => {
-  const f = await fixture();
-  await f.fire("session.start");
-  await f.fire("turn.start", { turnId: "main-turn" });
-  const controller = new AbortController();
-  const inherited = {};
-  const next = async () => inherited;
-  next.signal = controller.signal;
-  const delayed = deferred();
-  f.approvalReplies.push(() => delayed.promise);
-  const permission = f.fire("classic.PermissionRequest", {
-    session_id: "a", tool_name: "Write", tool_input: { file_path: "/project/result" },
-  }, next);
-  await flush();
-  await f.poll();
-  const target = f.latest();
-  assert.equal(target.approvals.length, 1);
-  const id = target.approvals[0].id;
-  controller.abort();
-  await f.poll();
-  assert.deepEqual(f.latest().approvals, []);
-  assert.ok(f.latest().events.some(e => e.kind === "approval_resolved" && e.id === id));
-  delayed.resolve({ generation: target.generation, id, decision: { behavior: "allow" } });
-  assert.equal(await permission, inherited, "a late remote allow cannot replace a native terminal answer");
-
-  await f.fire("turn.complete", { turnId: "child-turn", agentId: "child", reason: "completed" });
-  await f.poll();
-  assert.equal(f.latest().turn, "main-turn", "a subagent completion does not end the main conversation");
-  assert.equal(await f.fire("classic.PermissionRequest", {
-    session_id: "a", agent_id: "child", tool_name: "Write", tool_input: {},
-  }, next), inherited);
-});
-
-test("an unanswered question waits through native APIs and applies its exact answer", async () => {
-  const f = await fixture();
-  const retry = deferred();
-  f.api.clock.sleep = () => assert.fail("waiting for the person cannot consume the hook budget");
-  const input = { questions: [{ question: "Continue?", options: [{ label: "Yes" }] }] };
-  const decision = { behavior: "allow", updatedInput: { ...input, answers: { "Continue?": "Yes" } } };
-  f.approvalReplies.push(async body => {
-    await retry.promise;
-    return { generation: body.generation, id: body.id, decision: null };
-  });
-  f.approvalReplies.push(body => ({ generation: body.generation, id: body.id, decision }));
-  await f.fire("session.start");
-  const permission = f.fire("classic.PermissionRequest", {
-    session_id: "a", tool_name: "AskUserQuestion", tool_input: input,
-  });
-  await flush();
-  await f.poll();
-  assert.equal(f.latest().approvals.length, 1, "waiting cannot discard a pending native question");
-  retry.resolve();
-  assert.deepEqual(await permission, { decision });
-  await f.poll();
-  assert.equal(f.latest().approvals.length, 0);
-});
-
 test("native tool and compaction activity stays visible until completion without copying content", async () => {
   const f = await fixture();
   await f.fire("session.start");
@@ -367,10 +303,6 @@ test("native tool and compaction activity stays visible until completion without
   assert.deepEqual(f.latest().tools, [{ id: "read-1", tool: "Read" }]);
   assert.equal(f.latest().compacting, true);
   assert.equal(JSON.stringify(f.latest()).includes("Private transcript content"), false);
-  const generation = f.latest().generation;
-  await f.fire("classic.SessionStart", { session_id: "a", cwd: "/project", source: "compact" });
-  await f.poll();
-  assert.equal(f.latest().generation, generation, "compaction must not replace the live control generation");
   assert.equal(f.latest().turn, "compacting-turn");
   assert.equal(f.latest().compacting, true);
   const nativeToolResult = { result: "Private tool content" };
