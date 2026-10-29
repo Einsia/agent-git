@@ -4,6 +4,7 @@ mod approval;
 pub(crate) mod completion;
 pub(crate) mod event_queue;
 mod install;
+pub(crate) mod permission;
 pub(crate) mod status;
 mod transport;
 pub(crate) use approval::wait_approval;
@@ -119,6 +120,29 @@ impl Registration {
             })
             .is_some_and(|current| current == *self && self.is_current())
     }
+}
+
+/// The registration of the native writer that runs `session` and is an ancestor of this process.
+/// A settings hook is the writer's descendant through the shell, and any launcher, that runs it;
+/// a process outside that tree cannot speak for the session.
+pub(crate) fn ancestor_registration(session: &str) -> Option<Registration> {
+    const ANCESTRY: usize = 6;
+    let directory = crate::infra::config::agit_home()
+        .ok()?
+        .join("native-claude");
+    let mut pid = std::process::id();
+    for _ in 0..ANCESTRY {
+        let (_, parent) = process(pid)?;
+        if let Ok(registration) = read_registration(&directory.join(format!("{parent}.json")))
+            && registration.process.pid == parent
+            && registration.session == session
+            && registration.is_registered()
+        {
+            return Some(registration);
+        }
+        pid = parent;
+    }
+    None
 }
 
 /// Only a child of the registered native writer can announce its current generation.

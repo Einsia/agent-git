@@ -31,14 +31,12 @@ let registrationRetry = 0;
 let registering = null;
 let ending = false;
 let turn = null;
-let permissionMode = null;
 let polling = false;
 const tools = new Map();
 const compactions = new Set();
 const operations = new Map();
 let queue = null;
 let journal = null;
-const approvals = new Map();
 let modelChange = null;
 let recordCompletion = null;
 
@@ -49,11 +47,9 @@ function rotate(session, cwd) {
   descriptor = null;
   registrationRetry = 0;
   turn = null;
-  permissionMode = null;
   modelChange = null;
   queue = { sequence: 0, buffered: 0, events: [], spilled: false, work: Promise.resolve() };
   operations.clear();
-  approvals.clear();
   tools.clear();
   compactions.clear();
 }
@@ -273,19 +269,14 @@ export async function poll($) {
   try {
     target = await current($);
     if (!target || !await ensureRegistered($, target)) return;
-    for (const [id, value] of approvals) {
-      if (value.signal.aborted) {
-        approvals.delete(id);
-        await event("approval_resolved", { id });
-      }
-    }
     const pending = queue;
     const batch = await pendingEvents(target, pending);
     if (!matches(target)) return;
     const sentEvents = batch.events;
     const sentResults = [...operations.values()].filter(r => r.result);
-    const live = { turn, permission_mode: permissionMode, latest_seq: pending.sequence,
-      approvals: [...approvals.values()].map(r => r.wire),
+    // Permission asks and the permission mode arrive through the session's settings hooks,
+    // which Claude Code runs where it passes user plugins over on its classic events.
+    const live = { turn, permission_mode: null, latest_seq: pending.sequence, approvals: [],
       tools: [...tools.values()], compacting: compactions.size > 0 };
     const reply = await request($, "/poll", {
       ...target, ...live, registration, version: 1,
@@ -318,49 +309,6 @@ export async function poll($) {
   }
 }
 
-async function permission($, e, next) {
-  const inherited = await next(e);
-  if (inherited.decision || e.agent_id !== undefined) return inherited;
-  const target = await current($);
-  if (!target || e.session_id !== target.session || next.signal.aborted) return inherited;
-  const id = randomId();
-  const wire = { id, turn, tool: e.tool_name, input: e.tool_input };
-  approvals.set(id, { wire, signal: next.signal });
-  const executable = await $.env.get("AGIT_NATIVE_CONTROL_CLI") || DEFAULT_AGIT_CLI;
-  try {
-    while (!next.signal.aborted && matches(target)) {
-      try {
-        if (await ensureRegistered($, target)) {
-          // Native API waits preserve the hook budget while the person chooses an answer.
-          const result = await $.process.run([executable, "hooks", "native-approval",
-            "--session", target.session, "--generation", target.generation, "--id", id],
-          { cwd: target.cwd, timeoutMs: 35000,
-            ...(descriptor ? { env: { AGIT_NATIVE_CONTROL_DESCRIPTOR: descriptor } } : {}) });
-          if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error("Native approval is reconnecting");
-          const reply = JSON.parse(result.stdout);
-          if (next.signal.aborted || !matches(target)) break;
-          if (reply?.generation === target.generation && reply.id === id) {
-            if (reply.decision?.behavior === "allow" || reply.decision?.behavior === "deny") {
-              return { ...inherited, decision: reply.decision };
-            }
-          }
-          continue;
-        }
-      } catch {
-        // A transient control outage must not discard an unanswered native approval.
-      }
-      await $.clock.sleep(200, { signal: next.signal });
-    }
-  } catch {
-    // A native terminal decision aborts all APIs in this hook's context.
-  } finally {
-    if (matches(target) && approvals.delete(id)) {
-      await event("approval_resolved", { id });
-    }
-  }
-  return inherited;
-}
-
 export function registerControl(on) {
   on("session.start", async ($, e, next) => {
     journal = async (target, body) => {
@@ -387,20 +335,15 @@ export function registerControl(on) {
     $.clock.every(200, () => poll($));
     return next(e);
   });
-  on("classic.SessionEnd", ($, e, next) => {
+  on("session.end", async ($, e, next) => {
     // Invalidate before yielding to the runtime, even if the next session has the same ID.
-    if (e.agent_id === undefined && e.session_id === identity?.session) ending = true;
-    return next(e);
-  });
-  on("classic.SessionStart", ($, e, next) => {
-    if (e.agent_id === undefined) {
-      // Compaction can announce SessionStart while the same native turn is still running.
-      if (ending || !identity || identity.session !== e.session_id || identity.cwd !== e.cwd) {
-        rotate(e.session_id, e.cwd);
-      }
-      permissionMode = e.permission_mode ?? null;
-    }
-    return next(e);
+    const ended = e.sessionId === identity?.session;
+    if (ended) ending = true;
+    const result = await next(e);
+    // Whatever session follows, a /clear or a resume of this one included, starts a new
+    // generation at the next read.
+    if (ended) identity = null;
+    return result;
   });
   on("turn.start", async ($, e, next) => {
     await current($);
@@ -430,13 +373,6 @@ export function registerControl(on) {
     }
     return result;
   });
-  on("classic.UserPromptSubmit", ($, e, next) => {
-    if (e.agent_id === undefined && e.session_id === identity?.session && !ending) {
-      permissionMode = e.permission_mode ?? null;
-    }
-    return next(e);
-  });
-  on("classic.PermissionRequest", permission);
   on("tool.call", async ($, e, next) => {
     if (e.agentId !== undefined || !identity || ending || !e.tool_use_id) return next(e);
     const target = identity;
