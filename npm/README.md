@@ -23,8 +23,11 @@ Two package names, one CLI:
 `agit` is a native Rust binary. This package is a thin wrapper: npm installs
 the platform sub-package matching your `os`/`cpu` via `optionalDependencies`
 (`@einsia/agent-git-linux-x64` and friends), the `agit` bin is a Node shim
-that execs that binary with argv/stdio/exit-code forwarded, and `postinstall`
-runs `agit setup` once to wire skills, hooks, MCP and AGENTS.md.
+that execs that binary with argv/stdio/exit-code forwarded, and on a global install
+`postinstall` runs `agit setup` once to wire skills, hooks, MCP and AGENTS.md. A local
+install (a project dependency, or `npm install --prefix <dir>`) and `npx` configure nothing
+and record no installation: their binary goes away with that folder, so run `agit setup`
+yourself from a durable install if you want the integrations.
 
 The executable contains Git and Git LFS. On first use it extracts them under
 `$AGIT_HOME/git-runtime` (default `~/.agit/git-runtime`), with no runtime download.

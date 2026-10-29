@@ -24,23 +24,37 @@ function install(env, versionStatus = 0) {
   return calls
 }
 
+const GLOBAL = { npm_config_global: 'true' }
+const RECONCILE = ['rc', 'local', 'reconcile-installed', '--allow-other-installation']
+
 test('hidden npm retains a verified install even when integration setup is skipped', () => {
-  const calls = install({ AGIT_SKIP_SETUP: '1', DO_NOT_TRACK: '1' })
-  assert.deepEqual(calls.map(c => c.args), [['--version'], ['--internal-install-completed', '--defer-notice']])
+  const calls = install({ ...GLOBAL, AGIT_SKIP_SETUP: '1', DO_NOT_TRACK: '1' })
+  assert.deepEqual(calls.map(c => c.args), [['--version'], ['--internal-install-completed', '--defer-notice'], RECONCILE])
   assert.equal(calls[0].env.AGIT_TELEMETRY_DEFER, '1')
   assert.equal(calls[1].env.DO_NOT_TRACK, '1')
   assert.equal(calls[1].env.AGIT_INSTALL_CHANNEL, 'npm_global')
 })
 
 test('a failed binary self-check never reports installation success', () => {
-  assert.deepEqual(install({}, 1).map(c => c.args), [['--version']])
+  assert.deepEqual(install(GLOBAL, 1).map(c => c.args), [['--version']])
 })
 
-test('npm exec delegates the durable-install receipt to create-agit', () => {
-  assert.deepEqual(install({ npm_command: 'exec', AGIT_SKIP_SETUP: '1' }).map(c => c.args), [['--version']])
+test('npm exec delegates the durable-install receipt and setup to create-agit', () => {
+  assert.deepEqual(install({ ...GLOBAL, npm_command: 'exec' }).map(c => c.args), [['--version']])
+})
+
+// A local install (a project dependency, or `--prefix` into a scratch folder) only checks its
+// binary. One that recorded a receipt or ran `agit setup` would configure the person's machine
+// and point every runtime's hooks at a binary that goes away with that folder. Both ways npm
+// marks a global install still set the machine up.
+test('a local install records nothing and configures nothing', () => {
+  assert.deepEqual(install({}).map(c => c.args), [['--version']])
+  for (const env of [GLOBAL, { npm_config_location: 'global' }]) {
+    assert.deepEqual(install(env).map(c => c.args).at(-1), ['setup'])
+  }
 })
 
 test('foreground npm allows the verified binary to show its notice', () => {
-  const calls = install({ npm_config_foreground_scripts: 'true', AGIT_SKIP_SETUP: '1' })
+  const calls = install({ ...GLOBAL, npm_config_foreground_scripts: 'true', AGIT_SKIP_SETUP: '1' })
   assert.deepEqual(calls[1].args, ['--internal-install-completed'])
 })
