@@ -86,9 +86,18 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   two writers in at once. `was already adopted` is informational; the import
   continues. If a lock error persists, look for a still-running `agit` or `git`
   process and report it to the user.
-- Search prior work with `agit search "question" --repo owner/name --json`.
-  Repeat `--query` to batch related searches with shared filters. Read
+- Search prior work with `agit search "question" --repo owner/name --json`, or
+  across the person's organizations with `--scope org` when they ask how the team
+  did something. Repeat `--query` to batch related searches with shared filters. Read
   `references/commands/search.md` for pagination, limits, and uncertainty fields.
+- When a command fails, follow the `hint` in `diagnostics.stderr`; it names the next
+  command. Do not guess other commands or run diagnostics first. When a command says
+  the person must sign in, run the login steps above, then rerun the same command.
+- To take an upload down: when it exposed a secret, tell the person to rotate that
+  secret first, since a withdrawal doesn't undo a copy someone already made. Then have
+  them withdraw the session on its Hub page (the link push printed; owners can also
+  erase it there). Revoke a share link with `agit share rm <slug>`. agit has no
+  command that withdraws a session yet.
 - Read only the command reference needed for the operation; use
   `agit <command> --help` to check this installed build's exact options.
 
@@ -171,6 +180,8 @@ session and records its claim; it is not a read-only preview.
 | Open a branch or saved point | `agit run <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points |
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
+| Invite someone to a repository | `agit repo invite <owner/repo>[@branch] --role read\|write --json` | Prints an invite link (owners only); `@branch` lands them on that session |
+| Find how something was done before | `agit search "<words>" --scope org --json` | Cited session links from the person's organizations |
 | Publish local history | `agit push <owner/repo>@<branch> --yes` | Prints the destination, visibility and snapshot summary, then uploads; add `--dry-run` only when the user wants a preview first |
 
 ## Deliver files at completed milestones
