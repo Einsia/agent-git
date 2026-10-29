@@ -66,7 +66,7 @@ impl Daemon {
         #[cfg(unix)]
         let _native_claude = crate::rc::native_claude::Endpoint::start()?;
         #[cfg(unix)]
-        if crate::adapter::get("claude-code").is_ok_and(|adapter| adapter.available())
+        if crate::rc::harness::claude_code::program::resolve().is_some()
             && let Err(error) = crate::rc::native_claude::install_plugin()
         {
             eprintln!("agitd: native Claude integration is unavailable: {error:#}");

@@ -992,10 +992,11 @@ impl WatchRpcTicket {
                 let mut scanned = scanned;
                 if let Ok(prepared) = &mut scanned
                     && prepared.runtime == "codex"
-                    && let Some(codex) = prepared.enrolled.as_ref().map_or_else(
-                        || crate::adapter::which("codex"),
-                        |watch| watch.context.source.executable.clone(),
-                    )
+                    && let Some(codex) =
+                        prepared.enrolled.as_ref().map_or_else(
+                            crate::rc::runtime_sources::default_codex_program,
+                            |watch| watch.context.source.executable.clone(),
+                        )
                     && crate::rc::native_inbox::queue_available(codex).await
                 {
                     prepared.native_inbox = Some("codex_queue".into());

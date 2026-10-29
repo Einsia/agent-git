@@ -8,9 +8,13 @@ mod startup_cache;
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+    // A daemon installs Claude Code's native integration into the Claude profile under HOME, so
+    // the test's own home keeps every daemon it starts out of the real one.
     command
         .current_dir(home)
         .env("AGIT_HOME", home)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("AGIT_HUB_URL", "http://127.0.0.1:9")
         .env("AGIT_TELEMETRY", "off")
         .env("CI", "1")

@@ -558,9 +558,9 @@ impl Daemon {
     /// `session.resume` takes when it finds no logical identity.
     ///
     /// This sits apart from `resume_session` for exactly one reason: **so a unit test can really
-    /// walk the owner-only gate on this path.** `locate_local` succeeds only with an installed
-    /// harness (`which claude`) plus a real transcript on disk, so the whole takeover path is
-    /// unreachable from a test — and it is the scene of the "a transcript that ran without checks
+    /// walk the owner-only gate on this path.** `locate_local` needs a real transcript under a
+    /// bound folder and the takeover goes on to launch a harness, so the whole takeover path is
+    /// out of a unit test's reach — and it is the scene of the "a transcript that ran without checks
     /// gets minted into a clean identity" hole. Once the test is swapped for "ask this row" — a
     /// logical id fresh out of `mint_session_id` is forever clean to the ledger — an operator
     /// picks up everything that unchecked run read into its context; with this path unreachable,
@@ -893,7 +893,7 @@ impl Daemon {
                     })
                 }
                 None => crate::rc::native_inbox::Native::Codex(
-                    crate::adapter::which("codex")
+                    crate::rc::runtime_sources::default_codex_program()
                         .and_then(|path| path.canonicalize().ok())
                         .ok_or_else(|| {
                             RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
@@ -1506,7 +1506,11 @@ impl LocalSessionSnapshot {
         let mut out: Vec<LocalSession> = vec![];
 
         for adapter in crate::adapter::all() {
-            if !adapter.installable() || !adapter.available() {
+            // Sessions live in each runtime's own store, so whether its program can be found
+            // decides launching only. If it gated discovery, a daemon started with a minimal PATH
+            // (a desktop app's or a service manager's) would list none of them and answer every
+            // watch of one with "no local session".
+            if !adapter.installable() {
                 continue;
             }
             for root in &roots {
@@ -1646,15 +1650,11 @@ mod discovery_preview_tests {
     #[cfg(unix)]
     #[test]
     fn approval_sessions_cannot_displace_human_choices_but_remain_addressable() {
-        use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "AGIT_RC_INTERNAL_DISCOVERY_TEST_CHILD";
         let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
             let directory = tempfile::tempdir().unwrap();
             let bin = directory.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
-            let executable = bin.join("codex");
-            std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

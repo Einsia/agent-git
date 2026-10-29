@@ -158,6 +158,12 @@ pub(crate) fn override_harness_program(program: impl Into<String>) -> HarnessPro
 
 #[cfg(test)]
 #[cfg(unix)]
+pub(crate) fn harness_program_override() -> Option<String> {
+    PROGRAM_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) struct HarnessProgramOverride(Option<String>);
 
 #[cfg(test)]

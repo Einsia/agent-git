@@ -2,11 +2,12 @@ use super::*;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// Discovery must filter native children before its result limit, while explicit inventories
-/// retain them. Isolated processes keep runtime homes and executable discovery independent.
+/// retain them. Each case runs in its own process with a temporary home and a PATH that holds no
+/// runtime program, so discovery has only the runtime's own store to go on: a scan gated on
+/// finding the program lists nothing and fails here.
 #[test]
 fn user_session_discovery_preserves_parents_across_native_stores() {
     const CASE: &str = "AGIT_DISCOVERY_VISIBILITY_CASE";
@@ -23,12 +24,6 @@ fn user_session_discovery_preserves_parents_across_native_stores() {
             let root = directory.path();
             let bin = root.join("bin");
             std::fs::create_dir(&bin).unwrap();
-            for name in ["codex", "claude", "opencode"] {
-                let executable = bin.join(name);
-                std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-                std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-            }
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "rc::daemon::sessions::discovery_visibility_tests::user_session_discovery_preserves_parents_across_native_stores", "--nocapture"])
                 .env(CASE, case)

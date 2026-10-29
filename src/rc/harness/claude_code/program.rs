@@ -34,6 +34,15 @@ impl Program {
 
 /// PATH first, then the directories Claude Code's installers and Node package managers use.
 pub(crate) fn resolve() -> Option<Program> {
+    // A test's stand-in program is what a launch on its thread spawns, so it is also what this
+    // resolves to; otherwise a launch test on a machine without Claude Code stops here.
+    #[cfg(all(test, unix))]
+    if let Some(program) = crate::rc::harness::proc::harness_program_override() {
+        return Some(Program {
+            path: program.into(),
+            outside_path: false,
+        });
+    }
     resolve_from(
         crate::adapter::which(PROGRAM),
         crate::infra::config::user_home().as_deref(),
