@@ -109,6 +109,9 @@ pub mod domain {
     /// Links: what stands for a session in the store (not a copy).
     pub mod link;
     pub mod merge_archive;
+    /// The merge agent's opening message and the marker line the Hub renders it by. Shared by
+    /// the backend and the CLI.
+    pub mod merge_opening;
     /// The merge transaction lock (the target branch is locked between opening the merge and
     /// recording it).
     pub mod mergetx;

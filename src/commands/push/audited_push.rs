@@ -408,6 +408,18 @@ impl Intent {
         json!({"hub":self.hub,"account":self.account,"owner":self.owner,"name":self.name,"url":self.url,"visibility":self.visibility,"action":action,"agent_id":identity,"repo_origins":[],"publication":"registered session modes with immutable accepted ancestry"})
     }
 
+    /// The destination as a person confirms it; [`Self::json`] stays the machine form.
+    fn describe(&self) -> String {
+        let action = match &self.action {
+            Action::Create => "creates the repository",
+            Action::Existing(_) => "existing repository",
+        };
+        format!(
+            "{}/{} on {} ({}, {action}) as {}",
+            self.owner, self.name, self.hub, self.visibility, self.account
+        )
+    }
+
     fn verify_account(&self, client: &Client) -> Result<()> {
         ensure!(
             identity::normalize_hub(client.base())? == self.hub

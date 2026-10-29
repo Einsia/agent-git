@@ -30,7 +30,7 @@ agit merge --continue | --abort
 | `[SOURCE]` | Source branch, tag, or `owner/repo@ref`; `@` requires the session supplied through `AGIT_SESSION` |
 | `--into <owner/repo@branch>` | Explicit landing branch; a bare branch or an omitted target requires `AGIT_SESSION` |
 | `--as <runtime>` | Runtime used to start the merge agent |
-| `-m, --message <instruction>` | Extra constraints for the merge agent |
+| `-m, --message <instruction>` | Extra constraints for the merge agent; -m text is published with the conversation |
 | `--manual` | Do not start a model; print fork point, new turns, and plumbing commands |
 | `--dry-run` | Reconnaissance only; no lock, launch, or history change |
 | `--status` | Show the open merge transaction |

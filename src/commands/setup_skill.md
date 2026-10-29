@@ -380,7 +380,7 @@ Workspace bindings remain descriptive repo routes for creation and status. Nativ
 
 - Memory flows by itself between the runtime's memory directory and the session branch (materialized at `new`/`resume`, collected at every `agit commit`). `main` only moves when you distill: at a milestone run `agit memory status`, then `agit distill` (or `agit memory distill <file>…`) to carry the facts worth sharing into `main`; `commit --milestone` and `push` remind you when files are pending.
 - Do not run two branches of the same Agent repo in parallel in one directory; identity follows the process, not directory guesses.
-- With `AGIT_MERGE_TX=<owner/repo@target>`, act as the merge agent: inspect `agit view <source> --json`, drill into events with `agit show`, select with `merge pick/drop`, edit shared `memory/`, `skills/`, and `AGENTS.md`, write `agit merge summary -m "..."`, then `agit merge --continue`. Use `--abort` when irreconcilable.
+- With `AGIT_MERGE_TX=<owner/repo@target>`, act as the merge agent (`agit merge --status` names the source when the opening message withholds it): inspect `agit view <source> --json`, drill into events with `agit show`, select with `merge pick/drop`, edit shared `memory/`, `skills/`, and `AGENTS.md`, write `agit merge summary -m "..."`, then `agit merge --continue`. Use `--abort` when irreconcilable.
 - With `AGIT_RC=1`, a daemon supervises a shared workspace. Messages may come from other viewers/operators and approvals go to the workspace owner.
 - Never use rebase, amend, force-push, or ordinary `git checkout` to rewrite AgentGit history.
 

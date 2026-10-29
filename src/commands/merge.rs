@@ -53,7 +53,7 @@ pub struct Args {
     /// Run the merge agent under another runtime.
     #[arg(long = "as", value_name = "runtime")]
     pub as_runtime: Option<String>,
-    /// Extra human instruction (e.g. “only the conclusion, not the process”).
+    /// Extra human instruction (e.g. “only the conclusion, not the process”). -m text is published with the conversation.
     #[arg(short = 'm', long, value_name = "instruction")]
     pub message: Option<String>,
     /// Human-driven without a model: no agent is started; prints the fork point, new turns on both sides, and plumbing instructions.
@@ -374,7 +374,8 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    let instruction = merge_instruction(&slug, &target, src_ref, args.message.as_deref());
+    let source = opening_source(&slug, &base, tx.source_branch.as_deref());
+    let instruction = merge_instruction(&slug, &target, src_ref, &source, args.message.as_deref());
     let launch = archive_launch.context("agent merge has no retained launch selection")?;
     let mut launched = archive::launch::start(
         &destination,
@@ -386,7 +387,21 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         &instruction,
     )?;
     print_merge_instruction(&instruction);
-    archive::completion::finish(&destination, &store, &launched.binding, &mut launched.child)
+    let before = super::auto_push::branch_tip(destination.root(), &target);
+    let code =
+        archive::completion::finish(&destination, &store, &launched.binding, &mut launched.child)?;
+    // A session target also carries the exploration tail archived after landing. A file target's
+    // exploration lives on its own branch, which is published only on request.
+    if code == ExitCode::Ok && launched.binding.file_target.is_none() {
+        super::auto_push::after_settlement(
+            destination.root(),
+            &slug,
+            &target,
+            before.as_deref(),
+            false,
+        );
+    }
+    Ok(code)
 }
 
 fn print_merge_instruction(instruction: &str) {
@@ -496,23 +511,98 @@ fn manual_commands(slug: &str, target: &str, src_ref: &str) -> String {
 /// drills, are its own call, on demand.
 ///
 /// The native launch receives the opening prompt as an argument. It is never appended to the
-/// installed transcript, whose bytes define the archive's inherited evidence frontier.
-fn merge_instruction(slug: &str, target: &str, src: &str, extra: Option<&str>) -> String {
+/// installed transcript, whose bytes define the archive's inherited evidence frontier. The
+/// runtime records it as the exploration's first prompt, which is published with the target, so
+/// it opens with the [`merge_opening`](crate::domain::merge_opening) marker line the Hub renders
+/// it by, names the source only as far as `source` allows, and leaves the transaction marker to
+/// the agent's environment.
+fn merge_instruction(
+    slug: &str,
+    target: &str,
+    src: &str,
+    source: &crate::domain::merge_opening::Source,
+    extra: Option<&str>,
+) -> String {
+    let (src, locate) = match source.from() {
+        Some(_) => (src, String::new()),
+        None => (
+            "<source>",
+            "`agit merge --status` names `<source>`.\n".to_owned(),
+        ),
+    };
     let mut s = format!(
-        "You were started by `agit merge` as the merge agent (AGIT_MERGE_TX={slug}@{target}).\n\
-         Reconcile branch `{src}` into the target branch `{target}`. Reconcile intent, don't stitch text.\n\
+        "{}\n\
+         You were started by `agit merge` as the merge agent for `{slug}@{target}`.\n\
+         Reconcile `{src}` into the target branch `{target}`. Reconcile intent, don't stitch text.\n\
+         {locate}\
          \n\
          1. `agit view {src} --json` — what that session actually sees\n\
          2. `agit show {src}#n.k` — drill into events outside its VIEW\n\
          3. `agit merge pick {src}#a..#b` — select what belongs here (`drop` to unselect)\n\
          4. edit memory/ · skills/ · AGENTS.md under `$(agit repo path {slug}@{target})` — reconciling shared files is your job\n\
          5. `agit merge summary -m \"<what this reconciliation concluded>\"` — required to land\n\
-         6. `agit merge --continue` — land it (`--abort` drops it; the target ref never moved)\n"
+         6. `agit merge --continue` — land it (`--abort` drops it; the target ref never moved)\n",
+        source.sentence(),
     );
     if let Some(m) = extra.map(str::trim).filter(|m| !m.is_empty()) {
         s.push_str(&format!("\nThe human who started this merge adds: {m}\n"));
     }
-    s
+    let opening = crate::domain::merge_opening::Opening {
+        from: source.from(),
+        into: format!("{slug}@{target}"),
+    };
+    crate::domain::merge_opening::render(&opening, &s)
+}
+
+/// How the opening message may name the source, decided when the merge opens.
+///
+/// Another repository is named only when the Hub confirms, for the repository the source is
+/// pinned to, that anyone can read it; an unpublished source, a failed lookup or any other answer
+/// withholds it, because the message is published with the target.
+fn opening_source(
+    slug: &str,
+    base: &super::fork::ForkBase,
+    branch: Option<&str>,
+) -> crate::domain::merge_opening::Source {
+    let branch = branch.map_or_else(|| base.resolved.sha.clone(), str::to_owned);
+    let title = meta::read_at_ref(&base.repo, &base.resolved.sha).and_then(|m| m.title);
+    if base.slug == slug {
+        return crate::domain::merge_opening::Source::Same { branch, title };
+    }
+    let observed = crate::hub::identity::read(&base.repo)
+        .ok()
+        .flatten()
+        .map(|pin| {
+            let (owner, name) = super::parse_slug(&base.slug)?;
+            let client = crate::hub::Client::for_hub_with_timeout(
+                &pin.hub,
+                std::time::Duration::from_secs(5),
+            );
+            Ok((pin, client.get_agent(&owner, &name)?))
+        });
+    other_source(branch, title, observed)
+}
+
+fn other_source(
+    branch: String,
+    title: Option<String>,
+    observed: Option<
+        crate::Result<(
+            crate::hub::identity::RemoteIdentity,
+            crate::hub::RemoteAgent,
+        )>,
+    >,
+) -> crate::domain::merge_opening::Source {
+    match observed {
+        Some(Ok((pin, remote))) if remote.is_public() && remote.agent_id == pin.agent_id => {
+            crate::domain::merge_opening::Source::Public {
+                repository: remote.slug(),
+                branch,
+                title,
+            }
+        }
+        _ => crate::domain::merge_opening::Source::Withheld,
+    }
 }
 
 // ─────────────────── Transaction state ──────────────────
@@ -889,12 +979,15 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
             unreachable!()
         };
         let store = crate::domain::store::Store::at(crate::infra::config::store_root()?);
+        let target = binding.target_branch().to_owned();
+        let before = super::auto_push::branch_tip(repo.root(), &target);
         let outcome = archive::dispatch::continue_selected(&repo, &store, &binding, resolved)?;
         echo_archive(&slug, &binding, into);
         ui::success(&format!(
             "merge commit landed: {} (archived records: {})",
             outcome.commit, outcome.archived_records
         ));
+        super::auto_push::after_settlement(repo.root(), &slug, &target, before.as_deref(), false);
         return Ok(ExitCode::Ok);
     };
 
@@ -1037,6 +1130,13 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
         &tx.target_head[..9.min(tx.target_head.len())],
         &src_head[..9.min(src_head.len())]
     ));
+    super::auto_push::after_settlement(
+        repo.root(),
+        &slug,
+        &tx.target,
+        Some(&tx.target_head),
+        false,
+    );
     if !target_is_file_line {
         println!(
             "{}",
@@ -1102,10 +1202,12 @@ fn resolve_transaction_source(
             return Ok(None);
         }
     };
+    let name = super::fork::ref_name(&repo, &spec);
     Ok(Some(super::fork::ForkBase {
         repo,
         slug: slug.to_string(),
         resolved,
+        name,
     }))
 }
 
@@ -1623,11 +1725,19 @@ mod tests {
     // ───────────── The opening instruction ─────────────
 
     /// The instruction carries identity, direction and the whole protocol on its own — an agent
-    /// that has just come up never has to guess who it is.
+    /// that has just come up never has to guess who it is. The transaction marker stays in the
+    /// agent's environment: the instruction is published with the target.
     #[test]
     fn the_opening_instruction_carries_identity_direction_and_the_whole_protocol() {
-        let s = merge_instruction("me/repo", "main", "try-ratelimit", None);
-        assert!(s.contains("AGIT_MERGE_TX=me/repo@main"), "{s}");
+        let s = merge_instruction(
+            "me/repo",
+            "main",
+            "try-ratelimit",
+            &same("try-ratelimit"),
+            None,
+        );
+        assert!(s.contains("merge agent for `me/repo@main`"), "{s}");
+        assert!(!s.contains("AGIT_MERGE_TX"), "{s}");
         assert!(s.contains("`try-ratelimit`") && s.contains("`main`"), "{s}");
         for verb in [
             "agit view try-ratelimit --json",
@@ -1642,6 +1752,107 @@ mod tests {
             s.contains("memory/"),
             "shared-file reconciliation is its job and must be stated: {s}"
         );
+    }
+
+    fn same(branch: &str) -> crate::domain::merge_opening::Source {
+        crate::domain::merge_opening::Source::Same {
+            branch: branch.into(),
+            title: None,
+        }
+    }
+
+    /// The opening is published with the target, so it names the source only to readers who can
+    /// already open it: a branch of the same repository, or a repository the Hub confirms public
+    /// under the identity the source is pinned to. A rule that trusted the local slug, a pin to
+    /// another repository, or a failed lookup would publish a private repository's name, branch
+    /// and title.
+    #[test]
+    fn the_opening_names_its_source_only_as_far_as_the_targets_readers_can_see_it() {
+        use crate::domain::merge_opening::{Source, recognize};
+        const ONE: &str = "0190a8b2-0000-7000-8000-000000000001";
+        const OTHER: &str = "0190a8b2-0000-7000-8000-000000000002";
+        let (_tmp, repo) = refs::fixtures::forked_history();
+        let resolved = refs::resolve(&repo, &refs::parse("main").unwrap()).unwrap();
+        let base = super::super::fork::ForkBase {
+            repo,
+            slug: "me/repo".into(),
+            resolved,
+            name: Some("main".into()),
+        };
+        let local = opening_source("me/repo", &base, Some("try-ratelimit"));
+        assert!(
+            matches!(&local, Source::Same { branch, .. } if branch == "try-ratelimit"),
+            "{local:?}"
+        );
+        let s = merge_instruction("me/repo", "main", "try-ratelimit", &local, None);
+        assert_eq!(
+            recognize(&s).unwrap().from.as_deref(),
+            Some("try-ratelimit")
+        );
+        assert!(s.contains("Merged `try-ratelimit`"), "{s}");
+
+        let pin = crate::hub::identity::RemoteIdentity::new("https://hub.example", ONE).unwrap();
+        let remote = |visibility: &str, agent_id: &str| crate::hub::RemoteAgent {
+            agent_id: agent_id.into(),
+            owner: "bob".into(),
+            name: "notes".into(),
+            clone_url: "https://hub.example/git/bob/notes.git".into(),
+            visibility: visibility.into(),
+            session_count: 0,
+            updated_at: None,
+            last_gist: None,
+        };
+        let title = Some("Rate limits".to_owned());
+        let public = other_source(
+            "try-ratelimit".into(),
+            title.clone(),
+            Some(Ok((pin.clone(), remote("public", ONE)))),
+        );
+        assert_eq!(
+            public,
+            Source::Public {
+                repository: "bob/notes".into(),
+                branch: "try-ratelimit".into(),
+                title: title.clone(),
+            }
+        );
+        let s = merge_instruction("me/repo", "main", "bob/notes@try-ratelimit", &public, None);
+        assert_eq!(
+            recognize(&s).unwrap().from.as_deref(),
+            Some("bob/notes@try-ratelimit")
+        );
+        assert!(
+            s.contains("Merged `bob/notes@try-ratelimit` (\"Rate limits\")."),
+            "{s}"
+        );
+
+        for observed in [
+            Some(Ok((pin.clone(), remote("private", ONE)))),
+            Some(Ok((pin.clone(), remote("public", OTHER)))),
+            Some(Err(anyhow::anyhow!("visibility could not be read"))),
+            None,
+        ] {
+            assert_eq!(
+                other_source("try-ratelimit".into(), title.clone(), observed),
+                Source::Withheld
+            );
+        }
+        let s = merge_instruction(
+            "me/repo",
+            "main",
+            "bob/notes@try-ratelimit",
+            &Source::Withheld,
+            None,
+        );
+        assert_eq!(recognize(&s).unwrap().from, None);
+        assert!(s.contains("Merged another conversation."), "{s}");
+        assert!(s.contains("`agit merge --status` names `<source>`"), "{s}");
+        for leak in ["bob/notes", "try-ratelimit", "Rate limits", "AGIT_MERGE_TX"] {
+            assert!(
+                !s.contains(leak),
+                "`{leak}` reached the published opening: {s}"
+            );
+        }
     }
 
     #[test]
@@ -1694,6 +1905,7 @@ mod tests {
             "me/repo",
             "main",
             "try-ratelimit",
+            &same("try-ratelimit"),
             Some("only the conclusion"),
         );
         assert!(
@@ -1707,8 +1919,37 @@ mod tests {
 
     #[test]
     fn an_empty_extra_instruction_adds_nothing() {
-        let bare = merge_instruction("me/r", "main", "b", None);
-        assert_eq!(merge_instruction("me/r", "main", "b", Some("   ")), bare);
+        let bare = merge_instruction("me/r", "main", "b", &same("b"), None);
+        assert_eq!(
+            merge_instruction("me/r", "main", "b", &same("b"), Some("   ")),
+            bare
+        );
+    }
+
+    /// The human's text is theirs and is published as written; only the text agit generates
+    /// follows the source rule. A withheld source named in `-m` therefore appears once, in the
+    /// human's line, and agit neither repeats it in the marker, the sentence or the protocol
+    /// steps, nor drops the human's text.
+    #[test]
+    fn a_withheld_source_named_in_the_human_text_is_not_repeated_by_agit() {
+        let extra = "keep bob/notes@try-ratelimit's conclusion only";
+        let s = merge_instruction(
+            "me/repo",
+            "main",
+            "bob/notes@try-ratelimit",
+            &crate::domain::merge_opening::Source::Withheld,
+            Some(extra),
+        );
+        assert_eq!(
+            crate::domain::merge_opening::recognize(&s).unwrap().from,
+            None
+        );
+        assert!(
+            s.contains(&format!("The human who started this merge adds: {extra}\n")),
+            "{s}"
+        );
+        assert_eq!(s.matches("bob/notes").count(), 1, "{s}");
+        assert_eq!(s.matches("try-ratelimit").count(), 1, "{s}");
     }
 
     // ───── Selections land in the VIEW ─────

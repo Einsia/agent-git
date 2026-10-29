@@ -700,6 +700,37 @@ fn settlement_recovery_hint_preserves_the_literal_branch_argument() {
     }
 }
 
+/// With `push.auto` on, a landed merge publishes like a settled turn: `--continue` starts the
+/// same automatic push, and a Hub that cannot take it leaves the merge landed locally with the
+/// exact retry command. A landing that skipped automatic publication would leave the Hub without
+/// the merge and say nothing.
+#[test]
+fn a_landed_merge_is_pushed_automatically() {
+    let lab = Lab::new();
+    lab.success(&["config", "--repo", "me/qa", "push.auto", "true"]);
+    assert!(lab.merge().status.success());
+    lab.success(&[
+        "merge",
+        "--into",
+        "me/qa@work",
+        "summary",
+        "-m",
+        "keep both",
+    ]);
+    let head = lab.git(&["rev-parse", "refs/heads/work"]);
+    let landed = lab.success(&["merge", "--into", "me/qa@work", "--continue"]);
+    assert_ne!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&landed.stdout),
+        String::from_utf8_lossy(&landed.stderr)
+    );
+    assert!(
+        output.contains("automatic push failed for me/qa@work. Run `agit push me/qa@work`"),
+        "{output}"
+    );
+}
+
 /// A canceled runtime must not borrow authority from a replacement transaction on the same target.
 #[test]
 fn merge_agent_generation_cannot_modify_a_replacement_transaction() {
@@ -780,7 +811,7 @@ impl ArchiveTerminal {
     }
 
     fn start_with_runtime(lab: &Lab, exit: u8, available: bool) -> Self {
-        Self::start_selected(lab, exit, available, "work", "codex", None)
+        Self::start_selected(lab, exit, available, "work", "codex", None, &[])
     }
 
     fn start_selected(
@@ -790,6 +821,7 @@ impl ArchiveTerminal {
         target: &str,
         runtime: &str,
         file_mode: Option<&str>,
+        extra: &[&str],
     ) -> Self {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
@@ -849,6 +881,7 @@ impl ArchiveTerminal {
             "--as",
             runtime,
         ]);
+        command.args(extra);
         command.cwd(&lab.work);
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize::default())
@@ -1034,6 +1067,71 @@ fn session_agent_start_settles_old_content_then_activates_archive_before_spawn()
             journal.previous_claims[0].original_json
         );
     }
+}
+
+/// The runtime records the opening, `-m` text included, as the exploration's first prompt, and
+/// that prompt settles through the same protection as every other prompt: a credential the
+/// human typed into `-m` reaches the branch replaced, and the opening stays recognizable. An
+/// opening that carried `-m` outside the prompt, or a settlement that exempted it, would publish
+/// the credential with the target.
+#[test]
+#[cfg(unix)]
+fn a_credential_in_the_merge_message_is_replaced_in_the_settled_opening() {
+    use agit::domain::{merge_opening, meta, repo::Repo, storage};
+    let lab = Lab::new();
+    let credential = "ghp_7Kd2mQ9xR4vB1nT8sW3zY6cL5jH0gF2aE4pU";
+    let instruction = format!("call the API with {credential} only");
+    let _ = ArchiveTerminal::start_selected(
+        &lab,
+        0,
+        true,
+        "work",
+        "codex",
+        None,
+        &["-m", &instruction],
+    )
+    .finish();
+    let receipt = fs::read_to_string(lab.home.join("launch-receipt")).unwrap();
+    let opening = &receipt[receipt
+        .find(merge_opening::MARKER)
+        .expect("opening launched")..];
+    let opening = format!("{}\n", opening.trim_end());
+    assert!(opening.contains(&instruction), "{opening}");
+    lab.success(&["merge", "--abort", "--into", "me/qa@work"]);
+
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&lab.native)
+        .unwrap()
+        .write_all(
+            format!(
+                "{}{}",
+                message("user", &opening),
+                message("assistant", "SYNTHETIC-MERGED")
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(lab.merge().status.success());
+    let repo = Repo::open(lab.repo()).unwrap();
+    let head = lab.git(&["rev-parse", "refs/heads/work"]);
+    let log = storage::materialize_at(repo.root(), &head, meta::LOG_FILE).unwrap();
+    assert!(log.contains("SYNTHETIC-MERGED"), "{log}");
+    assert!(!log.contains(credential), "{log}");
+    let settled = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| {
+            let text = line
+                .pointer("/content/payload/content/0/text")?
+                .as_str()?
+                .to_owned();
+            merge_opening::recognize(&text).map(|_| text)
+        })
+        .expect("the settled opening is still recognized");
+    assert!(settled.contains("call the API with "), "{settled}");
+    assert!(settled.contains(" only"), "{settled}");
 }
 
 /// A failed runtime keeps the same generation cancellable without summary or a surviving source ref.
@@ -1391,7 +1489,8 @@ fn file_agent_public_launch_lands_and_captures_only_the_visible_session_branch()
         let existing = fs::read(lab.link()).unwrap();
         let native = fs::read(&lab.native).unwrap();
         let (status, output) =
-            ArchiveTerminal::start_selected(&lab, 0, true, "main", runtime, Some(mode)).finish();
+            ArchiveTerminal::start_selected(&lab, 0, true, "main", runtime, Some(mode), &[])
+                .finish();
         assert_eq!(status.exit_code(), 0, "{runtime}: {status:?}: {output}");
         let repo = Repo::open(lab.repo()).unwrap();
         let main = lab.git(&["rev-parse", "refs/heads/main"]);
@@ -1487,7 +1586,7 @@ fn file_agent_public_failed_launch_remains_abortable_without_a_native_file() {
         let lab = Lab::new();
         let main = lab.git(&["rev-parse", "refs/heads/main"]);
         let (status, output) =
-            ArchiveTerminal::start_selected(&lab, 0, true, "main", "claude-code", Some(mode))
+            ArchiveTerminal::start_selected(&lab, 0, true, "main", "claude-code", Some(mode), &[])
                 .finish();
         assert_eq!(status.exit_code(), 4, "{mode}: {status:?}: {output}");
         assert_eq!(lab.git(&["rev-parse", "refs/heads/main"]), main);

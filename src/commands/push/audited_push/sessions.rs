@@ -321,7 +321,7 @@ pub(super) fn run(
         args.show_preview && !automatic,
     )?;
     previewing.finish();
-    println!("Publication destination: {displayed}");
+    println!("Publication destination: {}", intent.describe());
     println!("Privacy preview: {}", preview.path.display());
     if !automatic {
         preview.show(&projected)?;
