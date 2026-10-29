@@ -157,6 +157,8 @@ impl Delivery {
             .as_ref()
             .and_then(|account| self.mapped_account(account));
         metadata.fork_origin = None;
+        metadata.source_ref = None;
+        metadata.source_commit = None;
         if metadata.is_session_line() {
             ensure!(
                 source

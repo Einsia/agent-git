@@ -50,6 +50,21 @@ pub struct ForkBase {
     pub repo: Repo,
     pub slug: String,
     pub resolved: refs::Resolved,
+    /// The ref name the source names, with `@` and an omitted ref already replaced by the
+    /// branch they stand for. `None` when the source names no ref at all.
+    pub name: Option<String>,
+}
+
+impl ForkBase {
+    /// The Hub's fork locator: `<owner/repo>@<name>#<turn>` when the fork point has a turn
+    /// ordinal, otherwise the exact commit. A branch name without a turn would follow the
+    /// branch as it moves, so it never stands alone.
+    pub fn locator(&self, turn: Option<u32>) -> String {
+        match (&self.name, self.resolved.turn.or(turn)) {
+            (Some(name), Some(turn)) => format!("{}@{name}#{turn}", self.slug),
+            _ => format!("{}@{}", self.slug, self.resolved.sha),
+        }
+    }
 }
 
 /// Reused by run: resolve the fork point.
@@ -67,11 +82,13 @@ pub fn resolve_base(source: &str, cwd: &std::path::Path) -> crate::Result<Option
             return Ok(None);
         }
     };
+    let name = ref_name(&repo, &spec);
     match refs::resolve(&repo, &spec) {
         Ok(resolved) => Ok(Some(ForkBase {
             repo,
             slug,
             resolved,
+            name,
         })),
         Err(e) if e.is::<refs::Ambiguous>() => {
             Err(e.context(format!("failed to resolve `{source}`")))
@@ -80,6 +97,15 @@ pub fn resolve_base(source: &str, cwd: &std::path::Path) -> crate::Result<Option
             ui::error(&format!("failed to resolve `{source}`: {e:#}"));
             Ok(None)
         }
+    }
+}
+
+/// The ref name a resolved-`@` spec names, as [`ForkBase::name`] holds it.
+pub fn ref_name(repo: &Repo, spec: &RefSpec) -> Option<String> {
+    match &spec.base {
+        refs::Base::Name(name) | refs::Base::SessionBranch(name) => Some(name.clone()),
+        refs::Base::Default => repo.current_branch(),
+        refs::Base::At => None,
     }
 }
 
@@ -173,6 +199,7 @@ pub fn fork_branch(
         return Ok(None);
     }
 
+    let source_ref = base.locator(base_snap.turn);
     let mut origin = ForkOrigin {
         commit: base_sha.clone(),
         context: ForkContext::Original,
@@ -226,6 +253,8 @@ pub fn fork_branch(
     snap.committer_account = crate::infra::credentials::current_account()?;
     snap.session_privacy = Some(SessionPrivacy::new(snap.committer_account.clone())?);
     snap.fork_origin = Some(origin);
+    snap.source_ref = Some(source_ref);
+    snap.source_commit = Some(base_sha.clone());
     snap.session = mint_claim(base_sha, new_name);
     snap.runtime_instances = Vec::new(); // instances belong to the source branch, not inherited
     snap.baseline_bytes = None;
@@ -378,6 +407,7 @@ mod tests {
                 range: None,
                 path: None,
             },
+            name: Some("main".into()),
         };
 
         let fork = fork_branch(&base, "main", "forked").unwrap().unwrap();
@@ -437,6 +467,7 @@ mod tests {
                 range: None,
                 path: None,
             },
+            name: Some("main".into()),
         };
 
         let error = fork_branch(&base, "main", "forked").unwrap_err();

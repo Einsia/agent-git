@@ -327,6 +327,31 @@ fn continue_and_fork_each_report_their_source_point_once() {
     );
 }
 
+/// The Hub shows a fork's origin from `source_ref` and `source_commit` in the new branch's
+/// meta, and both must name the point the user picked: the ref they wrote with its turn, and
+/// that turn's commit. Deriving them from the source branch's head, or from the new branch,
+/// shows a fork as coming from a turn it never saw.
+#[test]
+fn fork_and_a_forking_run_record_the_point_they_forked() {
+    let hub = Hub::new();
+    let lab = Lab::new(&hub.url);
+    let fork = lab.run(&["fork", "me/qa@work#1", "-b", "picked"]);
+    assert!(fork.status.success(), "{fork:?}");
+    let run = lab.run(&["run", "me/qa@v1", "-b", "forked", "--no-launch"]);
+    assert!(run.status.success(), "{run:?}");
+
+    let repo = Repo::open(lab.home.join("repos/me/qa")).unwrap();
+    for (branch, locator) in [("picked", "me/qa@work#1"), ("forked", "me/qa@v1#1")] {
+        let tip = meta::read_at_ref(&repo, &format!("refs/heads/{branch}")).unwrap();
+        assert_eq!(tip.source_ref.as_deref(), Some(locator), "{branch}");
+        assert_eq!(
+            tip.source_commit.as_deref(),
+            Some(lab.first.as_str()),
+            "{branch}"
+        );
+    }
+}
+
 /// A Hub that cannot be reached leaves both runs exactly as they are with a Hub that records
 /// the receipts: the same exit status and the same output on both streams, once the parts
 /// that differ between any two labs (temporary paths, ids, commits) are masked.

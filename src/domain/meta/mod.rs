@@ -381,6 +381,14 @@ pub struct Meta {
     /// Independent forks retain which exact source context was copied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_origin: Option<super::session_privacy::ForkOrigin>,
+    /// The fork point as the Hub shows it, `<owner/repo>@<ref>#<turn>` or `<owner/repo>@<sha>`.
+    /// Fork and run write it from the ref that was forked; every later settlement keeps it, since
+    /// the Hub reads it from the tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// The agit commit `source_ref` resolved to when the fork was born.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
     /// The runtime that produced this session: `codex` / `claude-code`.
     ///
     /// Required once a session line has claimed an identity: the envelope's `_source` and VIEW
@@ -441,6 +449,8 @@ impl Meta {
             session_privacy: None,
             committer_account: None,
             fork_origin: None,
+            source_ref: None,
+            source_commit: None,
             runtime,
             cwd,
             code: None,
@@ -610,6 +620,12 @@ pub fn validate(meta: &Meta) -> Result<()> {
             "file lines cannot carry fork context"
         );
         origin.validate()?;
+    }
+    if meta.source_ref.is_some() || meta.source_commit.is_some() {
+        anyhow::ensure!(
+            meta.is_session_line(),
+            "file lines cannot carry a fork source"
+        );
     }
     if meta.kind == Kind::Archive {
         anyhow::ensure!(

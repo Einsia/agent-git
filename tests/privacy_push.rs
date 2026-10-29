@@ -820,6 +820,15 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert!(!refused.status.success(), "{refused:?}");
     let displayed = String::from_utf8_lossy(&refused.stdout);
     assert!(displayed.contains("Registered plain conversation"));
+    // The destination is confirmed by a person, so it reads as a sentence, not a JSON object.
+    assert!(
+        displayed.lines().any(|line| line
+            == format!(
+                "Publication destination: alice/app on {} (private, existing repository) as alice",
+                hub.base
+            )),
+        "{displayed}"
+    );
     assert!(!displayed.contains("PRIVATE_NATIVE_FILE"));
     assert!(
         String::from_utf8_lossy(&refused.stdout).contains("receipt differs"),

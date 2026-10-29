@@ -2869,6 +2869,10 @@ fn settle_bytes(
     let mut observations = Meta::new(claim.clone(), source.to_string(), cwd.clone());
     observations.committer_account = credentials::current_account()?;
     observations.fork_origin = head_meta.as_ref().and_then(|head| head.fork_origin.clone());
+    observations.source_ref = head_meta.as_ref().and_then(|head| head.source_ref.clone());
+    observations.source_commit = head_meta
+        .as_ref()
+        .and_then(|head| head.source_commit.clone());
     observations.session_privacy = match head_meta.as_ref().filter(|head| head.is_session_line()) {
         Some(head) => head.session_privacy.clone(),
         None => Some(match &lk.session_privacy {
@@ -7902,6 +7906,8 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             snapshot: None,
         };
         snapshot.fork_origin = Some(fork_origin.clone());
+        snapshot.source_ref = Some("alice/photo@main#3".into());
+        snapshot.source_commit = Some("f".repeat(40));
         snapshot.turn = Some(4);
         meta::write(repo.root(), &snapshot).unwrap();
         repo.add_all().unwrap();
@@ -7968,6 +7974,8 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         assert_eq!(settled.runtime, "claude-code");
         assert_eq!(settled.session_privacy, Some(ownership));
         assert_eq!(settled.fork_origin, Some(fork_origin));
+        assert_eq!(settled.source_ref.as_deref(), Some("alice/photo@main#3"));
+        assert_eq!(settled.source_commit, Some("f".repeat(40)));
     }
 
     /// The main that `agit init` creates: its meta says `line: file`, and transcript input is
