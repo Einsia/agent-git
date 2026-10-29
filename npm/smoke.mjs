@@ -182,13 +182,20 @@ if (process.platform !== 'win32') {
     const lifecycleEnv = { ...env, HOME: lifecycleHome, USERPROFILE: lifecycleHome,
       AGIT_HOME: join(lifecycleHome, '.agit'), AGIT_SKIP_SETUP: '1',
       AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic',
-      npm_config_cache: join(work, 'npm-cache'), npm_config_userconfig: join(work, 'empty-npmrc') }
+      npm_config_cache: join(work, 'npm-cache'), npm_config_userconfig: join(work, 'empty-npmrc'),
+      npm_config_prefix: join(lifecycleHome, 'prefix') }
     delete lifecycleEnv.npm_config_foreground_scripts
-    const result = spawnSync('npm', ['install', '--offline', '--no-audit', '--no-fund', '--install-links', '--ignore-scripts=false', `--foreground-scripts=${foreground}`, fixture], {
+    const npmInstall = (global) => spawnSync('npm', ['install', ...(global ? ['-g'] : []), '--offline', '--no-audit', '--no-fund', '--install-links', '--ignore-scripts=false', `--foreground-scripts=${foreground}`, fixture], {
       encoding: 'utf8', env: lifecycleEnv, cwd: consumer, timeout: 30000,
     })
-    check(`real npm lifecycle succeeds (foreground=${foreground})`, result.status === 0, `${result.status} ${result.stderr}`)
     const dir = join(lifecycleHome, '.agit', 'telemetry')
+    // A local install's binary goes away with its folder, so it records no installation; only a
+    // global install records the receipt checked below.
+    const local = npmInstall(false)
+    check(`a local npm install records no installation (foreground=${foreground})`,
+      local.status === 0 && !existsSync(dir), `${local.status} ${local.stderr}`)
+    const result = npmInstall(true)
+    check(`real npm lifecycle succeeds (foreground=${foreground})`, result.status === 0, `${result.status} ${result.stderr}`)
     const prefs = join(dir, 'preferences.json')
     if (foreground) {
       check('foreground npm discloses before enabling statistics', existsSync(prefs) && (result.stdout + result.stderr).includes('AGIT_TELEMETRY_DISABLED'), result.stdout + result.stderr)

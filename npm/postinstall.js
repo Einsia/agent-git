@@ -44,29 +44,33 @@ function main() {
     return;
   }
 
-  // npx create-agit owns its durable-copy receipt and passes the browser acquisition key.
-  if (process.env.npm_command !== 'exec') {
-    const receiptArgs = ['--internal-install-completed'];
-    if (!truthy(process.env.npm_config_foreground_scripts)) receiptArgs.push('--defer-notice');
-    spawnSync(bin, receiptArgs, {
-      stdio: ['ignore', 'inherit', 'inherit'],
-      env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
-    });
-  }
-  if (truthy(process.env.npm_config_global) && process.env.npm_command !== 'exec') {
-    const reconciled = spawnSync(bin, ['rc', 'local', 'reconcile-installed', '--allow-other-installation'], {
-      encoding: 'utf8', timeout: 35000,
-      env: { ...env, AGIT_INTERNAL_UPDATE_RESTART: '1' },
-    });
-    if (reconciled.error || reconciled.status !== 0) {
-      log.warn(`RC daemon reconciliation failed: ${(reconciled.stderr || reconciled.error?.message || `exit ${reconciled.status}`).trim()}`);
-    } else {
-      try {
-        const outcome = JSON.parse(reconciled.stdout);
-        if (outcome.status === 'deferred') log.warn(`RC daemon upgrade is pending: ${outcome.message}`);
-      } catch {
-        log.warn('RC daemon returned an unreadable reconciliation result.');
-      }
+  // Only a global install configures the person's machine. A local install (a project dependency,
+  // or `--prefix` into a scratch folder) and `npm exec` record no receipt and run no setup: their
+  // binary goes away with that folder or cache, and every hook, Skill and MCP entry setup pointed
+  // at it would then fail in every runtime. npx create-agit records its own receipt and runs setup
+  // for the durable copy it installs.
+  const global = (truthy(process.env.npm_config_global) || process.env.npm_config_location === 'global')
+    && process.env.npm_command !== 'exec';
+  if (!global) return;
+
+  const receiptArgs = ['--internal-install-completed'];
+  if (!truthy(process.env.npm_config_foreground_scripts)) receiptArgs.push('--defer-notice');
+  spawnSync(bin, receiptArgs, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
+  });
+  const reconciled = spawnSync(bin, ['rc', 'local', 'reconcile-installed', '--allow-other-installation'], {
+    encoding: 'utf8', timeout: 35000,
+    env: { ...env, AGIT_INTERNAL_UPDATE_RESTART: '1' },
+  });
+  if (reconciled.error || reconciled.status !== 0) {
+    log.warn(`RC daemon reconciliation failed: ${(reconciled.stderr || reconciled.error?.message || `exit ${reconciled.status}`).trim()}`);
+  } else {
+    try {
+      const outcome = JSON.parse(reconciled.stdout);
+      if (outcome.status === 'deferred') log.warn(`RC daemon upgrade is pending: ${outcome.message}`);
+    } catch {
+      log.warn('RC daemon returned an unreadable reconciliation result.');
     }
   }
   if (truthy(process.env.AGIT_SKIP_SETUP)) return;
