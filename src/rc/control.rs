@@ -173,8 +173,9 @@ pub(crate) fn ask_with_timeout(
 enum Liveness {
     /// A daemon is on the far side, and it **answered**.
     Live(u32),
-    /// No socket exists and no instance holds ownership, or a refused socket has matching
-    /// ownership evidence and its lifetime lock is released. Refusal alone is insufficient.
+    /// No socket exists and no instance holds ownership, or a refused socket's lifetime lock is
+    /// released and either its record names it or the process that published it is gone.
+    /// Refusal alone is insufficient.
     Stale,
     /// Cannot tell: the connection goes through but nothing answers, or permissions or fds get in
     /// the way.
@@ -418,14 +419,7 @@ fn probe_with_owner(
         // Connect through the bounded path (see [`connect_within`]): against a full backlog a
         // blocking connect waits indefinitely on Linux, and probing twice would wedge twice.
         Liveness::Unknown(why) => match connect_within(path, CONNECT_TIMEOUT) {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                ownership_verdict(path, rc_dir, owner)
-            }
+            Err(e) if no_listener(&e) => ownership_verdict(path, rc_dir, owner),
             // Everything else that fails to connect (a connect timeout included) falls back to
             // `Unknown` — only the two above are enough for a verdict.
             _ => Liveness::Unknown(why),
@@ -433,8 +427,17 @@ fn probe_with_owner(
     }
 }
 
-/// A full accept queue may refuse connections. Only a released lifetime lock with a matching
-/// socket record proves exit; PID existence and missing legacy metadata cannot prove it.
+/// A connection that fails because nothing can listen at the path: no file, a refused socket, or
+/// a file that is not a socket (macOS reports one restored as a regular file that way).
+fn no_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) || error.raw_os_error() == Some(libc::ENOTSOCK)
+}
+
+/// A full accept queue may refuse connections. Only a released lifetime lock proves exit, with a
+/// record naming the socket or a publisher that is gone; missing legacy metadata cannot.
 fn ownership_verdict(
     path: &std::path::Path,
     rc_dir: &std::path::Path,
@@ -454,7 +457,8 @@ fn ownership_verdict(
             Err(error) => Err(error.into()),
             Ok(_) => owner
                 .ok_or_else(|| anyhow::anyhow!("no daemon lifetime ownership record exists"))?
-                .verify_stale(path),
+                .verify_stale(path)
+                .map(drop),
         }
     })();
     match evidence {
@@ -505,14 +509,7 @@ fn probe_once(
     // of the budgets below ever apply.
     let mut stream = match connect_within(path, CONNECT_TIMEOUT) {
         Ok(s) => s,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return ownership_verdict(path, rc_dir, owner);
-        }
+        Err(e) if no_listener(&e) => return ownership_verdict(path, rc_dir, owner),
         // A timeout lands here too: not getting a connection does not say "nobody is there", only
         // "this attempt did not connect". Calling it `Stale` removes the socket of a daemon that
         // may merely have a full queue.
@@ -598,7 +595,14 @@ fn listen_in(rc_dir: &std::path::Path) -> crate::Result<Listener> {
     }
     match probe_with_owner(&path, rc_dir, Some(&owner)) {
         Liveness::Stale => match std::fs::symlink_metadata(&path) {
-            Ok(_) => owner.remove_stale(&path)?,
+            Ok(_) => {
+                if owner.remove_stale(&path)? == ownership::Proof::Relocated {
+                    eprintln!(
+                        "agitd: removed {}, left by a daemon that no longer runs here",
+                        path.display()
+                    );
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         },
@@ -767,9 +771,19 @@ mod tests {
         std::fs::remove_file(desktop_socket).unwrap();
     }
 
+    /// A released lock reclaims a socket only with proof that its listener is gone: its record
+    /// names the socket, or nothing can still hold the file and the process `agitd.pid` names no
+    /// longer exists. A replacement bound by a starter that does not take the lock stays uncertain,
+    /// including before that starter has published its id, when `agitd.pid` still names its long
+    /// gone predecessor. Once nothing holds it, as after the home was copied to another machine,
+    /// the regular file a copy made of the socket is reclaimed everywhere, and the leftover socket
+    /// where the kernel lists bound sockets. Trusting the process id deletes a live replacement;
+    /// trusting the record alone leaves a moved home unable to start, stop or report its daemon.
     #[test]
-    fn stale_evidence_cannot_remove_a_replacement_socket() {
-        if in_isolated_process("stale_evidence_cannot_remove_a_replacement_socket") {
+    fn a_socket_the_record_does_not_name_is_reclaimed_only_once_its_publisher_is_gone() {
+        if in_isolated_process(
+            "a_socket_the_record_does_not_name_is_reclaimed_only_once_its_publisher_is_gone",
+        ) {
             return;
         }
         use std::os::unix::fs::MetadataExt;
@@ -777,20 +791,46 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rc = tmp.path();
         drop(listen_in(rc).unwrap());
+        // A starter that does not take the lock publishes its own process id, still running.
+        let running = std::os::unix::process::parent_id().to_string();
+        std::fs::write(rc.join("agitd.pid"), &running).unwrap();
         let path = socket_path_for(rc);
         let owner = Ownership::acquire(rc, false).unwrap().unwrap();
-        owner.verify_stale(&path).unwrap();
+        assert_eq!(
+            owner.verify_stale(&path).unwrap(),
+            ownership::Proof::Recorded
+        );
         // Retain the old inode so replacement cannot accidentally reuse its identity.
         let retired = rc.join("retired.sock");
         std::fs::rename(&path, retired).unwrap();
         let replacement = UnixListener::bind(&path).unwrap();
         let inode = std::fs::symlink_metadata(&path).unwrap().ino();
         assert!(owner.remove_stale(&path).is_err());
+        // No process has an id this large on either platform.
+        let gone = i32::MAX.to_string();
+        std::fs::write(rc.join("agitd.pid"), &gone).unwrap();
+        assert!(owner.remove_stale(&path).is_err());
+        std::fs::write(rc.join("agitd.pid"), &running).unwrap();
         drop(owner);
         assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
         drop(replacement);
         assert!(matches!(presence_in(rc), Presence::Unclear(_)));
         assert!(listen_in(rc).is_err());
+
+        std::fs::write(rc.join("agitd.pid"), &gone).unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(presence_in(rc), Presence::Absent);
+            drop(listen_in(rc).unwrap());
+        } else {
+            assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(rc.join("agitd.pid"), &running).unwrap();
+        assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+        std::fs::write(rc.join("agitd.pid"), &gone).unwrap();
+        assert_eq!(presence_in(rc), Presence::Absent);
+        drop(listen_in(rc).unwrap());
     }
 
     #[test]
