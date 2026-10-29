@@ -4,7 +4,7 @@
 
 pub(crate) mod media;
 pub(crate) mod paths;
-pub(crate) mod placeholder;
+pub mod placeholder;
 pub mod rules;
 pub(crate) mod syntax;
 use std::collections::{HashMap, HashSet};
@@ -128,7 +128,8 @@ pub(crate) fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 pub fn view_of(s: &str) -> String {
     let b = s.as_bytes();
-    if !b.contains(&b'\\') && !s.contains("{{AGIT_SECRET_V") {
+    if !b.contains(&b'\\') && !s.contains("{{AGIT_SECRET_V") && !s.contains(placeholder::TYPED_OPEN)
+    {
         return s.to_string();
     }
     let mut out = Vec::with_capacity(b.len());

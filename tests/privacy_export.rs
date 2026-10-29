@@ -154,7 +154,7 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
         String::from_utf8_lossy(&selected.stderr)
     );
     let selected = String::from_utf8(selected.stdout).unwrap();
-    assert!(selected.contains("AGIT_SECRET_V1"));
+    assert!(agit::domain::privacy::detector::placeholder::contains_token(&selected));
     assert!(!selected.contains("Read"));
     for args in [
         vec![

@@ -1,7 +1,7 @@
 //! User policy references durable recovery records without deleting their originals.
 
 use super::{
-    dictionary::{Origin, Record, token_identity},
+    dictionary::{Label, Origin, Record, token_id},
     policy::{self, Literal, Source},
     projector::Projector,
     storage::Store,
@@ -80,7 +80,7 @@ impl Store {
 
     pub fn decide(&mut self, decision: &Decision) -> crate::Result<()> {
         ensure!(
-            token_identity(&decision.token).is_some()
+            token_id(&decision.token).is_some()
                 && decision.name.len() <= 256
                 && decision.scope.len() <= 4096,
             "invalid privacy policy decision"
@@ -235,8 +235,9 @@ pub fn execute(
         ));
     }
     if command.action == "identify" {
-        // A finding without a record gets the record its replacement would have created, so
-        // every finding names an id that `allow` accepts.
+        // A finding without a record gets a record for its value, so every finding names an id
+        // that `allow` accepts. Only the value reaches this request, not the rule that found it,
+        // so its placeholder names the generic kind.
         let values: Vec<String> = serde_json::from_str(
             command
                 .secret
@@ -247,20 +248,23 @@ pub fn execute(
         for value in values {
             let token = match projector.dictionary.for_value(&value) {
                 Some(record) => Some(record.token.clone()),
-                None => Record::new(&projector.store.dictionary_id, &value, Origin::Heuristic)
-                    .and_then(|record| {
-                        projector
-                            .store
-                            .append(std::slice::from_ref(&record), projector.key.as_ref())?;
-                        let token = record.token.clone();
-                        projector.dictionary.accept(record)?;
-                        Ok(token)
-                    })
-                    .ok(),
+                None => Record::new(
+                    &projector.store.dictionary_id,
+                    &value,
+                    Origin::Heuristic,
+                    Label::secret("generic-api-key"),
+                )
+                .and_then(|record| {
+                    projector
+                        .store
+                        .append(std::slice::from_ref(&record), projector.key.as_ref())?;
+                    let token = record.token.clone();
+                    projector.dictionary.accept(record)?;
+                    Ok(token)
+                })
+                .ok(),
             };
-            identities.push(json!(
-                token.as_deref().and_then(token_identity).map(|(_, id)| id)
-            ));
+            identities.push(json!(token.as_deref().and_then(token_id)));
         }
         return Ok(Value::Array(identities));
     }
@@ -273,7 +277,12 @@ pub fn execute(
         )?;
         for value in values {
             if projector.dictionary.for_value(&value).is_none() {
-                let record = Record::new(&projector.store.dictionary_id, &value, Origin::Legacy)?;
+                let record = Record::new(
+                    &projector.store.dictionary_id,
+                    &value,
+                    Origin::Legacy,
+                    Label::secret("generic-api-key"),
+                )?;
                 projector
                     .store
                     .append(std::slice::from_ref(&record), projector.key.as_ref())?;
@@ -286,7 +295,7 @@ pub fn execute(
         let mut summaries: Vec<_> = projector.dictionary.records().filter_map(|record| {
             let rule = decisions.iter().find(|rule| rule.scope == scope && rule.token == record.token);
             if command.action == "list" && rule.is_none_or(|rule| rule.block != Some(true)) { return None; }
-            Some(json!({"id":token_identity(&record.token).map(|(_,id)|id),"token":record.token,
+            Some(json!({"id":token_id(&record.token),"token":record.token,
                 "name":rule.map(|rule|rule.name.as_str()).unwrap_or("detected secret"),
                 "origins":record.origins,"explicit_block":rule.is_some_and(|rule|rule.block == Some(true)),
                 "allowed":rule.is_some_and(|rule|rule.allow == Some(true))}))
@@ -310,6 +319,7 @@ pub fn execute(
                 } else {
                     Origin::RepositoryUser
                 },
+                Label::secret("explicit-block"),
             )?;
             projector
                 .store
@@ -328,7 +338,7 @@ pub fn execute(
             .records()
             .filter(|record| {
                 record.token == id
-                    || token_identity(&record.token).is_some_and(|(_, record_id)| record_id == id)
+                    || token_id(&record.token) == Some(id)
                     || decisions.iter().any(|rule| {
                         rule.scope == scope && rule.name == id && rule.token == record.token
                     })
@@ -365,5 +375,5 @@ pub fn execute(
         _ => anyhow::bail!("unknown privacy management action"),
     }
     projector.store.decide(&decision)?;
-    Ok(json!({"id":token_identity(&decision.token).map(|(_,id)|id),"name":decision.name}))
+    Ok(json!({"id":token_id(&decision.token),"name":decision.name}))
 }

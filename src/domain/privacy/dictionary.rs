@@ -1,8 +1,9 @@
 //! Reverse mappings are immutable. Policy changes do not destroy recovery information.
 
+use super::detector::placeholder;
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use zeroize::{Zeroize, Zeroizing};
 
 const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V2:";
@@ -51,15 +52,38 @@ impl Drop for Fragment {
     }
 }
 
+/// What a placeholder says about the value it replaced; see `placeholder::typed_token`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Label<'a> {
+    pub class: &'a str,
+    pub kind: &'a str,
+}
+
+impl<'a> Label<'a> {
+    /// A credential found by `rule`, or explicitly blocked when `rule` is `explicit-block`.
+    pub fn secret(rule: &'a str) -> Self {
+        Self {
+            class: "secret",
+            kind: placeholder::secret_kind(rule),
+        }
+    }
+}
+
 impl Record {
-    pub fn new(dictionary: &str, original: &str, origin: Origin) -> crate::Result<Self> {
+    pub fn new(
+        dictionary: &str,
+        original: &str,
+        origin: Origin,
+        label: Label<'_>,
+    ) -> crate::Result<Self> {
         uuid::Uuid::parse_str(dictionary).context("invalid dictionary identity")?;
         ensure!(
             !original.is_empty() && original.len() <= MAX_RECORD_BYTES,
             "privacy record exceeds its byte budget"
         );
         Ok(Self {
-            token: format!("{TOKEN_PREFIX}{dictionary}:{}}}}}", uuid::Uuid::new_v4()),
+            token: placeholder::typed_token(label.class, label.kind)
+                .context("invalid privacy placeholder label")?,
             original: original.to_owned(),
             origins: BTreeSet::from([origin]),
         })
@@ -91,7 +115,11 @@ impl Record {
     }
 }
 
-pub fn token_identity(token: &str) -> Option<(&str, &str)> {
+/// The record ID a placeholder names, for typed and legacy spellings alike.
+pub fn token_id(token: &str) -> Option<&str> {
+    if let Some((_, _, id)) = placeholder::typed_parts(token) {
+        return Some(id);
+    }
     let body = token
         .strip_prefix(TOKEN_PREFIX)
         .or_else(|| token.strip_prefix("{{AGIT_SECRET_V1:"))?
@@ -106,7 +134,7 @@ pub fn token_identity(token: &str) -> Option<(&str, &str)> {
             return None;
         }
     }
-    Some((dictionary, record))
+    Some(record)
 }
 
 struct Assembly {
@@ -137,6 +165,7 @@ impl Dictionary {
         self.records.get(token)
     }
 
+    /// The record that replaces `value`, preferring a typed token over a legacy alias.
     pub fn for_value(&self, value: &str) -> Option<&Record> {
         self.by_value
             .get(value)
@@ -149,7 +178,7 @@ impl Dictionary {
 
     pub fn accept(&mut self, record: Record) -> crate::Result<()> {
         ensure!(
-            token_identity(&record.token).is_some(),
+            token_id(&record.token).is_some(),
             "invalid privacy placeholder"
         );
         ensure!(
@@ -169,9 +198,18 @@ impl Dictionary {
                 "privacy dictionary exceeds its memory budget"
             );
             self.mapped_bytes += record.original.len();
-            self.by_value
-                .entry(record.original.clone())
-                .or_insert_with(|| record.token.clone());
+            match self.by_value.entry(record.original.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(record.token.clone());
+                }
+                Entry::Occupied(mut entry) => {
+                    if placeholder::typed_parts(&record.token).is_some()
+                        && placeholder::typed_parts(entry.get()).is_none()
+                    {
+                        entry.insert(record.token.clone());
+                    }
+                }
+            }
             self.records.insert(record.token.clone(), record);
         }
         Ok(())
@@ -180,7 +218,7 @@ impl Dictionary {
     /// A token is resolvable only after every authenticated fragment is available.
     pub fn accept_fragment(&mut self, part: Fragment) -> crate::Result<bool> {
         ensure!(
-            token_identity(&part.token).is_some(),
+            token_id(&part.token).is_some(),
             "invalid privacy placeholder"
         );
         ensure!(

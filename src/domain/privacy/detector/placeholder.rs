@@ -18,7 +18,133 @@ static CANONICAL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub(crate) fn token_segments(text: &str) -> TokenSegments<'_> {
-    TokenSegments { text, cursor: 0 }
+    TokenSegments {
+        text,
+        cursor: 0,
+        legacy: None,
+        typed: None,
+    }
+}
+
+/// Typed placeholders spell `‹CLASS:KIND:ID›`. The class and kind say what was removed, never
+/// anything about the value; the ID names a record in the owner's dictionary.
+pub const TYPED_OPEN: char = '\u{2039}';
+pub const TYPED_CLOSE: char = '\u{203A}';
+const TYPED_OPEN_ESCAPED: &str = "\\u2039";
+const TYPED_CLOSE_ESCAPED: &str = "\\u203a";
+pub const TYPED_CLASSES: [&str; 6] = ["secret", "path", "user", "host", "omitted", "custom"];
+const TYPED_ID_LEN: usize = 12;
+const TYPED_ID_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+const MAX_TYPED_KIND_LEN: usize = 32;
+/// The longest body a valid typed token can have, which bounds every scan for a closing mark.
+const MAX_TYPED_BODY_LEN: usize = 7 + 1 + MAX_TYPED_KIND_LEN + 1 + TYPED_ID_LEN;
+
+/// A new typed token with a random ID. The ID is not derived from the value, so equal tokens
+/// in two places say only that one dictionary replaced the same value there.
+pub fn typed_token(class: &str, kind: &str) -> Option<String> {
+    if !TYPED_CLASSES.contains(&class) || !valid_kind(kind) {
+        return None;
+    }
+    let bits: u64 = rand::random();
+    let id: String = (0..TYPED_ID_LEN)
+        .map(|index| char::from(TYPED_ID_ALPHABET[((bits >> (index * 5)) & 31) as usize]))
+        .collect();
+    Some(format!("{TYPED_OPEN}{class}:{kind}:{id}{TYPED_CLOSE}"))
+}
+
+/// `(class, kind, id)` of a complete typed token, or `None` for any other text.
+pub fn typed_parts(token: &str) -> Option<(&str, &str, &str)> {
+    let body = token.strip_prefix(TYPED_OPEN)?.strip_suffix(TYPED_CLOSE)?;
+    let mut parts = body.splitn(3, ':');
+    let (class, kind, id) = (parts.next()?, parts.next()?, parts.next()?);
+    (TYPED_CLASSES.contains(&class)
+        && valid_kind(kind)
+        && id.len() == TYPED_ID_LEN
+        && id.bytes().all(|byte| TYPED_ID_ALPHABET.contains(&byte)))
+    .then_some((class, kind, id))
+}
+
+fn valid_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= MAX_TYPED_KIND_LEN
+        && kind.as_bytes()[0].is_ascii_alphanumeric()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The kind a detector rule contributes to a secret placeholder.
+pub fn secret_kind(rule: &str) -> &str {
+    match rule {
+        "explicit-block" => "blocked",
+        "high-entropy-value" => "high-entropy",
+        "generic-api-key" | "credential-assignment" => "credential",
+        "private-key" | "agit-private-key-header" => "private-key",
+        "agit-credentials-in-url" => "url-password",
+        "agit-token" => "agentgit-token",
+        rule if valid_kind(rule) => rule,
+        _ => "credential",
+    }
+}
+
+/// A cheap prefilter: false means text holds no placeholder in any spelling.
+pub fn may_contain_token(text: &str) -> bool {
+    text.contains("AGIT_SECRET_V") || text.contains(TYPED_OPEN) || text.contains("\\u2039")
+}
+
+/// Whether text holds any recognized placeholder spelling, typed or legacy.
+pub fn contains_token(text: &str) -> bool {
+    may_contain_token(text) && token_segments(text).next().is_some()
+}
+
+/// The next typed token in raw text, accepting JSON-escaped delimiters around an ASCII body.
+/// One forward pass visits each byte once: only the lead byte of `‹` and a backslash can open a
+/// token, and each candidate is checked within the bounded token length.
+fn next_typed(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let lead = TYPED_OPEN.encode_utf8(&mut [0; 4]).as_bytes()[0];
+    let bytes = text.as_bytes();
+    let mut at = cursor;
+    while let Some(offset) = bytes[at..]
+        .iter()
+        .position(|&byte| byte == lead || byte == b'\\')
+    {
+        let start = at + offset;
+        at = start + 1;
+        let rest = &text[start..];
+        let open_len = if rest.starts_with(TYPED_OPEN) {
+            TYPED_OPEN.len_utf8()
+        } else if rest
+            .get(..TYPED_OPEN_ESCAPED.len())
+            .is_some_and(|open| open.eq_ignore_ascii_case(TYPED_OPEN_ESCAPED))
+        {
+            TYPED_OPEN_ESCAPED.len()
+        } else {
+            continue;
+        };
+        let body_start = start + open_len;
+        let tail = &text[body_start..];
+        let body_len = tail
+            .bytes()
+            .take(MAX_TYPED_BODY_LEN + 1)
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-'))
+            .count();
+        let after = &tail[body_len..];
+        let close_len = if after.starts_with(TYPED_CLOSE) {
+            Some(TYPED_CLOSE.len_utf8())
+        } else {
+            after
+                .get(..TYPED_CLOSE_ESCAPED.len())
+                .filter(|close| close.eq_ignore_ascii_case(TYPED_CLOSE_ESCAPED))
+                .map(str::len)
+        };
+        if let Some(close_len) = close_len {
+            let canonical = format!("{TYPED_OPEN}{}{TYPED_CLOSE}", &tail[..body_len]);
+            if typed_parts(&canonical).is_some() {
+                return Some((start, body_start + body_len + close_len));
+            }
+        }
+    }
+    None
 }
 
 /// Recognize repository tokens after decoding literal and JSON unicode-escaped bytes. Raw scans
@@ -254,15 +380,32 @@ fn next_token(text: &str, cursor: usize) -> Option<(usize, usize)> {
 pub(crate) struct TokenSegments<'a> {
     text: &'a str,
     cursor: usize,
+    /// Lookahead per spelling, so a spelling absent from the rest of the text is searched once.
+    legacy: Option<Option<(usize, usize)>>,
+    typed: Option<Option<(usize, usize)>>,
 }
 
 impl<'a> Iterator for TokenSegments<'a> {
     type Item = (usize, usize, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (start, end) = next_token(self.text, self.cursor)?;
+        let (text, cursor) = (self.text, self.cursor);
+        let stale = |found: &Option<Option<(usize, usize)>>| {
+            found.is_none_or(|found| found.is_some_and(|(start, _)| start < cursor))
+        };
+        if stale(&self.legacy) {
+            self.legacy = Some(next_token(text, cursor));
+        }
+        if stale(&self.typed) {
+            self.typed = Some(next_typed(text, cursor));
+        }
+        let (start, end) = match (self.legacy.flatten(), self.typed.flatten()) {
+            (Some(legacy), Some(typed)) => legacy.min(typed),
+            (Some(found), None) | (None, Some(found)) => found,
+            (None, None) => return None,
+        };
         self.cursor = end;
-        Some((start, end, &self.text[start..end]))
+        Some((start, end, &text[start..end]))
     }
 }
 
@@ -400,5 +543,43 @@ mod tests {
             let text = unit.repeat(128);
             assert_eq!(token_segments(&text).count(), expected * 128, "{unit}");
         }
+    }
+
+    /// Typed tokens are opaque in raw and JSON-escaped spellings, interleaved with legacy
+    /// tokens, and near misses stay ordinary text. A scanner that matched only raw delimiters
+    /// would scan inside an escaped token; one that accepted any bracketed text would hide
+    /// content that is not a placeholder.
+    #[test]
+    fn typed_tokens_are_opaque_in_raw_and_escaped_spellings() {
+        let token = typed_token("secret", "github-pat").unwrap();
+        let (class, kind, id) = typed_parts(&token).unwrap();
+        assert_eq!((class, kind), ("secret", "github-pat"));
+        assert_eq!(id.len(), TYPED_ID_LEN);
+        assert_ne!(token, typed_token("secret", "github-pat").unwrap());
+        let escaped = token
+            .replace(TYPED_OPEN, "\\u2039")
+            .replace(TYPED_CLOSE, "\\u203A");
+        let legacy = "{{AGIT_SECRET_V1:00000000-0000-0000-0000-000000000000:sec_00000000000000000000000000000000}}";
+        let text = format!("a {token} b {legacy} c {escaped} d {token}");
+        let found: Vec<_> = token_segments(&text).map(|(_, _, found)| found).collect();
+        assert_eq!(
+            found,
+            [token.as_str(), legacy, escaped.as_str(), token.as_str()]
+        );
+        assert!(contains_token(&escaped));
+        assert!(!crate::domain::privacy::detector::view_of(&text).contains(id));
+        for near in [
+            "\u{2039}secret:github-pat:abcdefghijk\u{203A}",
+            "\u{2039}secret:Github-pat:abcdefghijkl\u{203A}",
+            "\u{2039}unknown:github-pat:abcdefghijkl\u{203A}",
+            "\u{2039}secret:github-pat:abcdefghijk1\u{203A}",
+            "\u{2039}secret:github-pat:abcdefghijkl",
+        ] {
+            assert_eq!(token_segments(near).count(), 0, "{near}");
+            assert!(!contains_token(near), "{near}");
+        }
+        assert_eq!(secret_kind("explicit-block"), "blocked");
+        assert_eq!(secret_kind("aws-access-token"), "aws-access-token");
+        assert_eq!(secret_kind("Not A Kind"), "credential");
     }
 }

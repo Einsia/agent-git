@@ -1668,7 +1668,7 @@ fn device_policy_precedence_applies_during_import() {
     }
     assert!(!log.contains(registered));
     assert!(!log.contains(protected));
-    assert!(log.contains("AGIT_SECRET_V2"));
+    assert!(log.contains("\u{2039}secret:"));
 }
 
 /// Creator authority survives link-only adoption and later committers while observations are protected.
@@ -1825,7 +1825,7 @@ fn imported_and_live_metadata_remain_publishable() {
             .title
             .as_deref()
             .unwrap()
-            .contains("AGIT_SECRET_V2")
+            .contains("\u{2039}secret:")
     );
     let source_head = target_git(&lab, &lab.work, &["rev-parse", "HEAD"]);
 
@@ -1863,7 +1863,7 @@ fn imported_and_live_metadata_remain_publishable() {
     );
     assert!(!metadata.contains(milestone_secret));
     assert_eq!(snapshot.turn, Some(2));
-    assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V2"));
+    assert!(snapshot.milestone.unwrap().contains("\u{2039}secret:"));
     assert_eq!(
         snapshot.cwd_state.as_ref().unwrap().head.as_deref(),
         Some(source_head.trim())
@@ -1874,7 +1874,7 @@ fn imported_and_live_metadata_remain_publishable() {
             .unwrap()
             .branch
             .unwrap()
-            .contains("AGIT_SECRET_V2")
+            .contains("\u{2039}secret:")
     );
     let repeated = lab
         .command()
