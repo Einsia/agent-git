@@ -174,15 +174,22 @@ The release branch collects those lines into the version's section. CI's
 `changelog:released` fails any other merge request that changes the file: a line it adds
 under `## [Unreleased]` can merge into a released section without a conflict.
 
-After the source release commit passes CI, merge it into GitLab `main`. Wait for
-that pipeline's development builds and `mirror:github`, then run its manual
-`release:github-tag` job. CI verifies the recorded source-to-mirror mapping and
-creates `agit-v<version>` on the public mirror commit. Release tags are immutable;
-a stale pipeline cannot publish after either `main` moves.
+After the release merge request passes CI, merge it into GitLab `main` while its head
+contains `main`'s tip, and merge nothing else until the tag exists. Wait for that
+pipeline's `mirror:github`, then run its manual `release:github-tag` job. CI refuses a
+release commit whose tree is not the release merge request's head, verifies the
+recorded source-to-mirror mapping and creates `agit-v<version>` on the public mirror
+commit. Release tags are immutable; a stale pipeline cannot publish after either
+`main` moves.
+
+`mirror:github` does not wait for the `main` pipeline's Windows build. Windows is
+checked by every merge request's `rust:test:windows`, which for the release ran on
+exactly the tree being released, and again by the GitHub Release workflow before npm.
 
 The mirror rewrites commit IDs, so the source SHA is not the release SHA. Do not
 push release tags directly to GitHub. The CI-created tag starts the GitHub Release
-workflow, which builds the binaries and then triggers npm publication.
+workflow, which builds and checks the binaries of every target, Windows included,
+and then triggers npm publication.
 
 Distribution to users runs through the npm registry: each target ships as a
 platform sub-package (`@einsia/agent-git-linux-x64` and friends, gated by
