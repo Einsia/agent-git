@@ -29,8 +29,8 @@ Add Windows-specific regressions here when they need native behavior,
 including ACLs, process trees, JSON capture, filesystem paths, and CLI launches.
 Do not add platform-independent business or presentation matrices to this list.
 Use `-Suite unit` or `-Suite integration` for focused local runs.
-Linux validation runs shared unit tests, core CLI integrations, and product Clippy.
-See [CI validation scope](ci-validation.md) for the core suite and full local command. Native Windows tests compile the
+Linux validation runs shared unit tests, every integration test, and product Clippy.
+See [CI validation scope](ci-validation.md) for the Linux suite. Native Windows tests compile the
 Windows code directly; CI does not also download an SDK to cross-compile it.
 
 The native job invokes nextest once using the test build profile, without
