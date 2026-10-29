@@ -21,7 +21,7 @@ The record lives in the selected rc directory even when the socket path falls
 back to a shorter path under `XDG_RUNTIME_DIR` or the temporary directory.
 
 `agitd.pid` remains a numeric diagnostic file for compatibility. Its contents
-never establish ownership or authorize a signal. A running PID comes from the
+never establish ownership or exit on their own, and never authorize a signal. A running PID comes from the
 control socket's status reply. Process exit, PID reuse, reboot and container PID
 namespaces therefore do not turn an unrelated process into the daemon owner.
 
@@ -31,11 +31,21 @@ namespaces therefore do not turn an unrelated process into the daemon owner.
 - A refused socket with a matching record and released lifetime lock is stale.
   A missing socket is absent only when ownership inspection succeeds and no
   instance holds the lock.
+- A home copied or restored elsewhere keeps a valid record that no longer names
+  its socket file, which gets a new identity or becomes a regular file. Under a
+  released lock such a file is stale only when nothing can still hold it and the
+  process `agitd.pid` names is gone or is the caller: it is a regular file, to
+  which nothing can be bound, or, on Linux, the kernel's socket diagnostics
+  (sock_diag) report no socket in this network namespace bound to that file's
+  inode. The kernel reports a socket as soon as `bind` returns, before a starter
+  that does not take the lock writes `agitd.pid`, which until then still names
+  its predecessor. It is asked by inode because the path it keeps for a socket is
+  the one it was bound under, which a renamed home no longer has.
 - Without a valid status reply, a held lock, connect timeout, unreadable ownership,
-  incomplete publication or mismatched socket identity is unknown. Startup
-  preserves the socket and reports the uncertainty. A full accept queue can refuse
-  connections on macOS or time out on Linux; neither condition alone authorizes
-  cleanup.
+  incomplete publication or mismatched socket identity is otherwise unknown.
+  Startup preserves the socket and reports the uncertainty. A full accept queue
+  can refuse connections on macOS or time out on Linux; neither condition alone
+  authorizes cleanup.
 
 The lock covers the interval before the listener and PID file are published.
 If a process crashes between binding and completing its ownership record, the
@@ -47,7 +57,8 @@ including containers on the same host sharing the same filesystem inode. Use a
 local filesystem with working advisory locks. Independently copied homes, remote
 filesystems without coherent locks, and processes that deliberately replace lock
 files do not provide that guarantee. A changed device or socket identity fails
-closed. Process visibility across PID namespaces is not used as evidence of exit.
+closed unless nothing can hold the file, as above. Process visibility across PID
+namespaces is never evidence of exit on its own.
 
 ## Legacy and incomplete state
 
