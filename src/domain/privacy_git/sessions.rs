@@ -548,24 +548,13 @@ impl ProjectedHistory {
         ));
         initialize_with_format(&root, source_plan.heads()[0].oid().len())?;
         let repo = Repo::at(&root).local_objects_only();
-        let mut cache: Cache = match state::load(&root.join(".git/session-candidates"), &scope)? {
-            Some(bytes) => {
-                serde_json::from_slice(&bytes).context("invalid session candidate cache")?
-            }
+        let mut cache = match state::load(&root.join(".git/session-candidates"), &scope)? {
+            Some(bytes) => candidate_cache(&bytes),
             None => Cache {
                 version: CANDIDATE_CACHE_VERSION,
                 ..Default::default()
             },
         };
-        ensure!(
-            matches!(cache.version, 2 | CANDIDATE_CACHE_VERSION),
-            "unsupported session candidate cache"
-        );
-        if cache.version != CANDIDATE_CACHE_VERSION {
-            // Session aliases remain stable, but anonymous candidates cannot identify attributed commits.
-            cache.commits.clear();
-            cache.version = CANDIDATE_CACHE_VERSION;
-        }
         let fresh;
         let sources = match &selected.sources {
             Some(cached) if cached.matches(&source, &source_plan)? => cached,
@@ -1555,6 +1544,42 @@ fn retain_tags(
         );
     }
     Ok(())
+}
+
+/// The session candidate cache in `bytes`, at this build's version. A cache from another version,
+/// or with a shape this build cannot read, was written by another agit on this machine: its
+/// session aliases are kept wherever they can still be read, since history accepted before session
+/// envelopes records its published session nowhere else, and its candidates are dropped and
+/// prepared again. Refusing such a cache would fail every session on a machine where two agit
+/// versions publish.
+fn candidate_cache(bytes: &[u8]) -> Cache {
+    #[derive(Deserialize)]
+    struct Aliases {
+        #[serde(default)]
+        sessions: BTreeMap<String, String>,
+    }
+    let (version, sessions) = match serde_json::from_slice::<Cache>(bytes) {
+        Ok(cache) if cache.version == CANDIDATE_CACHE_VERSION => return cache,
+        Ok(cache) => (Some(cache.version), cache.sessions),
+        Err(_) => (
+            None,
+            serde_json::from_slice::<Aliases>(bytes)
+                .map(|aliases| aliases.sessions)
+                .unwrap_or_default(),
+        ),
+    };
+    // Version 2 is this build's own predecessor, whose candidates cannot identify attributed
+    // commits; it is upgraded in place without a note.
+    if version != Some(2) {
+        crate::ui::warning(
+            "the session publication cache was written by another agit version; rebuilding it",
+        );
+    }
+    Cache {
+        version: CANDIDATE_CACHE_VERSION,
+        sessions,
+        commits: BTreeMap::new(),
+    }
 }
 
 /// Tags the branches reach below the boundary that the destination does not have as they are
