@@ -35,7 +35,7 @@ impl Entry {
             }
             acknowledged.validate(notification)?;
             confirmed.request.verify(publication)?;
-            if !publication.ancestors(repo)?.contains(&request.source) {
+            if !publication.reaches(repo, &request.source)? {
                 continue;
             }
             let mut candidate = PublicationReceipt {

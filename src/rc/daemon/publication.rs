@@ -376,7 +376,7 @@ impl Prepared {
                 )
                 .ok();
                 if notification.is_some() {
-                    let _ = Entry::reclaim_acknowledged(&repo, &request);
+                    report_reclaim(Entry::reclaim_acknowledged(&repo, &request));
                 }
                 Ok(notification)
             })
@@ -447,7 +447,7 @@ impl Prepared {
                     let current_grant = authority.publication_grant()?;
                     response.validate(&checked_delivery, &current_grant, now())?;
                     Entry::acknowledge(&repo, &request, &response.receipt)?;
-                    let _ = Entry::reclaim_acknowledged(&repo, &request);
+                    report_reclaim(Entry::reclaim_acknowledged(&repo, &request));
                     Ok(())
                 })
                 .await?;
@@ -577,6 +577,14 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| unavailable())?
         .map_err(|_| unavailable())
+}
+
+/// A reclaim that cannot run leaves acknowledged records to grow without bound, so it is said, not
+/// dropped; it never publishes anything, so it does not fail the delivery.
+fn report_reclaim(result: anyhow::Result<usize>) {
+    if let Err(error) = result {
+        eprintln!("agitd: acknowledged publication records could not be reclaimed: {error:#}");
+    }
 }
 
 fn now() -> i64 {

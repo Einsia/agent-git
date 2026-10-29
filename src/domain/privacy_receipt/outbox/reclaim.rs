@@ -23,25 +23,59 @@ impl Entry {
             return Ok(0);
         }
         // Git traversal runs outside the mutation lease so new local turns can retain their intent.
-        let sources = crate::domain::repo::publication::raw_ancestors(repo, &request.source)?;
-        let public = latest
+        // Each candidate costs one ancestry question in the source and, if that holds, one in the
+        // store holding the published history, opened once for the whole reclaim; so reclaim
+        // answers however long the session grows. A candidate that cannot be answered, an object
+        // missing in either, stays and the failure is returned.
+        let publication = latest
             .publication
             .as_ref()
-            .context("acknowledged publication is missing")?
-            .ancestors(repo)?;
-        let candidates: Vec<_> = candidates
-            .into_iter()
-            .filter(|entry| {
-                sources.contains(&entry.request.source)
-                    && entry
-                        .publication
+            .context("acknowledged publication is missing")?;
+        let mut failure = None;
+        let mut dominated = Vec::new();
+        let mut published = None;
+        for entry in candidates {
+            if dominated.len() == RECLAIM_LIMIT {
+                break;
+            }
+            let Some(receipt) = entry.publication.as_ref() else {
+                continue;
+            };
+            let answer = match crate::domain::repo::publication::is_raw_ancestor(
+                repo,
+                &entry.request.source,
+                &request.source,
+            ) {
+                Ok(true) => {
+                    if published.is_none() {
+                        // No later candidate can be answered without the store either.
+                        match publication.history(repo) {
+                            Ok(history) => published = Some(history),
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                                break;
+                            }
+                        }
+                    }
+                    published
                         .as_ref()
-                        .is_some_and(|receipt| public.contains(&receipt.published))
-            })
-            .take(RECLAIM_LIMIT)
-            .collect();
+                        .expect("opened above")
+                        .contains(&receipt.published)
+                }
+                other => other,
+            };
+            match answer {
+                Ok(true) => dominated.push(entry),
+                Ok(false) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        drop(published);
+        let candidates = dominated;
         if candidates.is_empty() {
-            return Ok(0);
+            return failure.map_or(Ok(0), Err);
         }
         let (latest_path, _lock) = locked_path(repo, request)?;
         if Self::load(repo, request)?.as_ref() != Some(&latest)
@@ -62,7 +96,12 @@ impl Entry {
         }
         #[cfg(unix)]
         fs::File::open(directory)?.sync_all()?;
-        Ok(removed)
+        match failure {
+            Some(error) => Err(error.context(format!(
+                "reclaimed {removed} acknowledged publication records; others could not be checked"
+            ))),
+            None => Ok(removed),
+        }
     }
 
     fn covers(&self, previous: &Self) -> bool {

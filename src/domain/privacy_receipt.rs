@@ -82,6 +82,21 @@ pub struct PublicationReceipt {
     pub recipient: Option<String>,
 }
 
+/// A receipt's published history, held open while it answers ancestry questions.
+pub(crate) struct PublishedHistory {
+    store: Repo,
+    published: String,
+    _lock: Option<std::fs::File>,
+}
+
+impl PublishedHistory {
+    /// Whether `commit` is in this history: one bounded question, not a set of every published
+    /// ancestor, so it answers however long the history grows.
+    pub(crate) fn contains(&self, commit: &str) -> Result<bool> {
+        super::repo::publication::is_raw_ancestor(&self.store, commit, &self.published)
+    }
+}
+
 impl PublicationReceipt {
     pub(crate) fn session_id(&self, repo: &Repo) -> Result<String> {
         self.validate()?;
@@ -96,13 +111,26 @@ impl PublicationReceipt {
         Ok(metadata.session)
     }
 
-    pub(crate) fn ancestors(&self, repo: &Repo) -> Result<std::collections::BTreeSet<String>> {
+    /// Whether the published history this receipt names contains `commit`.
+    pub(crate) fn reaches(&self, repo: &Repo, commit: &str) -> Result<bool> {
+        self.history(repo)?.contains(commit)
+    }
+
+    /// The published history this receipt names, opened once for several questions: generated
+    /// history lives in its own store, which is located and locked here.
+    pub(crate) fn history(&self, repo: &Repo) -> Result<PublishedHistory> {
         self.validate()?;
-        if self.mode.uses_generated_history() {
-            super::privacy_git::receipt_ancestors(repo, self)
+        let (store, lock) = if self.mode.uses_generated_history() {
+            let (store, lock) = super::privacy_git::receipt_store(repo, self)?;
+            (store, Some(lock))
         } else {
-            super::repo::publication::raw_ancestors(repo, &self.published)
-        }
+            (repo.clone(), None)
+        };
+        Ok(PublishedHistory {
+            store,
+            published: self.published.clone(),
+            _lock: lock,
+        })
     }
 
     pub fn validate(&self) -> Result<()> {

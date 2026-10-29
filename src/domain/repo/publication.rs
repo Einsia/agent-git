@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_REFS: usize = 4096;
 const MAX_HEADS: usize = 64;
-const MAX_COMMITS: usize = 4096;
+pub(crate) const MAX_COMMITS: usize = 4096;
 const MAX_TAG_DEPTH: usize = 32;
 const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
@@ -421,11 +421,52 @@ enum Depth<'a> {
     Tips,
 }
 
-/// Raw, identity-checked parent pointers ignore local topology overlays.
-pub(crate) fn raw_ancestors(repo: &Repo, root: &str) -> Result<BTreeSet<String>> {
-    Ok(Reader::new(repo)
-        .ancestry_until(vec![root.into()], &BTreeSet::new())?
-        .0)
+/// Whether `ancestor` is reachable from `descendant` through raw parent pointers, however long
+/// the history between them. Replacement objects, grafts, the shallow file and the commit-graph
+/// cache are ignored, as for a captured ancestry, so a local overlay cannot make a commit appear
+/// published. An ancestor that is not a local commit is not reachable; a gap in the descendant's
+/// history is an error, never an answer.
+pub(crate) fn is_raw_ancestor(repo: &Repo, ancestor: &str, descendant: &str) -> Result<bool> {
+    ensure!(
+        valid_oid(ancestor) && valid_oid(descendant),
+        "invalid ancestry object identity"
+    );
+    let reader = Reader::new(repo);
+    let mut present = false;
+    reader
+        .repo
+        .git_cat_file_batch_check(vec![ancestor.to_owned()], |_, kind, _| {
+            present = kind == "commit";
+            Ok(())
+        })?;
+    if !present {
+        return Ok(false);
+    }
+    let mut command = reader.repo.inspection_command(&[]);
+    crate::infra::git_runtime::disable_grafts(&mut command);
+    command
+        .args([
+            "--no-replace-objects",
+            "--shallow-file",
+            "/dev/null",
+            "-c",
+            "core.commitGraph=false",
+        ])
+        .args(&reader.prefix)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let output = command
+        .output()
+        .context("local Git inspection could not start")?;
+    // Git also exits 1 when it cannot read the history between the two, so only a silent 1 is an
+    // answer.
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) if output.stderr.is_empty() => Ok(false),
+        _ => anyhow::bail!("audit publication data is unavailable locally"),
+    }
 }
 
 struct Reader {
@@ -1291,18 +1332,25 @@ mod tests {
         assert!(bounded.tags.is_empty());
     }
 
-    /// Missing history is an incomplete audit, even when a local shallow boundary hides it.
+    /// Missing history is an incomplete audit, even when a local shallow boundary hides it: a plan
+    /// refuses it, and whether a commit below the gap is an ancestor is an error, not an answer.
+    /// Git exits 1 both for "not an ancestor" and for a walk that cannot read the gap, so an
+    /// ancestry question that reads only the exit status answers "no" here, and a reclaim then
+    /// keeps or drops a record on history it never saw.
     #[test]
     fn unavailable_raw_parent_refuses_publication_plan() {
         let (_directory, repo, base) = repository();
+        git(repo.root(), &["commit", "--allow-empty", "-qm", "middle"]);
+        let middle = git(repo.root(), &["rev-parse", "HEAD"]);
         git(repo.root(), &["commit", "--allow-empty", "-qm", "tip"]);
         let tip = git(repo.root(), &["rev-parse", "HEAD"]);
+        assert!(is_raw_ancestor(&repo, &base, &tip).unwrap());
         std::fs::write(repo.root().join(".git/shallow"), format!("{tip}\n")).unwrap();
         let object = repo
             .root()
             .join(".git/objects")
-            .join(&base[..2])
-            .join(&base[2..]);
+            .join(&middle[..2])
+            .join(&middle[2..]);
         #[cfg(windows)]
         {
             let mut permissions = std::fs::metadata(&object).unwrap().permissions();
@@ -1315,6 +1363,7 @@ mod tests {
         }
         std::fs::remove_file(object).unwrap();
         assert!(PublicationPlan::freeze(&repo, &["main".into()]).is_err());
+        assert!(is_raw_ancestor(&repo, &base, &tip).is_err());
     }
 
     /// A nested tag keeps its outer message in the plan rather than collapsing to a commit.

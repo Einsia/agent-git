@@ -217,12 +217,12 @@ pub(crate) fn receipt_session_id(
     Ok(snapshot.session_id)
 }
 
-pub(crate) fn receipt_ancestors(
+/// The store holding the generated history a receipt names, with its shared lock.
+pub(crate) fn receipt_store(
     source: &Repo,
     receipt: &super::privacy_receipt::PublicationReceipt,
-) -> Result<BTreeSet<String>> {
-    let (repo, _lock) = receipt_cache(source, receipt)?;
-    super::repo::publication::raw_ancestors(&repo, &receipt.published)
+) -> Result<(Repo, fs::File)> {
+    receipt_cache(source, receipt)
 }
 
 /// Only authenticated, accepted mappings may translate private points for Hub bookkeeping.

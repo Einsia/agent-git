@@ -6,6 +6,8 @@ use crate::domain::privacy_receipt::{
 use agit_peer::{access::Principal, publication::Executor};
 
 /// Reclamation keeps pending work, distinct coverage and the current source's completion evidence.
+/// It answers however long the source history between two records grows: a set of every ancestor
+/// is refused past the publication history bound, and with it every reclaim of a long session.
 #[test]
 fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence() {
     use agit_peer::publication::Receipt;
@@ -126,6 +128,28 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
     let mut previous_public = vec![];
     let mut requests = vec![];
     for index in 0..6 {
+        if index == 5 {
+            // History past the publication bound between the last two records.
+            let mut stream = String::new();
+            for turn in 0..=crate::domain::repo::publication::MAX_COMMITS {
+                stream.push_str("commit refs/heads/work\n");
+                stream.push_str("committer Fixture <fixture@example.invalid> 1700000000 +0000\n");
+                stream.push_str(&format!("data {}\n{turn}\n", turn.to_string().len() + 1));
+                if turn == 0 {
+                    stream.push_str("from refs/heads/work^0\n");
+                }
+            }
+            let mut import = std::process::Command::new("git")
+                .arg("-C")
+                .arg(source.root())
+                .args(["fast-import", "--quiet"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut import.stdin.take().unwrap(), stream.as_bytes())
+                .unwrap();
+            assert!(import.wait().unwrap().success());
+        }
         source
             .git(&["commit", "--allow-empty", "-m", &format!("Source {index}")])
             .unwrap();
