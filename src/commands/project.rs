@@ -13,9 +13,9 @@ use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -54,6 +54,8 @@ pub enum Action {
     },
     /// Inspect the local project policy and the last sync result, without network access.
     Status { path: PathBuf },
+    /// List every enrolled or bound folder with its state and recent conversations, offline.
+    List,
     /// Stop project hook capture; retain local and remote session history.
     Unbind { path: PathBuf },
     /// Stop uploading a conversation from this computer; its local history stays.
@@ -502,7 +504,8 @@ fn publication(project: &Project, candidate: &Candidate) -> Result<String> {
     }
 }
 
-fn sync_one(project: &Project, candidate: &Candidate) -> Result<String> {
+/// Imports and publishes one session; returns its branch and the head the push started from.
+fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<String>)> {
     verify(project)?;
     let branch = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
@@ -530,13 +533,21 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<String> {
             == Some(&candidate.cwd),
         "imported session directory differs from the selected source"
     );
-    verify(project)?;
+    let repo = verify(project)?;
+    // Read before the push: a commit saved while it runs may not be in it, and is not counted as
+    // uploaded.
+    let head = repo.git_opt(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ]);
     let mut args = vec!["push".into(), target];
     if !project.auto_upload {
         args.push("--yes".into());
     }
     child(&args, &candidate.cwd, project.auto_upload)?;
-    Ok(branch)
+    Ok((branch, head))
 }
 
 fn sync(project: &mut Project) -> CmdResult {
@@ -550,8 +561,8 @@ fn sync(project: &mut Project) -> CmdResult {
             continue;
         }
         let outcome = match sync_one(project, &candidate) {
-            Ok(branch) => {
-                serde_json::json!({"branch": branch, "status": "pushed"})
+            Ok((branch, head)) => {
+                serde_json::json!({"branch": branch, "status": "pushed", "head": head})
             }
             Err(error) => {
                 failed = true;
@@ -599,6 +610,7 @@ pub fn run(args: Args) -> CmdResult {
             dry_run,
             rebind,
         } => bind(&path, &repo, history, auto_upload, dry_run, rebind),
+        Action::List => list(),
         Action::Status { path } => {
             let root = root(&path)?;
             let project = read(&root)?.context("directory has no project policy")?;
@@ -1021,9 +1033,11 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
         return Ok(false);
     }
     let result = sync_one(&project, &candidate);
-    project.last_result = Some(
-        serde_json::json!({"at":chrono::Utc::now(),"session_id":candidate.session_id,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))}),
-    );
+    project.last_result = Some(serde_json::json!({
+        "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
+        "error": result.as_ref().err().map(|e| format!("{e:#}")),
+        "head": result.as_ref().ok().and_then(|(_, head)| head.as_deref()),
+    }));
     save(&project)?;
     result?;
     Ok(true)
@@ -1071,6 +1085,15 @@ struct Withheld {
     announced: bool,
 }
 
+/// Whether a file in the projects directory is named as a policy is.
+fn is_policy(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "json")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Every project policy on this machine. An unreadable policy fails the caller, since it may be
 /// the one that withholds a branch.
 fn policies() -> Result<Vec<Project>> {
@@ -1082,14 +1105,7 @@ fn policies() -> Result<Vec<Project>> {
     let mut projects = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        let is_policy = path.extension().is_some_and(|e| e == "json")
-            && path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| {
-                    stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit())
-                });
-        if is_policy {
+        if is_policy(&path) {
             projects.push(
                 serde_json::from_slice(&fs::read(&path)?)
                     .with_context(|| format!("invalid project policy {}", path.display()))?,
@@ -1560,6 +1576,497 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
         && (!project.enabled || !project.auto_upload))
 }
 
+/// How many of a folder's newest conversations `project list` describes.
+const LISTED_SESSIONS: usize = 5;
+/// How much of either end of a transcript is read to name it, so naming a conversation costs the
+/// same however long it grows.
+const TITLE_SCAN_BYTES: u64 = 256 * 1024;
+
+/// A folder `project list` reports: one with a project policy, or a directory binding without one.
+struct Listed {
+    root: PathBuf,
+    repository: String,
+    hub: String,
+    project: Option<Project>,
+    sessions: Vec<adapter::SessionRef>,
+}
+
+/// Every existing folder with a policy or a binding; a policy wins over the binding it writes.
+/// The flag is false when a policy or binding could not be read, so a short list is told apart
+/// from a partial one.
+fn listed() -> Result<(Vec<Listed>, bool)> {
+    let mut folders = BTreeMap::new();
+    let mut complete = true;
+    let entries = match fs::read_dir(home()?) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries.into_iter().flatten() {
+        let path = entry?.path();
+        if !is_policy(&path) {
+            continue;
+        }
+        let project = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Project>(&bytes).ok());
+        // A policy belongs to a directory only when it is stored at that directory's own path.
+        match project {
+            Some(project) if state_path(&project.root)? == path => {
+                if project.root.is_dir() {
+                    folders.insert(
+                        project.root.clone(),
+                        Listed {
+                            root: project.root.clone(),
+                            repository: project.repository.clone(),
+                            hub: project.identity.hub.clone(),
+                            project: Some(project),
+                            sessions: Vec::new(),
+                        },
+                    );
+                }
+            }
+            _ => complete = false,
+        }
+    }
+    let (bindings, bindings_complete) = workspace::all()?;
+    let hub = identity::normalize_hub(&config::hub_url()).unwrap_or_else(|_| config::hub_url());
+    for binding in bindings {
+        let Ok(root) = Path::new(&binding.dir).canonicalize() else {
+            continue;
+        };
+        if root.is_dir() {
+            folders.entry(root.clone()).or_insert(Listed {
+                root,
+                repository: binding.repo,
+                hub: hub.clone(),
+                project: None,
+                sessions: Vec::new(),
+            });
+        }
+    }
+    Ok((
+        folders.into_values().collect(),
+        complete && bindings_complete,
+    ))
+}
+
+/// A conversation belongs to the deepest listed folder that holds its directory, as a nested
+/// binding takes its directory out of the folder around it. Returns false when a runtime's
+/// sessions could not be listed.
+fn assign_sessions(folders: &mut [Listed]) -> Result<bool> {
+    let mut complete = true;
+    for runtime in ["claude-code", "codex"] {
+        let Ok(sessions) = adapter::get(runtime)?.all_session_choices() else {
+            complete = false;
+            continue;
+        };
+        for session in sessions {
+            let cwd = session
+                .cwd
+                .clone()
+                .or_else(|| crate::tui::screens::selector::recorded_cwd(&session.path));
+            let Some(cwd) = cwd.and_then(|p| PathBuf::from(p).canonicalize().ok()) else {
+                continue;
+            };
+            if let Some(folder) = folders
+                .iter_mut()
+                .filter(|folder| cwd.starts_with(&folder.root))
+                .max_by_key(|folder| folder.root.components().count())
+            {
+                folder.sessions.push(session);
+            }
+        }
+    }
+    for folder in folders {
+        folder
+            .sessions
+            .sort_by_key(|session| std::cmp::Reverse(session.mtime));
+    }
+    Ok(complete)
+}
+
+/// Whole records from the start or the end of a transcript, at most [`TITLE_SCAN_BYTES`] of it.
+fn transcript_end(path: &Path, start: bool) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let offset = if start {
+        0
+    } else {
+        length.saturating_sub(TITLE_SCAN_BYTES)
+    };
+    file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TITLE_SCAN_BYTES).read_to_end(&mut bytes).ok()?;
+    // A cut record is dropped: the head keeps what ends in a newline, the tail what follows one.
+    let newline = |byte: &u8| *byte == b'\n';
+    if start {
+        bytes.truncate(bytes.iter().rposition(newline).map_or(0, |end| end + 1));
+    } else if offset > 0 {
+        bytes.drain(
+            ..bytes
+                .iter()
+                .position(newline)
+                .map_or(bytes.len(), |at| at + 1),
+        );
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The runtime's own name for a conversation, else its opening request. `None` when neither the
+/// runtime's index nor the bounded ends of the transcript name it.
+fn title(runtime: &str, session: &adapter::SessionRef) -> Option<String> {
+    session
+        .title
+        .clone()
+        .or_else(|| {
+            let tail = transcript_end(&session.path, false)?;
+            adapter::native_title::native_title(runtime, &session.id, &tail, None)
+        })
+        .or_else(|| session.gist.clone())
+        .or_else(|| {
+            let head = transcript_end(&session.path, true)?;
+            adapter::get(runtime)
+                .ok()?
+                .parse(&head)
+                .ok()?
+                .gist(adapter::preview::SESSION_PREVIEW_CHARS)
+        })
+}
+
+/// A failed child command records its JSON diagnostics after a `<command> failed: ` prefix;
+/// the reason a listing reports is their messages.
+fn readable(error: &str) -> String {
+    if let Some((command, diagnostics)) = error.split_once(": [")
+        && let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&format!("[{diagnostics}"))
+    {
+        let errors: Vec<_> = rows
+            .iter()
+            .filter(|row| row["level"] == "error")
+            .filter_map(|row| row["message"].as_str())
+            .collect();
+        if !errors.is_empty() {
+            return format!("{command}: {}", errors.join("; "));
+        }
+    }
+    error.to_owned()
+}
+
+/// A capture result and a sync result in one shape. `uploaded` maps each session the attempt
+/// published to the head its push started from; a result that recorded no head proves nothing.
+struct LastUpload {
+    at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    ok: bool,
+    error: Option<String>,
+    session_id: Option<String>,
+    uploaded: BTreeMap<String, String>,
+}
+
+fn last_upload(result: &serde_json::Value) -> LastUpload {
+    let at = result["at"]
+        .as_str()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    let reason = |error: &serde_json::Value| readable(error.as_str().unwrap_or("upload failed"));
+    if let Some(rows) = result["sessions"].as_array() {
+        let pushed = |row: &&serde_json::Value| row["outcome"]["status"] == "pushed";
+        let failed = rows.iter().find(|row| !pushed(row));
+        return LastUpload {
+            at,
+            ok: failed.is_none(),
+            error: failed.map(|row| reason(&row["outcome"]["error"])),
+            session_id: failed.and_then(|row| row["session_id"].as_str().map(str::to_owned)),
+            uploaded: rows
+                .iter()
+                .filter(pushed)
+                .filter_map(|row| {
+                    let head = row["outcome"]["head"].as_str()?;
+                    Some((row["session_id"].as_str()?.to_owned(), head.to_owned()))
+                })
+                .collect(),
+        };
+    }
+    let ok = result["ok"] == true;
+    let session_id = result["session_id"].as_str().map(str::to_owned);
+    LastUpload {
+        at,
+        ok,
+        error: (!ok).then(|| reason(&result["error"])),
+        uploaded: session_id
+            .iter()
+            .filter(|_| ok)
+            .zip(result["head"].as_str())
+            .map(|(id, head)| (id.clone(), head.to_owned()))
+            .collect(),
+        session_id,
+    }
+}
+
+/// A repository's local session heads with their commit times, and the heads it last saw on the
+/// Hub.
+#[derive(Default)]
+struct Heads {
+    local: BTreeMap<String, (String, Option<chrono::DateTime<chrono::FixedOffset>>)>,
+    remote: BTreeMap<String, String>,
+}
+
+fn heads(repo: &Repo) -> Heads {
+    let mut heads = Heads::default();
+    let Some(output) = repo.git_opt(&[
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(committerdate:iso-strict)",
+        "refs/heads",
+        "refs/remotes/origin",
+    ]) else {
+        return heads;
+    };
+    for line in output.lines() {
+        let mut fields = line.split('\0');
+        let (Some(name), Some(commit), Some(date)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            let date = chrono::DateTime::parse_from_rfc3339(date).ok();
+            heads.local.insert(branch.into(), (commit.into(), date));
+        } else if let Some(branch) = name.strip_prefix("refs/remotes/origin/") {
+            heads.remote.insert(branch.into(), commit.into());
+        }
+    }
+    heads
+}
+
+/// Local repositories by `owner/repo`, opened and read once per listing.
+type Checkouts = BTreeMap<String, Option<(Repo, Heads)>>;
+
+/// Where one conversation stands. A saved one is `uploaded` when the Hub has its local head: the
+/// last upload pushed that very commit, or this checkout last saw it there. A commit's time is
+/// no proof, since it has whole-second precision and a session can be saved again while a batch
+/// is still uploading. `waiting` when the Hub has an older head; `not_uploaded` when it has none
+/// this checkout knows of.
+struct Standing {
+    status: &'static str,
+    /// The `(owner, name, branch)` it is saved in.
+    saved: Option<(String, String, String)>,
+    saved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    on_hub: bool,
+}
+
+fn standing(
+    session: &adapter::SessionRef,
+    store: Option<&Store>,
+    checkouts: &mut Checkouts,
+    last: Option<&LastUpload>,
+) -> Standing {
+    let saved = store
+        .and_then(|store| link::get(store, session.runtime, &session.id))
+        .and_then(|link| Some((link.owner?, link.agent?, link.branch?)));
+    let Some((owner, name, branch)) = &saved else {
+        return Standing {
+            status: "not_saved",
+            saved: None,
+            saved_at: None,
+            on_hub: false,
+        };
+    };
+    let checkout = checkouts
+        .entry(format!("{owner}/{name}"))
+        .or_insert_with(|| {
+            let repo = Repo::open(config::repo_dir(owner, name).ok()?)?;
+            let heads = heads(&repo);
+            Some((repo, heads))
+        });
+    let local = checkout
+        .as_ref()
+        .and_then(|(_, heads)| heads.local.get(branch));
+    let remote = checkout
+        .as_ref()
+        .and_then(|(_, heads)| heads.remote.get(branch));
+    let saved_at = local.and_then(|(_, at)| *at);
+    let head = local.map(|(commit, _)| commit);
+    let pushed = last.is_some_and(|last| head.is_some() && last.uploaded.get(&session.id) == head);
+    let status = if pushed || (remote.is_some() && remote == head) {
+        "uploaded"
+    } else if remote.is_some() {
+        "waiting"
+    } else {
+        "not_uploaded"
+    };
+    Standing {
+        status,
+        on_hub: remote.is_some(),
+        saved_at,
+        saved,
+    }
+}
+
+fn session_json(
+    session: &adapter::SessionRef,
+    store: Option<&Store>,
+    checkouts: &mut Checkouts,
+    last: Option<&LastUpload>,
+    hub: &str,
+) -> serde_json::Value {
+    let standing = standing(session, store, checkouts, last);
+    let url = standing
+        .saved
+        .as_ref()
+        .filter(|_| standing.on_hub)
+        .and_then(|(owner, name, branch)| {
+            let (repo, _) = checkouts.get(&format!("{owner}/{name}"))?.as_ref()?;
+            super::repo::published_session_path(repo, owner, name, branch)
+        })
+        .map(|path| {
+            super::with_sharer(
+                format!("{}{path}", hub.trim_end_matches('/')),
+                super::link_sharer(hub).as_deref(),
+            )
+        });
+    serde_json::json!({
+        "title": title(session.runtime, session),
+        "runtime": session.runtime,
+        "session_id": session.id,
+        "last_active": chrono::DateTime::<chrono::Utc>::from(session.mtime),
+        "status": standing.status,
+        "repository": standing.saved.as_ref().map(|(owner, name, _)| format!("{owner}/{name}")),
+        "saved_at": standing.saved_at,
+        "url": url,
+    })
+}
+
+fn folder_json(
+    folder: &Listed,
+    store: Option<&Store>,
+    checkouts: &mut Checkouts,
+) -> serde_json::Value {
+    let slug = super::parse_slug(&folder.repository).ok();
+    let auto_push = slug
+        .as_ref()
+        .and_then(|(owner, name)| Repo::open(config::repo_dir(owner, name).ok()?))
+        .and_then(|repo| repo.auto_push_enabled().ok());
+    // A policy that uploads automatically publishes nothing while its repository's own automatic
+    // publication preference on this machine is off. The folder is then blocked, not uploading:
+    // reported as "on", its conversations would quietly stay here.
+    let (state, queued, last) = match &folder.project {
+        Some(project) => (
+            match (project.enabled && project.auto_upload, auto_push) {
+                (true, Some(false)) => "blocked",
+                (true, _) => "on",
+                (false, _) => "off",
+            },
+            markers(&folder.root).map_or(0, |markers| markers.len()),
+            project.last_result.as_ref().map(last_upload),
+        ),
+        None => ("local_only", 0, None),
+    };
+    let repository_url =
+        slug.map(|(owner, name)| format!("{}/@{owner}/{name}", folder.hub.trim_end_matches('/')));
+    let recent: Vec<_> = folder
+        .sessions
+        .iter()
+        .take(LISTED_SESSIONS)
+        .map(|session| session_json(session, store, checkouts, last.as_ref(), &folder.hub))
+        .collect();
+    let awaiting_upload = folder
+        .sessions
+        .iter()
+        .filter(|session| {
+            matches!(
+                standing(session, store, checkouts, last.as_ref()).status,
+                "waiting" | "not_uploaded"
+            )
+        })
+        .count();
+    // The refusal a disabled `push.auto` produced says nothing once the folder uploads again;
+    // shown as its last result, it reads as a failure that no longer exists.
+    let shown = last.as_ref().filter(|last| {
+        !(state == "on"
+            && !last.ok
+            && last
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(super::auto_push::DISABLED_FOR_REPOSITORY)))
+    });
+    serde_json::json!({
+        "folder": folder.root,
+        "state": state,
+        "repository": folder.repository,
+        "repository_url": repository_url,
+        "auto_push": auto_push,
+        "queued": queued,
+        "last_upload": shown.map(|last| serde_json::json!({
+            "at": last.at, "ok": last.ok, "error": last.error, "session_id": last.session_id,
+        })),
+        "sessions_here": folder.sessions.len(),
+        "awaiting_upload": awaiting_upload,
+        "recent": recent,
+    })
+}
+
+/// Reads local state only and changes none of it: no lock is taken, so a listing never delays
+/// or turns away a capture worker.
+fn listing() -> Result<serde_json::Value> {
+    let (mut folders, policies_complete) = listed()?;
+    let sessions_complete = assign_sessions(&mut folders)?;
+    let store = Store::open().ok().flatten();
+    let mut checkouts = Checkouts::new();
+    let folders: Vec<_> = folders
+        .iter()
+        .map(|folder| folder_json(folder, store.as_ref(), &mut checkouts))
+        .collect();
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "hub": config::hub_url(),
+        "folders": folders,
+        "incomplete": !(policies_complete && sessions_complete),
+    }))
+}
+
+fn list() -> CmdResult {
+    let value = listing()?;
+    if super::json::requested() {
+        println!("{value}");
+        return Ok(ExitCode::Ok);
+    }
+    let folders = value["folders"].as_array().map_or(&[][..], Vec::as_slice);
+    if folders.is_empty() {
+        println!("No folder is enrolled or bound yet; enroll one with `agit project bind`.");
+    }
+    for folder in folders {
+        let state = match folder["state"].as_str() {
+            Some("on") => "uploads automatically",
+            Some("off") => "paused",
+            Some("blocked") => "upload blocked",
+            _ => "saves on this computer",
+        };
+        let repository = folder["repository"].as_str().unwrap_or_default();
+        let count = folder["sessions_here"].as_u64().unwrap_or_default();
+        println!(
+            "{}  {}  {state}  ({count} conversation{})",
+            ui::tilde(Path::new(folder["folder"].as_str().unwrap_or_default())),
+            ui::bold(repository),
+            if count == 1 { "" } else { "s" }
+        );
+        if folder["state"] == "blocked" {
+            let waiting = folder["awaiting_upload"].as_u64().unwrap_or_default();
+            println!(
+                "  {} automatic upload (push.auto) is off for {repository} on this computer, so \
+                 {waiting} conversation{} here {} saved but not uploaded; turn it on with \
+                 `agit config --repo {repository} push.auto true`",
+                ui::warn_text("blocked:"),
+                if waiting == 1 { "" } else { "s" },
+                if waiting == 1 { "is" } else { "are" },
+            );
+        } else if folder["last_upload"]["ok"] == false {
+            println!(
+                "  {} {}",
+                ui::warn_text("the last upload failed:"),
+                folder["last_upload"]["error"].as_str().unwrap_or_default()
+            );
+        }
+    }
+    Ok(ExitCode::Ok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1816,6 +2323,174 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// `project list` reports every existing folder with a policy or a binding and the state it
+    /// actually uploads in, and gives each conversation to the deepest folder holding it, named
+    /// by the runtime's own title before its opening request. A listing that reads only policies
+    /// drops bound folders; one that trusts the policy alone calls a folder whose repository has
+    /// automatic publication off "on" instead of blocked, and one that counts only the listed
+    /// conversations understates what waits there; one that keeps that refusal as the last
+    /// result once publication is back on reports a failure that no longer exists; one that takes
+    /// the first folder matching by prefix hands a nested folder's conversations to its parent;
+    /// one that takes an upload recorded after a save as proof calls a conversation uploaded whose
+    /// newer commit never left this computer; and one that names a conversation by its opening
+    /// request alone ignores the user's name.
+    #[test]
+    fn listing_reports_each_folder_and_gives_conversations_to_the_nearest_one() {
+        if !isolated("listing_reports_each_folder_and_gives_conversations_to_the_nearest_one") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let outer = work.path().join("app");
+        let nested = outer.join("tools");
+        let paused = work.path().join("paused");
+        let gone = work.path().join("gone");
+        for dir in [&nested, &paused, &gone] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mut on = project(&outer);
+        on.last_result = Some(serde_json::json!({
+            "at": "2026-01-01T00:00:00Z", "ok": false, "session_id": "s",
+            "error": "push failed: [{\"level\":\"error\",\"message\":\"write access was revoked\"}]",
+        }));
+        save(&on).unwrap();
+        let mut off = project(&paused);
+        off.enabled = false;
+        save(&off).unwrap();
+        let muted = work.path().join("muted");
+        fs::create_dir_all(&muted).unwrap();
+        let mut quiet = project(&muted);
+        quiet.repository = "alice/muted".into();
+        let checkout = config::repo_dir("alice", "muted").unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        let muted_repo = Repo::init(&checkout).unwrap();
+        muted_repo.set_auto_push(Some(false)).unwrap();
+        // Two saves of one conversation; the later upload record names only the first.
+        let tree = muted_repo.git(&["write-tree"]).unwrap();
+        let commit = |message: &str, parent: Option<&str>| {
+            let mut args = vec!["-c", "user.name=t", "-c", "user.email=t@example.com"];
+            args.extend(["commit-tree", tree.trim(), "-m", message]);
+            args.extend(parent.into_iter().flat_map(|parent| ["-p", parent]));
+            muted_repo.git(&args).unwrap().trim().to_owned()
+        };
+        let first = commit("first save", None);
+        let second = commit("second save", Some(&first));
+        muted_repo
+            .git(&["update-ref", "refs/heads/notes", &second])
+            .unwrap();
+        let uploaded = |head: &str| {
+            serde_json::json!({
+                "at": "2999-01-01T00:00:00Z", "ok": true,
+                "session_id": "cccccccc-0000-4000-8000-000000000023", "head": head,
+            })
+        };
+        quiet.last_result = Some(uploaded(&first));
+        let resumed = work.path().join("resumed");
+        fs::create_dir_all(&resumed).unwrap();
+        let mut back = project(&resumed);
+        back.repository = "alice/resumed".into();
+        back.last_result = Some(serde_json::json!({
+            "at": "2026-01-01T00:00:00Z", "ok": false, "session_id": "s",
+            "error": format!("push failed: {}", super::super::auto_push::DISABLED_FOR_REPOSITORY),
+        }));
+        save(&back).unwrap();
+        let resumed_checkout = config::repo_dir("alice", "resumed").unwrap();
+        fs::create_dir_all(&resumed_checkout).unwrap();
+        Repo::init(&resumed_checkout)
+            .unwrap()
+            .set_auto_push(Some(true))
+            .unwrap();
+        workspace::bind(&nested, "alice/tools", false).unwrap();
+        workspace::bind(&gone, "alice/gone", false).unwrap();
+        fs::remove_dir(&gone).unwrap();
+
+        let claude = |cwd: &Path, id: &str, prompt: &str, title: Option<&str>| {
+            let cwd = cwd.canonicalize().unwrap();
+            let native = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+                .join("projects")
+                .join(adapter::claude_code::slug_for(&cwd));
+            fs::create_dir_all(&native).unwrap();
+            let mut records = vec![serde_json::json!({"type": "user", "isSidechain": false,
+                "sessionId": id, "cwd": cwd, "message": {"role": "user", "content": prompt}})];
+            records.extend(title.map(|title| {
+                serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": id})
+            }));
+            let lines: String = records.iter().map(|record| format!("{record}\n")).collect();
+            fs::write(native.join(format!("{id}.jsonl")), lines).unwrap();
+        };
+        claude(
+            &outer,
+            "aaaaaaaa-0000-4000-8000-000000000021",
+            "the login page loops",
+            Some("Fix the login page"),
+        );
+        claude(
+            &nested,
+            "bbbbbbbb-0000-4000-8000-000000000022",
+            "add a release script",
+            None,
+        );
+        claude(
+            &muted,
+            "cccccccc-0000-4000-8000-000000000023",
+            "draft the notes",
+            None,
+        );
+        let mut saved = link::Link::new(
+            "claude-code",
+            "cccccccc-0000-4000-8000-000000000023",
+            Some(&muted),
+        );
+        saved.owner = Some("alice".into());
+        saved.agent = Some("muted".into());
+        saved.branch = Some("notes".into());
+        link::write(&Store::at(config::store_root().unwrap()), &saved).unwrap();
+
+        save(&quiet).unwrap();
+
+        let value = listing().unwrap();
+        assert_eq!(value["incomplete"], false, "{value:#}");
+        let folders = value["folders"].as_array().unwrap();
+        let folder = |dir: &Path| {
+            let dir = serde_json::json!(dir.canonicalize().unwrap());
+            folders
+                .iter()
+                .find(|folder| folder["folder"] == dir)
+                .unwrap()
+        };
+        assert_eq!(folders.len(), 5, "{value:#}");
+        assert_eq!(folder(&outer)["state"], "on");
+        assert_eq!(folder(&paused)["state"], "off");
+        assert_eq!(folder(&nested)["state"], "local_only");
+        assert_eq!(folder(&muted)["state"], "blocked");
+        assert_eq!(folder(&muted)["auto_push"], false);
+        assert_eq!(folder(&muted)["awaiting_upload"], 1);
+        assert_eq!(folder(&muted)["recent"][0]["status"], "not_uploaded");
+        assert_eq!(folder(&resumed)["state"], "on");
+        assert!(folder(&resumed)["last_upload"].is_null(), "{value:#}");
+        assert_eq!(
+            folder(&outer)["last_upload"]["error"],
+            "push failed: write access was revoked"
+        );
+        assert_eq!(folder(&outer)["sessions_here"], 1);
+        assert_eq!(folder(&outer)["recent"][0]["title"], "Fix the login page");
+        assert_eq!(folder(&nested)["sessions_here"], 1);
+        let opened = &folder(&nested)["recent"][0];
+        assert_eq!(opened["title"], "add a release script");
+        assert_eq!(opened["status"], "not_saved");
+
+        quiet.last_result = Some(uploaded(&second));
+        save(&quiet).unwrap();
+        let value = listing().unwrap();
+        let muted = value["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|folder| folder["folder"] == serde_json::json!(muted.canonicalize().unwrap()))
+            .unwrap();
+        assert_eq!(muted["recent"][0]["status"], "uploaded", "{value:#}");
+        assert_eq!(muted["awaiting_upload"], 0);
     }
 
     /// A paused, upload-off or excluding project swallows only passive capture: the Stop hook

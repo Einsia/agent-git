@@ -7,6 +7,10 @@ use std::process::Stdio;
 
 pub(super) const AUTOMATIC_ENV: &str = "AGIT_AUTO_PUSH";
 
+/// The refusal an automatic publication meets while its repository's `push.auto` is off.
+pub(crate) const DISABLED_FOR_REPOSITORY: &str =
+    "automatic publication is disabled for this repository";
+
 /// A background child may use saved consent, never a parent's interactive confirmation flag.
 pub(crate) fn configure(command: &mut std::process::Command) {
     command.env(AUTOMATIC_ENV, "1").env_remove("AGIT_YES");

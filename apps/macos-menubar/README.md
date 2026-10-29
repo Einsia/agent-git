@@ -35,7 +35,12 @@ The app looks for agit, in order, at:
 2. `$AGIT_MENUBAR_CLI`;
 3. `~/.local/bin/agit`, `/usr/local/bin/agit`, `/opt/homebrew/bin/agit`,
    `~/.npm-global/bin/agit`;
-4. `command -v agit` in a login shell.
+4. `~/Library/Application Support/AgentGitMenuBar/agit-dev`;
+5. `command -v agit` in a login shell.
+
+The folder list needs agit 0.2.30 or later. When the agit the app runs is older, the app reads the
+list through the first other agit above that has it, and runs every action through its own agit
+still; with none, it says which release brings the list.
 
 It inherits the environment it was started with, so `AGIT_HOME` and `AGIT_HUB_URL` work as they
 do for the CLI.
@@ -56,18 +61,22 @@ the app tells you once what it repaired.
 | `icloud.slash` | No folder uploads automatically (nothing set up, or paused). |
 
 The menu lists each folder from `agit project list --json` with its state ("Uploads
-automatically", "Paused", "Saved on this Mac only"), its destination repository, and its newest
-conversations with the title Claude Code or Codex gave them, when they last changed, and whether
-they are uploaded. A failed upload shows agit's reason and a retry button. A folder whose
-repository has automatic publication turned off on this Mac (`agit config --repo OWNER/NAME
-push.auto false`) shows "Upload turned off" instead of a failure, explains it on hover, and its
-menu copies the command that turns it back on.
+automatically", "Upload blocked", "Paused", "Saved on this Mac only"), its destination repository,
+and its newest conversations with the title Claude Code or Codex gave them, when they last
+changed, and whether they are uploaded. A failed upload shows agit's reason and a retry button. A
+folder set to upload whose repository has automatic publication turned off on this Mac
+(`agit config --repo OWNER/NAME push.auto false`) reads "Upload blocked" and needs attention: it
+says why and how many of its conversations are saved but not uploaded, and offers to turn
+automatic upload on. Turning it on, from there or from the folder's switch, asks first: the
+question says the repository's automatic upload is off, how many conversations it releases, and
+who can read them, and Cancel is its default answer.
 
 Actions and the commands behind them:
 
 | Action | Command |
 | --- | --- |
-| Turn uploads on for a listed folder (asks first) | `agit --yes project bind <folder> --repo <owner/name> --history none --auto-upload` |
+| Turn uploads on for a listed folder (asks first) | `agit --yes project bind <folder> --repo <owner/name> --history none --auto-upload`, preceded by `agit config --repo <owner/name> push.auto true` when the repository's automatic upload is off on this Mac, which the question names |
+| Turn automatic upload on for a blocked folder's repository (asks first) | `agit config --repo <owner/name> push.auto true` |
 | Turn uploads off | `agit project unbind <folder>` |
 | Add a folder (asks first) | `agit --yes repo create <name> --private` when asked to create it, then the bind above |
 | Retry uploads / upload again now | `agit --yes project sync <folder>` |

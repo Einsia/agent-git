@@ -40,6 +40,32 @@ fn read_in(root: &Path, dir: &Path) -> Option<Workspace> {
     serde_json::from_str(&std::fs::read_to_string(path_for_in(root, dir)).ok()?).ok()
 }
 
+/// Every recorded binding, and whether all of them could be read. A binding file that cannot be
+/// read is left out and makes the listing incomplete rather than failing it.
+pub fn all() -> Result<(Vec<Workspace>, bool)> {
+    let entries = match std::fs::read_dir(self::dir()?) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
+        Err(e) => return Err(e.into()),
+    };
+    let mut bindings = Vec::new();
+    let mut complete = true;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+        {
+            Some(binding) => bindings.push(binding),
+            None => complete = false,
+        }
+    }
+    Ok((bindings, complete))
+}
+
 pub fn write(dir: &Path, ws: &Workspace) -> Result<()> {
     write_in(&self::dir()?, dir, ws)
 }

@@ -56,21 +56,14 @@ struct AgitCLI {
 
     let executable: URL
 
+    /// The first agit release with `agit project list`, which the folder list reads.
+    static let listingVersion = "0.2.30"
+
     /// The binary the user chose, then `AGIT_MENUBAR_CLI`, then the usual install locations, then
     /// the login shell's PATH: an app started from Finder does not inherit a terminal's PATH.
     static func locate() -> AgitCLI? {
         let fileManager = FileManager.default
-        var candidates: [String] = []
-        if let chosen = UserDefaults.standard.string(forKey: pathKey) { candidates.append(chosen) }
-        if let env = ProcessInfo.processInfo.environment["AGIT_MENUBAR_CLI"] { candidates.append(env) }
-        let home = fileManager.homeDirectoryForCurrentUser.path
-        candidates += [
-            "\(home)/.local/bin/agit",
-            "/usr/local/bin/agit",
-            "/opt/homebrew/bin/agit",
-            "\(home)/.npm-global/bin/agit",
-        ]
-        for path in candidates where fileManager.isExecutableFile(atPath: path) {
+        if let path = candidatePaths().first(where: fileManager.isExecutableFile(atPath:)) {
             return AgitCLI(executable: URL(fileURLWithPath: path))
         }
         if let path = loginShellLookup(), fileManager.isExecutableFile(atPath: path) {
@@ -79,6 +72,47 @@ struct AgitCLI {
         return nil
     }
 
+    /// Every other agit installed in the fixed places, in `locate`'s order, for a read the chosen
+    /// one cannot answer.
+    func alternatives() -> [AgitCLI] {
+        Self.candidatePaths()
+            .filter { $0 != executable.path && FileManager.default.isExecutableFile(atPath: $0) }
+            .map { AgitCLI(executable: URL(fileURLWithPath: $0)) }
+    }
+
+    /// The agit a login shell finds, when it is neither the chosen one nor in a fixed place. Asked
+    /// off the main thread, after the fixed places: a login shell can take a while.
+    func shellAlternative() async -> AgitCLI? {
+        guard let path = await Task.detached(operation: { Self.loginShellLookup() }).value,
+              path != executable.path, !Self.candidatePaths().contains(path),
+              FileManager.default.isExecutableFile(atPath: path)
+        else { return nil }
+        return AgitCLI(executable: URL(fileURLWithPath: path))
+    }
+
+    /// Where agit is looked for. The app's own support folder comes last: a build placed there
+    /// can serve what a released agit that predates the app does not.
+    private static func candidatePaths() -> [String] {
+        var candidates: [String] = []
+        if let chosen = UserDefaults.standard.string(forKey: pathKey) { candidates.append(chosen) }
+        if let env = ProcessInfo.processInfo.environment["AGIT_MENUBAR_CLI"] { candidates.append(env) }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        candidates += [
+            "\(home)/.local/bin/agit",
+            "/usr/local/bin/agit",
+            "/opt/homebrew/bin/agit",
+            "\(home)/.npm-global/bin/agit",
+            "\(home)/Library/Application Support/AgentGitMenuBar/agit-dev",
+        ]
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0).inserted }
+    }
+
+    /// How long a login shell may take to say where agit is.
+    private static let loginShellLimit: TimeInterval = 10
+
+    /// The last line `command -v agit` prints in a login shell; startup scripts may print before
+    /// it.
     private static func loginShellLookup() -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -87,11 +121,37 @@ struct AgitCLI {
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
-        process.waitUntilExit()
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return output?.isEmpty == false ? output : nil
+        let collected = OutputBuffer()
+        let closed = DispatchSemaphore(value: 0)
+        let exited = DispatchSemaphore(value: 0)
+        // Read as it is written: a startup script that prints more than a pipe holds would
+        // otherwise stop the shell on its write while this side waits for it to exit.
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                closed.signal()
+            } else {
+                collected.append(chunk)
+            }
+        }
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            return nil
+        }
+        // A shell that hangs, or leaves its output open behind it, is given up on.
+        let deadline = DispatchTime.now() + loginShellLimit
+        guard closed.wait(timeout: deadline) == .success, exited.wait(timeout: deadline) == .success,
+              process.terminationStatus == 0
+        else {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            if process.isRunning { process.terminate() }
+            return nil
+        }
+        let lines = String(data: collected.data, encoding: .utf8)?.split(whereSeparator: \.isNewline) ?? []
+        guard let last = lines.last?.trimmingCharacters(in: .whitespaces), !last.isEmpty else { return nil }
+        return last
     }
 
     /// The resolved program and when it was last written, read without running it: it changes
