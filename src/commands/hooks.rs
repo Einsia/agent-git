@@ -615,6 +615,9 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
     let owner = upload.repository.split('/').next().unwrap_or_default();
     let audience = match (upload.visibility.as_deref(), upload.org) {
         (Some("public"), _) => "public: anyone can read it".to_owned(),
+        (Some("private"), Some(true)) if upload.members_read == Some(true) => {
+            format!("private to {owner}: every member of {owner} can read it")
+        }
         (Some("private"), Some(true)) => {
             format!("private to {owner}: its owners and granted teams can read it")
         }
@@ -1279,7 +1282,8 @@ mod tests {
     /// The person is told before the first upload, once: a new conversation (a fork included) and
     /// a resumed one that has not uploaded yet are announced, an uploading one is not announced
     /// again, and a runtime that shows no hook message gets none. The line names who can see the repository
-    /// without guessing, and both ways to stop.
+    /// without guessing, every member of the organization when its base permission reads, and both
+    /// ways to stop.
     #[test]
     fn an_automatic_upload_is_announced_before_it_happens() {
         for runtime in ["claude-code", "codex"] {
@@ -1295,13 +1299,20 @@ mod tests {
             Source::Startup,
             false
         ));
-        let notice = |visibility: Option<&str>, org: Option<bool>| {
+        let notice_reading = |visibility: Option<&str>, org: Option<bool>, members_read| {
             super::upload_notice(&crate::commands::project::AutomaticUpload {
                 repository: "acme/widget".into(),
                 visibility: visibility.map(str::to_owned),
                 org,
+                members_read,
             })
         };
+        let notice =
+            |visibility: Option<&str>, org: Option<bool>| notice_reading(visibility, org, None);
+        assert!(
+            notice_reading(Some("private"), Some(true), Some(true))
+                .contains("(private to acme: every member of acme can read it)")
+        );
         assert_eq!(
             notice(Some("private"), Some(true)),
             "agit: this conversation is uploaded to acme/widget (private to acme: its owners and granted teams can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`."

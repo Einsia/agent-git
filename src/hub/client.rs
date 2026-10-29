@@ -1166,11 +1166,38 @@ impl Client {
     /// The status code only. On a 401 it exchanges the token once and retries, like
     /// [`Self::with_retry`]; a second 401 is reported as expired credentials, not as "no
     /// permission".
+    /// [`Self::status_of`] with the push route the Hub names, if it names one.
+    fn status_and_push_route_of(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<(u16, Option<String>)> {
+        let mut route = None;
+        let status = self.status_with(path, expected_agent_id, false, |response| {
+            route = response
+                .headers()
+                .get(super::git::PUSH_ROUTE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+        })?;
+        Ok((status, route))
+    }
+
     fn status_of(
         &self,
         path: &str,
         expected_agent_id: Option<&str>,
         accept_secret_findings: bool,
+    ) -> Result<u16> {
+        self.status_with(path, expected_agent_id, accept_secret_findings, |_| {})
+    }
+
+    fn status_with(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+        accept_secret_findings: bool,
+        inspect: impl FnOnce(&ureq::http::Response<ureq::Body>),
     ) -> Result<u16> {
         self.ensure_destination()?;
         let send = |t: Option<&str>| {
@@ -1198,6 +1225,7 @@ impl Client {
         if resp.status() == 401 {
             return Err(self.api_error(resp, path));
         }
+        inspect(&resp);
         Ok(resp.status().as_u16())
     }
 
@@ -1230,6 +1258,20 @@ impl Client {
 
     pub fn get_agent(&self, owner: &str, name: &str) -> Result<RemoteAgent> {
         self.get(&format!("api/agents/{owner}/{name}"))
+    }
+
+    /// Whether the signed-in account writes `owner/name` only through its organization's base
+    /// permission, which the Hub says with its push advertisement. A Hub without the base
+    /// permission never says so.
+    pub(crate) fn writes_only_through_base(
+        &self,
+        owner: &str,
+        name: &str,
+        expected_agent_id: &str,
+    ) -> Result<bool> {
+        let path = format!("{owner}/{name}.git/info/refs?service=git-receive-pack");
+        let (status, route) = self.status_and_push_route_of(&path, Some(expected_agent_id))?;
+        Ok(status == 200 && route.as_deref() == Some(super::git::PUSH_ROUTE_BASE))
     }
 
     pub fn secret_allowances(

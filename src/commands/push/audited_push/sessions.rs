@@ -165,6 +165,19 @@ pub(super) fn run(
     };
     let identity = RemoteIdentity::new(&intent.hub, &remote.agent_id)?;
     intent.verify_write_access(&client, &identity.agent_id)?;
+    // Writing a public repository only through the organization's base permission is the
+    // person's own act: nothing goes public through it unless the person says so.
+    let person_only = intent.visibility == "public"
+        && intent.owner != intent.account
+        && super::super::super::remote_request(client.writes_only_through_base(
+            &intent.owner,
+            &intent.name,
+            &identity.agent_id,
+        ))?;
+    ensure!(
+        !(person_only && automatic),
+        "{repository} is public and you write to it as a member of its organization; automatic upload does not publish there, push it yourself"
+    );
     let remote =
         crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
             .context("cannot establish accepted publication history")?;
@@ -348,28 +361,49 @@ pub(super) fn run(
         reviewed.as_ref().is_none_or(|review| review.complete()),
         args.dry_run,
         || {
-            // With nobody to ask, plain sessions publish to a private repository as before, but
-            // never to a public one: that takes the person's own confirmation (--yes or a terminal).
-            if delivery_confirmed
-                || automatic
-                || (!args.audit
-                    && (std::env::var_os("AGIT_YES").is_some()
-                        || (!encrypted && !public && !ui::prompt::can_ask())))
-            {
+            let answered = Answer {
+                person_only,
+                public,
+                delivery_confirmed,
+                automatic,
+                audit: args.audit,
+                agit_yes: std::env::var_os("AGIT_YES").is_some(),
+                encrypted,
+                can_ask: ui::prompt::can_ask(),
+            }
+            .without_asking();
+            if answered == Some(true) {
+                if person_only {
+                    crate::hub::git::confirm_person_publication();
+                }
                 return Ok(Some(true));
+            }
+            if answered == Some(false) {
+                return Err(crate::commands::InteractionRequired(format!(
+                    "{repository} is public and you write to it as a member of its organization; confirm what goes public at an interactive terminal or with --yes"
+                ))
+                .into());
             }
             if public && !args.audit && !ui::prompt::can_ask() {
                 return Err(crate::commands::InteractionRequired("publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation".into()).into());
             }
-            let answer = ui::prompt::confirm(
-                &format!(
+            let question = if person_only {
+                format!(
+                    "{repository} is public and you write to it as a member of its organization. Publish the {} reviewed session(s) and file changes to everyone?",
+                    receipts.len()
+                )
+            } else {
+                format!(
                     "Publish the reviewed sessions to {repository} on {} ({})?",
                     intent.hub, intent.visibility
-                ),
-                false,
-            )?;
+                )
+            };
+            let answer = ui::prompt::confirm(&question, false)?;
             if answer.is_none() && !args.audit {
                 return Err(crate::commands::InteractionRequired("session publication requires confirmation of its preview; use --yes or an interactive terminal".into()).into());
+            }
+            if person_only && answer == Some(true) {
+                crate::hub::git::confirm_person_publication();
             }
             Ok(answer)
         },
@@ -446,4 +480,117 @@ pub(super) fn run(
     recording.finish();
     ui::success(&format!("Published reviewed sessions to {repository}."));
     Ok(ExitCode::Ok)
+}
+
+/// Who answers the question of whether reviewed sessions publish. `Some(true)` publishes without
+/// asking and `Some(false)` refuses for want of a person; `None` asks at the terminal.
+#[derive(Clone, Copy)]
+struct Answer {
+    /// The destination is public and the account writes it only through its organization's base
+    /// permission.
+    person_only: bool,
+    /// The destination is public: with nobody to ask, plain sessions do not publish there.
+    public: bool,
+    delivery_confirmed: bool,
+    automatic: bool,
+    audit: bool,
+    agit_yes: bool,
+    encrypted: bool,
+    can_ask: bool,
+}
+
+impl Answer {
+    fn without_asking(self) -> Option<bool> {
+        // Rule (d): nothing goes public through the base permission unless a person says so: at
+        // the terminal, or with an explicit `--yes` on this one-off push. An automatic upload never
+        // says so, and neither does a terminal that cannot ask.
+        if self.person_only {
+            if self.automatic {
+                return Some(false);
+            }
+            if self.agit_yes {
+                return Some(true);
+            }
+            return (!self.can_ask).then_some(false);
+        }
+        (self.delivery_confirmed
+            || self.automatic
+            || (!self.audit
+                && (self.agit_yes || (!self.encrypted && !self.public && !self.can_ask))))
+            .then_some(true)
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::Answer;
+
+    /// A public repository written only through the base permission is answered by the person:
+    /// at a terminal, or by an explicit `--yes` (`AGIT_YES`) on a one-off push. An automatic upload,
+    /// even with `AGIT_YES`, and a terminal that cannot ask refuse it, while any other destination
+    /// keeps its unattended answers. A rule that let an automatic upload through for the member,
+    /// ignored the member's `--yes`, or started asking everyone fails here.
+    #[test]
+    fn a_member_publishes_to_a_public_repository_only_when_the_person_answers() {
+        let base = Answer {
+            person_only: false,
+            public: false,
+            delivery_confirmed: false,
+            automatic: false,
+            audit: false,
+            agit_yes: false,
+            encrypted: false,
+            can_ask: true,
+        };
+        let member = Answer {
+            person_only: true,
+            public: true,
+            ..base
+        };
+        assert_eq!(member.without_asking(), None);
+        for (answer, expected) in [
+            (
+                Answer {
+                    agit_yes: true,
+                    can_ask: false,
+                    ..member
+                },
+                Some(true),
+            ),
+            (
+                Answer {
+                    automatic: true,
+                    agit_yes: true,
+                    ..member
+                },
+                Some(false),
+            ),
+            (
+                Answer {
+                    can_ask: false,
+                    ..member
+                },
+                Some(false),
+            ),
+        ] {
+            assert_eq!(answer.without_asking(), expected);
+        }
+        assert_eq!(base.without_asking(), None);
+        for unattended in [
+            Answer {
+                agit_yes: true,
+                ..base
+            },
+            Answer {
+                automatic: true,
+                ..base
+            },
+            Answer {
+                can_ask: false,
+                ..base
+            },
+        ] {
+            assert_eq!(unattended.without_asking(), Some(true));
+        }
+    }
 }

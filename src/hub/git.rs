@@ -137,6 +137,23 @@ const COMMAND_HEADER: &str = "X-AgentGit-Command";
 /// rounds are not counted again.
 const OPERATION_HEADER: &str = "X-AgentGit-Operation";
 
+/// Answered by the Hub with a push advertisement when the account writes the repository only
+/// through its organization's base permission.
+pub(crate) const PUSH_ROUTE_HEADER: &str = "X-AgentGit-Push-Route";
+pub(crate) const PUSH_ROUTE_BASE: &str = "base";
+
+/// Sent with this process's transport requests once the person at the terminal confirmed
+/// publishing to a public repository written only through the base permission. The Hub refuses
+/// such a push without it, so an automatic upload, which never asks, publishes nothing there.
+const PERSON_CONFIRMED_HEADER: &str = "X-AgentGit-Person-Confirmed";
+
+static PERSON_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that the person answered the publication question for this process.
+pub(crate) fn confirm_person_publication() {
+    PERSON_CONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A fresh identifier per process links the requests of one invocation and nothing else; if it
 /// were persisted, separate invocations would collapse into one download. The session reuse
 /// receipt carries the same value in its body, so the Hub records a retried receipt once.
@@ -160,6 +177,9 @@ fn invocation_headers() -> Vec<(&'static str, &'static str)> {
         headers.push((COMMAND_HEADER, command));
     }
     headers.push((OPERATION_HEADER, operation_id()));
+    if PERSON_CONFIRMED.load(std::sync::atomic::Ordering::SeqCst) {
+        headers.push((PERSON_CONFIRMED_HEADER, "public"));
+    }
     headers
 }
 
