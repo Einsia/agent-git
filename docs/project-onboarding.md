@@ -79,7 +79,7 @@ agit: this conversation is uploaded to team/app (private to team: every member o
 
 The line says who can read the repository: anyone for a public one; for a private one, every
 member of the organization while its base permission lets members read (the default), its
-owners and granted teams when an owner has turned that off, or only you and people you add
+owners and the people granted access when an owner has turned that off, or only you and people you add
 when it is in your own namespace. The visibility is the Hub's answer when the conversation starts, or its last
 recorded answer when the Hub cannot be reached in time; when neither exists the line says so. A resumed
 conversation that has not been uploaded yet shows the line again.
