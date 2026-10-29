@@ -869,16 +869,19 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         cwd,
     };
     // A session claimed elsewhere is left to its source repository.
-    if !matches!(placement(&project, &candidate), Ok(Placement::Claim(_))) {
+    let Ok(Placement::Claim(branch)) = placement(&project, &candidate) else {
         return Ok(false);
-    }
+    };
     if !project.enabled
         || !project.auto_upload
         || project
             .excluded
             .contains(&key(&candidate.runtime, &candidate.session_id))
     {
-        return Ok(true);
+        // Pausing the project stops passive capture only. A session claimed on another branch
+        // (`agit run`, `resume --as`, an import) is settled from its link; a paused project
+        // still blocks its automatic push.
+        return Ok(branch == capture_branch(runtime, session));
     }
     enqueue(&project.root, &candidate)?;
     // The probe lock is released before spawning, so the new worker can take it.
@@ -1813,6 +1816,42 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A paused, upload-off or excluding project swallows only passive capture: the Stop hook
+    /// treats the session as handled. A session claimed on its own branch is not handled there,
+    /// so the hook settles it from its link; a capture that also swallowed it would drop the
+    /// turns of a session `agit run` launched in the folder.
+    #[test]
+    fn paused_project_leaves_explicitly_claimed_sessions_to_settlement() {
+        if !isolated("paused_project_leaves_explicitly_claimed_sessions_to_settlement") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        let store = Store::at(config::store_root().unwrap());
+        let claimed = "aaaaaaaa-0000-4000-8000-000000000041";
+        let mut claim = link::Link::new("codex", claimed, Some(&project.root));
+        claim.owner = Some("alice".into());
+        claim.agent = Some("app".into());
+        claim.branch = Some("run-1".into());
+        link::write(&store, &claim).unwrap();
+        let passive = "bbbbbbbb-0000-4000-8000-000000000042";
+        let cwd = project.root.to_str().unwrap().to_owned();
+        for pause in 0..3 {
+            let mut paused = project.clone();
+            match pause {
+                0 => paused.enabled = false,
+                1 => paused.auto_upload = false,
+                _ => paused
+                    .excluded
+                    .extend([key("codex", claimed), key("codex", passive)]),
+            }
+            save(&paused).unwrap();
+            assert!(!capture("codex", claimed, Some(&cwd)).unwrap());
+            assert!(capture("codex", passive, Some(&cwd)).unwrap());
+            assert!(markers(&paused.root).unwrap().is_empty());
+        }
     }
 
     #[test]
