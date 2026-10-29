@@ -21,6 +21,9 @@ const CHECKOUT_JOURNAL_LEGACY_VERSION: u32 = 1;
 const CHECKOUT_JOURNAL_NAME: &str = "agit-checkout-transaction.json";
 const CHECKOUT_ATTRIBUTES_SIDECAR_NAME: &str = "agit-checkout-attributes.snapshot";
 const CHECKOUT_LOCK_NAME: &str = "agit-checkout-transaction.lock";
+/// The files whose presence in a checkout's private Git directory is pending checkout recovery.
+const CHECKOUT_RECOVERY_METADATA: [&str; 2] =
+    [CHECKOUT_JOURNAL_NAME, CHECKOUT_ATTRIBUTES_SIDECAR_NAME];
 const MAX_CHECKOUT_JOURNAL_BYTES: u64 = 16 * 1024;
 // `.gitattributes` was unrestricted user state in v0. Keep the checkout subsystem's existing
 // materialization boundary instead of imposing the journal's tiny metadata bound on user data.
@@ -598,22 +601,36 @@ pub(super) fn interrupted_checkout_metadata_with_policy(
     repo: &Repo,
     policy: crate::domain::repo::ReadPolicy,
 ) -> Result<bool> {
-    for name in [CHECKOUT_JOURNAL_NAME, CHECKOUT_ATTRIBUTES_SIDECAR_NAME] {
-        let path = checkout_git_path_with_policy(repo, name, policy)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "cannot inspect checkout recovery metadata {}",
-                        path.display()
-                    )
-                });
-            }
+    for name in CHECKOUT_RECOVERY_METADATA {
+        if checkout_recovery_metadata_present(&checkout_git_path_with_policy(repo, name, policy)?)?
+        {
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// The same probe for a checkout whose private Git directory the caller has already resolved.
+pub(super) fn interrupted_checkout_metadata_in(git_dir: &std::path::Path) -> Result<bool> {
+    for name in CHECKOUT_RECOVERY_METADATA {
+        if checkout_recovery_metadata_present(&git_dir.join(name))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn checkout_recovery_metadata_present(path: &std::path::Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot inspect checkout recovery metadata {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 #[derive(Debug)]

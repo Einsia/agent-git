@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod checkouts;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub repos: usize,
@@ -58,6 +60,8 @@ const MIGRATION_SPOOL_PREFIX: &str = "agit-layout-v1-spool-";
 const MIGRATION_SPOOL_LOCK: &str = "agit-layout-v1-spool.lock";
 const MIGRATION_STDERR_BYTES: usize = 64 * 1024;
 const STARTUP_MIGRATION_COMPLETE: &str = "layout-v1.complete";
+/// The namespace that keeps each migrated branch's pre-migration tip as a permanent audit record.
+const LEGACY_RECOVERY_REF_PREFIX: &str = "refs/agit/layout-v0/";
 const STARTUP_RECOVERY_DIR: &str = "layout-v1-recovery";
 const STARTUP_RECOVERY_PREFIX: &str = "pending-";
 const STARTUP_MIGRATION_VERSION: &[u8] = b"1\n";
@@ -616,24 +620,53 @@ pub fn check_readonly_startup() -> Result<()> {
         startup_recovery_evidence(&home)?.is_empty(),
         "local storage has pending recovery; complete recovery through the original AgentGit store before inspecting status"
     );
-    for (_, _, path) in super::clone::list_local()? {
-        let repo = Repo::at(&path).local_objects_only();
-        for worktree in repo.inspection_worktrees()? {
-            let checkout = Repo::at(&worktree.path).local_objects_only();
-            let checkout_recovery =
-                super::plumbing::interrupted_checkout_metadata_present(&checkout)?;
-            let legacy_recovery = if checkout_recovery {
-                false
-            } else {
-                probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
-                    .map_err(RepoMigrationFailure::into_error)?
-            };
-            anyhow::ensure!(
-                !checkout_recovery && !legacy_recovery,
-                "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
-                worktree.path.display()
-            );
+    // Every probe only reads, so a bounded set of repositories, aliases that share a Git directory
+    // included, is inspected at once; the first failure in repository order is reported.
+    for group in super::clone::list_local()?.chunks(STARTUP_CHECKOUT_WORKERS) {
+        let results = std::thread::scope(|scope| {
+            let workers = group
+                .iter()
+                .map(|(_, _, path)| scope.spawn(move || check_readonly_repository(path)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("repository inspection panicked")))
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            result?;
         }
+    }
+    Ok(())
+}
+
+fn check_readonly_repository(path: &Path) -> Result<()> {
+    let repo = Repo::at(path).local_objects_only();
+    let registered = repo.inspection_worktrees()?;
+    let checkouts = checkouts::Checkouts::inspect(
+        &repo,
+        checkouts::main_checkout_common_dir(path).as_deref(),
+        &registered,
+    );
+    for worktree in &registered {
+        let checkout = Repo::at(&worktree.path).local_objects_only();
+        let pending = checkouts.pending(
+            &worktree.path,
+            || super::plumbing::interrupted_checkout_metadata_present(&checkout),
+            || {
+                probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
+                    .map_err(RepoMigrationFailure::into_error)
+            },
+        )?;
+        anyhow::ensure!(
+            !pending,
+            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
+            worktree.path.display()
+        );
     }
     Ok(())
 }
@@ -669,12 +702,13 @@ fn check_readonly_repo_startup_with_policy(
     let repos = crate::infra::config::repos_dir()?;
     let selected_common_dir = repo.common_dir_with_policy(policy)?.canonicalize()?;
     let mut roots = vec![repo.root().to_path_buf()];
-    let registered = if repo.is_local_inspection() {
+    let local = repo.is_local_inspection();
+    let registered = if local {
         repo.inspection_worktrees()?
     } else {
         repo.worktrees_with_policy(policy)?
     };
-    roots.extend(registered.into_iter().map(|worktree| worktree.path));
+    roots.extend(registered.iter().map(|worktree| worktree.path.clone()));
     let mut canonical_roots = Vec::new();
     for root in &roots {
         canonical_roots.push(
@@ -713,23 +747,31 @@ fn check_readonly_repo_startup_with_policy(
             "the selected repository has pending recovery; complete recovery through the original AgentGit store before inspecting it"
         );
     }
+    // Only the inspection parser keeps `git worktree list`'s branch exactly as Git resolved it.
+    let checkouts = checkouts::Checkouts::inspect(
+        repo,
+        local.then_some(selected_common_dir.as_path()),
+        &registered,
+    );
     // A probe touches only its own checkout, so a bounded set runs at once; failures are
     // reported in root order.
-    let local = repo.is_local_inspection();
     let pending = |root: &PathBuf| -> Result<bool> {
         let checkout = if local {
             Repo::at(root).local_objects_only()
         } else {
             Repo::at(root)
         };
-        Ok(
-            super::plumbing::interrupted_checkout_metadata_with_policy(&checkout, policy)?
-                || probe_legacy_storage_checkout_recovery_with_policy(
+        checkouts.pending(
+            root,
+            || super::plumbing::interrupted_checkout_metadata_with_policy(&checkout, policy),
+            || {
+                probe_legacy_storage_checkout_recovery_with_policy(
                     &checkout,
                     MigrationFailureKind::Skippable,
                     policy,
                 )
-                .map_err(RepoMigrationFailure::into_error)?,
+                .map_err(RepoMigrationFailure::into_error)
+            },
         )
     };
     for group in canonical_roots.chunks(STARTUP_CHECKOUT_WORKERS) {
@@ -1261,7 +1303,7 @@ fn interrupted_storage_checkout_with_policy(
     let branch = current_ref
         .strip_prefix("refs/heads/")
         .context("current branch ref has an unexpected shape")?;
-    let recovery = format!("refs/agit/layout-v0/{branch}");
+    let recovery = format!("{LEGACY_RECOVERY_REF_PREFIX}{branch}");
     let Some(old) = optional_ref_with_policy(repo, &recovery, policy)? else {
         return Ok(None);
     };
