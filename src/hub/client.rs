@@ -1261,6 +1261,26 @@ impl Client {
         self.get(&format!("api/agents/{owner}/{name}"))
     }
 
+    /// [`Self::get_agent`] as this Hub alone answers it: a redirect is an error rather than
+    /// followed, and no cache may answer instead. A followed redirect would let a repository of
+    /// the same name on another Hub stand in for this one.
+    pub fn get_agent_unredirected(&self, owner: &str, name: &str) -> Result<RemoteAgent> {
+        let path = format!("api/agents/{owner}/{name}");
+        self.with_retry(&path, |token| {
+            let mut request = self
+                .agent
+                .get(self.url(&path))
+                .config()
+                .max_redirects(0)
+                .build()
+                .header("Cache-Control", "no-store");
+            if let Some(token) = token {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.call()
+        })
+    }
+
     /// Whether the signed-in account writes `owner/name` only through its organization's base
     /// permission, which the Hub says with its push advertisement. A Hub without the base
     /// permission never says so.

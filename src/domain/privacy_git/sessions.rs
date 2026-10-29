@@ -21,6 +21,14 @@ pub struct SessionPublicationPlan {
     pub configs: BTreeMap<String, SessionPrivacyResponse>,
     pub(crate) delivery: Option<super::delivery::Delivery>,
     pub(crate) sources: Option<SourceHistory>,
+    /// Repositories, `owner/repo`, that introduced snapshots may keep naming as their fork source,
+    /// each with the repository identity that vouches for it: the destination itself, and any that
+    /// an anonymous lookup on this Hub found public while this publication was resolved. Every
+    /// other `source_ref` is withheld with its commit.
+    pub(crate) fork_sources: BTreeMap<String, String>,
+    /// The repository identity this checkout is pinned to on the destination's Hub, read when the
+    /// publication was resolved: a `fork_origin` without a snapshot points into it.
+    pub(crate) pinned_source: Option<String>,
 }
 
 /// Committed facts belong to the same object store and frozen selection. Remote authority and
@@ -136,6 +144,7 @@ impl SessionPublicationPlan {
         let enveloped = &sources.enveloped;
         let mut sessions = BTreeSet::new();
         let mut source_hubs = BTreeSet::new();
+        let mut named_sources = BTreeSet::new();
         for oid in plan.commit_objects() {
             let mut inherited = false;
             for branch in branches {
@@ -159,6 +168,9 @@ impl SessionPublicationPlan {
                 !enveloped.contains(oid),
                 "unaccepted ciphertext requires its original publication authority"
             );
+            if let Some(repository) = fork_source_on(&metadata, &identity.hub) {
+                named_sources.insert(repository.to_owned());
+            }
             if metadata.is_session_line() {
                 ensure!(
                     meta::is_bare_id(&metadata.session),
@@ -300,6 +312,17 @@ impl SessionPublicationPlan {
             }
             configs.insert(target_session, response);
         }
+        // Cross-Hub delivery withholds every fork source, so it never asks this Hub about one.
+        let fork_sources = if delivery.is_some() {
+            BTreeMap::new()
+        } else {
+            readable_fork_sources(
+                client.base(),
+                (repository, &identity.agent_id),
+                named_sources,
+            )
+        };
+        let pinned_source = pinned_source(source, &identity.hub);
         plan.verify(source, branches)?;
         Ok(Self {
             identity,
@@ -307,7 +330,37 @@ impl SessionPublicationPlan {
             configs,
             delivery,
             sources: Some(sources),
+            fork_sources,
+            pinned_source,
         })
+    }
+
+    /// Withholds `source_ref` and `source_commit` together unless [`Self::fork_sources`] admits
+    /// the repository the snapshot names on this destination's Hub. Withholds `fork_origin` whole
+    /// unless the repository it points into, its snapshot's or else this checkout's pinned one,
+    /// is the destination or is the one that vouched for the named source: its binding carries
+    /// that repository's identity, session ids, owner account and committer.
+    pub(crate) fn withhold_fork_source(&self, metadata: &mut Meta) {
+        let vouched = fork_source_on(metadata, &self.identity.hub)
+            .and_then(|repository| self.fork_sources.get(repository))
+            .cloned();
+        if vouched.is_none() {
+            metadata.source_ref = None;
+            metadata.source_commit = None;
+        }
+        if let Some(origin) = &metadata.fork_origin {
+            let points_into = match &origin.snapshot {
+                Some(snapshot) => Some(&snapshot.binding.repository_id),
+                None => self.pinned_source.as_ref(),
+            };
+            let kept = recorded_on(metadata, &self.identity.hub)
+                && points_into.is_some_and(|repository| {
+                    *repository == self.identity.agent_id || vouched.as_ref() == Some(repository)
+                });
+            if !kept {
+                metadata.fork_origin = None;
+            }
+        }
     }
 
     pub fn verify_configs(&self, client: &crate::hub::Client, repository: &str) -> Result<()> {
@@ -743,10 +796,11 @@ impl ProjectedHistory {
                     let original_metadata = source_sessions.metadata(&source, oid).context(
                         "introduced snapshots require declared file or session metadata",
                     )?;
-                    let metadata = match &selected.delivery {
+                    let mut metadata = match &selected.delivery {
                         Some(delivery) => delivery.metadata(&original_metadata)?,
                         None => original_metadata.clone(),
                     };
+                    selected.withhold_fork_source(&mut metadata);
                     let config = if metadata.is_file_line() {
                         None
                     } else {
@@ -794,6 +848,9 @@ impl ProjectedHistory {
                             }
                             if selected.delivery.is_none()
                                 && metadata.session_privacy == published.session_privacy
+                                && metadata.source_ref == original_metadata.source_ref
+                                && metadata.source_commit == original_metadata.source_commit
+                                && metadata.fork_origin == original_metadata.fork_origin
                                 && public_parents == parents[oid]
                             {
                                 oid.clone()
@@ -1082,6 +1139,81 @@ impl ProjectedHistory {
     }
 }
 
+/// The repository a snapshot's fork source names, when the snapshot was recorded on `hub`.
+///
+/// The locator itself names no Hub, so the snapshot's own account or session Hub stands for it;
+/// a snapshot with neither, or a locator that is not `<owner>/<repo>@...`, names nothing.
+fn fork_source_on<'a>(metadata: &'a Meta, hub: &str) -> Option<&'a str> {
+    if !recorded_on(metadata, hub) {
+        return None;
+    }
+    let (repository, _) = metadata.source_ref.as_deref()?.split_once('@')?;
+    let (owner, name) = repository.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some(repository)
+}
+
+/// Whether the snapshot's own account or session Hub is `hub`.
+fn recorded_on(metadata: &Meta, hub: &str) -> bool {
+    metadata
+        .committer_account
+        .as_ref()
+        .map(|account| account.hub.as_str())
+        .or_else(|| {
+            metadata
+                .session_privacy
+                .as_ref()
+                .and_then(|privacy| privacy.hub.as_deref())
+        })
+        .and_then(|recorded| crate::domain::session_privacy::canonical_hub(recorded).ok())
+        .is_some_and(|recorded| recorded == hub)
+}
+
+/// The repository identity `source` is pinned to, when that pin is on `hub`. An unreadable or
+/// absent pin names nothing.
+fn pinned_source(source: &Repo, hub: &str) -> Option<String> {
+    crate::hub::identity::read(source)
+        .ok()
+        .flatten()
+        .filter(|pin| pin.hub == hub)
+        .map(|pin| pin.agent_id)
+}
+
+/// The named repositories a fork source may keep naming in `destination`, `(owner/repo, id)`,
+/// each with the identity of the repository that vouches for it.
+///
+/// Each lookup is anonymous, made now and answered by this Hub alone: a reader set seen through
+/// the person's account, remembered from an earlier publication, or served by another Hub after a
+/// redirect does not say who can read the source here today. Any answer other than this exact
+/// repository being public with its clone URL on this Hub, an error, redirect or timeout
+/// included, leaves the repository out.
+fn readable_fork_sources(
+    hub: &str,
+    (destination, destination_id): (&str, &str),
+    named: BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let anonymous =
+        crate::hub::Client::for_hub_with_timeout(hub, std::time::Duration::from_secs(5));
+    let authority = crate::infra::hub_authority::HubAuthority::parse(hub).ok();
+    named
+        .into_iter()
+        .filter_map(|repository| {
+            if repository == destination {
+                return Some((repository, destination_id.to_owned()));
+            }
+            let (owner, name) = repository.split_once('/')?;
+            let remote = anonymous.get_agent_unredirected(owner, name).ok()?;
+            let public = remote.is_public()
+                && remote.owner == owner
+                && remote.name == name
+                && remote.clone_url.starts_with(&format!("{hub}/"))
+                && authority
+                    .as_ref()
+                    .is_some_and(|hub| hub.matches(&remote.clone_url));
+            public.then_some((repository, remote.agent_id))
+        })
+        .collect()
+}
+
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
 fn plain_commit(
     source: &Repo,
@@ -1149,6 +1281,19 @@ fn plain_commit(
         )?)?;
         value["session_privacy"] = serde_json::to_value(&metadata.session_privacy)?;
         value["session"] = json!(metadata.session);
+        let fields = value
+            .as_object_mut()
+            .context("session metadata must be an object")?;
+        for (key, kept) in [
+            ("source_ref", json!(metadata.source_ref)),
+            ("source_commit", json!(metadata.source_commit)),
+            ("fork_origin", serde_json::to_value(&metadata.fork_origin)?),
+        ] {
+            match kept {
+                serde_json::Value::Null => fields.remove(key),
+                kept => fields.insert(key.into(), kept),
+            };
+        }
         let blob = write_object(destination, "blob", &serde_json::to_vec(&value)?)?;
         replace(
             source,
@@ -1804,6 +1949,199 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A fork names its source only in that source's own repository, or while an anonymous lookup
+    /// on the same Hub finds the source public; `source_ref` and `source_commit` go together, and
+    /// `fork_origin` goes whole, on every snapshot the publication introduces. A projection that
+    /// strips only the branch tip still publishes the fork point beneath it, and one that takes an
+    /// unanswered lookup for a public answer names the private source in another repository.
+    #[test]
+    fn a_fork_source_is_published_only_to_its_own_repository_or_while_it_is_public() {
+        use crate::domain::session_privacy::{
+            AccountIdentity, ForkContext, ForkOrigin, SessionPrivacyConfig,
+        };
+        use crate::hub::privacy::sessions::SessionPrivacyResponse;
+        // Nothing listens on this Hub, so every anonymous lookup on it fails.
+        let hub = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let account = AccountIdentity::new(&hub, "alice").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let source = Repo::init(&temp.path().join("source")).unwrap();
+        for (key, value) in [
+            ("user.name", "Alice"),
+            ("user.email", "alice@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            source.git(&["config", key, value]).unwrap();
+        }
+        source.git(&["checkout", "-b", "fork"]).unwrap();
+        let home = "00000000-0000-0000-0000-000000000001";
+        crate::hub::identity::pin(&source, &RemoteIdentity::new(&hub, home).unwrap()).unwrap();
+        let snapshot = |metadata: &Meta| {
+            meta::write(source.root(), metadata).unwrap();
+            crate::domain::storage::write_snapshot(source.root(), "", "").unwrap();
+            source.add_all().unwrap();
+            source.commit("snapshot").unwrap();
+            source.git(&["rev-parse", "HEAD"]).unwrap()
+        };
+        let mut base = Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            "codex".into(),
+            "".into(),
+        );
+        base.committer_account = Some(account.clone());
+        base.session_privacy = Some(SessionPrivacy::new(Some(account)).unwrap());
+        let point = snapshot(&base);
+        let mut forked = base.clone();
+        forked.session = format!("agit-{}", "b".repeat(40));
+        forked.source_ref = Some("alice/private@main#1".into());
+        forked.source_commit = Some(point.clone());
+        let origin = ForkOrigin {
+            commit: point.clone(),
+            context: ForkContext::Original,
+            snapshot: None,
+        };
+        forked.fork_origin = Some(origin.clone());
+        snapshot(&forked);
+        forked.turn = Some(2);
+        snapshot(&forked);
+        type Published = (Option<String>, Option<String>, Option<ForkOrigin>);
+        let publish = |destination: &str, agent: &str| -> Vec<Published> {
+            let selected = SessionPublicationPlan {
+                identity: RemoteIdentity::new(&hub, agent).unwrap(),
+                remote: Default::default(),
+                configs: [&base, &forked]
+                    .map(|metadata| {
+                        let config = SessionPrivacyConfig {
+                            repository_id: agent.into(),
+                            session_id: metadata.session.clone(),
+                            privacy: metadata.session_privacy.clone().unwrap(),
+                            revision: 1,
+                            created_at: "2026-01-01T00:00:00Z".into(),
+                        };
+                        let response = SessionPrivacyResponse {
+                            config,
+                            owner_key: None,
+                        };
+                        (metadata.session.clone(), response)
+                    })
+                    .into(),
+                delivery: None,
+                sources: None,
+                fork_sources: readable_fork_sources(
+                    &hub,
+                    (destination, agent),
+                    BTreeSet::from(["alice/private".to_owned()]),
+                ),
+                pinned_source: pinned_source(&source, &hub),
+            };
+            let published = ProjectedHistory::prepare_sessions_with_redactor(
+                &source,
+                &["fork".into()],
+                &selected,
+                &[],
+                &Redactor::new(Default::default()),
+            )
+            .unwrap();
+            let commits = published
+                .repo
+                .git(&["rev-list", "refs/heads/fork"])
+                .unwrap();
+            commits
+                .lines()
+                .map(|commit| {
+                    let metadata =
+                        crate::domain::storage::metadata_local(published.repo.root(), commit)
+                            .unwrap();
+                    (
+                        metadata.source_ref,
+                        metadata.source_commit,
+                        metadata.fork_origin,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            publish("bob/public", "00000000-0000-0000-0000-000000000002"),
+            [(None, None, None), (None, None, None), (None, None, None)]
+        );
+        let kept = (
+            Some("alice/private@main#1".to_owned()),
+            Some(point),
+            Some(origin),
+        );
+        assert_eq!(
+            publish("alice/private", home),
+            [kept.clone(), kept, (None, None, None)]
+        );
+    }
+
+    /// Only the source's own Hub can vouch that a fork source is public. A probe that followed a
+    /// redirect would take another Hub's public repository of the same name for the source and
+    /// keep a private source in a public publication.
+    #[test]
+    fn a_redirected_lookup_never_vouches_for_a_fork_source() {
+        use std::io::{Read, Write};
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let respond = |listener: std::net::TcpListener, reply: String| {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !done.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            socket.set_nonblocking(false).unwrap();
+                            let mut request = [0u8; 4096];
+                            let _ = socket.read(&mut request).unwrap();
+                            socket.write_all(reply.as_bytes()).unwrap();
+                            return true;
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    }
+                }
+                false
+            })
+        };
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_hub = format!("http://{}", elsewhere.local_addr().unwrap());
+        let public = json!({
+            "agent_id": "00000000-0000-0000-0000-000000000009",
+            "owner": "alice",
+            "name": "private",
+            "clone_url": format!("{other_hub}/alice/private.git"),
+            "visibility": "public",
+        })
+        .to_string();
+        let served = respond(
+            elsewhere,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{public}",
+                public.len()
+            ),
+        );
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", source.local_addr().unwrap());
+        let redirected = respond(
+            source,
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {other_hub}/api/agents/alice/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let kept = readable_fork_sources(
+            &hub,
+            ("bob/public", "00000000-0000-0000-0000-000000000002"),
+            BTreeSet::from(["alice/private".to_owned()]),
+        );
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(redirected.join().unwrap(), "the source Hub was not asked");
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(!served.join().unwrap(), "the redirect was followed");
     }
 
     /// A version tag is owed only for a turn the destination still holds. An accepted turn below
