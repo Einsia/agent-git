@@ -53,6 +53,14 @@ pub struct PublicationPlan {
     tags: Vec<FrozenRef>,
     commit_objects: Vec<String>,
     tag_objects: Vec<String>,
+    /// Captured commits the walk stopped at because the destination already holds their history;
+    /// their ancestry is not part of the plan.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    boundary: Vec<String>,
+    /// Tag names the plan takes even below its boundary (see
+    /// [`PublicationPlan::freeze_selected_after_carrying`]).
+    #[serde(skip)]
+    carried: Vec<String>,
 }
 
 /// Inspection selection is independent of the complete publication and verification plan.
@@ -147,42 +155,66 @@ impl PublicationPlan {
         &self.commit_objects
     }
 
-    /// Only raw ancestry of live destination heads establishes accepted history. A head
-    /// outside the selected branch can still accept its ancestors; unavailable heads cannot.
+    /// Every local commit reachable from the advertised heads: the history the destination
+    /// already holds, as far as this repository has it. Only raw ancestry of live destination
+    /// heads counts; heads absent here contribute nothing.
     #[cfg(any(feature = "cli", test))]
-    pub(crate) fn accepted_commits(
-        &self,
-        repo: &Repo,
-        advertised: &[String],
-    ) -> Result<BTreeSet<String>> {
-        let advertised: BTreeSet<_> = advertised.iter().cloned().collect();
-        ensure!(
-            advertised.len() <= MAX_REFS,
-            "advertised ref limit exceeded"
-        );
-        ensure!(
-            advertised.iter().all(|oid| valid_oid(oid)),
-            "invalid advertised object identity"
-        );
+    pub(crate) fn held_history(repo: &Repo, advertised: &[String]) -> Result<BTreeSet<String>> {
         let mut reader = Reader::new(repo);
-        let mut roots = Vec::new();
-        reader.repo.git_cat_file_batch_check(
-            advertised.iter().cloned().collect(),
-            |oid, kind, _| {
-                ensure!(
-                    advertised.contains(oid),
-                    "unexpected advertised object identity"
-                );
-                if kind == "commit" {
-                    roots.push(oid.to_owned());
-                }
-                Ok(())
-            },
-        )?;
+        let roots = reader.advertised_commits(advertised)?;
         if roots.is_empty() {
             return Ok(BTreeSet::new());
         }
-        reader.reachable_among(&roots, &self.commit_objects)
+        reader.reachable_among(&roots, None)
+    }
+
+    /// Tags whose commits the heads reach below the boundary, which the plan leaves out: it takes
+    /// only the tags of its own commits. Each comes with its commit and the tag objects on the way
+    /// to it. Version tags are not listed; the caller knows which turns it published. A tag
+    /// `published` says the destination already has as it is here is skipped, and only when one
+    /// remains are the heads' ancestors listed.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn tags_below_boundary(
+        &self,
+        repo: &Repo,
+        published: impl Fn(&str, &str) -> bool,
+    ) -> Result<Vec<(FrozenRef, String, Vec<String>)>> {
+        if self.boundary.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reader = Reader::new(repo);
+        let (references, _) = reader.references()?;
+        let mut outside = BTreeMap::<String, Vec<(FrozenRef, Vec<String>)>>::new();
+        for (name, oid) in references
+            .iter()
+            .filter(|(name, oid)| name.starts_with("refs/tags/") && !published(name, oid))
+        {
+            if let Some((commit, objects)) = reader.tag_commit(oid)?
+                && self.commit_objects.binary_search(&commit).is_err()
+            {
+                outside.entry(commit).or_default().push((
+                    FrozenRef {
+                        name: name.clone(),
+                        oid: oid.clone(),
+                    },
+                    objects,
+                ));
+            }
+        }
+        let tips: Vec<String> = self.heads.iter().map(|head| head.oid.clone()).collect();
+        Ok(reader
+            .reached(&tips, outside)?
+            .into_iter()
+            .flat_map(|(commit, tags)| {
+                tags.into_iter()
+                    .map(move |(tag, objects)| (tag, commit.clone(), objects))
+            })
+            .collect())
+    }
+
+    /// Captured commits whose ancestry the plan leaves out, sorted.
+    pub fn boundary(&self) -> &[String] {
+        &self.boundary
     }
 
     /// Every annotated tag object in the selected chains, including unreferenced inner tags.
@@ -193,15 +225,61 @@ impl PublicationPlan {
     /// Capture explicit branch names and their locally available publication metadata.
     /// Missing objects, malformed metadata and exhausted inspection budgets return an error.
     pub fn freeze(repo: &Repo, branches: &[String]) -> Result<Self> {
-        Self::freeze_roots(repo, branches, true)
+        Self::freeze_roots(
+            repo,
+            branches,
+            true,
+            Depth::Until(&BTreeSet::new()),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// The heads `freeze` selects, with none of their history: each head is its own boundary.
+    pub fn freeze_tips(repo: &Repo, branches: &[String]) -> Result<Self> {
+        Self::freeze_roots(repo, branches, true, Depth::Tips, &BTreeSet::new())
     }
 
     /// Session publication must not add an independently advancing shared-file line.
     pub fn freeze_selected(repo: &Repo, branches: &[String]) -> Result<Self> {
-        Self::freeze_roots(repo, branches, false)
+        Self::freeze_roots(
+            repo,
+            branches,
+            false,
+            Depth::Until(&BTreeSet::new()),
+            &BTreeSet::new(),
+        )
     }
 
-    fn freeze_roots(repo: &Repo, branches: &[String], include_main: bool) -> Result<Self> {
+    /// Capture explicit branches down to the history the destination already holds: the walk
+    /// stops at a commit in `held` and keeps it as a boundary without its ancestry, so the bounds
+    /// apply to what this publication adds. An empty `held` captures the whole history.
+    pub fn freeze_selected_after(
+        repo: &Repo,
+        branches: &[String],
+        held: &BTreeSet<String>,
+    ) -> Result<Self> {
+        Self::freeze_roots(repo, branches, false, Depth::Until(held), &BTreeSet::new())
+    }
+
+    /// As [`PublicationPlan::freeze_selected_after`], and the tags named in `carried` are taken
+    /// too when the heads reach their commits below the boundary. Their history is not captured:
+    /// the caller names only tags whose commits the destination holds.
+    pub fn freeze_selected_after_carrying(
+        repo: &Repo,
+        branches: &[String],
+        held: &BTreeSet<String>,
+        carried: &BTreeSet<String>,
+    ) -> Result<Self> {
+        Self::freeze_roots(repo, branches, false, Depth::Until(held), carried)
+    }
+
+    fn freeze_roots(
+        repo: &Repo,
+        branches: &[String],
+        include_main: bool,
+        depth: Depth,
+        carried: &BTreeSet<String>,
+    ) -> Result<Self> {
         ensure!(
             !branches.is_empty(),
             "audit needs a selected publication branch"
@@ -232,39 +310,58 @@ impl PublicationPlan {
             })
             .collect::<Result<_>>()?;
 
+        let tips: BTreeSet<String> = heads.iter().map(|head| head.oid.clone()).collect();
+        let held = match depth {
+            Depth::Until(held) => held,
+            Depth::Tips => &tips,
+        };
         // Raw parent pointers define published history. Grafts, shallow boundaries, replacement
         // refs and commit-graph caches cannot remove an ancestor from this set.
-        let commits = reader.ancestry(
-            heads
-                .iter()
-                .map(|reference| reference.oid.clone())
-                .collect(),
-        )?;
+        let (commits, boundary) = reader.ancestry_until(tips.iter().cloned().collect(), held)?;
 
         let mut tags = Vec::new();
         let mut tag_objects = BTreeSet::new();
+        // Carried tags below the boundary, by commit, kept only if a head reaches them.
+        let mut outside = BTreeMap::<String, Vec<(FrozenRef, Vec<String>)>>::new();
         for (name, oid) in references
             .iter()
             .filter(|(name, _)| name.starts_with("refs/tags/"))
         {
-            if let Some((commit, objects)) = reader.tag_commit(oid)?
-                && commits.contains(&commit)
-            {
-                tags.push(FrozenRef {
+            if let Some((commit, objects)) = reader.tag_commit(oid)? {
+                let reference = FrozenRef {
                     name: name.clone(),
                     oid: oid.clone(),
-                });
-                tag_objects.extend(objects);
+                };
+                if commits.contains(&commit) {
+                    tags.push(reference);
+                    tag_objects.extend(objects);
+                } else if carried.contains(name) {
+                    outside
+                        .entry(commit)
+                        .or_default()
+                        .push((reference, objects));
+                }
             }
         }
         // A version tag names the commit it points at, so whether it belongs to this plan is
         // known without reading it.
-        tags.extend(
-            versions
-                .into_iter()
-                .filter(|(_, oid)| commits.contains(oid))
-                .map(|(name, oid)| FrozenRef { name, oid }),
-        );
+        for (name, oid) in versions {
+            if commits.contains(&oid) {
+                tags.push(FrozenRef { name, oid });
+            } else if carried.contains(&name) {
+                outside
+                    .entry(oid.clone())
+                    .or_default()
+                    .push((FrozenRef { name, oid }, Vec::new()));
+            }
+        }
+        let roots: Vec<String> = tips.iter().cloned().collect();
+        for (_, reached) in reader.reached(&roots, outside)? {
+            for (reference, objects) in reached {
+                tags.push(reference);
+                tag_objects.extend(objects);
+            }
+        }
         tags.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(Self {
             include_main,
@@ -272,14 +369,25 @@ impl PublicationPlan {
             tags,
             commit_objects: commits.into_iter().collect(),
             tag_objects: tag_objects.into_iter().collect(),
+            boundary: boundary.into_iter().collect(),
+            carried: carried.iter().cloned().collect(),
         })
     }
 
     /// Refuse if a fresh local observation differs from the captured plan.
     /// Callers still publish literal object refspecs because this comparison does not lock refs.
+    /// The boundary stands in for the held history: a walk that stops at it again captures the
+    /// same commits from unchanged heads.
     pub fn verify(&self, repo: &Repo, branches: &[String]) -> Result<()> {
+        let held = self.boundary.iter().cloned().collect();
         ensure!(
-            Self::freeze_roots(repo, branches, self.include_main)? == *self,
+            Self::freeze_roots(
+                repo,
+                branches,
+                self.include_main,
+                Depth::Until(&held),
+                &self.carried.iter().cloned().collect(),
+            )? == *self,
             "publication refs changed during audit; rerun the audit before publishing"
         );
         Ok(())
@@ -305,9 +413,19 @@ impl PublicationPlan {
     }
 }
 
+/// How far below the selected heads a plan captures history.
+enum Depth<'a> {
+    /// Down to commits in this set, which become the boundary; empty means the whole history.
+    Until(&'a BTreeSet<String>),
+    /// The heads alone.
+    Tips,
+}
+
 /// Raw, identity-checked parent pointers ignore local topology overlays.
 pub(crate) fn raw_ancestors(repo: &Repo, root: &str) -> Result<BTreeSet<String>> {
-    Reader::new(repo).ancestry(vec![root.into()])
+    Ok(Reader::new(repo)
+        .ancestry_until(vec![root.into()], &BTreeSet::new())?
+        .0)
 }
 
 struct Reader {
@@ -456,25 +574,90 @@ impl Reader {
         self.finish(|pipe| pipe.skip(size))
     }
 
-    fn ancestry(&mut self, mut pending: Vec<String>) -> Result<BTreeSet<String>> {
+    /// The commits reachable from `pending`, and those of them in `held`, whose parents are not
+    /// walked. `MAX_COMMITS` bounds the captured commits, boundary included.
+    fn ancestry_until(
+        &mut self,
+        mut pending: Vec<String>,
+        held: &BTreeSet<String>,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         let mut commits = BTreeSet::new();
+        let mut boundary = BTreeSet::new();
         while let Some(oid) = pending.pop() {
             if commits.contains(&oid) {
                 continue;
             }
-            ensure!(
-                commits.len() < MAX_COMMITS,
-                "this branch has more history than one publication can carry ({MAX_COMMITS} \
-                 commits); it cannot be published until agit lifts this limit"
-            );
+            if held.is_empty() {
+                ensure!(
+                    commits.len() < MAX_COMMITS,
+                    "this branch has more history than one publication can carry ({MAX_COMMITS} \
+                     commits); it cannot be published until agit lifts this limit"
+                );
+            } else {
+                ensure!(
+                    commits.len() < MAX_COMMITS,
+                    "this push adds more history than one publication can carry ({MAX_COMMITS} \
+                     commits); publish it in smaller steps"
+                );
+            }
             let body = self.object(&oid, "commit")?;
-            pending.extend(commit_parents(&body)?);
+            if held.contains(&oid) {
+                boundary.insert(oid.clone());
+            } else {
+                pending.extend(commit_parents(&body)?);
+            }
             commits.insert(oid);
         }
-        Ok(commits)
+        Ok((commits, boundary))
     }
 
-    /// The commits of `among`, which is sorted, that are reachable from `roots`.
+    /// The advertised objects that are commits in this repository.
+    #[cfg(any(feature = "cli", test))]
+    fn advertised_commits(&mut self, advertised: &[String]) -> Result<Vec<String>> {
+        let advertised: BTreeSet<_> = advertised.iter().cloned().collect();
+        ensure!(
+            advertised.len() <= MAX_REFS,
+            "advertised ref limit exceeded"
+        );
+        ensure!(
+            advertised.iter().all(|oid| valid_oid(oid)),
+            "invalid advertised object identity"
+        );
+        let mut roots = Vec::new();
+        self.repo.git_cat_file_batch_check(
+            advertised.iter().cloned().collect(),
+            |oid, kind, _| {
+                ensure!(
+                    advertised.contains(oid),
+                    "unexpected advertised object identity"
+                );
+                if kind == "commit" {
+                    roots.push(oid.to_owned());
+                }
+                Ok(())
+            },
+        )?;
+        Ok(roots)
+    }
+
+    /// The entries of `outside` whose commit `roots` reach. Nothing is walked when it is empty.
+    fn reached<T>(
+        &mut self,
+        roots: &[String],
+        outside: BTreeMap<String, T>,
+    ) -> Result<Vec<(String, T)>> {
+        if outside.is_empty() {
+            return Ok(Vec::new());
+        }
+        let among: Vec<String> = outside.keys().cloned().collect();
+        let reachable = self.reachable_among(roots, Some(&among))?;
+        Ok(outside
+            .into_iter()
+            .filter(|(commit, _)| reachable.contains(commit))
+            .collect())
+    }
+
+    /// The commits reachable from `roots`, limited to `among` (sorted) when it is given.
     ///
     /// Every ancestor of the roots is listed, under its own bound rather than the selected
     /// history's: a walk of every advertised branch under the selected-history bound refuses a
@@ -482,7 +665,11 @@ impl Reader {
     /// asked to exclude history (`--not`), because that stops early on commit dates and misses an
     /// ancestor older than its descendants. Replacement objects, grafts, the shallow file and the
     /// commit-graph cache are ignored, so Git sees the same raw parents as the captured ancestry.
-    fn reachable_among(&mut self, roots: &[String], among: &[String]) -> Result<BTreeSet<String>> {
+    fn reachable_among(
+        &mut self,
+        roots: &[String],
+        among: Option<&[String]>,
+    ) -> Result<BTreeSet<String>> {
         use std::io::{BufRead, Seek, Write};
         let mut input = tempfile::tempfile()?;
         for root in roots {
@@ -520,7 +707,7 @@ impl Reader {
                     walked <= MAX_ACCEPTED_HISTORY,
                     "accepted publication history limit exceeded"
                 );
-                if among.binary_search(&oid).is_ok() {
+                if among.is_none_or(|among| among.binary_search(&oid).is_ok()) {
                     reachable.insert(oid);
                 }
                 Ok(())
@@ -990,28 +1177,24 @@ mod tests {
         git(root, &["checkout", "-qb", "historical-fork", &base]);
         git(root, &["commit", "--allow-empty", "-qm", "local fork"]);
         let fork = git(root, &["rev-parse", "HEAD"]);
-        let historical =
-            PublicationPlan::freeze_selected(&repo, &["historical-fork".into()]).unwrap();
         git(root, &["replace", "--graft", &tip, &fork]);
         std::fs::write(root.join(".git/shallow"), format!("{tip}\n")).unwrap();
         std::fs::write(root.join(".git/info/grafts"), format!("{tip} {fork}\n")).unwrap();
         assert_eq!(PublicationPlan::freeze(&repo, &branches).unwrap(), plan);
         assert_eq!(plan.tags[0].oid, base);
-        assert_eq!(
-            historical.accepted_commits(&repo, &[tip]).unwrap(),
-            BTreeSet::from([base])
-        );
+        let held = PublicationPlan::held_history(&repo, std::slice::from_ref(&tip)).unwrap();
+        assert_eq!(held, BTreeSet::from([base.clone(), tip]));
         assert!(
-            historical
-                .accepted_commits(&repo, &["f".repeat(40)])
+            PublicationPlan::held_history(&repo, &["f".repeat(40)])
                 .unwrap()
                 .is_empty()
         );
     }
 
-    /// A short branch's accepted history is decided however much history the destination's other
-    /// branches hold. A raw walk of every advertised tip under the history bound refuses here, and
-    /// with it every session of a repository whose published branches together outgrow the bound.
+    /// The destination's held history is read however much of it there is, and a short branch
+    /// continuing it is captured down to it. A raw walk of every advertised tip under the history
+    /// bound refuses here, and with it every session of a repository whose published branches
+    /// together outgrow the bound.
     #[test]
     fn accepted_history_ignores_the_length_of_unrelated_published_branches() {
         use std::io::Write;
@@ -1043,11 +1226,69 @@ mod tests {
         let published = git(root, &["rev-parse", "refs/heads/published"]);
         git(root, &["checkout", "-qb", "short", &base]);
         git(root, &["commit", "--allow-empty", "-qm", "short session"]);
-        let plan = PublicationPlan::freeze_selected(&repo, &["short".into()]).unwrap();
+        let held = PublicationPlan::held_history(&repo, &[published]).unwrap();
+        assert!(held.contains(&base));
+        let plan = PublicationPlan::freeze_selected_after(&repo, &["short".into()], &held).unwrap();
+        assert_eq!(plan.boundary(), std::slice::from_ref(&base));
+        assert_eq!(plan.commit_objects.len(), 2);
+    }
+
+    /// A bounded plan takes the tags it is asked to carry when the heads reach their commits below
+    /// the boundary, without capturing that history, so a tag on an early commit of a history
+    /// longer than one publication can carry is published with a short continuation. A carried
+    /// name the heads do not reach, and a tag below the boundary nobody named, stay out. A plan
+    /// that captured down to the tag's commit is refused here at the commit bound; one that took
+    /// every tag below the boundary would republish the whole history's tags on every push.
+    #[test]
+    fn a_bounded_plan_carries_named_tags_below_its_boundary() {
+        let (_directory, repo, base) = repository();
+        let root = repo.root();
+        let mut stream = String::new();
+        for index in 0..=MAX_COMMITS {
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{}\n", index + 1));
+            stream.push_str("committer Writer <writer@example.invalid> 1700000000 +0000\n");
+            stream.push_str(&format!("data {}\n{index}\n", index.to_string().len() + 1));
+            if index == 0 {
+                stream.push_str(&format!("from {base}\n"));
+            }
+        }
+        stream.push_str("reset refs/tags/early\nfrom :2\n\n");
+        stream.push_str("reset refs/tags/unnamed\nfrom :3\n\n");
+        git_with_input(root, &["fast-import", "--quiet"], &stream);
+        let published = git(root, &["rev-parse", "main"]);
+        let early = git(root, &["rev-parse", "refs/tags/early"]);
+        git(root, &["checkout", "-qb", "elsewhere", &base]);
+        git(root, &["commit", "--allow-empty", "-qm", "elsewhere"]);
+        let elsewhere = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["tag", "unreached", &elsewhere]);
+        git(root, &["checkout", "-q", "main"]);
+        git(root, &["commit", "--allow-empty", "-qm", "continued"]);
+        let held = BTreeSet::from([published.clone()]);
+        let carried = BTreeSet::from([
+            "refs/tags/early".to_owned(),
+            "refs/tags/unreached".to_owned(),
+        ]);
+        let plan = PublicationPlan::freeze_selected_after_carrying(
+            &repo,
+            &["main".into()],
+            &held,
+            &carried,
+        )
+        .unwrap();
+        assert_eq!(plan.boundary(), std::slice::from_ref(&published));
+        assert_eq!(plan.commit_objects.len(), 2);
         assert_eq!(
-            plan.accepted_commits(&repo, &[published]).unwrap(),
-            BTreeSet::from([base])
+            plan.tags,
+            [FrozenRef {
+                name: "refs/tags/early".into(),
+                oid: early,
+            }]
         );
+        plan.verify(&repo, &["main".into()]).unwrap();
+        let bounded =
+            PublicationPlan::freeze_selected_after(&repo, &["main".into()], &held).unwrap();
+        assert!(bounded.tags.is_empty());
     }
 
     /// Missing history is an incomplete audit, even when a local shallow boundary hides it.

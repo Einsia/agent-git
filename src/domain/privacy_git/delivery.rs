@@ -25,11 +25,7 @@ impl Delivery {
         sessions: &BTreeSet<String>,
         persist: bool,
     ) -> Result<Option<Self>> {
-        let scope = digest_json(&json!({"version":1,"delivery":identity}))?;
-        let directory = source
-            .common_dir()?
-            .join("agit/deliveries")
-            .join(scope.trim_start_matches("sha256:"));
+        let (scope, directory) = Self::state(source, identity)?;
         if !explicit && !directory.exists() {
             return Ok(None);
         }
@@ -84,6 +80,21 @@ impl Delivery {
             state::save(&directory, &scope, &serde_json::to_vec(&delivery)?)?;
         }
         Ok(Some(delivery))
+    }
+
+    /// Whether this checkout has delivered sessions to `identity` from another Hub; publications
+    /// to it then go through [`Delivery::prepare`].
+    pub fn active(source: &Repo, identity: &RemoteIdentity) -> Result<bool> {
+        Ok(Self::state(source, identity)?.1.exists())
+    }
+
+    fn state(source: &Repo, identity: &RemoteIdentity) -> Result<(String, std::path::PathBuf)> {
+        let scope = digest_json(&json!({"version":1,"delivery":identity}))?;
+        let directory = source
+            .common_dir()?
+            .join("agit/deliveries")
+            .join(scope.trim_start_matches("sha256:"));
+        Ok((scope, directory))
     }
 
     pub fn session(&self, source: &str) -> Result<&str> {

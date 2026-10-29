@@ -18,7 +18,10 @@ pub(super) struct History {
 
 impl History {
     pub fn read(repo: &Repo, plan: &PublicationPlan) -> Result<Self> {
-        let parents = commit_parent_map(repo, plan.commit_objects())?;
+        let parents = super::walk_parents(
+            commit_parent_map(repo, plan.commit_objects())?,
+            plan.boundary(),
+        );
         let mut records = BTreeMap::new();
         let mut cached = BTreeMap::new();
         for oid in plan.commit_objects() {
