@@ -556,7 +556,7 @@ fn transform_inner(
     if matches!(
         mode,
         Mode::HydrateText | Mode::HydrateJsonl | Mode::HydrateEnvelopes
-    ) && !text.contains("{{AGIT_SECRET_")
+    ) && !super::detector::placeholder::may_contain_token(text)
     {
         return Outcome {
             content: text.into(),
@@ -1088,9 +1088,7 @@ fn validate(input: &str, output: &Outcome, mode: Mode) -> crate::Result<()> {
                             && before
                                 .get(field)
                                 .and_then(serde_json::Value::as_str)
-                                .is_some_and(|value| {
-                                    super::dictionary::token_identity(value).is_some()
-                                });
+                                .is_some_and(|value| super::dictionary::token_id(value).is_some());
                         ensure!(
                             before.get(field) == after.get(field) || restored_native_identity,
                             "privacy changed a carrier identity"

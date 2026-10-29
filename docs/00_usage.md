@@ -914,7 +914,10 @@ global vault; repository dictionaries keep their own local keys beside the mappi
 answers) · `privacy.entropy` (`report | replace`; captured content always has provider credentials,
 private keys, credential assignments and explicitly blocked values replaced with reversible
 placeholders, while values whose only evidence is high entropy or the generic key rule stay
-unchanged unless this is `replace`).
+unchanged unless this is `replace`). Protocol fields are the exception: the identity and linkage
+fields a runtime needs to resume (Codex `call_id`, Claude Code tool-use IDs) and its opaque carriers
+(thinking signatures, `redacted_thinking` data, Codex `encrypted_content`) keep their bytes, even
+when they hold a blocked value or have a credential's shape.
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.

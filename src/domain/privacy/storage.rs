@@ -1,7 +1,7 @@
 //! A private transactional journal acknowledges mappings only after durable commit.
 
 use super::crypto::{self, Envelope, Owner, UserKey};
-use super::dictionary::{Dictionary, Fragment, Record, token_identity};
+use super::dictionary::{Dictionary, Fragment, Record, token_id};
 use anyhow::{Context, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -479,10 +479,7 @@ impl Store {
         );
         let mut validation = Dictionary::default();
         for fragment in contents.records {
-            ensure!(
-                token_identity(&fragment.token).is_some(),
-                "invalid privacy token"
-            );
+            ensure!(token_id(&fragment.token).is_some(), "invalid privacy token");
             validation.accept_fragment(fragment)?;
         }
         let payload = serde_json::to_vec(envelope)?;
@@ -679,7 +676,13 @@ mod tests {
             1
         );
 
-        let alias = Record::new(&restored.store.dictionary_id, secret, Origin::Heuristic).unwrap();
+        let alias = Record::new(
+            &restored.store.dictionary_id,
+            secret,
+            Origin::Heuristic,
+            super::super::dictionary::Label::secret("generic-api-key"),
+        )
+        .unwrap();
         let alias_token = alias.token.clone();
         restored
             .store

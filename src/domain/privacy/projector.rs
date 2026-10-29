@@ -1,7 +1,8 @@
 //! Semantic projection uses durable mappings and keeps valid placeholders opaque.
 
 use super::crypto::UserKey;
-use super::dictionary::{Dictionary, Origin, Record, token_identity};
+use super::detector::placeholder;
+use super::dictionary::{Dictionary, Label, Origin, Record, token_id};
 use super::policy::{Batch, Snapshot, Source};
 use super::storage::Store;
 use serde::{Deserialize, Serialize};
@@ -197,9 +198,11 @@ pub struct Projector {
     pub missing: Option<Reason>,
 }
 
-/// Recognition validates bounded token syntax before treating any text as opaque.
+/// Recognition validates bounded token syntax before treating any text as opaque. Decoded
+/// text carries raw delimiters, so escaped spellings are not placeholders here.
 pub fn tokens(text: &str) -> impl Iterator<Item = (usize, usize, &str)> {
-    text.match_indices("{{AGIT_SECRET_V")
+    let legacy = text
+        .match_indices("{{AGIT_SECRET_V")
         .filter_map(|(start, _)| {
             let tail = &text[start..];
             let end = tail
@@ -208,9 +211,25 @@ pub fn tokens(text: &str) -> impl Iterator<Item = (usize, usize, &str)> {
                 .take(128)
                 .position(|bytes| bytes == b"}}")?
                 + 2;
-            let token = &tail[..end];
-            token_identity(token).map(|_| (start, start + end, token))
-        })
+            Some((start, start + end))
+        });
+    let typed = text
+        .match_indices(placeholder::TYPED_OPEN)
+        .filter_map(|(start, _)| {
+            let close = text[start..]
+                .char_indices()
+                .take(96)
+                .find(|(_, c)| *c == placeholder::TYPED_CLOSE)?
+                .0;
+            Some((start, start + close + placeholder::TYPED_CLOSE.len_utf8()))
+        });
+    let mut found: Vec<_> = legacy
+        .chain(typed)
+        .filter(|&(start, end)| token_id(&text[start..end]).is_some())
+        .map(|(start, end)| (start, end, &text[start..end]))
+        .collect();
+    found.sort_unstable_by_key(|&(start, _, _)| start);
+    found.into_iter()
 }
 
 fn whole_token(text: &str) -> bool {
@@ -622,7 +641,7 @@ impl Projector {
                 let token = value
                     .pointer(&identity.pointer)
                     .and_then(Value::as_str)
-                    .filter(|text| token_identity(text).is_some())
+                    .filter(|text| token_id(text).is_some())
                     .map(str::to_owned);
                 if let Some(token) = token {
                     if let Some(field) = value.pointer_mut(&identity.pointer) {
@@ -870,13 +889,24 @@ impl Projector {
                 complete = false;
                 continue;
             };
-            if self.dictionary.for_value(original).is_none() && seen.insert(original) {
+            // A value first replaced under a legacy spelling gains a typed alias here.
+            if self
+                .dictionary
+                .for_value(original)
+                .is_none_or(|record| placeholder::typed_parts(&record.token).is_none())
+                && seen.insert(original)
+            {
                 let origin = match finding.source {
                     Source::Default => Origin::Heuristic,
                     Source::GlobalUser => Origin::GlobalUser,
                     Source::RepositoryUser => Origin::RepositoryUser,
                 };
-                match Record::new(&self.store.dictionary_id, original, origin) {
+                match Record::new(
+                    &self.store.dictionary_id,
+                    original,
+                    origin,
+                    Label::secret(finding.rule),
+                ) {
                     Ok(record) => new.push(record),
                     Err(_) => complete = false,
                 }
@@ -1019,12 +1049,15 @@ mod tests {
         let quoted = "quoted \" private value\nwith \\ escapes";
         let fragment = "\"name\":\"read\"},\"id\"";
         let mut legacy = |value: &str| {
-            let record = Record::new(
-                &projector.store.dictionary_id,
-                value,
-                Origin::RepositoryUser,
-            )
-            .unwrap();
+            let record = Record {
+                token: format!(
+                    "{{{{AGIT_SECRET_V2:{}:{}}}}}",
+                    projector.store.dictionary_id,
+                    uuid::Uuid::new_v4()
+                ),
+                original: value.to_owned(),
+                origins: [Origin::RepositoryUser].into(),
+            };
             projector
                 .store
                 .append(std::slice::from_ref(&record), None)
@@ -1196,7 +1229,7 @@ mod tests {
         let inner = protected_calls[0]["function"]["arguments"]["secret"]
             .as_str()
             .unwrap();
-        assert!(token_identity(inner).is_some());
+        assert!(token_id(inner).is_some());
         projector.policy = Snapshot::compile(
             &[secret, quoted, fragment].map(|value| super::super::policy::Literal {
                 value,
@@ -1210,7 +1243,7 @@ mod tests {
         assert!(protected.status == Status::Complete);
         let outer: Value = serde_json::from_str(protected.content.lines().next().unwrap()).unwrap();
         let outer = outer["data"]["tool_calls"].as_str().unwrap();
-        assert!(token_identity(outer).is_some());
+        assert!(token_id(outer).is_some());
         let hydrated = projector.transform(&protected.content, Mode::HydrateJsonl);
         assert!(hydrated.status == Status::Complete);
         assert_eq!(hydrated.unresolved, 0);
@@ -1321,7 +1354,7 @@ mod tests {
             let raw = row["data"]["tool_calls"].as_str().unwrap();
             assert!(!raw.contains(block));
             assert!(!raw.contains(&serde_json::to_string(quoted).unwrap()));
-            assert!(raw.starts_with("{{AGIT_SECRET_V2:"));
+            assert!(raw.starts_with("\u{2039}secret:blocked:"));
             let repeated = projector.transform(&protected.content, Mode::ProtectJsonl);
             assert_eq!(repeated.content, protected.content);
             assert_eq!(repeated.replacements, 0);
@@ -1384,6 +1417,54 @@ mod tests {
             serde_json::from_str::<Value>(&allowed.content).unwrap(),
             record
         );
+    }
+
+    /// A value first replaced under a legacy spelling gains a typed token for new content, and
+    /// the legacy token keeps restoring. Reusing the legacy record would keep minting long
+    /// tokens; dropping it would strand published history.
+    #[test]
+    fn new_replacements_use_typed_tokens_while_legacy_tokens_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(&[], &[], false).unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+        };
+        let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let legacy = Record {
+            token: format!(
+                "{{{{AGIT_SECRET_V2:{}:{}}}}}",
+                projector.store.dictionary_id,
+                uuid::Uuid::new_v4()
+            ),
+            original: secret.to_owned(),
+            origins: [Origin::Heuristic].into(),
+        };
+        let legacy_token = legacy.token.clone();
+        projector
+            .store
+            .append(std::slice::from_ref(&legacy), None)
+            .unwrap();
+        projector.dictionary.accept(legacy).unwrap();
+        let protected = projector.transform(&format!("token {secret}"), Mode::ProtectText);
+        let (start, end, token) = tokens(&protected.content).next().unwrap();
+        assert_eq!(
+            protected.content[..start].to_owned() + &protected.content[end..],
+            "token "
+        );
+        assert_eq!(
+            placeholder::typed_parts(token).map(|(class, kind, _)| (class, kind)),
+            Some(("secret", "github-pat"))
+        );
+        for spelling in [token, legacy_token.as_str()] {
+            assert_eq!(
+                projector.transform(spelling, Mode::HydrateText).content,
+                secret
+            );
+        }
     }
 
     /// A base64 media payload passes through byte for byte even when a run inside it has a
@@ -1594,7 +1675,7 @@ mod tests {
                 );
                 let body = record.pointer(data).unwrap().to_string();
                 assert!(!body.contains(id), "{runtime}: {data}");
-                assert!(body.contains("AGIT_SECRET_V2:"), "{runtime}: {data}");
+                assert!(body.contains("\u{2039}secret:"), "{runtime}: {data}");
             }
         }
 
@@ -1737,7 +1818,7 @@ mod tests {
             protected["data"]["tool_calls"]
                 .as_str()
                 .unwrap()
-                .starts_with("{{AGIT_SECRET_V2:")
+                .starts_with("\u{2039}secret:blocked:")
         );
     }
 

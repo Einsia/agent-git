@@ -100,7 +100,7 @@ committed history; it applies to newly captured content.
 
 ## 5 Placeholders
 
-New replacements use `‹CLASS:KIND:ID›`, for example `‹secret:github-pat:k3m9x2q7w4ab›`.
+New replacements use `‹CLASS:KIND:ID›`, for example `‹secret:github-pat:k3m7x2q6w4ab›`.
 
 - `CLASS` is `secret` for credentials. Anonymization uses `path`, `user`, `host` and
   `omitted` (section 8).
@@ -146,12 +146,16 @@ high tier of the same detector (the backend links this crate's detector). It nev
 the receive request and it never rejects a push.
 
 A hit marks the session *suspected credential* with the rule kinds and the commit that carried
-them. A suspected session is excluded from public listings, search results and translation,
-and its owner is notified: the owner's session and repository pages show the alert, and an
-email is sent when the Hub has mail delivery configured. Repository members with read access still see it, with the hit
-locations rendered as masked spans. The flag clears when a later snapshot of the session no
-longer contains a hit, or when the owner dismisses it after review. Legacy encrypted snapshots
-are not re-checked: readers only ever saw their sanitized projection.
+them. A suspected session is left out of search results, translation, and the repository
+session lists shown to readers without write access. Its owner is notified: the owner's alert
+list and the session page show it to repository writers, and an email is sent when the Hub has
+mail delivery configured. Writers keep seeing the session so they can fix it. A direct link
+keeps working, because immutable reads are served to shared caches where a per-reader decision
+would leak; rendering the hit spans masked is the step that covers direct readers.
+
+The flag clears when a later snapshot of the session no longer contains a hit. A writer can
+dismiss it after review; the dismissal lasts until a later snapshot carries more findings.
+Legacy encrypted snapshots are not re-checked: readers only ever saw their sanitized projection.
 
 ## 8 Restore and reveal
 

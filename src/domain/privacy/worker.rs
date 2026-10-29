@@ -691,6 +691,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                     &store.dictionary_id,
                     value,
                     super::dictionary::Origin::GlobalUser,
+                    super::dictionary::Label::secret("explicit-block"),
                 )?;
                 store.append(std::slice::from_ref(&record), key.as_ref())?;
                 let token = record.token.clone();

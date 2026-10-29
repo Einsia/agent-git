@@ -1252,7 +1252,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
 
     // A publication restores repeated events across worker batches from one retained dictionary.
     use agit::domain::privacy::{
-        dictionary::{Origin, Record},
+        dictionary::{Label, Origin, Record},
         keys,
         storage::Store,
     };
@@ -1263,7 +1263,13 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     )
     .unwrap();
     let secret = "AKIA2E7YQXK4NMZ5VJ3T";
-    let record = Record::new(&dictionary.dictionary_id, secret, Origin::RepositoryUser).unwrap();
+    let record = Record::new(
+        &dictionary.dictionary_id,
+        secret,
+        Origin::RepositoryUser,
+        Label::secret("explicit-block"),
+    )
+    .unwrap();
     dictionary
         .append(std::slice::from_ref(&record), None)
         .unwrap();
@@ -1316,6 +1322,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         &dictionary.dictionary_id,
         "missing original",
         Origin::RepositoryUser,
+        Label::secret("explicit-block"),
     )
     .unwrap();
     let unknown = transcript::wrap_lines(

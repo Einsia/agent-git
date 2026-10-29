@@ -372,7 +372,7 @@ fn native_settlement_survives_privacy_timeout_and_recovery_loss() {
         agit::domain::meta::LOG_FILE,
     )
     .unwrap();
-    assert!(saved.contains("{{AGIT_SECRET_V2:"));
+    assert!(saved.contains("\u{2039}secret:"));
     assert!(!saved.contains("SYNTHETIC-PRIVATE-VALUE"));
     let legacy = lab.store.join("secret-filter");
     fs::create_dir_all(&legacy).unwrap();
