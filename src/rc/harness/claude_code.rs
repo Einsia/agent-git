@@ -490,13 +490,14 @@ impl ClaudeCodeDriver {
         // Mark the child so nested tooling can tell it is running under RC.
         env.push(("AGIT_RC".into(), "1".into()));
 
-        let program = program::resolve();
-        env.extend(program.as_ref().and_then(program::Program::env));
-        let executable = program
-            .as_ref()
-            .map(|program| program.path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "claude".into());
-        let mut proc = Proc::spawn(&executable, &args, &spec.cwd, &env)?;
+        let program = program::resolve().ok_or_else(|| {
+            LaunchError::not_spawned(anyhow::anyhow!(
+                "Claude Code is not installed where this device's daemon can run it: no `claude` \
+                 on the daemon's PATH or in Claude Code's install directories"
+            ))
+        })?;
+        env.extend(program.env());
+        let mut proc = Proc::spawn(&program.path.to_string_lossy(), &args, &spec.cwd, &env)?;
 
         // The SDK handshake. Declaring it is what puts the CLI in "ask the
         // client" mode for permissions; without it we would silently fall back

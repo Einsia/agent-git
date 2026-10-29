@@ -154,6 +154,16 @@ impl RuntimeSource {
     }
 }
 
+/// The Codex program for the default Codex home: the one its source launches, which falls back past
+/// PATH to the last program it saw, so a daemon started with a minimal PATH still reaches it.
+pub(crate) fn default_codex_program() -> Option<PathBuf> {
+    Registry::open()
+        .ok()
+        .and_then(|registry| registry.default_source().ok().flatten())
+        .and_then(|source| source.launch_executable())
+        .or_else(|| crate::adapter::which("codex"))
+}
+
 #[derive(Serialize, Deserialize)]
 struct State {
     version: u32,
@@ -313,19 +323,23 @@ impl Registry {
         self.register_inner(home, executable, socket, name, false)
     }
 
-    pub(crate) fn default_for_launch(
-        &self,
-    ) -> crate::Result<Option<crate::protocol::NativeSourceRef>> {
+    /// The default Codex home's source, the one launches and native sends use.
+    fn default_source(&self) -> crate::Result<Option<RuntimeSource>> {
         let home = crate::adapter::codex::codex_home()?;
         let Ok(home) = home.canonicalize() else {
             return Ok(None);
         };
-        let Some(source) = self
+        Ok(self
             .list()?
             .into_iter()
             .filter(|source| source.home == home)
-            .max_by_key(|source| source.enabled)
-        else {
+            .max_by_key(|source| source.enabled))
+    }
+
+    pub(crate) fn default_for_launch(
+        &self,
+    ) -> crate::Result<Option<crate::protocol::NativeSourceRef>> {
+        let Some(source) = self.default_source()? else {
             return Ok(None);
         };
         source.validate()?;

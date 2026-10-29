@@ -2833,15 +2833,11 @@ async fn finished_supervisor_is_reconciled_without_releasing_an_accepted_rpc() {
 #[cfg(unix)]
 #[tokio::test]
 async fn native_titles_reach_session_list_without_replacing_gist_or_reading_rollouts() {
-    use std::os::unix::fs::PermissionsExt;
     const CHILD: &str = "AGIT_NATIVE_TITLE_TEST_CHILD";
     let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
         let directory = tempfile::tempdir().unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let executable = bin.join("codex");
-        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "rc::daemon::tests::sessions::native_titles_reach_session_list_without_replacing_gist_or_reading_rollouts", "--nocapture"])
             .env(CHILD, directory.path())

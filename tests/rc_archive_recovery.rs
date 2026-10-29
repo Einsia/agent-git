@@ -31,14 +31,14 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("AGIT_SESSION")
-        .env_remove("AGIT_RC");
+        .env_remove("AGIT_RC")
+        .env_remove("CLAUDE_CONFIG_DIR");
     command
 }
 
-/// Puts a `claude` first on the daemon's PATH, as on a machine with Claude Code installed:
-/// without one the Claude Code adapter is unavailable and no native session can be watched. It
-/// answers the version probe; any other invocation is a model launch and leaves
-/// `claude-launched` in `root`.
+/// Puts a `claude` first on the daemon's PATH, so a model launch runs this stand-in rather than
+/// whatever Claude Code the machine has. It answers the version probe; any other invocation is a
+/// model launch and leaves `claude-launched` in `root`.
 fn install_claude(root: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = root.join("bin");
