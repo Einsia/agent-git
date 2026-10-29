@@ -75,7 +75,11 @@ pub enum Action {
     /// SessionStart: record which session is running now (reads the hook JSON on stdin).
     Ingest,
     /// Stop: settle the turn that just ended, located by the payload's session_id.
-    Settle,
+    Settle {
+        /// Wait, bounded, until the transcript holds the stopped turn's reply.
+        #[arg(long, hide = true)]
+        await_reply: bool,
+    },
     /// Deliver a Claude Code session's queued workspace messages while that session runs.
     #[command(hide = true)]
     Relay {
@@ -127,7 +131,7 @@ pub fn run(args: Args) -> CmdResult {
     let runtime = args.runtime.clone();
     match args.action.unwrap_or(Action::Ingest) {
         Action::Ingest => ingest(runtime.as_deref()),
-        Action::Settle => settle(runtime.as_deref()),
+        Action::Settle { await_reply } => settle(runtime.as_deref(), await_reply),
         Action::Relay { session } => {
             // The relay has no audience; it ends quietly when it cannot or need not run.
             let _ = crate::rc::claude_inbox::run_relay(&session);
@@ -277,10 +281,18 @@ fn starts_inbox_relay(runtime: Option<&str>, event: &Event) -> bool {
         && crate::rc::claude_inbox::relay_serves(event.permission_mode.as_deref())
 }
 
-fn read_event(runtime: Option<&str>) -> Option<Event> {
+fn read_payload() -> Option<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).ok()?;
-    let mut event = parse_event(&buf)?;
+    Some(buf)
+}
+
+fn read_event(runtime: Option<&str>) -> Option<Event> {
+    event_from(runtime, &read_payload()?)
+}
+
+fn event_from(runtime: Option<&str>, buf: &str) -> Option<Event> {
+    let mut event = parse_event(buf)?;
     match runtime.and_then(|runtime| crate::adapter::normalize(runtime).ok()) {
         Some("workbuddy") if event.cwd.is_none() => {
             event.cwd = std::env::var("CODEBUDDY_PROJECT_DIR")
@@ -288,7 +300,7 @@ fn read_event(runtime: Option<&str>) -> Option<Event> {
                 .filter(|cwd| !cwd.is_empty());
         }
         Some("hermes") => {
-            let value: serde_json::Value = serde_json::from_str(&buf).ok()?;
+            let value: serde_json::Value = serde_json::from_str(buf).ok()?;
             if value["hook_event_name"] == "on_session_start" {
                 event.source = Source::Startup;
             }
@@ -768,14 +780,14 @@ fn sh_quote(s: &str) -> String {
 
 // ── settle (Stop) ─────────────────────────────────────────────────────
 
-fn settle(runtime: Option<&str>) -> CmdResult {
+fn settle(runtime: Option<&str>, await_reply: bool) -> CmdResult {
     // The gate sits before reading the payload and opening the store: inside a process tree
     // delegated to the supervisor, the hook touches no local state at all — the branch moves only
     // within the supervisor's lease.
     if super::commit::delegated_settlement(true)?.is_some() {
         return Ok(ExitCode::Ok);
     }
-    match settle_inner(runtime) {
+    match settle_inner(runtime, await_reply) {
         Err(error) if super::commit::archive::is_failure(&error) => {
             crate::ui::error(&format!("{error:#}"));
             Ok(super::terminal_error_code(&error, ExitCode::Failure))
@@ -784,9 +796,13 @@ fn settle(runtime: Option<&str>) -> CmdResult {
     }
 }
 
-fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
-    let event = read_event(runtime);
+fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
+    let payload = read_payload();
+    let event = payload
+        .as_deref()
+        .and_then(|payload| event_from(runtime, payload));
     if let Some(ev) = &event
+        && !await_reply
         && starts_inbox_relay(runtime, ev)
     {
         crate::rc::claude_inbox::start_relay(&ev.session_id);
@@ -803,6 +819,21 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
     };
+    // Archive settlement reports its failure to the hook's caller, so it never detaches.
+    if !archive_required
+        && rt == "claude-code"
+        && let Some(transcript) = ev.transcript_path.as_deref().map(std::path::Path::new)
+    {
+        if await_reply {
+            wait_for_reply(transcript);
+        } else if tail_awaits_reply(transcript)
+            && concerns_settlement(&store, rt, &ev)
+            && let Some(payload) = payload.as_deref()
+            && spawn_awaiting_settlement(runtime, payload).is_ok()
+        {
+            return Ok(());
+        }
+    }
     if !archive_required
         && super::project::capture(rt, &ev.session_id, session_origin(&ev).as_deref())?
     {
@@ -827,10 +858,113 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
     Ok(())
 }
 
+/// How long a detached settlement waits for Claude Code to write the stopped turn's reply. Past
+/// it, the turn settles with what the transcript holds rather than not at all.
+const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How much of the transcript's end is read to judge whether the stopped turn is answered.
+const REPLY_TAIL_BYTES: u64 = 1 << 20;
+
+/// Whether the transcript's end holds conversation after its last completed turn.
+///
+/// Claude Code runs Stop hooks before its transcript writer flushes the turn's final reply. A
+/// Stop that settled what it reads would leave the turn unsettled, and after the last turn before
+/// `/exit` no later Stop comes to settle it.
+fn tail_awaits_reply(transcript: &std::path::Path) -> bool {
+    use std::io::{Read as _, Seek as _};
+    let Ok(mut file) = std::fs::File::open(transcript) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    let start = len.saturating_sub(REPLY_TAIL_BYTES);
+    let mut tail = Vec::new();
+    if file
+        .seek(std::io::SeekFrom::Start(start))
+        .and_then(|_| file.read_to_end(&mut tail))
+        .is_err()
+    {
+        return false;
+    }
+    let tail = String::from_utf8_lossy(&tail);
+    // A window that starts inside the file and holds no completed turn may be cut through the
+    // stopped turn's own record, which then parses as nothing; it cannot show the turn answered.
+    (start > 0 && crate::adapter::claude_code::completed_turn_boundary(&tail).is_none())
+        || crate::adapter::claude_code::awaits_reply(&tail)
+}
+
+fn wait_for_reply(transcript: &std::path::Path) {
+    let deadline = std::time::Instant::now() + REPLY_WAIT;
+    while tail_awaits_reply(transcript) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Whether a Stop could settle or capture this session. A session that is none of agit's
+/// business starts no waiting process.
+fn concerns_settlement(store: &Store, runtime: &str, ev: &Event) -> bool {
+    link::get(store, runtime, &ev.session_id).is_some()
+        || session_origin(ev)
+            .and_then(|origin| std::path::Path::new(&origin).canonicalize().ok())
+            .is_some_and(|origin| super::project::registration_scope(&origin))
+}
+
+/// Hands the Stop to a detached `agit hooks settle --await-reply` that holds no pipe of the
+/// runtime, so the turn ends at once and the settlement outlives a runtime that exits.
+fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut command = crate::infra::background::command(std::env::current_exe()?);
+    command.args(["hooks", "settle", "--await-reply"]);
+    if let Some(runtime) = runtime {
+        command.args(["--runtime", runtime]);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    let written = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(payload.as_bytes()));
+    if written.is_err() {
+        // A child that read part of the payload settles nothing; this Stop settles inline.
+        let _ = child.kill();
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Decision, Source, decide};
     use clap::Parser as _;
+
+    /// The Stop hook reads only the transcript's end, so an unanswered record longer than that
+    /// window (a pasted image, a large tool result) is cut where the read starts. A check that
+    /// judged only the records it could parse would find none, settle at once, and leave the
+    /// last turn before `/exit` unsettled.
+    #[test]
+    fn an_unanswered_record_longer_than_the_read_window_still_awaits_its_reply() {
+        use std::io::Write as _;
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        let text = "x".repeat(super::REPLY_TAIL_BYTES as usize);
+        let prompt = serde_json::json!({"type":"user","message":{"role":"user","content":text}});
+        std::fs::write(&transcript, format!("{prompt}\n")).unwrap();
+        assert!(super::tail_awaits_reply(&transcript));
+
+        let reply = serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":"done"}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(format!("{reply}\n").as_bytes())
+            .unwrap();
+        assert!(!super::tail_awaits_reply(&transcript));
+    }
 
     /// Every form the harness runs must parse. A form that does not parse is
     /// `unexpected argument 'ingest'` + exit code 2 on every trigger, and hook failures are

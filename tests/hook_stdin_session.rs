@@ -299,6 +299,149 @@ fn native_resume_receives_saved_environment_without_a_workspace_binding() {
     assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
 }
 
+impl Lab {
+    /// The hook commands `agit setup --hooks` installed into this home's Claude Code settings
+    /// for `event`.
+    fn installed_hooks(&self, event: &str) -> Vec<String> {
+        let path = self.home.join(".claude/settings.json");
+        let settings: serde_json::Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|group| group["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|hook| hook["command"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Run every installed hook for `event` the way Claude Code does: through a shell, in the
+    /// session's directory, with the event's JSON on stdin.
+    fn fire(&self, event: &str, session_id: &str, extra: serde_json::Value) {
+        let mut payload = serde_json::json!({
+            "session_id": session_id,
+            "cwd": self.work,
+            "transcript_path": self.transcript(session_id),
+            "hook_event_name": event,
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        for command in self.installed_hooks(event) {
+            let mut child = Command::new("sh")
+                .args(["-c", &command])
+                .current_dir(&self.work)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &self.home)
+                .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
+                .env("AGIT_HOME", &self.agit_home)
+                .env("AGIT_HUB_URL", HUB)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{event} hook `{command}` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
+/// The last turn before `/exit` is settled without the person running `agit commit`.
+///
+/// Claude Code runs Stop hooks before its transcript writer has flushed the turn's final reply,
+/// and writes that reply, with its hook and duration summaries, only afterwards. A turn's Stop
+/// therefore reads the turn unanswered; ordinarily the next turn's Stop settles it, but after the
+/// last turn the session ends with only SessionEnd left to fire. An implementation that settles
+/// solely from what Stop reads leaves that turn unsettled, so automatic upload never sees it; one
+/// that settles the unanswered prompt at Stop lands the turn without its reply.
+#[test]
+fn the_last_turn_before_exit_settles_with_its_reply() {
+    let lab = Lab::new();
+    let config = lab.home.join(".claude");
+    fs::create_dir_all(&config).unwrap();
+    lab.run(&["setup", "--hooks", "--runtime", "claude-code", "--yes"]);
+    assert!(
+        !lab.installed_hooks("Stop").is_empty(),
+        "setup installed no Stop hook"
+    );
+
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+
+    // The last turn: Stop fires while only its prompt is on disk.
+    let turn = lab.turn(A, 2, "A turn 2", "A answer 2");
+    let (prompt, reply) = turn.split_at(turn.find('\n').unwrap() + 1);
+    lab.append(A, prompt);
+    lab.fire("Stop", A, serde_json::json!({"stop_hook_active": false}));
+
+    // The writer flushes the reply and the turn's bookkeeping, then the person types /exit.
+    lab.append(A, reply);
+    let answered = fs::metadata(lab.transcript(A)).unwrap().len();
+    lab.append(
+        A,
+        &format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "system", "subtype": "stop_hook_summary", "sessionId": A}),
+            serde_json::json!({"type": "system", "subtype": "turn_duration", "sessionId": A}),
+        ),
+    );
+    lab.fire(
+        "SessionEnd",
+        A,
+        serde_json::json!({"reason": "prompt_input_exit"}),
+    );
+
+    // Settlement may finish in a process the hooks detached, so wait a bounded time for it.
+    let link = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{A}.json"));
+    let checkpoint = || {
+        fs::read_to_string(&link)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|lk| lk["native_checkpoint"]["bytes"].as_u64())
+            .unwrap_or(0)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while checkpoint() < answered && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let log = lab.run(&["log", "me/qa@s1", "--oneline"]);
+    assert_eq!(turn_subjects(&log), vec!["A turn 1", "A turn 2"], "{log}");
+    assert!(
+        checkpoint() >= answered,
+        "the last turn settled without its reply: checkpoint {} < {answered}",
+        checkpoint()
+    );
+}
+
 fn turn_subjects(log: &str) -> Vec<String> {
     log.lines()
         .filter(|l| l.contains("[turn ]"))

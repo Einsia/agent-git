@@ -23,7 +23,7 @@ agit hooks settle < hook.json    # Stop
 | Subcommand | Event | Meaning |
 |---|---|---|
 | `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` claims that branch; `resume`, `clear`, and Claude `fork` register unmanaged sessions for explicit adoption; `compact` leaves the binding alone. Existing bindings win over inherited environment values. Claude Code, Codex and WorkBuddy receive the native session ID with the explicit destination and its `agit commit`/`agit push` commands, or the adoption command. Claude gets a default title only when its payload has no title, on events that support titles. |
-| `settle` | Stop | Settle the turn that just ended. The target branch is resolved from the payload's `session_id` through the store link — **never from the environment**. A session that was never adopted is not settled. |
+| `settle` | Stop | Settle the turn that just ended. The target branch is resolved from the payload's `session_id` through the store link — **never from the environment**. A session that was never adopted is not settled. When Claude Code has not yet written the stopped turn's reply, the hook returns at once and a detached `agit hooks settle` settles the turn after the reply is written, so the last turn before `/exit` is saved too. |
 
 ## Options
 
