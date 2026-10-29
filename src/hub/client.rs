@@ -9,7 +9,7 @@ use crate::infra::config;
 use crate::infra::credentials;
 use crate::infra::hub_authority::HubAuthority;
 use anyhow::Context;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Request configuration is local even when the caller expects a network operation.
 #[derive(Debug)]
@@ -142,6 +142,27 @@ pub struct Client {
     /// (the login flow, the PAT flow).
     cred: std::cell::RefCell<Option<credentials::HubCredential>>,
     agent: ureq::Agent,
+    /// Recent answers to the repository probes a publication repeats. See [`PROBE_REUSE`].
+    probes: std::cell::RefCell<Probes>,
+}
+
+/// How long one client reuses a receive-pack probe or a repository lookup.
+///
+/// One publication asks both at several checkpoints, and the receive-pack advertisement is the
+/// Hub's slowest answer for a repository with many refs. Reuse within the window cannot widen
+/// authority: every upload request authenticates again and carries the expected repository
+/// identity, so a revocation or a replacement inside the window is still refused at the Hub.
+/// Only successful answers are kept, so a failure is always asked again.
+const PROBE_REUSE: Duration = Duration::from_secs(60);
+
+/// Repository, expected identity and secret acceptance, to when the probe answered and with what.
+type ReceivePackProbes =
+    std::collections::HashMap<(String, String, bool), (Instant, u16, Option<String>)>;
+
+#[derive(Clone, Default)]
+struct Probes {
+    receive_pack: ReceivePackProbes,
+    agents: std::collections::HashMap<(String, String), (Instant, super::RemoteAgent)>,
 }
 
 /// After a failed exchange, wait for a sibling process to persist the new pair: each wait is
@@ -243,6 +264,7 @@ impl Client {
             token: std::cell::RefCell::new(cred.as_ref().map(|c| c.access_token.clone())),
             cred: std::cell::RefCell::new(cred),
             agent: super::transport::agent(cfg),
+            probes: Default::default(),
         }
     }
 
@@ -405,6 +427,8 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         self.post_expected(path, body, None)
     }
 
@@ -414,6 +438,8 @@ impl Client {
         body: &B,
         expected_agent_id: Option<&str>,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         self.post_with(path, body, expected_agent_id, &[])
     }
 
@@ -451,6 +477,8 @@ impl Client {
         body: &B,
         expected_agent_id: &str,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         let uri: http::Uri = self
             .base
             .parse()
@@ -736,6 +764,8 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         crate::telemetry::allow_uploads();
         crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
             self.post_public_telemetry_inner(path, body)
@@ -757,6 +787,8 @@ impl Client {
     }
 
     fn delete(&self, path: &str) -> Result<()> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         self.delete_inner(path, None)
     }
 
@@ -823,6 +855,8 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         self.with_retry(path, |t| {
             let mut req = self.agent.patch(self.url(path));
             if let Some(t) = t {
@@ -837,6 +871,8 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        // A change this client makes must be visible to its next probe.
+        self.forget_probes();
         self.with_retry(path, |t| {
             let mut req = self.agent.put(self.url(path));
             if let Some(t) = t {
@@ -1149,8 +1185,8 @@ impl Client {
         expected_agent_id: &str,
         accept_secret_findings: bool,
     ) -> Result<super::PushAccess> {
-        let path = format!("{owner}/{name}.git/info/refs?service=git-receive-pack");
-        let status = self.status_of(&path, Some(expected_agent_id), accept_secret_findings)?;
+        let (status, _) =
+            self.receive_pack_probe(owner, name, expected_agent_id, accept_secret_findings)?;
         super::PushAccess::from_status(status).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} answered {status} to the push-access probe for {owner}/{name}",
@@ -1167,32 +1203,6 @@ impl Client {
     /// The status code only. On a 401 it exchanges the token once and retries, like
     /// [`Self::with_retry`]; a second 401 is reported as expired credentials, not as "no
     /// permission".
-    /// [`Self::status_of`] with the push route the Hub names, if it names one.
-    fn status_and_push_route_of(
-        &self,
-        path: &str,
-        expected_agent_id: Option<&str>,
-    ) -> Result<(u16, Option<String>)> {
-        let mut route = None;
-        let status = self.status_with(path, expected_agent_id, false, |response| {
-            route = response
-                .headers()
-                .get(super::git::PUSH_ROUTE_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-        })?;
-        Ok((status, route))
-    }
-
-    fn status_of(
-        &self,
-        path: &str,
-        expected_agent_id: Option<&str>,
-        accept_secret_findings: bool,
-    ) -> Result<u16> {
-        self.status_with(path, expected_agent_id, accept_secret_findings, |_| {})
-    }
-
     fn status_with(
         &self,
         path: &str,
@@ -1257,8 +1267,25 @@ impl Client {
         self.get(&format!("api/agents?owner={}", urlencode(owner)))
     }
 
+    /// A repository lookup, reused within [`PROBE_REUSE`].
     pub fn get_agent(&self, owner: &str, name: &str) -> Result<RemoteAgent> {
-        self.get(&format!("api/agents/{owner}/{name}"))
+        let key = (owner.to_owned(), name.to_owned());
+        if let Some((at, agent)) = self.probes.borrow().agents.get(&key)
+            && at.elapsed() < PROBE_REUSE
+        {
+            return Ok(agent.clone());
+        }
+        let agent: RemoteAgent = self.get(&format!("api/agents/{owner}/{name}"))?;
+        self.probes
+            .borrow_mut()
+            .agents
+            .insert(key, (Instant::now(), agent.clone()));
+        Ok(agent)
+    }
+
+    /// Forget reused probe answers, for a caller that must observe a change it just made.
+    pub(crate) fn forget_probes(&self) {
+        *self.probes.borrow_mut() = Probes::default();
     }
 
     /// [`Self::get_agent`] as this Hub alone answers it: a redirect is an error rather than
@@ -1290,9 +1317,49 @@ impl Client {
         name: &str,
         expected_agent_id: &str,
     ) -> Result<bool> {
-        let path = format!("{owner}/{name}.git/info/refs?service=git-receive-pack");
-        let (status, route) = self.status_and_push_route_of(&path, Some(expected_agent_id))?;
+        let (status, route) = self.receive_pack_probe(owner, name, expected_agent_id, false)?;
         Ok(status == 200 && route.as_deref() == Some(super::git::PUSH_ROUTE_BASE))
+    }
+
+    /// The receive-pack advertisement's status and push route, reused within [`PROBE_REUSE`].
+    fn receive_pack_probe(
+        &self,
+        owner: &str,
+        name: &str,
+        expected_agent_id: &str,
+        accept_secret_findings: bool,
+    ) -> Result<(u16, Option<String>)> {
+        let key = (
+            format!("{owner}/{name}"),
+            expected_agent_id.to_owned(),
+            accept_secret_findings,
+        );
+        if let Some((at, status, route)) = self.probes.borrow().receive_pack.get(&key)
+            && at.elapsed() < PROBE_REUSE
+        {
+            return Ok((*status, route.clone()));
+        }
+        let path = format!("{owner}/{name}.git/info/refs?service=git-receive-pack");
+        let mut route = None;
+        let status = self.status_with(
+            &path,
+            Some(expected_agent_id),
+            accept_secret_findings,
+            |response| {
+                route = response
+                    .headers()
+                    .get(super::git::PUSH_ROUTE_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+            },
+        )?;
+        if status == 200 {
+            self.probes
+                .borrow_mut()
+                .receive_pack
+                .insert(key, (Instant::now(), status, route.clone()));
+        }
+        Ok((status, route))
     }
 
     pub fn secret_allowances(
@@ -1656,6 +1723,7 @@ mod tests {
             token: std::cell::RefCell::new(None),
             cred: std::cell::RefCell::new(None),
             agent: ureq::Agent::new_with_defaults(),
+            probes: Default::default(),
         }
     }
 
@@ -2308,7 +2376,11 @@ mod tests {
             assert!(!token.has_token());
             assert!(token.logout().is_err());
             assert!(token.delete("api/agents/alice/example").is_err());
-            assert!(token.status_of("api/health", None, false).is_err());
+            assert!(
+                token
+                    .status_with("api/health", None, false, |_| {})
+                    .is_err()
+            );
         }
         assert_eq!(
             listener.accept().unwrap_err().kind(),

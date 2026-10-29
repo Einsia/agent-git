@@ -225,11 +225,16 @@ impl Entry {
 
     /// An unacknowledged candidate keeps a publication in the delivery workflow.
     pub fn pending_for_publication(repo: &Repo, publication: &PublicationReceipt) -> Result<bool> {
-        Ok(Self::scan(repo)?.into_iter().any(|entry| {
-            entry.acknowledged.is_none()
-                && (entry.prepared.as_ref() == Some(publication)
-                    || entry.publication.as_ref() == Some(publication))
-        }))
+        Ok(Self::scan(repo)?
+            .into_iter()
+            .any(|entry| entry.awaits(publication)))
+    }
+
+    /// Whether this entry is an unacknowledged candidate of `publication`.
+    pub(crate) fn awaits(&self, publication: &PublicationReceipt) -> bool {
+        self.acknowledged.is_none()
+            && (self.prepared.as_ref() == Some(publication)
+                || self.publication.as_ref() == Some(publication))
     }
 
     /// A controller can recover durable acknowledgements after losing the RPC response.
@@ -256,7 +261,7 @@ impl Entry {
             .collect())
     }
 
-    fn scan(repo: &Repo) -> Result<Vec<Self>> {
+    pub(crate) fn scan(repo: &Repo) -> Result<Vec<Self>> {
         let directory = repo.common_dir()?.join("agit/rc-publications");
         let paths = match fs::read_dir(&directory) {
             Ok(paths) => paths,

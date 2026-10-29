@@ -88,11 +88,16 @@ impl FrozenPublication {
         identity: &RemoteIdentity,
     ) -> Option<bool> {
         let refs = Self::advertised_refs_for(repo, canonical_url, identity)?;
-        Some(plan.heads().iter().chain(plan.tags()).all(|reference| {
+        Some(Self::refs_match(plan, &refs))
+    }
+
+    /// [`Self::advertised_refs_match`] against an advertisement this publication already read.
+    pub fn refs_match(plan: &PublicationPlan, refs: &RemoteRefs) -> bool {
+        plan.heads().iter().chain(plan.tags()).all(|reference| {
             refs.refs
                 .get(reference.name())
                 .is_some_and(|oid| oid == reference.oid())
-        }))
+        })
     }
 
     /// The URL must be the canonical clone URL selected alongside the immutable remote identity.
@@ -400,8 +405,8 @@ impl FrozenPublication {
         policy: &crate::hub::privacy::publication::PublicationPolicy,
         batch: &[FrozenRef],
         held: Option<&BTreeMap<String, String>>,
+        before: BTreeMap<String, String>,
     ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
-        let before = self.privacy_remote_refs()?;
         if let Some(held) = held {
             self.verify_held_heads(held, &before)?;
         }
@@ -588,8 +593,24 @@ impl FrozenPublication {
             );
             let receipt_progress =
                 crate::ui::publication::stage(format!("Getting receipt for {batch_label}"));
+            // A receipt binds the listing it was read from, so refs that listing already holds at
+            // their frozen object are acknowledged from it and never sent. Sending them makes the
+            // Hub check the whole selection again for refs it cannot change.
+            let mut current = Vec::new();
             let receipt = match policy
-                .map(|policy| self.receive_receipt(policy, batch, held))
+                .map(|policy| {
+                    let before = self.privacy_remote_refs()?;
+                    let (held_refs, pending): (Vec<_>, Vec<_>) =
+                        batch.iter().cloned().partition(|reference| {
+                            before.get(reference.name()).map(String::as_str)
+                                == Some(reference.oid())
+                        });
+                    current = held_refs;
+                    let receipt = (!pending.is_empty())
+                        .then(|| self.receive_receipt(policy, &pending, held, before))
+                        .transpose()?;
+                    Ok::<_, anyhow::Error>((pending, receipt))
+                })
                 .transpose()
             {
                 Ok(receipt) => receipt,
@@ -600,8 +621,28 @@ impl FrozenPublication {
                 }
             };
             receipt_progress.finish();
+            if !current.is_empty() {
+                phase
+                    .attempts
+                    .push(PublicationAttempt::already_published(index, &current));
+            }
+            let (batch, receipt) = match receipt {
+                Some((pending, receipt)) => (pending, receipt),
+                None => (batch.clone(), None),
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            let sent_heads = batch
+                .iter()
+                .filter(|reference| reference.name().starts_with("refs/heads/"))
+                .count();
             let uploading = crate::ui::publication::stage(format!(
-                "Uploading and awaiting acknowledgement for {batch_label}"
+                "Uploading and awaiting acknowledgement for batch {}/{} ({sent_heads} branches, {} tags; {} already published)",
+                index + 1,
+                batches.len(),
+                batch.len() - sent_heads,
+                current.len()
             ));
             let specs: Vec<_> = batch.iter().map(FrozenRef::refspec).collect();
             let mut args = vec![
@@ -628,7 +669,7 @@ impl FrozenPublication {
             phase.attempts.extend(
                 run.attempts
                     .into_iter()
-                    .map(|attempt| PublicationAttempt::parse(index, batch, attempt)),
+                    .map(|attempt| PublicationAttempt::parse(index, &batch, attempt)),
             );
             phase.error = run.error.map(|error| format!("{error:#}"));
             if phase.error.is_some() || !phase.attempts.last().is_some_and(PublicationAttempt::ok) {

@@ -58,6 +58,16 @@ pub struct Args {
     #[arg(long, conflicts_with = "branch")]
     pub all: bool,
 
+    /// Ask the Hub about every selected branch, including those whose last acknowledged
+    /// publication already matches their local tip.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// With several branches: when publishing them together fails, publish each one on its own,
+    /// so a branch that cannot be published holds back only itself.
+    #[arg(long)]
+    pub keep_going: bool,
+
     /// First publish only: only you and the authorized can read it.
     ///
     /// This is what a non-interactive run defaults to. Visibility is settled once, at
@@ -259,9 +269,10 @@ pub fn run(mut args: Args) -> CmdResult {
     // skipped quietly: that is the one they meant, and a silent skip that still exits 0 reads as
     // a successful publish. That case says why, and ends in failure.
     let asked_explicitly = !explicit_branches.is_empty();
+    let settled = settled_turns(&repo, &branches);
     let (branches, unsettled): (Vec<String>, Vec<String>) = branches
         .into_iter()
-        .partition(|b| has_settled_turns(&repo, b));
+        .partition(|b| settled.get(b).copied().unwrap_or(true));
     if !unsettled.is_empty() {
         if asked_explicitly {
             ui::error(&format!(
@@ -280,8 +291,15 @@ pub fn run(mut args: Args) -> CmdResult {
         ));
     }
     let mut publishable = Vec::new();
-    for branch in branches {
-        match super::project::withheld(&checkout.slug(), &branch) {
+    let verdicts = match super::project::withheld_all(&checkout.slug(), &branches) {
+        Ok(verdicts) => verdicts.into_iter().map(Ok).collect::<Vec<_>>(),
+        Err(error) => branches
+            .iter()
+            .map(|_| Err(anyhow::anyhow!("{error:#}")))
+            .collect(),
+    };
+    for (branch, verdict) in branches.into_iter().zip(verdicts) {
+        match verdict {
             Ok(None) => publishable.push(branch),
             Ok(Some(reason)) if asked_explicitly => {
                 ui::error(&format!(
@@ -311,7 +329,28 @@ pub fn run(mut args: Args) -> CmdResult {
             }
         }
     }
-    let branches = publishable;
+    let mut branches = publishable;
+    if let Some(unchanged) = acknowledged_unchanged(&args, &repo, &client, &branches) {
+        if !unchanged.is_empty() {
+            ui::info(format_args!(
+                "{}",
+                ui::dim(&format!(
+                    "  {} unchanged since their acknowledged publication: {}",
+                    unchanged.len(),
+                    unchanged.join(", ")
+                ))
+            ));
+        }
+        branches.retain(|branch| !unchanged.contains(branch));
+        if branches.is_empty() {
+            reading.finish();
+            if !args.dry_run {
+                crate::domain::privacy::service::schedule_sync(client.base());
+            }
+            ui::info(format_args!("{}: already up to date.", checkout.slug()));
+            return Ok(ExitCode::Ok);
+        }
+    }
     if !args.dry_run {
         crate::domain::privacy::service::schedule_sync(client.base());
         // Dictionary sync runs detached, so push is where its refusals become visible.
@@ -348,14 +387,168 @@ pub fn run(mut args: Args) -> CmdResult {
     };
 
     reading.finish();
-    audited_push::run(
+    publish_in_groups(
         &args,
-        publication_client,
+        &publication_client,
         &publication_account,
-        checkout,
-        repo,
+        &checkout,
+        &repo,
         &branches,
     )
+}
+
+/// Selected branches whose local tip is the source of the publication the Hub last acknowledged
+/// for them, decided from local records alone; `None` when this push must ask the Hub about all.
+///
+/// A receipt is saved only after the Hub acknowledged every ref of a publication, and an
+/// acknowledged commit stays published: the Hub refuses rewriting it. So a branch whose tip still
+/// equals its receipt's source has nothing to send. What local records cannot show is a branch
+/// removed or replaced on the Hub since; `--verify` asks the Hub about every branch.
+///
+/// `main` carries no receipt: it is the shared file line, published alongside session branches.
+/// While it differs from what the destination last listed for it, every branch takes the full
+/// path, so a session push still carries an advanced `main`.
+fn acknowledged_unchanged(
+    args: &Args,
+    repo: &Repo,
+    client: &crate::hub::Client,
+    branches: &[String],
+) -> Option<Vec<String>> {
+    use crate::domain::privacy_receipt::{PublicationReceipt, outbox::Entry};
+    if args.verify
+        || args.dry_run
+        || args.audit
+        || args.show_preview
+        || args.to.is_some()
+        || args.to_hub.is_some()
+        || std::env::var_os(crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV).is_some()
+    {
+        return None;
+    }
+    let identity = identity::read(repo).ok()??;
+    if identity.hub != identity::normalize_hub(client.base()).ok()? {
+        return None;
+    }
+    // One listing answers every tip: a lookup per branch costs a Git process each.
+    let tips: std::collections::BTreeMap<String, String> = repo
+        .git_opt(&[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/remotes/origin/main",
+        ])?
+        .lines()
+        .filter_map(|line| {
+            let (oid, name) = line.split_once(' ')?;
+            Some((name.to_owned(), oid.to_owned()))
+        })
+        .collect();
+    let tip = |reference: &str| tips.get(reference).cloned();
+    if let Some(main) = tip("refs/heads/main")
+        && tip("refs/remotes/origin/main").as_deref() != Some(main.as_str())
+    {
+        return None;
+    }
+    let pending = Entry::scan(repo).ok()?;
+    Some(
+        branches
+            .iter()
+            .filter(|branch| branch.as_str() != "main")
+            .filter(|branch| {
+                let Ok(Some(receipt)) = PublicationReceipt::load(repo, branch) else {
+                    return false;
+                };
+                receipt.destination == identity
+                    && tip(&format!("refs/heads/{branch}")).as_deref()
+                        == Some(receipt.source.as_str())
+                    && !pending.iter().any(|entry| entry.awaits(&receipt))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Branches one publication carries. A publication's fixed cost (destination checks, the ref
+/// advertisement, snapshot planning) is paid once per publication, so many branches share one.
+/// The plan's head limit also counts `main` and branches a selection carries, so a group stays
+/// well below it.
+const BRANCHES_PER_PUBLICATION: usize = 48;
+
+/// Publish `branches` in as few publications as the head limit allows.
+///
+/// Without `--keep-going` the first failing group ends the push, as one publication of the whole
+/// selection would: a refusal of what the person selected never becomes a partial publication
+/// they did not ask for. With it, a failing group is published again one branch at a time, so a
+/// branch that cannot be published (a pending privacy check, a refused upload) holds back only
+/// itself. Publishing is idempotent: a branch its group already delivered is reported up to date
+/// the second time.
+fn publish_in_groups(
+    args: &Args,
+    client: &crate::hub::Client,
+    account: &str,
+    checkout: &super::clone::Checkout,
+    repo: &Repo,
+    branches: &[String],
+) -> CmdResult {
+    let publish = |group: &[String]| {
+        audited_push::run(
+            args,
+            client.clone(),
+            account,
+            checkout.clone(),
+            repo.clone(),
+            group,
+        )
+    };
+    if branches.len() == 1 {
+        return publish(branches);
+    }
+    let mut failed: Vec<(String, String, ExitCode)> = Vec::new();
+    for group in branches.chunks(BRANCHES_PER_PUBLICATION) {
+        let outcome = publish(group);
+        let failure = match &outcome {
+            Ok(ExitCode::Ok) => continue,
+            Ok(code) => (format!("exit {}", code.as_i32()), *code),
+            Err(error) => (format!("{error:#}"), ExitCode::Precondition),
+        };
+        if !args.keep_going {
+            return outcome;
+        }
+        if group.len() == 1 {
+            failed.push((group[0].clone(), failure.0, failure.1));
+            continue;
+        }
+        ui::warning(&format!(
+            "publishing {} branches together failed ({}); publishing them one at a time",
+            group.len(),
+            failure.0
+        ));
+        for branch in group {
+            match publish(std::slice::from_ref(branch)) {
+                Ok(ExitCode::Ok) => {}
+                Ok(code) => failed.push((branch.clone(), format!("exit {}", code.as_i32()), code)),
+                Err(error) => {
+                    ui::error(&format!("{}@{branch}: {error:#}", checkout.slug()));
+                    failed.push((branch.clone(), format!("{error:#}"), ExitCode::Precondition));
+                }
+            }
+        }
+    }
+    let Some((_, _, code)) = failed.first().cloned() else {
+        return Ok(ExitCode::Ok);
+    };
+    ui::error(&format!(
+        "{} of {} branches were not published: {}",
+        failed.len(),
+        branches.len(),
+        failed
+            .iter()
+            .map(|(branch, _, _)| branch.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    ui::hint("the other branches were published; each listed branch says why above");
+    Ok(code)
 }
 
 /// Normalize the unified human-facing target.  The old bare repo spelling is
@@ -584,6 +777,61 @@ struct Refusal {
 ///
 /// The file line (main) is always pushable — it never claims a session, and the test does not
 /// apply to it.
+/// [`has_settled_turns`] for each of `branches`, reading every branch's metadata in one Git
+/// process. A branch the batch cannot answer is judged on its own.
+fn settled_turns(repo: &Repo, branches: &[String]) -> std::collections::BTreeMap<String, bool> {
+    let batched = (|| -> crate::Result<std::collections::BTreeMap<String, bool>> {
+        let mut input = String::new();
+        for branch in branches {
+            anyhow::ensure!(
+                !branch.contains(['\n', '\r']),
+                "branch name cannot be listed"
+            );
+            input.push_str(&format!("refs/heads/{branch}:{}\n", meta::FILE));
+        }
+        let mut file = tempfile::tempfile()?;
+        use std::io::{Seek as _, Write as _};
+        file.write_all(input.as_bytes())?;
+        file.rewind()?;
+        let output = repo.git_with_stdin_file(&["cat-file", "--batch"], file)?;
+        let mut rest = output.as_bytes();
+        let mut verdicts = std::collections::BTreeMap::new();
+        for branch in branches {
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(rest.len());
+            let header = std::str::from_utf8(&rest[..end])?;
+            rest = rest.get(end + 1..).unwrap_or_default();
+            if header.ends_with(" missing") {
+                // No metadata is left to the server, as for a single branch.
+                verdicts.insert(branch.clone(), true);
+                continue;
+            }
+            let size: usize = header
+                .rsplit(' ')
+                .next()
+                .context("malformed metadata batch")?
+                .parse()?;
+            // The output arrives with trailing whitespace trimmed, which can shorten only the
+            // last body; a body cut anywhere else fails to parse below.
+            let body = rest.get(..size).unwrap_or(rest);
+            rest = rest.get(size + 1..).unwrap_or_default();
+            let settled = meta::parse_strict(std::str::from_utf8(body)?, branch)
+                .map(|m| !m.is_session_line() || meta::is_bare_id(&m.session))
+                .unwrap_or(true);
+            verdicts.insert(branch.clone(), settled);
+        }
+        Ok(verdicts)
+    })();
+    batched.unwrap_or_else(|_| {
+        branches
+            .iter()
+            .map(|branch| (branch.clone(), has_settled_turns(repo, branch)))
+            .collect()
+    })
+}
+
 fn has_settled_turns(repo: &Repo, branch: &str) -> bool {
     match meta::read_at_ref(repo, &format!("refs/heads/{branch}")) {
         Some(m) => !m.is_session_line() || meta::is_bare_id(&m.session),
@@ -809,6 +1057,8 @@ mod tests {
             agent: None,
             branch: vec![],
             all: false,
+            keep_going: false,
+            verify: false,
             private: false,
             public: false,
             allow_secrets: false,

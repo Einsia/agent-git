@@ -430,25 +430,103 @@ fn commit_preview(bytes: &[u8]) -> Result<serde_json::Value> {
 const COMPACT_PACKS: u64 = 50;
 const COMPACT_LOOSE: u64 = 6700;
 
-/// Compact the publication store at `root` once it holds many packs or loose objects, and say
-/// whether it did. Every publication imports into the store and nothing else packs it, so it would
-/// keep each import's pack and each snapshot's loose objects for good. Unreachable objects stay
-/// (`-k`): what pending candidates and outbox receipts name is not always reachable from the
-/// store's refs. Only the store's own objects are packed (`-l`): were it ever to gain an alternate,
-/// packing everything would copy the source's private objects into the publication store. Callers
-/// hold the publication lock, so no agit process writes the store meanwhile.
-pub(crate) fn compact_store(root: &Path) -> Result<bool> {
-    let repo = Repo::at(root);
+/// The hidden entry that compacts one publication store in the background.
+pub const COMPACT: &str = "__privacy-compact-v1";
+
+fn store_counts(repo: &Repo) -> Result<impl Fn(&str) -> u64> {
     let counts = repo.git(&["count-objects", "-v"])?;
-    let field = |name: &str| {
+    Ok(move |name: &str| {
         counts
             .lines()
             .find_map(|line| line.strip_prefix(name)?.trim().parse::<u64>().ok())
             .unwrap_or(0)
+    })
+}
+
+fn needs_compaction(repo: &Repo) -> Result<bool> {
+    let field = store_counts(repo)?;
+    Ok(field("packs:") > COMPACT_PACKS || field("count:") > COMPACT_LOOSE)
+}
+
+/// Start compacting the store at `root` in a detached process once it needs it.
+///
+/// A repack takes as long as the store is large, and a publication that waited for it would hold
+/// every caller for that long. The publication never depends on the result, so a store that cannot
+/// be compacted, or a process that cannot start, still publishes and is compacted at a later push.
+pub(crate) fn schedule_compaction(root: &Path) {
+    if !needs_compaction(&Repo::at(root)).unwrap_or(false) {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
     };
-    if field("packs:") <= COMPACT_PACKS && field("count:") <= COMPACT_LOOSE {
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(COMPACT)
+        .arg(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
+}
+
+/// Run [`COMPACT`]: `None` when `args` name another command.
+pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
+    if args.get(1)?.to_str()? != COMPACT {
+        return None;
+    }
+    let [_, _, root] = args else {
+        return Some(4);
+    };
+    let root = Path::new(root);
+    // Only a store under a publication directory: the argument comes from this binary, but the
+    // entry must not become a way to repack an arbitrary repository.
+    let is_store = root.is_absolute()
+        && root.join(".git").is_dir()
+        && root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "privacy-publication");
+    if !is_store || crate::infra::git_runtime::initialize().is_err() {
+        return Some(4);
+    }
+    let compacted = (|| -> Result<()> {
+        let lock = crate::infra::config::state_file_options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".git/agit-compact.lock"))?;
+        // Another compaction of this store is already running; one is enough.
+        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            return Ok(());
+        }
+        compact_store(root)?;
+        Ok(())
+    })();
+    Some(if compacted.is_ok() { 0 } else { 4 })
+}
+
+/// Compact the publication store at `root` once it holds many packs or loose objects, and say
+/// whether it did. Every publication imports into the store and nothing else packs it, so it would
+/// keep each import's pack and each snapshot's loose objects for good. Unreachable objects stay
+/// (`-k`): what pending candidates and outbox receipts name is not always reachable from the
+/// store's refs, and a publication running alongside may still write objects no ref names yet.
+/// Because nothing is pruned, a repack needs no publication lock: Git's own repack leaves every
+/// object either in a pack or loose. Only the store's own objects are packed (`-l`): were it ever
+/// to gain an alternate, packing everything would copy the source's private objects into the
+/// publication store.
+pub(crate) fn compact_store(root: &Path) -> Result<bool> {
+    let repo = Repo::at(root);
+    if !needs_compaction(&repo)? {
         return Ok(false);
     }
+    let field = store_counts(&repo)?;
     // The new pack is written before anything it replaces is removed, so compaction needs about
     // the store's size free; starting without it would fill the disk and then fail.
     let needed = (field("size:") + field("size-pack:")) * 1024;
@@ -459,10 +537,7 @@ pub(crate) fn compact_store(root: &Path) -> Result<bool> {
         needed >> 20,
         available >> 20
     );
-    // Its own stage, so that a long repack reads as progress rather than as a stalled push.
-    let compacting = crate::ui::publication::stage("Compacting the privacy publication store");
     repo.git(&["repack", "-a", "-d", "-k", "-l", "-q"])?;
-    compacting.finish();
     Ok(true)
 }
 
@@ -649,23 +724,130 @@ fn write_tree(repo: &Repo, files: BTreeMap<String, Vec<u8>>) -> Result<String> {
             }
         }
     }
-    fn emit(repo: &Repo, tree: Tree) -> Result<String> {
-        let mut records = Vec::new();
-        for (name, bytes) in tree.files {
-            records.extend(
-                format!(
-                    "100644 blob {}\t{name}\0",
-                    write_object(repo, "blob", &bytes)?
-                )
-                .as_bytes(),
-            );
-        }
-        for (name, subtree) in tree.directories {
-            records.extend(format!("040000 tree {}\t{name}\0", emit(repo, subtree)?).as_bytes());
-        }
-        input(repo, &["mktree", "-z"], &records)
+    // Objects are written one tree depth at a time, each depth in one Git process: a tree names
+    // its entries by object ID, so a depth can be written only once the one below it has been.
+    // One process per object makes a snapshot cost as many processes as it has files and
+    // directories, and a publication pays that for every snapshot it projects, reused or not.
+    struct Node {
+        files: Vec<(String, usize)>,
+        directories: Vec<(String, usize)>,
+        height: usize,
     }
-    emit(repo, tree)
+    fn flatten(tree: Tree, blobs: &mut Vec<Vec<u8>>, nodes: &mut Vec<Node>) -> usize {
+        let files = tree
+            .files
+            .into_iter()
+            .map(|(name, bytes)| {
+                blobs.push(bytes);
+                (name, blobs.len() - 1)
+            })
+            .collect();
+        let directories: Vec<(String, usize)> = tree
+            .directories
+            .into_iter()
+            .map(|(name, subtree)| (name, flatten(subtree, blobs, nodes)))
+            .collect();
+        let height = directories
+            .iter()
+            .map(|(_, child)| nodes[*child].height + 1)
+            .max()
+            .unwrap_or(0);
+        nodes.push(Node {
+            files,
+            directories,
+            height,
+        });
+        nodes.len() - 1
+    }
+    let mut blobs = Vec::new();
+    let mut nodes = Vec::new();
+    let root = flatten(tree, &mut blobs, &mut nodes);
+    let blob_ids = write_objects(repo, "blob", &blobs)?;
+    let mut tree_ids: Vec<Option<String>> = vec![None; nodes.len()];
+    for height in 0..=nodes[root].height {
+        let level = (0..nodes.len())
+            .filter(|index| nodes[*index].height == height)
+            .collect::<Vec<_>>();
+        let mut contents = Vec::with_capacity(level.len());
+        for index in &level {
+            let node = &nodes[*index];
+            let mut entries = Vec::new();
+            for (name, blob) in &node.files {
+                entries.push((name.as_bytes().to_vec(), "100644", &blob_ids[*blob]));
+            }
+            for (name, child) in &node.directories {
+                let mut key = name.as_bytes().to_vec();
+                // Git orders a directory as though its name ended in a slash.
+                key.push(b'/');
+                let id = tree_ids[*child]
+                    .as_ref()
+                    .context("projected subtree was not written")?;
+                entries.push((key, "40000", id));
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut bytes = Vec::new();
+            for (key, mode, id) in entries {
+                let name = if mode == "40000" {
+                    &key[..key.len() - 1]
+                } else {
+                    &key[..]
+                };
+                bytes.extend_from_slice(mode.as_bytes());
+                bytes.push(b' ');
+                bytes.extend_from_slice(name);
+                bytes.push(0);
+                bytes.extend_from_slice(&hex::decode(id)?);
+            }
+            contents.push(bytes);
+        }
+        for (index, id) in level
+            .into_iter()
+            .zip(write_objects(repo, "tree", &contents)?)
+        {
+            tree_ids[index] = Some(id);
+        }
+    }
+    tree_ids[root]
+        .take()
+        .context("projected tree was not written")
+}
+
+/// Write `contents` as objects of `kind` in one Git process, returning their IDs in order.
+fn write_objects(repo: &Repo, kind: &str, contents: &[Vec<u8>]) -> Result<Vec<String>> {
+    if contents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let directory = tempfile::tempdir()?;
+    let mut paths = String::new();
+    for (index, bytes) in contents.iter().enumerate() {
+        let path = directory.path().join(index.to_string());
+        std::fs::write(&path, bytes)?;
+        let path = path
+            .to_str()
+            .filter(|path| !path.contains(['\n', '\r']))
+            .context("projected object path cannot be listed")?;
+        paths.push_str(path);
+        paths.push('\n');
+    }
+    // Content is written as given: path attributes must not filter what the projection decided.
+    let ids = input(
+        repo,
+        &[
+            "hash-object",
+            "-t",
+            kind,
+            "-w",
+            "--no-filters",
+            "--stdin-paths",
+        ],
+        paths.as_bytes(),
+    )?;
+    let ids = ids.lines().map(str::to_owned).collect::<Vec<_>>();
+    ensure!(
+        ids.len() == contents.len() && ids.iter().all(|id| valid_oid(id)),
+        "Git returned an invalid projected object ID"
+    );
+    Ok(ids)
 }
 
 fn ancestors(head: &str, parents: &BTreeMap<String, Vec<String>>) -> Result<BTreeSet<String>> {
@@ -737,6 +919,73 @@ mod store_tests {
                     .is_some_and(|extension| extension == "pack")
             })
             .count()
+    }
+
+    /// Projected trees keep the object IDs `git mktree` gives the same entries, in both object
+    /// formats: cached snapshots and published commits are identified by them. A writer that
+    /// sorted directories by bare name (`a` before `a-b`), or wrote a directory mode as `040000`,
+    /// produces another tree for the same files and the cache rejects its own candidates.
+    #[test]
+    fn projected_trees_match_mktree() {
+        for format in ["sha1", "sha256"] {
+            let root = tempfile::tempdir().unwrap();
+            git(
+                root.path(),
+                &["init", "-q", &format!("--object-format={format}")],
+            );
+            let repo = Repo::at(root.path());
+            let files: BTreeMap<String, Vec<u8>> = [
+                "a-b",
+                "a.b",
+                "a/x",
+                "a/y/z",
+                "a0",
+                "b/c/d/e",
+                "privacy/envelope.json",
+                "ab",
+            ]
+            .into_iter()
+            .map(|path| (path.to_owned(), format!("{path}\n").into_bytes()))
+            .collect();
+            fn mktree(repo: &Repo, entries: &[(&str, &str, String)]) -> String {
+                let mut records = String::new();
+                for (mode, name, id) in entries {
+                    let kind = if *mode == "040000" { "tree" } else { "blob" };
+                    records.push_str(&format!("{mode} {kind} {id}\t{name}\0"));
+                }
+                input(repo, &["mktree", "-z"], records.as_bytes()).unwrap()
+            }
+            let blob = |path: &str| {
+                input(
+                    &repo,
+                    &["hash-object", "-w", "--stdin"],
+                    format!("{path}\n").as_bytes(),
+                )
+                .unwrap()
+            };
+            let y = mktree(&repo, &[("100644", "z", blob("a/y/z"))]);
+            let a = mktree(&repo, &[("100644", "x", blob("a/x")), ("040000", "y", y)]);
+            let d = mktree(&repo, &[("100644", "e", blob("b/c/d/e"))]);
+            let c = mktree(&repo, &[("040000", "d", d)]);
+            let b = mktree(&repo, &[("040000", "c", c)]);
+            let privacy = mktree(
+                &repo,
+                &[("100644", "envelope.json", blob("privacy/envelope.json"))],
+            );
+            let expected = mktree(
+                &repo,
+                &[
+                    ("100644", "a-b", blob("a-b")),
+                    ("100644", "a.b", blob("a.b")),
+                    ("040000", "a", a),
+                    ("100644", "a0", blob("a0")),
+                    ("100644", "ab", blob("ab")),
+                    ("040000", "b", b),
+                    ("040000", "privacy", privacy),
+                ],
+            );
+            assert_eq!(write_tree(&repo, files).unwrap(), expected, "{format}");
+        }
     }
 
     /// A store past Git's own maintenance thresholds is compacted into one pack without losing an

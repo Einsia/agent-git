@@ -1238,32 +1238,55 @@ fn recording_into(all: &[link::Link], owner: &str, agent: &str, branch: &str) ->
 /// looser rule, or one the user excluded afterwards, would otherwise upload a conversation the
 /// project never had the right to capture.
 pub(crate) fn withheld(slug: &str, branch: &str) -> Result<Option<Withholding>> {
-    if let Some(record) = withheld_records()?
-        .into_iter()
-        .find(|r| r.repository == slug && r.branch == branch)
-    {
-        return Ok(Some(record.reason));
-    }
+    Ok(
+        withheld_all(slug, std::slice::from_ref(&branch.to_owned()))?
+            .pop()
+            .flatten(),
+    )
+}
+
+/// [`withheld`] for each of `branches`, in order. The records, the project policies and the
+/// store's links are read once for all of them: read per branch, a push of many branches pays a
+/// full scan of the session store for every one.
+pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option<Withholding>>> {
+    let records = withheld_records()?;
     let projects: Vec<_> = policies()?
         .into_iter()
         .filter(|p| p.repository == slug)
         .collect();
-    if projects.is_empty() {
-        return Ok(None);
-    }
-    // An excluded session's capture branch stays withheld after its claim is gone.
-    let excluded_branch = projects.iter().flat_map(|p| &p.excluded).any(|session| {
-        session
-            .split_once(':')
-            .is_some_and(|(runtime, id)| capture_branch(runtime, id) == branch)
-    });
-    if excluded_branch {
-        return Ok(Some(Withholding::Excluded));
-    }
     let (owner, agent) = super::parse_slug(slug)?;
-    let store = Store::at(config::store_root()?);
-    let claims = recording_into(&link::list(&store), &owner, &agent, branch);
-    Ok(judge(&projects, branch, &claims))
+    let mut links = None;
+    let mut verdicts = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if let Some(record) = records
+            .iter()
+            .find(|r| r.repository == slug && &r.branch == branch)
+        {
+            verdicts.push(Some(record.reason));
+            continue;
+        }
+        if projects.is_empty() {
+            verdicts.push(None);
+            continue;
+        }
+        // An excluded session's capture branch stays withheld after its claim is gone.
+        let excluded_branch = projects.iter().flat_map(|p| &p.excluded).any(|session| {
+            session
+                .split_once(':')
+                .is_some_and(|(runtime, id)| capture_branch(runtime, id) == *branch)
+        });
+        if excluded_branch {
+            verdicts.push(Some(Withholding::Excluded));
+            continue;
+        }
+        let links = match &links {
+            Some(links) => links,
+            None => links.insert(link::list(&Store::at(config::store_root()?))),
+        };
+        let claims = recording_into(links, &owner, &agent, branch);
+        verdicts.push(judge(&projects, branch, &claims));
+    }
+    Ok(verdicts)
 }
 
 /// Whether a project on this machine is bound to `slug`, so `project drop` can act on its branches.
