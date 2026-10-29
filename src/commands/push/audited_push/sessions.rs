@@ -303,12 +303,9 @@ pub(super) fn run(
         && complete.captured().pointers().is_empty()
         && receipts_match_current(&repo, &receipts)?
         && (supervisor.is_some() || no_pending_publication_receipts(&repo, &receipts)?)
-        && FrozenPublication::advertised_refs_match(
-            &repo,
-            projected.plan(),
-            &intent.url,
-            &identity,
-        ) == Some(true);
+        // The advertisement this publication was planned from decides "already published"; a
+        // second listing only adds a Hub round trip, since nothing is sent on this path.
+        && FrozenPublication::refs_match(projected.plan(), &selected.remote);
     status.finish();
     if synchronized {
         let checking = ui::publication::stage("Rechecking synchronized publication");
@@ -320,7 +317,11 @@ pub(super) fn run(
         if let Some(selection) = &local_target {
             selection.verify(&repo)?;
         }
-        selected.verify_configs(&client, &repository)?;
+        // Nothing is sent on this path, so a registration can only matter to the receipt a
+        // supervisor records from it.
+        if supervisor.is_some() {
+            selected.verify_configs(&client, &repository)?;
+        }
         let (repo, remote) = intent.materialize(&client, repo)?;
         if intent.explicit_hub {
             intent.bind_delivered_origin(&repo, &remote)?;

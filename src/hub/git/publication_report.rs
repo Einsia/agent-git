@@ -137,6 +137,28 @@ impl PublicationAttempt {
                 .all(|reference| reference.status != PublicationStatus::Unconfirmed)
     }
 
+    /// Refs the destination advertised at their frozen object immediately before this batch,
+    /// acknowledged as Git would report them had they been sent.
+    pub(super) fn already_published(batch: usize, refs: &[FrozenRef]) -> Self {
+        Self {
+            batch,
+            outcome: Outcome {
+                code: 0,
+                stderr: String::new(),
+            },
+            refs: refs
+                .iter()
+                .map(|reference| PublishedRef {
+                    reference: reference.clone(),
+                    status: PublicationStatus::UpToDate,
+                    detail: None,
+                })
+                .collect(),
+            complete: true,
+            error: None,
+        }
+    }
+
     pub(super) fn parse(batch: usize, refs: &[FrozenRef], output: ProcessOutput) -> Self {
         let mut result = Self {
             batch,

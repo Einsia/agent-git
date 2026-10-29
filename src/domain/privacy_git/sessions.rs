@@ -364,14 +364,38 @@ impl SessionPublicationPlan {
     }
 
     pub fn verify_configs(&self, client: &crate::hub::Client, repository: &str) -> Result<()> {
-        for (session, expected) in &self.configs {
-            let current = client.session_privacy_config(repository, &self.identity, session)?;
-            ensure!(
-                current.config == expected.config,
-                "registered session authority changed during publication"
-            );
-        }
-        Ok(())
+        /// Lookups in flight at once. Each session is one independent Hub read, so a publication
+        /// of many sessions otherwise waits for them one round trip after another.
+        const CONCURRENT: usize = 8;
+        let configs = self.configs.iter().collect::<Vec<_>>();
+        let chunk = configs.len().div_ceil(CONCURRENT).max(1);
+        std::thread::scope(|scope| {
+            let workers = configs
+                .chunks(chunk)
+                .map(|part| {
+                    let client = client.clone();
+                    scope.spawn(move || -> Result<()> {
+                        for (session, expected) in part {
+                            let current = client.session_privacy_config(
+                                repository,
+                                &self.identity,
+                                session,
+                            )?;
+                            ensure!(
+                                current.config == expected.config,
+                                "registered session authority changed during publication"
+                            );
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers.into_iter().try_for_each(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("session authority check panicked"))?
+            })
+        })
     }
 
     fn config(&self, metadata: &Meta) -> Result<&SessionPrivacyResponse> {
@@ -1172,12 +1196,7 @@ impl ProjectedHistory {
         )?;
         source_plan.verify(&source, branches)?;
         preparing.finish();
-        // A store that cannot be compacted still publishes; it is compacted at a later push.
-        if let Err(error) = super::compact_store(&root) {
-            crate::ui::warning(&format!(
-                "the privacy publication store could not be compacted: {error:#}"
-            ));
-        }
+        super::schedule_compaction(&root);
         Ok(Self {
             repo,
             source: source_plan,

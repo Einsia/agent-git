@@ -52,8 +52,9 @@ agit push [owner/repo@branch] [options]
 | Option | Meaning |
 |---|---|
 | `[owner/repo@branch]` | Explicit saved branch; a bare repo with `-b` is also accepted. An omitted target requires `AGIT_SESSION` outside the terminal picker |
-| `-b, --branch <branch>` | Branches to publish; repeatable |
+| `-b, --branch <branch>` | Branches to publish; repeatable. Name every branch of one repository in one push rather than pushing them one at a time |
 | `--all` | Publish all settled local branches |
+| `--keep-going` | With several branches, publish each on its own when publishing them together fails |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
 | `--to <owner/repo>` | Select the retained Hub publication target for a device-local RC repository |
 | `--allow-secrets` | Compatibility flag for servers that require secret-findings acceptance |
@@ -209,3 +210,12 @@ continuation retains the session owner and uses the same capture and receipt che
 A device-local RC repository can select its initial Hub destination with `--to owner/repo`. Later
 pushes retain that confirmed destination and the device's independent local identity. Cross-repository
 push copies require source-publication authority and are currently refused before mutation.
+
+## Many branches
+
+One push carries many branches: destination checks, the ref listing and snapshot planning run
+once for all of them, and only refs the Hub does not already hold at the same object are sent.
+Branches are grouped below the publication head limit. Without `--keep-going` the first failing
+group ends the push. With `--keep-going` a failing group's branches are published again one at a
+time, so a branch with a pending privacy check or a refused upload is listed at the end without
+holding back the rest; the exit code is that of the first failure.

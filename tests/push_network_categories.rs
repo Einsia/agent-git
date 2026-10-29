@@ -514,10 +514,7 @@ fn dry_run_reads_registered_history_without_pinning_or_publishing() {
     let server = Server::start(
         &lab,
         vec![
-            Step::new(
-                "GET /api/agents/alice/qa",
-                Reply::Json(remote(&lab, "alice", AGENT_ID)),
-            ),
+            // One lookup serves every destination check of the publication.
             Step::new(
                 "GET /api/agents/alice/qa",
                 Reply::Json(remote(&lab, "alice", AGENT_ID)),
@@ -877,10 +874,7 @@ fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
     let server = Server::start(
         &lab,
         vec![
-            Step::new(
-                "GET /api/agents/alice/qa",
-                Reply::Json(remote(&lab, "alice", AGENT_ID)),
-            ),
+            // One lookup serves every destination check of the publication.
             Step::new(
                 "GET /api/agents/alice/qa",
                 Reply::Json(remote(&lab, "alice", AGENT_ID)),

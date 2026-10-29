@@ -81,6 +81,12 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   sign-in itself: when it says to sign in, follow the login steps above and rerun
   the same push. Read
   [push](references/commands/push.md) for the dry-run diagnostics and audit mode.
+- To publish several branches of one repository, name them all in one command:
+  `agit push <owner/repo> -b <branch> -b <branch> … --keep-going --yes`, or `--all`
+  for every settled branch. Each push pays the destination checks and ref listing
+  once, so a loop of single-branch pushes repeats that cost for every branch. With
+  `--keep-going` a branch that cannot be published is reported at the end and does
+  not stop the others; without it the first failure stops the push.
 - Never delete files under `~/.agit/store` or any `*.lock` file. AgentGit's locks
   are released when the process holding them exits, and deleting a lock file lets
   two writers in at once. `was already adopted` is informational; the import
