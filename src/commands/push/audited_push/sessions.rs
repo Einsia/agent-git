@@ -58,7 +58,15 @@ pub(super) fn run(
     };
     intent.verify_account(&client)?;
     intent.verify_before_mutation(&client, &repo)?;
-    let original = PublicationPlan::freeze(&repo, branches)?;
+    // A new destination's first publication carries the whole history, which is checked here;
+    // an existing one only needs the selected heads, whatever the length of their history. A
+    // cross-Hub delivery checks every selected commit for plain local history, so it captures
+    // the whole history too.
+    let original = if matches!(intent.action, Action::Create) || intent.explicit_hub {
+        PublicationPlan::freeze(&repo, branches)?
+    } else {
+        PublicationPlan::freeze_tips(&repo, branches)?
+    };
     if intent.explicit_hub {
         for commit in original.commit_objects() {
             let metadata = crate::domain::storage::metadata_local(repo.root(), commit)?;
@@ -416,6 +424,7 @@ pub(super) fn run(
         projected.policy_digest(),
         projected.session_manifest(),
         &intent.visibility,
+        &selected.remote,
     ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
     let recording = ui::publication::stage("Recording publication acknowledgements");
     projected.confirm_acceptance(&report)?;

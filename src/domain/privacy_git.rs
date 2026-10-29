@@ -69,6 +69,9 @@ pub struct ProjectedHistory {
     reports: Vec<ProjectionReport>,
     accepted_ledger: accepted::Ledger,
     candidates: BTreeMap<String, accepted::Candidate>,
+    /// Boundary commits mapped under their own ids because the destination's advertisement
+    /// reaches them; only these may leave their ancestry out of a candidate.
+    held_boundary: BTreeSet<String>,
     session_manifest: super::session_privacy::SessionPublicationManifest,
     #[cfg(test)]
     preparations: usize,
@@ -100,7 +103,8 @@ impl ProjectedHistory {
     }
 
     pub(crate) fn prepare_acceptance(&mut self) -> Result<()> {
-        self.accepted_ledger.prepare(&self.candidates)
+        self.accepted_ledger
+            .prepare(&self.candidates, &self.held_boundary)
     }
 
     pub(crate) fn confirm_acceptance(

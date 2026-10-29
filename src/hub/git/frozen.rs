@@ -334,7 +334,7 @@ impl FrozenPublication {
     /// Every attempt retains its observations, including effects preceding a failed retry.
     /// Tags are attempted only after all branch batches are affirmatively acknowledged.
     pub(super) fn push_refs(&self) -> (PublicationPhase, Option<PublicationPhase>) {
-        self.push_refs_confirmed(None)
+        self.push_refs_confirmed(None, None)
     }
 
     pub(super) fn session_privacy_policy(
@@ -381,12 +381,17 @@ impl FrozenPublication {
         )
     }
 
+    /// `held` names the advertised branch heads the publication's held history was read from;
+    /// every receipt binds a listing that still has them.
     pub(super) fn push_refs_confirmed(
         &self,
         policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
+        held: Option<&BTreeMap<String, String>>,
     ) -> (PublicationPhase, Option<PublicationPhase>) {
-        let heads = self.push_phase(&self.heads, policy);
-        let tags = heads.ok().then(|| self.push_phase(&self.tags, policy));
+        let heads = self.push_phase(&self.heads, policy, held);
+        let tags = heads
+            .ok()
+            .then(|| self.push_phase(&self.tags, policy, held));
         (heads, tags)
     }
 
@@ -394,8 +399,12 @@ impl FrozenPublication {
         &self,
         policy: &crate::hub::privacy::publication::PublicationPolicy,
         batch: &[FrozenRef],
+        held: Option<&BTreeMap<String, String>>,
     ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
         let before = self.privacy_remote_refs()?;
+        if let Some(held) = held {
+            self.verify_held_heads(held, &before)?;
+        }
         let mut after = before.clone();
         for reference in batch {
             after.insert(reference.name().into(), reference.oid().into());
@@ -408,6 +417,34 @@ impl FrozenPublication {
             &before,
             &after,
         )
+    }
+
+    /// A publication declares as new only what the Hub lacked when its held history was read. If
+    /// a branch head of that advertisement has since moved or gone, other than by this
+    /// publication's own update, the declaration may leave out commits the Hub no longer holds,
+    /// and their content would reach it without inspection; such a receipt is refused before
+    /// anything is sent. Heads that appeared since only make the declaration larger than needed,
+    /// which the Hub refuses itself.
+    fn verify_held_heads(
+        &self,
+        held: &BTreeMap<String, String>,
+        before: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (name, oid) in held {
+            let current = before.get(name);
+            let published = self
+                .plan
+                .heads()
+                .iter()
+                .find(|reference| reference.name() == name)
+                .map(FrozenRef::oid);
+            ensure!(
+                current == Some(oid)
+                    || current.is_some_and(|current| Some(current.as_str()) == published),
+                "the destination's published history changed during this publication; publish again"
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn privacy_remote_refs(&self) -> Result<BTreeMap<String, String>> {
@@ -535,6 +572,7 @@ impl FrozenPublication {
         &self,
         batches: &[Vec<FrozenRef>],
         policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
+        held: Option<&BTreeMap<String, String>>,
     ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         for (index, batch) in batches.iter().enumerate() {
@@ -551,7 +589,7 @@ impl FrozenPublication {
             let receipt_progress =
                 crate::ui::publication::stage(format!("Getting receipt for {batch_label}"));
             let receipt = match policy
-                .map(|policy| self.receive_receipt(policy, batch))
+                .map(|policy| self.receive_receipt(policy, batch, held))
                 .transpose()
             {
                 Ok(receipt) => receipt,

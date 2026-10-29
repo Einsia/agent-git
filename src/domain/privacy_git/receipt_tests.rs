@@ -156,14 +156,17 @@ fn receipt_reclamation_requires_both_raw_histories_and_preserves_retry_evidence(
         let mut candidate_mappings = mappings.clone();
         candidate_mappings.get_mut(&source_id).unwrap().public = snapshot.published_commit.clone();
         ledger
-            .prepare(&BTreeMap::from([(
-                "work".into(),
-                accepted::Candidate {
-                    source_head: source_id.clone(),
-                    public_head: snapshot.published_commit.clone(),
-                    mappings: candidate_mappings,
-                },
-            )]))
+            .prepare(
+                &BTreeMap::from([(
+                    "work".into(),
+                    accepted::Candidate {
+                        source_head: source_id.clone(),
+                        public_head: snapshot.published_commit.clone(),
+                        mappings: candidate_mappings,
+                    },
+                )]),
+                &BTreeSet::new(),
+            )
             .unwrap();
         previous_source = vec![source_id.clone()];
         previous_public = vec![canonical.published_commit.clone()];

@@ -47,6 +47,69 @@ impl SourceHistory {
     }
 }
 
+/// Raw parents with the boundary's left out: a plan does not carry the boundary's ancestry.
+fn walk_parents(
+    mut parents: BTreeMap<String, Vec<String>>,
+    boundary: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    for oid in boundary {
+        if let Some(parents) = parents.get_mut(oid) {
+            parents.clear();
+        }
+    }
+    parents
+}
+
+/// The selected history a publication carries: from the heads down to the history the
+/// destination already holds, so the publication's bounds apply to what it adds. Each boundary
+/// commit must be one the branch itself accepted in plain or under its own id, or plain history
+/// the Hub holds under its own id. An encrypted boundary needs its binding re-read and one only
+/// another branch accepted has its ancestry outside this branch's record, so either makes the
+/// publication carry the whole history. So does a cross-Hub delivery: it admits each session from
+/// its birth, and below a boundary the plan would name a later commit as the birth.
+fn freeze_publication(
+    source: &Repo,
+    branches: &[String],
+    held: &BTreeSet<String>,
+    ledger: &accepted::Ledger,
+    delivering: bool,
+) -> Result<PublicationPlan> {
+    if delivering {
+        return PublicationPlan::freeze_selected(source, branches);
+    }
+    let mut stops = ledger.accepted_sources(branches);
+    stops.extend(held.iter().cloned());
+    let plan = PublicationPlan::freeze_selected_after(source, branches, &stops)?;
+    if plan.boundary().is_empty() {
+        return Ok(plan);
+    }
+    let parents = walk_parents(
+        commit_parent_map(source, plan.commit_objects())?,
+        plan.boundary(),
+    );
+    let enveloped = enveloped_commits(source, plan.boundary())?;
+    for head in plan.heads() {
+        let branch = head
+            .name()
+            .strip_prefix("refs/heads/")
+            .context("invalid publication branch")?;
+        for oid in ancestors(head.oid(), &parents)? {
+            if plan.boundary().binary_search(&oid).is_err() {
+                continue;
+            }
+            let continues = !enveloped.contains(&oid)
+                && match ledger.get(branch, &oid) {
+                    Some(entry) => entry.plain || accepted::is_identity(entry),
+                    None => held.contains(&oid),
+                };
+            if !continues {
+                return PublicationPlan::freeze_selected(source, branches);
+            }
+        }
+    }
+    Ok(plan)
+}
+
 impl SessionPublicationPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
@@ -63,13 +126,20 @@ impl SessionPublicationPlan {
             crate::domain::session_privacy::canonical_hub(client.base())? == identity.hub,
             "session publication belongs to another Hub"
         );
-        let plan = PublicationPlan::freeze_selected(source, branches)?;
-        let sources = SourceHistory::read(source, &plan)?;
-        let history = &sources.history;
+        let held = PublicationPlan::held_history(source, &remote.heads)?;
         let mut ledger = accepted::Ledger::open(source, &identity)?;
         ledger.reconcile(&remote)?;
+        let delivering = explicit_hub || super::delivery::Delivery::active(source, &identity)?;
+        let plan = freeze_publication(source, branches, &held, &ledger, delivering)?;
+        let sources = SourceHistory::read(source, &plan)?;
+        let history = &sources.history;
         require_remote_ancestry(source, &plan, &ledger, &remote, repository)?;
-        let accepted = plan.accepted_commits(source, &remote.heads)?;
+        let accepted = plan
+            .commit_objects()
+            .iter()
+            .filter(|oid| held.contains(*oid))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let enveloped = &sources.enveloped;
         let mut sessions = BTreeSet::new();
         let mut source_hubs = BTreeSet::new();
@@ -294,7 +364,14 @@ pub(super) fn require_remote_ancestry(
     repository: &str,
 ) -> Result<()> {
     let source = source.clone().local_objects_only();
-    let parents = commit_parent_map(&source, plan.commit_objects())?;
+    let parents = walk_parents(
+        commit_parent_map(&source, plan.commit_objects())?,
+        plan.boundary(),
+    );
+    // A plan with a boundary stops at history the destination holds, so the remote head and the
+    // branch's accepted ancestors may lie below the walk; there Git's ancestry decides the
+    // fast-forward, and a missing mapping is not evidence of an inconsistent ledger.
+    let truncated = !plan.boundary().is_empty();
     for head in plan.heads() {
         let branch = head
             .name()
@@ -315,13 +392,23 @@ pub(super) fn require_remote_ancestry(
                 contained |= &entry.public == remote_head;
             }
         }
-        if contained {
+        if contained
+            || (truncated
+                && source
+                    .git_opt(&[
+                        "merge-base",
+                        "--is-ancestor",
+                        remote_head.as_str(),
+                        head.oid(),
+                    ])
+                    .is_some())
+        {
             continue;
         }
         // A valid accepted ancestor establishes the publication baseline. Its remote successor
         // need not exist locally; absence of that object does not invalidate the local ledger.
         ensure!(
-            mapped || !ledger.has_accepted_branch(branch),
+            mapped || truncated || !ledger.has_accepted_branch(branch),
             "{}",
             accepted::RECOVERY
         );
@@ -384,11 +471,6 @@ impl ProjectedHistory {
             "invalid session publication destination"
         );
         let source = source.clone().local_objects_only();
-        let source_plan = PublicationPlan::freeze_selected(&source, branches)?;
-        preparing.detail(format!(
-            "0/{} snapshots",
-            source_plan.commit_objects().len()
-        ));
         let policy = effective_policy(&source, additional)?;
         let policy_digest = policy.digest()?;
         let parent = source.common_dir()?.join("agit/privacy-publication");
@@ -405,6 +487,21 @@ impl ProjectedHistory {
         )?;
         let store = scope.trim_start_matches("sha256:").to_owned();
         let root = parent.join(&store);
+        let mut ledger = accepted::Ledger::open(&source, identity)?;
+        ledger.reconcile(&selected.remote)?;
+        // What the destination already holds, read from the advertisement the receipts are bound to.
+        let held = PublicationPlan::held_history(&source, &selected.remote.heads)?;
+        let source_plan = freeze_publication(
+            &source,
+            branches,
+            &held,
+            &ledger,
+            selected.delivery.is_some(),
+        )?;
+        preparing.detail(format!(
+            "0/{} snapshots",
+            source_plan.commit_objects().len()
+        ));
         initialize_with_format(&root, source_plan.heads()[0].oid().len())?;
         let repo = Repo::at(&root).local_objects_only();
         let mut cache: Cache = match state::load(&root.join(".git/session-candidates"), &scope)? {
@@ -425,8 +522,6 @@ impl ProjectedHistory {
             cache.commits.clear();
             cache.version = CANDIDATE_CACHE_VERSION;
         }
-        let mut ledger = accepted::Ledger::open(&source, identity)?;
-        ledger.reconcile(&selected.remote)?;
         let fresh;
         let sources = match &selected.sources {
             Some(cached) if cached.matches(&source, &source_plan)? => cached,
@@ -435,11 +530,21 @@ impl ProjectedHistory {
                 &fresh
             }
         };
-        let parents = &sources.history.parents;
+        // Raw parents: a boundary commit's own parents are checked against its accepted mapping,
+        // while the walk leaves them out.
+        let parents = commit_parent_map(&source, source_plan.commit_objects())?;
+        let walk = &sources.history.parents;
         let enveloped = &sources.enveloped;
-        let order = parent_first(parents)?;
+        let order = parent_first(walk)?;
         let source_sessions = &sources.history;
-        let accepted = source_plan.accepted_commits(&source, &selected.remote.heads)?;
+        let accepted = source_plan
+            .commit_objects()
+            .iter()
+            .filter(|oid| held.contains(*oid))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut public_boundary = BTreeSet::new();
+        let mut held_boundary = BTreeSet::new();
         let mut references = BTreeMap::new();
         let mut candidates = BTreeMap::new();
         let mut snapshots = BTreeMap::new();
@@ -480,9 +585,13 @@ impl ProjectedHistory {
                     redactor.publishes_unchanged(branch)?,
                     "publication branch name requires privacy rewriting; rename it before publishing"
                 );
-                let reachable = ancestors(head.oid(), parents)?;
+                let reachable = ancestors(head.oid(), walk)?;
+                // Below a boundary the remote head may be held history the walk did not reach;
+                // whether the publication fast-forwards it is checked against the Hub before
+                // anything is sent.
                 if let Some(remote_head) = selected.remote.refs.get(head.name())
                     && !reachable.contains(remote_head)
+                    && (source_plan.boundary().is_empty() || !held.contains(remote_head))
                 {
                     let mut found = false;
                     for oid in &reachable {
@@ -495,22 +604,42 @@ impl ProjectedHistory {
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
                 let mut plain_rewrites = BTreeSet::new();
                 for oid in order.iter().filter(|oid| reachable.contains(*oid)) {
-                    let public_parents = parents[oid]
-                        .iter()
-                        .map(|oid| {
-                            mapped
-                                .get(oid)
-                                .map(|entry| entry.public.clone())
-                                .context("published parent is unavailable")
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                    // The plan leaves a boundary commit's ancestry out, so its public parents come
+                    // from its accepted mapping instead of from this walk.
+                    let boundary = source_plan.boundary().binary_search(oid).is_ok();
+                    let public_parents = if boundary {
+                        None
+                    } else {
+                        Some(
+                            parents[oid]
+                                .iter()
+                                .map(|oid| {
+                                    mapped
+                                        .get(oid)
+                                        .map(|entry| entry.public.clone())
+                                        .context("published parent is unavailable")
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        )
+                    };
                     if let Some(entry) = ledger.inherited_immutable(branch, oid)? {
+                        // A boundary is admitted only as this branch's own accepted mapping or as
+                        // an identity mapping; anything else would map an old commit anew with
+                        // no ancestry check.
                         ensure!(
                             entry.source_parents == parents[oid]
-                                && entry.public_parents == public_parents,
+                                && public_parents
+                                    .as_ref()
+                                    .is_none_or(|public| &entry.public_parents == public)
+                                && (!boundary
+                                    || ledger.get(branch, oid) == Some(entry)
+                                    || accepted::is_identity(entry)),
                             "{}",
                             accepted::RECOVERY
                         );
+                        if boundary {
+                            public_boundary.insert(entry.public.clone());
+                        }
                         let retained = entry.object_source(&source, &parent, branch)?;
                         let plain = entry.plain;
                         if plain {
@@ -537,7 +666,7 @@ impl ProjectedHistory {
                             &retained,
                             &repo,
                             &entry.public,
-                            &public_parents,
+                            &entry.public_parents,
                         )? {
                             aliases.reserve_aliases(&reused.inspection)?;
                             reports.push(reused.report);
@@ -551,10 +680,15 @@ impl ProjectedHistory {
                         continue;
                     }
                     if accepted.contains(oid) {
+                        let public_parents = public_parents.unwrap_or_else(|| parents[oid].clone());
                         ensure!(
                             public_parents == parents[oid],
                             "accepted history cannot change parents"
                         );
+                        if boundary {
+                            public_boundary.insert(oid.clone());
+                            held_boundary.insert(oid.clone());
+                        }
                         imports.add(oid, &parents[oid]);
                         if enveloped.contains(oid) {
                             // Accepted objects keep their IDs, so the source holds the same bytes.
@@ -584,6 +718,9 @@ impl ProjectedHistory {
                         record_progress(oid, true);
                         continue;
                     }
+                    let Some(public_parents) = public_parents else {
+                        anyhow::bail!("{}", accepted::RECOVERY);
+                    };
                     let original_metadata = source_sessions.metadata(&source, oid).context(
                         "introduced snapshots require declared file or session metadata",
                     )?;
@@ -842,6 +979,17 @@ impl ProjectedHistory {
         })?;
         imports.finish(&repo, &source)?;
         retain_tags(&source, &source_plan, &repo, &candidates, &mut references)?;
+        let carried = carry_tags(
+            &source,
+            &source_plan,
+            &repo,
+            &parent,
+            &ledger,
+            branches,
+            &selected.remote,
+            &held,
+            &mut references,
+        )?;
         // A previously accepted alias wins when the same public object is reached on another branch.
         snapshots.retain(|commit, _| !preserved.contains(commit));
         let manifest = SessionPublicationManifest {
@@ -874,7 +1022,12 @@ impl ProjectedHistory {
             &["-c", "core.hooksPath=", "update-ref", "--stdin"],
             refs.as_bytes(),
         )?;
-        let plan = PublicationPlan::freeze_selected(&repo, branches)?;
+        let plan = PublicationPlan::freeze_selected_after_carrying(
+            &repo,
+            branches,
+            &public_boundary,
+            &carried,
+        )?;
         source_plan.verify(&source, branches)?;
         preparing.finish();
         // A store that cannot be compacted still publishes; it is compacted at a later push.
@@ -893,6 +1046,7 @@ impl ProjectedHistory {
             reports,
             accepted_ledger: ledger,
             candidates,
+            held_boundary,
             session_manifest: manifest,
             #[cfg(test)]
             preparations,
@@ -1228,6 +1382,70 @@ fn retain_tags(
     Ok(())
 }
 
+/// Tags the branches reach below the boundary that the destination does not have as they are
+/// here, added to `references`, with the names returned for the public plan to carry. A plan takes
+/// only its own commits' tags, so without this a tag added to an earlier, published commit, and a
+/// version tag of a published turn whose tags phase failed after its heads landed, never reach the
+/// Hub; a plan that captured their history instead would meet the commit bound once the published
+/// history outgrows it. Each points to a commit in `held`, which the destination holds under that
+/// id, so no history is sent for it. A turn whose commit the destination no longer holds (erased,
+/// withdrawn, its branch gone) owes no tag, and neither does a rewritten turn, whose public commit
+/// `held` cannot contain.
+#[allow(clippy::too_many_arguments)]
+fn carry_tags(
+    source: &Repo,
+    plan: &PublicationPlan,
+    destination: &Repo,
+    parent: &std::path::Path,
+    ledger: &accepted::Ledger,
+    branches: &[String],
+    remote: &RemoteRefs,
+    held: &BTreeSet<String>,
+    references: &mut BTreeMap<String, String>,
+) -> Result<BTreeSet<String>> {
+    let lacks = |name: &str, oid: &str| remote.refs.get(name).is_none_or(|current| current != oid);
+    let mut carried = BTreeSet::new();
+    for branch in branches {
+        for entry in ledger.accepted(branch) {
+            let name = format!("refs/tags/agit-{}", entry.public);
+            if plan.commit_objects().binary_search(&entry.source).is_ok()
+                || !held.contains(&entry.public)
+                || references.contains_key(&name)
+                || !lacks(&name, &entry.public)
+            {
+                continue;
+            }
+            let retained = entry.object_source(source, parent, branch)?;
+            crate::commands::plumbing::import_commit_graph(destination, &retained, &entry.public)?;
+            references.insert(name.clone(), entry.public.clone());
+            carried.insert(name);
+        }
+    }
+    for (tag, commit, objects) in plan.tags_below_boundary(source, |name, oid| !lacks(name, oid))? {
+        ensure!(
+            held.contains(&commit),
+            "custom tag {} points to rewritten publication history; remove it from the source or recreate it on the accepted public commit",
+            tag.name()
+        );
+        crate::commands::plumbing::import_commit_graph(destination, source, &commit)?;
+        for oid in &objects {
+            let bytes = read(source, &["cat-file", "tag", oid], MAX_COMMIT)?;
+            ensure!(
+                write_object(destination, "tag", &bytes)? == *oid,
+                "publication tag changed object identity"
+            );
+        }
+        if let Some(previous) = references.insert(tag.name().to_owned(), tag.oid().to_owned()) {
+            ensure!(
+                previous == tag.oid(),
+                "custom tag conflicts with a generated version tag"
+            );
+        }
+        carried.insert(tag.name().to_owned());
+    }
+    Ok(carried)
+}
+
 fn retain_session_mapping(
     repo: &Repo,
     commit: &str,
@@ -1559,6 +1777,107 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A version tag is owed only for a turn the destination still holds. An accepted turn below
+    /// the boundary whose tag the advertisement lacks is carried while its commit is in the held
+    /// history, and skipped once the destination no longer holds it (an erased or withdrawn turn,
+    /// a branch gone), since the tag would then name history the Hub no longer has. A turn the plan
+    /// captures takes its tag from the plan itself. An implementation that carried every accepted
+    /// turn's missing tag pushes the erased turn's tag here.
+    #[test]
+    fn only_turns_the_destination_still_holds_owe_their_version_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        let commit = |message: &str| {
+            git(&root, &["commit", "-q", "--allow-empty", "-m", message]);
+            git(&root, &["rev-parse", "HEAD"])
+        };
+        let first = commit("first");
+        let second = commit("second");
+        commit("third");
+        let source = Repo::at(&root).local_objects_only();
+        let identity = RemoteIdentity::new(
+            "https://hub.invalid",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let mapping = |oid: &str, parent: Option<&str>| accepted::Mapping {
+            source: oid.into(),
+            public: oid.into(),
+            source_parents: parent.map(str::to_owned).into_iter().collect(),
+            public_parents: parent.map(str::to_owned).into_iter().collect(),
+            store: "c".repeat(64),
+            source_session: session.clone(),
+            public_session: session.clone(),
+            policy: crate::domain::privacy_envelope::digest_bytes(b"policy"),
+            recipient: None,
+            plain: false,
+            delivered: false,
+        };
+        let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
+        ledger
+            .prepare(
+                &BTreeMap::from([(
+                    "main".to_owned(),
+                    accepted::Candidate {
+                        source_head: second.clone(),
+                        public_head: second.clone(),
+                        mappings: BTreeMap::from([
+                            (first.clone(), mapping(&first, None)),
+                            (second.clone(), mapping(&second, Some(&first))),
+                        ]),
+                    },
+                )]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        let remote = RemoteRefs {
+            refs: BTreeMap::from([("refs/heads/main".to_owned(), second.clone())]),
+            ..Default::default()
+        };
+        ledger.reconcile(&remote).unwrap();
+        let plan = PublicationPlan::freeze_selected_after(
+            &source,
+            &["main".into()],
+            &BTreeSet::from([second.clone()]),
+        )
+        .unwrap();
+        let carry = |held: BTreeSet<String>| {
+            let store = dir.path().join(format!("store-{}", held.len()));
+            std::fs::create_dir(&store).unwrap();
+            git(&store, &["init", "-q"]);
+            let destination = Repo::at(&store);
+            let mut references = BTreeMap::new();
+            let carried = carry_tags(
+                &source,
+                &plan,
+                &destination,
+                &dir.path().join("publication"),
+                &ledger,
+                &["main".into()],
+                &remote,
+                &held,
+                &mut references,
+            )
+            .unwrap();
+            (carried, references, destination)
+        };
+
+        let version = format!("refs/tags/agit-{first}");
+        let (carried, references, destination) =
+            carry(BTreeSet::from([first.clone(), second.clone()]));
+        assert_eq!(carried, BTreeSet::from([version.clone()]));
+        assert_eq!(references, BTreeMap::from([(version, first.clone())]));
+        destination
+            .git(&["cat-file", "-e", &format!("{first}^{{commit}}")])
+            .unwrap();
+        let (carried, references, _) = carry(BTreeSet::from([second.clone()]));
+        assert!(carried.is_empty());
+        assert!(references.is_empty());
     }
 
     /// A root introduces its tree and a merge introduces only paths whose blob differs from every

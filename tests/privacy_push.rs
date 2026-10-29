@@ -45,6 +45,10 @@ struct Hub {
     visibility: Arc<Mutex<&'static str>>,
     key_version: Arc<AtomicUsize>,
     key_requests: Arc<AtomicUsize>,
+    /// Every publication preview request body, in arrival order.
+    previews: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// A ref the next strategy registration moves before answering: `(name, oid)`.
+    move_on_strategy: Arc<Mutex<Option<(String, String)>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -81,6 +85,10 @@ impl Hub {
         let confirmed = Arc::clone(&confirmations);
         let creations = Arc::new(AtomicUsize::new(0));
         let created = Arc::clone(&creations);
+        let previews = Arc::new(Mutex::new(Vec::new()));
+        let recorded_previews = Arc::clone(&previews);
+        let move_on_strategy = Arc::new(Mutex::new(None::<(String, String)>));
+        let strategy_move = Arc::clone(&move_on_strategy);
         let visibility = Arc::new(Mutex::new("private"));
         let served_visibility = Arc::clone(&visibility);
         let resolver_hub = base.clone();
@@ -323,6 +331,9 @@ impl Hub {
                         )
                     }
                     ("PUT", "/api/agents/alice/app/privacy/strategy") => {
+                        if let Some((name, oid)) = strategy_move.lock().unwrap().take() {
+                            git(&root.join("alice/app.git"), &["update-ref", &name, &oid]);
+                        }
                         strategy = serde_json::from_slice(&body).unwrap();
                         assert_eq!(strategy["publication_format_version"], 2);
                         assert_eq!(
@@ -336,6 +347,7 @@ impl Hub {
                     }
                     ("POST", "/api/agents/alice/app/privacy/publication/preview") => {
                         preview = serde_json::from_slice(&body).unwrap();
+                        recorded_previews.lock().unwrap().push(preview.clone());
                         assert_eq!(preview["policy_digest"], strategy["policy_digest"]);
                         assert_eq!(
                             preview["expected_refs_digest"],
@@ -472,6 +484,8 @@ impl Hub {
             visibility,
             key_version,
             key_requests,
+            previews,
+            move_on_strategy,
             stop,
             worker: Some(worker),
         }
@@ -1969,6 +1983,187 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
             }
         }
     }
+}
+
+/// A plain session that continues its published history declares only what it adds: the next
+/// push preserves just the heads the Hub already holds and snapshots just the new turns, so its
+/// size follows the push, not the session. A walk of the whole history declares every earlier turn
+/// again. If a branch head of the advertisement that history was read from moves before a receipt
+/// binds it, the declaration may leave out commits the Hub no longer holds, so the publication is
+/// refused before anything is sent.
+///
+/// The bound applies to commits, not to tags: a tag the branch reaches below the boundary that the
+/// Hub lacks still arrives, both one added to an earlier turn after it was published and a version
+/// tag of a published turn the Hub lost, as when a tags phase fails after the heads land, and the
+/// push that carries them still declares only the new turn. A plan that takes only its own
+/// commits' tags leaves both off the Hub on every later push; one that publishes them by capturing
+/// the whole history again declares every turn, and past the commit bound cannot push at all.
+#[test]
+fn continued_plain_session_declares_only_what_it_adds() {
+    use agit::domain::session_privacy::SessionPublicationManifest;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [26; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    let base = git(repo.root(), &["rev-parse", "HEAD"]);
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let turn = |content: &str| {
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let first: Vec<String> = (0..3).map(|index| turn(&format!("turn {index}"))).collect();
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(repo.root(), &["rev-parse", "HEAD"]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
+
+    let earlier = hub.previews.lock().unwrap().len();
+    let added = std::collections::BTreeSet::from([turn("turn 3"), turn("turn 4")]);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let head = git(repo.root(), &["rev-parse", "HEAD"]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), head);
+    let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
+    assert!(!previews.is_empty());
+    for preview in previews {
+        let declared: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        assert_eq!(
+            declared
+                .preserved_commits
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([base.clone(), published.clone()])
+        );
+        assert_eq!(
+            declared
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.commit().to_owned())
+                .collect::<std::collections::BTreeSet<_>>(),
+            added
+        );
+    }
+
+    let version = format!("refs/tags/agit-{}", first[1]);
+    assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);
+    git(&remote, &["update-ref", "-d", &version]);
+    git(repo.root(), &["tag", "reviewed", &first[0]]);
+    let earlier = hub.previews.lock().unwrap().len();
+    let fifth = turn("turn 5");
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/tags/reviewed"]), first[0]);
+    let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
+    assert!(!previews.is_empty());
+    for preview in previews {
+        let declared: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        assert_eq!(
+            declared
+                .preserved_commits
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([base.clone(), head.clone()])
+        );
+        assert_eq!(
+            declared
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.commit().to_owned())
+                .collect::<Vec<_>>(),
+            [fifth.clone()]
+        );
+    }
+
+    turn("turn 6");
+    let earlier = hub.previews.lock().unwrap().len();
+    let received = hub.posts.load(Ordering::Acquire);
+    *hub.move_on_strategy.lock().unwrap() = Some(("refs/heads/talk".into(), published.clone()));
+    let refused = run(&["--yes", "push", "alice/app@talk"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        )
+        .contains("changed during this publication"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), received);
+    assert_eq!(hub.previews.lock().unwrap().len(), earlier);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
 }
 
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.

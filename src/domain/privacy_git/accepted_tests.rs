@@ -74,14 +74,17 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     };
     accepted::Ledger::open(&source, &identity)
         .unwrap()
-        .prepare(&BTreeMap::from([(
-            "teammate".into(),
-            accepted::Candidate {
-                source_head: base.clone(),
-                public_head: base.clone(),
-                mappings: BTreeMap::from([(base.clone(), mapping)]),
-            },
-        )]))
+        .prepare(
+            &BTreeMap::from([(
+                "teammate".into(),
+                accepted::Candidate {
+                    source_head: base.clone(),
+                    public_head: base.clone(),
+                    mappings: BTreeMap::from([(base.clone(), mapping)]),
+                },
+            )]),
+            &BTreeSet::new(),
+        )
         .unwrap();
     source.git(&["checkout", "-b", "fork"]).unwrap();
     let mut metadata = Meta::new(
@@ -874,7 +877,10 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
 
     accepted::Ledger::open(&source, &identity)
         .unwrap()
-        .prepare(&BTreeMap::from([("work".into(), candidate)]))
+        .prepare(
+            &BTreeMap::from([("work".into(), candidate)]),
+            &BTreeSet::new(),
+        )
         .unwrap();
     selected.remote = RemoteRefs {
         heads: vec![anonymous.clone()],
@@ -1000,14 +1006,17 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
     };
     let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
     ledger
-        .prepare(&BTreeMap::from([(
-            "work".into(),
-            accepted::Candidate {
-                source_head: original.clone(),
-                public_head: public.clone(),
-                mappings: BTreeMap::from([(original.clone(), mapping)]),
-            },
-        )]))
+        .prepare(
+            &BTreeMap::from([(
+                "work".into(),
+                accepted::Candidate {
+                    source_head: original.clone(),
+                    public_head: public.clone(),
+                    mappings: BTreeMap::from([(original.clone(), mapping)]),
+                },
+            )]),
+            &BTreeSet::new(),
+        )
         .unwrap();
     let mut selected = SessionPublicationPlan {
         sources: None,
@@ -1121,4 +1130,106 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
     assert_eq!(receipts[0].source, continuation);
     assert!(next.session_manifest().preserved_commits.contains(&public));
     crate::hub::git::CapturedPublication::capture_projected(&next, 1024 * 1024, &source).unwrap();
+}
+
+/// A candidate that continues accepted history may leave out ancestry only where nothing at or
+/// below it changes: below a mapping this branch accepted, carried exactly as accepted, or below an
+/// identity mapping of a commit the destination's advertisement reaches, whose ancestry is the
+/// destination's under the same ids. A forged boundary (an old commit mapped anew with its
+/// ancestry left out, an accepted commit carried with another public commit, or an identity mapping
+/// of a local-only commit) is refused rather than recorded, so it never escapes the ancestry check.
+#[test]
+fn ledger_admits_left_out_ancestry_only_below_accepted_or_identity_mappings() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = Repo::init(&temp.path().join("source")).unwrap();
+    let identity = RemoteIdentity::new(
+        "https://hub.invalid",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    .unwrap();
+    let oid = |letter: char| letter.to_string().repeat(40);
+    let session = format!("agit-{}", "a".repeat(40));
+    let policy = crate::domain::privacy_envelope::digest_bytes(b"policy");
+    let mapping =
+        |source: char, public: char, parent: Option<(char, char)>, plain: bool| accepted::Mapping {
+            source: oid(source),
+            public: oid(public),
+            source_parents: parent.map(|(source, _)| oid(source)).into_iter().collect(),
+            public_parents: parent.map(|(_, public)| oid(public)).into_iter().collect(),
+            store: "c".repeat(64),
+            source_session: session.clone(),
+            public_session: session.clone(),
+            policy: policy.clone(),
+            recipient: None,
+            plain,
+            delivered: false,
+        };
+    // Only `a` is reached by the destination's advertisement.
+    let held = BTreeSet::from([oid('a')]);
+    let prepare = |branch: &str, head: (char, char), mappings: Vec<accepted::Mapping>| {
+        let mut ledger = accepted::Ledger::open(&source, &identity)?;
+        ledger.prepare(
+            &BTreeMap::from([(
+                branch.to_owned(),
+                accepted::Candidate {
+                    source_head: oid(head.0),
+                    public_head: oid(head.1),
+                    mappings: mappings
+                        .into_iter()
+                        .map(|entry| (entry.source.clone(), entry))
+                        .collect(),
+                },
+            )]),
+            &held,
+        )?;
+        ledger.reconcile(&RemoteRefs {
+            refs: BTreeMap::from([(format!("refs/heads/{branch}"), oid(head.1))]),
+            ..Default::default()
+        })
+    };
+
+    // Identity history the Hub holds: the boundary `a` leaves its parent `0` out.
+    prepare(
+        "held",
+        ('b', 'b'),
+        vec![
+            mapping('a', 'a', Some(('0', '0')), false),
+            mapping('b', 'b', Some(('a', 'a')), false),
+        ],
+    )
+    .unwrap();
+    // A rewritten plain line, then a continuation that carries its accepted head as the boundary.
+    prepare("plain", ('c', '1'), vec![mapping('c', '1', None, true)]).unwrap();
+    prepare(
+        "plain",
+        ('d', '2'),
+        vec![
+            mapping('c', '1', None, true),
+            mapping('d', '2', Some(('c', '1')), true),
+        ],
+    )
+    .unwrap();
+
+    let forged = [
+        ("other", mapping('a', '3', Some(('0', '0')), true)),
+        ("plain", mapping('c', '4', None, true)),
+        ("local", mapping('6', '6', Some(('7', '7')), false)),
+    ];
+    for (branch, boundary) in forged {
+        let parent = (
+            boundary.source.chars().next().unwrap(),
+            boundary.public.chars().next().unwrap(),
+        );
+        let child = mapping('e', '5', Some(parent), true);
+        let refused = prepare(branch, ('e', '5'), vec![boundary, child]).unwrap_err();
+        assert!(
+            refused.to_string().contains(accepted::RECOVERY),
+            "{refused:#}"
+        );
+    }
+    let ledger = accepted::Ledger::open(&source, &identity).unwrap();
+    assert!(ledger.get("other", &oid('e')).is_none());
+    assert!(ledger.get("local", &oid('e')).is_none());
+    assert!(ledger.get("plain", &oid('e')).is_none());
+    assert_eq!(ledger.get("plain", &oid('d')).unwrap().public, oid('2'));
 }

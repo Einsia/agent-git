@@ -16,15 +16,18 @@ impl CompleteInspection {
     /// Accepting findings applies to this operation and does not constitute model approval.
     /// Native Git LFS retains its own User-Agent and server-directed transfer policy.
     pub fn publish(self, acceptance: SecretFindingsAcceptance) -> PublicationReport {
-        self.publish_confirmed(acceptance, None)
+        self.publish_confirmed(acceptance, None, None)
     }
 
     /// Every receive batch binds the same reviewed session manifest and its exact ref transition.
+    /// `held` is the advertisement the manifest's held history was read from; a receipt whose
+    /// listing no longer has its branch heads is refused.
     pub fn publish_with_session_receipts(
         self,
         policy_digest: &str,
         manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
+        held: &crate::hub::git::RemoteRefs,
     ) -> Result<PublicationReport> {
         let preparing = crate::ui::publication::stage("Preparing publication authority");
         let policy = self.prepared.publication.session_privacy_policy(
@@ -32,14 +35,21 @@ impl CompleteInspection {
             manifest,
             visibility,
         )?;
+        let heads = held
+            .refs
+            .iter()
+            .filter(|(name, _)| name.starts_with("refs/heads/"))
+            .map(|(name, oid)| (name.clone(), oid.clone()))
+            .collect();
         preparing.finish();
-        Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy)))
+        Ok(self.publish_confirmed(SecretFindingsAcceptance::Reject, Some(policy), Some(&heads)))
     }
 
     fn publish_confirmed(
         self,
         _acceptance: SecretFindingsAcceptance,
         policy: Option<crate::hub::privacy::publication::PublicationPolicy>,
+        held: Option<&std::collections::BTreeMap<String, String>>,
     ) -> PublicationReport {
         let lfs = self.publish_lfs();
         if !lfs.ok() {
@@ -51,7 +61,10 @@ impl CompleteInspection {
             };
         }
         let (heads, tags) = match policy.as_ref() {
-            Some(policy) => self.prepared.publication.push_refs_confirmed(Some(policy)),
+            Some(policy) => self
+                .prepared
+                .publication
+                .push_refs_confirmed(Some(policy), held),
             None => self.prepared.publication.push_refs(),
         };
         PublicationReport {

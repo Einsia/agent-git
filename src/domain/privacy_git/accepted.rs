@@ -113,9 +113,9 @@ impl Ledger {
     fn validate(&self) -> Result<()> {
         for (branch, state) in &self.branches {
             crate::domain::repo::valid_branch_name(branch)?;
-            validate_mappings(&state.accepted)?;
+            validate_mappings(&state.accepted, None)?;
             for candidate in &state.pending {
-                validate_mappings(&candidate.mappings)?;
+                validate_mappings(&candidate.mappings, Some(&state.accepted))?;
                 ensure!(
                     candidate
                         .mappings
@@ -130,6 +130,23 @@ impl Ledger {
 
     pub fn get(&self, branch: &str, source: &str) -> Option<&Mapping> {
         self.branches.get(branch)?.accepted.get(source)
+    }
+
+    /// Sources these branches have accepted publications for.
+    pub fn accepted_sources(&self, branches: &[String]) -> BTreeSet<String> {
+        branches
+            .iter()
+            .filter_map(|branch| self.branches.get(branch))
+            .flat_map(|state| state.accepted.keys().cloned())
+            .collect()
+    }
+
+    /// The mappings this branch has accepted.
+    pub fn accepted(&self, branch: &str) -> impl Iterator<Item = &Mapping> {
+        self.branches
+            .get(branch)
+            .into_iter()
+            .flat_map(|state| state.accepted.values())
     }
 
     pub fn has_accepted_branch(&self, branch: &str) -> bool {
@@ -235,9 +252,28 @@ impl Ledger {
         self.save()
     }
 
-    pub fn prepare(&mut self, candidates: &BTreeMap<String, Candidate>) -> Result<()> {
+    /// A candidate may carry a commit the branch already accepted only as that accepted mapping,
+    /// and may leave a mapping's ancestry out only when the mapping is an identity mapping of a
+    /// commit in `held`, which the destination's advertisement reaches. Validation admits that
+    /// shape alone; without the held check an identity mapping of a local-only commit would carry
+    /// its unpublished ancestry past the ledger.
+    pub fn prepare(
+        &mut self,
+        candidates: &BTreeMap<String, Candidate>,
+        held: &BTreeSet<String>,
+    ) -> Result<()> {
         for (branch, candidate) in candidates {
             let state = self.branches.entry(branch.clone()).or_default();
+            for (source, entry) in &candidate.mappings {
+                if let Some(old) = state.accepted.get(source) {
+                    ensure!(same_mapping(old, entry), "{RECOVERY}");
+                    continue;
+                }
+                let continues = entry.source_parents.iter().all(|parent| {
+                    candidate.mappings.contains_key(parent) || state.accepted.contains_key(parent)
+                });
+                ensure!(continues || held.contains(source), "{RECOVERY}");
+            }
             if !state.pending.iter().any(|old| {
                 old.source_head == candidate.source_head && old.public_head == candidate.public_head
             }) {
@@ -282,27 +318,35 @@ impl Ledger {
     }
 }
 
+/// A candidate that continues accepted history carries only what it adds and its boundary, so the
+/// walk stops where the candidate ends: there validation admitted only history this branch already
+/// accepted or the ancestry of an identity mapping, and neither changes state.
 fn promote(state: &mut Branch, candidate: &Candidate, source: &str) -> Result<()> {
-    let mut pending = vec![source.to_owned()];
+    let mut pending = vec![(source.to_owned(), false)];
     let mut visited = BTreeSet::new();
-    while let Some(source) = pending.pop() {
+    while let Some((source, below_identity)) = pending.pop() {
         if !visited.insert(source.clone()) {
             continue;
         }
-        let entry = candidate.mappings.get(&source).context(RECOVERY)?;
-        if let Some(old) = state.accepted.get(&source) {
+        let Some(entry) = candidate.mappings.get(&source) else {
             ensure!(
-                old.public == entry.public
-                    && old.public_parents == entry.public_parents
-                    && old.source_parents == entry.source_parents
-                    && old.public_session == entry.public_session
-                    && compatible_recipient(old, entry),
+                below_identity || state.accepted.contains_key(&source),
                 "{RECOVERY}"
             );
+            continue;
+        };
+        if let Some(old) = state.accepted.get(&source) {
+            ensure!(same_mapping(old, entry), "{RECOVERY}");
         } else {
             state.accepted.insert(source.clone(), entry.clone());
         }
-        pending.extend(entry.source_parents.clone());
+        let identity = is_identity(entry);
+        pending.extend(
+            entry
+                .source_parents
+                .iter()
+                .map(|parent| (parent.clone(), identity)),
+        );
     }
     state.pending.retain(|pending| {
         pending.source_head != source || pending.public_head != candidate.public_head
@@ -310,7 +354,24 @@ fn promote(state: &mut Branch, candidate: &Candidate, source: &str) -> Result<()
     Ok(())
 }
 
-fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
+/// An accepted commit published under its own id with its own parents. Its public commit is its
+/// source commit, so the destination holds its ancestry under the same ids and no mapping of an
+/// ancestor can differ from it.
+pub(super) fn is_identity(entry: &Mapping) -> bool {
+    entry.source == entry.public
+        && entry.source_parents == entry.public_parents
+        && entry.recipient.is_none()
+        && !entry.plain
+}
+
+/// Each mapping's public parents are the mappings of its source parents. A parent may come from
+/// `accepted` when the mappings continue it; one found nowhere is admitted only below an identity
+/// mapping, whose ancestry is identity. Any other mapping without its parents is refused, so a
+/// candidate cannot attach a new mapping to an old commit without the ancestry check.
+fn validate_mappings(
+    mappings: &BTreeMap<String, Mapping>,
+    accepted: Option<&BTreeMap<String, Mapping>>,
+) -> Result<()> {
     for (source, entry) in mappings {
         ensure!(
             source == &entry.source
@@ -323,12 +384,13 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
         );
         for (source_parent, public_parent) in entry.source_parents.iter().zip(&entry.public_parents)
         {
-            ensure!(
-                mappings
-                    .get(source_parent)
-                    .is_some_and(|parent| &parent.public == public_parent),
-                "{RECOVERY}"
-            );
+            let parent = mappings
+                .get(source_parent)
+                .or_else(|| accepted.and_then(|accepted| accepted.get(source_parent)));
+            match parent {
+                Some(parent) => ensure!(&parent.public == public_parent, "{RECOVERY}"),
+                None => ensure!(is_identity(entry), "{RECOVERY}"),
+            }
         }
         super::super::privacy_envelope::validate_digest(&entry.policy)?;
         if entry.plain {
@@ -358,6 +420,15 @@ fn validate_mappings(mappings: &BTreeMap<String, Mapping>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An accepted source keeps its public commit, parents and session for good.
+fn same_mapping(old: &Mapping, entry: &Mapping) -> bool {
+    old.public == entry.public
+        && old.public_parents == entry.public_parents
+        && old.source_parents == entry.source_parents
+        && old.public_session == entry.public_session
+        && compatible_recipient(old, entry)
 }
 
 fn compatible_recipient(left: &Mapping, right: &Mapping) -> bool {
