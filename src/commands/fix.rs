@@ -261,6 +261,9 @@ pub fn register_terminal_error(error: &anyhow::Error) {
     if let Some(required) = error.downcast_ref::<super::LoginRequired>() {
         register(|| required.fix());
     }
+    if let Some(mismatch) = error.downcast_ref::<crate::hub::identity::HubMismatch>() {
+        register(|| mismatch.fix());
+    }
     register_terminal_api_error(error);
 }
 

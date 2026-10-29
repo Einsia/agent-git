@@ -31,6 +31,14 @@ agit doctor --repo alice/research --deep
 
 The report diagnoses problems; it does not automatically create branches or rewrite history. Follow its suggested `setup`, `login`, or explicit `new`/`import` actions.
 
+Checkouts pinned to another Hub are reported with both addresses and an explicit cross-Hub
+delivery command. The command selects the recorded source Hub and retains the Agit home, so
+copying it while the current Hub is already the destination still selects distinct source and
+destination Hubs. Review the saved branches before delivering them. Doctor does not change pins,
+remotes, or publication records. Only discard a local copy when its work is no longer needed;
+`agit repo delete OWNER/REPO --local` leaves the remote untouched, while omitting `--local`
+deletes the remote repository.
+
 `--repo` requires an explicit complete owner and repository name, without a branch or selector. The repository must already exist locally; a missing repository is a reference error. The option does not infer an owner from authentication, workspace context, or an incomplete claim. Repository integrity checks include its registered worktrees. Other repositories are excluded from the integrity report, and their native transcripts are not opened. Runtime, skill, authentication, Git, and keystore diagnostics remain global.
 
 Doctor does not run startup migration or the automatic upgrade network check. It refuses pending recovery without consuming that evidence or repairing storage. With `--repo`, this includes the selected repository's checkout aliases and legacy recovery evidence. Global recovery records are inspected for repository identity; records belonging to other repositories are then skipped. Recovery evidence whose repository cannot be identified also blocks scoped inspection. `--check-backend` remains an explicit request for a network connectivity check.
