@@ -107,10 +107,66 @@ pub(super) fn after_settlement(
                 }
             }
         }
-        _ => {
-            ui::warning(&format!(
-                "saved locally; automatic push failed for {target}. Run `agit push {target}` to inspect the problem and retry."
-            ));
-        }
+        Ok(output) => match failure_reason(&output.stdout) {
+            Some((reason, hints)) => {
+                ui::warning(&format!(
+                    "saved locally; automatic push failed for {target}: {reason}"
+                ));
+                if hints.is_empty() {
+                    ui::hint(&format!("retry with `agit push {target}`"));
+                }
+                for hint in hints {
+                    ui::hint(&hint);
+                }
+            }
+            None => unexplained(&target),
+        },
+        Err(_) => unexplained(&target),
     }
+}
+
+fn unexplained(target: &str) {
+    ui::warning(&format!(
+        "saved locally; automatic push failed for {target}. Run `agit push {target}` to inspect the problem and retry."
+    ));
+}
+
+/// The child's own error and hint lines, so the reason and its next commands are read where the
+/// turn was settled. A child that produced no envelope, or no error line in it, has no reason to
+/// relay.
+fn failure_reason(stdout: &[u8]) -> Option<(String, Vec<String>)> {
+    let document: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let lines = document["diagnostics"]["stderr"].as_array()?;
+    let messages = |level: &str| {
+        lines
+            .iter()
+            .filter(|line| line["level"] == level)
+            .filter_map(|line| line["message"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let reason = messages("error").join("; ");
+    (!reason.is_empty()).then(|| (reason, messages("hint")))
+}
+
+/// The settling command repeats the child's reason and next commands; reading only the exit
+/// status would leave "run push to inspect" as the whole explanation.
+#[cfg(test)]
+#[test]
+fn a_failed_child_relays_its_error_and_hints() {
+    let envelope = serde_json::json!({
+        "ok": false,
+        "diagnostics": {"stderr": [
+            {"level": "info", "message": "Reading remote history and session modes…"},
+            {"level": "error", "message": "remote branch work has diverged from this checkout"},
+            {"level": "hint", "message": "keep both: `agit fork alice/app@work -b work-local`"},
+        ]},
+    });
+    assert_eq!(
+        failure_reason(envelope.to_string().as_bytes()),
+        Some((
+            "remote branch work has diverged from this checkout".into(),
+            vec!["keep both: `agit fork alice/app@work -b work-local`".into()]
+        ))
+    );
+    assert_eq!(failure_reason(b"not an envelope"), None);
 }

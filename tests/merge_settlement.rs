@@ -702,8 +702,8 @@ fn settlement_recovery_hint_preserves_the_literal_branch_argument() {
 
 /// With `push.auto` on, a landed merge publishes like a settled turn: `--continue` starts the
 /// same automatic push, and a Hub that cannot take it leaves the merge landed locally with the
-/// exact retry command. A landing that skipped automatic publication would leave the Hub without
-/// the merge and say nothing.
+/// push's reason and the exact retry command. A landing that skipped automatic publication would
+/// leave the Hub without the merge and say nothing.
 #[test]
 fn a_landed_merge_is_pushed_automatically() {
     let lab = Lab::new();
@@ -726,7 +726,11 @@ fn a_landed_merge_is_pushed_automatically() {
         String::from_utf8_lossy(&landed.stderr)
     );
     assert!(
-        output.contains("automatic push failed for me/qa@work. Run `agit push me/qa@work`"),
+        output.contains("automatic push failed for me/qa@work: "),
+        "{output}"
+    );
+    assert!(
+        output.contains("retry with `agit push me/qa@work`"),
         "{output}"
     );
 }

@@ -2716,3 +2716,184 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         }
     }
 }
+
+/// A session branch that moved on the Hub while this checkout settled its own turn is refused
+/// with the divergence and the commands that resolve it, piped and at a terminal. At a terminal
+/// the stopped stage ends its own row: a progress display that leaves its last row open puts the
+/// error on the stage's row, where a reader of that row sees only that the stage stopped.
+#[test]
+fn diverged_session_branch_names_the_divergence_and_next_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let desktop = temp.path().join("desktop");
+    let laptop = temp.path().join("laptop");
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    let sign_in = |home: &Path| {
+        startup_cache::seed(home);
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    };
+    sign_in(&desktop);
+    sign_in(&laptop);
+    let run_in = |home: &Path, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&desktop.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run_in(
+        &desktop,
+        &["new", "alice/app", "-b", "work", "--no-launch"],
+    ));
+    assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@main"]));
+    assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@work"]));
+    assert_success(&run_in(&laptop, &["clone", "alice/app", "--no-bind"]));
+    let laptop_repo = laptop.join("repos/alice/app");
+    git(
+        &laptop_repo,
+        &["config", "http.userAgent", TRANSPORT_USER_AGENT],
+    );
+    let laptop_work = temp.path().join("laptop-work");
+    git(
+        &laptop_repo,
+        &["worktree", "add", laptop_work.to_str().unwrap(), "work"],
+    );
+
+    let desktop_work = desktop.join("worktrees/alice/app/work");
+    fs::write(desktop_work.join("README.md"), "Desktop turn").unwrap();
+    git(&desktop_work, &["commit", "-am", "Desktop turn"]);
+    assert_success(&run_in(&desktop, &["push", "alice/app@work"]));
+    let hub_tip = git(&remote, &["rev-parse", "refs/heads/work"]);
+    git(&laptop_work, &["config", "user.name", "Source Writer"]);
+    git(
+        &laptop_work,
+        &["config", "user.email", "source@example.invalid"],
+    );
+    fs::write(laptop_work.join("NOTES.md"), "Laptop turn").unwrap();
+    git(&laptop_work, &["add", "NOTES.md"]);
+    git(
+        &laptop_work,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "Laptop turn"],
+    );
+    let explains = |output: &str| {
+        for expected in [
+            "error remote branch work has diverged from this checkout",
+            "local unpublished commits are kept",
+            "`agit fork alice/app@work -b work-local`, then `agit push alice/app@work-local`",
+            &format!(
+                "`agit fetch alice/app`, then `agit merge alice/app@{} --into alice/app@work`",
+                &hub_tip[..12]
+            ),
+        ] {
+            assert!(output.contains(expected), "{expected}: {output}");
+        }
+    };
+    let refused = run_in(&laptop, &["push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    explains(&String::from_utf8_lossy(&refused.stderr));
+
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+    builder.env_clear();
+    for (name, value) in git_command(temp.path()).get_envs() {
+        if let Some(value) = value {
+            builder.env(name, value);
+        }
+    }
+    builder.env("AGIT_HOME", &laptop);
+    builder.env("CODEX_HOME", laptop.join("codex"));
+    builder.env("CLAUDE_CONFIG_DIR", laptop.join("claude"));
+    builder.env("AGIT_HUB_URL", &hub.base);
+    builder.env("AGIT_TUI", "0");
+    builder.env("AGIT_USE_SYSTEM_GIT", "1");
+    builder.env("AGIT_SECRETS_KEYSTORE", "file");
+    builder.env("TERM", "xterm");
+    builder.cwd(temp.path());
+    builder.args(["push", "alice/app@work"]);
+    let mut child = pair.slave.spawn_command(builder).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (sender, chunks) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut screen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        while let Ok(chunk) = chunks.try_recv() {
+            screen.extend(chunk);
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "push waited at a terminal");
+        thread::sleep(Duration::from_millis(20));
+    };
+    thread::sleep(Duration::from_millis(200));
+    while let Ok(chunk) = chunks.try_recv() {
+        screen.extend(chunk);
+    }
+    assert!(!status.success());
+    let screen = String::from_utf8_lossy(&screen)
+        .replace("\u{1b}[2K", "")
+        .replace("\u{1b}[31m", "")
+        .replace("\u{1b}[39m", "");
+    explains(&screen);
+    let stopped = screen
+        .lines()
+        .find(|row| row.contains("Reading remote history and session modes — stopped"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(!stopped.contains("error"), "{screen}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
+}
