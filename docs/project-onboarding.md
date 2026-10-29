@@ -92,12 +92,17 @@ binding with `--auto-upload` fails only when no runtime can provide hooks.
 ## Verify, retry and pause
 
 ```sh
+agit project list
 agit project status /work/project
 agit project sync /work/project --dry-run
 agit project sync /work/project
 agit project unbind /work/project
 agit project drop [MANAGER/project-name@BRANCH]
 ```
+
+`agit project list` shows every enrolled or bound folder on this machine with its state, its
+last upload result and its newest conversations; `--json` gives the same for tools such as the
+macOS menu bar app.
 
 Check that the Manager can open each developer's sessions in the shared repository.
 Repeat sync to verify that no duplicate branches appear. The last result distinguishes

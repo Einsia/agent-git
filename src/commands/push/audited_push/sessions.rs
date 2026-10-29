@@ -25,7 +25,8 @@ pub(super) fn run(
     );
     ensure!(
         !automatic || repo.auto_push_enabled()?,
-        "automatic publication is disabled for this repository"
+        "{}",
+        crate::commands::auto_push::DISABLED_FOR_REPOSITORY
     );
     if automatic && intent.visibility == "public" {
         let enrolled = match &intent.action {

@@ -887,6 +887,17 @@ fn published_session(repo: &Repo, branch: &str) -> crate::Result<Result<String, 
     Ok(Ok(snapshot.session))
 }
 
+/// The Hub page of `branch`'s session as a path, when this checkout has seen it published.
+pub(crate) fn published_session_path(
+    repo: &Repo,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> Option<String> {
+    let session = published_session(repo, branch).ok()?.ok()?;
+    Some(session_path(owner, name, &session, branch))
+}
+
 /// Resolve the landing session before anything is minted: a link, once printed, cannot be
 /// retargeted, and a refused lookup must not leave an unused invitation behind.
 fn landing_session(

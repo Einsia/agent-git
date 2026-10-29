@@ -18,7 +18,7 @@ enum Health {
 
 /// Something the user has to act on, in plain words, with the one action that fixes it.
 struct Problem: Identifiable, Equatable {
-    enum Fix: Equatable { case signIn, retry(String), chooseCLI, update, none }
+    enum Fix: Equatable { case signIn, retry(String), allowAutoUpload(String), chooseCLI, none }
 
     let id: String
     let title: String
@@ -57,6 +57,10 @@ final class AppModel: ObservableObject {
     private var wasSignedIn: Bool?
     private var refreshAgain = false
     private var waiting: [String: [Job]] = [:]
+    /// The agit that lists folders when the chosen one predates the folder list.
+    private var lister: AgitCLI?
+    /// `AgitCLI.stamp` of the chosen agit `lister` was found for.
+    private var listerChosenFor: String?
     /// `AgitCLI.stamp` of the program `version` was read from.
     private var versionStamp: String?
     /// When a hook repair that has not finished was last tried.
@@ -101,10 +105,13 @@ final class AppModel: ObservableObject {
                 detail: signedOutReason, fix: .signIn))
         }
         if listUnsupported {
+            // No released agit may list folders yet, so this names the release that does rather
+            // than asking for an update that would not help.
             problems.append(Problem(
-                id: "update", title: "This agit cannot list folders yet",
-                detail: "\(version ?? "The installed agit") predates `agit project list`. Update agit.",
-                fix: .update))
+                id: "list-unsupported", title: "This agit doesn't list folders yet",
+                detail: "\(version ?? "The installed agit") predates the folder list, which comes with "
+                    + "agit \(AgitCLI.listingVersion).",
+                fix: .chooseCLI))
         } else if let listProblem {
             problems.append(Problem(id: "list", title: "Could not read agit's folders", detail: listProblem, fix: .none))
         }
@@ -113,6 +120,12 @@ final class AppModel: ObservableObject {
                 id: "upload:\(folder.folder)",
                 title: "Uploads from \(folder.name) are failing",
                 detail: folder.lastUpload?.error, fix: .retry(folder.folder)))
+        }
+        for folder in folders where folder.blocked {
+            problems.append(Problem(
+                id: "blocked:\(folder.folder)",
+                title: "Uploads from \(folder.name) are blocked",
+                detail: folder.blockedReason, fix: .allowAutoUpload(folder.folder)))
         }
         return problems
     }
@@ -158,15 +171,48 @@ final class AppModel: ObservableObject {
                 lastRefresh = Date()
                 return
             }
+            // A reader found for an earlier chosen agit is not kept for a new one, which may list.
+            if listerChosenFor != cli.stamp { lister = nil }
+            let listing = lister ?? cli
             async let whoamiResult = try? cli.run(["whoami"], timeout: 20)
-            async let listResult = try? cli.run(["project", "list"], timeout: 120)
-            let (who, list) = await (whoamiResult, listResult)
+            async let listResult = try? listing.run(["project", "list"], timeout: 120)
+            var (who, list) = await (whoamiResult, listResult)
+            // A reader that no longer starts or lists is dropped, and the chosen agit is asked
+            // first again: keeping it would retry a moved or deleted program on every poll.
+            if lister != nil, list == nil || list?.kind == "parse_error" {
+                lister = nil
+                list = try? await cli.run(["project", "list"], timeout: 120)
+            }
+            if list?.kind == "parse_error" {
+                if let found = await listingAlternative(to: cli) {
+                    listerChosenFor = cli.stamp
+                    lister = found.cli
+                    list = found.result
+                }
+            }
             applyWhoami(who)
             applyList(list)
             lastRefresh = Date()
             if cli.stamp != versionStamp { await readVersion(cli) }
             await repairHooks(cli)
         } while refreshAgain
+    }
+
+    /// An installed agit that lists folders, with its answer, for a chosen agit that predates the
+    /// folder list. Only the list is read through it; every action still runs the chosen agit.
+    private func listingAlternative(to cli: AgitCLI) async -> (cli: AgitCLI, result: CLIResult)? {
+        func lists(_ candidate: AgitCLI) async -> CLIResult? {
+            guard let result = try? await candidate.run(["project", "list"], timeout: 120),
+                  result.kind != "parse_error" else { return nil }
+            return result
+        }
+        for alternative in cli.alternatives() {
+            if let result = await lists(alternative) { return (alternative, result) }
+        }
+        if let alternative = await cli.shellAlternative(), let result = await lists(alternative) {
+            return (alternative, result)
+        }
+        return nil
     }
 
     /// Reads `agit --version`. A read that fails leaves the stamp unset, so the next poll reads
@@ -263,8 +309,8 @@ final class AppModel: ObservableObject {
             guard let last = folder.lastUpload, let at = last.date, seen[folder.folder] != last else { continue }
             seen[folder.folder] = last
             // An upload refused because the repository's automatic publication is off is that
-            // choice taking effect; it is neither a failure to report nor an upload.
-            if folder.autoPushOff && !last.ok { continue }
+            // setting taking effect; the folder reads as blocked instead of reporting a failure.
+            if folder.blocked && !last.ok { continue }
             let title = folder.recent.first { $0.sessionId == last.sessionId }?.displayTitle
             let event = UploadEvent(folder: folder.folder, at: at, ok: last.ok, reason: last.error, conversation: title)
             if !history.contains(event) {
@@ -293,8 +339,21 @@ final class AppModel: ObservableObject {
 
     /// Turning uploads on publishes this folder's new conversations, so it always asks first.
     func turnOn(_ folder: Folder) {
+        if folder.blocked { return allowAutoUpload(folder.folder) }
         guard confirmUpload(folders: [(folder.folder, folder.repository)], includeHistory: false) else { return }
         bind(folder.folder, repository: folder.repository, history: false)
+    }
+
+    /// A blocked folder's policy already uploads; only its repository's `push.auto` holds it
+    /// back, and turning that on is the change the confirmation names.
+    func allowAutoUpload(_ path: String) {
+        guard let folder = folders.first(where: { $0.folder == path }),
+              confirmUpload(folders: [(folder.folder, folder.repository)], includeHistory: false)
+        else { return }
+        perform(
+            path, "Turning on automatic upload for \(folder.repository)…",
+            { cli in try await cli.run(["config", "--repo", folder.repository, "push.auto", "true"]) },
+            done: { _ in "\(folder.repository) uploads automatically on this Mac again." })
     }
 
     func turnOff(_ folder: Folder, then: ((Bool) -> Void)? = nil) {
@@ -334,11 +393,13 @@ final class AppModel: ObservableObject {
         guard confirmUpload(folders: [(path, repository)], includeHistory: includeHistory) else { return }
         let parts = repository.split(separator: "/", maxSplits: 1).map(String.init)
         let ownName = parts.count == 2 && parts[0] == whoami?.account
+        let off = autoPushOff(repository)
         perform(path, "Turning on uploads in \((path as NSString).lastPathComponent)…") { cli in
             if createPrivate && ownName {
                 // An existing repository refuses creation; the bind below reports any real problem.
                 _ = try? await cli.run(["--yes", "repo", "create", parts[1], "--private"], timeout: 120)
             }
+            if off, let refused = try await Self.allowAutoPush(cli, repository) { return refused }
             return try await cli.run(
                 ["--yes", "project", "bind", path, "--repo", repository,
                  "--history", includeHistory ? "all" : "none", "--auto-upload"],
@@ -348,10 +409,12 @@ final class AppModel: ObservableObject {
 
     private func bind(_ path: String, repository: String, history: Bool, then: ((Bool) -> Void)? = nil) {
         let name = (path as NSString).lastPathComponent
+        let off = autoPushOff(repository)
         perform(
             path, "Turning on uploads in \(name)…",
             { cli in
-                try await cli.run(
+                if off, let refused = try await Self.allowAutoPush(cli, repository) { return refused }
+                return try await cli.run(
                     ["--yes", "project", "bind", path, "--repo", repository,
                      "--history", history ? "all" : "none", "--auto-upload"],
                     timeout: 600)
@@ -382,6 +445,7 @@ final class AppModel: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         defaults.set(url.path, forKey: AgitCLI.pathKey)
         cli = AgitCLI.locate()
+        lister = nil
         Task { await refresh() }
     }
 
@@ -454,13 +518,47 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Whether the listing reports the repository's automatic upload off on this Mac.
+    private func autoPushOff(_ repository: String) -> Bool {
+        folders.contains { $0.repository == repository && $0.autoPush == false }
+    }
+
+    /// Lifts a repository's automatic upload by name, once the person has agreed to exactly that:
+    /// agit's bind never lifts an explicit off by itself. The refusal, when there is one, is what
+    /// the action reports.
+    private static func allowAutoPush(_ cli: AgitCLI, _ repository: String) async throws -> CLIResult? {
+        let result = try await cli.run(["config", "--repo", repository, "push.auto", "true"])
+        return result.ok ? nil : result
+    }
+
     /// Publication needs a yes from the user every time it is turned on; nothing here uploads
-    /// silently.
+    /// silently. A repository whose `push.auto` is off on this Mac was turned off on purpose, so
+    /// the question names that setting, how much it releases, and who can read it, and Cancel is
+    /// the default answer.
     private func confirmUpload(folders targets: [(String, String)], includeHistory: Bool) -> Bool {
         let alert = NSAlert()
         let hub = Words.host(whoami?.hub ?? "the Hub")
         let account = whoami?.account ?? "your account"
-        if targets.count == 1, let (path, repository) = targets.first {
+        let held = Set(targets.map(\.1)).filter(autoPushOff)
+        let waiting = folders
+            .filter { held.contains($0.repository) }
+            .reduce(0) { $0 + ($1.awaitingUpload ?? 0) }
+        if targets.count == 1, let (path, repository) = targets.first, held.contains(repository) {
+            alert.messageText = "Turn on automatic upload for \(repository)?"
+            let release = waiting == 0
+                ? ""
+                : waiting == 1
+                    ? ", including 1 already saved here that has not been uploaded"
+                    : ", including \(waiting) already saved here that have not been uploaded"
+            alert.informativeText = """
+            Automatic upload (push.auto) is off for \(repository) on this Mac. Turning it on \
+            uploads every conversation this Mac saves in \(repository), from \(Words.tilde(path)) \
+            and anywhere else, after each turn\(release).
+
+            They upload to \(hub) as \(account). Everyone who can open \(repository) there can \
+            read them; agit checks every upload for secrets first.
+            """
+        } else if targets.count == 1, let (path, repository) = targets.first {
             alert.messageText = "Upload conversations from \((path as NSString).lastPathComponent)?"
             let which = includeHistory
                 ? "Claude Code and Codex conversations that already ran in \(Words.tilde(path)), and every new one there,"
@@ -479,9 +577,12 @@ final class AppModel: ObservableObject {
                 .joined(separator: "\n")
                 + "\n\nNew conversations there upload to \(hub) as \(account) after each turn, and "
                 + "automatic upload turns on for every conversation this Mac saves in those repositories."
+                + (held.isEmpty ? "" : " It is off on this Mac now for \(held.sorted().joined(separator: ", ")).")
         }
         alert.addButton(withTitle: "Turn on uploads")
         alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].keyEquivalent = ""
+        alert.buttons[1].keyEquivalent = "\r"
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
     }

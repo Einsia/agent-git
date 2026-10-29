@@ -276,8 +276,13 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
 
 /// Commands that prepare local storage also judge existing project claims, once per machine. A
 /// hook's output does not reach the user, so what was dropped is said by the next other command.
+/// A listing changes nothing: a tool that polls it would otherwise take the judgement, and the
+/// one notice of what it dropped, away from the user.
 fn recheck_project_claims(command: &Commands) {
     match command {
+        Commands::Project(commands::project::Args {
+            action: commands::project::Action::List,
+        }) => {}
         Commands::Hooks(_)
         | Commands::Project(commands::project::Args {
             action: commands::project::Action::Capture { .. },

@@ -205,3 +205,49 @@ repairing or removing it. Summary text and picked-event lists are never returned
 
 Both output versions preserve exact identity and path strings in these fields instead of
 escaped or truncated terminal cells. Empty arrays with `incomplete: true` do not prove absence.
+
+## Enrolled folders: project list
+
+`agit project list --json` describes every folder this machine saves conversations for, offline
+and without changing local state: it takes no lock, so a listing never delays or turns away an
+automatic upload. `result.kind` is `project` and `result.value` holds:
+
+- `schema_version` (`1`), `hub` (the selected Hub), and `incomplete`: true when a project policy,
+  a directory binding or a runtime's session index could not be read, so a short list is told
+  apart from a partial one.
+- `folders`: one item per existing folder that has a project policy (`agit project bind`) or a
+  directory binding (`agit init`, `agit clone`); a folder with both is listed once, by its policy.
+
+Each folder has:
+
+- `folder`: the canonical path. `state` says what actually happens to a new conversation there:
+  `on` (saved and uploaded automatically), `blocked` (a policy that uploads automatically, but
+  the repository's automatic publication is off on this machine, so conversations are saved and
+  not uploaded until `agit config --repo OWNER/NAME push.auto true`), `off` (a policy that is
+  paused or uploads only on `agit project sync`) or `local_only` (saved on this machine only, by
+  a binding without a policy).
+- `repository` (`owner/name`) and `repository_url`, its page on the folder's Hub.
+- `auto_push`: the repository's automatic publication preference on this machine
+  (`agit config --repo OWNER/NAME push.auto`), or null when it has no local checkout. While it is
+  false, the uploads a policy attempts are refused by that choice, not failing.
+- `queued`: conversations waiting for the folder's background upload.
+- `last_upload`: null, or the last automatic or `project sync` attempt as `at`, `ok`, `error` (the
+  failure's own words, without the diagnostic envelope) and `session_id` (the conversation it
+  failed on, or the one it uploaded). A refusal recorded while `push.auto` was off is left out once
+  the folder is `on` again, since it no longer describes the folder.
+- `sessions_here`: Claude Code and Codex conversations whose directory is this folder or below
+  it. A conversation belongs to the deepest listed folder holding its directory, the way a nested
+  binding owns its directory.
+- `awaiting_upload`: how many of those are saved and not on the Hub at their saved head (status
+  `not_uploaded` or `waiting`), counted over all of them, not only `recent`.
+- `recent`: the newest of those conversations, newest first. Each has `title` (the runtime's own
+  name for it, else its opening request; null when neither is known), `runtime`, `session_id`,
+  `last_active` (when its transcript last changed), `status`, `repository` (where it is saved,
+  or null), `saved_at` (its saved branch head's commit time, or null) and `url` (its Hub page,
+  only when this checkout has seen it published).
+
+`status` is `not_saved` (no repository holds the conversation), `not_uploaded` (saved here, and
+this checkout knows of no upload), `waiting` (the Hub has an older head than the saved one) or
+`uploaded` (the folder's last upload published this head, or the head this checkout last saw on
+the Hub is the saved one). Titles are read from bounded ends of each transcript, so listing costs
+the same however long a conversation grows.

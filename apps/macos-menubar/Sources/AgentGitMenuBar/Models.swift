@@ -33,7 +33,7 @@ struct ProjectList: Decodable {
 }
 
 struct Folder: Decodable, Identifiable, Equatable {
-    /// `on`, `off` or `local_only`.
+    /// `on`, `blocked`, `off` or `local_only`.
     let state: String
     let folder: String
     let repository: String
@@ -43,6 +43,9 @@ struct Folder: Decodable, Identifiable, Equatable {
     let queued: Int
     let lastUpload: LastUpload?
     let sessionsHere: Int
+    /// Conversations here that are saved and not uploaded at their saved head; absent from an
+    /// agit that predates the count.
+    let awaitingUpload: Int?
     let recent: [Conversation]
 
     var id: String { folder }
@@ -50,16 +53,22 @@ struct Folder: Decodable, Identifiable, Equatable {
     var name: String { (folder as NSString).lastPathComponent }
     var path: String { Words.tilde(folder) }
     var failing: Bool { isOn && lastUpload?.ok == false }
-    /// Saves here but uploads nothing because the repository's automatic publication is off on
-    /// this Mac, a deliberate choice rather than a failure.
-    var autoPushOff: Bool { state == "local_only" && autoPush == false }
-    var description: String {
-        autoPushOff ? "Upload turned off" : Words.folderState(state)
+    /// The folder is set to upload, but its repository's automatic publication is off on this
+    /// Mac, so its conversations stay here until someone turns that on.
+    var blocked: Bool { state == "blocked" }
+    var description: String { Words.folderState(state) }
+    /// Why nothing uploads, in the words `agit project list` uses.
+    var blockedReason: String {
+        let waiting = awaitingUpload ?? 0
+        let held = waiting == 0
+            ? ""
+            : waiting == 1
+                ? " 1 conversation here is saved but not uploaded."
+                : " \(waiting) conversations here are saved but not uploaded."
+        return "Automatic upload (push.auto) is off for \(repository) on this Mac." + held
     }
     var detail: String {
-        autoPushOff
-            ? "\(path)\nAutomatic upload is off for \(repository) on this Mac, so conversations here are saved but not uploaded. Turn it on with: \(autoPushCommand)"
-            : path
+        blocked ? "\(path)\n\(blockedReason) Turn it on with: \(autoPushCommand)" : path
     }
     var autoPushCommand: String { "agit config --repo \(repository) push.auto true" }
 }
@@ -122,6 +131,7 @@ enum Words {
     static func folderState(_ state: String) -> String {
         switch state {
         case "on": return "Uploads automatically"
+        case "blocked": return "Upload blocked"
         case "off": return "Paused"
         default: return "Saved on this Mac only"
         }

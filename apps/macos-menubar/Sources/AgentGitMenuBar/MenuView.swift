@@ -188,10 +188,11 @@ private struct ProblemRow: View {
             } else {
                 Button("Retry uploads") { model.retry(path) }
             }
+        case .allowAutoUpload(let path):
+            Button("Turn on automatic upload…") { model.allowAutoUpload(path) }
+                .disabled(model.busy[path] != nil)
         case .chooseCLI:
             Button("Choose the agit program…") { model.chooseCLI() }
-        case .update:
-            Button("Copy the update command") { model.copy("agit upgrade", what: "the update command") }
         case .none:
             EmptyView()
         }
@@ -220,11 +221,11 @@ private struct FolderRow: View {
     let folder: Folder
     @StateObject private var expanded: Flag
 
-    /// Folders that only save on this Mac start folded, so the ones that upload, or would but
-    /// have upload turned off, stay in view.
+    /// Folders that only save on this Mac start folded, so the ones that upload, or are set to
+    /// but blocked, stay in view.
     init(folder: Folder) {
         self.folder = folder
-        _expanded = StateObject(wrappedValue: Flag(folder.state != "local_only" || folder.autoPushOff))
+        _expanded = StateObject(wrappedValue: Flag(folder.state != "local_only"))
     }
 
     var body: some View {
@@ -243,7 +244,7 @@ private struct FolderRow: View {
                     Text(folder.name).font(.system(size: 12, weight: .semibold))
                     Text("\(folder.description) · \(folder.repository)")
                         .font(.system(size: 11))
-                        .foregroundStyle(folder.failing ? Color.orange : Color.secondary)
+                        .foregroundStyle(folder.failing || folder.blocked ? Color.orange : Color.secondary)
                         .lineLimit(1)
                 }
                 .help(folder.detail)
@@ -255,14 +256,18 @@ private struct FolderRow: View {
                     .controlSize(.mini)
                     .labelsHidden()
                     .disabled(model.busy[folder.folder] != nil)
-                    .help(folder.isOn ? "Stop uploading this folder's conversations" : "Upload this folder's new conversations")
+                    .help(folder.isOn
+                        ? "Stop uploading this folder's conversations"
+                        : folder.blocked
+                            ? "Turn on automatic upload (push.auto) for \(folder.repository) on this Mac"
+                            : "Upload this folder's new conversations")
                 Menu {
                     Button("Open the repository on the Hub") { model.open(folder.repositoryUrl) }
                         .disabled(folder.repositoryUrl == nil)
                     if let link = folder.repositoryUrl {
                         Button("Copy the repository link") { model.copy(link, what: "the repository link") }
                     }
-                    if folder.autoPushOff {
+                    if folder.blocked {
                         Button("Copy the command that turns automatic upload on") {
                             model.copy(folder.autoPushCommand, what: "the command")
                         }
@@ -278,6 +283,17 @@ private struct FolderRow: View {
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
+            }
+            if folder.blocked && model.busy[folder.folder] == nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(folder.blockedReason)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Turn on automatic upload…") { model.allowAutoUpload(folder.folder) }
+                        .controlSize(.small)
+                }
+                .padding(.leading, 18)
             }
             if let running = model.busy[folder.folder] {
                 HStack(spacing: 6) {
