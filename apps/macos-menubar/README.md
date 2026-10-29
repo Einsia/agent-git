@@ -46,6 +46,14 @@ such as one whose path holds a space, and installs none. Only the broken command
 file as it was is kept beside it, readable only by you, with `.agit-backup` added to its name, and
 the app tells you once what it repaired.
 
+Where every agit hook in your Claude Code settings runs the app's agit and that agit has the
+permission hook, the app asks once for each Claude Code settings file whether to add it. The hook
+lets approvals you answer in AgentGit allow or deny Claude Code's permission requests on this
+computer, which Claude Code's security default otherwise keeps from AgentGit; Claude Code's own
+dialog still answers as before. Cancel is the default. Add runs
+`agit setup --hooks --runtime claude-code`, which rewrites the settings file and keeps the file as
+it was before AgentGit first changed it beside it, with `.agit-backup` added to the name.
+
 ## What it shows
 
 | Icon | Meaning |
