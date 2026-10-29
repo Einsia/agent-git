@@ -729,7 +729,8 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     );
 }
 
-/// Preview caches can be regenerated, but accepted anonymous ancestors and their receipts are immutable.
+/// Preview caches can be regenerated, including a cache another agit version wrote, but accepted
+/// anonymous ancestors, their receipts and the session identity they publish under are immutable.
 #[test]
 fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history() {
     use super::sessions::SessionPublicationPlan;
@@ -896,6 +897,29 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
 
     source.git(&["config", "user.name", "Next Writer"]).unwrap();
     let continued = save("Continue accepted anonymous history");
+    // A cache another agit version wrote, with a version or a shape this build does not know, is
+    // rebuilt rather than refused, and the accepted session keeps the identity it publishes
+    // under. Refusing it fails the push; dropping its session aliases publishes the continuation
+    // of history accepted before session envelopes as a new session.
+    let current: serde_json::Value =
+        serde_json::from_slice(&state::load(&cache_path, &scope).unwrap().unwrap()).unwrap();
+    for extra in [None, Some("aliases")] {
+        let mut foreign = current.clone();
+        foreign["version"] = json!(4);
+        if let Some(field) = extra {
+            foreign[field] = json!({});
+        }
+        state::save(&cache_path, &scope, &serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let rebuilt = prepare(&selected)
+            .session_receipts("owner/app", &identity, "https://hub.invalid/owner/app.git")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            rebuilt.projected_session_id.as_deref(),
+            Some(public_session.as_str())
+        );
+    }
     let next = prepare(&selected);
     let head = next.plan.heads()[0].oid();
     assert_eq!(
