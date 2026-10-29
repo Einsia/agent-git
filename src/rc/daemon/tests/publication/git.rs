@@ -103,6 +103,8 @@ pub(super) fn publication(
     let public_key = STANDARD.encode(key.public_key().as_bytes());
     let mut selected = SessionPublicationPlan {
         sources: None,
+        fork_sources: Default::default(),
+        pinned_source: None,
         delivery: None,
         identity: destination.clone(),
         remote: Default::default(),
