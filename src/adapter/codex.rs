@@ -1521,15 +1521,32 @@ fn wrapped_human_request(text: &str) -> Option<&str> {
         // sessions was actually stuck. Auditing 20 `failed` labels, three trace back to this one
         // (oc-19 / oc-28 / oc-33 in `eval/outcomes_to_label.jsonl`).
         "# Context from my IDE setup:",
+        // The Codex app's state of its in-app browser (open tabs, current URL), written ahead of
+        // the request in every message while that browser is open. Left in, it is the whole gist:
+        // the block runs far longer than a title.
+        "<in-app-browser-context",
     ];
-    /// The marker line Codex writes itself.
-    const REQUEST_MARK: &str = "## My request for Codex:";
+    /// The marker lines Codex writes itself: the IDE extension's, then the app's.
+    const REQUEST_MARKS: [&str; 2] = ["## My request for Codex:", "## My request:"];
 
     let s = text.trim_start();
     if !WRAPPERS.iter().any(|w| s.starts_with(w)) {
         return None;
     }
-    Some(s.split_once(REQUEST_MARK)?.1.trim())
+    // The request starts at the earliest marker line, which leaves the longest tail: a marker
+    // further down is text the person wrote.
+    REQUEST_MARKS
+        .iter()
+        .filter_map(|mark| after_marker_line(s, mark))
+        .max_by_key(|tail| tail.len())
+        .map(str::trim)
+}
+
+/// The text after `mark` where `mark` opens a line.
+fn after_marker_line<'a>(s: &'a str, mark: &str) -> Option<&'a str> {
+    s.match_indices(mark)
+        .find(|(at, _)| *at == 0 || s.as_bytes()[at - 1] == b'\n')
+        .map(|(at, _)| &s[at + mark.len()..])
 }
 
 /// Whether what is left after peeling the wrapper is nothing but attachment references.
@@ -3109,6 +3126,29 @@ mod tests {
         assert!(
             sim < 0.5,
             "with the header peeled, two different questions must not look alike: got {sim:.3}"
+        );
+    }
+
+    /// The Codex app writes the state of its in-app browser ahead of every request and marks the
+    /// request with `## My request:`. Peeled, the gist is what the person asked; unpeeled, every
+    /// turn of a session with the browser open is titled by the same block. A marker line inside
+    /// the request is part of it: peeling at the IDE's marker because it is listed first would cut
+    /// the request short, or leave nothing and drop the turn.
+    #[test]
+    fn the_codex_app_browser_state_is_peeled_before_the_request() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"s","cwd":"/r"}}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\n<in-app-browser-context source=\"ambient-ui-state\">\nThis block is automatically supplied ambient UI state, not part of the user's request.\n# In app browser:\n- The user has the in-app browser open with 1 tab.\n</in-app-browser-context>\n\n## My request:\nmake the page darker"}]}}"##,
+        );
+        let s = Codex.parse(text).unwrap();
+        assert_eq!(s.counts().prompts, 1);
+        assert_eq!(s.gist(60).as_deref(), Some("make the page darker"));
+        assert_eq!(
+            wrapped_human_request(
+                "<in-app-browser-context>\n- one tab\n</in-app-browser-context>\n\n## My request:\nExplain this IDE template:\n## My request for Codex:"
+            ),
+            Some("Explain this IDE template:\n## My request for Codex:")
         );
     }
 
