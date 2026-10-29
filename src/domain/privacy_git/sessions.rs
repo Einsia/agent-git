@@ -159,15 +159,9 @@ impl SessionPublicationPlan {
                 &identity,
                 &target_session,
             )? {
-                Some(response) => {
-                    ensure!(
-                        choice
-                            .as_ref()
-                            .is_none_or(|choice| choice.scheme == response.config.privacy.scheme),
-                        "session publication mode is already registered and differs from the local choice"
-                    );
-                    response
-                }
+                // A session already registered in this repository continues under its stored
+                // configuration, whatever this client chose or recorded.
+                Some(response) => response,
                 None => {
                     ensure!(
                         register,
@@ -213,10 +207,14 @@ impl SessionPublicationPlan {
                         choice.repository_id = Some(identity.agent_id.clone());
                         choice.save(source)?;
                     }
-                    ensure!(
-                        privacy.hub.as_deref() == Some(identity.hub.as_str()),
-                        "session creator belongs to another Hub"
-                    );
+                    // A session first published on another Hub publishes here as a new plain
+                    // session of this account: the record of that Hub is not this one's.
+                    if privacy.hub.as_deref() != Some(identity.hub.as_str()) {
+                        privacy = super::super::session_privacy::SessionPrivacy::new(Some(
+                            account.clone(),
+                        ))?;
+                        privacy.scheme = SessionScheme::Plain;
+                    }
                     if privacy.scheme == SessionScheme::SessionOwnerV2
                         && privacy.creator.as_deref() == Some(account.account_id.as_str())
                     {
