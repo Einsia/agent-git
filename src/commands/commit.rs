@@ -2246,7 +2246,8 @@ fn settle_bytes(
     };
     // Snapshot the persisted claim before parsing can fill its cwd/watermark fields. The caller
     // holds the link lock for the entire settlement, so this remains the exact CAS value.
-    let link_disk_at_entry = lk.to_json().ok().map(|j| format!("{j}\n").into_bytes());
+    let mut link_at_entry = lk.clone();
+    let mut link_disk_at_entry = lk.to_json().ok().map(|j| format!("{j}\n").into_bytes());
     // Freeze the target branch exactly once before reading any committed state. Every metadata,
     // sequence, parent-tree and CAS decision below must refer to this immutable object id: if a
     // concurrent settlement advances the branch after these reads, our final expected-old CAS
@@ -2397,6 +2398,34 @@ fn settle_bytes(
             return Ok(ExitCode::Policy);
         };
         native_prefix = retained;
+        // A prefix proven against the frozen tip without the checkpoint becomes that tip's
+        // checkpoint. Otherwise a settlement that lands nothing (privacy pending, an unfinished
+        // turn) leaves no checkpoint behind, and every retry hydrates the whole committed
+        // history through the privacy worker again.
+        if !checkpoint_verified
+            && let Some(tip) = settlement_tip.as_deref()
+            && !committed.is_empty()
+            && std::str::from_utf8(bytes).is_ok()
+        {
+            use sha2::Digest as _;
+            let checkpoint = link::NativeCheckpoint {
+                tip: tip.to_owned(),
+                bytes: native_prefix.0 as u64,
+                sha256: hex::encode(sha2::Sha256::digest(&bytes[..native_prefix.0])),
+            };
+            lk.native_checkpoint = Some(checkpoint.clone());
+            // Persist only the checkpoint, onto the claim as it was read, under the same CAS as
+            // the final watermark write; the final write then compares against this one.
+            let current = std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
+            if current.is_some() && current == link_disk_at_entry {
+                link_at_entry.native_checkpoint = Some(checkpoint);
+                link::write(store, &link_at_entry)?;
+                link_disk_at_entry = link_at_entry
+                    .to_json()
+                    .ok()
+                    .map(|j| format!("{j}\n").into_bytes());
+            }
+        }
         let settled = head_meta.as_ref().and_then(|s| s.turn).map(|t| t as usize);
         // No turn ordinal (a newborn session line, or history pushed in from outside): parse
         // the committed content and count its turns.
@@ -5026,8 +5055,24 @@ mod tests {
             assert!(!view.contains("uncompleted continuation"));
         }
         let caught_up = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        // A checkpoint naming another tip never verifies. A settlement that lands nothing must
+        // still leave the current tip's checkpoint, or every retry repeats the full comparison.
+        let mut claim = link::get(&store, "codex", "AB").unwrap();
+        let landed = claim.native_checkpoint.clone().unwrap();
+        claim.native_checkpoint = Some(link::NativeCheckpoint {
+            tip: "b".repeat(40),
+            ..landed.clone()
+        });
+        link::write(&store, &claim).unwrap();
         settle(&pending, true, false);
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), caught_up);
+        let refreshed = link::get(&store, "codex", "AB")
+            .unwrap()
+            .native_checkpoint
+            .unwrap();
+        assert_eq!(refreshed.tip, caught_up);
+        assert_eq!(refreshed.bytes, landed.bytes);
+        assert_eq!(refreshed.sha256, landed.sha256);
 
         // A materialized resume can continue its retained user turn without another prompt.
         use sha2::Digest as _;

@@ -650,6 +650,7 @@ fn landed_link(
     if previous_owner.as_deref() != Some(owner.as_str())
         || !crate::domain::link::claims_branch(&lk, &owner, agent, &args.branch)
     {
+        lk.native_checkpoint = None;
         lk.baseline_bytes = None;
         lk.baseline_hash = None;
         lk.materialized_from = None;
@@ -1225,6 +1226,11 @@ mod tests {
         resumed.baseline_bytes = Some(4096);
         resumed.baseline_hash = Some("f00d".into());
         resumed.materialized_from = Some("a".repeat(40));
+        resumed.native_checkpoint = Some(link::NativeCheckpoint {
+            tip: "a".repeat(40),
+            bytes: 4096,
+            sha256: "f00d".into(),
+        });
         link::write(&store, &resumed).unwrap();
         let mut args = super::LandArgs {
             adopt_unclaimed: false,
@@ -1242,6 +1248,7 @@ mod tests {
         assert_eq!(repeated.baseline_bytes, resumed.baseline_bytes);
         assert_eq!(repeated.baseline_hash, resumed.baseline_hash);
         assert_eq!(repeated.materialized_from, resumed.materialized_from);
+        assert!(repeated.native_checkpoint.is_some());
         assert_eq!(repeated.cwd.as_deref(), Some(args.cwd.as_str()));
 
         args.adopt_unclaimed = true;
@@ -1253,6 +1260,10 @@ mod tests {
         assert!(rerouted.baseline_bytes.is_none());
         assert!(rerouted.baseline_hash.is_none());
         assert!(rerouted.materialized_from.is_none());
+        assert!(
+            rerouted.native_checkpoint.is_none(),
+            "a checkpoint names a tip of the old destination; kept, it never verifies there"
+        );
         assert_eq!(rerouted.branch.as_deref(), Some("recovery"));
 
         resumed.superseded_by = Some("claude-code/successor".into());
