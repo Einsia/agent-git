@@ -679,11 +679,28 @@ fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() 
         .unwrap();
     // An opt-out cannot be undone by a flush still running from an earlier command only because
     // every queue write happens under the gate the opt-out takes. With the gate held, a flush
-    // must leave the queue file as it is; one that wrote around the gate replaces it.
+    // must leave the queue file as it is; one that wrote around the gate replaces it. It must
+    // also refuse the held gate rather than wait for it. A refusal returns at once, while a wait
+    // lasts the whole state-lock wait before it gives up, so a bound below that wait tells the
+    // two apart.
     {
         let _gate = f.gate();
         let before = f.queue_file();
-        f.run(&["--internal-telemetry-flush"]);
+        let flush = f
+            .command()
+            .arg("--internal-telemetry-flush")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || done.send(flush.wait_with_output()));
+        assert!(
+            finished
+                .recv_timeout(agit::infra::local_state::LOCK_WAIT / 2)
+                .is_ok(),
+            "a flush waited for the held gate"
+        );
         assert_eq!(f.queue_file(), before);
     }
     f.disable();
