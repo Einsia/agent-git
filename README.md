@@ -163,6 +163,17 @@ The section becomes the GitHub Release body (`scripts/release-notes.mjs` extract
 `release.yml`, with repository-relative links pinned to the release tag) and ships inside
 the `@einsia/agent-git` package.
 
+Only the release branch (`release/<version>`) edits `CHANGELOG.md`. Every other merge
+request puts one line per user-visible change in its description, or `Changelog: none`:
+
+```text
+Changelog: Added|Changed|Fixed|Security: <one sentence for users>
+```
+
+The release branch collects those lines into the version's section. CI's
+`changelog:released` fails any other merge request that changes the file: a line it adds
+under `## [Unreleased]` can merge into a released section without a conflict.
+
 After the source release commit passes CI, merge it into GitLab `main`. Wait for
 that pipeline's development builds and `mirror:github`, then run its manual
 `release:github-tag` job. CI verifies the recorded source-to-mirror mapping and
