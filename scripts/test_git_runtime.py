@@ -13,6 +13,9 @@ import urllib.error
 spec = importlib.util.spec_from_file_location("runtime", Path(__file__).with_name("prepare-git-runtime.py"))
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
+spec = importlib.util.spec_from_file_location("mirror", Path(__file__).with_name("mirror-git-runtime-archives.py"))
+mirror = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mirror)
 
 
 class RuntimeArchiveTests(unittest.TestCase):
@@ -114,6 +117,64 @@ class RuntimeArchiveTests(unittest.TestCase):
                 self.assertEqual(requested[0], mirror)
                 self.assertEqual(requested.count(pin["url"]), upstream_requests)
 
+    def test_package_mirror_receives_only_verified_copies_of_missing_pins(self):
+        """The upload job adds an archive only when the mirror lacks it and upstream serves the pinned bytes.
+
+        The walk must yield each downloaded pin once and nothing a vendored pin carries, or the job
+        uploads duplicates and goes red over provenance archives no build fetches. An uploader that
+        trusted upstream would publish tampered bytes; one that ignored a wrong mirror copy, took an
+        unavailable mirror for a missing copy, skipped the read-back, or let a refused upload end the
+        run would report success or stop with pins unchecked; each breaks a case below.
+        """
+        body = b"verified runtime"
+        pin = {"url": "https://example.invalid/runtime.tar.gz", "sha256": hashlib.sha256(body).hexdigest()}
+        provenance = {"url": "https://example.invalid/bundle.apk", "sha256": "1" * 64}
+        vendored = {"path": "git-runtime-data/bundle.pem.gz", "sha256": "0" * 64, "source_archives": [provenance]}
+        lock = {"linux": [pin, dict(pin)], "linux_ca_bundle": vendored}
+        self.assertEqual(list(mirror.upstream_pins(lock)), [pin])
+        api = "https://gitlab.invalid/api/v4"
+        copy_url = f"{api}/projects/87/packages/generic/git-runtime-archives/{pin['sha256']}/runtime.tar.gz"
+        server_error = urllib.error.HTTPError(copy_url, 500, "Internal Server Error", {}, None)
+        refused = urllib.error.HTTPError(copy_url, 403, "Forbidden", {}, None)
+        cases = {
+            # mirror copy before the run, upstream bytes, mirror read error, upload error, upload kept,
+            # whether the pinned bytes are sent, whether the run reports a failure
+            "copy present": (body, body, None, None, True, False, False),
+            "copy missing": (None, body, None, None, True, True, False),
+            "upstream tampered": (None, b"tampered", None, None, True, False, True),
+            "copy tampered": (b"tampered", body, None, None, True, False, True),
+            "mirror unavailable": (None, body, server_error, None, True, False, True),
+            "upload refused": (None, body, None, refused, True, True, True),
+            "upload lost": (None, body, None, None, False, True, True),
+        }
+        for case, (copy, upstream, read_error, upload_error, kept, uploaded, failed) in cases.items():
+            store = {} if copy is None else {copy_url: copy}
+            puts = []
+
+            def urlopen(request, timeout):
+                url = getattr(request, "full_url", request)
+                if url == copy_url:
+                    self.assertEqual(request.get_header("Job-token"), "job-token")
+                    if request.get_method() == "PUT":
+                        puts.append(request.data)
+                        if upload_error:
+                            raise upload_error
+                        if kept:
+                            store[copy_url] = request.data
+                        return io.BytesIO(b"{}")
+                    if read_error:
+                        raise read_error
+                    if copy_url not in store:
+                        raise urllib.error.HTTPError(copy_url, 404, "Not Found", {}, None)
+                    return io.BytesIO(store[copy_url])
+                self.assertEqual(url, pin["url"])
+                return io.BytesIO(upstream)
+
+            with self.subTest(case), tempfile.TemporaryDirectory() as temporary:
+                with patch.object(runtime.urllib.request, "urlopen", side_effect=urlopen), patch.object(mirror.time, "sleep"):
+                    failures = mirror.mirror_missing(lock, api, "87", "job-token", Path(temporary))
+                self.assertEqual(puts, [body] if uploaded else [])
+                self.assertEqual(bool(failures), failed, failures)
 
 if __name__ == "__main__":
     unittest.main()
