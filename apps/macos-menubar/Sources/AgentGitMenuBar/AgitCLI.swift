@@ -168,6 +168,23 @@ struct AgitCLI {
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Whether this agit has the command `arguments` names: its help exits 0, and an agit that
+    /// predates the command rejects it as unrecognized.
+    func knows(_ arguments: [String]) async -> Bool {
+        guard let (_, status) = try? await launch(arguments + ["--help"], timeout: 10) else { return false }
+        return status == 0
+    }
+
+    /// `path` as agit writes a program into a hook command: bare when every character is one a
+    /// shell reads as itself, otherwise in single quotes, with `'\''` for a quote inside.
+    static func shellWord(_ path: String) -> String {
+        let plain = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "/._-+=:,@%"))
+        if !path.isEmpty, path.unicodeScalars.allSatisfy({ $0.isASCII && plain.contains($0) }) {
+            return path
+        }
+        return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Runs `agit --json <arguments>` and decodes the envelope. A failed command is a result with
     /// `ok == false`, not a thrown error; only a missing or unreadable answer throws.
     func run(_ arguments: [String], timeout: TimeInterval = 60) async throws -> CLIResult {

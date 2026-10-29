@@ -31,6 +31,51 @@ private struct HookRepair: Decodable {
     let hookFilesRepaired: Int
 }
 
+/// The hook commands in Claude Code's settings file, read without running anything.
+private struct ClaudeHooks {
+    /// The file `agit setup` installs Claude Code's hooks into.
+    static var settings: URL {
+        if let dir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir).appendingPathComponent("settings.json")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
+    }
+
+    /// Event → the command of every command hook under it.
+    let commands: [String: [String]]
+
+    init?(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = root["hooks"] as? [String: Any]
+        else { return nil }
+        var commands: [String: [String]] = [:]
+        for (event, groups) in hooks {
+            for group in groups as? [[String: Any]] ?? [] {
+                for entry in group["hooks"] as? [[String: Any]] ?? [] {
+                    if let command = entry["command"] as? String { commands[event, default: []].append(command) }
+                }
+            }
+        }
+        self.commands = commands
+    }
+
+    /// Whether `program` settles Claude Code's turns here and every agit capture hook here runs
+    /// `program`, written the way `agit setup` writes it. `agit setup --hooks` points every agit
+    /// hook it finds at the agit that runs it, so a capture hook of another program would move.
+    func capturesOnly(with program: String) -> Bool {
+        let words = [AgitCLI.shellWord(program), program]
+        let runs = { (command: String, verb: String) in words.contains { command.hasPrefix("\($0) hooks \(verb)") } }
+        let captures = commands.values.joined().filter { $0.contains(" hooks ingest") || $0.contains(" hooks settle") }
+        return commands["Stop", default: []].contains { runs($0, "settle") }
+            && captures.allSatisfy { runs($0, "ingest") || runs($0, "settle") }
+    }
+
+    var answersPermissions: Bool {
+        commands["PermissionRequest", default: []].contains { $0.contains(" hooks native-permission") }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var cli: AgitCLI?
@@ -65,10 +110,13 @@ final class AppModel: ObservableObject {
     private var versionStamp: String?
     /// When a hook repair that has not finished was last tried.
     private var repairTried: Date?
+    /// `AgitCLI.stamp` of a program found not to have the permission hook.
+    private var lacksPermissionHook: String?
     private let defaults = UserDefaults.standard
     private static let historyKey = "uploadHistory"
     private static let pausedKey = "pausedFolders"
     private static let hooksRepairedKey = "hooksRepairedFor"
+    private static let permissionHookAskedKey = "permissionHookAskedFor"
     private static let repairRetry: TimeInterval = 600
     private static let historyLimit = 30
     private static let pollInterval: TimeInterval = 30
@@ -195,6 +243,7 @@ final class AppModel: ObservableObject {
             lastRefresh = Date()
             if cli.stamp != versionStamp { await readVersion(cli) }
             await repairHooks(cli)
+            await offerPermissionHook(cli)
         } while refreshAgain
     }
 
@@ -260,6 +309,59 @@ final class AppModel: ObservableObject {
             defaults.set(key, forKey: Self.hooksRepairedKey)
             repairTried = nil
         }
+    }
+
+    /// Offers, once for each settings file, to add the Claude Code hook that lets approvals
+    /// answered in AgentGit decide its permission requests. Where Claude Code's security default is
+    /// in force it keeps plugins from seeing those requests, and only this hook carries the answer.
+    /// The offer comes only where this agit already settles Claude Code's turns and runs every agit
+    /// capture hook, and only from an agit that has the hook, so adding it turns capture on nowhere
+    /// new and moves no hook to another program.
+    private func offerPermissionHook(_ cli: AgitCLI) async {
+        let settings = ClaudeHooks.settings
+        var asked = defaults.stringArray(forKey: Self.permissionHookAskedKey) ?? []
+        guard !asked.contains(settings.path), lacksPermissionHook != cli.stamp,
+              let hooks = ClaudeHooks(settings),
+              hooks.capturesOnly(with: cli.executable.path), !hooks.answersPermissions
+        else { return }
+        guard await cli.knows(["hooks", "native-permission"]) else {
+            lacksPermissionHook = cli.stamp
+            return
+        }
+        asked.append(settings.path)
+        defaults.set(asked, forKey: Self.permissionHookAskedKey)
+        guard confirmPermissionHook(settings) else { return }
+        let result = try? await cli.run(["setup", "--hooks", "--runtime", "claude-code"], timeout: 60)
+        if let result, result.ok, ClaudeHooks(settings)?.answersPermissions == true {
+            notifier.post(
+                key: "permission-hook",
+                title: "Claude Code's permission requests reach AgentGit",
+                body: "Approvals you answer in AgentGit now allow or deny them on this computer.")
+        } else {
+            let reason = result?.reason ?? "agit did not finish."
+            notifier.post(
+                key: "permission-hook",
+                title: "AgentGit could not add the permission hook",
+                body: "\(reason) Running agit setup in a terminal adds it.")
+        }
+    }
+
+    /// Cancel is the default: once added, an answer given in AgentGit decides for this computer.
+    private func confirmPermissionHook(_ settings: URL) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Answer Claude Code's permission requests from AgentGit?"
+        alert.informativeText = """
+        This lets approvals you answer in AgentGit allow or deny Claude Code's permission requests \
+        on this computer. Claude Code still shows its own dialog, and answering there works as before.
+
+        agit rewrites \(Words.tilde(settings.path)) to add it, which can change the order of its \
+        settings. The file as it was before AgentGit first changed it stays beside it, with \
+        .agit-backup added to the name.
+        """
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Add")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
     }
 
     private func applyWhoami(_ result: CLIResult?) {
