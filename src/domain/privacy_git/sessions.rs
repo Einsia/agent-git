@@ -658,6 +658,9 @@ impl ProjectedHistory {
                         );
                         if boundary {
                             public_boundary.insert(entry.public.clone());
+                            if held.contains(oid) && accepted::is_identity(entry) {
+                                held_boundary.insert(oid.clone());
+                            }
                         }
                         let retained = entry.object_source(&source, &parent, branch)?;
                         let plain = entry.plain;
