@@ -2158,7 +2158,7 @@ fn continued_plain_session_declares_only_what_it_adds() {
                 .iter()
                 .map(|snapshot| snapshot.commit().to_owned())
                 .collect::<Vec<_>>(),
-            [fifth.clone()]
+            std::slice::from_ref(&fifth)
         );
     }
 
@@ -2180,6 +2180,167 @@ fn continued_plain_session_declares_only_what_it_adds() {
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
     assert_eq!(hub.previews.lock().unwrap().len(), earlier);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
+}
+
+/// An encrypted session that continues its published history declares only what it adds, and its
+/// new snapshots keep the public session identity it was accepted under even when the local
+/// candidate cache is gone: the accepted record, not the cache, decides the identity. Minting one
+/// here would split the session into two public sessions on the Hub.
+#[test]
+fn continued_encrypted_session_keeps_its_public_identity() {
+    use agit::domain::session_privacy::{
+        AccountIdentity, PublishedSnapshot, SessionPrivacy, SessionPublicationManifest,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    let base = git(repo.root(), &["rev-parse", "HEAD"]);
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "work"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    session.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(
+            AccountIdentity::new(&hub.base, "session-owner").unwrap(),
+        ))
+        .unwrap()
+    });
+    session.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
+    let turn = |content: &str| {
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    for index in 0..3 {
+        turn(&format!("turn {index}"));
+    }
+    assert_success(&run(&["--yes", "push", "alice/app@work"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
+    let public_session = |commit: &str| {
+        PrivacyEnvelope::parse(
+            git(
+                &remote,
+                &["show", &format!("{commit}:privacy/envelope.json")],
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+        .session_binding
+        .unwrap()
+        .published_session_id
+    };
+    let accepted_identity = public_session(&published);
+
+    // The candidate cache holds the session's public identity; losing it must not change it.
+    let stores = home
+        .join("repos/alice/app/.git/agit/privacy-publication")
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join(".git/session-candidates").exists())
+        .collect::<Vec<_>>();
+    assert_eq!(stores.len(), 1);
+    fs::remove_dir_all(stores[0].join(".git/session-candidates")).unwrap();
+
+    let earlier = hub.previews.lock().unwrap().len();
+    turn("turn 3");
+    turn("turn 4");
+    assert_success(&run(&["--yes", "push", "alice/app@work"]));
+    let head = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{head}^^")]),
+        published
+    );
+    assert_eq!(public_session(&head), accepted_identity);
+    let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
+    assert!(!previews.is_empty());
+    for preview in previews {
+        let declared: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        assert_eq!(
+            declared
+                .preserved_commits
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([base.clone(), published.clone()])
+        );
+        assert_eq!(declared.snapshots.len(), 2);
+        for snapshot in &declared.snapshots {
+            let PublishedSnapshot::SessionOwnerV2 { snapshot, .. } = snapshot else {
+                panic!("an encrypted turn is declared as {snapshot:?}");
+            };
+            assert_eq!(snapshot.binding.published_session_id, accepted_identity);
+        }
+    }
 }
 
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.

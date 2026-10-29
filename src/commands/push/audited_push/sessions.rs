@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::domain::privacy_git::sessions::SessionPublicationPlan;
-use crate::domain::repo::publication::{PublicationPlan, raw_ancestors};
+use crate::domain::repo::publication::{PublicationPlan, is_raw_ancestor};
 
 pub(super) fn run(
     args: &Args,
@@ -194,7 +194,7 @@ pub(super) fn run(
         if branch == "main"
             && implicit_main
             && let Some(remote_head) = remote.refs.get(head.name())
-            && !raw_ancestors(&repo, head.oid())?.contains(remote_head)
+            && !is_raw_ancestor(&repo, remote_head, head.oid())?
         {
             #[cfg(windows)]
             use crate::ui::quote_powershell_argument as quote_arg;

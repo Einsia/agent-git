@@ -630,7 +630,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         "session_owner_v2"
     );
     assert_eq!(receipt.session_id(&source).unwrap(), public_session);
-    assert!(receipt.ancestors(&source).unwrap().contains(&base));
+    assert!(receipt.reaches(&source, &base).unwrap());
     let mut altered = receipt.clone();
     altered.session_snapshot.as_mut().unwrap().envelope_digest =
         digest_json(&json!("different envelope")).unwrap();
@@ -690,6 +690,30 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     next.prepare_acceptance().unwrap();
     selected.remote = remote(&next);
     drop(next);
+    // The accepted record outranks the candidate cache: a cache that names another public
+    // identity for the accepted session is refused instead of believed.
+    let candidates = store.join(".git/session-candidates");
+    let scope = digest_json(&json!({
+        "version": crate::domain::session_privacy::SESSION_ENVELOPE_VERSION,
+        "kind": "session-owner",
+        "identity": identity,
+    }))
+    .unwrap();
+    let kept = state::load(&candidates, &scope).unwrap().unwrap();
+    let mut replaced: Cache = serde_json::from_slice(&kept).unwrap();
+    replaced.sessions.insert(
+        digest_json(&json!({"repository":identity.agent_id,"session":owned.session})).unwrap(),
+        meta::mint_session_id(),
+    );
+    state::save(&candidates, &scope, &serde_json::to_vec(&replaced).unwrap()).unwrap();
+    assert!(
+        prepare(&branches, &selected)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ambiguous publication identities")
+    );
+    state::save(&candidates, &scope, &kept).unwrap();
     assert_eq!(receipt.session_id(&source).unwrap(), public_session);
     assert_eq!(receipt.published, published_a);
     source.git(&["branch", "-m", "work", "renamed"]).unwrap();

@@ -62,9 +62,8 @@ fn walk_parents(
 
 /// The selected history a publication carries: from the heads down to the history the
 /// destination already holds, so the publication's bounds apply to what it adds. Each boundary
-/// commit must be one the branch itself accepted in plain or under its own id, or plain history
-/// the Hub holds under its own id. An encrypted boundary needs its binding re-read and one only
-/// another branch accepted has its ancestry outside this branch's record, so either makes the
+/// commit must be one the branch itself accepted, or history the Hub holds under its own id. One
+/// only another branch accepted has its ancestry outside this branch's record, so it makes the
 /// publication carry the whole history. So does a cross-Hub delivery: it admits each session from
 /// its birth, and below a boundary the plan would name a later commit as the birth.
 fn freeze_publication(
@@ -87,7 +86,6 @@ fn freeze_publication(
         commit_parent_map(source, plan.commit_objects())?,
         plan.boundary(),
     );
-    let enveloped = enveloped_commits(source, plan.boundary())?;
     for head in plan.heads() {
         let branch = head
             .name()
@@ -97,12 +95,7 @@ fn freeze_publication(
             if plan.boundary().binary_search(&oid).is_err() {
                 continue;
             }
-            let continues = !enveloped.contains(&oid)
-                && match ledger.get(branch, &oid) {
-                    Some(entry) => entry.plain || accepted::is_identity(entry),
-                    None => held.contains(&oid),
-                };
-            if !continues {
+            if ledger.get(branch, &oid).is_none() && !held.contains(&oid) {
                 return PublicationPlan::freeze_selected(source, branches);
             }
         }
@@ -541,6 +534,34 @@ impl ProjectedHistory {
             .filter(|oid| held.contains(*oid))
             .cloned()
             .collect::<BTreeSet<_>>();
+        // The ledger outranks the candidate cache: an accepted encrypted session keeps the public
+        // identity it was accepted under, so a cache that lost or replaced it cannot mint a second
+        // one. A session the boundary continues gets no new identity at all; the boundary's own
+        // binding, re-read below, must agree with the ledger.
+        let mut continued = BTreeSet::new();
+        for oid in source_plan.boundary() {
+            for branch in branches {
+                if let Some(entry) = ledger.get(branch, oid) {
+                    continued.insert(entry.source_session.clone());
+                    if entry.plain || accepted::is_identity(entry) {
+                        continue;
+                    }
+                    let key = digest_json(
+                        &json!({"repository":identity.agent_id,"session":entry.source_session}),
+                    )?;
+                    if let Some(previous) = cache.sessions.insert(key, entry.public_session.clone())
+                    {
+                        ensure!(
+                            previous == entry.public_session,
+                            "accepted session has ambiguous publication identities"
+                        );
+                    }
+                }
+            }
+            if let Some(metadata) = source_sessions.stored(oid) {
+                continued.insert(metadata.session.clone());
+            }
+        }
         let mut public_boundary = BTreeSet::new();
         let mut held_boundary = BTreeSet::new();
         let mut references = BTreeMap::new();
@@ -849,11 +870,19 @@ impl ProjectedHistory {
                     let session_key = digest_json(
                         &json!({"repository":identity.agent_id,"session":metadata.session}),
                     )?;
-                    let public_session = cache
-                        .sessions
-                        .entry(session_key)
-                        .or_insert_with(meta::mint_session_id)
-                        .clone();
+                    let public_session = match cache.sessions.get(&session_key) {
+                        Some(public_session) => public_session.clone(),
+                        None => {
+                            ensure!(
+                                !continued.contains(&metadata.session),
+                                "{}",
+                                accepted::RECOVERY
+                            );
+                            let public_session = meta::mint_session_id();
+                            cache.sessions.insert(session_key, public_session.clone());
+                            public_session
+                        }
+                    };
                     let mut files = projection.prepare_git(&public_session)?;
                     let key = digest_json(
                         &json!({"source":oid, "parents":public_parents, "policy":policy_digest,
