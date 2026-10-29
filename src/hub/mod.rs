@@ -70,12 +70,21 @@ pub struct OrgView {
     /// allow it. A Hub that predates member privileges omits it, and there only an owner creates.
     #[serde(default)]
     pub can_create_private_repositories: Option<bool>,
+    /// What every member may do in every repository of the org: `none`, `read` or `write`. A Hub
+    /// without the base permission omits it, and there membership alone reads nothing.
+    #[serde(default)]
+    pub base_permission: Option<String>,
 }
 
 impl OrgView {
     pub fn creates_repositories(&self) -> bool {
         self.can_create_private_repositories
             .unwrap_or(self.role == "owner")
+    }
+
+    /// Whether every member reads the org's private repositories.
+    pub fn members_read(&self) -> bool {
+        matches!(self.base_permission.as_deref(), Some("read" | "write"))
     }
 }
 

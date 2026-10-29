@@ -243,6 +243,10 @@ struct Audience {
     visibility: Option<String>,
     /// Whether the owner is an organization; `None` until the Hub has said.
     org: Option<bool>,
+    /// Whether every member of that organization reads its private repositories, as the Hub
+    /// last said; `None` until it has, or for a Hub without the base permission.
+    #[serde(default)]
+    members_read: Option<bool>,
 }
 
 fn recorded_audience(root: &Path) -> Audience {
@@ -269,6 +273,13 @@ fn owner_is_org(client: &crate::hub::Client, owner: &str, account: &str) -> Opti
         return Some(false);
     }
     client.get_org(owner).ok().map(|_| true)
+}
+
+/// Whether every member of `owner` reads its private repositories; `None` when the owner is no
+/// organization the caller belongs to, or the Hub does not say.
+fn members_read(client: &crate::hub::Client, owner: &str) -> Option<bool> {
+    let org = client.get_org(owner).ok()?;
+    org.base_permission.is_some().then(|| org.members_read())
 }
 
 fn root(path: &Path) -> Result<PathBuf> {
@@ -780,9 +791,14 @@ fn bind(
             ),
         )?;
     }
+    let org = owner_is_org(&client, &owner, &project.account);
     let audience = Audience {
         visibility: Some(remote.visibility.clone()),
-        org: owner_is_org(&client, &owner, &project.account),
+        org,
+        members_read: org
+            .unwrap_or(false)
+            .then(|| members_read(&client, &owner))
+            .flatten(),
     };
     println!(
         "Project: {} -> {repository} ({})",
@@ -1452,6 +1468,8 @@ pub(crate) struct AutomaticUpload {
     pub(crate) visibility: Option<String>,
     /// Whether the owner is an organization, when known.
     pub(crate) org: Option<bool>,
+    /// Whether every member of that organization reads it, when known.
+    pub(crate) members_read: Option<bool>,
 }
 
 /// The repository a project uploads this conversation to by itself, judged by the folder the
@@ -1497,11 +1515,21 @@ pub(crate) fn automatic_upload(
         .and_then(|client| {
             let (owner, name) = super::parse_slug(&project.repository).ok()?;
             let remote = client.get_agent(&owner, &name).ok()?;
-            (remote.agent_id == project.identity.agent_id).then(|| Audience {
-                visibility: Some(remote.visibility),
-                org: recorded
+            (remote.agent_id == project.identity.agent_id).then(|| {
+                let org = recorded
                     .org
-                    .or_else(|| owner_is_org(&client, &owner, &project.account)),
+                    .or_else(|| owner_is_org(&client, &owner, &project.account));
+                // Owners change the base permission, so it is asked for every time.
+                let members_read = if org == Some(true) {
+                    members_read(&client, &owner).or(recorded.members_read)
+                } else {
+                    None
+                };
+                Audience {
+                    visibility: Some(remote.visibility),
+                    org,
+                    members_read,
+                }
             })
         });
     let audience = match answered {
@@ -1515,6 +1543,7 @@ pub(crate) fn automatic_upload(
         repository: project.repository,
         visibility: audience.visibility.filter(|v| !v.is_empty()),
         org: audience.org,
+        members_read: audience.members_read,
     })
 }
 
@@ -1648,6 +1677,7 @@ mod tests {
             &Audience {
                 visibility: Some("private".into()),
                 org: Some(true),
+                members_read: None,
             },
         )
         .unwrap();
