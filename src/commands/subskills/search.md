@@ -70,8 +70,10 @@ RFC3339 offsets are normalized to UTC. The start is inclusive and the end is
 exclusive. Use the session result's `total` for a filtered count; these flags
 cannot be combined with the multi-category `--counts` option.
 
-These options use dedicated HTTP parameters rather than query qualifiers. Do not
-write `author:`, `since:`, or `before:` inside the query. `applied_filters` echoes
+These options use dedicated HTTP parameters rather than query qualifiers. Prefer the
+flags; `author:`, `since:` or `before:` written into a single query is read as the
+flag of the same name (with a hint), and inside a batch query it is refused, since
+a batch shares its filters. `applied_filters` echoes
 the normalized predicates; an older Hub that omits them causes an explicit error
 instead of an unfiltered answer. Metadata is checked before blob deduplication,
 ranking, counts and pagination, under the same repository permissions as content.

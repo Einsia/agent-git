@@ -214,6 +214,17 @@ const BATCH_CONCURRENCY: usize = 4;
 const MAX_QUERY_CHARS: usize = 256;
 
 pub fn run(mut args: Args) -> CmdResult {
+    match lift_filter_qualifiers(&mut args) {
+        Ok(read) => {
+            for (written, flag) in read {
+                ui::hint(&format!("read `{written}` as `{flag}`"));
+            }
+        }
+        Err(message) => {
+            ui::error(&message);
+            return Ok(ExitCode::Usage);
+        }
+    }
     let mut queries = match effective_queries(&args) {
         Ok(queries) => queries,
         Err(message) => {
@@ -351,6 +362,117 @@ fn scoped_queries(
             Ok(query)
         })
         .collect()
+}
+
+/// Query words the shared grammar does not know, which people and agents still write the GitHub
+/// way: `author:`, `since:` and `before:` are the saved-version filters of the same names, and the
+/// Hub takes those only as parameters. Left in the query they are unknown words, which match
+/// nothing, and an empty result reads as "no precedent exists". A single query's are taken out
+/// and set as the filters, unless the flag is also given with another value; a batch shares its
+/// filters, so one written into a batch query is refused with the flag to use. A word inside double
+/// quotes, or negated, stays a word. A `--query` made only of filter words leaves no query behind,
+/// so it is a filter-only search like the positional form rather than an empty query. Returns each
+/// word read and the flag it was read as.
+fn lift_filter_qualifiers(args: &mut Args) -> Result<Vec<(String, String)>, String> {
+    let batch = args.queries.len() + usize::from(!args.query.is_empty()) > 1;
+    let mut read = Vec::new();
+    let mut lifted = |query: &str, args: &mut Args| -> Result<String, String> {
+        let mut kept = Vec::new();
+        for word in query_words(query) {
+            let Some((key, value)) = filter_qualifier(&word) else {
+                kept.push(word);
+                continue;
+            };
+            let flag = format!("--{key} {value}");
+            if batch {
+                return Err(format!(
+                    "`{word}` is the {key} filter, which a batch shares: pass `{flag}` once instead"
+                ));
+            }
+            let slot = match key {
+                "author" => &mut args.author,
+                "since" => &mut args.since,
+                _ => &mut args.before,
+            };
+            match slot {
+                Some(given) if filter_value(key, given) != filter_value(key, &value) => {
+                    return Err(format!(
+                        "`{word}` in the query disagrees with --{key} {given}; give the filter once"
+                    ));
+                }
+                _ => *slot = Some(value),
+            }
+            read.push((word, flag));
+        }
+        Ok(kept.join(" "))
+    };
+    args.query = lifted(&args.query.clone(), args)?;
+    let mut kept = Vec::with_capacity(args.queries.len());
+    for query in std::mem::take(&mut args.queries) {
+        let rest = lifted(&query, args)?;
+        if rest.is_empty() && !query.trim().is_empty() {
+            continue;
+        }
+        kept.push(rest);
+    }
+    args.queries = kept;
+    Ok(read)
+}
+
+/// The value a filter is compared by, as the saved-version filters normalize it, so that one
+/// filter written two ways (`Alice` and `alice`, a date and its UTC midnight) is not a conflict. A
+/// value that does not normalize compares as written; the filters' own check reports it later.
+fn filter_value(key: &str, value: &str) -> String {
+    fn slot<'a>(filters: &'a mut SearchFilters, key: &str) -> &'a mut Option<String> {
+        match key {
+            "author" => &mut filters.author,
+            "since" => &mut filters.since,
+            _ => &mut filters.before,
+        }
+    }
+    let mut filters = SearchFilters::default();
+    *slot(&mut filters, key) = Some(value.to_owned());
+    match filters.normalized() {
+        Ok(mut normalized) => slot(&mut normalized, key).take().unwrap_or_default(),
+        Err(_) => value.to_owned(),
+    }
+}
+
+/// `query` split at whitespace outside double quotes, quoted phrases kept whole.
+fn query_words(query: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in query.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if c.is_whitespace() && !quoted {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The filter a query word names (`author:`, `since:` or `before:` and a value, which may be in
+/// double quotes), or `None` for any other word.
+fn filter_qualifier(word: &str) -> Option<(&'static str, String)> {
+    let (key, value) = word.split_once(':')?;
+    let key = ["author", "since", "before"]
+        .into_iter()
+        .find(|k| k.eq_ignore_ascii_case(key))?;
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    (!value.is_empty() && !value.contains('"')).then(|| (key, value.to_owned()))
 }
 
 fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
@@ -979,6 +1101,78 @@ mod tests {
     struct W {
         #[command(flatten)]
         a: super::Args,
+    }
+
+    /// `author:`, `since:` and `before:` written into a query are the saved-version filters the
+    /// Hub takes only as parameters; passed through, they are unknown words and the search finds
+    /// nothing. A quoted or negated word stays a word, a value in quotes keeps its spaces, the
+    /// same filter as the flag is fine however each is written while another is a conflict, one
+    /// `--query` is a single search that reaches the same request as the positional form even when
+    /// only filter words are left, and a batch shares its filters, so one inside a batch query is
+    /// refused rather than applied to every query.
+    #[test]
+    fn filter_words_in_a_query_become_the_filters() {
+        let mut w = W::parse_from([
+            "x",
+            "stall author:sim-lin SINCE:2026-10-24 \"author:quoted\" -before:2026-01-01",
+        ]);
+        let read = super::lift_filter_qualifiers(&mut w.a).unwrap();
+        assert_eq!(w.a.query, "stall \"author:quoted\" -before:2026-01-01");
+        assert_eq!(
+            (
+                w.a.author.as_deref(),
+                w.a.since.as_deref(),
+                w.a.before.as_deref()
+            ),
+            (Some("sim-lin"), Some("2026-10-24"), None)
+        );
+        let flags: Vec<&str> = read.iter().map(|(_, flag)| flag.as_str()).collect();
+        assert_eq!(flags, ["--author sim-lin", "--since 2026-10-24"]);
+
+        let mut w = W::parse_from(["x", "stall author:\"Lin Wang\""]);
+        super::lift_filter_qualifiers(&mut w.a).unwrap();
+        assert_eq!(
+            (w.a.query.as_str(), w.a.author.as_deref()),
+            ("stall", Some("Lin Wang"))
+        );
+
+        for agreeing in [
+            ["x", "stall author:sim-lin", "--author", "sim-lin"],
+            ["x", "stall author:alice", "--author", "Alice"],
+            [
+                "x",
+                "stall since:2026-10-24",
+                "--since",
+                "2026-10-24T00:00:00Z",
+            ],
+        ] {
+            let mut w = W::parse_from(agreeing);
+            assert!(
+                super::lift_filter_qualifiers(&mut w.a).is_ok(),
+                "{agreeing:?}"
+            );
+        }
+        let mut w = W::parse_from(["x", "stall author:sim-lin", "--author", "sim-priya"]);
+        assert!(super::lift_filter_qualifiers(&mut w.a).is_err());
+
+        let mut w = W::parse_from(["x", "--query", "stall author:sim-lin"]);
+        super::lift_filter_qualifiers(&mut w.a).unwrap();
+        assert_eq!(
+            (w.a.queries.as_slice(), w.a.author.as_deref()),
+            (&["stall".to_owned()][..], Some("sim-lin"))
+        );
+        let request = |argv: &[&str]| {
+            let mut w = W::parse_from(argv);
+            super::lift_filter_qualifiers(&mut w.a).unwrap();
+            (super::effective_queries(&w.a), w.a.author)
+        };
+        for words in ["stall author:sim-lin", "author:sim-lin"] {
+            let positional = request(&["x", words]);
+            assert!(positional.0.is_ok(), "{words}: {positional:?}");
+            assert_eq!(request(&["x", "--query", words]), positional, "{words}");
+        }
+        let mut w = W::parse_from(["x", "--query", "stall author:sim-lin", "--query", "cache"]);
+        assert!(super::lift_filter_qualifiers(&mut w.a).is_err());
     }
 
     #[test]
