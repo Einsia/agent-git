@@ -113,8 +113,9 @@ if (check.status !== 0) process.exit(check.status ?? 1)
 
 console.log(`
 version ${version} prepared (the CHANGELOG.md section for it is the Release body). Next:
-  Commit and review the changed files, then merge after CI passes.
-  Wait for the GitLab main pipeline's builds and mirror:github job.
+  Commit and review the changed files, then merge after CI passes, with main's tip in the branch
+  and nothing else merged until the tag exists.
+  Wait for the GitLab main pipeline's mirror:github job.
   Run that pipeline's manual release:github-tag job to publish agit-v${version}.
   Do not push tags directly to GitHub; CI uses the verified mirror commit.
   release.yml builds the binaries; on success "npm publish" publishes the npm family.`)
