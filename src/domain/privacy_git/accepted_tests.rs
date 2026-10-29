@@ -29,6 +29,7 @@ fn remote(history: &ProjectedHistory) -> RemoteRefs {
 }
 
 /// Identity mappings retain public Git bytes without requiring a separate projection cache.
+/// An inherited held boundary keeps its remote proof even when its parents lie outside the plan.
 #[test]
 fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() {
     use super::sessions::SessionPublicationPlan;
@@ -52,6 +53,10 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     meta::write(source.root(), &original_meta).unwrap();
     storage::write_snapshot(source.root(), "", "").unwrap();
     source.add_all().unwrap();
+    source.commit("Published teammate root").unwrap();
+    let root = source.git(&["rev-parse", "HEAD"]).unwrap();
+    fs::write(source.root().join("README.md"), "Shared public files\n").unwrap();
+    source.add_all().unwrap();
     source.commit("Published teammate snapshot").unwrap();
     let base = source.git(&["rev-parse", "HEAD"]).unwrap();
     let identity = RemoteIdentity::new(
@@ -62,8 +67,8 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     let mapping = accepted::Mapping {
         source: base.clone(),
         public: base.clone(),
-        source_parents: vec![],
-        public_parents: vec![],
+        source_parents: vec![root.clone()],
+        public_parents: vec![root.clone()],
         store: "c".repeat(64),
         source_session: original_meta.session.clone(),
         public_session: original_meta.session,
@@ -71,6 +76,13 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
         recipient: None,
         plain: false,
         delivered: false,
+    };
+    let root_mapping = accepted::Mapping {
+        source: root.clone(),
+        public: root.clone(),
+        source_parents: vec![],
+        public_parents: vec![],
+        ..mapping.clone()
     };
     accepted::Ledger::open(&source, &identity)
         .unwrap()
@@ -80,7 +92,10 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
                 accepted::Candidate {
                     source_head: base.clone(),
                     public_head: base.clone(),
-                    mappings: BTreeMap::from([(base.clone(), mapping)]),
+                    mappings: BTreeMap::from([
+                        (root.clone(), root_mapping),
+                        (base.clone(), mapping),
+                    ]),
                 },
             )]),
             &BTreeSet::new(),
@@ -143,6 +158,8 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
         &Redactor::new(Default::default()),
     )
     .unwrap();
+    assert_eq!(published.source.boundary(), std::slice::from_ref(&base));
+    assert!(!published.source.commit_objects().contains(&root));
     assert_eq!(published.plan.heads()[0].oid(), head);
     assert_eq!(
         published
