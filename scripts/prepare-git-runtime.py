@@ -23,6 +23,12 @@ import zipfile
 MIRROR_PACKAGE = "git-runtime-archives"
 
 
+def mirror_url(pin, api, project):
+    """Return where the package mirror keeps a copy of an upstream pin: one version per digest."""
+    name = pin["url"].rsplit("/", 1)[-1]
+    return f"{api}/projects/{project}/packages/generic/{MIRROR_PACKAGE}/{pin['sha256']}/{name}"
+
+
 def fetch_mirror(pin):
     """Return the pinned bytes from the project's GitLab package registry, or None to use upstream.
 
@@ -36,7 +42,7 @@ def fetch_mirror(pin):
     if not (api and project and token):
         return None
     name = pin["url"].rsplit("/", 1)[-1]
-    url = f"{api}/projects/{project}/packages/generic/{MIRROR_PACKAGE}/{pin['sha256']}/{name}"
+    url = mirror_url(pin, api, project)
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers={"JOB-TOKEN": token}), timeout=120) as response:
             body = response.read()
