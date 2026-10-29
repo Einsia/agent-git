@@ -9,11 +9,9 @@ contracts with focused output tests and use representative formats for business
 scenarios. Avoid separate tests for fixture helpers, trivial argument forwarding,
 or documentation formatting when they repeat existing coverage.
 
-Linux runs workspace unit tests, product Clippy, and core CLI integration tests
-for session selection, publication, merge/recovery, credentials, and RC. The
-standalone tunnel process test also runs. Use `cargo test --locked --workspace`
-locally when changing presentation, status, or another non-core integration path;
-those matrices are not mandatory for every commit. Native Windows tests cover Windows
+Linux runs workspace unit tests, product Clippy, and every integration test target
+of every workspace member, so a new file under `tests/` is in the merge gate without
+a list to update. Native Windows tests cover Windows
 security, paths, process ownership, pipes, startup, and installation. macOS runs
 product Clippy and process/signal regressions. Neither platform repeats the full
 Linux business matrix. Packaging builds artifacts and verifies their identity;
