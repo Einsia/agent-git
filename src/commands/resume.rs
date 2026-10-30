@@ -23,6 +23,9 @@
 //! * the target must be a session-line branch head (historic points and tags go through `fork`,
 //!   the file line through `new`);
 //! * unsealed (`agit branch seal` leaves only forking and viewing);
+//! * not behind its published tip: a local branch `origin/<branch>` is strictly ahead of is
+//!   fast-forwarded first, and one that diverged from it is refused with the merge and fork
+//!   steps named (resume compares with the last fetch; it does not fetch);
 //! * an omitted branch is not guessed: a tty enters the picker (one activity order across sources), a
 //!   non-tty lists the candidates and exits 8.
 
@@ -927,6 +930,15 @@ fn resume_branch_for(
         ui::error(&format!("{slug} has no branch `{branch}`."));
         return Ok(None);
     }
+    let store = Store::open_or_init()?;
+    match super::pull::align_to_published(repo, &store, slug, branch)? {
+        super::pull::Alignment::Current => {}
+        super::pull::Alignment::FastForwarded { to, commits } => ui::info(format_args!(
+            "fast-forwarded `{branch}` +{commits} to the published tip {}",
+            &to[..9.min(to.len())]
+        )),
+        super::pull::Alignment::Diverged => return Ok(None),
+    }
     if super::branch::is_sealed(repo, branch) {
         ui::error(&format!("`{branch}` is sealed — not resumable."));
         ui::hint(&format!(
@@ -934,7 +946,6 @@ fn resume_branch_for(
         ));
         return Ok(None);
     }
-    let store = Store::open_or_init()?;
     let head = repo.git(&["rev-parse", &format!("refs/heads/{branch}")])?;
     let head = head.trim().to_string();
     // The form comes from `meta.line`, never a guess. A missing meta and "this is the file line"
@@ -1835,9 +1846,40 @@ fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Res
         match crate::domain::privacy::service::native_continuity(repo.root(), committed, live)? {
             transcript::Continuity::Noop => ClaimActivity::Untouched,
             transcript::Continuity::Append => ClaimActivity::Appended,
-            transcript::Continuity::Diverged => ClaimActivity::Rewritten,
+            // A branch that moved past the live transcript already holds every event of it, so
+            // replacing that transcript loses nothing.
+            transcript::Continuity::Diverged => {
+                let settled = committed_prefix(committed, transcript::live_hashes(live).len());
+                if settled.len() < committed.len()
+                    && crate::domain::privacy::service::native_continuity(
+                        repo.root(),
+                        settled,
+                        live,
+                    )? == transcript::Continuity::Noop
+                {
+                    ClaimActivity::Untouched
+                } else {
+                    ClaimActivity::Rewritten
+                }
+            }
         },
     )
+}
+
+/// The committed LOG cut after its first `events` envelopes.
+fn committed_prefix(committed: &str, events: usize) -> &str {
+    let mut seen = 0;
+    let mut end = 0;
+    for line in committed.split_inclusive('\n') {
+        if seen == events {
+            break;
+        }
+        end += line.len();
+        if serde_json::from_str::<transcript::Envelope>(line).is_ok() {
+            seen += 1;
+        }
+    }
+    &committed[..end]
 }
 
 /// Classify whether replacing one active branch claim can lose runtime content.

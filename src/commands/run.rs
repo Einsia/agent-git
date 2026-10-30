@@ -253,6 +253,21 @@ pub fn run(args: Args) -> CmdResult {
 
     super::migration::finish_external_history_update(&repo, history_update)?;
 
+    // A branch head is judged at the published tip when that tip is strictly ahead: arbitration
+    // on the older local head continues, or forks from, a line without the turns a collaborator
+    // pushed.
+    if matches!(spec.tail, refs::Tail::None) {
+        let store = crate::domain::store::Store::open_or_init()?;
+        match super::pull::align_to_published(&repo, &store, &slug, &base_name)? {
+            super::pull::Alignment::Current => {}
+            super::pull::Alignment::FastForwarded { to, commits } => startup_notes.push(format!(
+                "  fast-forwarded `{base_name}` +{commits} to the published tip {}",
+                &to[..9.min(to.len())]
+            )),
+            super::pull::Alignment::Diverged => return Ok(ExitCode::Precondition),
+        }
+    }
+
     // ── 3. Arbitration: continue or fork ──
     // A branch head is the local branch, or else the hub's branch as `origin` mirrors it: a
     // collaborator's first checkout of someone else's repo has only the remote-tracking form,
