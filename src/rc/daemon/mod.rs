@@ -2562,18 +2562,22 @@ fn finish_local_sessions(
 /// the runtime's title, so they are protected like any other remote-control text, under the rules
 /// of the repository each session belongs to: a value registered in that repository is replaced
 /// as it would be in the session's transcript. The repository comes from the session's own link,
-/// never from the label or its working directory alone. The labels of each repository go to the
-/// privacy worker in one request; if its check does not complete, or a session's repository
-/// cannot be resolved or loaded, those labels show the failure marker instead of their text.
+/// never from the label or its working directory alone; a Codex conversation read through a
+/// registered source is linked under that source's qualified key. The labels of each repository
+/// go to the privacy worker in one request; if its check does not complete, or a session's
+/// repository cannot be resolved or loaded, those labels show the failure marker instead of their
+/// text.
 pub fn protect_session_labels(sessions: &mut [LocalSession]) {
+    let sources = crate::rc::protection::local_sources();
     protect_labels_with(
         sessions,
         &crate::domain::redact::Redactor::this_machine(),
         |item| {
-            crate::rc::protection::native_repository(
+            crate::rc::protection::local_repository(
                 &item.runtime,
                 &item.runtime_session_id,
                 std::path::Path::new(&item.cwd),
+                &sources,
             )
         },
         Some(crate::domain::redact::PROTECTION_ERROR_TEXT),

@@ -19,21 +19,94 @@ pub(crate) fn native_repository(
 pub(crate) fn catalog_repository(
     row: &crate::rc::runtime_context::CatalogRow,
 ) -> crate::Result<Option<PathBuf>> {
-    let qualified = linked_repository(&row.runtime, &row.session_ref, &row.cwd, |link| {
+    match source_repository(
+        &row.runtime,
+        &row.session_ref,
+        &row.source_id,
+        &row.native_session_id,
+        &row.cwd,
+    )? {
+        Some(root) => Ok(Some(root)),
+        None => native_repository(&row.runtime, &row.native_session_id, &row.cwd),
+    }
+}
+
+/// The registered sources of the Codex home the local session list reads, the sources a
+/// conversation listed there can have been read through.
+pub(crate) fn local_sources() -> crate::Result<Vec<crate::protocol::NativeSourceRef>> {
+    let home = crate::adapter::codex::codex_home()?;
+    let Ok(home) = home.canonicalize() else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::rc::runtime_sources::Registry::open()?
+        .list()?
+        .into_iter()
+        .filter(|source| source.home == home)
+        .map(|source| crate::protocol::NativeSourceRef {
+            source_id: source.source_id,
+            generation: source.generation,
+        })
+        .collect())
+}
+
+/// The repository whose rules protect a local session-list row's labels. A Codex conversation
+/// read through one of `sources` is linked under that source's qualified key, as a catalog row
+/// is (see [`catalog_repository`]); the bare thread id counts only when no such link exists.
+/// Two sources linking it to different repositories leave its ownership unreadable.
+pub(crate) fn local_repository(
+    runtime: &str,
+    native: &str,
+    cwd: &Path,
+    sources: &crate::Result<Vec<crate::protocol::NativeSourceRef>>,
+) -> crate::Result<Option<PathBuf>> {
+    if runtime == "codex" {
+        let sources = sources
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("registered native sources are unreadable"))?;
+        let mut qualified = None;
+        for source in sources {
+            let key = crate::domain::link::NativeBinding {
+                source: source.clone(),
+                thread_id: native.into(),
+            }
+            .key()?;
+            if let Some(root) = source_repository(runtime, &key, &source.source_id, native, cwd)? {
+                anyhow::ensure!(
+                    qualified
+                        .as_ref()
+                        .is_none_or(|qualified| *qualified == root),
+                    "native sources link the conversation to different repositories"
+                );
+                qualified = Some(root);
+            }
+        }
+        if qualified.is_some() {
+            return Ok(qualified);
+        }
+    }
+    native_repository(runtime, native, cwd)
+}
+
+/// The repository of the link stored under the source-qualified `key`, which must bind
+/// `source_id` and `native`.
+fn source_repository(
+    runtime: &str,
+    key: &str,
+    source_id: &str,
+    native: &str,
+    cwd: &Path,
+) -> crate::Result<Option<PathBuf>> {
+    linked_repository(runtime, key, cwd, |link| {
         let binding = link
             .native_binding
             .as_ref()
             .context("source-qualified native link has no source binding")?;
         anyhow::ensure!(
-            binding.source.source_id == row.source_id && binding.thread_id == row.native_session_id,
+            binding.source.source_id == source_id && binding.thread_id == native,
             "source-qualified native link names another source or thread"
         );
         Ok(())
-    })?;
-    match qualified {
-        Some(root) => Ok(Some(root)),
-        None => native_repository(&row.runtime, &row.native_session_id, &row.cwd),
-    }
+    })
 }
 
 /// The repository of the link stored under `key`, once `check` accepts that link.

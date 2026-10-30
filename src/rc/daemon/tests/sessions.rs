@@ -3194,3 +3194,146 @@ async fn subscribing_to_a_dormant_conversation_asks_for_resume_without_leaking_o
         assert_eq!(error.code, ErrorCode::SessionNotFound as i32, "{unknown}");
     }
 }
+
+/// The local rows of `session.list` carry a Codex conversation's title and opening prompt. A
+/// conversation read through a registered source is linked under that source's qualified key,
+/// so a listing that looked its repository up by the bare thread id alone would protect the
+/// labels under the global rules only and send a phrase blocked in its repository raw, and a
+/// label cache keyed on that lookup would keep serving the result checked under the global rules.
+/// A conversation whose repository cannot be read shows the marker and says why.
+#[tokio::test]
+async fn local_session_list_protects_labels_under_their_source_link() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::local_session_list_protects_labels_under_their_source_link",
+    ) {
+        return;
+    }
+    let credential = "AKIA4X7QZ2M5RT6VW3JH";
+    let phrase = "cedar lantern";
+    let linked = "6b3f2c1e-0000-4000-8000-000000000011";
+    let unreadable = "6b3f2c1e-0000-4000-8000-000000000012";
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    // A unit-test binary cannot host the privacy worker, and here an outcome it did not process
+    // counts as passed: this process checks the labels in place as the worker does, so a label
+    // that skipped the check comes back raw and fails this test.
+    crate::domain::privacy::worker::check_in_process();
+    // SAFETY: this case runs alone in its own process.
+    unsafe {
+        std::env::set_var("AGIT_HOME", base.join("agit"));
+        std::env::set_var("CODEX_HOME", base.join("codex"));
+    }
+    let project = base.join("project");
+    let codex = base.join("codex");
+    for directory in [&project, &codex.join("sessions")] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let database = rusqlite::Connection::open(codex.join("state_1.sqlite")).unwrap();
+    database.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, source TEXT, title TEXT);").unwrap();
+    for native in [linked, unreadable] {
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, 'user', 100, 0, '\"cli\"', ?5)",
+                rusqlite::params![
+                    native,
+                    codex
+                        .join(format!("sessions/{native}.jsonl"))
+                        .to_str()
+                        .unwrap(),
+                    project.to_str().unwrap(),
+                    format!("the key is {credential}"),
+                    format!("{phrase} plan"),
+                ],
+            )
+            .unwrap();
+    }
+    let source = crate::rc::runtime_sources::Registry::open()
+        .unwrap()
+        .register(&codex, None, None, None)
+        .unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", &project).unwrap();
+    let frame = frame_with(
+        Some(claim("viewer", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a", "include_local":true}),
+    );
+    let list = |state: &mut Daemon| {
+        let snapshot = state.prepare_session_list(&frame).unwrap();
+        let listed = snapshot.clone().scan(LocalSessionScan::Listing);
+        state
+            .finish_session_list(&frame, &snapshot.roots, listed)
+            .unwrap()
+    };
+    // Listed before either is linked, the labels are checked under the global rules only, and
+    // that result is cached.
+    let unlinked = list(&mut state);
+    assert!(!unlinked.to_string().contains(credential), "{unlinked}");
+
+    // The phrase is blocked only in the repository the first conversation's source-qualified
+    // link names.
+    let repository =
+        crate::domain::repo::Repo::init(&crate::infra::config::repo_dir("alice", "notes").unwrap())
+            .unwrap();
+    crate::domain::secret_filter::RepositoryDictionary::open(repository.root())
+        .unwrap()
+        .block_add(
+            "Private phrase",
+            zeroize::Zeroizing::new(phrase.into()),
+            true,
+        )
+        .unwrap();
+    // The second is linked through the same source to an Agent repository that does not exist.
+    let store = crate::domain::store::Store::open_or_init().unwrap();
+    for (native, agent) in [(linked, "notes"), (unreadable, "missing")] {
+        let mut link = crate::domain::link::Link::from_native(
+            crate::domain::link::NativeBinding {
+                source: crate::protocol::NativeSourceRef {
+                    source_id: source.source_id.clone(),
+                    generation: source.generation,
+                },
+                thread_id: native.into(),
+            },
+            &project,
+        )
+        .unwrap();
+        link.owner = Some("alice".into());
+        link.agent = Some(agent.into());
+        crate::domain::link::write(&store, &link).unwrap();
+    }
+
+    let value = list(&mut state);
+    assert!(
+        !value.to_string().contains(phrase) && !value.to_string().contains(credential),
+        "{value}"
+    );
+    let result: SessionListResult = serde_json::from_value(value.clone()).unwrap();
+    let row = |native: &str| {
+        result
+            .local
+            .iter()
+            .find(|row| row.runtime_session_id == native)
+            .unwrap_or_else(|| panic!("{native} is missing from {value}"))
+    };
+    let checked = row(linked);
+    for label in [&checked.title, &checked.gist] {
+        let label = label.as_deref().unwrap();
+        assert_eq!(
+            crate::domain::privacy::projector::tokens(label).count(),
+            1,
+            "{label}"
+        );
+    }
+    assert_eq!(checked.labels_withheld, None);
+    let unresolved = row(unreadable);
+    for label in [&unresolved.title, &unresolved.gist] {
+        assert_eq!(
+            label.as_deref(),
+            Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
+        );
+    }
+    assert_eq!(
+        unresolved.labels_withheld.as_deref(),
+        Some("repository_unavailable")
+    );
+}
