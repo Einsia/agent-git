@@ -414,6 +414,11 @@ impl Hub {
                     ("GET", "/api/agents/alice/app") => Some(
                         json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url,"visibility":*served_visibility.lock().unwrap()}),
                     ),
+                    // A publication plans against the limits the Hub publishes.
+                    ("GET", "/api/hub/config") => Some(json!({
+                        "mode":"live",
+                        "limits":{"push":{"max_new_commits":4096,"max_request_bytes":2147483648u64}}
+                    })),
                     _ => None,
                 };
                 if let Some(json) = json {
@@ -2344,6 +2349,44 @@ fn continued_plain_session_declares_only_what_it_adds() {
             added
         );
     }
+
+    // A new branch off the published tip continues history another branch accepted and the
+    // destination holds: it declares only its own turn, though it has accepted nothing itself.
+    repo.git(&["checkout", "-b", "other"]).unwrap();
+    let other = meta::Meta::new(
+        format!("agit-{}", "d".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"another session"}})
+        ),
+        "claude-code",
+        &other.session,
+    );
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &other).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("another session").unwrap();
+    let branched = git(repo.root(), &["rev-parse", "HEAD"]);
+    let earlier = hub.previews.lock().unwrap().len();
+    assert_success(&run(&["--yes", "push", "alice/app@other"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/other"]), branched);
+    for preview in &hub.previews.lock().unwrap()[earlier..] {
+        let declared: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        assert_eq!(
+            declared
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.commit().to_owned())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&branched)
+        );
+    }
+    repo.git(&["checkout", "talk"]).unwrap();
 
     let version = format!("refs/tags/agit-{}", first[1]);
     assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);

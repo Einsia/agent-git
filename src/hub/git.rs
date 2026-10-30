@@ -2156,6 +2156,14 @@ mod git_credential_lifecycle_tests {
                             stream.set_nonblocking(false)?;
                             stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                             let request = read_request(&mut stream)?;
+                            // A Hub that publishes no push limits; the fixtures pin the requests
+                            // a publication makes beyond reading them.
+                            if request.path == "/api/hub/config" {
+                                stream.write_all(
+                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )?;
+                                continue;
+                            }
                             let response = respond(&request);
                             requests.push(request);
                             let reason = if response.status == 200 {

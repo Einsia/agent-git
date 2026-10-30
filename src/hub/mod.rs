@@ -562,6 +562,62 @@ pub struct Health {
     pub version: Option<String>,
 }
 
+/// What one Git push request may carry, as the Hub publishes it at `GET /api/hub/config`.
+///
+/// The Hub refuses a request past either bound, so a publication larger than them is delivered in
+/// several fast-forward requests. A Hub that publishes no limits is planned for with the bounds it
+/// enforced by default before it published them; planning by a larger bound would make the first
+/// request of a long session fail there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushLimits {
+    /// Commits one request may introduce that the Hub has not accepted before.
+    pub max_new_commits: usize,
+    /// Largest body one Git smart HTTP request may carry.
+    pub max_request_bytes: u64,
+}
+
+impl PushLimits {
+    /// The bounds of a Hub that publishes none.
+    pub const UNPUBLISHED: Self = Self {
+        max_new_commits: 512,
+        max_request_bytes: 128 * 1024 * 1024,
+    };
+}
+
+#[derive(Deserialize)]
+pub(crate) struct HubConfig {
+    #[serde(default)]
+    limits: Option<PublishedLimits>,
+}
+
+#[derive(Deserialize)]
+struct PublishedLimits {
+    #[serde(default)]
+    push: Option<PublishedPushLimits>,
+}
+
+#[derive(Deserialize)]
+struct PublishedPushLimits {
+    max_new_commits: u64,
+    max_request_bytes: u64,
+}
+
+impl HubConfig {
+    pub(crate) fn push_limits(&self) -> anyhow::Result<PushLimits> {
+        let Some(push) = self.limits.as_ref().and_then(|limits| limits.push.as_ref()) else {
+            return Ok(PushLimits::UNPUBLISHED);
+        };
+        anyhow::ensure!(
+            push.max_new_commits > 0 && push.max_request_bytes > 0,
+            "the hub publishes an empty push limit"
+        );
+        Ok(PushLimits {
+            max_new_commits: usize::try_from(push.max_new_commits).unwrap_or(usize::MAX),
+            max_request_bytes: push.max_request_bytes,
+        })
+    }
+}
+
 /// The latest CLI version the hub hands down (`GET /api/cli/version`).
 ///
 /// `version` takes part in the semver comparison and answers "is this the one I should upgrade

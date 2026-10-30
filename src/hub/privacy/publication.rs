@@ -33,6 +33,7 @@ struct Strategy {
     mandatory_policy: MandatoryPolicy,
 }
 
+#[derive(Clone)]
 pub(crate) struct PublicationPolicy {
     path: String,
     policy_digest: String,
@@ -140,6 +141,29 @@ impl PublicationPolicy {
             mandatory_policy_digest: strategy.mandatory_policy_digest,
             receiver_scope: format!("sessions:{visibility}:{}", manifest.repository_id),
             session_manifest: manifest.clone(),
+        })
+    }
+
+    /// The same publication declaring only the snapshots of `introduced`, for a request that
+    /// delivers part of the history. The Hub refuses a manifest naming a commit the request does
+    /// not deliver, so each staged request confirms its own receipt for exactly what it adds;
+    /// preserved commits are already accepted and stay declared.
+    pub(crate) fn scoped(&self, introduced: &std::collections::BTreeSet<String>) -> Result<Self> {
+        let mut session_manifest = self.session_manifest.clone();
+        session_manifest
+            .snapshots
+            .retain(|snapshot| introduced.contains(snapshot.commit()));
+        ensure!(
+            session_manifest.snapshots.len() == introduced.len(),
+            "a staged publication request introduces a commit its manifest does not review"
+        );
+        session_manifest.validate()?;
+        Ok(Self {
+            path: self.path.clone(),
+            policy_digest: self.policy_digest.clone(),
+            mandatory_policy_digest: self.mandatory_policy_digest.clone(),
+            receiver_scope: self.receiver_scope.clone(),
+            session_manifest,
         })
     }
 
@@ -251,6 +275,53 @@ pub(crate) fn parse_refs(output: &str) -> Result<BTreeMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged request declares exactly the snapshots it delivers and keeps accepted history
+    /// declared: the Hub refuses a manifest naming a commit outside the request's transition, and
+    /// a request introducing a commit nobody reviewed must not reach it at all.
+    #[test]
+    fn staged_receipts_declare_only_what_their_request_introduces() {
+        use crate::domain::session_privacy::PublishedSnapshot;
+        let plain = |commit: char| PublishedSnapshot::Plain {
+            commit: commit.to_string().repeat(40),
+            session_id: format!("agit-{}", "b".repeat(40)),
+            config_revision: 1,
+        };
+        let repository = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7".to_owned();
+        let policy = PublicationPolicy {
+            path: "api/agents/team/notes/privacy".into(),
+            policy_digest: digest_bytes(b"policy"),
+            mandatory_policy_digest: digest_bytes(b"mandatory"),
+            receiver_scope: format!("sessions:private:{repository}"),
+            session_manifest: SessionPublicationManifest {
+                version: SESSION_ENVELOPE_VERSION,
+                repository_id: repository.clone(),
+                snapshots: vec![plain('b'), plain('c'), plain('d')],
+                preserved_commits: vec!["a".repeat(40)],
+            },
+        };
+        let stage = policy
+            .scoped(&["b".repeat(40), "c".repeat(40)].into_iter().collect())
+            .unwrap();
+        assert_eq!(
+            stage.session_manifest.snapshots,
+            vec![plain('b'), plain('c')]
+        );
+        assert_eq!(
+            stage.session_manifest.preserved_commits,
+            vec!["a".repeat(40)]
+        );
+        assert_ne!(
+            stage.binding(&BTreeMap::new(), &BTreeMap::new()).unwrap(),
+            policy.binding(&BTreeMap::new(), &BTreeMap::new()).unwrap(),
+            "a stage confirms its own manifest digest"
+        );
+        assert!(
+            policy
+                .scoped(&["d".repeat(40), "e".repeat(40)].into_iter().collect())
+                .is_err()
+        );
+    }
 
     /// The server must confirm the same manifest even when the ref targets are unchanged.
     #[test]

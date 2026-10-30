@@ -43,6 +43,16 @@ impl FrozenRef {
     pub fn refspec(&self) -> String {
         format!("{}:{}", self.oid, self.name)
     }
+
+    /// The same destination ref at an ancestor of the frozen source. Callers take `oid` from the
+    /// frozen source's own history, so delivering it never publishes content outside the plan.
+    #[cfg(feature = "cli")]
+    pub(crate) fn staged(&self, oid: &str) -> Self {
+        Self {
+            name: self.name.clone(),
+            oid: oid.to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

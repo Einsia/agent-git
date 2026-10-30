@@ -579,14 +579,24 @@ pub(crate) fn inspection_git_path_spelling(path: PathBuf) -> PathBuf {
 }
 
 pub(crate) fn bounded_inspection_output(
+    command: Command,
+    limit: usize,
+) -> Result<std::process::Output> {
+    bounded_inspection_output_from(command, std::process::Stdio::null(), limit)
+}
+
+/// [`bounded_inspection_output`] with `input` on stdin, so a revision list of any length stays off
+/// the command line.
+pub(crate) fn bounded_inspection_output_from(
     mut command: Command,
+    input: std::process::Stdio,
     limit: usize,
 ) -> Result<std::process::Output> {
     use std::io::Read as _;
     use std::process::Stdio;
 
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
