@@ -31,7 +31,8 @@ pub enum Cmd {
     Create {
         /// `<owner/repo>[@<target>]`: the PR's destination
         target: String,
-        /// Your branch (the source)
+        /// Your branch (the source): `<owner>/<repo>@<branch>`, or a bare branch of the session
+        /// AGIT_SESSION names
         #[arg(short = 'b', long, value_name = "your-branch")]
         branch: String,
         /// Description
@@ -87,19 +88,33 @@ fn create(client: &Client, target: &str, branch: &str, message: Option<&str>) ->
         crate::domain::refs::Base::Name(b) => b.clone(),
         _ => "main".to_string(),
     };
-    // The source repo is the local current context (your fork).
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let ctx = match super::context::resolve(&cwd) {
-        Ok(c) => c,
+    let (so, sn, branch) = match explicit_source(branch) {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            // A bare branch belongs to the session context (your fork).
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let ctx = match super::context::resolve(&cwd) {
+                Ok(c) => c,
+                Err(_) => {
+                    ui::error(&format!(
+                        "no session names the source repository of `{branch}`: write it as \
+                         --branch <owner>/<repo>@{branch}"
+                    ));
+                    return Ok(ExitCode::Ref);
+                }
+            };
+            let (so, sn) = match ctx.owner_name() {
+                Ok(v) => v,
+                Err(_) => return Ok(ExitCode::Ref),
+            };
+            (so, sn, branch.to_owned())
+        }
         Err(e) => {
-            ui::error(&format!("source came from context resolution: {e:#}"));
-            return Ok(ExitCode::Ref);
+            ui::error(&format!("{e:#}"));
+            return Ok(ExitCode::Usage);
         }
     };
-    let (so, sn) = match ctx.owner_name() {
-        Ok(v) => v,
-        Err(_) => return Ok(ExitCode::Ref),
-    };
+    let branch = branch.as_str();
     let dir = config::repo_dir(&so, &sn)?;
     let Some(repo) = Repo::open(&dir) else {
         ui::error(&format!(
@@ -174,6 +189,22 @@ fn create(client: &Client, target: &str, branch: &str, message: Option<&str>) ->
             }
             Ok(code)
         }
+    }
+}
+
+/// `<owner>/<repo>@<branch>` names the source whole; a bare branch leaves its repository to the
+/// session context.
+fn explicit_source(branch: &str) -> crate::Result<Option<(String, String, String)>> {
+    use crate::domain::refs::{Base, RepoSel, Tail};
+    if !branch.contains('@') {
+        return Ok(None);
+    }
+    let spec = crate::domain::refs::parse(branch)?;
+    match (spec.repo, spec.base, spec.tail) {
+        (RepoSel::Slug(owner, name), Base::Name(branch), Tail::None) => {
+            Ok(Some((owner, name, branch)))
+        }
+        _ => bail!("a PR's source is a whole branch: write it as <owner>/<repo>@<branch>"),
     }
 }
 
@@ -378,6 +409,24 @@ mod tests {
         repo.add_all().unwrap();
         assert!(repo.commit(message).unwrap());
         repo.git(&["rev-parse", "HEAD"]).unwrap()
+    }
+
+    /// A PR's source can be named whole, so `agit pr create` works without AGIT_SESSION: an
+    /// `<owner>/<repo>@<branch>` source selects that repository, a bare branch is left to the
+    /// session context, and a turn or a repository without a branch is refused rather than
+    /// proposed. Reading the whole argument as a branch name would send `owner/repo@branch` to
+    /// the Hub as the branch of whatever repository the context names.
+    #[test]
+    fn a_source_is_named_whole_or_left_to_the_session() {
+        assert_eq!(
+            explicit_source("alice/src@exp").unwrap(),
+            Some(("alice".into(), "src".into(), "exp".into()))
+        );
+        assert_eq!(explicit_source("exp").unwrap(), None);
+        assert_eq!(explicit_source("feat/x").unwrap(), None);
+        for refused in ["alice/src@exp#2", "alice/src@exp~1", "@"] {
+            assert!(explicit_source(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]
