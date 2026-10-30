@@ -8,13 +8,16 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
-## [0.2.31] - 2026-10-30
+## [0.2.32] - 2026-10-31
 
 ### Changed
 
 - `agit push` splits a publication larger than the Hub's published per-request limits into
   fast-forward requests within them instead of being refused, and a single commit too large for any
   request is refused before anything is sent, naming the setting that raises the limit.
+- Session-start hooks no longer add anything to an agent's context; in a folder that uploads, the
+  person is still told where each conversation goes at every start, resume included.
+- The Git bundled in the Linux packages uses curl 8.23.0, brotli 1.2.1 and musl 1.2.6-r3.
 
 ### Fixed
 
@@ -35,6 +38,18 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
   pending marker.
 - `agit push` sends a tag added to an already published session branch instead of reporting the
   branch up to date.
+- A session converted from another runtime now opens in Codex when Codex uses a provider other than
+  `openai`.
+- `agit setup` and the installer no longer write an AGENTS.md section into whatever folder they run
+  in. `--agents-md` writes it only at a Git repository's top level and says where.
+- A skill install removes an agit section left in a home-level instruction file (`~/AGENTS.md`,
+  `~/CLAUDE.md`, the Codex and OpenCode ones), which reached every conversation, and `agit doctor`
+  reports one.
+
+## [0.2.31] - 2026-10-30
+
+This version was tagged but not published: its Linux builds could not download the packages the
+bundled Git pinned, which Alpine had replaced. Every change listed for it ships in 0.2.32.
 
 ## [0.2.30] - 2026-10-30
 
