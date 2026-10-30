@@ -12,6 +12,8 @@ use std::{
 
 pub const SUPERVISOR_RESULT_ENV: &str = "AGIT_RC_SUPERVISOR_PUSH_RESULT";
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
+/// Where [`save_acknowledged_tags`] keeps a branch's tag listing, beside its receipt.
+const ACKNOWLEDGED_TAGS: &str = "agit/privacy-published-tags";
 
 pub mod outbox;
 
@@ -192,20 +194,15 @@ impl PublicationReceipt {
     }
 
     pub fn save(&self, repo: &Repo) -> Result<()> {
+        // The tag listing recorded with the receipt this one replaces vouches for nothing now; a
+        // publication that knows its listing records it again once this receipt is saved.
+        forget_acknowledged_tags(repo, &self.branch)?;
         self.save_at(&receipt_path(repo, &self.branch)?)
     }
 
     fn save_at(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let parent = path
-            .parent()
-            .context("publication receipt has no directory")?;
-        crate::infra::config::create_state_dir(parent)?;
-        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
-        staging.write_all(&serde_json::to_vec(self)?)?;
-        staging.as_file().sync_all()?;
-        staging.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        persist(path, &serde_json::to_vec(self)?)
     }
 
     pub fn load(repo: &Repo, branch: &str) -> Result<Option<Self>> {
@@ -247,12 +244,122 @@ impl PublicationReceipt {
 }
 
 fn receipt_path(repo: &Repo, branch: &str) -> Result<PathBuf> {
+    branch_record_path(repo, "agit/privacy-published", branch)
+}
+
+fn branch_record_path(repo: &Repo, directory: &str, branch: &str) -> Result<PathBuf> {
     use sha2::Digest;
     let key = hex::encode(sha2::Sha256::digest(branch.as_bytes()));
     Ok(repo
         .common_dir()?
-        .join("agit/privacy-published")
+        .join(directory)
         .join(format!("{key}.json")))
+}
+
+fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("publication receipt has no directory")?;
+    crate::infra::config::create_state_dir(parent)?;
+    let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+    staging.write_all(bytes)?;
+    staging.as_file().sync_all()?;
+    staging.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// The local tags a publication is frozen from, as one digest of their names and objects.
+///
+/// A publication carries every tag its heads reach, but its receipt names only the branch tip, so
+/// a branch whose tip is unchanged still owes a tag added since its publication. Equal digests
+/// mean no tag was added, moved or removed.
+pub(crate) fn tag_listing<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    use sha2::Digest;
+    let sorted: std::collections::BTreeMap<&str, &str> = tags.into_iter().collect();
+    let mut digest = sha2::Sha256::new();
+    for (name, oid) in sorted {
+        digest.update(format!("{oid} {name}\n").as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+/// [`tag_listing`] of `repo`'s tags as they are now.
+pub(crate) fn current_tag_listing(repo: &Repo) -> Result<String> {
+    let mut tags = Vec::new();
+    repo.git_stream_split_inspection(
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags",
+        ],
+        b'\n',
+        crate::infra::local_git::Deadline::new(),
+        |line| {
+            if !line.is_empty() {
+                let line = std::str::from_utf8(line).context("tag listing is not valid UTF-8")?;
+                let (oid, name) = line.split_once(' ').context("tag listing is malformed")?;
+                tags.push((name.to_owned(), oid.to_owned()));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(tag_listing(
+        tags.iter().map(|(name, oid)| (name.as_str(), oid.as_str())),
+    ))
+}
+
+/// The tag listing a branch's acknowledged publication was frozen from. It is kept beside the
+/// receipt, not in it: receipts are read with unknown fields refused, so a field there makes every
+/// agit that predates it refuse the receipt.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgedTags {
+    branch: String,
+    source: String,
+    tags: String,
+}
+
+/// Record the tag listing `receipt`'s publication was frozen from, once the receipt is saved.
+pub(crate) fn save_acknowledged_tags(
+    repo: &Repo,
+    receipt: &PublicationReceipt,
+    tags: &str,
+) -> Result<()> {
+    let record = AcknowledgedTags {
+        branch: receipt.branch.clone(),
+        source: receipt.source.clone(),
+        tags: tags.to_owned(),
+    };
+    persist(
+        &branch_record_path(repo, ACKNOWLEDGED_TAGS, &receipt.branch)?,
+        &serde_json::to_vec(&record)?,
+    )
+}
+
+/// Drop `branch`'s recorded tag listing, so the next push asks the Hub about the branch: for
+/// anything that makes the branch owe a ref its tip and tags do not show.
+pub(crate) fn forget_acknowledged_tags(repo: &Repo, branch: &str) -> Result<()> {
+    match fs::remove_file(branch_record_path(repo, ACKNOWLEDGED_TAGS, branch)?) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// The tag listing recorded for `branch`'s acknowledged publication of `source`. `None` when the
+/// record names another source, as when an agit that keeps no listing published the branch since.
+pub(crate) fn acknowledged_tags(repo: &Repo, branch: &str, source: &str) -> Result<Option<String>> {
+    let path = branch_record_path(repo, ACKNOWLEDGED_TAGS, branch)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "acknowledged tag listing is not a regular file"
+        ),
+    }
+    let record: AcknowledgedTags =
+        serde_json::from_slice(&storage::read_bytes_capped(&path, MAX_RECEIPT_BYTES)?)?;
+    Ok((record.branch == branch && record.source == source).then_some(record.tags))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

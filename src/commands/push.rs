@@ -402,8 +402,10 @@ pub fn run(mut args: Args) -> CmdResult {
 ///
 /// A receipt is saved only after the Hub acknowledged every ref of a publication, and an
 /// acknowledged commit stays published: the Hub refuses rewriting it. So a branch whose tip still
-/// equals its receipt's source has nothing to send. What local records cannot show is a branch
-/// removed or replaced on the Hub since; `--verify` asks the Hub about every branch.
+/// equals its receipt's source has nothing to send, unless a tag changed since: the publication
+/// carries every tag the branch reaches, so the tags must also be as they were when it was frozen.
+/// What local records cannot show is a branch removed or replaced on the Hub since; `--verify`
+/// asks the Hub about every branch.
 ///
 /// `main` carries no receipt: it is the shared file line, published alongside session branches.
 /// While it differs from what the destination last listed for it, every branch takes the full
@@ -414,7 +416,9 @@ fn acknowledged_unchanged(
     client: &crate::hub::Client,
     branches: &[String],
 ) -> Option<Vec<String>> {
-    use crate::domain::privacy_receipt::{PublicationReceipt, outbox::Entry};
+    use crate::domain::privacy_receipt::{
+        PublicationReceipt, acknowledged_tags, outbox::Entry, tag_listing,
+    };
     if args.verify
         || args.dry_run
         || args.audit
@@ -436,6 +440,7 @@ fn acknowledged_unchanged(
             "--format=%(objectname) %(refname)",
             "refs/heads",
             "refs/remotes/origin/main",
+            "refs/tags",
         ])?
         .lines()
         .filter_map(|line| {
@@ -443,6 +448,11 @@ fn acknowledged_unchanged(
             Some((name.to_owned(), oid.to_owned()))
         })
         .collect();
+    let tags = tag_listing(
+        tips.iter()
+            .filter(|(name, _)| name.starts_with("refs/tags/"))
+            .map(|(name, oid)| (name.as_str(), oid.as_str())),
+    );
     let tip = |reference: &str| tips.get(reference).cloned();
     if let Some(main) = tip("refs/heads/main")
         && tip("refs/remotes/origin/main").as_deref() != Some(main.as_str())
@@ -461,6 +471,8 @@ fn acknowledged_unchanged(
                 receipt.destination == identity
                     && tip(&format!("refs/heads/{branch}")).as_deref()
                         == Some(receipt.source.as_str())
+                    && acknowledged_tags(repo, branch, &receipt.source)
+                        .is_ok_and(|acknowledged| acknowledged.as_deref() == Some(tags.as_str()))
                     && !pending.iter().any(|entry| entry.awaits(&receipt))
             })
             .cloned()

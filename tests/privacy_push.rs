@@ -2233,7 +2233,11 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
 /// tag of a published turn the Hub lost, as when a tags phase fails after the heads land, and the
 /// push that carries them still declares only the new turn. A plan that takes only its own
 /// commits' tags leaves both off the Hub on every later push; one that publishes them by capturing
-/// the whole history again declares every turn, and past the commit bound cannot push at all.
+/// the whole history again declares every turn, and past the commit bound cannot push at all. The
+/// added tag arrives without a new turn too: a push that skips a branch because its tip is still
+/// the one its receipt acknowledged, without checking the tags, reports it up to date and never
+/// sends the tag. Once the tag is acknowledged the branch is skipped again; a tag listing that is
+/// recorded differently from how the skip reads it would never skip anything.
 #[test]
 fn continued_plain_session_declares_only_what_it_adds() {
     use agit::domain::session_privacy::SessionPublicationManifest;
@@ -2390,8 +2394,27 @@ fn continued_plain_session_declares_only_what_it_adds() {
 
     let version = format!("refs/tags/agit-{}", first[1]);
     assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);
-    git(&remote, &["update-ref", "-d", &version]);
+    // As after `agit fetch`: a push decides from local records alone only while the checkout's
+    // main is the one it last fetched.
+    git(
+        repo.root(),
+        &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+    );
     git(repo.root(), &["tag", "reviewed", &first[0]]);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/tags/reviewed"]), first[0]);
+    let unchanged = run(&["--yes", "push", "alice/app@talk"]);
+    assert_success(&unchanged);
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&unchanged.stdout),
+            String::from_utf8_lossy(&unchanged.stderr)
+        )
+        .contains("unchanged since their acknowledged publication: talk"),
+        "{unchanged:?}"
+    );
+    git(&remote, &["update-ref", "-d", &version]);
     let earlier = hub.previews.lock().unwrap().len();
     let fifth = turn("turn 5");
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
