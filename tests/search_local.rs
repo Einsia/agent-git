@@ -604,6 +604,37 @@ fn small_saved_versions_return_hits_after_accounting_for_actual_reads() {
     }
 }
 
+/// Ordinary transcripts must leave the command work budget for every saved version: if a budget
+/// sized for one-line fixtures binds on a few hundred records, the newest version is reported as
+/// unreadable and every version saved before it is skipped, so the saved prompt is never found.
+#[test]
+fn transcript_sized_versions_are_all_searched() {
+    let lab = Lab::new();
+    let reply = json!({"type":"assistant", "message":{"role":"assistant",
+        "content":[{"type":"text", "text":"ordinary reply ".repeat(20)}]}});
+    let mut records = vec![prompt("needle saved prompt")];
+    records.extend(std::iter::repeat_n(reply, 600));
+    let repo = lab.seed("ordinary", meta::LayoutVersion::V1, &records);
+    let sid = format!("agit-{}", "a".repeat(40));
+    for version in 1..=3 {
+        records.push(prompt(&format!("follow-up {version}")));
+        let raw: String = records.iter().map(|v| format!("{v}\n")).collect();
+        let log = transcript::wrap_lines(&raw, "claude-code", &sid);
+        storage::write_snapshot(repo.root(), &log, "").unwrap();
+        lab.commit_at(&repo, version);
+    }
+    let result = value(
+        &lab.command("json2")
+            .args(["search", "--local", "needle"])
+            .output()
+            .unwrap(),
+        "json2",
+    );
+    assert_eq!(result["total"], 4, "{result}");
+    assert_eq!(result["incomplete"], false, "{result}");
+    lab.assert_offline();
+}
+
 #[test]
 fn exhausted_scan_budget_keeps_verified_partial_hits() {
     let lab = Lab::new();
@@ -1010,29 +1041,45 @@ fn a_carrierless_repo_name_cannot_relabel_parent_history() {
 #[test]
 fn dense_saved_blocks_exhaust_the_command_work_budget_without_native_or_file_writes() {
     let lab = Lab::new();
-    let content = json!({"type":"assistant", "message":{"role":"assistant", "content":vec![json!({"type":"text", "text":"needle"}); 30_000]}});
-    let repo = lab.seed("dense", meta::LayoutVersion::V0, &[content]);
+    // Each version stays under the per-object read ceiling; together they exceed the work budget.
+    let content = json!({"type":"assistant", "message":{"role":"assistant", "content":vec![json!({"type":"text", "text":"filler"}); 60_000]}});
+    let repos: Vec<_> = (0..4)
+        .map(|i| {
+            lab.seed(
+                &format!("dense{i}"),
+                meta::LayoutVersion::V0,
+                std::slice::from_ref(&content),
+            )
+        })
+        .collect();
     let before = inventory(lab.temp.path());
-    for mode in ["plain", "quiet", "json1", "json2"] {
-        for query in ["needle", "needle turns:>999"] {
-            let output = lab
-                .command(mode)
-                .args(["search", "--local", query])
-                .output()
-                .unwrap();
-            let result = value(&output, mode);
-            assert_eq!(result["total"], 0);
-            assert_eq!(result["incomplete"], true);
-        }
+    for query in ["needle", "needle turns:>999"] {
+        let output = lab
+            .command("json2")
+            .args(["search", "--local", query])
+            .output()
+            .unwrap();
+        let result = value(&output, "json2");
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["incomplete"], true);
+        assert!(
+            result["incomplete_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("record_budget")),
+            "{result}"
+        );
     }
-    assert!(
-        repo.root()
-            .join("session/log.jsonl")
-            .metadata()
-            .unwrap()
-            .len()
-            < 2 * 1024 * 1024
-    );
+    for repo in &repos {
+        assert!(
+            repo.root()
+                .join("session/log.jsonl")
+                .metadata()
+                .unwrap()
+                .len()
+                < 2 * 1024 * 1024
+        );
+    }
     assert_eq!(before, inventory(lab.temp.path()));
     lab.assert_offline();
 }

@@ -20,7 +20,11 @@ const MAX_REFS: usize = 128;
 const MAX_COMMITS: usize = 256;
 const MAX_OBJECT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_READ_BYTES: usize = 32 * 1024 * 1024;
-const MAX_RECORDS: usize = 20_000;
+/// Structural work units (JSON nodes and saved event ids) across every pass of the command.
+/// Projection walks a log several times, so this must admit the whole byte budget at ordinary
+/// transcript density; otherwise one ordinary saved version exhausts it and every later version
+/// is skipped. It binds only on structurally dense input.
+const MAX_WORK: usize = 8 * 1024 * 1024;
 const MAX_HITS: usize = 1_024;
 const MAX_REF_BYTES: usize = 128 * 1024;
 const MAX_COMMIT_BYTES: usize = 64 * 1024;
@@ -64,7 +68,7 @@ impl Default for Budget {
             refs: 0,
             commits: 0,
             bytes: 0,
-            work: storage::LocalReadBudget::with_deadline(MAX_RECORDS, deadline),
+            work: storage::LocalReadBudget::with_deadline(MAX_WORK, deadline),
             hits: 0,
             reasons: BTreeSet::new(),
         }
@@ -74,6 +78,20 @@ impl Default for Budget {
 impl Budget {
     fn incomplete(&mut self, reason: &'static str) {
         self.reasons.insert(reason);
+    }
+
+    /// A read that fails because a shared budget ran out names that budget rather than reporting
+    /// the saved history as unreadable. Returns whether the scan must stop.
+    fn failed(&mut self, reason: &'static str) -> bool {
+        if self.deadline.expired() {
+            self.incomplete("time_budget");
+        } else if self.work.remaining() == 0 {
+            self.incomplete("record_budget");
+        } else {
+            self.incomplete(reason);
+            return false;
+        }
+        true
     }
 
     fn reserve(&mut self, maximum: usize) -> Option<usize> {
@@ -194,10 +212,8 @@ pub(super) fn execute(args: &Args, texts: &[String], queries: &[Query]) -> Resul
                 &mut budget.work,
             ) {
                 Ok(log) => log,
-                Err(_) => {
-                    budget.incomplete("unavailable_saved_log");
-                    continue;
-                }
+                Err(_) if budget.failed("unavailable_saved_log") => break,
+                Err(_) => continue,
             };
             let read_bytes = budget.work.read_bytes() - read_before;
             ensure!(read_bytes <= reserved, "saved read exceeds its reservation");
@@ -205,10 +221,8 @@ pub(super) fn execute(args: &Args, texts: &[String], queries: &[Query]) -> Resul
             let log_hash = hex::encode(Sha256::digest(log.as_bytes()));
             let (projected, turns) = match project(&log, &mut budget.work) {
                 Ok(events) => events,
-                Err(_) => {
-                    budget.incomplete("unavailable_projection");
-                    continue;
-                }
+                Err(_) if budget.failed("unavailable_projection") => break,
+                Err(_) => continue,
             };
             let turns_incomplete = projected.iter().any(|event| event.turns_incomplete);
             if projected.iter().any(|event| event.incomplete) {
@@ -330,10 +344,68 @@ pub(super) fn execute(args: &Args, texts: &[String], queries: &[Query]) -> Resul
             "total": total, "total_unit": "saved_versions", "page": args.page, "per": args.limit,
             "has_more": start.saturating_add(args.limit) < total,
             "incomplete": incomplete, "incomplete_reasons": budget.reasons,
+            "incomplete_details": budget.reasons.iter().map(|reason| json!({"reason": reason, "message": explain(reason)})).collect::<Vec<_>>(),
             "unknown": [], "terms": queries[i].terms, "applied_filters": {}, "hits": page,
             "coverage": {"repositories_and_refs": "local refs/heads and refs/remotes with raw reachable commit parents", "native_transcripts": false, "hub_permissions": "not revalidated offline"},
         })
     }).collect())
+}
+
+const NARROW: &str = "narrow the search with repo:<owner/name>, runtime:<runtime> or a more specific phrase, or search the Hub without --local";
+
+/// Each reason says in words what was not searched and what the user can do about it.
+fn explain(reason: &str) -> String {
+    let (what, fix) = match reason {
+        "time_budget" => (
+            "the time limit for an offline search was reached before every saved version was read",
+            NARROW,
+        ),
+        "read_budget"
+        | "record_budget"
+        | "scan_budget"
+        | "commit_budget"
+        | "ref_budget"
+        | "directory_budget"
+        | "verification_budget" => (
+            "the offline search reached its size limit, so some saved versions or repositories were not read",
+            NARROW,
+        ),
+        "hit_budget" => (
+            "too many matches; later matches were not collected",
+            "use a more specific phrase or filter",
+        ),
+        "unavailable_repository" | "unavailable_refs" | "unavailable_directory" => (
+            "a local repository or its branches could not be read",
+            "check that `agit status` lists the repository and that its directory is readable",
+        ),
+        "symlinked_directory" | "invalid_repository_name" => (
+            "an entry in the local repository directory is a symlink or has an invalid name and was skipped",
+            "keep only agit-created repositories under the AgentGit home",
+        ),
+        "noncommit_ref" => (
+            "a local branch does not point to a commit and was skipped",
+            "check the repository's branches with `agit branch`",
+        ),
+        "unavailable_commit"
+        | "invalid_commit"
+        | "unavailable_metadata"
+        | "invalid_metadata"
+        | "unavailable_saved_log"
+        | "unavailable_projection" => (
+            "some saved versions could not be read and were skipped",
+            "inspect them with `agit log` and `agit show`; a fresh clone restores corrupt local history",
+        ),
+        "unrepresented_event_content" => (
+            "some saved events have content that offline search cannot represent; it was not searched",
+            "read the session with `agit show` to see that content",
+        ),
+        "unverified_snapshot" => (
+            "a repository changed during the search, so its matches were dropped",
+            "run the search again once the repository is idle",
+        ),
+        _ => ("part of the saved history was not searched", NARROW),
+    };
+    format!("{what}; {fix}")
 }
 
 fn reserve_verification(initial: &[SavedRef], budget: &mut Budget) -> Option<Budget> {
@@ -349,7 +421,7 @@ fn reserve_verification(initial: &[SavedRef], budget: &mut Budget) -> Option<Bud
     budget.refs += refs;
     Some(Budget {
         deadline: budget.deadline,
-        work: storage::LocalReadBudget::with_deadline(MAX_RECORDS, budget.deadline),
+        work: storage::LocalReadBudget::with_deadline(MAX_WORK, budget.deadline),
         bytes: MAX_READ_BYTES - bytes,
         refs: MAX_REFS - refs,
         ..Default::default()
@@ -1064,8 +1136,7 @@ mod tests {
         let user = json!({"type":"user", "message":{"role":"user", "content":"needle"}});
         let call = json!({"type":"assistant", "agit":"merge_summary", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"call", "name":"Bash", "input":{"command":"argument-only-needle"}}]}});
         let log = transcript::wrap_lines(&format!("{user}\n{call}\n{user}\n"), "claude-code", &sid);
-        let (events, turns) =
-            project(&log, &mut storage::LocalReadBudget::new(MAX_RECORDS)).unwrap();
+        let (events, turns) = project(&log, &mut storage::LocalReadBudget::new(MAX_WORK)).unwrap();
         assert_eq!(turns, 2);
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event.line, Some(0));
@@ -1081,8 +1152,7 @@ mod tests {
         let sid = format!("agit-{}", "a".repeat(40));
         let summary = json!({"type":"user", "agit":"merge_summary", "message":{"role":"user", "content":"saved reconciliation"}});
         let log = transcript::wrap_lines(&format!("{summary}\n"), "opencode", &sid);
-        let (events, turns) =
-            project(&log, &mut storage::LocalReadBudget::new(MAX_RECORDS)).unwrap();
+        let (events, turns) = project(&log, &mut storage::LocalReadBudget::new(MAX_WORK)).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].scope, Some(EventScope::Summary));
         assert_eq!(events[0].searchable, "saved reconciliation");
@@ -1098,7 +1168,7 @@ mod tests {
             "claude-code",
             &sid,
         );
-        if let Ok((events, _)) = project(&log, &mut storage::LocalReadBudget::new(MAX_RECORDS)) {
+        if let Ok((events, _)) = project(&log, &mut storage::LocalReadBudget::new(MAX_WORK)) {
             assert!(events.iter().any(|event| event.incomplete));
         }
     }
@@ -1179,7 +1249,8 @@ mod tests {
         let content = json!({"type":"assistant", "message":{"role":"assistant", "content":vec![json!({"type":"text", "text":"x"}); 60_000]}});
         let log = transcript::wrap_lines(&format!("{content}\n"), "claude-code", &sid);
         assert!(log.len() < MAX_OBJECT_BYTES);
-        let mut work = storage::LocalReadBudget::new(MAX_RECORDS);
+        // A small explicit budget pins exhaustion itself, independent of the command's sizing.
+        let mut work = storage::LocalReadBudget::new(20_000);
         assert!(project(&log, &mut work).is_err());
         assert_eq!(work.remaining(), 0);
         let small = transcript::wrap_lines(
@@ -1195,7 +1266,8 @@ mod tests {
         let arguments = format!("[{}0]", "0,".repeat(30_000));
         let call = json!({"type":"response_item", "payload":{"type":"function_call", "call_id":"call", "name":"exec_command", "arguments":arguments}});
         let log = transcript::wrap_lines(&format!("{call}\n"), "codex", &sid);
-        let mut work = storage::LocalReadBudget::new(MAX_RECORDS);
+        // A small explicit budget pins exhaustion itself, independent of the command's sizing.
+        let mut work = storage::LocalReadBudget::new(20_000);
         assert!(project(&log, &mut work).is_err());
         assert_eq!(work.remaining(), 0);
     }
@@ -1257,7 +1329,7 @@ mod tests {
         );
         let mut budget = Budget {
             deadline,
-            work: storage::LocalReadBudget::with_deadline(MAX_RECORDS, deadline),
+            work: storage::LocalReadBudget::with_deadline(MAX_WORK, deadline),
             ..Default::default()
         };
         let mut verification = reserve_verification(&initial, &mut budget).unwrap();
