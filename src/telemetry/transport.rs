@@ -115,6 +115,10 @@ pub(crate) enum EventName {
     AcquisitionLinked,
     #[serde(rename = "cli_install_attributed")]
     InstallAttributed,
+    #[serde(rename = "cli_first_upload")]
+    FirstUpload,
+    #[serde(rename = "cli_first_share")]
+    FirstShare,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -189,6 +193,8 @@ pub(crate) fn enqueue_locked(
     if (event.event == EventName::InstallSucceeded && preferences.install_reported)
         || (event.event == EventName::AcquisitionLinked && preferences.acquisition_completed)
         || (event.event == EventName::InstallAttributed && preferences.acquisition_reported)
+        || (event.event == EventName::FirstUpload && preferences.first_upload_reported)
+        || (event.event == EventName::FirstShare && preferences.first_share_reported)
     {
         return Ok(());
     }
@@ -248,6 +254,8 @@ pub(crate) fn enqueue_locked(
         EventName::InstallSucceeded => preferences.install_reported = true,
         EventName::AcquisitionLinked => preferences.acquisition_completed = true,
         EventName::InstallAttributed => preferences.acquisition_reported = true,
+        EventName::FirstUpload => preferences.first_upload_reported = true,
+        EventName::FirstShare => preferences.first_share_reported = true,
         _ => return Ok(()),
     }
     state::write_json(&dir.join("preferences.json"), &preferences)

@@ -218,6 +218,10 @@ pub fn run(mut args: Args) -> CmdResult {
     );
 
     ui::success("share created");
+    crate::telemetry::activation::reached(
+        crate::telemetry::activation::Milestone::FirstShare,
+        client.base(),
+    );
 
     // When encrypted, the key is appended to the fragment — it is never sent to the server.
     let link = match &key {

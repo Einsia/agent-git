@@ -75,6 +75,9 @@ pub struct Preferences {
     /// identity was reported: an installation that was reported or considered in any generation
     /// never sends a first-command receipt, so a re-enable does not count as a new installation.
     pub first_command_checked: bool,
+    /// Set when this generation's first upload and first share are queued; each is sent once.
+    pub first_upload_reported: bool,
+    pub first_share_reported: bool,
 }
 
 impl Preferences {
@@ -283,6 +286,8 @@ fn choose_at(
     current.acquisition_completed = false;
     current.first_acquisition_account = None;
     current.acquisition_reported = false;
+    current.first_upload_reported = false;
+    current.first_share_reported = false;
     current.channel = match std::env::var("AGIT_INSTALL_CHANNEL").as_deref() {
         Ok("create_agit") => "create_agit",
         Ok("npm_global") => "npm_global",

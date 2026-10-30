@@ -1070,6 +1070,7 @@ fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
         .map(|(branch, id)| session_path(owner, name, id, branch));
     let sharer = crate::infra::credentials::load(hub).map(|credential| credential.username);
     let url = invite_link(hub, &created.token, next.as_deref(), sharer.as_deref());
+    crate::telemetry::activation::reached(crate::telemetry::activation::Milestone::FirstShare, hub);
     let session_url = next.as_ref().map(|path| format!("{hub}{path}"));
 
     if super::json::requested() {

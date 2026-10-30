@@ -439,6 +439,7 @@ pub(super) fn run(
         "automatic publication was disabled during inspection"
     );
     let (repo, remote) = intent.materialize(&client, repo)?;
+    let hub = client.base().to_owned();
     intent.verify_remote(&remote)?;
     if let Some(selection) = &local_target {
         selection.bind(&repo, &remote.identity)?;
@@ -462,6 +463,20 @@ pub(super) fn run(
         &intent.visibility,
         &selected.remote,
     ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
+    // A branch the Hub acknowledged is uploaded whatever fails after it, in the tag phase or while
+    // saving receipts, and a retry finds it up to date; so it counts now.
+    let updated = report
+        .heads
+        .iter()
+        .flat_map(|phase| &phase.attempts)
+        .flat_map(|attempt| &attempt.refs)
+        .any(|reference| matches!(reference.status, PublicationStatus::Updated));
+    if updated {
+        crate::telemetry::activation::reached(
+            crate::telemetry::activation::Milestone::FirstUpload,
+            &hub,
+        );
+    }
     let recording = ui::publication::stage("Recording publication acknowledgements");
     projected.confirm_acceptance(&report)?;
     show_publication(&report);
