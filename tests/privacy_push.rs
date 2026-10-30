@@ -38,6 +38,8 @@ struct Hub {
     manifests: Arc<Mutex<Vec<serde_json::Value>>>,
     registrations: Arc<AtomicUsize>,
     deny: Arc<AtomicBool>,
+    /// Refuses a receive that updates only tags, as a Hub that closed them would.
+    refuse_tags: Arc<AtomicBool>,
     unsupported_policy: Arc<AtomicBool>,
     corrupt_receipt: Arc<AtomicBool>,
     creations: Arc<AtomicUsize>,
@@ -77,6 +79,8 @@ impl Hub {
         let registered = Arc::clone(&registrations);
         let deny = Arc::new(AtomicBool::new(false));
         let denied = Arc::clone(&deny);
+        let refuse_tags = Arc::new(AtomicBool::new(false));
+        let refusing_tags = Arc::clone(&refuse_tags);
         let unsupported_policy = Arc::new(AtomicBool::new(false));
         let unsupported = Arc::clone(&unsupported_policy);
         let corrupt_receipt = Arc::new(AtomicBool::new(false));
@@ -192,6 +196,20 @@ impl Hub {
                 if target == "/api/agents/alice/app" && !root.join("alice/app.git").is_dir() {
                     let body = r#"{"error":"repository is unavailable"}"#;
                     write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                let contains =
+                    |needle: &[u8]| body.windows(needle.len()).any(|value| value == needle);
+                if target.ends_with("/git-receive-pack")
+                    && refusing_tags.load(Ordering::Acquire)
+                    && contains(b"refs/tags/")
+                    && !contains(b"refs/heads/")
+                {
+                    write!(
+                        stream,
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
                     continue;
                 }
                 if target.starts_with("/alice/app.git/") && denied.load(Ordering::Acquire) {
@@ -477,6 +495,7 @@ impl Hub {
             manifests,
             registrations,
             deny,
+            refuse_tags,
             unsupported_policy,
             corrupt_receipt,
             creations,
@@ -1682,6 +1701,131 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
         git(&remote, &["rev-parse", "refs/heads/work"]),
         git(repo.root(), &["rev-parse", "refs/heads/work"])
     );
+}
+
+/// The first upload counts as soon as the Hub acknowledged a branch it updated, before anything
+/// after that can fail. Here the Hub refuses the tag of a push whose branch went up, so the push
+/// fails, and its retry finds the branch up to date. Counting only at the end of a push that
+/// fully succeeded would miss this installation's first upload for good.
+#[test]
+fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("AGIT_TELEMETRY_HOST", "http://127.0.0.1:9")
+            .env("AGIT_TELEMETRY_KEY", "synthetic_project")
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let telemetry = home.join("telemetry");
+    let uploads = || {
+        let queue: serde_json::Value = fs::read(telemetry.join("queue.json"))
+            .ok()
+            .and_then(|body| serde_json::from_slice(&body).ok())
+            .unwrap_or_default();
+        queue["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["event"]["event"] == "cli_first_upload")
+            .count()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "tag.gpgsign", "false"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    // The repository is created and first published while statistics are still undecided, so
+    // nothing is counted yet.
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    assert_eq!(uploads(), 0);
+
+    {
+        fs::create_dir_all(&telemetry).unwrap();
+        let gate = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(telemetry.join("gate.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&gate).unwrap();
+        let preferences = json!({
+            "preference": "enabled",
+            "generation": 1,
+            "device_id": uuid::Uuid::new_v4(),
+            "decision_source": "explicit_enable",
+            "notice_version": agit::telemetry::state::NOTICE_VERSION,
+        });
+        fs::write(telemetry.join("preferences.json"), preferences.to_string()).unwrap();
+    }
+    hub.refuse_tags.store(true, Ordering::Release);
+    fs::write(repo.root().join("README.md"), "Shared file, revised").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Revise file").unwrap();
+    git(repo.root(), &["tag", "release-2"]);
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/main"]),
+        git(repo.root(), &["rev-parse", "refs/heads/main"])
+    );
+    assert!(git(&remote, &["for-each-ref", "refs/tags/release-2"]).is_empty());
+    assert_eq!(uploads(), 1, "{refused:?}");
+
+    hub.refuse_tags.store(false, Ordering::Release);
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    assert!(!git(&remote, &["for-each-ref", "refs/tags/release-2"]).is_empty());
+    assert_eq!(uploads(), 1);
 }
 
 #[test]

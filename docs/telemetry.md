@@ -112,6 +112,8 @@ been persisted when the daemon exits may be lost.
 | `cli_install_succeeded` | An installer verified the binary runs, or a new installation without an installer receipt ran its first user command; once per installation generation |
 | `cli_install_attributed` | A tagged installer associates an installation with an anonymous website acquisition |
 | `cli_acquisition_linked` | The first successful CLI login saved an authoritative account ID |
+| `cli_first_upload` | The Hub acknowledged a session reference this installation updated, automatic or by hand; once per installation generation |
+| `cli_first_share` | This installation created a read-only link (`agit share`) or an invitation (`agit repo invite`); once per installation generation |
 
 Use `cli_command_finished` and `invocation_id` for command counts. Operation events
 are detail within an invocation, not additional commands. MCP child commands carry
@@ -319,6 +321,15 @@ first-command receipt, so an installation that never runs a user command has non
 Nonproduction opt-outs, offline delivery expiry, and older CLI releases have no verified install
 receipt. Exclude those from claims of complete coverage. Data
 is prospective; deploying the website and releasing the CLI are both required.
+
+**First upload and first share.** `cli_first_upload` and `cli_first_share` carry the
+same installation and acquisition keys as the install receipt and nothing about what
+was uploaded or shared: no content, path, repository, branch, session or link. They
+extend the funnel past registration: verified installation -> first upload -> first
+share, each counted once per installation generation, with the event time measuring
+the time from the install receipt. Statistics turned off, a Hub without an analytics
+destination and offline queues that expire leave them unobserved, as for the install
+receipt.
 
 ## Local campaign attribution
 
