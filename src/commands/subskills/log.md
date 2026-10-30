@@ -61,6 +61,8 @@ has `schema_version: 1`, `repo`, and a `view` discriminator:
 - `turns`: `target` is the frozen repo/commit reference, `head_oid` is the full commit ID,
   and `turns` contains `oid`, `turn`, `kind`, the complete `subject`, `tags`, `code_anchor`,
   `milestone`, and `committed_at` (Unix seconds). Non-turn events have a null `turn`.
+  `total` counts the entries that passed the filters, and `truncated` is true when `-n` kept
+  only the newest of them; text output then starts with a line saying how many were left out.
 - `branches`: `branches` has the same structured records as `agit branch --json`.
   A local branch takes precedence over its origin tracking copy; remote-only branches retain
   their full `refs/remotes/origin/...` reference.

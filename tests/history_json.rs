@@ -274,6 +274,15 @@ fn turn_history_preserves_ids_subjects_tags_and_non_turn_absence() {
     assert_eq!(second["tags"], json!([]));
     assert_eq!(turns.last().unwrap()["kind"], "merge");
     assert_eq!(turns.last().unwrap()["oid"], history.head);
+    assert_eq!(value["total"], 7);
+    assert_eq!(value["truncated"], false);
+    // A limit keeps the newest entries and says how many it left out; without the marker a
+    // caller cannot tell a short history from a truncated one.
+    let limited = history.lab.run(&["--json", "log", "-n", "2"]);
+    assert_eq!(limited["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(limited["turns"][1]["oid"], history.head);
+    assert_eq!(limited["total"], 7);
+    assert_eq!(limited["truncated"], true);
 }
 
 #[test]
