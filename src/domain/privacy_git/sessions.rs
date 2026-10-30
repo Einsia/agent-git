@@ -892,6 +892,19 @@ impl ProjectedHistory {
                         None => original_metadata.clone(),
                     };
                     selected.withhold_fork_source(&mut metadata);
+                    let neutral = match original_metadata
+                        .source_ref
+                        .as_deref()
+                        .filter(|_| metadata.source_ref.is_none())
+                    {
+                        Some(source_ref) => {
+                            let mut commit =
+                                read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+                            neutral_fork_text(source_ref, &mut metadata, &mut commit)
+                                .then_some(commit)
+                        }
+                        None => None,
+                    };
                     let config = if metadata.is_file_line() {
                         None
                     } else {
@@ -914,13 +927,18 @@ impl ProjectedHistory {
                         );
                         imports.add(oid, &parents[oid]);
                         let public = if let Some(delivery) = &selected.delivery {
+                            let delivered = Meta {
+                                milestone: metadata.milestone.clone(),
+                                ..original_metadata.clone()
+                            };
                             let (commit, report) =
                                 delivery.project_snapshot(super::delivery::Snapshot {
                                     source: &source,
                                     destination: &repo,
                                     oid,
+                                    commit: neutral.as_deref(),
                                     parents: &public_parents,
-                                    metadata: &original_metadata,
+                                    metadata: &delivered,
                                     policy: &policy,
                                     aliases,
                                     branch,
@@ -959,6 +977,7 @@ impl ProjectedHistory {
                                 && metadata.source_ref == original_metadata.source_ref
                                 && metadata.source_commit == original_metadata.source_commit
                                 && metadata.fork_origin == original_metadata.fork_origin
+                                && neutral.is_none()
                                 && public_parents == parents[oid]
                             {
                                 oid.clone()
@@ -966,13 +985,14 @@ impl ProjectedHistory {
                                 plain_commit(
                                     &source,
                                     &repo,
-                                    oid,
+                                    (oid, neutral.as_deref()),
                                     &public_parents,
                                     Some(&published),
                                 )?
                             }
-                        } else if public_parents != parents[oid] {
-                            plain_commit(&source, &repo, oid, &public_parents, None)?
+                        } else if neutral.is_some() || public_parents != parents[oid] {
+                            let commit = (oid.as_str(), neutral.as_deref());
+                            plain_commit(&source, &repo, commit, &public_parents, None)?
                         } else {
                             oid.clone()
                         };
@@ -1021,7 +1041,10 @@ impl ProjectedHistory {
                         limit,
                         limit,
                     )?;
-                    let original = read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+                    let original = match &neutral {
+                        Some(commit) => commit.clone(),
+                        None => read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+                    };
                     let committer = SourceCommitter::from_commit(
                         &original,
                         metadata.committer_account.clone(),
@@ -1049,10 +1072,12 @@ impl ProjectedHistory {
                         }
                     };
                     let mut files = projection.prepare_git(&public_session)?;
-                    let key = digest_json(
-                        &json!({"source":oid, "parents":public_parents, "policy":policy_digest,
-                        "config":config, "public":projection.public_value(), "private":projection.private_fingerprint()?}),
-                    )?;
+                    let mut key = json!({"source":oid, "parents":public_parents, "policy":policy_digest,
+                        "config":config, "public":projection.public_value(), "private":projection.private_fingerprint()?});
+                    if neutral.is_some() {
+                        key["commit"] = json!(digest_bytes(&original));
+                    }
+                    let key = digest_json(&key)?;
                     let envelope_bytes = if let Some(public) = cache.commits.get(&key) {
                         let bytes = read(
                             &repo,
@@ -1271,6 +1296,80 @@ fn recorded_on(metadata: &Meta, hub: &str) -> bool {
         .is_some_and(|recorded| recorded == hub)
 }
 
+/// Puts the fork wording agit generates into its neutral form where it names `source_ref`, the
+/// withheld source of the snapshot `metadata` and `commit` describe: the milestone
+/// `fork from <reference>` becomes `fork`, the message `agit: fork <name> from <reference>` becomes
+/// `agit: fork <name>`. Text matches only in that exact form with a `<reference>` that resolves
+/// into the repository and ref `source_ref` names, so a milestone or message the person wrote is
+/// never changed. Returns whether either changed; `commit` holds the published commit bytes.
+fn neutral_fork_text(source_ref: &str, metadata: &mut Meta, commit: &mut Vec<u8>) -> bool {
+    let mut changed = false;
+    if metadata
+        .milestone
+        .as_deref()
+        .and_then(|milestone| milestone.strip_prefix("fork from "))
+        .is_some_and(|reference| names_fork_source(reference, source_ref))
+    {
+        metadata.milestone = Some("fork".into());
+        changed = true;
+    }
+    let Some(boundary) = commit.windows(2).position(|bytes| bytes == b"\n\n") else {
+        return changed;
+    };
+    let neutral = std::str::from_utf8(&commit[boundary + 2..])
+        .ok()
+        .and_then(|message| message.strip_suffix('\n'))
+        .and_then(|message| message.strip_prefix("agit: fork "))
+        .and_then(|rest| rest.split_once(" from "))
+        .filter(|(name, reference)| {
+            !name.is_empty()
+                && !name.contains(char::is_whitespace)
+                && names_fork_source(reference, source_ref)
+        })
+        .map(|(name, _)| format!("agit: fork {name}\n"));
+    if let Some(neutral) = neutral {
+        commit.truncate(boundary + 2);
+        commit.extend_from_slice(neutral.as_bytes());
+        changed = true;
+    }
+    changed
+}
+
+/// Whether `reference`, as `agit fork` or `agit run` was given it, can name the fork point
+/// `source_ref` records: trimmed as the CLI trims it, it parses as one reference, any repository
+/// it writes is the one `source_ref` names, and any ref name it writes is that ref. A fork point
+/// recorded as a bare commit keeps no ref name to compare, so any ref name matches it.
+fn names_fork_source(reference: &str, source_ref: &str) -> bool {
+    use crate::domain::refs::{Base, RepoSel};
+    let Some((repository, point)) = source_ref.split_once('@') else {
+        return false;
+    };
+    let Some((owner, name)) = repository.split_once('/') else {
+        return false;
+    };
+    let point = point.split_once('#').map_or(point, |(point, _)| point);
+    let reference = reference.trim();
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return false;
+    }
+    let Ok(spec) = crate::domain::refs::parse(reference) else {
+        return false;
+    };
+    let repository = match &spec.repo {
+        RepoSel::Context => true,
+        RepoSel::Slug(o, n) => o == owner && n == name,
+        RepoSel::Local(n) => n == name,
+    };
+    let base = match &spec.base {
+        Base::At | Base::Default => true,
+        Base::Name(base) | Base::SessionBranch(base) => {
+            base == point
+                || (point.len() >= 40 && point.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+    };
+    repository && base
+}
+
 /// The repository identity `source` is pinned to, when that pin is on `hub`. An unreadable or
 /// absent pin names nothing.
 fn pinned_source(source: &Repo, hub: &str) -> Option<String> {
@@ -1321,7 +1420,7 @@ fn readable_fork_sources(
 fn plain_commit(
     source: &Repo,
     destination: &Repo,
-    oid: &str,
+    (oid, commit): (&str, Option<&[u8]>),
     parents: &[String],
     metadata: Option<&Meta>,
 ) -> Result<String> {
@@ -1374,7 +1473,10 @@ fn plain_commit(
         // Source objects are imported in a batch before this publication becomes inspectable.
         input(destination, &["mktree", "-z", "--missing"], &output)
     }
-    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+    let original = match commit {
+        Some(commit) => commit.to_vec(),
+        None => read(source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+    };
     let tree = source.git(&["rev-parse", &format!("{oid}^{{tree}}")])?;
     let tree = if let Some(metadata) = metadata {
         let mut value: serde_json::Value = serde_json::from_slice(&read(
@@ -1384,6 +1486,9 @@ fn plain_commit(
         )?)?;
         value["session_privacy"] = serde_json::to_value(&metadata.session_privacy)?;
         value["session"] = json!(metadata.session);
+        if metadata.milestone.is_some() {
+            value["milestone"] = json!(metadata.milestone);
+        }
         let fields = value
             .as_object_mut()
             .context("session metadata must be an object")?;
@@ -2096,9 +2201,13 @@ mod tests {
 
     /// A fork names its source only in that source's own repository, or while an anonymous lookup
     /// on the same Hub finds the source public; `source_ref` and `source_commit` go together, and
-    /// `fork_origin` goes whole, on every snapshot the publication introduces. A projection that
-    /// strips only the branch tip still publishes the fork point beneath it, and one that takes an
-    /// unanswered lookup for a public answer names the private source in another repository.
+    /// `fork_origin` goes whole, on every snapshot the publication introduces. Where they are
+    /// withheld, the fork message and milestone agit wrote take the neutral form, so neither the
+    /// source repository nor its branch is left in any published commit or meta, while the text the
+    /// person wrote is published as written. A projection that strips only the branch tip still
+    /// publishes the fork point beneath it, one that takes an unanswered lookup for a public
+    /// answer names the private source in another repository, and one that leaves display text
+    /// alone names it in the fork's own message.
     #[test]
     fn a_fork_source_is_published_only_to_its_own_repository_or_while_it_is_public() {
         use crate::domain::session_privacy::{
@@ -2123,11 +2232,11 @@ mod tests {
         source.git(&["checkout", "-b", "fork"]).unwrap();
         let home = "00000000-0000-0000-0000-000000000001";
         crate::hub::identity::pin(&source, &RemoteIdentity::new(&hub, home).unwrap()).unwrap();
-        let snapshot = |metadata: &Meta| {
+        let snapshot = |metadata: &Meta, message: &str| {
             meta::write(source.root(), metadata).unwrap();
             crate::domain::storage::write_snapshot(source.root(), "", "").unwrap();
             source.add_all().unwrap();
-            source.commit("snapshot").unwrap();
+            source.commit(message).unwrap();
             source.git(&["rev-parse", "HEAD"]).unwrap()
         };
         let mut base = Meta::new(
@@ -2137,10 +2246,10 @@ mod tests {
         );
         base.committer_account = Some(account.clone());
         base.session_privacy = Some(SessionPrivacy::new(Some(account)).unwrap());
-        let point = snapshot(&base);
+        let point = snapshot(&base, "snapshot");
         let mut forked = base.clone();
         forked.session = format!("agit-{}", "b".repeat(40));
-        forked.source_ref = Some("alice/private@main#1".into());
+        forked.source_ref = Some("alice/private@hidden#1".into());
         forked.source_commit = Some(point.clone());
         let origin = ForkOrigin {
             commit: point.clone(),
@@ -2148,10 +2257,18 @@ mod tests {
             snapshot: None,
         };
         forked.fork_origin = Some(origin.clone());
-        snapshot(&forked);
+        forked.milestone = Some("fork from alice/private@hidden".into());
+        snapshot(&forked, "agit: fork fork from alice/private@hidden");
         forked.turn = Some(2);
-        snapshot(&forked);
-        type Published = (Option<String>, Option<String>, Option<ForkOrigin>);
+        forked.milestone = Some("fork from the review plan".into());
+        snapshot(&forked, "Turn 2: fork from here");
+        type Published = (
+            Option<String>,
+            Option<String>,
+            Option<ForkOrigin>,
+            Option<String>,
+            String,
+        );
         let publish = |destination: &str, agent: &str| -> Vec<Published> {
             let selected = SessionPublicationPlan {
                 identity: RemoteIdentity::new(&hub, agent).unwrap(),
@@ -2196,29 +2313,61 @@ mod tests {
             commits
                 .lines()
                 .map(|commit| {
-                    let metadata =
-                        crate::domain::storage::metadata_local(published.repo.root(), commit)
-                            .unwrap();
+                    let object = published.repo.git(&["cat-file", "commit", commit]).unwrap();
+                    let meta = published
+                        .repo
+                        .git(&["cat-file", "blob", &format!("{commit}:{}", meta::FILE)])
+                        .unwrap();
+                    let metadata: Meta = serde_json::from_str(&meta).unwrap();
+                    let message = object.split_once("\n\n").unwrap().1.to_owned();
+                    let names_source = [object, meta]
+                        .iter()
+                        .any(|text| text.contains("alice/private") || text.contains("hidden"));
+                    assert_eq!(names_source, metadata.source_ref.is_some(), "{commit}");
                     (
                         metadata.source_ref,
                         metadata.source_commit,
                         metadata.fork_origin,
+                        metadata.milestone,
+                        message,
                     )
                 })
                 .collect()
         };
+        let written = (
+            Some("fork from the review plan".to_owned()),
+            "Turn 2: fork from here".to_owned(),
+        );
+        let base = (None, None, None, None, "snapshot".to_owned());
         assert_eq!(
             publish("bob/public", "00000000-0000-0000-0000-000000000002"),
-            [(None, None, None), (None, None, None), (None, None, None)]
+            [
+                (None, None, None, written.0.clone(), written.1.clone()),
+                (
+                    None,
+                    None,
+                    None,
+                    Some("fork".into()),
+                    "agit: fork fork".into()
+                ),
+                base.clone(),
+            ]
         );
-        let kept = (
-            Some("alice/private@main#1".to_owned()),
-            Some(point),
-            Some(origin),
-        );
+        let kept = |(milestone, message): (Option<String>, String)| {
+            let source = Some("alice/private@hidden#1".to_owned());
+            let (commit, origin) = (Some(point.clone()), Some(origin.clone()));
+            (source, commit, origin, milestone, message)
+        };
         assert_eq!(
             publish("alice/private", home),
-            [kept.clone(), kept, (None, None, None)]
+            [
+                kept(written),
+                kept((
+                    Some("fork from alice/private@hidden".into()),
+                    "agit: fork fork from alice/private@hidden".into(),
+                )),
+                base,
+            ]
         );
     }
 
