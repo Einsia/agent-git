@@ -672,19 +672,19 @@ pub(crate) fn materialize_worktree_with_layout(
         LayoutVersion::V0 => {
             let path = root.join(kind.path(layout));
             ensure_regular_file_or_missing(&path)?;
-            let text = read_text_capped(&path, MAX_MATERIALIZED_BYTES)?;
+            let text = read_sequence_file(&path)?;
             canonical_v0(&text).with_context(|| format!("invalid v0 file {}", path.display()))
         }
         LayoutVersion::V1 => {
             let path = root.join(kind.path(layout));
             ensure_regular_file_or_missing(&path)?;
-            let sequence = read_text_capped(&path, MAX_MATERIALIZED_BYTES)?;
+            let sequence = read_sequence_file(&path)?;
             let ids = parse_sequence(&sequence)
                 .with_context(|| format!("invalid v1 sequence {}", path.display()))?;
             if kind == SequenceKind::View {
                 let log_path = root.join(meta::LOG_FILE);
                 ensure_regular_file_or_missing(&log_path)?;
-                let log_sequence = read_text_capped(&log_path, MAX_MATERIALIZED_BYTES)?;
+                let log_sequence = read_sequence_file(&log_path)?;
                 let log_ids = parse_sequence(&log_sequence)
                     .with_context(|| format!("invalid v1 sequence {}", log_path.display()))?;
                 ensure_view_reachable(&ids, &log_ids)?;
@@ -2106,8 +2106,11 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     anyhow::bail!("{} has no parent directory", path.display())
 }
 
-fn read_text_capped(path: &Path, limit: usize) -> Result<String> {
-    let bytes = read_bytes_capped(path, limit)?;
+/// A checked-out LOG or VIEW sequence, bounded as agit bounds a materialized sequence.
+fn read_sequence_file(path: &Path) -> Result<String> {
+    let bytes = read_bytes_within(path, MAX_MATERIALIZED_BYTES, |message| {
+        ReadLimitExceeded(message).into()
+    })?;
     String::from_utf8(bytes).with_context(|| format!("cannot read {} as UTF-8", path.display()))
 }
 
@@ -2150,9 +2153,23 @@ fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata)> 
 }
 
 pub(crate) fn read_bytes_capped(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    read_bytes_within(path, limit, anyhow::Error::msg)
+}
+
+/// `over` builds the error for a file past `limit`. Only agit's own read limits report
+/// `ReadLimitExceeded`: a caller's private cap reported that way would tell an inspector that agit
+/// cannot read a file it reads.
+fn read_bytes_within(
+    path: &Path,
+    limit: usize,
+    over: impl Fn(String) -> anyhow::Error,
+) -> Result<Vec<u8>> {
     let (mut file, metadata) = open_regular_file(path)?;
     if metadata.len() > limit as u64 {
-        anyhow::bail!("{} exceeds the {limit}-byte limit", path.display());
+        return Err(over(format!(
+            "{} exceeds the {limit}-byte limit",
+            path.display()
+        )));
     }
 
     // Read from the same open handle that was inspected above. The extra byte closes the
@@ -2163,7 +2180,10 @@ pub(crate) fn read_bytes_capped(path: &Path, limit: usize) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read {}", path.display()))?;
     if bytes.len() > limit {
-        anyhow::bail!("{} exceeds the {limit}-byte limit", path.display());
+        return Err(over(format!(
+            "{} exceeds the {limit}-byte limit",
+            path.display()
+        )));
     }
     Ok(bytes)
 }

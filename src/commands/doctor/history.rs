@@ -10,9 +10,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 const MAX_ROOTS: usize = 4_096;
 const MAX_COMMITS: usize = 10_000;
 const MAX_OBJECT_READS: usize = 200_000;
-const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
-const MAX_SEQUENCE_EVENTS: usize = 100_000;
 const MAX_FINDINGS: usize = 100;
 const MAX_ROOT_OUTPUT: usize = 1024 * 1024;
 const MAX_TREE_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -81,19 +79,29 @@ struct Limits {
     commits: usize,
     reads: usize,
     object_bytes: usize,
+    event_bytes: usize,
+    expansion_bytes: usize,
     total_bytes: usize,
     sequence_events: usize,
     tree_cache_bytes: usize,
 }
 
 impl Default for Limits {
+    /// One snapshot is bounded as agit's reader bounds it: an event is at most
+    /// `storage::MAX_EVENT_BYTES`, a LOG or VIEW expands to at most `storage::MAX_MATERIALIZED_BYTES`
+    /// over at most `storage::MAX_SEQUENCE_EVENTS` events, and a v0 LOG or VIEW is a single blob of
+    /// up to that size. A tighter bound leaves incomplete a history agit reads; a looser one calls
+    /// valid an object agit refuses. The commit, read and byte budgets bound the walk over the
+    /// whole history, and running out of them also leaves the report incomplete.
     fn default() -> Self {
         Self {
             commits: MAX_COMMITS,
             reads: MAX_OBJECT_READS,
-            object_bytes: MAX_OBJECT_BYTES,
+            object_bytes: storage::MAX_MATERIALIZED_BYTES,
+            event_bytes: storage::MAX_EVENT_BYTES,
+            expansion_bytes: storage::MAX_MATERIALIZED_BYTES,
             total_bytes: MAX_TOTAL_BYTES,
-            sequence_events: MAX_SEQUENCE_EVENTS,
+            sequence_events: storage::MAX_SEQUENCE_EVENTS,
             tree_cache_bytes: MAX_TREE_CACHE_BYTES,
         }
     }
@@ -397,12 +405,17 @@ impl Objects {
     }
 
     fn read(&mut self, oid: &str) -> Checked<(String, Vec<u8>)> {
+        self.read_capped(oid, self.limits.object_bytes)
+    }
+
+    /// `cap` bounds this one object; the read count and the byte budget bound the walk.
+    fn read_capped(&mut self, oid: &str, cap: usize) -> Checked<(String, Vec<u8>)> {
         if self.stopped {
             return Err(Failure::unavailable(
                 "local object inspection stopped before completion",
             ));
         }
-        let result = self.read_object(oid);
+        let result = self.read_object(oid, cap);
         if let Err(error) = result
             && error.message != "reachable history objects are unavailable locally"
         {
@@ -413,7 +426,7 @@ impl Objects {
         result
     }
 
-    fn read_object(&mut self, oid: &str) -> Checked<(String, Vec<u8>)> {
+    fn read_object(&mut self, oid: &str, cap: usize) -> Checked<(String, Vec<u8>)> {
         if !valid_oid(oid) {
             return Err(Failure::invalid("history contains a malformed object id"));
         }
@@ -428,10 +441,13 @@ impl Objects {
             .bytes
             .checked_add(size)
             .ok_or_else(|| Failure::unavailable("history byte budget is exhausted"))?;
-        if size > self.limits.object_bytes || total > self.limits.total_bytes {
+        if size > cap {
             return Err(Failure::unavailable(
-                "history object bytes exceed the inspection limit",
+                "a history object is larger than agit reads",
             ));
+        }
+        if total > self.limits.total_bytes {
+            return Err(Failure::unavailable("history byte budget is exhausted"));
         }
         let (body_kind, body_size) = self.contents.header(oid)?;
         if body_kind != kind || body_size != size {
@@ -516,7 +532,7 @@ impl Objects {
         Ok(())
     }
 
-    fn blob(&mut self, tree: &str, path: &str) -> Checked<Option<Vec<u8>>> {
+    fn blob(&mut self, tree: &str, path: &str, cap: usize) -> Checked<Option<Vec<u8>>> {
         let mut tree = tree.to_owned();
         let mut components = path.split('/').peekable();
         while let Some(component) = components.next() {
@@ -536,7 +552,7 @@ impl Objects {
                         "a historical storage file is not a regular blob",
                     ));
                 }
-                let (kind, body) = self.read(&oid)?;
+                let (kind, body) = self.read_capped(&oid, cap)?;
                 if kind != "blob" {
                     return Err(Failure::invalid("a historical storage file is not a blob"));
                 }
@@ -546,8 +562,8 @@ impl Objects {
         Err(Failure::invalid("a historical storage path is invalid"))
     }
 
-    fn required_blob(&mut self, tree: &str, path: &str) -> Checked<Vec<u8>> {
-        self.blob(tree, path)?.ok_or_else(|| {
+    fn required_blob(&mut self, tree: &str, path: &str, cap: usize) -> Checked<Vec<u8>> {
+        self.blob(tree, path, cap)?.ok_or_else(|| {
             Failure::invalid("a declared session is missing a LOG, VIEW, or referenced event")
         })
     }
@@ -559,7 +575,7 @@ impl Objects {
         {
             return Ok(None);
         }
-        self.blob(tree, meta::FILE)?
+        self.blob(tree, meta::FILE, self.limits.object_bytes)?
             .map(|bytes| {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| Failure::invalid("historical session metadata is not UTF-8"))?;
@@ -1064,9 +1080,9 @@ fn inspect_snapshot(
     }
     *declaration = Declaration::Session;
     match snapshot.layout {
-        meta::LayoutVersion::V0 => check_legacy(objects, tree, false)?,
-        meta::LayoutVersion::V1 => check_current(objects, tree, false)?,
-    };
+        meta::LayoutVersion::V0 => check_legacy(objects, tree)?,
+        meta::LayoutVersion::V1 => check_current(objects, tree)?,
+    }
     report.views += 1;
     Ok(())
 }
@@ -1076,20 +1092,14 @@ fn text(bytes: &[u8]) -> Checked<&str> {
         .map_err(|_| Failure::invalid("historical session storage is not UTF-8"))
 }
 
-struct Content {
-    log: String,
-    view: String,
-}
-
-fn check_legacy(objects: &mut Objects, tree: &str, include_log: bool) -> Checked<Content> {
-    let log = objects.required_blob(tree, meta::LEGACY_LOG_FILE)?;
-    let view = objects.required_blob(tree, meta::LEGACY_VIEW_FILE)?;
+fn check_legacy(objects: &mut Objects, tree: &str) -> Checked<()> {
+    let log = objects.required_blob(tree, meta::LEGACY_LOG_FILE, objects.limits.object_bytes)?;
+    let view = objects.required_blob(tree, meta::LEGACY_VIEW_FILE, objects.limits.object_bytes)?;
     let mut reachable = HashSet::new();
-    let mut canonical_log = String::new();
     for (index, line) in text(&log)?.split_inclusive('\n').enumerate() {
         if index == objects.limits.sequence_events {
             return Err(Failure::unavailable(
-                "historical sequence length exceeds the inspection limit",
+                "a historical LOG or VIEW is longer than agit reads",
             ));
         }
         let envelope = storage::parse_legacy_envelope_line(line)
@@ -1099,15 +1109,12 @@ fn check_legacy(objects: &mut Objects, tree: &str, include_log: bool) -> Checked
             storage::event_id(&canonical)
                 .map_err(|_| Failure::invalid("historical LOG contains an invalid event"))?,
         );
-        if include_log {
-            append_view(&mut canonical_log, &canonical, objects.limits.object_bytes)?;
-        }
     }
     let mut canonical_view = String::new();
     for (index, line) in text(&view)?.split_inclusive('\n').enumerate() {
         if index == objects.limits.sequence_events {
             return Err(Failure::unavailable(
-                "historical sequence length exceeds the inspection limit",
+                "a historical LOG or VIEW is longer than agit reads",
             ));
         }
         let envelope = storage::parse_legacy_envelope_line(line)
@@ -1120,13 +1127,13 @@ fn check_legacy(objects: &mut Objects, tree: &str, include_log: bool) -> Checked
                 "historical VIEW references an event absent from its LOG",
             ));
         }
-        append_view(&mut canonical_view, &canonical, objects.limits.object_bytes)?;
+        append_view(
+            &mut canonical_view,
+            &canonical,
+            objects.limits.expansion_bytes,
+        )?;
     }
-    check_markers(&canonical_view)?;
-    Ok(Content {
-        log: canonical_log,
-        view: canonical_view,
-    })
+    check_markers(&canonical_view)
 }
 
 pub(super) fn legacy_view_only_record(content: &serde_json::Value) -> bool {
@@ -1170,17 +1177,17 @@ pub(super) fn legacy_view_only_record(content: &serde_json::Value) -> bool {
 fn sequence(bytes: &[u8], limit: usize) -> Checked<Vec<String>> {
     if bytes.iter().filter(|byte| **byte == b'\n').count() > limit {
         return Err(Failure::unavailable(
-            "historical sequence length exceeds the inspection limit",
+            "a historical LOG or VIEW is longer than agit reads",
         ));
     }
     storage::parse_sequence(text(bytes)?)
         .map_err(|_| Failure::invalid("historical LOG or VIEW has an invalid event sequence"))
 }
 
-fn check_current(objects: &mut Objects, tree: &str, include_log: bool) -> Checked<Content> {
-    let log = objects.required_blob(tree, meta::LOG_FILE)?;
+fn check_current(objects: &mut Objects, tree: &str) -> Checked<()> {
+    let log = objects.required_blob(tree, meta::LOG_FILE, objects.limits.object_bytes)?;
     let log = sequence(&log, objects.limits.sequence_events)?;
-    let view = objects.required_blob(tree, meta::VIEW_FILE)?;
+    let view = objects.required_blob(tree, meta::VIEW_FILE, objects.limits.object_bytes)?;
     let view = sequence(&view, objects.limits.sequence_events)?;
     let reachable: HashSet<_> = log.iter().collect();
     if view.iter().any(|id| !reachable.contains(id)) {
@@ -1189,17 +1196,9 @@ fn check_current(objects: &mut Objects, tree: &str, include_log: bool) -> Checke
         ));
     }
     let mut verified = HashSet::new();
-    let mut canonical_log = String::new();
     for id in &log {
-        if verified.insert(id) || include_log {
-            let body = event(objects, tree, id)?;
-            if include_log {
-                append_view(
-                    &mut canonical_log,
-                    text(&body)?,
-                    objects.limits.object_bytes,
-                )?;
-            }
+        if verified.insert(id) {
+            event(objects, tree, id)?;
         }
     }
     let mut canonical_view = String::new();
@@ -1208,59 +1207,16 @@ fn check_current(objects: &mut Objects, tree: &str, include_log: bool) -> Checke
         append_view(
             &mut canonical_view,
             text(&body)?,
-            objects.limits.object_bytes,
+            objects.limits.expansion_bytes,
         )?;
     }
-    check_markers(&canonical_view)?;
-    Ok(Content {
-        log: canonical_log,
-        view: canonical_view,
-    })
-}
-
-pub(super) struct StoredSnapshot {
-    pub meta: meta::Meta,
-    pub log: String,
-    pub view: String,
-}
-
-/// Snapshot reads use frozen object ids and never hydrate missing promisor objects.
-pub(super) fn read_snapshot(root: &Path, oid: &str) -> Result<StoredSnapshot, String> {
-    read_snapshot_checked(root, oid).map_err(|error| error.message.to_owned())
-}
-
-fn read_snapshot_checked(root: &Path, oid: &str) -> Checked<StoredSnapshot> {
-    let mut objects = Objects::open(root, Limits::default())?;
-    let (kind, bytes) = objects.read(oid)?;
-    if kind != "commit" {
-        return Err(Failure::unavailable("snapshot object is not a commit"));
-    }
-    let (tree, _) = commit_header(&bytes, oid.len())?;
-    let snapshot = objects
-        .metadata(&tree)?
-        .ok_or_else(|| Failure::invalid("snapshot has no session metadata"))?;
-    let content = if snapshot.is_file_line() {
-        Content {
-            log: String::new(),
-            view: String::new(),
-        }
-    } else {
-        match snapshot.layout {
-            meta::LayoutVersion::V0 => check_legacy(&mut objects, &tree, true)?,
-            meta::LayoutVersion::V1 => check_current(&mut objects, &tree, true)?,
-        }
-    };
-    Ok(StoredSnapshot {
-        meta: snapshot,
-        log: content.log,
-        view: content.view,
-    })
+    check_markers(&canonical_view)
 }
 
 fn event(objects: &mut Objects, tree: &str, id: &str) -> Checked<Vec<u8>> {
     let path = meta::event_path(id)
         .map_err(|_| Failure::invalid("historical storage references an invalid event id"))?;
-    let body = objects.required_blob(tree, &path)?;
+    let body = objects.required_blob(tree, &path, objects.limits.event_bytes)?;
     let actual = storage::event_id(text(&body)?)
         .map_err(|_| Failure::invalid("historical storage contains an invalid event envelope"))?;
     if actual != id {
@@ -1278,7 +1234,7 @@ fn append_view(view: &mut String, line: &str, cap: usize) -> Checked<()> {
         .is_none_or(|size| size > cap)
     {
         return Err(Failure::unavailable(
-            "historical VIEW expansion exceeds the inspection limit",
+            "a historical VIEW is larger than agit reads",
         ));
     }
     view.push_str(line);
@@ -1297,6 +1253,7 @@ fn check_markers(view: &str) -> Checked<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{SessionRoot, ViewVerdict, view_verdict};
     use super::*;
     use crate::domain::repo::Repo;
     use crate::domain::transcript;
@@ -1357,6 +1314,17 @@ mod tests {
             fs::write(self.repo.root().join(meta::LEGACY_LOG_FILE), log).unwrap();
             fs::write(self.repo.root().join(meta::LEGACY_VIEW_FILE), view).unwrap();
             self.record()
+        }
+
+        /// Doctor's view check of `main` as a session branch without a worktree.
+        fn view_by_ref(&self) -> Option<ViewVerdict> {
+            view_verdict(
+                "main",
+                &SessionRoot::Ref {
+                    repo: self.repo.root().to_path_buf(),
+                    branch: "main".into(),
+                },
+            )
         }
 
         fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1535,15 +1503,12 @@ mod tests {
         );
         fs::write(lab.repo.root().join(meta::LEGACY_LOG_FILE), &reordered).unwrap();
         fs::write(lab.repo.root().join(meta::LEGACY_VIEW_FILE), &reordered).unwrap();
-        let head = lab.record();
+        lab.record();
         let report = check(lab.repo.root());
         assert!(!report.incomplete, "{report:?}");
         assert!(report.findings.is_empty(), "{report:?}");
         assert_eq!(report.views, 1);
-        let snapshot = read_snapshot(lab.repo.root(), &head).unwrap();
-        assert_eq!(snapshot.log, envelope);
-        assert_eq!(snapshot.view, envelope);
-        assert_eq!(snapshot.meta.layout, meta::LayoutVersion::V0);
+        assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Ok)));
     }
 
     #[test]
@@ -1567,23 +1532,13 @@ mod tests {
             );
             let summary = summary_envelope("Synthetic summary", "claude-code", &session);
             let view = format!("{start}{log}{summary}{end}");
-            let old = lab.legacy_session(&log, &view);
+            lab.legacy_session(&log, &view);
             let before = lab.files();
-            let stored = read_snapshot(lab.repo.root(), &old).unwrap();
-            assert_eq!(stored.log, log);
-            assert_eq!(stored.view, view);
             assert_eq!(
                 super::super::check_view(lab.repo.root()).unwrap(),
                 Some(super::super::ViewNote::Ok)
             );
-            let by_ref = super::super::SessionRoot::Ref {
-                repo: lab.repo.root().to_path_buf(),
-                branch: "main".into(),
-            };
-            assert_eq!(
-                super::super::check_view_root(&by_ref).unwrap(),
-                Some(super::super::ViewNote::Ok)
-            );
+            assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Ok)));
             assert!(check(lab.repo.root()).findings.is_empty());
             assert_eq!(before, lab.files());
             assert_eq!(
@@ -1599,7 +1554,6 @@ mod tests {
             assert!(!report.incomplete, "{report:?}");
             assert!(report.findings.is_empty(), "{report:?}");
             assert_eq!(report.views, 2);
-            assert_eq!(read_snapshot(lab.repo.root(), &old).unwrap().view, view);
             assert_eq!(before, lab.files());
         }
     }
@@ -1643,7 +1597,7 @@ mod tests {
             assert_eq!(report.findings.len(), 1, "{report:?}");
             assert_eq!(report.findings[0].commit.as_deref(), Some(head.as_str()));
             assert!(report.findings[0].message.contains(message), "{report:?}");
-            assert!(read_snapshot(lab.repo.root(), &head).is_err());
+            assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Problem(_))));
             assert_ne!(
                 super::super::check_view(lab.repo.root()).unwrap(),
                 Some(super::super::ViewNote::Ok)
@@ -1679,7 +1633,7 @@ mod tests {
                     && finding.message.contains("absent from its LOG")),
             "{report:?}"
         );
-        assert!(read_snapshot(lab.repo.root(), &head).is_err());
+        assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Problem(_))));
         assert_eq!(before, lab.files());
     }
 
@@ -1735,6 +1689,136 @@ mod tests {
         assert_eq!(report.findings[0].commit.as_deref(), Some(broken.as_str()));
     }
 
+    /// `--deep` bounds one snapshot exactly as agit's reader does: a bound below the storage
+    /// constant leaves incomplete a history agit reads, one above it calls valid an object agit
+    /// refuses, and a copied constant drifts when storage changes it.
+    #[test]
+    fn snapshot_bounds_are_the_storage_reader_bounds() {
+        let limits = Limits::default();
+        assert_eq!(limits.object_bytes, storage::MAX_MATERIALIZED_BYTES);
+        assert_eq!(limits.event_bytes, storage::MAX_EVENT_BYTES);
+        assert_eq!(limits.expansion_bytes, storage::MAX_MATERIALIZED_BYTES);
+        assert_eq!(limits.sequence_events, storage::MAX_SEQUENCE_EVENTS);
+    }
+
+    /// A session past agit's own read limits is listed as not inspected whether doctor reads it by
+    /// reference or from its checkout: agit does not read it either, so it is neither consistent
+    /// nor broken. A path that loses the reader's error type, or a classifier that matches on
+    /// message text, reports it as unreadable storage instead.
+    #[test]
+    fn a_session_past_agits_read_limits_is_not_inspected_either_way() {
+        let lab = Lab::new();
+        let metadata = meta::Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            "claude-code".into(),
+            "/synthetic".into(),
+        );
+        meta::write(lab.repo.root(), &metadata).unwrap();
+        let raw = format!(
+            "{{\"message\":\"{}\"}}\n",
+            "a".repeat(storage::MAX_EVENT_BYTES)
+        );
+        let line = transcript::wrap_lines(&raw, &metadata.runtime, &metadata.session);
+        let id = storage::canonical_event_id(&line);
+        let event = lab.repo.root().join(meta::event_path(&id).unwrap());
+        fs::create_dir_all(event.parent().unwrap()).unwrap();
+        fs::write(&event, &line).unwrap();
+        for file in [meta::LOG_FILE, meta::VIEW_FILE] {
+            fs::write(lab.repo.root().join(file), format!("{id}\n")).unwrap();
+        }
+        lab.record();
+        for root in [
+            SessionRoot::Worktree(lab.repo.root().to_path_buf()),
+            SessionRoot::Ref {
+                repo: lab.repo.root().to_path_buf(),
+                branch: "main".into(),
+            },
+        ] {
+            let verdict = view_verdict("main", &root);
+            assert!(
+                matches!(verdict, Some(ViewVerdict::NotInspected(_))),
+                "{verdict:?}"
+            );
+        }
+    }
+
+    /// A session whose sequences are longer than any one Git inspection output, but within agit's
+    /// own limits, is consistent both by reference and through its checkout: a check that rereads
+    /// the committed sequences under a smaller private cap reports it as unreadable storage.
+    #[test]
+    fn long_sequences_within_agits_limits_are_consistent_either_way() {
+        let lab = Lab::new();
+        lab.session("{\"message\":\"hello\"}\n");
+        let view = fs::read_to_string(lab.repo.root().join(meta::VIEW_FILE)).unwrap();
+        let repeated = view.repeat(26_000);
+        assert!(repeated.len() > 1024 * 1024);
+        for file in [meta::LOG_FILE, meta::VIEW_FILE] {
+            fs::write(lab.repo.root().join(file), &repeated).unwrap();
+        }
+        lab.record();
+        for root in [
+            SessionRoot::Worktree(lab.repo.root().to_path_buf()),
+            SessionRoot::Ref {
+                repo: lab.repo.root().to_path_buf(),
+                branch: "main".into(),
+            },
+        ] {
+            let verdict = view_verdict("main", &root);
+            assert!(matches!(verdict, Some(ViewVerdict::Ok)), "{verdict:?}");
+        }
+    }
+
+    /// Storage committed as a link where a file belongs is broken storage, whether doctor reads the
+    /// commit by reference or through its checkout: a reader that resolves a path to its blob sees
+    /// valid content behind the link, while the checkout refuses to follow it.
+    #[test]
+    fn linked_storage_is_a_problem_either_way() {
+        for linked in ["view", "event"] {
+            let lab = Lab::new();
+            lab.session("{\"message\":\"hello\"}\n");
+            let path = match linked {
+                "view" => meta::VIEW_FILE.to_owned(),
+                _ => {
+                    let view = fs::read_to_string(lab.repo.root().join(meta::VIEW_FILE)).unwrap();
+                    meta::event_path(view.trim()).unwrap()
+                }
+            };
+            let blob = lab
+                .repo
+                .git(&["rev-parse", &format!("HEAD:{path}")])
+                .unwrap();
+            lab.repo
+                .git(&[
+                    "update-index",
+                    "--cacheinfo",
+                    &format!("120000,{blob},{path}"),
+                ])
+                .unwrap();
+            lab.repo.commit("storage committed as a link").unwrap();
+            lab.repo
+                .git(&["checkout", "-f", "HEAD", "--", &path])
+                .unwrap();
+            assert!(
+                fs::symlink_metadata(lab.repo.root().join(&path))
+                    .unwrap()
+                    .is_symlink()
+            );
+            for root in [
+                SessionRoot::Worktree(lab.repo.root().to_path_buf()),
+                SessionRoot::Ref {
+                    repo: lab.repo.root().to_path_buf(),
+                    branch: "main".into(),
+                },
+            ] {
+                let verdict = view_verdict("main", &root);
+                assert!(
+                    matches!(verdict, Some(ViewVerdict::Problem(_))),
+                    "{linked}: {verdict:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn limits_and_missing_history_are_explicitly_incomplete() {
         let lab = Lab::new();
@@ -1751,6 +1835,14 @@ mod tests {
             },
             Limits {
                 object_bytes: 1,
+                ..Limits::default()
+            },
+            Limits {
+                event_bytes: 1,
+                ..Limits::default()
+            },
+            Limits {
+                expansion_bytes: 1,
                 ..Limits::default()
             },
             Limits {
@@ -1844,12 +1936,14 @@ mod tests {
         assert!(!healthy.incomplete, "{healthy:?}");
         assert!(healthy.findings.is_empty(), "{healthy:?}");
         assert_eq!(healthy.views, 1);
+        let verdict = lab.view_by_ref();
+        assert!(verdict.is_none(), "{verdict:?}");
         let broken = lab.broken_view();
         let report = check(lab.repo.root());
         assert!(!report.incomplete, "{report:?}");
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].commit.as_deref(), Some(broken.as_str()));
-        assert!(read_snapshot(lab.repo.root(), &broken).is_err());
+        assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Problem(_))));
     }
 
     #[test]
@@ -1969,7 +2063,7 @@ mod tests {
             prior_declaration(lab.repo.root(), &session).unwrap(),
             Some(meta::Line::Session)
         );
-        assert!(read_snapshot(lab.repo.root(), &session).is_err());
+        assert!(matches!(lab.view_by_ref(), Some(ViewVerdict::Problem(_))));
         assert!(read_metadata(lab.repo.root(), "HEAD").is_err());
     }
 
@@ -2115,7 +2209,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.incomplete);
-        assert!(error.message.contains("object bytes"));
+        assert!(error.message.contains("larger than agit reads"));
         assert!(!error.message.contains("private metadata sentinel"));
         assert_eq!(
             prior_declaration(lab.repo.root(), &head).unwrap(),
@@ -2435,7 +2529,7 @@ mod tests {
             meta::Line::File
         );
         let error = shared.metadata(&second).unwrap_err();
-        assert!(error.contains("object bytes"), "{error}");
+        assert!(error.contains("byte budget is exhausted"), "{error}");
         assert!(!error.contains("private metadata sentinel"));
         assert!(shared.metadata(&first).is_err());
     }

@@ -519,26 +519,14 @@ pub fn run(args: Args) -> CmdResult {
         // ── View comparison: every event the VIEW references must be reachable in the log ──
         let mut view_ok = 0usize;
         let mut view_errs: Vec<String> = vec![];
+        let mut view_skipped: Vec<String> = vec![];
         for (slug, root) in views {
-            match check_view_root(&root) {
-                    Ok(None) => {}
-                    Ok(Some(ViewNote::Ok)) => view_ok += 1,
-                    Ok(Some(ViewNote::MissingView)) => view_errs.push(format!(
-                        "{slug}: {} present but {} missing",
-                        meta::LOG_FILE,
-                        meta::VIEW_FILE
-                    )),
-                    Ok(Some(ViewNote::Unreachable { count })) => view_errs.push(format!(
-                        "{slug}: VIEW references {count} events the log doesn’t have (VIEW consistency broken)",
-                    )),
-                    Ok(Some(ViewNote::UnbalancedMarkers { count })) => view_errs.push(format!(
-                        "{slug}: merge markers don’t pair up ({count} unclosed)",
-                    )),
-                    Err(error) => view_errs.push(format!(
-                        "{slug}: storage is unreadable: {}",
-                        first_line(&format!("{error:#}"))
-                    )),
-                }
+            match view_verdict(&slug, &root) {
+                None => {}
+                Some(ViewVerdict::Ok) => view_ok += 1,
+                Some(ViewVerdict::Problem(problem)) => view_errs.push(problem),
+                Some(ViewVerdict::NotInspected(note)) => view_skipped.push(note),
+            }
         }
         sp.finish_and_clear();
 
@@ -564,10 +552,11 @@ pub fn run(args: Args) -> CmdResult {
         }
 
         match view_errs.len() {
-            0 if view_ok == 0 => println!(
+            0 if view_ok == 0 && view_skipped.is_empty() => println!(
                 "  {}",
                 ui::dim("no views to compare yet (no repo has a session log)")
             ),
+            0 if view_ok == 0 => {}
             0 => println!(
                 "  {} the VIEW of {view_ok} session branches all reference reachable events",
                 ui::ok(s.check)
@@ -586,10 +575,10 @@ pub fn run(args: Args) -> CmdResult {
                         ui::dim(&format!("… and {} more", view_errs.len() - 8))
                     );
                 }
-                ui::hint(
-                    "doctor only reports: the next version (`agit commit`) rebuilds the VIEW wholesale",
-                );
             }
+        }
+        for skipped in &view_skipped {
+            println!("  {}", ui::dim(skipped));
         }
 
         if !old_layout.is_empty() {
@@ -1119,10 +1108,9 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
         return Ok((check_materialized(lk, &live)?, lineage));
     }
     let live = std::str::from_utf8(&live).context("live transcript is not valid UTF-8")?;
-    let stored = history::read_snapshot(repo.root(), &head)
-        .map_err(anyhow::Error::msg)
-        .context("claimed committed storage is unavailable")?;
-    let committed = committed_content(&stored.log)?;
+    let (log, _) =
+        committed_pair(repo.root(), &head).context("claimed committed storage is unavailable")?;
+    let committed = committed_content(&log)?;
     use crate::domain::privacy::{projector::Mode, service};
     let committed = service::transform(Some(repo.root()), &committed, Mode::HydrateJsonl);
     let live = service::transform(Some(repo.root()), live, Mode::HydrateJsonl);
@@ -1230,10 +1218,15 @@ fn print_live_comparisons(links: &[link::Link]) {
             }
             Err(error) => {
                 unavailable += 1;
-                println!(
-                    "  {identity}: unavailable — {}",
-                    first_line(&format!("{error:#}"))
-                );
+                match error.downcast_ref::<crate::domain::storage::ReadLimitExceeded>() {
+                    Some(limit) => {
+                        println!("  {identity}: not inspected — larger than agit reads ({limit})")
+                    }
+                    None => println!(
+                        "  {identity}: unavailable — {}",
+                        first_line(&format!("{error:#}"))
+                    ),
+                }
             }
         }
     }
@@ -1292,6 +1285,46 @@ fn check_continuity(stored: &str, live: &str) -> crate::Result<ContinuityNote> {
     })
 }
 
+/// What the VIEW check reports for one session branch.
+#[derive(Debug)]
+enum ViewVerdict {
+    Ok,
+    Problem(String),
+    /// Past agit's own read limits neither agit nor doctor reads the session, so nothing about its
+    /// consistency is known.
+    NotInspected(String),
+}
+
+fn view_verdict(slug: &str, root: &SessionRoot) -> Option<ViewVerdict> {
+    let problem = match check_view_root(root) {
+        Ok(None) => return None,
+        Ok(Some(ViewNote::Ok)) => return Some(ViewVerdict::Ok),
+        Ok(Some(ViewNote::MissingView)) => format!(
+            "{slug}: {} present but {} missing",
+            meta::LOG_FILE,
+            meta::VIEW_FILE
+        ),
+        Ok(Some(ViewNote::Unreachable { count })) => format!(
+            "{slug}: VIEW references {count} events the log doesn’t have (VIEW consistency broken)",
+        ),
+        Ok(Some(ViewNote::UnbalancedMarkers { count })) => {
+            format!("{slug}: merge markers don’t pair up ({count} unclosed)")
+        }
+        Err(error) => match error.downcast_ref::<crate::domain::storage::ReadLimitExceeded>() {
+            Some(limit) => {
+                return Some(ViewVerdict::NotInspected(format!(
+                    "{slug}: not inspected, larger than agit reads ({limit})"
+                )));
+            }
+            None => format!(
+                "{slug}: storage is unreadable: {}",
+                first_line(&format!("{error:#}"))
+            ),
+        },
+    };
+    Some(ViewVerdict::Problem(problem))
+}
+
 /// The view-comparison verdict for one repo. No log = nothing to compare against (None).
 ///
 /// The PRD's "doctor" section: VIEW self-consistency = every referenced event is reachable +
@@ -1314,6 +1347,104 @@ enum ViewNote {
     },
 }
 
+/// The first storage path of a committed session that is not a regular file: its LOG and VIEW, and
+/// in the current layout every event they reference. A checkout's reader refuses a link, or any
+/// other non-file, where storage belongs, while Git resolves a link's own blob by path; without
+/// this the same commit would pass by reference and fail through its checkout.
+///
+/// Sequences are read under agit's own sequence limit and the tree is listed as a stream, so this
+/// check sets no bound of its own below the ones the session was already read under.
+fn irregular_committed_storage(
+    git: &Repo,
+    head: &str,
+    layout: meta::LayoutVersion,
+) -> crate::Result<Option<String>> {
+    use std::io::{BufRead as _, Read as _};
+    const MAX_TREE_RECORD_BYTES: u64 = 64 * 1024;
+    let sequences = match layout {
+        meta::LayoutVersion::V0 => [meta::LEGACY_LOG_FILE, meta::LEGACY_VIEW_FILE],
+        meta::LayoutVersion::V1 => [meta::LOG_FILE, meta::VIEW_FILE],
+    };
+    let mut wanted: std::collections::HashSet<String> =
+        sequences.iter().map(|path| (*path).to_owned()).collect();
+    let mut listed = vec!["ls-tree", "-r", "-z", "--full-tree", head, "--"];
+    listed.extend(sequences);
+    if layout == meta::LayoutVersion::V1 {
+        for sequence in sequences {
+            let output = git.inspection_output(
+                &["cat-file", "blob", &format!("{head}:{sequence}")],
+                crate::domain::storage::MAX_MATERIALIZED_BYTES,
+            )?;
+            anyhow::ensure!(
+                output.status.success() && output.stderr.is_empty(),
+                "{sequence} cannot be read"
+            );
+            let text = String::from_utf8(output.stdout)
+                .with_context(|| format!("{sequence} is not UTF-8"))?;
+            for id in crate::domain::storage::parse_sequence(&text)? {
+                wanted.insert(meta::event_path(&id)?);
+            }
+        }
+        listed.push(meta::EVENTS_DIR);
+    }
+    let mut child = git
+        .inspection_command(&listed)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("the committed storage tree cannot be listed")?;
+    let mut entries = std::io::BufReader::new(child.stdout.take().expect("piped tree listing"));
+    let mut found = None;
+    let mut record = Vec::new();
+    let listing = loop {
+        record.clear();
+        match (&mut entries)
+            .take(MAX_TREE_RECORD_BYTES)
+            .read_until(0, &mut record)
+        {
+            Ok(0) => break Ok(()),
+            Ok(_) if record.last() != Some(&0) => {
+                break Err(anyhow::anyhow!("git listed a malformed tree entry"));
+            }
+            Ok(_) => {}
+            Err(error) => break Err(error.into()),
+        }
+        let Some((header, path)) = std::str::from_utf8(&record[..record.len() - 1])
+            .ok()
+            .and_then(|record| record.split_once('\t'))
+        else {
+            break Err(anyhow::anyhow!("git listed a malformed tree entry"));
+        };
+        let mode = header.split(' ').next().unwrap_or_default();
+        if wanted.contains(path) && !matches!(mode, "100644" | "100755") {
+            found = Some(path.to_owned());
+            break Ok(());
+        }
+    };
+    if found.is_some() || listing.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .context("the committed storage tree listing did not finish")?;
+    listing?;
+    anyhow::ensure!(
+        found.is_some() || status.success(),
+        "the committed storage tree cannot be listed"
+    );
+    Ok(found)
+}
+
+/// A committed LOG and VIEW, read by the materializer and limits agit itself reads them with. A
+/// smaller doctor budget would report as unreadable a session that agit commits and pushes, and a
+/// checked-out branch, read from its files under these limits, would pass where the same commit
+/// read by reference fails.
+fn committed_pair(repo: &Path, commit: &str) -> crate::Result<(String, String)> {
+    use crate::domain::storage::{MAX_MATERIALIZED_BYTES, materialize_pair_local};
+    materialize_pair_local(repo, commit, MAX_MATERIALIZED_BYTES, MAX_MATERIALIZED_BYTES)
+}
+
 #[cfg(test)]
 fn check_view(repo_root: &Path) -> crate::Result<Option<ViewNote>> {
     check_view_root(&SessionRoot::Worktree(repo_root.to_path_buf()))
@@ -1327,11 +1458,23 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
             "--verify",
             &format!("refs/heads/{branch}^{{commit}}"),
         ])?;
-        let stored = history::read_snapshot(repo, &head).map_err(anyhow::Error::msg)?;
-        if stored.meta.is_file_line() || stored.meta.session.is_empty() {
+        let Some(snapshot) = history::read_metadata(repo, &head).map_err(anyhow::Error::msg)?
+        else {
+            return Ok(None);
+        };
+        if snapshot.is_file_line() {
             return Ok(None);
         }
-        return check_view_content(&stored.log, &stored.view, stored.meta.layout);
+        // A declared session's committed pair is read before its session is bound, so storage
+        // agit cannot read is reported even where there is no consistency to check yet.
+        let (log, view) = committed_pair(repo, &head)?;
+        if let Some(path) = irregular_committed_storage(&git, &head, snapshot.layout)? {
+            anyhow::bail!("{path} is not a regular file");
+        }
+        if snapshot.session.is_empty() {
+            return Ok(None);
+        }
+        return check_view_content(&log, &view, snapshot.layout);
     }
     let Some(snapshot) = root.meta()? else {
         return Ok(None);
