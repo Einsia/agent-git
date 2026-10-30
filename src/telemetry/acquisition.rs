@@ -426,22 +426,32 @@ pub fn save_login_with(
 
 pub(crate) fn enqueue_pending_link(hub: &str) -> anyhow::Result<()> {
     let preferences = state::read()?;
-    if !state::enabled(&preferences, hub) || preferences.acquisition_completed || state::debug(hub)
-    {
-        return Ok(());
-    }
-    let Some(destination) = Destination::for_hub(hub) else {
+    let Some((event, destination)) = pending_link(hub, &preferences) else {
         return Ok(());
     };
+    transport::enqueue(event, preferences.generation, &destination)
+}
+
+/// The caller holds the state gate.
+pub(crate) fn enqueue_pending_link_locked(hub: &str, dir: &std::path::Path) -> anyhow::Result<()> {
+    let preferences = state::read_at(dir)?;
+    let Some((event, destination)) = pending_link(hub, &preferences) else {
+        return Ok(());
+    };
+    transport::enqueue_locked(dir, event, preferences.generation, &destination)
+}
+
+/// The link still owed for the first account saved after an acquisition, if any.
+fn pending_link(hub: &str, preferences: &state::Preferences) -> Option<(Event, Destination)> {
+    if !state::enabled(preferences, hub) || preferences.acquisition_completed || state::debug(hub) {
+        return None;
+    }
+    let destination = Destination::for_hub(hub)?;
     if preferences.acquisition_route.as_ref() != Some(&destination.route) {
-        return Ok(());
+        return None;
     }
-    let Some(first) = &preferences.first_acquisition_account else {
-        return Ok(());
-    };
-    let Some(account) = &first.account_id else {
-        return Ok(());
-    };
+    let first = preferences.first_acquisition_account.as_ref()?;
+    let account = first.account_id.as_ref()?;
     let mut properties = json!({
         "schema_version": 1, "client_type": "cli", "cli_version": super::build_version(),
         "source": "direct", "ci": first.ci, "channel": preferences.channel,
@@ -450,20 +460,17 @@ pub(crate) fn enqueue_pending_link(hub: &str) -> anyhow::Result<()> {
         "deployment_env": destination.environment, "event_id": first.event_id,
         "event_ts": first.saved_at.timestamp_millis(), "$process_person_profile": true, "$geoip_disable": true
     }).as_object().unwrap().clone();
-    extend_properties(&preferences, &mut properties);
-    transport::enqueue(
-        Event {
-            event: EventName::AcquisitionLinked,
-            uuid: first.event_id,
-            distinct_id: if destination.environment == "production" {
-                account.clone()
-            } else {
-                format!("{}:{account}", destination.environment)
-            },
-            timestamp: first.saved_at,
-            properties,
+    extend_properties(preferences, &mut properties);
+    let event = Event {
+        event: EventName::AcquisitionLinked,
+        uuid: first.event_id,
+        distinct_id: if destination.environment == "production" {
+            account.clone()
+        } else {
+            format!("{}:{account}", destination.environment)
         },
-        preferences.generation,
-        &destination,
-    )
+        timestamp: first.saved_at,
+        properties,
+    };
+    Some((event, destination))
 }

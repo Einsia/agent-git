@@ -10,6 +10,10 @@ use std::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_agit");
+/// The window in which a flush that does not wait for a held state gate finishes; one that waits
+/// is still running at its end. It only gives a wrong flush time to show itself, so a correct one
+/// passes however long it lasts.
+const UNGATED_WINDOW: Duration = Duration::from_secs(2);
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -69,11 +73,14 @@ impl Fixture {
         self.preference(false);
     }
     fn preference(&self, enabled: bool) {
-        std::fs::create_dir_all(self.path("")).unwrap();
         // The choice is made under the state gate, as the product makes it. A flush worker left
         // behind by an earlier run holds the gate across its read and its write of the queue;
         // without the gate, that write can land after the removal below and restore the queue.
         let _gate = self.gate();
+        self.choose(enabled);
+    }
+    /// Writes the choice the way the product's opt-out does; the caller holds the state gate.
+    fn choose(&self, enabled: bool) {
         let previous: Value = std::fs::read(self.path("preferences.json"))
             .ok()
             .and_then(|body| serde_json::from_slice(&body).ok())
@@ -678,13 +685,13 @@ fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() 
         .output()
         .unwrap();
     // An opt-out cannot be undone by a flush still running from an earlier command only because
-    // every queue write happens under the gate the opt-out takes. With the gate held, a flush
-    // must leave the queue file as it is; one that wrote around the gate replaces it. It must
-    // also refuse the held gate rather than wait for it. A refusal returns at once, while a wait
-    // lasts the whole state-lock wait before it gives up, so a bound below that wait tells the
-    // two apart.
+    // every queue write happens under the gate the opt-out takes, and the flush reads the choice
+    // under that gate. While the opt-out holds the gate, a flush must leave the queue file as it
+    // is; one that writes around the gate replaces it within the window. Once the opt-out
+    // releases the gate, a flush waiting for it must write nothing; one that read the choice
+    // before the gate writes the queue the opt-out removed.
     {
-        let _gate = f.gate();
+        let gate = f.gate();
         let before = f.queue_file();
         let flush = f
             .command()
@@ -695,15 +702,13 @@ fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() 
             .unwrap();
         let (done, finished) = mpsc::channel();
         std::thread::spawn(move || done.send(flush.wait_with_output()));
-        assert!(
-            finished
-                .recv_timeout(agit::infra::local_state::LOCK_WAIT / 2)
-                .is_ok(),
-            "a flush waited for the held gate"
-        );
+        let early = finished.recv_timeout(UNGATED_WINDOW).ok();
         assert_eq!(f.queue_file(), before);
+        f.choose(false);
+        drop(gate);
+        early.unwrap_or_else(|| finished.recv().unwrap()).unwrap();
+        assert_eq!(f.queue_file(), None, "a flush wrote after the opt-out");
     }
-    f.disable();
     f.run(&["--internal-install-completed"]);
     assert!(f.events().is_empty());
     f.enable();
@@ -910,6 +915,11 @@ fn official_installation_keys_do_not_cross_into_another_hubs_authorization_url()
     }
 }
 
+/// The first account saved after an acquisition is linked exactly once: a login that meets a held
+/// state gate and a queue it cannot read still leaves the link owed, and the flush worker waits for
+/// a held gate and queues the link after its release. A worker that gives up on a busy gate is
+/// caught when it exits inside the observation window; one that links every saved account credits
+/// the second sign-in as well.
 #[test]
 fn the_first_saved_account_survives_a_busy_collector_and_a_broken_queue() {
     let hub = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -958,8 +968,17 @@ fn the_first_saved_account_survives_a_busy_collector_and_a_broken_queue() {
         }
         assert_eq!(preferences["acquisition_completed"], false);
     }
+    let held = f.gate();
     std::fs::remove_file(f.path("queue.json")).unwrap();
-    f.run(&["--internal-telemetry-flush"]);
+    let mut flush = f
+        .command()
+        .arg("--internal-telemetry-flush")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(UNGATED_WINDOW);
+    assert!(flush.try_wait().unwrap().is_none());
+    drop(held);
+    assert!(flush.wait().unwrap().success());
     let linked: Vec<_> = f
         .events()
         .into_iter()

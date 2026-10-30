@@ -306,12 +306,15 @@ fn flush_inner(installation_attempt: Option<uuid::Uuid>) -> Result<()> {
         return Ok(());
     }
     state::enforce(&hub)?;
-    let _ = super::acquisition::enqueue_pending_link(&hub);
     let Some(destination) = Destination::for_hub(&hub) else {
         return Ok(());
     };
     let dir = state::directory()?;
-    let _guard = state::gate(&dir, installation_attempt.is_some())?;
+    // A flush that finds the gate busy runs after the holder: giving up would leave the owed link
+    // and the queue to a later flush that nothing guarantees will start. The wait is bounded, so a
+    // stuck holder leaves the state for a later sender instead of piling up waiting ones.
+    let _guard = state::gate(&dir, true)?;
+    let _ = super::acquisition::enqueue_pending_link_locked(&hub, &dir);
     let preferences = state::read_at(&dir)?;
     if !state::enabled(&preferences, &destination.hub) {
         return Ok(());
