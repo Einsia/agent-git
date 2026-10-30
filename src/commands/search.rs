@@ -279,6 +279,13 @@ pub fn run(mut args: Args) -> CmdResult {
                     ui::warning(
                         "local history search is incomplete; missing or bounded evidence may contain additional matches",
                     );
+                    for detail in result["incomplete_details"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        ui::hint(detail["message"].as_str().unwrap_or_default());
+                    }
                 }
             }
         }
