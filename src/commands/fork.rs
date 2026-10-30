@@ -263,7 +263,8 @@ pub fn fork_branch(
     // This commit establishes a new branch identity; it is not another user turn even when the
     // source tip's last commit was one. Backends use `kind` to build the turn timeline.
     snap.kind = meta::Kind::File;
-    snap.milestone = Some(format!("fork from {source_desc}"));
+    // The source is named only by `source_ref`, which a publication keeps or withholds by rule.
+    snap.milestone = Some("fork".into());
     snap.layout = meta::LayoutVersion::CURRENT;
     let snap_text = meta::to_text(&snap)?;
 
@@ -279,12 +280,8 @@ pub fn fork_branch(
             ("privacy/envelope.json", None),
         ],
     )?;
-    let commit = super::plumbing::commit_tree(
-        repo,
-        &tree,
-        &[base_sha],
-        &format!("agit: fork {new_name} from {source_desc}"),
-    )?;
+    let commit =
+        super::plumbing::commit_tree(repo, &tree, &[base_sha], &format!("agit: fork {new_name}"))?;
     // CAS: the branch must not exist (checked above; this is the real guarantee).
     super::plumbing::update_ref_cas(repo, &format!("refs/heads/{new_name}"), &commit, None)?;
     Ok(Some(commit))
@@ -358,6 +355,9 @@ mod tests {
         );
     }
 
+    /// The fork tip is written in the current layout with the source's full context, and names its
+    /// source only through `source_ref`: a message or milestone that spelled out the reference
+    /// would carry a private source into every publication that withholds `source_ref`.
     #[test]
     fn forking_a_v0_history_point_writes_a_v1_tip_without_losing_context() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,8 +410,15 @@ mod tests {
             name: Some("main".into()),
         };
 
-        let fork = fork_branch(&base, "main", "forked").unwrap().unwrap();
+        let fork = fork_branch(&base, "local/repo@main", "forked")
+            .unwrap()
+            .unwrap();
         let fork_meta = meta::read_at_ref(&base.repo, &fork).unwrap();
+        assert_eq!(fork_meta.milestone.as_deref(), Some("fork"));
+        assert_eq!(
+            base.repo.git(&["log", "-1", "--format=%B", &fork]).unwrap(),
+            "agit: fork forked"
+        );
         assert!(
             base.repo
                 .show_raw(&base.resolved.sha, super::super::branch::SEAL_FILE)

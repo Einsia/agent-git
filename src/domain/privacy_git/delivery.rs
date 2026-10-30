@@ -190,6 +190,8 @@ pub(super) struct Snapshot<'a> {
     pub source: &'a Repo,
     pub destination: &'a Repo,
     pub oid: &'a str,
+    /// The commit bytes to publish when the publication rewrote its text; otherwise `oid`'s own.
+    pub commit: Option<&'a [u8]>,
     pub parents: &'a [String],
     pub metadata: &'a Meta,
     pub policy: &'a PrivacyPolicy,
@@ -207,6 +209,7 @@ impl Delivery {
             source,
             destination,
             oid,
+            commit,
             parents,
             metadata,
             policy,
@@ -276,7 +279,10 @@ impl Delivery {
             entries.push(0);
         }
         let tree = input(destination, &["mktree", "-z", "--missing"], &entries)?;
-        let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+        let original = match commit {
+            Some(commit) => commit.to_vec(),
+            None => read(source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+        };
         let body =
             attributed_commit_body(&tree, parents, &original, target.committer_account.as_ref())?;
         Ok((
@@ -389,6 +395,7 @@ mod tests {
                 source: &source,
                 destination: &destination,
                 oid: oid.trim(),
+                commit: None,
                 parents: &[],
                 metadata: &metadata,
                 policy: &PrivacyPolicy::default(),
