@@ -51,15 +51,6 @@ pub(crate) struct MissingAcceptedObjects {
     pub published: String,
 }
 
-/// The accepted ledger is local bookkeeping that only agit writes, so no user command repairs
-/// it; deleting it or publishing again could republish commits under new public ids. Its
-/// refusal therefore asks for a report instead of naming a recovery.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "this checkout's record of what it already published to the Hub is missing or does not match its commits, so agit cannot tell which commits are already public. Your local commits are unchanged. This is most likely a bug in agit, not something you did, and running the command again will not fix it. Keep this checkout as it is and report the problem with this message and the output of `agit status`"
-)]
-pub(crate) struct InconsistentAcceptedMapping;
-
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cache {

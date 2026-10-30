@@ -244,10 +244,7 @@ fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
             "{error}"
         );
         assert!(!error.contains("agit pull"), "{error}");
-        assert!(
-            !error.contains(&accepted::Inconsistent.to_string()),
-            "{error}"
-        );
+        assert!(!error.contains(accepted::RECOVERY), "{error}");
     }
     // A Hub tip that is not here leaves this checkout merely behind when the last fetched remote
     // branch already holds its head; reading every unknown tip as divergence would hide `pull`.
@@ -279,10 +276,7 @@ fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
     source.commit("Session").unwrap();
     let error = check(&peer).unwrap_err().to_string();
     assert!(error.contains("agit fork team/wiki@wiki"), "{error}");
-    assert!(
-        !error.contains(&accepted::Inconsistent.to_string()),
-        "{error}"
-    );
+    assert!(!error.contains(accepted::RECOVERY), "{error}");
 }
 
 /// Mixed admission preserves accepted bytes and scopes each new ciphertext to its own session.
@@ -1343,7 +1337,7 @@ fn ledger_admits_left_out_ancestry_only_below_accepted_or_identity_mappings() {
         let child = mapping('e', '5', Some(parent), true);
         let refused = prepare(branch, ('e', '5'), vec![boundary, child]).unwrap_err();
         assert!(
-            refused.downcast_ref::<accepted::Inconsistent>().is_some(),
+            refused.to_string().contains(accepted::RECOVERY),
             "{refused:#}"
         );
     }
