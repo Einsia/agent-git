@@ -1009,7 +1009,8 @@ impl Lab {
     }
 }
 
-/// Session entry reports retained Archive identity without making it an ordinary writable claim.
+/// Session entry leaves a retained Archive identity as it is, never making it an ordinary writable
+/// claim, whether or not its role is still valid, and tells the model nothing about it.
 #[test]
 fn archive_ingest_preserves_exact_role_context_without_rewriting_authority() {
     let lab = Lab::new(true);
@@ -1030,20 +1031,11 @@ fn archive_ingest_preserves_exact_role_context_without_rewriting_authority() {
         command.env("AGIT_SESSION", "alice/source@source");
         let output = lab.hook_payload(command, payload.to_string().as_bytes());
         assert!(output.status.success(), "{output:?}");
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        assert!(output.stdout.is_empty(), "{output:?}");
     };
     for source in ["startup", "resume"] {
         let before = lab.facts();
-        let response = ingest(source);
-        let context = response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert!(context.contains("'alice/target@work'"), "{response}");
-        assert!(
-            context.contains("Do not import this session again"),
-            "{response}"
-        );
-        assert!(!context.contains("alice/source@source"), "{response}");
+        ingest(source);
         assert_eq!(lab.facts(), before);
     }
     for change in ["superseded", "owner", "branch", "generation"] {
@@ -1060,18 +1052,7 @@ fn archive_ingest_preserves_exact_role_context_without_rewriting_authority() {
             invalid.to_json().unwrap().as_bytes(),
         );
         let before = lab.facts();
-        let response = ingest("resume");
-        let context = response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert!(
-            context.contains("no active agit branch"),
-            "{change}: {response}"
-        );
-        assert!(
-            !context.contains("'alice/target@work'"),
-            "{change}: {response}"
-        );
+        ingest("resume");
         assert_eq!(lab.facts(), before, "{change}");
     }
 }

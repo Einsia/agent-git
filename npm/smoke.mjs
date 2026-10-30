@@ -126,11 +126,11 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
   if (existsSync(installed)) {
     const v = spawnSync(installed, ['--version'], { encoding: 'utf8', env })
     check('installed binary runs', v.status === 0, `${v.status} ${v.stderr}`)
-    // at least one of what setup persists (the skill, the AGENTS.md marker block) must be there
     check('agit setup ran (skills marker exists)',
-      existsSync(join(home, '.claude', 'skills', 'agit', 'SKILL.md')) ||
-      existsSync(join(home, '.claude', 'agents.md')) ||
-      existsSync(join(home, 'AGENTS.md')))
+      existsSync(join(home, '.claude', 'skills', 'agit', 'SKILL.md')))
+    // The installer ran in the home folder; an AGENTS.md section there would reach every
+    // conversation under it (CLI #198, #211).
+    check('setup writes no AGENTS.md into the folder it runs in', !existsSync(join(home, 'AGENTS.md')))
     check('setup persists usage-statistics preferences', existsSync(preferences), r.stderr)
     if (existsSync(preferences)) {
       const saved = JSON.parse(readFileSync(preferences, 'utf8'))

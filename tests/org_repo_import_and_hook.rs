@@ -446,21 +446,12 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let response: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("SessionStart must return one hook response: {e}"));
-    // The identity reaches the agent and the environment, never the conversation's title: agit
-    // does not name a Claude Code conversation, with or without a title of its own.
+    // The identity reaches the environment only: neither the model's context nor the
+    // conversation's title hears of it, since agit does not name a Claude Code conversation.
     assert!(
-        response["hookSpecificOutput"].get("sessionTitle").is_none(),
-        "{response}"
-    );
-    let context = response["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(context.contains("einsia/qa@work"), "{response}");
-    assert!(
-        context.contains("Do not import this session again"),
-        "{response}"
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
     );
     let written = fs::read_to_string(&env_file).unwrap();
     assert!(
@@ -475,13 +466,10 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         &[("source", "resume"), ("session_title", "My chosen name")],
         &[],
     );
-    let response: serde_json::Value = serde_json::from_slice(&native.stdout).unwrap();
-    assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
     assert!(
-        response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("einsia/qa@work")
+        native.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&native.stdout)
     );
 }
 

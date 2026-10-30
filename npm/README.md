@@ -24,7 +24,8 @@ Two package names, one CLI:
 the platform sub-package matching your `os`/`cpu` via `optionalDependencies`
 (`@einsia/agent-git-linux-x64` and friends), the `agit` bin is a Node shim
 that execs that binary with argv/stdio/exit-code forwarded, and on a global install
-`postinstall` runs `agit setup` once to wire skills, hooks, MCP and AGENTS.md. A local
+`postinstall` runs `agit setup` once to wire skills, hooks and MCP; it writes no AGENTS.md
+into any folder (`agit setup --agents-md` adds the section to a project on request). A local
 install (a project dependency, or `npm install --prefix <dir>`) and `npx` configure nothing
 and record no installation: their binary goes away with that folder, so run `agit setup`
 yourself from a durable install if you want the integrations.

@@ -90,10 +90,8 @@ Resume retains the existing cwd comparison choices: continue, continue with an
 environment notice, or cancel. Different or uncertain comparable states require
 an explicit choice; unattended calls exit with code 8 unless `--yes` is supplied.
 `--yes` continues without the CLI notice. A non-Git directory warns and continues.
-Selecting the notice appends it to Claude system instructions. Configured native
-SessionStart hooks provide historical context independently of that CLI choice.
-Codex uses trusted AgentGit hooks, preserving configured developer instructions
-and the user's prompt.
+Selecting the notice appends it to Claude system instructions. SessionStart
+hooks add nothing to the model's context.
 The hook also covers native TUI session changes, supplies the active explicit
 AgentGit identity and historical state, and preserves a user's session title.
 Unclaimed runtime sessions stay available for explicit naming/adoption.

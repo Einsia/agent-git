@@ -187,10 +187,10 @@ the session in the inbox for next time. `x` records a persistent dismissal, for
 sessions that should never enter version control. The runtime is part of every
 identity, so equal ids from two runtime indexes are never conflated.
 
-SessionStart hooks also tell the agent the state while the runtime owns the
-terminal: a managed session learns its `<owner/repo>@<branch>`, and an
-unmanaged one gets the explicit `agit import` form in case the user asks to save
-the conversation. The hooks never name a session. The runtime's own title, the
+SessionStart hooks tell the agent nothing while the runtime owns the terminal:
+an agent that needs the session's state runs `agit`, which names the
+conversation from the runtime's own session variable. The hooks never name a
+session. The runtime's own title, the
 one it generates or the one the user chose, is the session's name everywhere
 agit shows it. A Claude Code session that an earlier agit named `agit: unnamed`
 or `agit <owner/repo>@<branch>` gets Claude Code's own title back the next time

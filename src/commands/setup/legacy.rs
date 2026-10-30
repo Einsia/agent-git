@@ -6,6 +6,16 @@ use sha2::{Digest, Sha256};
 /// Only standalone, versioned blocks outside Markdown fences belong to the installer.
 /// Nested or incomplete markers cannot establish a safe deletion boundary.
 pub(super) fn without_versioned_blocks(text: &str, begin: &str, end: &str) -> Option<String> {
+    without_blocks(text, begin, end, true)
+}
+
+/// The short sections `setup --agents-md` writes: standalone blocks outside Markdown fences that
+/// carry no skill version, under the same boundary rules as [`without_versioned_blocks`].
+pub(super) fn without_sections(text: &str, begin: &str, end: &str) -> Option<String> {
+    without_blocks(text, begin, end, false)
+}
+
+fn without_blocks(text: &str, begin: &str, end: &str, versioned_wanted: bool) -> Option<String> {
     let mut offset = 0;
     let mut start = None;
     let mut depth = 0;
@@ -56,7 +66,12 @@ pub(super) fn without_versioned_blocks(text: &str, begin: &str, end: &str) -> Op
                 && depth > 0
             {
                 depth -= 1;
-                if depth == 0 && selected && content == end && versioned && !nested {
+                if depth == 0
+                    && selected
+                    && content == end
+                    && versioned == versioned_wanted
+                    && !nested
+                {
                     ranges.push(start.take().unwrap()..offset + line.len());
                 }
             } else if depth > 0
@@ -84,13 +99,26 @@ pub(super) fn without_versioned_blocks(text: &str, begin: &str, end: &str) -> Op
 }
 
 pub(super) fn remove(path: &Path, begin: &str, end: &str) -> io::Result<Option<PathBuf>> {
+    remove_with(path, |text| without_versioned_blocks(text, begin, end))
+}
+
+/// [`remove`] for the short sections ([`without_sections`]).
+pub(super) fn remove_sections(path: &Path, begin: &str, end: &str) -> io::Result<Option<PathBuf>> {
+    remove_with(path, |text| without_sections(text, begin, end))
+}
+
+/// Rewrites the file without what `select` drops, keeping a backup of the original next to it.
+fn remove_with(
+    path: &Path,
+    select: impl Fn(&str) -> Option<String>,
+) -> io::Result<Option<PathBuf>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let existing = std::fs::read_to_string(path)?;
-    let Some(updated) = without_versioned_blocks(&existing, begin, end) else {
+    let Some(updated) = select(&existing) else {
         return Ok(None);
     };
     if !metadata.file_type().is_file() {
@@ -176,6 +204,26 @@ mod tests {
                 "{original}"
             );
         }
+    }
+
+    /// The section `--agents-md` writes is the unversioned block. Removing it keeps the user's own
+    /// text, a versioned skill block (removed only once a native skill has replaced it) and an
+    /// example inside a fence.
+    #[test]
+    fn removing_a_section_keeps_everything_else() {
+        let (begin, end) = ("<!-- agit:begin -->", "<!-- agit:end -->");
+        let section = format!("{begin}\n## Session version control (agit)\nrules\n{end}\n");
+        let versioned = format!("{begin}\n<!-- agit:skill-version:old -->\nold\n{end}\n");
+        let fenced = format!("```md\n{section}```\n");
+        let text = format!("mine\n{section}{versioned}{fenced}");
+        assert_eq!(
+            without_sections(&text, begin, end),
+            Some(format!("mine\n{versioned}{fenced}"))
+        );
+        assert_eq!(
+            without_sections(&format!("mine\n{versioned}"), begin, end),
+            None
+        );
     }
 
     #[test]

@@ -180,7 +180,9 @@ async function main() {
     dim(`note: your shell selects another agit at ${selected}; put ${targetDir} first on PATH or invoke ${target} directly`)
   }
 
-  // "installed by default at download time": hooks + skill + MCP + AGENTS.md in one pass. A
+  // "installed by default at download time": hooks + skill + MCP in one pass, and nothing written
+  // into the folder the installer runs in (no AGENTS.md section; `agit setup --agents-md` does that
+  // in a project on request). A
   // failure does not block the install itself — the binary is already there, and setup can be
   // re-run by hand later.
   spawnSync(target, ['--internal-install-completed', '--defer-notice'], {
@@ -201,7 +203,7 @@ async function main() {
   report('setup', setup.status === 0 ? 'ok' : 'error', integrating, setup.status === 0 ? 'none' : 'integration')
   await finish(setup.status === 0 ? 'ok' : 'partial', setup.status === 0 ? 'none' : 'integration')
   if (setup.status === 0) {
-    ok('integrations installed (skills · hooks · MCP · AGENTS.md)')
+    ok('integrations installed (skills · hooks · MCP)')
   } else {
     dim('`agit setup` did not fully succeed — re-run it later; the CLI itself is installed.')
   }
