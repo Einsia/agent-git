@@ -13,6 +13,8 @@ const LIVE_BUDGET: Duration = Duration::from_millis(750);
 const DURABLE_BASE: Duration = Duration::from_secs(5);
 const DURABLE_PER_MIB: Duration = Duration::from_secs(1);
 const DURABLE_CAP: Duration = Duration::from_secs(60);
+/// A viewer's text waits a moment for the worker, so one caller ahead of it does not withhold it.
+const LIVE_LOCK_WAIT: Duration = Duration::from_millis(250);
 /// How long a new worker may take to load a repository's dictionary and policy. It is spent
 /// before, and apart from, any caller's budget.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
@@ -33,6 +35,15 @@ pub(crate) enum Budget {
 }
 
 impl Budget {
+    /// How long a caller waits for another caller in this process to finish with the worker.
+    /// Durable callers do not wait here: each has its own retry.
+    fn lock_wait(self) -> Duration {
+        match self {
+            Self::Live => LIVE_LOCK_WAIT,
+            Self::Durable => Duration::ZERO,
+        }
+    }
+
     fn for_input(self, bytes: usize) -> Duration {
         match self {
             Self::Live => LIVE_BUDGET,
@@ -285,6 +296,39 @@ impl Drop for Process {
 struct State {
     process: Option<Process>,
     failed_until: Option<Instant>,
+}
+
+/// The worker state, once no other caller in this process holds it, or `None` after `wait`.
+fn lock_within(wait: Duration) -> Option<std::sync::MutexGuard<'static, State>> {
+    let until = Instant::now() + wait;
+    loop {
+        match shared().try_lock() {
+            Ok(state) => return Some(state),
+            // A caller panicked while it held the worker, maybe with a request in flight: the
+            // worker is not trusted with another one, and the next caller starts a new one.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                shared().clear_poison();
+                if let Some(process) = &mut state.process {
+                    process.terminate();
+                }
+                state.failed_until = Some(Instant::now());
+                return Some(state);
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+/// What the policy the worker checks `repo`'s content under is loaded from, as of now, or `None`
+/// when that cannot be read. Two equal stamps mean the same policy, so a result checked under one
+/// may be used again while the stamp is unchanged; a new rule, decision, account or allowlist
+/// changes it.
+pub(crate) fn policy_stamp(repo: Option<&Path>) -> Option<u64> {
+    worker::policy_stamp(repo).ok()
 }
 
 /// Wait until a worker that failed may be started again, at most one back-off.
@@ -568,7 +612,7 @@ fn transform_inner(
             reason: None,
         };
     }
-    let Ok(mut state) = shared().try_lock() else {
+    let Some(mut state) = lock_within(budget.lock_wait()) else {
         return skipped(text, Reason::LockBusy);
     };
     if let Some(until) = state.failed_until {

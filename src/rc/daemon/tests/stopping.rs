@@ -1480,6 +1480,7 @@ fn local_session_wire_previews_bound_indexed_and_parsed_prompts() {
         .enumerate()
         .map(|(index, gist)| LocalSession {
             title: None,
+            labels_withheld: None,
             runtime_session_id: format!("native-{index}"),
             runtime: "codex".into(),
             cwd: "/fixture".into(),
@@ -1528,6 +1529,7 @@ fn session_labels_leave_only_through_the_redactor() {
     });
     let row = |gist: Option<&str>, title: Option<&str>| LocalSession {
         title: title.map(str::to_owned),
+        labels_withheld: None,
         runtime_session_id: "native".into(),
         runtime: "codex".into(),
         cwd: "/fixture".into(),
@@ -1567,6 +1569,11 @@ fn session_labels_leave_only_through_the_redactor() {
             Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
         );
     }
+    assert!(rows[..3].iter().all(|row| row.labels_withheld.is_none()));
+    assert_eq!(
+        rows[3].labels_withheld.as_deref(),
+        Some("repository_unavailable")
+    );
 
     // Catalog rows name the same conversations in the sidebar; one whose labels cannot be
     // protected carries none rather than the marker or its text.
@@ -1602,6 +1609,130 @@ fn session_labels_leave_only_through_the_redactor() {
     assert_eq!((&catalog[1].title, &catalog[1].gist), (&None, &None));
 }
 
+/// A label whose check does not pass shows the marker and says why, and a label checked before
+/// under the policy in force now is shown as it was checked, without waiting for the worker
+/// again. A list that showed a withheld label as read would publish it; one that kept no reason
+/// would leave the viewer guessing; one that checked every label on every listing would withhold
+/// labels whenever the worker is busy; one that kept a label checked under an older policy would
+/// show a value a new rule blocks.
+#[test]
+fn a_withheld_label_says_why_and_a_checked_one_is_not_checked_again() {
+    use crate::domain::privacy::projector::Reason;
+    let redactor = crate::domain::redact::Redactor::new(crate::domain::redact::Persona {
+        home: Some("/cluster/home/mika".into()),
+        ..Default::default()
+    });
+    let row = |gist: &str| LocalSession {
+        title: None,
+        labels_withheld: None,
+        runtime_session_id: "native".into(),
+        runtime: "codex".into(),
+        cwd: "/fixture".into(),
+        modified_at: "2026-10-30T00:00:00Z".into(),
+        gist: Some(gist.to_owned()),
+        adopted: false,
+        agent: None,
+        likely_active: false,
+    };
+    let list = |gist: &str| {
+        let mut rows = vec![row(gist)];
+        protect_labels_with(
+            &mut rows,
+            &redactor,
+            |_| Ok(None),
+            Some(crate::domain::redact::PROTECTION_ERROR_TEXT),
+        );
+        rows.remove(0)
+    };
+    let withhold = |reason: Option<Reason>| {
+        crate::domain::redact::WITHHOLD_LIVE
+            .with(|withhold| withhold.set(reason.map(|reason| ("grasp planner", reason))));
+    };
+
+    withhold(Some(Reason::LockBusy));
+    let busy = list("tune the grasp planner in /cluster/home/mika/arm");
+    assert_eq!(
+        busy.gist.as_deref(),
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
+    );
+    assert_eq!(busy.labels_withheld.as_deref(), Some("lock_busy"));
+
+    withhold(None);
+    let checked = list("tune the grasp planner in /cluster/home/mika/arm");
+    assert_eq!(
+        checked.gist.as_deref(),
+        Some("tune the grasp planner in ~/arm")
+    );
+    assert_eq!(checked.labels_withheld, None);
+
+    // The worker is busy again, and the label it checked is shown as it was checked.
+    withhold(Some(Reason::Deadline));
+    let again = list("tune the grasp planner in /cluster/home/mika/arm");
+    assert_eq!(
+        again.gist.as_deref(),
+        Some("tune the grasp planner in ~/arm")
+    );
+    assert_eq!(again.labels_withheld, None);
+    let other = list("the grasp planner, second try");
+    assert_eq!(other.labels_withheld.as_deref(), Some("deadline"));
+    // Only the label that was not checked before waits.
+    let mut rows = vec![row("tune the grasp planner in /cluster/home/mika/arm")];
+    rows[0].title = Some("grasp planner notes".into());
+    protect_labels_with(
+        &mut rows,
+        &redactor,
+        |_| Ok(None),
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT),
+    );
+    assert_eq!(
+        rows[0].gist.as_deref(),
+        Some("tune the grasp planner in ~/arm")
+    );
+    assert_eq!(
+        rows[0].title.as_deref(),
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
+    );
+    assert_eq!(rows[0].labels_withheld.as_deref(), Some("deadline"));
+    // A catalog row takes the checked label too, and one still waiting is left out rather than
+    // shown as the marker.
+    let mut catalog = vec![crate::rc::runtime_context::CatalogRow {
+        session_ref: "local-native".into(),
+        source_id: "source".into(),
+        source_generation: 1,
+        runtime: "codex".into(),
+        native_session_id: "native".into(),
+        cwd: "/fixture".into(),
+        title: Some("grasp planner notes".into()),
+        gist: Some("tune the grasp planner in /cluster/home/mika/arm".into()),
+        updated_at_ms: None,
+        writer_active: None,
+        parent_session_ref: None,
+        technical: false,
+    }];
+    protect_labels_with(&mut catalog, &redactor, |_| Ok(None), None);
+    assert_eq!(
+        catalog[0].gist.as_deref(),
+        Some("tune the grasp planner in ~/arm")
+    );
+    assert_eq!(catalog[0].title, None);
+    withhold(None);
+
+    // What is kept is the checked label under a digest of its text, never the text, and only
+    // under the stamp it was checked with.
+    let scope = (None, redactor.persona_key());
+    let labels = checked_labels();
+    assert!(
+        labels
+            .entries
+            .values()
+            .all(|label| !label.contains("/cluster/home/mika"))
+    );
+    let stamp = crate::domain::privacy::service::policy_stamp(None).unwrap();
+    let raw = "tune the grasp planner in /cluster/home/mika/arm";
+    assert!(labels.get(&scope, stamp, raw).is_some());
+    assert!(labels.get(&scope, stamp.wrapping_add(1), raw).is_none());
+}
+
 #[test]
 fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
     let temp = tempfile::tempdir().unwrap();
@@ -1614,6 +1745,7 @@ fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
     let scanned = finish_local_sessions(
         vec![LocalSession {
             title: None,
+            labels_withheld: None,
             runtime_session_id: "native-thread".into(),
             runtime: "claude-code".into(),
             cwd: root.to_string_lossy().to_string(),
@@ -1645,6 +1777,74 @@ fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
         located.likely_active,
         "the busy guard and launch coordinates must use the same row"
     );
+}
+
+/// A session opened from the local list takes the labels the list showed, except a privacy
+/// marker, and says why it has none: the Hub stores the first title and gist an opened session
+/// reports and never replaces them, so a marker carried over would name that session for good.
+/// Dropping every label, keeping the marker, or dropping the reason all fail here.
+#[test]
+fn a_withheld_label_never_names_the_session_it_opens() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let mut mirror = Mirror::default();
+    mirror
+        .bind("ws", "project", &root)
+        .expect("test project is bindable");
+    let located = locate_local_with(&mirror, "ws", "native-thread", || {
+        vec![LocalSession {
+            title: Some(crate::domain::redact::PROTECTION_ERROR_TEXT.into()),
+            labels_withheld: Some("lock_busy".into()),
+            runtime_session_id: "native-thread".into(),
+            runtime: "claude-code".into(),
+            cwd: root.to_string_lossy().to_string(),
+            modified_at: "2026-08-22T00:00:00Z".into(),
+            gist: Some("tune the grasp planner".into()),
+            adopted: false,
+            agent: None,
+            likely_active: false,
+        }]
+    })
+    .unwrap();
+    assert_eq!(located.title, None);
+    assert_eq!(located.gist.as_deref(), Some("tune the grasp planner"));
+    assert_eq!(located.labels_withheld.as_deref(), Some("lock_busy"));
+}
+
+/// A running session joined to its row in the local list takes the labels the row was just
+/// checked with. When the row's labels are withheld, after a rule was added that may block the
+/// session's earlier title, the session drops that title and gist and says why. Keeping the
+/// earlier ones as a fallback would send a value the new rule blocks to the Hub.
+#[test]
+fn a_withheld_list_label_replaces_the_session_name_it_had() {
+    let mut info: SessionInfo = serde_json::from_value(serde_json::json!({
+        "session_id": "session",
+        "workspace_id": "ws",
+        "runtime": "claude-code",
+        "status": "running",
+        "last_seq": 0,
+        "title": "Acme renewal plan",
+        "gist": "draft the Acme renewal",
+        "created_at": "2026-10-30T00:00:00Z",
+        "updated_at": "2026-10-30T00:00:00Z",
+    }))
+    .unwrap();
+    let marker = || Some(crate::domain::redact::PROTECTION_ERROR_TEXT.to_owned());
+    let row = LocalSession {
+        title: marker(),
+        labels_withheld: Some("lock_busy".into()),
+        runtime_session_id: "native".into(),
+        runtime: "claude-code".into(),
+        cwd: "/fixture".into(),
+        modified_at: "2026-10-30T00:00:00Z".into(),
+        gist: marker(),
+        adopted: false,
+        agent: None,
+        likely_active: false,
+    };
+    crate::rc::daemon::sessions::take_list_labels(&mut info, &row);
+    assert_eq!((info.title, info.gist), (None, None));
+    assert_eq!(info.labels_withheld.as_deref(), Some("lock_busy"));
 }
 
 /// The cost of listing local sessions must scale with how many sessions this project holds, not

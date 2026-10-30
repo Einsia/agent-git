@@ -797,6 +797,7 @@ mod tests {
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
             created_at: "now".into(),

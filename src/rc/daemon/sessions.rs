@@ -157,11 +157,9 @@ impl Daemon {
                 .runtime_thread_id
                 .as_deref()
                 .and_then(|id| native.get(&(session.info.runtime.as_str(), id)))
+                .map(|row| (*row).clone())
             {
-                session.info.title = row.title.clone();
-                if row.gist.is_some() {
-                    session.info.gist = row.gist.clone();
-                }
+                take_list_labels(&mut session.info, &row);
             }
         }
         // Dormant roster identities must remain discoverable after a daemon restart.
@@ -201,8 +199,9 @@ impl Daemon {
                 branch: lineage.as_ref().map(|lineage| lineage.branch().into()),
                 status: SessionStatus::Ended,
                 last_seq: 0,
-                title: row.title.clone(),
-                gist: row.gist.clone(),
+                title: super::named(row.title.clone()),
+                labels_withheld: row.labels_withheld.clone(),
+                gist: super::named(row.gist.clone()),
                 dangerous: self.roster.transcript_ever_dangerous(
                     &entry.runtime,
                     &entry.thread_id,
@@ -441,6 +440,7 @@ impl Daemon {
                 last_seq: 0,
                 gist: None,
                 title: None,
+                labels_withheld: None,
                 // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
                 dangerous: false,
@@ -592,6 +592,7 @@ impl Daemon {
         let LocatedLocal {
             title,
             gist,
+            labels_withheld,
             runtime,
             cwd,
             project_id,
@@ -707,6 +708,7 @@ impl Daemon {
             last_seq: 0,
             gist,
             title,
+            labels_withheld,
             // The judged bit is stamped by `prepare_spawn` — copying it here is one more place
             // that has to be right.
             dangerous: false,
@@ -1100,6 +1102,7 @@ impl Daemon {
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
             created_at: now.clone(),
@@ -1496,6 +1499,21 @@ pub(super) struct LocalSessionSnapshot {
     supervised: std::collections::HashSet<String>,
 }
 
+/// Join a running session to its row in the local list: the session takes the row's labels as
+/// they were just checked. A label withheld in this listing leaves the session without it, and
+/// with the reason, never with the label it had before: that one was checked under the policy
+/// then in force, and a rule added since may block it.
+pub(super) fn take_list_labels(info: &mut SessionInfo, row: &LocalSession) {
+    info.title = super::named(row.title.clone());
+    if row.gist.is_some() {
+        info.gist = super::named(row.gist.clone());
+    }
+    info.labels_withheld = row
+        .labels_withheld
+        .clone()
+        .filter(|_| info.title.is_none() || info.gist.is_none());
+}
+
 impl LocalSessionSnapshot {
     pub(super) fn scan(self, purpose: LocalSessionScan) -> Vec<LocalSession> {
         let roots = self.roots;
@@ -1544,6 +1562,7 @@ impl LocalSessionSnapshot {
                     }
                     out.push(LocalSession {
                         title: r.title,
+                        labels_withheld: None,
                         runtime_session_id: r.id.clone(),
                         runtime: r.runtime.to_string(),
                         cwd: r
@@ -1589,6 +1608,7 @@ impl LocalSessionSnapshot {
             }
             out.push(LocalSession {
                 title: None,
+                labels_withheld: None,
                 runtime_session_id: registration.session,
                 runtime: "claude-code".into(),
                 cwd: registration.cwd.to_string_lossy().into_owned(),
@@ -1774,6 +1794,7 @@ mod discovery_preview_tests {
         assert_eq!(refs.len(), 1);
         let item = LocalSession {
             title: None,
+            labels_withheld: None,
             runtime_session_id: refs[0].id.clone(),
             runtime: refs[0].runtime.to_owned(),
             cwd: refs[0].cwd.clone().unwrap(),
@@ -1841,6 +1862,7 @@ mod discovery_preview_tests {
             .enumerate()
             .map(|(index, gist)| LocalSession {
                 title: None,
+                labels_withheld: None,
                 runtime_session_id: format!("native-{index}"),
                 runtime: "codex".into(),
                 cwd: "/fixture".into(),

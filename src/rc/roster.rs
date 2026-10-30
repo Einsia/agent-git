@@ -1399,6 +1399,7 @@ mod tests {
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             dangerous: false,
             permission_mode: Some(crate::protocol::PermissionMode::Default),
             created_at: "2026-08-22T00:00:00Z".into(),

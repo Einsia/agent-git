@@ -104,6 +104,7 @@ impl WatchScan {
                 modified_at: String::new(),
                 gist: None,
                 title: None,
+                labels_withheld: None,
                 adopted: false,
                 agent: None,
                 likely_active: false,
@@ -442,6 +443,7 @@ impl Daemon {
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             // Watching is read-only, but this field records what this session **has
             // done**, not what you can do now. Hard-coding false hides that warning on
             // the web interface for a session that ran with no approval — exactly when it

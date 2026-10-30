@@ -31,6 +31,7 @@ pub(super) fn rpc_test_live(
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             dangerous: false,
             permission_mode: Some(mode),
             created_at: "now".into(),

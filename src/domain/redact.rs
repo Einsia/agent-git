@@ -109,6 +109,8 @@ pub(crate) struct NativeJson {
     /// protocol error, rather than not running for contention or a back-off. Only such failures
     /// count toward giving a record up.
     pub failed: bool,
+    /// Why this withheld record's check did not complete, when the worker said.
+    pub reason: Option<crate::domain::privacy::projector::Reason>,
 }
 
 #[cfg(feature = "rc")]
@@ -121,6 +123,7 @@ impl NativeJson {
             registered_ids: Vec::new(),
             permanent: false,
             failed: false,
+            reason: None,
         }
     }
 
@@ -153,6 +156,11 @@ thread_local! {
     /// records; unit tests cannot host the privacy worker.
     pub(crate) static WITHHOLD_NATIVE: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    /// The reason the records [`WITHHOLD_NATIVE`] withholds report: a protocol error unless this
+    /// names another, such as the lock contention that only delays a record.
+    pub(crate) static WITHHOLD_NATIVE_REASON: std::cell::Cell<
+        Option<crate::domain::privacy::projector::Reason>,
+    > = const { std::cell::Cell::new(None) };
     /// Makes the text and JSON checks on this thread whose input contains this text come back
     /// incomplete for this reason, as they do while the privacy worker is busy or backing off.
     pub(crate) static WITHHOLD_LIVE: std::cell::Cell<
@@ -524,17 +532,25 @@ impl Redactor {
                         .any(|record| record.to_string().contains(text))
                 })
         });
+        // A batch that cannot be put into a request is as malformed as a reply that cannot be read.
+        let reason = projected.as_ref().map_or(
+            Some(crate::domain::privacy::projector::Reason::ProtocolError),
+            |outcome| outcome.reason,
+        );
+        #[cfg(test)]
+        let reason = match WITHHOLD_NATIVE_REASON.with(std::cell::Cell::get) {
+            Some(withheld) if projected.is_none() => Some(withheld),
+            _ => reason,
+        };
         // Only a check that ran and ended with a deadline or a protocol error is this group's
         // failure; contention, a back-off or a busy dictionary only delays it.
-        let failed = projected.as_ref().is_none_or(|outcome| {
-            matches!(
-                outcome.reason,
-                Some(
-                    crate::domain::privacy::projector::Reason::Deadline
-                        | crate::domain::privacy::projector::Reason::ProtocolError
-                )
+        let failed = matches!(
+            reason,
+            Some(
+                crate::domain::privacy::projector::Reason::Deadline
+                    | crate::domain::privacy::projector::Reason::ProtocolError
             )
-        });
+        );
         let values = projected
             .filter(crate::domain::privacy::service::passed)
             .and_then(|outcome| {
@@ -555,6 +571,7 @@ impl Redactor {
             } else {
                 out[group[0]] = Some(NativeJson {
                     failed,
+                    reason,
                     ..NativeJson::withheld()
                 });
             }
@@ -569,8 +586,16 @@ impl Redactor {
                 registered_ids: Vec::new(),
                 permanent: false,
                 failed: false,
+                reason: None,
             });
         }
+    }
+
+    /// What this redactor replaces on its own, after the privacy worker: text the worker checked
+    /// under one policy comes out of two redactors the same when this is the same for both.
+    #[cfg(feature = "rc")]
+    pub(crate) fn persona_key(&self) -> String {
+        format!("{:?}/{}", self.persona, self.preserve_device_identity)
     }
 
     pub fn this_machine() -> Self {
