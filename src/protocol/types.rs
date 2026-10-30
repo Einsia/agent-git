@@ -617,6 +617,11 @@ pub struct LocalSession {
     /// A native display name; absent titles leave the opening preview available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Why `gist` or `title` shows the privacy marker in place of its text: the privacy check's
+    /// reason, such as `lock_busy` or `deadline`, or `repository_unavailable` when the session's
+    /// repository could not be resolved. Absent when every label passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_withheld: Option<String>,
     /// Already adopted by agit (the store holds a link). Taking it over
     /// continues that lineage.
     #[serde(default)]
@@ -715,6 +720,11 @@ pub struct SessionInfo {
     pub gist: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Why the session lacks a `title` or `gist` its local labels have: their privacy check did
+    /// not pass, for the reason [`LocalSession::labels_withheld`] gives. A session is never named
+    /// by the privacy marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_withheld: Option<String>,
     /// Started with permission checks disabled (`--dangerously-skip-permissions`,
     /// codex `dangerFullAccess`). Sharing such a session is handing out an
     /// unsupervised root shell; the hub locks it to the owner.

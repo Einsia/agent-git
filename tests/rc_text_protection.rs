@@ -418,6 +418,7 @@ fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
         modified_at: "2026-10-26T00:00:00Z".into(),
         gist: Some(format!("ask about the {phrase}")),
         title: Some(format!("{phrase} plan")),
+        labels_withheld: None,
         adopted: true,
         agent: None,
         likely_active: false,

@@ -26,9 +26,10 @@ struct Snapshot {
 }
 
 /// How long a history page whose records may still pass is refused as busy, so the viewer asks
-/// again, before it is returned with the given-up marker in place of each record that did not
-/// pass and the viewer moves on past it. It is a time, not a count of requests: a viewer's retries
-/// come faster than a worker back-off ends.
+/// again, before it may be returned with the given-up marker in place of each record that did not
+/// pass and the viewer moves on past it. It is a time as well as a count of failures: a viewer's
+/// retries come faster than a worker back-off ends. Only checks that ran and failed count (see
+/// [`Cache::refuse`]), so contention for the worker delays a page and never gives it up.
 fn withheld_page_notice() -> Duration {
     #[cfg(test)]
     if let Some(notice) = WITHHELD_PAGE_NOTICE.with(std::cell::Cell::get) {
@@ -177,7 +178,13 @@ struct Cache {
     /// When a page was first refused because its privacy check did not pass, by conversation and
     /// cursor. Kept beside the snapshots rather than in one: a first page is captured anew for
     /// every request, and its refusals still have to add up.
-    refusals: Mutex<HashMap<(String, Option<u64>), Instant>>,
+    refusals: Mutex<HashMap<(String, Option<u64>), Refusal>>,
+}
+
+/// Since when a page is refused, and how often its check ran and failed meanwhile.
+struct Refusal {
+    since: Instant,
+    failures: u32,
 }
 
 impl Default for Cache {
@@ -255,15 +262,27 @@ impl Cache {
         Ok((token, snapshot))
     }
 
-    /// How long ago `page` was first refused, if it was.
-    fn refused_for(&self, page: &(String, Option<u64>)) -> Option<Duration> {
-        self.refusals.lock().ok()?.get(page).map(Instant::elapsed)
+    /// Whether `page` has been refused through the notice, with its check failing each of the
+    /// times a held tail line needs before it is given up.
+    fn given_up(&self, page: &(String, Option<u64>)) -> bool {
+        self.refusals.lock().ok().is_some_and(|refusals| {
+            refusals.get(page).is_some_and(|refusal| {
+                refusal.since.elapsed() >= withheld_page_notice()
+                    && refusal.failures >= crate::rc::supervisor::HELD_TAIL_GIVE_UP_FAILURES
+            })
+        })
     }
 
-    fn refuse(&self, page: (String, Option<u64>)) {
+    /// Refuse `page` once more; `failed` says whether its check ran and failed, rather than not
+    /// running for contention or a back-off.
+    fn refuse(&self, page: (String, Option<u64>), failed: bool) {
         if let Ok(mut refusals) = self.refusals.lock() {
-            refusals.retain(|_, since| since.elapsed() < LIFETIME);
-            refusals.entry(page).or_insert_with(Instant::now);
+            refusals.retain(|_, refusal| refusal.since.elapsed() < LIFETIME);
+            let refusal = refusals.entry(page).or_insert_with(|| Refusal {
+                since: Instant::now(),
+                failures: 0,
+            });
+            refusal.failures += u32::from(failed);
         }
     }
 
@@ -403,9 +422,7 @@ pub(super) fn read(
                 // marker, so the viewer asks for the same page again instead of moving past it;
                 // only a page that keeps failing past the notice is returned with its markers.
                 let page = (conversation_key.clone(), cursor);
-                let given_up = cache
-                    .refused_for(&page)
-                    .is_some_and(|refused| refused >= withheld_page_notice());
+                let given_up = cache.given_up(&page);
                 let projected = super::super::supervisor::items_from_lines_tracked(
                     runtime,
                     &redactor,
@@ -417,8 +434,12 @@ pub(super) fn read(
                     },
                 );
                 if projected.first_withheld.is_some() {
-                    cache.refuse(page);
-                    anyhow::bail!(Failure::Busy);
+                    cache.refuse(page, projected.first_withheld_failed);
+                    anyhow::bail!(Failure::Withheld(
+                        crate::domain::privacy::service::reason_name(
+                            projected.first_withheld_reason
+                        )
+                    ));
                 }
                 cache.accept(&page);
                 Ok(projected

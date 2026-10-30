@@ -847,6 +847,7 @@ mod bound_lineage_tests {
                         last_seq: 0,
                         gist: None,
                         title: None,
+                        labels_withheld: None,
                         dangerous: false,
                         permission_mode: Some(crate::protocol::PermissionMode::Default),
                         created_at: "now".into(),

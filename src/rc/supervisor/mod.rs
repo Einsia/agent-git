@@ -4155,7 +4155,7 @@ pub(crate) const HELD_TAIL_GIVE_UP: std::time::Duration =
 /// How many times the first held line's own check must have failed, with a deadline or a
 /// protocol error, before it may be given up. Lock contention and back-offs never give a line up:
 /// it waits, bounded by [`HELD_TAIL_BYTES`].
-const HELD_TAIL_GIVE_UP_FAILURES: u32 = 3;
+pub(crate) const HELD_TAIL_GIVE_UP_FAILURES: u32 = 3;
 /// How much tailed text may wait for its privacy check before it is given up and shown as the
 /// marker.
 pub(crate) const HELD_TAIL_BYTES: usize = 16 * 1024 * 1024;
@@ -4404,6 +4404,8 @@ pub(crate) struct ProjectedLines {
     pub first_withheld: Option<usize>,
     /// Whether that line's check ran and failed, rather than not running for contention.
     pub first_withheld_failed: bool,
+    /// Why that line's check did not complete, when the worker said.
+    pub first_withheld_reason: Option<crate::domain::privacy::projector::Reason>,
 }
 
 /// Records from lines before `given_up` whose privacy check did not complete are given up: each
@@ -4423,6 +4425,7 @@ pub(crate) fn items_from_lines_tracked(
         item_lines: vec![],
         first_withheld: None,
         first_withheld_failed: false,
+        first_withheld_reason: None,
     };
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return projected;
@@ -4491,6 +4494,7 @@ pub(crate) fn items_from_lines_tracked(
                 if projected.first_withheld.is_none() {
                     projected.first_withheld = Some(index);
                     projected.first_withheld_failed = scrubbed.failed;
+                    projected.first_withheld_reason = scrubbed.reason;
                 }
                 if pending_marker_emitted {
                     continue;

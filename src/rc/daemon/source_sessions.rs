@@ -212,6 +212,7 @@ impl Daemon {
             last_seq: 0,
             gist,
             title,
+            labels_withheld: None,
             dangerous: false,
             permission_mode: settings.permission_mode,
             created_at: now.clone(),

@@ -382,6 +382,24 @@ fn stamp(repo: Option<&Path>) -> Vec<(u64, Option<std::time::SystemTime>)> {
         .collect()
 }
 
+/// The state of everything a worker loads its policy for `repo` from: the files [`stamp`] reads,
+/// every journal on the device with the state of its database files, and the account the device
+/// is signed in to, which picks the journal in force. A worker reloads before it checks again
+/// whenever any of these changes (see [`execute`]), so a result checked when this was last the
+/// same was checked under the policy in force now. It reads file metadata only: no journal, no
+/// key and no credential secret.
+pub(super) fn policy_stamp(repo: Option<&Path>) -> crate::Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let root = keys::root()?;
+    let hub = crate::infra::config::hub_url();
+    let account = crate::infra::credentials::load(&hub)
+        .map(|credential| (credential.account_id, credential.username));
+    let journals = device_journals(&root, Path::new(""))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (repo, hub, account, stamp(repo), device_stamp(&journals)).hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
 fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
     let root = keys::root()?;
     let hub = crate::infra::config::hub_url();

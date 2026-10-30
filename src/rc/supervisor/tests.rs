@@ -90,6 +90,7 @@ pub(super) fn harness_test_session_with_channels(
             last_seq: 0,
             gist: None,
             title: None,
+            labels_withheld: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
             created_at: "now".into(),

@@ -47,6 +47,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
             modified_at: String::new(),
             gist: None,
             title: None,
+            labels_withheld: None,
             adopted: false,
             agent: None,
             likely_active: false,
@@ -776,6 +777,7 @@ fn native_watch_reuses_readonly_snapshot_without_materializing_exports() {
     let cache = refs[0].path.clone();
     let local = LocalSession {
         title: None,
+        labels_withheld: None,
         runtime_session_id: "ses_watch".into(),
         runtime: "opencode".into(),
         cwd: cwd.to_string_lossy().into_owned(),

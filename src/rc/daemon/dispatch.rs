@@ -679,6 +679,7 @@ mod tests {
                 last_seq: 0,
                 gist: None,
                 title: None,
+                labels_withheld: None,
                 dangerous: false,
                 permission_mode: None,
                 created_at: String::new(),

@@ -282,6 +282,9 @@ pub(crate) enum Failure {
     Unsupported,
     #[error("History reader is busy; retry shortly")]
     Busy,
+    /// A record on the page has not passed its privacy check yet, for this reason.
+    #[error("History page is waiting for its privacy check ({0}); retry shortly")]
+    Withheld(&'static str),
     #[error("History snapshot expired; reload history")]
     Expired,
     #[error("Invalid history cursor; reload history")]
@@ -305,11 +308,17 @@ pub(crate) enum Failure {
 pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     use crate::protocol::{ErrorCode, RpcError};
     let mut reason = None;
+    let mut privacy = None;
     let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
         Some(Failure::Missing) => ("source_missing", false, true),
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
         Some(Failure::Unsupported) => ("unsupported", false, false),
         Some(Failure::Busy) => ("busy", true, false),
+        Some(Failure::Withheld(withheld)) => {
+            reason = Some("privacy_check_pending");
+            privacy = Some(*withheld);
+            ("busy", true, false)
+        }
         Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
         Some(Failure::Limit) => ("resource_limit", false, false),
         // The snapshot no longer holds the history it pinned; only a fresh read helps.
@@ -361,6 +370,9 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
     if let Some(reason) = reason {
         data["reason"] = json!(reason);
+    }
+    if let Some(privacy) = privacy {
+        data["privacy_reason"] = json!(privacy);
     }
     result.data = Some(data);
     result
@@ -950,23 +962,48 @@ mod tests {
             )
             .unwrap();
             assert!(beta.to_string().contains("beta-child"));
-            // A page whose records may still pass is refused as busy however often it is asked
-            // for, until it has been refused for the notice period; then it is returned with
-            // the given-up marker for each record. A count of tries runs out within one burst of
-            // a client's retries, long before a worker back-off ends.
+            // A page whose records may still pass is refused as busy, with the privacy check's
+            // reason, however often it is asked for. While the worker is only contended it is
+            // never given up, however long that lasts: the check did not run, so nothing says the
+            // page cannot pass.
             crate::domain::redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
+            crate::domain::redact::WITHHOLD_NATIVE_REASON
+                .with(|r| r.set(Some(crate::domain::privacy::projector::Reason::LockBusy)));
             snapshot::WITHHELD_PAGE_NOTICE
                 .with(|n| n.set(Some(std::time::Duration::from_millis(200))));
-            for _ in 0..5 {
-                let refused = read_with_roster(
+            let read_refused = || {
+                read_with_roster(
                     json!({"session_id":"beta"}),
                     &roster,
                     &mut Timings::default(),
                 )
-                .unwrap_err();
-                assert!(matches!(refused.downcast_ref(), Some(Failure::Busy)));
+                .unwrap_err()
+            };
+            for _ in 0..5 {
+                let refused = read_refused();
+                assert!(matches!(
+                    refused.downcast_ref(),
+                    Some(Failure::Withheld("lock_busy"))
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
+            let contended = rpc_error(read_refused()).data.unwrap();
+            assert_eq!(contended["kind"], "busy");
+            assert_eq!(contended["retryable"], true);
+            assert_eq!(contended["reason"], "privacy_check_pending");
+            assert_eq!(contended["privacy_reason"], "lock_busy");
+            // A check that runs and fails is counted, and once the page has been refused for the
+            // notice with as many failures as a held tail line needs, it is returned with the
+            // given-up marker for each record. Time alone would give a page up within one burst
+            // of a client's retries, long before a worker back-off ends.
+            crate::domain::redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(None));
+            for _ in 0..crate::rc::supervisor::HELD_TAIL_GIVE_UP_FAILURES {
+                let refused = read_refused();
+                assert!(matches!(
+                    refused.downcast_ref(),
+                    Some(Failure::Withheld("protocol_error"))
+                ));
+            }
             let given_up = read_with_roster(
                 json!({"session_id":"beta"}),
                 &roster,

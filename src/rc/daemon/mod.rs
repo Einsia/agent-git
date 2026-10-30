@@ -102,6 +102,8 @@ enum LocalSessionScan {
 struct LocatedLocal {
     title: Option<String>,
     gist: Option<String>,
+    /// Why a label the list showed is not carried over: see [`LocalSession::labels_withheld`].
+    labels_withheld: Option<String>,
     runtime: String,
     cwd: PathBuf,
     project_id: Option<String>,
@@ -2594,11 +2596,17 @@ pub(crate) fn protect_catalog_labels(rows: &mut [crate::rc::runtime_context::Cat
 /// A row whose labels leave the device: the opening-prompt gist and the runtime's title.
 trait Labelled {
     fn labels(&mut self) -> [&mut Option<String>; 2];
+    /// Say why a label of this row was withheld.
+    fn withhold(&mut self, reason: &str);
 }
 
 impl Labelled for LocalSession {
     fn labels(&mut self) -> [&mut Option<String>; 2] {
         [&mut self.gist, &mut self.title]
+    }
+
+    fn withhold(&mut self, reason: &str) {
+        self.labels_withheld = Some(reason.to_owned());
     }
 }
 
@@ -2606,6 +2614,10 @@ impl Labelled for crate::rc::runtime_context::CatalogRow {
     fn labels(&mut self) -> [&mut Option<String>; 2] {
         [&mut self.gist, &mut self.title]
     }
+
+    /// A catalog row has no field for it: its withheld labels are simply absent, and the row is
+    /// named by its runtime and time.
+    fn withhold(&mut self, _reason: &str) {}
 }
 
 /// Protect the labels of `rows`, each under its own repository's rules; a label whose check does
@@ -2625,54 +2637,162 @@ fn protect_labels_with<T: Labelled>(
         }
     }
     for (root, indexes) in groups {
-        let redactor = match root {
-            Some(root) => base.clone().with_repository(&root),
+        let redactor = match &root {
+            Some(root) => base.clone().with_repository(root),
             None => Ok(base.clone()),
         };
         match redactor {
-            Ok(redactor) => protect_label_group(rows, &indexes, &redactor, withheld),
+            Ok(redactor) => {
+                protect_label_group(rows, &indexes, &redactor, root.as_deref(), withheld)
+            }
             Err(_) => unresolved.extend(indexes),
         }
     }
     for index in unresolved {
-        for label in rows[index].labels() {
+        let row = &mut rows[index];
+        let mut had = false;
+        for label in row.labels() {
             if label.is_some() {
                 *label = withheld.map(str::to_owned);
+                had = true;
+            }
+        }
+        if had {
+            row.withhold("repository_unavailable");
+        }
+    }
+}
+
+/// Protect the labels of `rows[indexes]`, those of `repository`, in one request; a label whose
+/// check does not pass becomes `withheld`. A label checked before under the policy in force now is
+/// not checked again: the lists are asked for often, and every label the worker need not see
+/// again is one fewer to wait for.
+fn protect_label_group<T: Labelled>(
+    rows: &mut [T],
+    indexes: &[usize],
+    redactor: &crate::domain::redact::Redactor,
+    repository: Option<&std::path::Path>,
+    withheld: Option<&str>,
+) {
+    let stamp = crate::domain::privacy::service::policy_stamp(repository);
+    let scope = (
+        repository.map(std::path::Path::to_path_buf),
+        redactor.persona_key(),
+    );
+    let mut unchecked = Vec::new();
+    for &index in indexes {
+        for (slot, label) in rows[index].labels().into_iter().enumerate() {
+            let Some(text) = label.as_mut() else {
+                continue;
+            };
+            match stamp.and_then(|stamp| checked_labels().get(&scope, stamp, text)) {
+                Some(protected) => *text = protected,
+                None => unchecked.push((index, slot)),
+            }
+        }
+    }
+    if unchecked.is_empty() {
+        return;
+    }
+    let labels = unchecked
+        .iter()
+        .map(|&(index, slot)| serde_json::Value::String(label_at(&mut rows[index], slot).clone()))
+        .collect();
+    let protected = redactor
+        .protect_json(&serde_json::Value::Array(labels))
+        .map_err(|withheld| crate::domain::privacy::service::reason_name(withheld.reason))
+        .and_then(|report| match report.value {
+            serde_json::Value::Array(values) if values.len() == unchecked.len() => values
+                .into_iter()
+                .map(|value| value.as_str().map(str::to_owned).ok_or("protocol_error"))
+                .collect::<Result<Vec<_>, _>>(),
+            _ => Err("protocol_error"),
+        });
+    match protected {
+        Ok(protected) => {
+            for (&(index, slot), protected) in unchecked.iter().zip(protected) {
+                let label = label_at(&mut rows[index], slot);
+                if let Some(stamp) = stamp {
+                    checked_labels().put(&scope, stamp, label, &protected);
+                }
+                *label = protected;
+            }
+        }
+        Err(reason) => {
+            // The labels of one request pass or fail together; a label taken from the checked
+            // ones already shows its protected text, and only the others wait.
+            for &(index, slot) in &unchecked {
+                *rows[index].labels()[slot] = withheld.map(str::to_owned);
+                rows[index].withhold(reason);
             }
         }
     }
 }
 
-/// Protect the labels of `rows[indexes]` in one request.
-fn protect_label_group<T: Labelled>(
-    rows: &mut [T],
-    indexes: &[usize],
-    redactor: &crate::domain::redact::Redactor,
-    withheld: Option<&str>,
-) {
-    let mut labels = Vec::new();
-    for &index in indexes {
-        for label in rows[index].labels().into_iter().flatten() {
-            labels.push(serde_json::Value::String(label.clone()));
-        }
+/// The text of `row`'s label in `slot` (0 the gist, 1 the title), which it has.
+fn label_at<T: Labelled>(row: &mut T, slot: usize) -> &mut String {
+    row.labels()
+        .into_iter()
+        .nth(slot)
+        .and_then(Option::as_mut)
+        .expect("the slot was taken from this row's labels")
+}
+
+/// Labels the privacy worker checked, as they were shown, each under the repository and the
+/// persona it was protected for and the policy stamp it was checked with. A label is found by a
+/// digest of its text, so no raw label is kept, and only where the stamp is the one in force now:
+/// a new rule, decision or account changes the stamp, and every label is checked again.
+#[derive(Default)]
+struct CheckedLabels {
+    entries: std::collections::HashMap<(LabelScope, u64, [u8; 32]), String>,
+}
+
+/// The repository whose rules a label was checked under, and the redactor's persona.
+type LabelScope = (Option<std::path::PathBuf>, String);
+
+/// How many checked labels are kept: the session list's labels, several times over.
+const CHECKED_LABELS: usize = 4096;
+
+impl CheckedLabels {
+    fn key(scope: &LabelScope, stamp: u64, label: &str) -> (LabelScope, u64, [u8; 32]) {
+        use sha2::Digest;
+        (
+            scope.clone(),
+            stamp,
+            sha2::Sha256::digest(label.as_bytes()).into(),
+        )
     }
-    if labels.is_empty() {
-        return;
+
+    fn get(&self, scope: &LabelScope, stamp: u64, label: &str) -> Option<String> {
+        self.entries.get(&Self::key(scope, stamp, label)).cloned()
     }
-    let protected = redactor.scrub_json(&serde_json::Value::Array(labels)).value;
-    let mut protected = protected.as_array().map(|labels| labels.iter());
-    for &index in indexes {
-        for label in rows[index].labels() {
-            if label.is_some() {
-                *label = protected
-                    .as_mut()
-                    .and_then(Iterator::next)
-                    .and_then(serde_json::Value::as_str)
-                    .or(withheld)
-                    .map(str::to_owned);
+
+    fn put(&mut self, scope: &LabelScope, stamp: u64, label: &str, protected: &str) {
+        if self.entries.len() >= CHECKED_LABELS {
+            // Labels checked under an earlier stamp can never be used again.
+            self.entries
+                .retain(|(kept, kept_stamp, _), _| kept != scope || *kept_stamp == stamp);
+            if self.entries.len() >= CHECKED_LABELS {
+                self.entries.clear();
             }
         }
+        self.entries
+            .insert(Self::key(scope, stamp, label), protected.to_owned());
     }
+}
+
+fn checked_labels() -> std::sync::MutexGuard<'static, CheckedLabels> {
+    static CHECKED: std::sync::LazyLock<std::sync::Mutex<CheckedLabels>> =
+        std::sync::LazyLock::new(Default::default);
+    CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `label`, unless it is the privacy marker the session list shows in place of a label whose check
+/// did not pass: that is never a session's name.
+pub(super) fn named(label: Option<String>) -> Option<String> {
+    label.filter(|label| label != crate::domain::redact::PROTECTION_ERROR_TEXT)
 }
 
 /// Resolve one already-enumerated local session.
@@ -2704,9 +2824,13 @@ fn locate_local_with(
             .find(|(_, path)| cwd.starts_with(std::path::Path::new(path)))
             .map(|(id, _)| id.clone())
     });
+    // A label whose privacy check did not pass is a marker for the list, not the session's name:
+    // the session opened from it reports its title and gist to the Hub, which keeps the first
+    // ones it is given. It opens with no name and says why.
     Ok(LocatedLocal {
-        title: cand.title,
-        gist: cand.gist,
+        title: named(cand.title),
+        gist: named(cand.gist),
+        labels_withheld: cand.labels_withheld,
         runtime: cand.runtime,
         cwd,
         project_id,
