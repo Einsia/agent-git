@@ -834,8 +834,10 @@ gathered into one line instead of flooding the screen one by one):
 3. **VIEW self-consistency**: the current v1 `VIEW` event ids must be
    reachable in `LOG`, and merge / cherry-pick markers must close in
    pairs (the self-consistency invariant, §4); a log present with no VIEW is an
-   error too (the VIEW is a required file). doctor only reports — the next
-   version (`agit commit`) rebuilds the VIEW whole.
+   error too (the VIEW is a required file). doctor only reports. A branch
+   without a worktree is read with the materializer and limits agit itself
+   uses, so a session agit can read is never reported as unreadable; one past
+   those limits is listed as not inspected, since nothing about it is known.
 
 Check 2 depends on the committed content staying: a staging area deleted after a
 successful push leaves no local copy, so only turn hashes can be compared, and a
