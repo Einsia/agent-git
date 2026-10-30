@@ -1,5 +1,6 @@
 //! Resolve the repository that owns a native session's local secret mappings.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn native_repository(
@@ -7,14 +8,50 @@ pub(crate) fn native_repository(
     native: &str,
     cwd: &Path,
 ) -> crate::Result<Option<PathBuf>> {
+    linked_repository(runtime, native, cwd, |_| Ok(()))
+}
+
+/// The repository whose rules protect a runtime catalog row's labels. A conversation read through
+/// a registered source is linked under its source-qualified key, the row's `session_ref`, and that
+/// link must bind the row's own source and thread. Only when there is no such link does a link
+/// kept under the bare thread id count, as a conversation adopted before it was read through a
+/// source has: that can only add its repository's rules, never take the source's away.
+pub(crate) fn catalog_repository(
+    row: &crate::rc::runtime_context::CatalogRow,
+) -> crate::Result<Option<PathBuf>> {
+    let qualified = linked_repository(&row.runtime, &row.session_ref, &row.cwd, |link| {
+        let binding = link
+            .native_binding
+            .as_ref()
+            .context("source-qualified native link has no source binding")?;
+        anyhow::ensure!(
+            binding.source.source_id == row.source_id && binding.thread_id == row.native_session_id,
+            "source-qualified native link names another source or thread"
+        );
+        Ok(())
+    })?;
+    match qualified {
+        Some(root) => Ok(Some(root)),
+        None => native_repository(&row.runtime, &row.native_session_id, &row.cwd),
+    }
+}
+
+/// The repository of the link stored under `key`, once `check` accepts that link.
+fn linked_repository(
+    runtime: &str,
+    key: &str,
+    cwd: &Path,
+    check: impl FnOnce(&crate::domain::link::Link) -> crate::Result<()>,
+) -> crate::Result<Option<PathBuf>> {
     use crate::domain::{link, store::Store};
     let Some(store) = Store::open()? else {
         return Ok(None);
     };
-    let Some(snapshot) = link::read_archive_link_snapshot(&store, runtime, native)? else {
+    let Some(snapshot) = link::read_archive_link_snapshot(&store, runtime, key)? else {
         return Ok(None);
     };
     let link = snapshot.link;
+    check(&link)?;
     let (Some(owner), Some(agent)) = (&link.owner, &link.agent) else {
         return Ok(None);
     };

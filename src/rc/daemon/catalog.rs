@@ -106,12 +106,13 @@ impl Prepared {
             frame.authority.check()?;
             let catalog = Catalog::open().map_err(|error| failed(error, false))?;
             let value = match self.request {
-                Request::List(request) => serde_json::to_value(
-                    catalog
+                Request::List(request) => {
+                    let mut page = catalog
                         .list(&self.roots, &request)
-                        .map_err(|error| failed(error, false))?,
-                )
-                .map_err(internal)?,
+                        .map_err(|error| failed(error, false))?;
+                    super::protect_catalog_labels(&mut page.rows);
+                    serde_json::to_value(page).map_err(internal)?
+                }
                 // The request names a source generation, so a changed source never matches it.
                 Request::Settings(request) => catalog
                     .settings(&self.roots, &request)
@@ -326,5 +327,179 @@ mod tests {
         assert!(state.prepare_catalog(&frame).is_err());
         frame.params = Some(serde_json::json!({"workspace_id":"ws-b"}));
         assert!(state.prepare_catalog(&frame).is_err());
+    }
+
+    /// A catalog page, and the name a source-bound session opens with, leave only through the
+    /// privacy check, under the rules of the repository the conversation's source-qualified link
+    /// names. A value registered only in that repository, and a credential, come back as
+    /// placeholders; a row whose repository cannot be resolved comes back with no labels, since its
+    /// rules cannot be loaded. A `session.catalog.list` that returned the rows as read, or that
+    /// looked the link up by the bare thread id and so checked under the global rules alone, would
+    /// send them to the browser.
+    #[tokio::test]
+    async fn catalog_list_returns_labels_only_through_the_privacy_check() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::catalog::tests::catalog_list_returns_labels_only_through_the_privacy_check",
+        ) {
+            return;
+        }
+        let credential = "AKIA4X7QZ2M5RT6VW3JH";
+        let phrase = "cedar lantern";
+        let linked = "6b3f2c1e-0000-4000-8000-000000000001";
+        let unlinked = "6b3f2c1e-0000-4000-8000-000000000002";
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        // A unit-test binary cannot host the privacy worker, and here an outcome it did not
+        // process counts as passed: this process checks the labels in place as the worker does,
+        // so a label that skipped the check comes back raw and fails this test.
+        crate::domain::privacy::worker::check_in_process();
+        // SAFETY: this case runs alone in its own process.
+        unsafe {
+            std::env::set_var("AGIT_HOME", base.join("agit"));
+        }
+        let project = base.join("project");
+        let runtime = base.join("codex");
+        for directory in [&project, &runtime] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let source = crate::rc::runtime_sources::Registry::open()
+            .unwrap()
+            .register(&runtime, None, None, None)
+            .unwrap();
+        let source_ref = crate::protocol::NativeSourceRef {
+            source_id: source.source_id.clone(),
+            generation: source.generation,
+        };
+        // The phrase is blocked only in the repository the first conversation's source-qualified
+        // link names.
+        let repository = crate::domain::repo::Repo::init(
+            &crate::infra::config::repo_dir("alice", "notes").unwrap(),
+        )
+        .unwrap();
+        crate::domain::secret_filter::RepositoryDictionary::open(repository.root())
+            .unwrap()
+            .block_add(
+                "Private phrase",
+                zeroize::Zeroizing::new(phrase.into()),
+                true,
+            )
+            .unwrap();
+        let store = crate::domain::store::Store::open_or_init().unwrap();
+        let mut link = crate::domain::link::Link::from_native(
+            crate::domain::link::NativeBinding {
+                source: source_ref.clone(),
+                thread_id: linked.into(),
+            },
+            &project,
+        )
+        .unwrap();
+        link.owner = Some("alice".into());
+        link.agent = Some("notes".into());
+        crate::domain::link::write(&store, &link).unwrap();
+        // The second is linked to an Agent repository that does not exist.
+        let mut link = crate::domain::link::Link::new("codex", unlinked, Some(&project));
+        link.owner = Some("alice".into());
+        link.agent = Some("missing".into());
+        crate::domain::link::write(&store, &link).unwrap();
+        drop(Catalog::open().unwrap());
+        let database = rusqlite::Connection::open(
+            base.join("agit")
+                .join("runtime-catalog")
+                .join("catalog.sqlite"),
+        )
+        .unwrap();
+        for native in [linked, unlinked] {
+            let row = crate::rc::runtime_context::CatalogRow {
+                session_ref: source.session_ref(native),
+                source_id: source.source_id.clone(),
+                source_generation: source.generation,
+                runtime: "codex".into(),
+                native_session_id: native.into(),
+                cwd: project.clone(),
+                title: Some(format!("{phrase} plan")),
+                gist: Some(format!("the key is {credential}")),
+                updated_at_ms: None,
+                writer_active: Some(false),
+                parent_session_ref: None,
+                technical: false,
+            };
+            database
+                .execute(
+                    "INSERT INTO sessions VALUES(?1,?2,?3,1,?4)",
+                    rusqlite::params![
+                        row.session_ref,
+                        row.source_id,
+                        row.cwd.to_string_lossy(),
+                        serde_json::to_string(&row).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        let placeholder = |label: Option<&str>| {
+            let label = label.unwrap();
+            assert!(
+                !label.contains(phrase) && !label.contains(credential),
+                "{label}"
+            );
+            assert_eq!(
+                crate::domain::privacy::projector::tokens(label).count(),
+                1,
+                "{label}"
+            );
+        };
+
+        let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+        let mut frame = Frame::request(
+            method::SESSION_CATALOG_LIST,
+            serde_json::json!({"workspace_id":"ws-a","project_id":"project"}),
+        );
+        frame.caller = Some(crate::protocol::CallerClaim {
+            account_id: None,
+            username: None,
+            role: "viewer".into(),
+            workspace_id: "ws-a".into(),
+        });
+        let (prepared, epoch) = {
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "project", &project).unwrap();
+            (
+                state.prepare_catalog(&frame).unwrap(),
+                state.settlement.borrow().epoch,
+            )
+        };
+        let page = prepared.execute(daemon, frame, epoch).await.unwrap();
+        assert!(
+            !page.to_string().contains(phrase) && !page.to_string().contains(credential),
+            "{page}"
+        );
+        let rows = page["rows"].as_array().unwrap();
+        let row = |native: &str| {
+            rows.iter()
+                .find(|row| row["native_session_id"] == native)
+                .unwrap_or_else(|| panic!("{native} is missing from {page}"))
+        };
+        let checked = row(linked);
+        placeholder(checked["title"].as_str());
+        placeholder(checked["gist"].as_str());
+        let unresolved = row(unlinked);
+        assert!(
+            unresolved
+                .get("title")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(
+            unresolved
+                .get("gist")
+                .is_none_or(serde_json::Value::is_null)
+        );
+
+        // A source-bound session opens with the same labels.
+        let (title, gist) = super::super::source_sessions::catalog_labels(&source_ref, linked);
+        placeholder(title.as_deref());
+        placeholder(gist.as_deref());
+        assert_eq!(
+            super::super::source_sessions::catalog_labels(&source_ref, unlinked),
+            (None, None)
+        );
     }
 }
