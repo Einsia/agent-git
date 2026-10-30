@@ -21,11 +21,11 @@
     "x86_64": [
       {
         "name": "brotli-libs",
-        "version": "1.2.0-r1",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/brotli-libs-1.2.0-r1.apk",
-        "sha256": "f0823de7c6d45859aeb6a7facfc5cfbf2dadb83ad4f27c794cb6ecc74e578cee",
+        "version": "1.2.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/brotli-libs-1.2.1-r0.apk",
+        "sha256": "62a7e37e43bbfc1f8525a00ad2125fd5897135dc93b849733884cb78ffd8e26c",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/1ee249c9da168084b1c6c9f7488bdffa2ac33c84/main/brotli"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8313352127992a9d82e2c2024494f6c38a4dffb4/main/brotli"
       },
       {
         "name": "c-ares",
@@ -61,11 +61,11 @@
       },
       {
         "name": "libcurl",
-        "version": "8.22.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcurl-8.22.0-r0.apk",
-        "sha256": "40b2a8e15a8d24bc95a5f42aaeb018313a1ff457cee71d8e15aaf1328da765e8",
+        "version": "8.23.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcurl-8.23.0-r0.apk",
+        "sha256": "1f70ca404818805a6465b615bbfe84ef861488a963d7e630108ebd7fbaa51665",
         "license": "curl",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/ab53c408436ac7199ed5b67bde204aaca73003bd/main/curl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c65a7b3f6d6bc4b3c0a8a6fff759d8fd05a167ce/main/curl"
       },
       {
         "name": "libexpat",
@@ -109,11 +109,11 @@
       },
       {
         "name": "musl",
-        "version": "1.2.6-r2",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r2.apk",
-        "sha256": "573712e2f49c15bfc20a2699f204acdfc74c772722b15e7353d768057fae0e71",
+        "version": "1.2.6-r3",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r3.apk",
+        "sha256": "e142255d0fa397f14318996bc10378093dcc069dc3dd1b6818c8f28a789c21da",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/f5640d3a10f664c9119720c60515265d3d6f6d01/main/musl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl"
       },
       {
         "name": "nghttp2-libs",
@@ -151,11 +151,11 @@
     "aarch64": [
       {
         "name": "brotli-libs",
-        "version": "1.2.0-r1",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/brotli-libs-1.2.0-r1.apk",
-        "sha256": "e0e7a7892f28326a9f18e09607b1aea72baedda470bc4e3d2b11262b9ae5dda3",
+        "version": "1.2.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/brotli-libs-1.2.1-r0.apk",
+        "sha256": "f802b9d5a329c216f02e73607cb8f662c434767e41686367ac0afcf6d0d45d64",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/1ee249c9da168084b1c6c9f7488bdffa2ac33c84/main/brotli"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8313352127992a9d82e2c2024494f6c38a4dffb4/main/brotli"
       },
       {
         "name": "c-ares",
@@ -191,11 +191,11 @@
       },
       {
         "name": "libcurl",
-        "version": "8.22.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcurl-8.22.0-r0.apk",
-        "sha256": "cbec830a63888be570c06d20d87c85649aff1db38c3b4dcc17884b14471e39e3",
+        "version": "8.23.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcurl-8.23.0-r0.apk",
+        "sha256": "64ae89f6e5d318ed5209778232191806ce49644ce9e09540b7d7830a5330d127",
         "license": "curl",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/ab53c408436ac7199ed5b67bde204aaca73003bd/main/curl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c65a7b3f6d6bc4b3c0a8a6fff759d8fd05a167ce/main/curl"
       },
       {
         "name": "libexpat",
@@ -239,11 +239,11 @@
       },
       {
         "name": "musl",
-        "version": "1.2.6-r2",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/musl-1.2.6-r2.apk",
-        "sha256": "5e9674b7f41152fe2119093b5cb4c13eaaadb19c2d5422b2d7267913e663ee6e",
+        "version": "1.2.6-r3",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/musl-1.2.6-r3.apk",
+        "sha256": "2e17864102278d9049c3a56f1bceed9e8cf287065617e579325123443daed8a5",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/f5640d3a10f664c9119720c60515265d3d6f6d01/main/musl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl"
       },
       {
         "name": "nghttp2-libs",
