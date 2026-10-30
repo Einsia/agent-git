@@ -270,6 +270,182 @@ async fn session_end_runs_a_final_settlement_for_the_pending_push() {
     }
 }
 
+/// Each archived Claude turn ends where the completed-only cut ends, and a turn a person stopped
+/// stays out of the archive until a later turn's cut carries it.
+///
+/// The transcripts are the shapes Claude Code writes in stream-json mode: a finished reply followed
+/// by bookkeeping; an interrupt that leaves a `user-rejected` denial and synthetic text; a stop
+/// mid-approval that leaves only a `permission-rule` denial. A job that counts the bookkeeping, or
+/// a stopped turn left to wait for a later completion, ends past every cut a commit makes and stays
+/// queued. A job capped at the last completion lets an earlier reply acknowledge a prompt that is
+/// still open. An interrupt, or a stop the daemon was asked for, that gets its own cut publishes
+/// what the person may have stopped in order to withhold.
+#[cfg(unix)]
+#[test]
+fn archived_turns_end_where_the_completed_only_cut_ends() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::settle_tests::archived_turns_end_where_the_completed_only_cut_ends",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path());
+    }
+    crate::rc::select_local_authority();
+    let line = |value: serde_json::Value| format!("{value}\n");
+    let prompt = |text: &str| {
+        line(serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}))
+    };
+    let tool_call = |id: &str| {
+        line(serde_json::json!({"type": "assistant", "message": {
+            "model": "claude-haiku-5-5", "role": "assistant", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "ls"}}],
+        }}))
+    };
+    let denial = |id: &str, kind: &str, text: &str| {
+        line(
+            serde_json::json!({"type": "user", "toolDenialKind": kind, "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": id, "is_error": true, "content": text}],
+            }}),
+        )
+    };
+    let finished = prompt("first")
+        + &line(serde_json::json!({"type": "assistant", "message": {
+            "model": "claude-haiku-5-5", "role": "assistant", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "done"}],
+        }}));
+    let bookkept =
+        finished.clone() + &line(serde_json::json!({"type": "last-prompt", "lastPrompt": "first"}));
+    let interrupted = bookkept.clone()
+        + &prompt("regretted paste")
+        + &tool_call("toolu_1")
+        + &denial(
+            "toolu_1",
+            "user-rejected",
+            "The user doesn't want to proceed with this tool use.",
+        )
+        + &prompt("[Request interrupted by user for tool use]");
+    let stream_closed =
+        "Tool permission request failed: AbortError: Tool permission stream closed before response";
+    let held_stop = interrupted.clone()
+        + &prompt("second")
+        + &tool_call("toolu_2")
+        + &denial("toolu_2", "permission-rule", stream_closed);
+    let stopped = held_stop.clone()
+        + &prompt("third")
+        + &tool_call("toolu_3")
+        + &denial("toolu_3", "permission-rule", stream_closed);
+    let reopened = stopped.clone() + &prompt("again");
+
+    let transcript = home.path().join("native.jsonl");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _context = runtime.enter();
+    let (mut session, _out, _notes) = super::tests::harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
+        )),
+        "claude-code",
+        SessionStatus::Idle,
+    );
+    let (_lease, settlement) = tokio::sync::watch::channel(SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    });
+    session.settlement = settlement;
+    session.agit_session = Some(
+        crate::rc::lineage::AgitSession::new(
+            "alice/photo",
+            "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+            "s/settlement",
+        )
+        .unwrap(),
+    );
+    session.settlement_child = Some(SettlementChild {
+        exe: "/usr/bin/true".into(),
+        repo_dir: home.path().into(),
+    });
+    let read = |session: &mut Session, text: &str| {
+        std::fs::write(&transcript, text).unwrap();
+        session.tailer = Some(Tailer::new(&transcript, false));
+    };
+    let exit = |session: &mut Session, requested: bool| {
+        let AnyDriver::ClaudeCode(driver) = &mut session.driver else {
+            unreachable!()
+        };
+        driver.set_test_current_turn(&uuid::Uuid::new_v4().to_string());
+        session.stop_requested = requested;
+        runtime.block_on(session.settle_on_exit());
+    };
+    let cut = |text: &str| {
+        let own = crate::commands::commit::completed_native_boundary("claude-code", text)
+            .unwrap()
+            .unwrap_or(0);
+        let receipts = crate::rc::native_claude::completion::boundaries(
+            "test-session",
+            &transcript,
+            text.as_bytes(),
+        )
+        .unwrap();
+        own.max(receipts.last().copied().unwrap_or(0) as u64)
+    };
+    let queued = || {
+        let jobs = crate::rc::archive_jobs::pending().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "each newer job of one transcript replaces the older"
+        );
+        jobs[0].required_bytes
+    };
+    let retain = |session: &Session, ending| {
+        session
+            .retain_completed_archive(&uuid::Uuid::new_v4().to_string(), ending)
+            .unwrap()
+    };
+    use super::archive_recovery::TurnEnding;
+    crate::rc::with_agit_home(home.path(), || {
+        read(&mut session, &bookkept);
+        retain(&session, TurnEnding::Completed);
+        assert_eq!(queued(), finished.len() as u64);
+        assert_eq!(cut(&bookkept), finished.len() as u64);
+
+        read(&mut session, &interrupted);
+        retain(&session, TurnEnding::Interrupted);
+        assert_eq!(
+            queued(),
+            finished.len() as u64,
+            "an interrupt queues nothing"
+        );
+        assert_eq!(cut(&interrupted), finished.len() as u64);
+
+        read(&mut session, &held_stop);
+        exit(&mut session, true);
+        assert_eq!(
+            queued(),
+            finished.len() as u64,
+            "a requested stop queues nothing"
+        );
+        assert_eq!(cut(&held_stop), finished.len() as u64);
+
+        read(&mut session, &stopped);
+        exit(&mut session, false);
+        assert_eq!(queued(), stopped.len() as u64);
+        assert_eq!(cut(&stopped), stopped.len() as u64);
+
+        read(&mut session, &reopened);
+        retain(&session, TurnEnding::Completed);
+        assert_eq!(queued(), reopened.len() as u64);
+        assert_eq!(cut(&reopened), stopped.len() as u64);
+    });
+}
+
 /// The other half of what `settle_on_exit` owes: lines written into the transcript after the
 /// last turn boundary still become `item.completed` at session end, rather than being lost
 /// forever because no further `turn.completed` arrives.

@@ -123,6 +123,7 @@ pub(super) fn harness_test_session_with_channels(
         reported_settlement_failure: None,
         local_settlement: None,
         settlement_due: false,
+        stop_requested: false,
         completed_boundary: None,
         settlement_child: None,
         queued_initial_turn: None,

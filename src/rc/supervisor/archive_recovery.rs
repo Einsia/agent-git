@@ -8,8 +8,30 @@ use crate::{
 use anyhow::{Context, ensure};
 use std::io::Write;
 
+/// How a turn ended, which decides what becomes of a tail no completion closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TurnEnding {
+    /// The harness reported a normal completion.
+    Completed,
+    /// The person interrupted it. An open tail stays out of the archive until a later turn's cut
+    /// covers it or the person publishes it: an interrupt is their quick stop, often right after
+    /// sending something they regret.
+    Interrupted,
+    /// It stopped without anyone choosing to: a failed turn, or one still running when the session
+    /// exits. An open tail ends where it stopped.
+    Stopped,
+}
+
 impl Session {
-    pub(super) fn retain_completed_archive(&self, turn_id: &str) -> crate::Result<()> {
+    /// Queues the archive of a turn that ended, through the end its completed-only cut will reach.
+    ///
+    /// Only a harness this supervisor starts and reaps gets an end receipt for a stopped turn: an
+    /// attached Claude outlives the supervisor, and its plugin ends its own turns.
+    pub(super) fn retain_completed_archive(
+        &self,
+        turn_id: &str,
+        ending: TurnEnding,
+    ) -> crate::Result<()> {
         let Some(lineage) = &self.agit_session else {
             return Ok(());
         };
@@ -23,12 +45,27 @@ impl Session {
             .context("archive native transcript is unavailable")?;
         let boundary = tailer.consumed();
         #[cfg(unix)]
-        let boundary = if matches!(self.driver, AnyDriver::ClaudeNative(_)) {
-            crate::rc::native_claude::completion::turn_boundary(&native, tailer.path(), turn_id)?
-                .unwrap_or(boundary)
-        } else {
-            boundary
+        let boundary = match &self.driver {
+            AnyDriver::ClaudeNative(_) | AnyDriver::ClaudeCode(_) => {
+                let generation = self.generation.to_string();
+                let stopped = (ending == TurnEnding::Stopped
+                    && matches!(self.driver, AnyDriver::ClaudeCode(_)))
+                .then_some((generation.as_str(), turn_id));
+                let end = crate::rc::native_claude::completion::turn_end(
+                    &native,
+                    tailer.path(),
+                    boundary,
+                    stopped,
+                )?;
+                if end.open && ending == TurnEnding::Interrupted {
+                    return Ok(());
+                }
+                end.at
+            }
+            _ => boundary,
         };
+        #[cfg(not(unix))]
+        let _ = ending;
         ensure!(
             boundary <= tailer.consumed(),
             "native completion has not reached the transcript reader"
