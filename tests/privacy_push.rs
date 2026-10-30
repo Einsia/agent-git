@@ -2438,6 +2438,26 @@ fn continued_plain_session_declares_only_what_it_adds() {
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
     assert_eq!(hub.previews.lock().unwrap().len(), earlier);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
+
+    // An unreadable accepted record has no user-side repair: the refusal names the branch, sends
+    // nothing, keeps local commits, and asks for a report instead of an operation to run.
+    *hub.move_on_strategy.lock().unwrap() = None;
+    let local = git(repo.root(), &["rev-parse", "HEAD"]);
+    for scope in fs::read_dir(repo.root().join(".git/agit/privacy-accepted")).unwrap() {
+        fs::write(scope.unwrap().path().join("index.enc"), [0; 64]).unwrap();
+    }
+    let refused = run(&["--yes", "push", "alice/app@talk"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("cannot push alice/app@talk; nothing was sent to the Hub")
+            && stderr.contains("report the problem")
+            && stderr.contains("`agit status`"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), received);
+    assert_eq!(git(repo.root(), &["rev-parse", "HEAD"]), local);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
 }
 
 /// An encrypted session that continues its published history declares only what it adds, and its

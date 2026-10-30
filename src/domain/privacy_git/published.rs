@@ -58,8 +58,7 @@ pub(super) fn retain_accepted(
                 &["hash-object", "-t", "commit", "--stdin"],
                 &original
             )? == oid,
-        "{}",
-        accepted::RECOVERY
+        accepted::Inconsistent
     );
     crate::commands::plumbing::import_commit_graph(destination, source, oid)?;
     Ok(None)
