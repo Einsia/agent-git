@@ -126,7 +126,7 @@ impl From<PushAutoBefore> for Option<bool> {
 
 fn auto_push_scope(repository: &str) -> String {
     format!(
-        "turns on automatic push for the whole repository {repository}: every managed session there uploads after each turn"
+        "turns on automatic push on this computer: every managed conversation saved to {repository} (in any folder) uploads after each turn. Teammates' settings and Hub settings are unchanged. Unbinding this folder restores the previous setting once no other bound folder holds automatic push on"
     )
 }
 
@@ -145,8 +145,8 @@ fn auto_push_holders(project: &Project) -> Result<Vec<Project>> {
         .collect())
 }
 
-/// Turns on automatic push for the whole repository, recording the override from before any
-/// folder turned it on: this folder's own earlier record, another bound folder's, or the
+/// Turns on automatic push for this computer's local repository, recording the override from
+/// before any folder turned it on: this folder's own earlier record, another bound folder's, or the
 /// current one. A folder that recorded the override another folder set would turn automatic
 /// push back on when it is unbound last.
 fn enable_auto_push(project: &mut Project, repo: &Repo) -> Result<()> {
