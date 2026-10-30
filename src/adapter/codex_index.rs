@@ -203,23 +203,39 @@ pub fn session_choices_for_cwd(cwd: &str) -> Option<Vec<Thread>> {
     threads_for_cwd_at(&con, cwd, true)
 }
 
+/// The conditions that keep rows out of session choices; empty when every row is a choice.
+fn choice_filter(con: &Connection, choices_only: bool) -> String {
+    let mut filter = String::new();
+    if !choices_only {
+        return filter;
+    }
+    // Unknown provenance stays visible; prompt text and broad subagent labels do not identify
+    // internal approval runtimes. Filtering before projection avoids reading their previews.
+    if con.prepare("SELECT source FROM threads LIMIT 0").is_ok() {
+        filter.push_str(
+            " AND CASE WHEN typeof(source) = 'text' AND length(source) <= 4096 AND json_valid(source) \
+             THEN COALESCE(json_extract(source, '$.subagent.other') != 'guardian', 1) ELSE 1 END",
+        );
+    }
+    // A side conversation is listed under the conversation it is attached to, as Codex lists it.
+    if con
+        .prepare("SELECT attached_thread_parent_id FROM threads LIMIT 0")
+        .is_ok()
+    {
+        filter.push_str(" AND attached_thread_parent_id IS NULL");
+    }
+    filter
+}
+
 fn threads_for_cwd_at(con: &Connection, cwd: &str, choices_only: bool) -> Option<Vec<Thread>> {
     if !schema_ok(con) {
         return None;
     }
-    // Unknown provenance stays visible; prompt text and broad subagent labels do not identify
-    // internal approval runtimes. Filtering before projection avoids reading their previews.
-    let source_filter = if choices_only && con.prepare("SELECT source FROM threads LIMIT 0").is_ok()
-    {
-        "AND CASE WHEN typeof(source) = 'text' AND length(source) <= 4096 AND json_valid(source) \
-         THEN COALESCE(json_extract(source, '$.subagent.other') != 'guardian', 1) ELSE 1 END"
-    } else {
-        ""
-    };
     let sql = format!(
-        "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
-         {source_filter} ORDER BY updated_at_ms DESC",
-        select(con)
+        "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL{} \
+         ORDER BY updated_at_ms DESC",
+        select(con),
+        choice_filter(con, choices_only)
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([cwd], row_to_thread).ok()?;
@@ -231,13 +247,22 @@ fn threads_for_cwd_at(con: &Connection, cwd: &str, choices_only: bool) -> Option
 /// Still orders of magnitude faster than scanning files, but the result can run to tens of
 /// thousands of rows — the caller must be prepared for that.
 pub fn all_threads() -> Option<Vec<Thread>> {
-    let con = open(&index_path()?)?;
-    if !schema_ok(&con) {
+    all_threads_at(&open(&index_path()?)?, false)
+}
+
+/// Session choices in every directory, filtered as [`session_choices_for_cwd`] filters one.
+pub fn all_session_choices() -> Option<Vec<Thread>> {
+    all_threads_at(&open(&index_path()?)?, true)
+}
+
+fn all_threads_at(con: &Connection, choices_only: bool) -> Option<Vec<Thread>> {
+    if !schema_ok(con) {
         return None;
     }
     let sql = format!(
-        "{} WHERE archived = 0 AND rollout_path IS NOT NULL ORDER BY updated_at_ms DESC",
-        select(&con)
+        "{} WHERE archived = 0 AND rollout_path IS NOT NULL{} ORDER BY updated_at_ms DESC",
+        select(con),
+        choice_filter(con, choices_only)
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([], row_to_thread).ok()?;
@@ -639,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn session_choices_filter_native_approval_provenance_without_hiding_other_work() {
+    fn session_choices_hide_approval_runtimes_and_side_conversations_but_no_other_work() {
         let (_directory, path) = fixture();
         let con = Connection::open(&path).unwrap();
         con.execute_batch("ALTER TABLE threads ADD COLUMN source TEXT;")
@@ -686,15 +711,28 @@ mod tests {
                 rusqlite::params![id, thread_source, source],
             ).unwrap();
         }
+        // A side conversation has a user origin; only its attachment keeps it out of choices.
+        con.execute_batch(
+            "ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT;
+             INSERT INTO threads (id, rollout_path, cwd, first_user_message, thread_source, updated_at_ms, archived, source, attached_thread_parent_id) \
+             VALUES ('side', '/missing.jsonl', '/repo/one', 'side question', 'user', 600, 0, '\"vscode\"', 'id-a');",
+        )
+        .unwrap();
         drop(con);
         let con = open(&path).unwrap();
         let choices = threads_for_cwd_at(&con, "/repo/one", true).unwrap();
         let all = threads_for_cwd_at(&con, "/repo/one", false).unwrap();
-        for (id, _, _, visible) in cases {
+        let every_choice = all_threads_at(&con, true).unwrap();
+        for (id, _, _, visible) in cases.into_iter().chain([("side", None, None, false)]) {
             assert_eq!(
                 choices.iter().any(|thread| thread.id == id),
                 visible,
                 "{id}"
+            );
+            assert_eq!(
+                every_choice.iter().any(|thread| thread.id == id),
+                visible,
+                "{id} in every directory"
             );
             assert!(all.iter().any(|thread| thread.id == id), "{id}");
         }

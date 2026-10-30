@@ -360,6 +360,16 @@ fn runtime_of(explicit: Option<&str>, transcript_path: Option<&str>) -> &'static
     }
 }
 
+/// Whether the hook comes from a side conversation, which agit neither records, announces, nor
+/// captures. Codex alone decides when such a conversation closes or expires, and a record agit
+/// kept would outlive it.
+fn side_conversation(runtime: &str, ev: &Event) -> bool {
+    runtime == "codex"
+        && crate::adapter::codex::side_conversation(
+            ev.transcript_path.as_deref().map(std::path::Path::new),
+        )
+}
+
 /// The directory the session started in, which decides whether a project captures it.
 ///
 /// A hook's `cwd` follows the session's current directory, so a session started elsewhere that
@@ -473,6 +483,9 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     }
     let ev = read_event(runtime)?;
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
+    if side_conversation(rt, &ev) {
+        return None;
+    }
     let restored = restored_title(rt, &ev);
     let response = session_start(rt, &ev);
     let Some(title) = restored else {
@@ -761,7 +774,11 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         return Ok(());
     };
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
-    let (store, archive_required) = match super::commit::archive::process_store()? {
+    let archive_store = super::commit::archive::process_store()?;
+    if archive_store.is_none() && side_conversation(rt, &ev) {
+        return Ok(());
+    }
+    let (store, archive_required) = match archive_store {
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
     };
@@ -1011,6 +1028,40 @@ mod tests {
         // An unseen value must not be guessed as startup — that would claim a branch.
         assert_eq!(Source::parse(Some("teleport")), Source::Other);
         assert_eq!(Source::parse(None), Source::Other);
+    }
+
+    /// Codex reports a temporary side conversation without a transcript and records a persistent
+    /// one as attached to its main conversation; both are left alone. Keying on the `fork` source
+    /// would also drop a fork opened as a conversation of its own, and treating every payload
+    /// without a transcript as a side conversation would drop runtimes that never report one.
+    #[test]
+    fn only_codex_side_conversations_are_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = |name: &str, payload: serde_json::Value| {
+            let path = directory.path().join(name);
+            let header = serde_json::json!({"type": "session_meta", "payload": payload});
+            std::fs::write(&path, format!("{header}\n")).unwrap();
+            path
+        };
+        let attached = rollout(
+            "attached.jsonl",
+            serde_json::json!({"id": "side", "forked_from_id": "main", "attached_thread": true}),
+        );
+        let forked = rollout(
+            "forked.jsonl",
+            serde_json::json!({"id": "fork", "forked_from_id": "main"}),
+        );
+        let event = |transcript: Option<&std::path::Path>| {
+            super::parse_event(
+                &serde_json::json!({"session_id": "s", "source": "fork", "transcript_path": transcript})
+                    .to_string(),
+            )
+            .unwrap()
+        };
+        assert!(super::side_conversation("codex", &event(None)));
+        assert!(super::side_conversation("codex", &event(Some(&attached))));
+        assert!(!super::side_conversation("codex", &event(Some(&forked))));
+        assert!(!super::side_conversation("workbuddy", &event(None)));
     }
 
     /// The parser accepts the fields emitted by Codex hooks and ignores event-specific additions.
