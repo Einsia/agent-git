@@ -55,6 +55,10 @@ agit init p1 --auto-push=false
 
 If `szh/p1` already exists, do not run `init` again. Use `new` for a new session in that repo and `import` for an existing runtime conversation.
 
+`init` for a repository that already has history creates nothing:
+- From a directory that is not bound yet, it binds that directory to the existing repository and exits `0`. It changes nothing else. `--private`, `--auto-push` and `--seed` apply only when `init` creates a repository, and an existing repository keeps its automatic publishing setting. When that setting is off, the output says so.
+- From the directory already bound to it, or with `--no-bind`, it reports that there is nothing to do and exits `4`.
+
 ## Session privacy
 
 `init` creates the repository's shared-file line. New sessions created with `new`, `import` or

@@ -211,3 +211,69 @@ fn init_under_an_agent_pseudo_terminal_takes_the_default_without_waiting() {
     );
     assert!(!store.join("repos/local/published").exists(), "{output}");
 }
+
+/// `init` for an existing repository creates nothing and says where this directory stands. From a
+/// directory not yet bound it binds that directory and changes no repository setting; from the
+/// bound directory it reports nothing to do. Refusing both alike leaves a user unable to tell
+/// whether sessions here are captured, and applying a repeated `--auto-push` could turn on uploads
+/// the owner turned off.
+#[test]
+fn init_on_an_existing_repo_binds_a_new_directory_and_changes_nothing_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (first, second) = (tmp.path().join("first"), tmp.path().join("second"));
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    let created = agit(&home, &first, &["init", "qa", "--auto-push=false"]);
+    assert!(created.status.success(), "{created:?}");
+    let repo = home.join("repos/local/qa");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let (head, config) = (
+        git(&["rev-parse", "main"]),
+        fs::read(repo.join(".git/config")).unwrap(),
+    );
+
+    let again = agit(&home, &first, &["init", "qa"]);
+    assert_eq!(again.status.code(), Some(4), "{again:?}");
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        stderr.contains("already bound") && stderr.contains("nothing to do"),
+        "{stderr}"
+    );
+
+    let joined = agit(
+        &home,
+        &second,
+        &["init", "qa", "--auto-push=true", "--private"],
+    );
+    assert!(joined.status.success(), "{joined:?}");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&joined.stdout),
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(output.contains("--private, --auto-push"), "{output}");
+    assert!(
+        output.contains("automatic push is off for local/qa"),
+        "{output}"
+    );
+    let bound: Vec<String> = fs::read_dir(home.join("workspaces"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(bound.len(), 2, "{bound:?}");
+    assert!(
+        bound.iter().all(|text| text.contains("local/qa")),
+        "{bound:?}"
+    );
+    assert_eq!(git(&["rev-parse", "main"]), head);
+    assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config);
+}

@@ -159,7 +159,11 @@ pub fn run(args: Args) -> CmdResult {
             None => crate::infra::config::auto_push_default()?,
         },
     };
-    if auto_push && crate::infra::credentials::current_user().is_none() {
+    // A repository with history is only bound, never set to push, so it needs no sign-in here.
+    let binds_only = existing
+        .as_ref()
+        .is_some_and(|repo| checkout_state(repo) == CheckoutState::HasHistory);
+    if auto_push && !binds_only && crate::infra::credentials::current_user().is_none() {
         ui::info("Sign in to enable automatic pushing for this repository.");
         let result = super::login::run(super::login::Args {
             hub: None,
@@ -218,13 +222,23 @@ pub fn run(args: Args) -> CmdResult {
             );
             return Ok(ExitCode::Precondition);
         }
-        Some((CheckoutState::HasHistory, _)) => {
-            ui::error(&format!(
-                "{owner}/{name} already exists ({}).",
-                dir.display()
-            ));
-            ui::hint("init creates repos; an existing one is used as-is");
-            return Ok(ExitCode::Precondition);
+        Some((CheckoutState::HasHistory, existing)) => {
+            let creation_only = [
+                (args.private, "--private"),
+                (args.auto_push.is_some(), "--auto-push"),
+                (args.seed || args.seed_assets.is_some(), "--seed"),
+            ]
+            .into_iter()
+            .filter_map(|(given, flag)| given.then_some(flag))
+            .collect::<Vec<_>>();
+            let binding = (!args.no_bind).then_some(args.rebind);
+            return init_existing(
+                &cwd,
+                &existing,
+                &format!("{owner}/{name}"),
+                binding,
+                &creation_only,
+            );
         }
         None => Repo::init(&dir)?,
     };
@@ -268,6 +282,56 @@ pub fn run(args: Args) -> CmdResult {
             "repo created: {owner}/{name} (no directory bound)"
         ));
     }
+    Ok(ExitCode::Ok)
+}
+
+/// `init` for a repository that already has history creates nothing. Binding the directory is the
+/// one part of `init` left to do, so it binds a directory that is not bound yet, and only that: an
+/// existing repository keeps its automatic-push setting and every other preference, because an
+/// option given to a repeated setup step must not turn on uploads its owner turned off. It
+/// succeeds only when it binds, so a repeat in the bound directory still ends as a refused
+/// precondition.
+///
+/// `binding` is `None` for `--no-bind`, otherwise whether `--rebind` was given; `creation_only`
+/// names the options given that apply only to a new repository.
+fn init_existing(
+    cwd: &Path,
+    repo: &Repo,
+    slug: &str,
+    binding: Option<bool>,
+    creation_only: &[&str],
+) -> CmdResult {
+    let at = ui::tilde(repo.root());
+    let Some(rebind) = binding else {
+        ui::error(&format!(
+            "{slug} already exists ({at}); there is nothing to create"
+        ));
+        return Ok(ExitCode::Precondition);
+    };
+    if workspace::read(cwd).is_some_and(|bound| bound.repo == slug) {
+        ui::error(&format!(
+            "{slug} already exists ({at}) and this directory is already bound to it; nothing to do"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
+    workspace::bind(cwd, slug, rebind)?;
+    ui::success(&format!(
+        "bound this directory to {slug}, which already exists ({at})"
+    ));
+    if !creation_only.is_empty() {
+        ui::info(ui::dim(&format!(
+            "  {} apply only when init creates a repository; {slug} keeps its settings",
+            creation_only.join(", ")
+        )));
+    }
+    if !repo.auto_push_enabled()? {
+        ui::info(ui::dim(&format!(
+            "  automatic push is off for {slug}; publish with `agit push`"
+        )));
+    }
+    ui::info(ui::dim("  Next:"));
+    ui::info("    agit import          adopt a running session (settles on import)");
+    ui::info("    agit new -b <name>   start a fresh session (inherits memory/skills)");
     Ok(ExitCode::Ok)
 }
 
