@@ -283,8 +283,17 @@ impl SessionPublicationPlan {
                         choice.save(source)?;
                     }
                     // A session first published on another Hub publishes here as a new plain
-                    // session of this account: the record of that Hub is not this one's.
-                    if privacy.hub.as_deref() != Some(identity.hub.as_str()) {
+                    // session of this account only when this device is signed in to that Hub as
+                    // the account that created it. Any other session there is someone else's:
+                    // registered here as this account's, its copy would be out of its author's
+                    // reach to withdraw or erase, and would name the uploader as its creator.
+                    if let Some(hub) = privacy.hub.clone().filter(|hub| *hub != identity.hub) {
+                        let signed_in = crate::infra::credentials::load_checked(&hub)?
+                            .and_then(|credential| credential.account_id);
+                        ensure!(
+                            privacy.creator.is_some() && privacy.creator == signed_in,
+                            "session {session} was first published on {hub} by an account this device is not signed in to there, so it cannot be published here as yours; sign in to {hub} with the account that created it, or push without the branches that hold it"
+                        );
                         privacy = super::super::session_privacy::SessionPrivacy::new(Some(
                             account.clone(),
                         ))?;
@@ -921,15 +930,32 @@ impl ProjectedHistory {
                             commit
                         } else if let Some(response) = config {
                             let mut published = metadata.clone();
-                            if published
-                                .session_privacy
-                                .as_ref()
-                                .is_some_and(|privacy| privacy.scheme != SessionScheme::Plain)
+                            let born_elsewhere = source_sessions
+                                .births
+                                .get(&metadata.session)
+                                .and_then(sources::Birth::hub)
+                                .is_some_and(|hub| hub != identity.hub);
+                            if born_elsewhere
+                                || published
+                                    .session_privacy
+                                    .as_ref()
+                                    .is_some_and(|privacy| privacy.scheme != SessionScheme::Plain)
                             {
                                 published.session_privacy = Some(response.config.privacy.clone());
                             }
+                            // A session registered here from another Hub's birth carries no
+                            // account of that Hub: it names nobody here.
+                            if born_elsewhere
+                                && published
+                                    .committer_account
+                                    .as_ref()
+                                    .is_some_and(|account| account.hub != identity.hub)
+                            {
+                                published.committer_account = None;
+                            }
                             if selected.delivery.is_none()
                                 && metadata.session_privacy == published.session_privacy
+                                && metadata.committer_account == published.committer_account
                                 && metadata.source_ref == original_metadata.source_ref
                                 && metadata.source_commit == original_metadata.source_commit
                                 && metadata.fork_origin == original_metadata.fork_origin
@@ -1365,6 +1391,10 @@ fn plain_commit(
             ("source_ref", json!(metadata.source_ref)),
             ("source_commit", json!(metadata.source_commit)),
             ("fork_origin", serde_json::to_value(&metadata.fork_origin)?),
+            (
+                "committer_account",
+                serde_json::to_value(&metadata.committer_account)?,
+            ),
         ] {
             match kept {
                 serde_json::Value::Null => fields.remove(key),

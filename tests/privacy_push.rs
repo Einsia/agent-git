@@ -1957,6 +1957,77 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
     let mut collaborator = metadata.clone();
     collaborator.committer_account = Some(AccountIdentity::new(&source.base, "account-2").unwrap());
     save(&collaborator, &["First turn"], "Collaborator contribution");
+    // An ordinary push of a session first published on another Hub registers it as the pusher's
+    // only when this device is signed in there as its creator, or when its birth names no Hub.
+    // Someone else's session from the target Hub is refused, named, before anything reaches the
+    // source Hub; one that re-owned every such session would register it as account-1's here.
+    // An admitted one names neither the other Hub's registration nor its accounts, including one
+    // whose metadata predates recorded privacy and names its birth only by its committer.
+    for (branch, id, birth, recorded, admitted) in [
+        ("theirs", "d", Some("account-2"), true, false),
+        ("mine", "e", Some("account-1"), true, true),
+        ("legacy", "7", Some("account-1"), false, true),
+        ("offline", "f", None, false, true),
+    ] {
+        repo.git(&["checkout", "-b", branch, &format!("{first}~2")])
+            .unwrap();
+        let mut elsewhere = metadata.clone();
+        elsewhere.session = format!("agit-{}", id.repeat(40));
+        let creator = birth.map(|creator| AccountIdentity::new(&target.base, creator).unwrap());
+        elsewhere.session_privacy = recorded.then(|| SessionPrivacy::new(creator.clone()).unwrap());
+        elsewhere.committer_account = creator;
+        let mut claim = elsewhere.clone();
+        claim.session.clear();
+        storage::write_snapshot(repo.root(), "", "").unwrap();
+        meta::write(repo.root(), &claim).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Claim session").unwrap();
+        save(&elsewhere, &["Session from elsewhere"], "Elsewhere");
+        let before = (
+            source.registrations.load(Ordering::Acquire),
+            source.posts.load(Ordering::Acquire),
+        );
+        let pushed = run(&source, &["--yes", "push", &format!("alice/app@{branch}")]);
+        repo.git(&["checkout", "work"]).unwrap();
+        if !admitted {
+            assert!(!pushed.status.success(), "{pushed:?}");
+            let stderr = String::from_utf8_lossy(&pushed.stderr);
+            assert!(
+                stderr.contains(&format!(
+                    "session {} was first published on",
+                    elsewhere.session
+                )) && stderr.contains("cannot be published here as yours"),
+                "{pushed:?}"
+            );
+            assert_eq!(
+                (
+                    source.registrations.load(Ordering::Acquire),
+                    source.posts.load(Ordering::Acquire),
+                ),
+                before
+            );
+            continue;
+        }
+        assert_success(&pushed);
+        let tip = git(
+            &source_root.join("alice/app.git"),
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        );
+        let published: serde_json::Value = serde_json::from_str(&git(
+            &source_root.join("alice/app.git"),
+            &["show", &format!("{tip}:session/meta.json")],
+        ))
+        .unwrap();
+        assert_eq!(published["session"], elsewhere.session);
+        assert!(published["committer_account"].is_null(), "{published}");
+        if birth.is_some() {
+            assert_eq!(
+                published["session_privacy"]["hub"], source.base,
+                "{branch}: {published}"
+            );
+            assert_eq!(published["session_privacy"]["creator"], "account-1");
+        }
+    }
     assert_success(&run(&source, &["--yes", "push", "alice/app@work"]));
     let source_refs = git(&source_root.join("alice/app.git"), &["show-ref"]);
     for (branch, hub, creator) in [
