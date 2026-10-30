@@ -49,10 +49,12 @@ repository, including a desktop RC project, keeps its source authority; sync rep
 before importing or publishing it elsewhere. Publish that session from its source repository.
 Archived or superseded instances are not published; inspect reported failures.
 
-`--auto-upload` turns on automatic push for the whole repository: every managed session in
-this local repository uploads after each turn, not only the folder's. The dry run says so in
-`repository_auto_push` and `repository_auto_push_scope`. The command does not alter global
-preferences.
+`--auto-upload` turns on automatic push on this computer: every managed conversation saved to
+the selected repository (in any folder) uploads after each turn. Teammates' settings and Hub
+settings are unchanged. Unbinding this folder restores the previous local setting once no
+other bound folder holds automatic push on. The command does not alter global preferences.
+In the dry-run JSON, `repository_auto_push: true` means this local override would be enabled;
+`repository_auto_push_scope` explains its scope and how unbinding restores the setting.
 Do not use `--yes` before reviewing these choices; it explicitly accepts the confirmations.
 
 ## Developer: enroll a new project
