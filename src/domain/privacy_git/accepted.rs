@@ -79,6 +79,7 @@ pub(super) struct Ledger {
     directory: std::path::PathBuf,
     scope: String,
     branches: BTreeMap<String, Branch>,
+    withheld: BTreeSet<String>,
 }
 
 impl Ledger {
@@ -101,16 +102,61 @@ impl Ledger {
             } else {
                 BTreeMap::new()
             };
+        // Kept beside the ledger rather than in it, so a release that predates it still reads the
+        // ledger.
+        let withheld =
+            match super::state::load(&directory.join("withheld"), &scope).context(RECOVERY)? {
+                Some(bytes) => {
+                    let (version, refs): (u32, BTreeSet<String>) =
+                        serde_json::from_slice(&bytes).context(RECOVERY)?;
+                    ensure!(version == 1, "{RECOVERY}");
+                    refs
+                }
+                None => BTreeSet::new(),
+            };
         let ledger = Self {
             directory,
             scope,
             branches,
+            withheld,
         };
         ledger.validate()?;
         Ok(ledger)
     }
 
+    /// Destination refs this checkout no longer publishes because the Hub refused them as
+    /// withdrawn. A plan leaves them out and a missing one is not owed, until [`Ledger::release`]
+    /// takes it back; otherwise every later push would plan them again and meet the same refusal.
+    /// The record is local and never sent.
+    pub fn withheld(&self) -> &BTreeSet<String> {
+        &self.withheld
+    }
+
+    pub fn withhold(&mut self, refs: &[String]) -> Result<()> {
+        for name in refs {
+            ensure!(valid_ref_name(name), "invalid withheld publication ref");
+        }
+        self.withheld.extend(refs.iter().cloned());
+        self.save_withheld()
+    }
+
+    pub fn release(&mut self, refs: &[String]) -> Result<()> {
+        for name in refs {
+            self.withheld.remove(name);
+        }
+        self.save_withheld()
+    }
+
+    fn save_withheld(&self) -> Result<()> {
+        let bytes = Zeroizing::new(serde_json::to_vec(&(1, &self.withheld))?);
+        super::state::save(&self.directory.join("withheld"), &self.scope, &bytes)
+    }
+
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.withheld.iter().all(|name| valid_ref_name(name)),
+            "{RECOVERY}"
+        );
         for (branch, state) in &self.branches {
             crate::domain::repo::valid_branch_name(branch)?;
             validate_mappings(&state.accepted, None)?;
@@ -357,6 +403,12 @@ fn promote(state: &mut Branch, candidate: &Candidate, source: &str) -> Result<()
 /// An accepted commit published under its own id with its own parents. Its public commit is its
 /// source commit, so the destination holds its ancestry under the same ids and no mapping of an
 /// ancestor can differ from it.
+fn valid_ref_name(name: &str) -> bool {
+    (name.starts_with("refs/heads/") || name.starts_with("refs/tags/"))
+        && name.len() <= 1024
+        && !name.contains(['\0', '\n'])
+}
+
 pub(super) fn is_identity(entry: &Mapping) -> bool {
     entry.source == entry.public
         && entry.source_parents == entry.public_parents

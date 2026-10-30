@@ -1123,6 +1123,12 @@ impl Client {
         self.get("api/health")
     }
 
+    /// The push bounds this hub enforces; see [`super::PushLimits`].
+    pub fn push_limits(&self) -> Result<super::PushLimits> {
+        self.get::<super::HubConfig>("api/hub/config")?
+            .push_limits()
+    }
+
     /// "What the newest version is right now" — the source for self-upgrade. A failure must not
     /// block the main flow: the caller decides whether this Err is swallowed (an incidental
     /// hint) or propagated (agit upgrade).

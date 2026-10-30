@@ -690,6 +690,251 @@ fn tag_rejection_preserves_branch_success_and_quiet_keeps_machine_acknowledgment
     println!("{COMPLETE}");
 }
 
+/// A history larger than the destination's push limits arrives in fast-forward requests that each
+/// stay within both the commit and the byte bound, and the last request acknowledges the frozen
+/// tips; a commit that alone exceeds a bound is refused before any request. The limits are the ones
+/// the Hub publishes, even below the unpublished bounds. A branch the destination already has moves
+/// only to descendants of its tip there, so a tip that arrives through a merge's second parent is
+/// reached by the merge or later, and a merge too large for one request is refused before any
+/// request. A publisher that pushes only the tips sends the whole history in one request; one that
+/// counts only commits sends every large object at once; one that plans by the unpublished bounds
+/// before reading the Hub's sends this short history whole; one that cuts the first-parent line
+/// without the destination's tip sends a cut that is not a fast-forward, which the destination
+/// rejects.
+#[test]
+fn staged_publication_keeps_every_request_within_the_push_limits() {
+    let Some(root) = isolated("staged_publication_keeps_every_request_within_the_push_limits")
+    else {
+        return;
+    };
+    // Incompressible, so a payload's stored size is its length.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut noise = |length: usize| -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    };
+    let introduced = |repo: &Repo, tips: &[String], published: &[String]| -> (usize, u64) {
+        let mut args = vec!["rev-list", "--objects", "--no-object-names"];
+        args.extend(tips.iter().map(String::as_str));
+        args.push("--not");
+        args.extend(published.iter().map(String::as_str));
+        let objects = git(repo.root(), &args);
+        let mut commits = 0;
+        let mut bytes = 0;
+        for oid in objects.lines() {
+            let kind = git(repo.root(), &["cat-file", "-t", oid]);
+            commits += usize::from(kind.trim() == "commit");
+            bytes += git(repo.root(), &["cat-file", "-s", oid])
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+        }
+        (commits, bytes)
+    };
+    for (case, limits, payload) in [
+        (
+            "commits",
+            crate::hub::PushLimits {
+                max_new_commits: 3,
+                max_request_bytes: u64::MAX,
+            },
+            0,
+        ),
+        (
+            "bytes",
+            crate::hub::PushLimits {
+                max_new_commits: 64,
+                max_request_bytes: 160 * 1024,
+            },
+            48 * 1024,
+        ),
+    ] {
+        let (repo, _) = source(&root, &format!("source-{case}"), "sha1");
+        for turn in 0..7 {
+            if payload > 0 {
+                std::fs::write(repo.root().join(format!("turn-{turn}.bin")), noise(payload))
+                    .unwrap();
+                git(repo.root(), &["add", "."]);
+            }
+            git(
+                repo.root(),
+                &["commit", "--allow-empty", "-qm", &format!("turn {turn}")],
+            );
+        }
+        let plan = PublicationPlan::freeze(&repo, &["selected".into()]).unwrap();
+        let target = receiver(&root, &format!("receiver-{case}.git"), "sha1");
+        let mut publication = build(&repo, &plan, &target);
+        // The commit bound is the one the Hub publishes, far below the unpublished bounds.
+        let hub = (case == "commits").then(|| config_hub(limits));
+        match &hub {
+            Some((base, _)) => {
+                publication.transport.client = Some(crate::hub::Client::for_hub(base));
+            }
+            None => publication.push_limits = Some(limits),
+        }
+        let (heads, tags) = publication.push_refs();
+        assert!(
+            heads.ok() && tags.as_ref().is_some_and(|phase| phase.ok()),
+            "{case}: {heads:?}"
+        );
+        assert_eq!(refs(&target), expected(&plan), "{case}");
+        assert!(heads.attempts.len() > publication.heads.len(), "{case}");
+
+        let mut published: Vec<String> = Vec::new();
+        for attempt in &heads.attempts {
+            let tips: Vec<String> = attempt
+                .refs
+                .iter()
+                .map(|reference| reference.reference.oid().to_owned())
+                .collect();
+            let (commits, bytes) = introduced(&repo, &tips, &published);
+            assert!(
+                commits <= limits.max_new_commits && bytes <= limits.max_request_bytes,
+                "{case}: one request introduced {commits} commits, {bytes} bytes"
+            );
+            published.extend(tips);
+        }
+        let last = heads.attempts.last().unwrap();
+        for head in plan.heads() {
+            assert!(
+                last.refs
+                    .iter()
+                    .any(|reference| reference.reference == *head
+                        && reference.status == super::super::PublicationStatus::UpToDate),
+                "{case}"
+            );
+        }
+        if let Some((_, served)) = hub {
+            served.join().unwrap();
+        }
+    }
+
+    // The destination's branch is at B; the local branch runs C -> D -> E -> F, merges B as M's
+    // second parent, and continues G -> H -> I.
+    let (repo, _) = source(&root, "source-merged", "sha1");
+    git(repo.root(), &["checkout", "-qb", "remote-side"]);
+    git(repo.root(), &["commit", "--allow-empty", "-qm", "B"]);
+    git(repo.root(), &["checkout", "-q", "selected"]);
+    for name in ["C", "D", "E", "F"] {
+        git(repo.root(), &["commit", "--allow-empty", "-qm", name]);
+    }
+    git(
+        repo.root(),
+        &[
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-q",
+            "-m",
+            "M",
+            "remote-side",
+        ],
+    );
+    for name in ["G", "H", "I"] {
+        git(repo.root(), &["commit", "--allow-empty", "-qm", name]);
+    }
+    let remote_tip = git(repo.root(), &["rev-parse", "remote-side"]);
+    let plan = PublicationPlan::freeze(&repo, &["selected".into()]).unwrap();
+    // M, with C through F, is the smallest fast-forward step.
+    for (case, max_new_commits, delivered) in [("merged-small", 3, false), ("merged", 6, true)] {
+        let target = receiver(&root, &format!("receiver-{case}.git"), "sha1");
+        git(
+            repo.root(),
+            &[
+                "push",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
+                &file_url(&target),
+                &format!("{remote_tip}:refs/heads/selected"),
+            ],
+        );
+        let before = refs(&target);
+        let mut publication = build(&repo, &plan, &target);
+        publication.push_limits = Some(crate::hub::PushLimits {
+            max_new_commits,
+            max_request_bytes: u64::MAX,
+        });
+        let (heads, tags) = publication.push_refs();
+        if delivered {
+            assert!(
+                heads.ok() && tags.as_ref().is_some_and(|phase| phase.ok()),
+                "{case}: {heads:?}"
+            );
+            assert_eq!(refs(&target), expected(&plan), "{case}");
+            assert!(heads.attempts.len() > publication.heads.len(), "{case}");
+        } else {
+            let error = heads.error.as_deref().unwrap_or_default();
+            assert!(
+                heads.attempts.is_empty()
+                    && tags.is_none()
+                    && error.contains("cannot be split further"),
+                "{case}: {heads:?}"
+            );
+            assert_eq!(refs(&target), before, "{case}");
+        }
+    }
+
+    let (repo, _) = source(&root, "source-oversized", "sha1");
+    std::fs::write(repo.root().join("large.bin"), noise(256 * 1024)).unwrap();
+    git(repo.root(), &["add", "."]);
+    git(repo.root(), &["commit", "-qm", "one large turn"]);
+    let plan = PublicationPlan::freeze(&repo, &["selected".into()]).unwrap();
+    let target = receiver(&root, "receiver-oversized.git", "sha1");
+    let before = refs(&target);
+    let mut publication = build(&repo, &plan, &target);
+    publication.push_limits = Some(crate::hub::PushLimits {
+        max_new_commits: 64,
+        max_request_bytes: 128 * 1024,
+    });
+    let (heads, tags) = publication.push_refs();
+    let error = heads.error.as_deref().unwrap_or_default();
+    assert!(
+        heads.attempts.is_empty()
+            && tags.is_none()
+            && error.contains("cannot be split further")
+            && error.contains("AGIT_PUSH_TRANSPORT_LIMIT_MB"),
+        "{heads:?}"
+    );
+    assert_eq!(heads.unattempted, plan.heads());
+    assert_eq!(refs(&target), before);
+    println!("{COMPLETE}");
+}
+
+/// Answers one `GET /api/hub/config` with `limits`.
+fn config_hub(limits: crate::hub::PushLimits) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let served = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            assert_eq!(stream.read(&mut byte).unwrap(), 1);
+            request.push(byte[0]);
+        }
+        assert!(request.starts_with(b"GET /api/hub/config "));
+        let body = serde_json::json!({"mode": "live", "limits": {"push": {
+            "max_new_commits": limits.max_new_commits,
+            "max_request_bytes": limits.max_request_bytes,
+        }}})
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    (base, served)
+}
+
 #[test]
 fn missing_duplicate_malformed_and_interrupted_records_cannot_complete_a_batch() {
     let Some(root) =

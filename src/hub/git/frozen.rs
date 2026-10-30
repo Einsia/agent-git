@@ -6,10 +6,12 @@
 
 use super::{PublicationAttempt, PublicationPhase, RemoteRefs, TransportIdentity};
 use crate::domain::repo::publication::{FrozenRef, PublicationPlan};
-use crate::domain::repo::{Repo, bounded_inspection_output, inspection_git_path_spelling};
+use crate::domain::repo::{
+    Repo, bounded_inspection_output, bounded_inspection_output_from, inspection_git_path_spelling,
+};
 use crate::hub::identity::RemoteIdentity;
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -17,6 +19,8 @@ use std::process::{Command, Output};
 const CONFIG_LIMIT: usize = 64 * 1024;
 const REQUEST_UNITS: usize = 24 * 1024;
 const LFS_REMOTE: &str = "agit-publication";
+/// Bounds one history listing used to plan staged requests.
+const STAGE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
 #[path = "captured_publication.rs"]
 mod captured;
@@ -51,6 +55,29 @@ pub struct FrozenPublication {
     lfs_inventory: Vec<crate::domain::lfs::Pointer>,
     heads: Vec<Vec<FrozenRef>>,
     tags: Vec<Vec<FrozenRef>>,
+    /// Replaces the bounds the destination Hub publishes.
+    push_limits: Option<crate::hub::PushLimits>,
+}
+
+/// One receive-pack request: the refs it moves and the receipt policy it confirms.
+struct ReceiveBatch<'a> {
+    refs: Vec<FrozenRef>,
+    policy: Option<std::borrow::Cow<'a, crate::hub::privacy::publication::PublicationPolicy>>,
+}
+
+/// How far [`FrozenPublication::fits`] goes to prove that a request fits.
+#[derive(Clone, Copy)]
+enum Measure {
+    /// The size bound alone, which needs nothing from the destination.
+    BoundOnly,
+    /// The bound, then the pack the push would send.
+    Pack,
+}
+
+/// A fast-forward of one branch to an ancestor of its frozen tip, and the commits it introduces.
+struct Stage {
+    reference: FrozenRef,
+    introduced: BTreeSet<String>,
 }
 
 impl FrozenPublication {
@@ -234,6 +261,7 @@ impl FrozenPublication {
             scope,
             heads,
             tags,
+            push_limits: None,
         })
     }
 
@@ -386,29 +414,398 @@ impl FrozenPublication {
         )
     }
 
+    /// A history larger than one request may carry is delivered first as fast-forward stages,
+    /// each confirming a receipt for exactly the commits it introduces; the frozen batches then
+    /// follow unchanged and acknowledge the tips. A failed stage leaves the destination at a
+    /// published prefix, which the next push continues from.
+    ///
     /// `held` names the advertised branch heads the publication's held history was read from;
-    /// every receipt binds a listing that still has them.
+    /// every receipt binds a listing that still has them, or has them where this publication's
+    /// own requests moved them.
     pub(super) fn push_refs_confirmed(
         &self,
         policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
         held: Option<&BTreeMap<String, String>>,
     ) -> (PublicationPhase, Option<PublicationPhase>) {
-        let heads = self.push_phase(&self.heads, policy, held);
+        let staged = self.stages().and_then(|stages| {
+            stages
+                .into_iter()
+                .map(|stage| {
+                    let policy = policy
+                        .map(|policy| policy.scoped(&stage.introduced))
+                        .transpose()?
+                        .map(std::borrow::Cow::Owned);
+                    Ok(ReceiveBatch {
+                        refs: vec![stage.reference],
+                        policy,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        let mut batches = match staged {
+            Ok(batches) => batches,
+            Err(error) => {
+                let phase = PublicationPhase {
+                    attempts: Vec::new(),
+                    unattempted: self.heads.iter().flatten().cloned().collect(),
+                    error: Some(format!("{error:#}")),
+                };
+                return (phase, None);
+            }
+        };
+        batches.extend(self.batches(&self.heads, policy));
+        let mut heads = self.push_phase(&batches, held);
+        // A stage is a means of delivery; only the frozen tips remain owed after a failure.
+        heads
+            .unattempted
+            .retain(|reference| self.plan.heads().contains(reference));
         let tags = heads
             .ok()
-            .then(|| self.push_phase(&self.tags, policy, held));
+            .then(|| self.push_phase(&self.batches(&self.tags, policy), held));
         (heads, tags)
     }
 
+    fn batches<'a>(
+        &self,
+        refs: &[Vec<FrozenRef>],
+        policy: Option<&'a crate::hub::privacy::publication::PublicationPolicy>,
+    ) -> Vec<ReceiveBatch<'a>> {
+        refs.iter()
+            .map(|refs| ReceiveBatch {
+                refs: refs.clone(),
+                policy: policy.map(std::borrow::Cow::Borrowed),
+            })
+            .collect()
+    }
+
+    fn limits(&self) -> crate::hub::PushLimits {
+        if let Some(limits) = self.push_limits {
+            return limits;
+        }
+        // An unreadable configuration plans by the bounds of a Hub that publishes none.
+        self.transport
+            .client
+            .as_ref()
+            .and_then(|client| client.push_limits().ok())
+            .unwrap_or(crate::hub::PushLimits::UNPUBLISHED)
+    }
+
+    /// Stages that keep every request within the destination's push limits, or none when the
+    /// whole publication fits in one request. Each stage moves one branch along its first-parent
+    /// line, so it is a fast-forward of what the branch published before and keeps the branch's
+    /// own line as its history.
+    ///
+    /// The destination's own limits decide, whatever their size: a Hub may publish less than the
+    /// unpublished bounds, and a request planned by those is refused there on every retry. A
+    /// history that fits the limits as a whole is delivered as before without reading the
+    /// destination's refs; only a longer one is planned against them.
+    ///
+    /// The plan's boundary is history the destination held when the plan was taken, so every
+    /// walk here stops at it, as at the destination's current tips.
+    ///
+    /// A branch the destination already has moves only to descendants of its tip there, or the
+    /// request is not a fast-forward and is refused. When that tip arrives through a merge, the
+    /// first stage is the merge or a later commit; when no stage can be both a fast-forward and
+    /// within the limits, the publication is refused before any request.
+    fn stages(&self) -> Result<Vec<Stage>> {
+        let tips: Vec<&str> = self.plan.heads().iter().map(FrozenRef::oid).collect();
+        let limits = self.limits();
+        let mut published = self.plan.boundary().to_vec();
+        if self.fits(&tips, &published, limits, Measure::BoundOnly)? {
+            return Ok(Vec::new());
+        }
+        let remote = self.privacy_remote_refs()?;
+        let present = self.present(remote.values())?;
+        published.extend(present.iter().cloned());
+        if self.fits(&tips, &published, limits, Measure::Pack)? {
+            return Ok(Vec::new());
+        }
+        let mut stages = Vec::new();
+        for head in self.plan.heads() {
+            let branch = head
+                .name()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(head.name());
+            let mut line =
+                self.rev_list(&["--first-parent", "--reverse"], &[head.oid()], &published)?;
+            if let Some(tip) = remote.get(head.name())
+                && !line.is_empty()
+            {
+                // Along a first-parent line every commit after a descendant of the tip is one too,
+                // so the cuts that fast-forward the branch are a suffix of the line.
+                let first = if present.contains(tip) {
+                    let (mut low, mut high) = (0, line.len());
+                    while low < high {
+                        let middle = low + (high - low) / 2;
+                        if self.is_ancestor(tip, &line[middle])? {
+                            high = middle;
+                        } else {
+                            low = middle + 1;
+                        }
+                    }
+                    low
+                } else {
+                    line.len()
+                };
+                ensure!(
+                    first < line.len(),
+                    "{branch}: the hub's branch is at {}, which this history does not continue; \
+                     it cannot be published as a fast-forward",
+                    &tip[..tip.len().min(12)]
+                );
+                line.drain(..first);
+            }
+            let mut start = 0;
+            while start < line.len() {
+                ensure!(
+                    self.fits(&[line[start].as_str()], &published, limits, Measure::Pack)?,
+                    "{branch}: the smallest fast-forward step, to {}, is more than the hub accepts \
+                     in one push ({} new commits, {} MiB); it cannot be split further. Ask the hub \
+                     operator to raise AGIT_PUSH_MAX_NEW_COMMITS or AGIT_PUSH_TRANSPORT_LIMIT_MB.",
+                    &line[start][..12],
+                    limits.max_new_commits,
+                    limits.max_request_bytes / (1024 * 1024)
+                );
+                // A first-parent step introduces at least itself, so no stage reaches further than
+                // the commit budget along the line; within that, the furthest cut that fits.
+                let (mut low, mut high) =
+                    (start, (start + limits.max_new_commits).min(line.len()) - 1);
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    if self.fits(&[line[middle].as_str()], &published, limits, Measure::Pack)? {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                let cut = &line[low];
+                let introduced = self.rev_list(&[], &[cut.as_str()], &published)?;
+                stages.push(Stage {
+                    reference: head.staged(cut),
+                    introduced: introduced.into_iter().collect(),
+                });
+                published.push(cut.clone());
+                start = low + 1;
+            }
+        }
+        Ok(stages)
+    }
+
+    /// Whether one request moving refs to `tips` stays within `limits` against `published`.
+    ///
+    /// The objects' uncompressed sizes, with what compression can add to each, bound the pack from
+    /// above whatever is deltified, so a request under that bound needs no pack. Stored sizes do
+    /// not: an object stored as a delta against a base the destination lacks is sent whole. A
+    /// larger request is sized by building the thin pack the push would send, which stops as soon
+    /// as it crosses the bound, unless `measure` only asks for the bound. The request keeps a
+    /// sixteenth of the limit for its commands and framing.
+    fn fits(
+        &self,
+        tips: &[&str],
+        published: &[String],
+        limits: crate::hub::PushLimits,
+        measure: Measure,
+    ) -> Result<bool> {
+        let commits = self.rev_list(&[], tips, published)?;
+        if commits.len() > limits.max_new_commits {
+            return Ok(false);
+        }
+        let bound = limits.max_request_bytes - limits.max_request_bytes / 16;
+        let objects = self.git_with_input(
+            &[
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--stdin",
+                "--",
+            ],
+            &revisions(tips, published),
+        )?;
+        let sizes = self.git_with_input(&["cat-file", "--batch-check=%(objectsize)"], &objects)?;
+        let mut ceiling = 0u64;
+        for line in sizes.lines() {
+            let size = line
+                .parse::<u64>()
+                .context("publication object sizes are malformed")?;
+            // A deflate stream grows incompressible input by a few bytes per block; the entry
+            // header adds a few more.
+            ceiling = ceiling.saturating_add(size + size / 1024 + 64);
+        }
+        if ceiling <= bound {
+            return Ok(true);
+        }
+        match measure {
+            Measure::BoundOnly => Ok(false),
+            Measure::Pack => self.pack_within(tips, published, bound),
+        }
+    }
+
+    /// Whether the thin pack for `tips` against `published` is at most `bound` bytes.
+    fn pack_within(&self, tips: &[&str], published: &[String], bound: u64) -> Result<bool> {
+        use std::io::Read as _;
+        let input = self.planning_input(&revisions(tips, published))?;
+        let mut command = self
+            .transport
+            .execution
+            .as_ref()
+            .context("publication has no captured Git context")?
+            .command();
+        command
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .args([
+                "pack-objects",
+                "--revs",
+                "--thin",
+                "--stdout",
+                "--delta-base-offset",
+                "-q",
+            ])
+            .stdin(input)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .context("publication pack size could not be measured")?;
+        let mut stdout = child.stdout.take().expect("piped pack output");
+        let mut buffer = vec![0; 1 << 16];
+        let mut size = 0u64;
+        let within = loop {
+            let read = match stdout.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("publication pack size could not be measured");
+                }
+            };
+            if read == 0 {
+                break true;
+            }
+            size += read as u64;
+            if size > bound {
+                break false;
+            }
+        };
+        if !within {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        let status = child
+            .wait()
+            .context("publication pack size could not be measured")?;
+        ensure!(
+            status.success(),
+            "publication pack size could not be measured"
+        );
+        Ok(true)
+    }
+
+    /// The `oids` present in the captured repository. A remote target absent locally has no local
+    /// history, so leaving it out of an exclusion changes nothing.
+    fn present<'a>(&self, oids: impl Iterator<Item = &'a String>) -> Result<Vec<String>> {
+        let oids: BTreeSet<&String> = oids.collect();
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+        let listing = self.git_with_input(
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            &input,
+        )?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(_, kind)| *kind != "missing")
+            .map(|(oid, _)| oid.to_owned())
+            .collect())
+    }
+
+    /// Commits reachable from `tips` and not from `published`, oldest first when `options` asks.
+    fn rev_list(
+        &self,
+        options: &[&str],
+        tips: &[&str],
+        published: &[String],
+    ) -> Result<Vec<String>> {
+        let mut args = vec!["rev-list"];
+        args.extend(options);
+        args.extend(["--stdin", "--"]);
+        let listing = self.git_with_input(&args, &revisions(tips, published))?;
+        listing
+            .lines()
+            .map(|oid| {
+                ensure!(
+                    matches!(oid.len(), 40 | 64)
+                        && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "publication history listing is malformed"
+                );
+                Ok(oid.to_owned())
+            })
+            .collect()
+    }
+
+    /// Whether `ancestor` is reachable from `descendant` in the captured repository; both are
+    /// present there.
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let mut command = self
+            .transport
+            .execution
+            .as_ref()
+            .context("publication has no captured Git context")?
+            .command();
+        command.env("GIT_ALLOW_PROTOCOL", "").args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ]);
+        let output = bounded_inspection_output(command, CONFIG_LIMIT)?;
+        ensure!(
+            output.stderr.is_empty() && matches!(output.status.code(), Some(0 | 1)),
+            "publication history cannot be planned within the hub's push limits"
+        );
+        Ok(output.status.success())
+    }
+
+    /// Planning input on a file, so a revision list of any length stays off the command line.
+    fn planning_input(&self, input: &str) -> Result<std::process::Stdio> {
+        let mut file = tempfile::tempfile_in(self.directory.path())
+            .context("publication planning input could not be staged")?;
+        std::io::Write::write_all(&mut file, input.as_bytes())
+            .and_then(|()| std::io::Seek::rewind(&mut file))
+            .context("publication planning input could not be staged")?;
+        Ok(file.into())
+    }
+
+    fn git_with_input(&self, args: &[&str], input: &str) -> Result<String> {
+        let input = self.planning_input(input)?;
+        let mut command = self
+            .transport
+            .execution
+            .as_ref()
+            .context("publication has no captured Git context")?
+            .command();
+        command.env("GIT_ALLOW_PROTOCOL", "").args(args);
+        let output = bounded_inspection_output_from(command, input, STAGE_OUTPUT_LIMIT)?;
+        ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "publication history cannot be planned within the hub's push limits"
+        );
+        String::from_utf8(output.stdout).context("publication history listing is not valid UTF-8")
+    }
+
+    /// `delivered` are the batches of this phase acknowledged before `batch`.
     fn receive_receipt(
         &self,
         policy: &crate::hub::privacy::publication::PublicationPolicy,
         batch: &[FrozenRef],
         held: Option<&BTreeMap<String, String>>,
+        delivered: &[ReceiveBatch<'_>],
         before: BTreeMap<String, String>,
     ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
         if let Some(held) = held {
-            self.verify_held_heads(held, &before)?;
+            self.verify_held_heads(held, &before, delivered)?;
         }
         let mut after = before.clone();
         for reference in batch {
@@ -430,22 +827,28 @@ impl FrozenPublication {
     /// and their content would reach it without inspection; such a receipt is refused before
     /// anything is sent. Heads that appeared since only make the declaration larger than needed,
     /// which the Hub refuses itself.
+    ///
+    /// A head this publication moved itself is at its frozen tip or at a stage of it that an
+    /// earlier request in `delivered` acknowledged. Every request is a fast-forward, so such a
+    /// head still holds everything the advertisement had; refusing it would refuse every staged
+    /// request after the first.
     fn verify_held_heads(
         &self,
         held: &BTreeMap<String, String>,
         before: &BTreeMap<String, String>,
+        delivered: &[ReceiveBatch<'_>],
     ) -> Result<()> {
         for (name, oid) in held {
             let current = before.get(name);
-            let published = self
-                .plan
-                .heads()
-                .iter()
-                .find(|reference| reference.name() == name)
-                .map(FrozenRef::oid);
+            let own = current.is_some_and(|current| {
+                self.plan
+                    .heads()
+                    .iter()
+                    .chain(delivered.iter().flat_map(|batch| &batch.refs))
+                    .any(|reference| reference.name() == name && reference.oid() == current)
+            });
             ensure!(
-                current == Some(oid)
-                    || current.is_some_and(|current| Some(current.as_str()) == published),
+                current == Some(oid) || own,
                 "the destination's published history changed during this publication; publish again"
             );
         }
@@ -575,12 +978,24 @@ impl FrozenPublication {
 
     fn push_phase(
         &self,
-        batches: &[Vec<FrozenRef>],
-        policy: Option<&crate::hub::privacy::publication::PublicationPolicy>,
+        batches: &[ReceiveBatch<'_>],
         held: Option<&BTreeMap<String, String>>,
     ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
-        for (index, batch) in batches.iter().enumerate() {
+        let owed = |from: usize| -> Vec<FrozenRef> {
+            batches[from..]
+                .iter()
+                .flat_map(|batch| batch.refs.iter().cloned())
+                .collect()
+        };
+        for (
+            index,
+            ReceiveBatch {
+                refs: batch,
+                policy,
+            },
+        ) in batches.iter().enumerate()
+        {
             let heads = batch
                 .iter()
                 .filter(|reference| reference.name().starts_with("refs/heads/"))
@@ -598,6 +1013,7 @@ impl FrozenPublication {
             // Hub check the whole selection again for refs it cannot change.
             let mut current = Vec::new();
             let receipt = match policy
+                .as_deref()
                 .map(|policy| {
                     let before = self.privacy_remote_refs()?;
                     let (held_refs, pending): (Vec<_>, Vec<_>) =
@@ -607,7 +1023,9 @@ impl FrozenPublication {
                         });
                     current = held_refs;
                     let receipt = (!pending.is_empty())
-                        .then(|| self.receive_receipt(policy, &pending, held, before))
+                        .then(|| {
+                            self.receive_receipt(policy, &pending, held, &batches[..index], before)
+                        })
                         .transpose()?;
                     Ok::<_, anyhow::Error>((pending, receipt))
                 })
@@ -616,7 +1034,7 @@ impl FrozenPublication {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     phase.error = Some(format!("{error:#}"));
-                    phase.unattempted = batches[index..].iter().flatten().cloned().collect();
+                    phase.unattempted = owed(index);
                     break;
                 }
             };
@@ -674,7 +1092,7 @@ impl FrozenPublication {
             phase.error = run.error.map(|error| format!("{error:#}"));
             if phase.error.is_some() || !phase.attempts.last().is_some_and(PublicationAttempt::ok) {
                 let start = if attempted { index + 1 } else { index };
-                phase.unattempted = batches[start..].iter().flatten().cloned().collect();
+                phase.unattempted = owed(start);
                 break;
             }
             uploading.finish();
@@ -766,6 +1184,21 @@ fn validate_prepared_parameters(parameters: &OsStr) -> Result<()> {
         "frozen HTTP configuration exceeds its environment limit"
     );
     Ok(())
+}
+
+/// `rev-list --stdin` input: the tips, then every published tip excluded.
+fn revisions(tips: &[&str], published: &[String]) -> String {
+    let mut input = String::new();
+    for tip in tips {
+        input.push_str(tip);
+        input.push('\n');
+    }
+    for oid in published {
+        input.push('^');
+        input.push_str(oid);
+        input.push('\n');
+    }
+    input
 }
 
 fn batches(refs: &[FrozenRef], url: &str, oid_length: usize) -> Result<Vec<Vec<FrozenRef>>> {

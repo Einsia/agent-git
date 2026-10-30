@@ -184,6 +184,36 @@ impl ProjectedHistory {
     }
 }
 
+/// Destination refs publications to `identity` leave out because the Hub refused them as
+/// withdrawn (see `accepted::Ledger::withheld`).
+#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
+pub(crate) fn withheld_refs(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+) -> Result<BTreeSet<String>> {
+    Ok(accepted::Ledger::open(source, identity)?.withheld().clone())
+}
+
+/// Record refs the Hub refused as withdrawn, so later publications to `identity` leave them out.
+#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
+pub(crate) fn withhold_refs(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+    refs: &[String],
+) -> Result<()> {
+    accepted::Ledger::open(source, identity)?.withhold(refs)
+}
+
+/// Let publications to `identity` plan these refs again, as when the person names one explicitly.
+#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
+pub(crate) fn release_refs(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+    refs: &[String],
+) -> Result<()> {
+    accepted::Ledger::open(source, identity)?.release(refs)
+}
+
 /// A retained receipt selects an immutable generated snapshot, independently of current refs.
 pub(crate) fn receipt_session_id(
     source: &Repo,
