@@ -49,6 +49,17 @@ impl Repo {
         Ok(())
     }
 
+    /// Whether automatic publication is explicitly off for this repository on this computer: its
+    /// own preference is false, or it has none and the user's is false. Only a request that names
+    /// the setting lifts it. An unset preference is a choice not yet made, which enrolment may
+    /// make.
+    pub fn auto_push_explicitly_off(&self) -> Result<bool> {
+        Ok(match self.auto_push_override()? {
+            Some(value) => !value,
+            None => crate::infra::config::get_global("push.auto")?.as_deref() == Some("false"),
+        })
+    }
+
     pub fn auto_push_enabled(&self) -> Result<bool> {
         match self.auto_push_override()? {
             Some(value) => Ok(value),

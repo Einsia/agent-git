@@ -52,7 +52,7 @@ impl Session {
                     == crate::hub::identity::normalize_hub(&crate::infra::config::hub_url())?,
                 "RC publication Hub changed"
             );
-            if !repo.auto_push_enabled()? {
+            if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)? {
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Configuration);
                 status.reason = Some(Reason::PushDisabled);

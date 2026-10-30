@@ -24,7 +24,7 @@ pub(super) fn run(
         "automatic publication cannot replace an interactive audit decision"
     );
     ensure!(
-        !automatic || repo.auto_push_enabled()?,
+        !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
         "{}",
         crate::commands::auto_push::DISABLED_FOR_REPOSITORY
     );
@@ -446,7 +446,7 @@ pub(super) fn run(
         selection.verify(&repo)?;
     }
     ensure!(
-        !automatic || repo.auto_push_enabled()?,
+        !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
         "automatic publication was disabled during inspection"
     );
     let (repo, remote) = intent.materialize(&client, repo)?;

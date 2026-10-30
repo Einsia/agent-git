@@ -347,6 +347,16 @@ async fn exercise(home: &std::path::Path, session_encrypted: bool) {
     assert!(disabled["items"].as_array().unwrap().is_empty());
     assert!(disabled["retry_after_ms"].is_null());
     repo.set_auto_push(Some(true)).unwrap();
+    // This device-local repository publishes on the person's behalf, so turning automatic
+    // publication off in the destination's own checkout stops it as well, whatever its own value.
+    let checkout_dir = crate::infra::config::repo_dir("owner", "project").unwrap();
+    std::fs::create_dir_all(&checkout_dir).unwrap();
+    let checkout = Repo::init(&checkout_dir).unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let destination_off = connection.call(request()).await.unwrap();
+    assert_eq!(destination_off["publication"]["reason"], "push_disabled");
+    assert!(destination_off["items"].as_array().unwrap().is_empty());
+    checkout.set_auto_push(None).unwrap();
     let consent_path = repo
         .common_dir()
         .unwrap()
