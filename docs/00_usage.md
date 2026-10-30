@@ -139,8 +139,10 @@ completes**, and day to day you never type `agit commit`. Manual settlement stay
 milestones in 3.2.
 
 Codex hook installation is capability-gated by `codex features list`; unsupported installations
-are left untouched. Codex treats user hooks as untrusted until they are reviewed, so it may ask for
-approval before first use or after the installed command changes. OpenCode and Cursor have no
+are left untouched. Codex treats user hooks as untrusted until they are reviewed, so it asks for
+approval before first use or after the installed command changes, and saves nothing until then.
+`agit setup`, `agit doctor` and `agit project status` say which AgentGit hooks Codex will not run
+yet; approve them in Codex's startup review or in `/hooks`. OpenCode and Cursor have no
 equivalent "turn finished" callback; the skill above injects the settlement discipline into the
 agent, and the agent types `agit commit` itself at the right moment.
 
