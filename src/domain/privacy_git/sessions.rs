@@ -486,7 +486,8 @@ pub(super) fn require_remote_ancestry(
         // need not exist locally; absence of that object does not invalidate the local ledger.
         ensure!(
             mapped || truncated || !ledger.has_accepted_branch(branch),
-            accepted::Inconsistent
+            "{}",
+            accepted::RECOVERY
         );
         let difference = source
             .git_opt(&[
@@ -758,7 +759,7 @@ impl ProjectedHistory {
                             .inherited_immutable(branch, oid)?
                             .is_some_and(|entry| &entry.public == remote_head);
                     }
-                    ensure!(found, accepted::Inconsistent);
+                    ensure!(found, "{}", accepted::RECOVERY);
                 }
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
                 let mut plain_rewrites = BTreeSet::new();
@@ -793,7 +794,8 @@ impl ProjectedHistory {
                                 && (!boundary
                                     || ledger.get(branch, oid) == Some(entry)
                                     || accepted::is_identity(entry)),
-                            accepted::Inconsistent
+                            "{}",
+                            accepted::RECOVERY
                         );
                         if boundary {
                             public_boundary.insert(entry.public.clone());
@@ -880,7 +882,7 @@ impl ProjectedHistory {
                         continue;
                     }
                     let Some(public_parents) = public_parents else {
-                        anyhow::bail!(accepted::Inconsistent);
+                        anyhow::bail!("{}", accepted::RECOVERY);
                     };
                     let original_metadata = source_sessions.metadata(&source, oid).context(
                         "introduced snapshots require declared file or session metadata",
@@ -1061,7 +1063,8 @@ impl ProjectedHistory {
                         None => {
                             ensure!(
                                 !continued.contains(&metadata.session),
-                                accepted::Inconsistent
+                                "{}",
+                                accepted::RECOVERY
                             );
                             let public_session = meta::mint_session_id();
                             cache.sessions.insert(session_key, public_session.clone());
