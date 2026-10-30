@@ -98,7 +98,7 @@ Once a folder is on:
 - each completed turn of Claude Code or Codex is saved and uploaded in the background (the existing
   project capture worker, started by the Stop hook);
 - a turn whose hook did not run (an untrusted Codex hook, a crash, being offline) is caught up the
-  next time any session starts in an on folder, or any `agit` command runs there;
+  next time any session starts in an on folder, or `agit` runs there without a command;
 - uploads go to a private destination unless the person named a public one explicitly (see
   [Visibility](#visibility)); a link readable without an account exists only after
   `agit share --anyone` or `agit share --public`;

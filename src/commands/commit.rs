@@ -381,6 +381,7 @@ fn run_inner(args: Args) -> CmdResult {
         message: args.message,
         paths: args.paths,
         quiet,
+        capture: false,
     };
 
     match target {
@@ -678,6 +679,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             message: None,
             paths: Vec::new(),
             quiet: true,
+            capture: false,
         },
     )
 }
@@ -1084,6 +1086,8 @@ struct SettleOpts {
     message: Option<String>,
     paths: Vec<String>,
     quiet: bool,
+    /// The settlement opens a line for a project's capture of the session.
+    capture: bool,
 }
 
 /// The commit one turn lands.
@@ -2955,6 +2959,19 @@ fn settle_bytes(
     observations.source_commit = head_meta
         .as_ref()
         .and_then(|head| head.source_commit.clone());
+    // Only a line's first settlement can mark it a capture; later ones carry what it says.
+    let first_turn = head_meta
+        .as_ref()
+        .is_none_or(|head| !head.is_session_line() || head.turn.is_none());
+    observations.capture = head_meta
+        .as_ref()
+        .and_then(|head| head.capture.clone())
+        .or_else(|| {
+            (opts.capture && first_turn).then(|| meta::CaptureOrigin {
+                runtime: source.to_string(),
+                session: lk.session_id.clone(),
+            })
+        });
     observations.session_privacy = match head_meta.as_ref().filter(|head| head.is_session_line()) {
         Some(head) => head.session_privacy.clone(),
         None => Some(match &lk.session_privacy {
@@ -4625,7 +4642,9 @@ pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    record_at(store, lk, agent, owner, author, &repo_dir, true, None)
+    record_at(
+        store, lk, agent, owner, author, &repo_dir, true, None, false,
+    )
 }
 
 /// Import settlement uses the repository selected before its adoption writes.
@@ -4643,6 +4662,7 @@ pub(super) fn record_at(
     repo_dir: &Path,
     automatic_push: bool,
     milestone: Option<(String, Option<u32>)>,
+    capture: bool,
 ) -> CmdResult {
     let branch = lk
         .branch
@@ -4662,6 +4682,7 @@ pub(super) fn record_at(
         message: None,
         paths: vec![],
         quiet: false,
+        capture,
     };
     if automatic_push {
         return settle(store, repo_dir, &slug, &branch, lk, author, opts);
@@ -4812,6 +4833,7 @@ mod tests {
             message: None,
             paths: vec![],
             quiet: false,
+            capture: false,
         }
     }
 
@@ -5502,6 +5524,7 @@ mod tests {
                 privacy: false,
                 milestone: None,
                 milestone_turn: None,
+                project_capture: false,
             });
             let repo = Repo::open(&importer_repo).unwrap();
             assert_ne!(

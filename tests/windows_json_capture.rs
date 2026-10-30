@@ -365,7 +365,6 @@ fn parse_and_interactive_rejections_leave_local_state_untouched() {
         for (tail, expected_code) in [
             (vec!["--not-an-option"], 2),
             (vec!["search"], 2),
-            (vec![], 2),
             (vec!["resume"], 8),
             (vec!["resume", "me/qa@work"], 8),
             (vec!["login", "--device"], 8),
@@ -378,6 +377,14 @@ fn parse_and_interactive_rejections_leave_local_state_untouched() {
             assert_eq!(document.get("fix").is_some(), has_fix);
             assert_eq!(lab.state(), before, "rejection must precede store changes");
         }
+    }
+    // Bare `agit` is no rejection: it answers with the overview, whose startup update check may
+    // write its cache, so it runs apart from the snapshot above.
+    let overview = Lab::new();
+    for version in ["1", "2"] {
+        let (output, document) = overview.json(&["--json", "--json-version", version]);
+        assert_eq!(output.status.code(), Some(0), "{document}");
+        assert_eq!(document["command"], "overview");
     }
 }
 

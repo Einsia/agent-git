@@ -1206,6 +1206,24 @@ impl Client {
         self.get(&format!("api/orgs/{name}"))
     }
 
+    /// The organization's teams and their members; only members may list them.
+    pub fn org_teams(&self, org: &str) -> Result<Vec<super::TeamView>> {
+        self.get(&format!("api/orgs/{}/teams", urlencode(org)))
+    }
+
+    /// Lets `team` read and upload to the organization's repository `name`; owners only.
+    pub fn grant_team(&self, org: &str, team: &str, name: &str) -> Result<serde_json::Value> {
+        self.put(
+            &format!(
+                "api/orgs/{}/teams/{}/agents/{}",
+                urlencode(org),
+                urlencode(team),
+                urlencode(name)
+            ),
+            &serde_json::json!({}),
+        )
+    }
+
     /// The status code only. On a 401 it exchanges the token once and retries, like
     /// [`Self::with_retry`]; a second 401 is reported as expired credentials, not as "no
     /// permission".

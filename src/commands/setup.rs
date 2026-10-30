@@ -671,6 +671,11 @@ struct CodexHooksCapability {
     enabled: bool,
 }
 
+/// Whether the installed Codex reports its hooks feature as enabled.
+pub(crate) fn codex_hooks_enabled() -> bool {
+    codex_hooks_capability().is_some_and(|c| c.enabled)
+}
+
 /// Ask the installed Codex whether it knows the hooks feature. Presence is the compatibility
 /// boundary; the version string is not, because downstream builds may add or remove capabilities
 /// without sharing the release numbering of the public binary.

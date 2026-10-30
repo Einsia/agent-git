@@ -609,6 +609,13 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
             .and_then(session_env_value),
     };
 
+    // A session starting in a folder that uploads automatically is the moment to upload what
+    // earlier sessions there left behind; the worker does it after this hook returns.
+    if matches!(ev.source, Source::Startup | Source::Resume)
+        && let Some(dir) = dir
+    {
+        let _ = super::project::catch_up(dir);
+    }
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(&ev.session_id, env_value.as_deref());

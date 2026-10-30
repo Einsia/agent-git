@@ -38,6 +38,7 @@ pub mod branch;
 pub mod context;
 pub mod echo;
 pub mod fix;
+pub mod front;
 pub mod import;
 pub mod json;
 pub mod project;
@@ -1247,6 +1248,15 @@ pub struct Cli {
 /// main.rs dispatch, and the module file.
 #[derive(Subcommand)]
 pub enum Commands {
+    // ── Everyday ────────────────────────────────────────────────────
+    /// Save and upload this folder's sessions automatically from now on
+    On(front::on::OnArgs),
+    /// Stop saving this folder's new sessions (nothing is deleted)
+    Off(front::on::OffArgs),
+    /// (hidden) bare `agit`: what is saved here and the next step
+    #[command(hide = true)]
+    Overview,
+
     // ── Authentication ──────────────────────────────────────────────
     /// Sign in to the hub (interactive on a TTY; CI uses --with-token reading a PAT from stdin)
     Login(login::Args),
@@ -1365,6 +1375,9 @@ pub enum Commands {
 /// Stable command identifier used in machine-readable output.
 pub fn command_name(command: &Commands) -> &'static str {
     match command {
+        Commands::On(_) => "on",
+        Commands::Off(_) => "off",
+        Commands::Overview => "overview",
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",

@@ -257,6 +257,8 @@ pub fn fork_branch(
     snap.source_commit = Some(base_sha.clone());
     snap.session = mint_claim(base_sha, new_name);
     snap.runtime_instances = Vec::new(); // instances belong to the source branch, not inherited
+    // A fork is a line the user opens; the capture rule judges only lines a project opened.
+    snap.capture = None;
     snap.baseline_bytes = None;
     snap.cwd_state = None;
     snap.cwd_is_agent_repository = false;

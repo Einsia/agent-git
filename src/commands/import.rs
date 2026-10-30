@@ -133,6 +133,11 @@ pub struct Args {
     /// The turn (`#n` on the destination branch) that carries `--milestone`
     #[arg(long, value_name = "n", requires = "milestone", value_parser = clap::value_parser!(u32).range(1..))]
     pub milestone_turn: Option<u32>,
+
+    /// A project opens this branch for its capture of the session; the line records that, so the
+    /// project's capture rule applies to it whatever its name and wherever it is read.
+    #[arg(long, hide = true, conflicts_with_all = ["link_only", "propose_lineage"])]
+    pub project_capture: bool,
 }
 
 /// The session that was found. All three fields come from the runtime index; **no transcript is
@@ -538,6 +543,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
             args.milestone
                 .clone()
                 .map(|text| (text, args.milestone_turn)),
+            args.project_capture,
         )
     })();
     if !matches!(outcome, Ok(ExitCode::Ok)) {

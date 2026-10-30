@@ -58,7 +58,7 @@ const LONGEST_WAIT: Duration = Duration::from_secs(10 * 60);
 /// waiting for the claim lock outlasts one slow poll.
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Default)]
 pub struct Args {
     /// Hub to sign in to (default: AGIT_HUB_URL → config hub.url → the built-in public hub).
     #[arg(long, value_name = "url")]
@@ -945,10 +945,16 @@ struct CliSession {
     expires_in: u64,
 }
 
-fn start_browser_handoff(hub: &str) -> CmdResult {
-    if let Err(error) = ensure_saveable(|| Unsaveable::BeforeRequest) {
-        return Ok(refuse_unsaveable(&error));
-    }
+/// A recorded browser sign-in request: the link the person opens, and how long it stays valid.
+/// Any later command that needs the account finishes it once approved.
+pub(crate) struct SignInLink {
+    pub url: String,
+    pub expires_in: u64,
+    state: String,
+}
+
+pub(crate) fn request_sign_in(hub: &str) -> crate::Result<SignInLink> {
+    ensure_saveable(|| Unsaveable::BeforeRequest)?;
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
         remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
@@ -959,8 +965,21 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
         pending::MIN_INTERVAL,
         session.expires_in,
     ));
-    let url = crate::telemetry::acquisition::authorization_url(&session.url, hub);
     crate::telemetry::observe(crate::telemetry::Observation::Authentication(false));
+    Ok(SignInLink {
+        url: crate::telemetry::acquisition::authorization_url(&session.url, hub),
+        expires_in: session.expires_in,
+        state: session.state,
+    })
+}
+
+fn start_browser_handoff(hub: &str) -> CmdResult {
+    let session = match request_sign_in(hub) {
+        Ok(link) => link,
+        Err(error) if error.is::<Unsaveable>() => return Ok(refuse_unsaveable(&error)),
+        Err(error) => return Err(error),
+    };
+    let url = session.url.clone();
     let message = "Ask the human to open the login link, sign in, and approve CLI access.";
     let complete = ["agit", "login", "--hub", hub, "--complete", &session.state];
     if super::json::is_capturing() {
