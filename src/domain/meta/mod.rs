@@ -437,6 +437,18 @@ pub struct Meta {
     /// provenance, not permission to route a runtime or write to a repository after relocation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cwd_is_agent_repository: bool,
+    /// The conversation a project capture opened this line for. Every later settlement carries
+    /// it, so the line is known as a capture whatever its name and on whichever machine it is
+    /// read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureOrigin>,
+}
+
+/// The runtime session whose capture by a project opened a session line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureOrigin {
+    pub runtime: String,
+    pub session: String,
 }
 
 impl Meta {
@@ -463,6 +475,7 @@ impl Meta {
             baseline_bytes: None,
             runtime_instances: Vec::new(),
             cwd_is_agent_repository: false,
+            capture: None,
         }
     }
 

@@ -88,6 +88,19 @@ impl OrgView {
     }
 }
 
+/// A team in an organization, as `GET /api/orgs/{org}/teams` shows it to a member.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeamView {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeamMember {
+    pub username: String,
+}
+
 /// The answer to one push-permission probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushAccess {

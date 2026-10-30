@@ -216,9 +216,11 @@ mod unix {
         for (version, has_fix) in [("1", false), ("2", true)] {
             for tail in [vec!["--not-an-option"], vec!["resume"], vec![]] {
                 let mut args = vec!["--json", "--json-version", version];
+                let bare = tail.is_empty();
                 args.extend(tail);
                 let (output, value) = lab.json(&args);
-                assert!(!output.status.success());
+                // Bare `agit` answers with the overview; the others are rejections.
+                assert_eq!(output.status.success(), bare, "{value}");
                 assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
                 assert_eq!(value.get("fix").is_some(), has_fix);
                 if has_fix {

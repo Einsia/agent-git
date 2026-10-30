@@ -29,8 +29,8 @@ impl Terminal {
             })
             .unwrap();
         let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-        if !command.is_empty() {
-            builder.arg(command);
+        for arg in command.split_whitespace() {
+            builder.arg(arg);
         }
         builder.cwd(cwd);
         builder.env_clear();
@@ -264,14 +264,15 @@ fn bare_init_creates_only_the_named_repo_with_binding_disabled() {
     assert!(!home.join("workspaces").exists());
 }
 
+/// Bare `agit` is the overview; `agit --tui` keeps the picker that bare `agit resume` opens.
 #[test]
-fn bare_resume_and_bare_agit_show_the_same_adopted_session() {
+fn bare_resume_and_agit_tui_show_the_same_adopted_session() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().canonicalize().unwrap();
     let home = tmp.path().join("agit");
     fixture(&home);
     native_fixture(&home, &cwd, true);
-    for command in ["resume", ""] {
+    for command in ["resume", "--tui"] {
         let mut terminal = Terminal::start(&home, &cwd, command, 100);
         terminal.wait_for("enter continue");
         terminal.wait_for("me/fixture");

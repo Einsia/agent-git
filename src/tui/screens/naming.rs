@@ -61,6 +61,7 @@ impl ImportChoice {
             privacy: false,
             milestone: None,
             milestone_turn: None,
+            project_capture: false,
         }
     }
 }

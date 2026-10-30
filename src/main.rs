@@ -159,7 +159,12 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         unsafe { std::env::set_var("AGIT_TUI", "0") };
     }
 
-    let Some(command) = cli.command else {
+    // Bare `agit` shows the overview. Only an explicit `--tui` still opens the session picker.
+    let command = match cli.command {
+        None if !cli.tui => Some(Commands::Overview),
+        command => command,
+    };
+    let Some(command) = command else {
         // No subcommand: **arbitrate first, then decide whether to touch the store**.
         //
         // Only actually entering the interface needs the cd and the startup migration. In a pipe,
@@ -340,7 +345,8 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Rc(args) if matches!(args.action, commands::rc::Action::Local(_)) => {
             Startup::ToolDispatcher
         }
-        Commands::Status(_) => Startup::Inspect,
+        Commands::Status(_) | Commands::Overview => Startup::Inspect,
+        Commands::On(_) | Commands::Off(_) => Startup::ScopedImport,
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
@@ -444,6 +450,9 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
     recheck_project_claims(&cmd);
     let _echo = commands::echo::Invocation::enter(&cmd, json);
     let result = match cmd {
+        Commands::On(a) => commands::front::on::on(a),
+        Commands::Off(a) => commands::front::on::off(a),
+        Commands::Overview => commands::front::overview::run(),
         Commands::Login(a) => commands::login::run(a),
         Commands::Rc(a) => commands::rc::run(a),
         Commands::Logout(a) => commands::logout::run(a),

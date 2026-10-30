@@ -3,7 +3,7 @@
 use super::CmdResult;
 use crate::{
     ExitCode, adapter,
-    domain::{link, repo::Repo, store::Store, workspace},
+    domain::{link, meta, repo::Repo, store::Store, workspace},
     hub::identity::{self, RemoteIdentity},
     infra::{config, credentials},
     ui,
@@ -284,7 +284,7 @@ fn members_read(client: &crate::hub::Client, owner: &str) -> Option<bool> {
     org.base_permission.is_some().then(|| org.members_read())
 }
 
-fn root(path: &Path) -> Result<PathBuf> {
+pub(crate) fn root(path: &Path) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .context("project directory must exist")?;
@@ -457,8 +457,10 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
 /// A project can publish only its own claims; foreign claims retain their source authority.
 #[derive(Debug, PartialEq, Eq)]
 enum Placement {
-    /// The project repository holds, or will hold, the session's claim on this branch.
+    /// The project repository holds the session's claim on this branch.
     Claim(String),
+    /// No repository claims the session yet; importing it names its branch.
+    New,
     /// Another repository holds the claim; the value is its `owner/repo@branch`.
     Foreign(String),
 }
@@ -494,10 +496,58 @@ fn placement(project: &Project, candidate: &Candidate) -> Result<Placement> {
             "session has a protected claim"
         );
     }
-    Ok(Placement::Claim(capture_branch(
-        &candidate.runtime,
-        &candidate.session_id,
-    )))
+    Ok(Placement::New)
+}
+
+/// The branch a newly imported session gets: its opening request in a few words, then a short
+/// hash of its identity so two sessions that open alike still get different branches. A request
+/// without Latin letters falls back to the runtime and the date.
+fn new_branch(project: &Project, candidate: &Candidate) -> String {
+    let identity = hash(&key(&candidate.runtime, &candidate.session_id));
+    let gist = adapter::get(&candidate.runtime).ok().and_then(|adapter| {
+        let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
+        adapter.parse_at(&path).ok()?.gist(200)
+    });
+    let words = gist
+        .as_deref()
+        .map(|gist| super::front::slug(&without_markup(gist), 40))
+        .unwrap_or_default();
+    let runtime = match candidate.runtime.as_str() {
+        "claude-code" => "claude",
+        other => other,
+    };
+    let stem = if words.is_empty() {
+        format!("{runtime}-{}", chrono::Local::now().format("%m%d"))
+    } else if crate::domain::repo::valid_branch_name(&words).is_err() || words == "main" {
+        format!("{runtime}-{words}")
+    } else {
+        words
+    };
+    let taken = |branch: &str| {
+        checkout(project).is_ok_and(|repo| repo.has_ref(&format!("refs/heads/{branch}")))
+    };
+    let short = format!("{stem}-{}", &identity[..4]);
+    if taken(&short) {
+        format!("{stem}-{identity}")
+    } else {
+        short
+    }
+}
+
+/// A request's text without the markup a runtime or a paste wraps around it, such as
+/// `<pasted_content id="…">` or `[Pasted text #1 +20 lines]`: a branch is named by what the person
+/// asked, and its name ends up in links people paste elsewhere.
+fn without_markup(text: &str) -> String {
+    static MARKUP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MARKUP
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"</?[A-Za-z][\w:-]*(?:\s[^<>]*)?/?>|\[(?:Pasted text|Image) #\d+[^\]]*\]",
+            )
+            .unwrap()
+        })
+        .replace_all(text, " ")
+        .into_owned()
 }
 
 /// The branch a project opens for a session it captures.
@@ -505,10 +555,12 @@ fn capture_branch(runtime: &str, id: &str) -> String {
     format!("project-{runtime}-{}", hash(&key(runtime, id)))
 }
 
-/// Resolve under the project lock so a moved claim cannot authorize another repository.
-fn publication(project: &Project, candidate: &Candidate) -> Result<String> {
+/// Resolve under the project lock so a moved claim cannot authorize another repository. The flag
+/// says whether the capture opens the branch.
+fn publication(project: &Project, candidate: &Candidate) -> Result<(String, bool)> {
     match placement(project, candidate)? {
-        Placement::Claim(branch) => Ok(branch),
+        Placement::Claim(branch) => Ok((branch, false)),
+        Placement::New => Ok((new_branch(project, candidate), true)),
         Placement::Foreign(source) => anyhow::bail!(
             "session is claimed by {source}; cross-repository publication requires preserved source authority; publish from its source repository"
         ),
@@ -518,21 +570,40 @@ fn publication(project: &Project, candidate: &Candidate) -> Result<String> {
 /// Imports and publishes one session; returns its branch and the head the push started from.
 fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<String>)> {
     verify(project)?;
-    let branch = publication(project, candidate)?;
+    let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
-    child(
-        &[
-            "import".into(),
-            candidate.session_id.clone(),
-            "--from".into(),
-            candidate.runtime.clone(),
-            "--into".into(),
-            target.clone(),
-            "--independent".into(),
-        ],
-        &candidate.cwd,
-        true,
-    )?;
+    // A capture whose first import settled no turn is marked by the import that settles one.
+    let marks = opens
+        || captured_records()?.iter().any(|r| {
+            r.repository == project.repository
+                && r.branch == branch
+                && r.runtime == candidate.runtime
+                && r.session == candidate.session_id
+        });
+    let mut import = vec![
+        "import".into(),
+        candidate.session_id.clone(),
+        "--from".into(),
+        candidate.runtime.clone(),
+        "--into".into(),
+        target.clone(),
+        "--independent".into(),
+    ];
+    if marks {
+        import.push("--project-capture".into());
+    }
+    child(&import, &candidate.cwd, true)?;
+    // Only a branch the import created is listed: the list must never name a branch the user
+    // creates later under the same name. The import that settles the branch's first turn records
+    // the same fact in its metadata.
+    if opens {
+        record_capture(Captured {
+            repository: project.repository.clone(),
+            branch: branch.clone(),
+            runtime: candidate.runtime.clone(),
+            session: candidate.session_id.clone(),
+        })?;
+    }
     let store = Store::at(config::store_root()?);
     let link = link::get(&store, &candidate.runtime, &candidate.session_id)
         .context("import did not retain its claim")?;
@@ -558,6 +629,13 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
         args.push("--yes".into());
     }
     child(&args, &candidate.cwd, project.auto_upload)?;
+    // A publication does not move the local view of the Hub's branches; fetching does, so local
+    // status and links can tell that this branch is on the Hub.
+    let _ = child(
+        &["fetch".into(), project.repository.clone()],
+        &candidate.cwd,
+        false,
+    );
     Ok((branch, head))
 }
 
@@ -880,6 +958,150 @@ fn bind(
     }
 }
 
+/// The local files that route a folder to its repository: its project policy, upload records and
+/// directory binding, as they are now.
+pub(crate) struct Routing {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The repositories the policy and the directory binding named before the release.
+    policy: Option<String>,
+    binding: Option<String>,
+}
+
+impl Routing {
+    fn paths(root: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths: Vec<PathBuf> = ["json", "caught", "catch-up"]
+            .iter()
+            .map(|extension| Ok(state_path(root)?.with_extension(extension)))
+            .collect::<Result<_>>()?;
+        paths.push(workspace::path_for(root)?);
+        Ok(paths)
+    }
+
+    /// Puts every file back as it was, removing those that did not exist. A move to `moved_to`
+    /// leaves each file absent, naming `moved_to`, or as it was, wherever the move stopped; a file
+    /// naming any other repository was written by another command since, and that setup is kept.
+    pub(crate) fn restore(self, root: &Path, moved_to: &str) -> Result<()> {
+        let _guard = lock(root)?;
+        let policy = read(root)?.map(|project| project.repository);
+        let binding = workspace::read(root).map(|binding| binding.repo);
+        let ours = |now: Option<&str>, before: Option<&str>| {
+            now.is_none_or(|repo| repo == moved_to || Some(repo) == before)
+        };
+        ensure!(
+            ours(policy.as_deref(), self.policy.as_deref())
+                && ours(binding.as_deref(), self.binding.as_deref()),
+            "the folder was set up again by another command meanwhile; its new setup was kept"
+        );
+        for (path, bytes) in self.files {
+            match bytes {
+                Some(bytes) => {
+                    let parent = path.parent().context("routing file has no directory")?;
+                    config::create_state_dir(parent)?;
+                    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                    file.write_all(&bytes)?;
+                    file.as_file().sync_all()?;
+                    file.persist(&path).map_err(|e| e.error)?;
+                }
+                None => match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Serializes everything that sets up `root` from the front door, from choosing its destination
+/// to enrolling it or putting the previous setup back. It is not the project lock, which the
+/// enrolling child process takes itself.
+pub(crate) fn setup_lock(root: &Path) -> Result<fs::File> {
+    config::create_state_dir(&home()?)?;
+    let path = state_path(root)?.with_extension("setup");
+    let file = config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    crate::infra::local_state::lock_patiently(&file, &path, "the folder setup lock", true)?;
+    Ok(file)
+}
+
+/// Forgets the project policy at `root` so the folder can be bound to another repository, and
+/// returns what it was so a move that fails can put it back. Sessions already saved stay in the
+/// repository that holds them.
+pub(crate) fn unbind_for_move(root: &Path) -> Result<Routing> {
+    let _guard = lock(root)?;
+    let mut files = Vec::new();
+    for path in Routing::paths(root)? {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        files.push((path, bytes));
+    }
+    let policy = read(root)?.map(|project| project.repository);
+    let binding = workspace::read(root).map(|binding| binding.repo);
+    for (path, _) in files.iter().take(3) {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Routing {
+        files,
+        policy,
+        binding,
+    })
+}
+
+/// The repository of the project policy that covers `path`, paused or not.
+pub(crate) fn policy_repository(path: &Path) -> Option<String> {
+    let project = nearest(path).ok().flatten()?;
+    includes(&project, path).ok()?.then_some(project.repository)
+}
+
+/// Whether the project policy covering `path` uploads automatically, without network access.
+pub(crate) fn uploads_automatically(path: &Path) -> Option<bool> {
+    let project = nearest(path).ok().flatten()?;
+    includes(&project, path)
+        .ok()?
+        .then_some(project.enabled && project.auto_upload)
+}
+
+/// The last automatic upload's error, when it failed.
+pub(crate) fn last_failure(path: &Path) -> Option<String> {
+    let project = nearest(path).ok().flatten()?;
+    let last = project.last_result?;
+    (last["ok"] == false).then(|| last["error"].as_str().unwrap_or("unknown error").to_owned())
+}
+
+/// Sessions under `root` that the policy left out when it was bound without earlier history and
+/// that no repository holds yet.
+pub(crate) fn excluded_count(root: &Path) -> usize {
+    let Some(project) = read(root).ok().flatten() else {
+        return 0;
+    };
+    let store = Store::open().ok().flatten();
+    project
+        .excluded
+        .iter()
+        .filter(|session_key| {
+            let Some((runtime, id)) = session_key.split_once(':') else {
+                return true;
+            };
+            store
+                .as_ref()
+                .and_then(|store| link::get(store, runtime, id))
+                .is_none_or(|link| link.branch.is_none())
+        })
+        .count()
+}
+
 /// Exact hook identity remains authoritative; a project policy never overrides another claim.
 pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result<bool> {
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
@@ -897,8 +1119,10 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         cwd,
     };
     // A session claimed elsewhere is left to its source repository.
-    let Ok(Placement::Claim(branch)) = placement(&project, &candidate) else {
-        return Ok(false);
+    let branch = match placement(&project, &candidate) {
+        Ok(Placement::Claim(branch)) => Some(branch),
+        Ok(Placement::New) => None,
+        _ => return Ok(false),
     };
     if !project.enabled
         || !project.auto_upload
@@ -908,8 +1132,8 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     {
         // Pausing the project stops passive capture only. A session claimed on another branch
         // (`agit run`, `resume --as`, an import) is settled from its link; a paused project
-        // still blocks its automatic push.
-        return Ok(branch == capture_branch(runtime, session));
+        // still blocks its automatic push. A session no project has claimed has nothing to settle.
+        return Ok(branch.is_none_or(|branch| branch == capture_branch(runtime, session)));
     }
     enqueue(&project.root, &candidate)?;
     // The probe lock is released before spawning, so the new worker can take it.
@@ -1015,6 +1239,16 @@ fn drain(root: &Path) -> Result<()> {
         let Some(worker) = capture_worker(root)? else {
             return Ok(());
         };
+        if take_catch_up(root)?
+            && let Some(project) = read(root)?
+        {
+            let caught = caught(root);
+            for candidate in candidates(&project)? {
+                if behind(&project, &candidate, &caught) {
+                    enqueue(root, &candidate)?;
+                }
+            }
+        }
         while let Some(candidate) = take_pending(root)? {
             let Some(project) = read(root)? else {
                 return Ok(());
@@ -1023,7 +1257,7 @@ fn drain(root: &Path) -> Result<()> {
             let _ = capture_candidate(project, candidate);
         }
         drop(worker);
-        if markers(root)?.is_empty() {
+        if markers(root)?.is_empty() && !catch_up_requested(root)? {
             return Ok(());
         }
     }
@@ -1031,7 +1265,10 @@ fn drain(root: &Path) -> Result<()> {
 
 fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool> {
     // Automatic capture leaves foreign claims to their source repository's settlement.
-    if !matches!(placement(&project, &candidate), Ok(Placement::Claim(_))) {
+    if !matches!(
+        placement(&project, &candidate),
+        Ok(Placement::Claim(_) | Placement::New)
+    ) {
         return Ok(false);
     }
     let session_key = key(&candidate.runtime, &candidate.session_id);
@@ -1048,7 +1285,13 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     if !includes(&project, &candidate.cwd)? {
         return Ok(false);
     }
+    let modified = transcript_modified(&candidate);
     let result = sync_one(&project, &candidate);
+    if result.is_ok()
+        && let Some(modified) = modified
+    {
+        let _ = record_caught(&project.root, &candidate, modified);
+    }
     project.last_result = Some(serde_json::json!({
         "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),
@@ -1059,11 +1302,44 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     Ok(true)
 }
 
+/// Queues a catch-up of the project covering `path`: every session of it with turns the Hub does
+/// not have yet, which a Stop hook that did not run (an untrusted hook, a crash, no network) left
+/// behind. The worker does the work; this returns at once.
+pub(crate) fn catch_up(path: &Path) -> Result<bool> {
+    let Some(project) = nearest(path)? else {
+        return Ok(false);
+    };
+    if !project.enabled || !project.auto_upload || !includes(&project, path)? {
+        return Ok(false);
+    }
+    let marker = state_path(&project.root)?.with_extension("catch-up");
+    config::create_state_dir(&home()?)?;
+    fs::write(&marker, b"")?;
+    if capture_worker(&project.root)?.is_some() {
+        let _ = spawn_capture(&project.root);
+    }
+    Ok(true)
+}
+
+fn catch_up_requested(root: &Path) -> Result<bool> {
+    Ok(state_path(root)?.with_extension("catch-up").exists())
+}
+
+fn take_catch_up(root: &Path) -> Result<bool> {
+    match fs::remove_file(state_path(root)?.with_extension("catch-up")) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ── publication withheld by project policy ─────────────────────────────
 
 /// Branches withheld from publication, kept apart from the policies so that a dropped claim stays
 /// withheld after its link, and even its project, is gone.
 const WITHHELD: &str = "withheld";
+/// Branches this machine's projects opened for captured sessions.
+const CAPTURED: &str = "captured";
 /// Present once this machine's existing claims have been judged by the capture rule.
 const RECHECKED: &str = "claims-rechecked";
 
@@ -1139,29 +1415,92 @@ fn withheld_records() -> Result<Vec<Withheld>> {
     }
 }
 
+/// A branch one of this machine's projects opened for a captured session. The branch's own
+/// metadata says the same and travels with it; this list answers without reading the branch.
+#[derive(Serialize, Deserialize)]
+struct Captured {
+    repository: String,
+    branch: String,
+    runtime: String,
+    session: String,
+}
+
+fn captured_records() -> Result<Vec<Captured>> {
+    match fs::read(home()?.join(CAPTURED)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid captured branch list"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn record_capture(capture: Captured) -> Result<()> {
+    update_list(
+        CAPTURED,
+        "the captured branch lock",
+        captured_records,
+        |records| {
+            records.retain(|r| r.repository != capture.repository || r.branch != capture.branch);
+            records.push(capture);
+        },
+    )
+}
+
+/// The conversation whose capture opened `slug@branch`: from this machine's list, else from the
+/// branch's own metadata, so a lost list or another machine's capture still names it.
+fn capture_origin(slug: &str, branch: &str) -> Result<Option<meta::CaptureOrigin>> {
+    if let Some(record) = captured_records()?
+        .into_iter()
+        .find(|r| r.repository == slug && r.branch == branch)
+    {
+        return Ok(Some(meta::CaptureOrigin {
+            runtime: record.runtime,
+            session: record.session,
+        }));
+    }
+    let (owner, agent) = super::parse_slug(slug)?;
+    let Some(repo) = Repo::open(config::repo_dir(&owner, &agent)?) else {
+        return Ok(None);
+    };
+    let tip = format!("refs/heads/{branch}");
+    if !repo.has_ref(&tip) {
+        return Ok(None);
+    }
+    Ok(meta::read_at_ref_result(&repo, &tip)?.and_then(|m| m.capture))
+}
+
 /// Read-modify-write of the withheld list under its own lock.
 fn update_withheld<T>(change: impl FnOnce(&mut Vec<Withheld>) -> T) -> Result<T> {
+    update_list(
+        WITHHELD,
+        "the withheld branch lock",
+        withheld_records,
+        change,
+    )
+}
+
+/// Read-modify-write of the list in `name` under its own lock.
+fn update_list<R: Serialize, T>(
+    name: &str,
+    what: &str,
+    read: fn() -> Result<Vec<R>>,
+    change: impl FnOnce(&mut Vec<R>) -> T,
+) -> Result<T> {
     let home = home()?;
     config::create_state_dir(&home)?;
-    let lock_path = home.join(WITHHELD).with_extension("lock");
+    let lock_path = home.join(name).with_extension("lock");
     let guard = config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    crate::infra::local_state::lock_patiently(
-        &guard,
-        &lock_path,
-        "the withheld branch lock",
-        true,
-    )?;
-    let mut records = withheld_records()?;
+    crate::infra::local_state::lock_patiently(&guard, &lock_path, what, true)?;
+    let mut records = read()?;
     let result = change(&mut records);
     let mut file = tempfile::NamedTempFile::new_in(&home)?;
     file.write_all(&serde_json::to_vec_pretty(&records)?)?;
     file.as_file().sync_all()?;
-    file.persist(home.join(WITHHELD)).map_err(|e| e.error)?;
+    file.persist(home.join(name)).map_err(|e| e.error)?;
     Ok(result)
 }
 
@@ -1173,9 +1512,9 @@ fn start(claim: &link::Link) -> Option<PathBuf> {
     Path::new(&start).canonicalize().ok()
 }
 
-/// Whether a branch carries the name a project capture gives a session. A resumed conversation
-/// keeps recording into that branch under a new session id, so the name, not the current claim,
-/// says that the branch began as a capture.
+/// Whether a branch carries the name a project capture gave a session before captures were
+/// named by their request. A resumed conversation keeps recording into that branch under a new
+/// session id, so the name, not the current claim, says that the branch began as a capture.
 fn is_capture_branch(branch: &str) -> bool {
     branch
         .strip_prefix("project-")
@@ -1191,22 +1530,32 @@ fn is_capture_branch(branch: &str) -> bool {
 /// The conversation that opened a capture branch is judged by where it started, and the branch is
 /// sound when any project bound to the repository contains that start: the same repository may be
 /// bound from several folders, and a conversation that belongs to one of them is not outside
-/// because it is outside another. A branch the user named, without a capture's name, is theirs
-/// and only an exclusion withholds it.
-fn judge(projects: &[Project], branch: &str, claims: &[link::Link]) -> Option<Withholding> {
-    let excluded = claims.iter().any(|claim| {
-        let session = key(&claim.source, &claim.session_id);
-        projects.iter().any(|p| p.excluded.contains(&session))
-    });
-    if excluded {
+/// because it is outside another. A capture is known by `origin`, the conversation recorded as
+/// having opened it, or by a capture's legacy name; a branch the user named is theirs and only an
+/// exclusion withholds it.
+fn judge(
+    projects: &[Project],
+    branch: &str,
+    claims: &[link::Link],
+    origin: Option<&meta::CaptureOrigin>,
+) -> Option<Withholding> {
+    let excluded = |session: String| projects.iter().any(|p| p.excluded.contains(&session));
+    if claims
+        .iter()
+        .any(|claim| excluded(key(&claim.source, &claim.session_id)))
+        || origin.is_some_and(|o| excluded(key(&o.runtime, &o.session)))
+    {
         return Some(Withholding::Excluded);
     }
-    if !is_capture_branch(branch) {
-        return None;
-    }
-    let opener = claims
-        .iter()
-        .find(|claim| capture_branch(&claim.source, &claim.session_id) == branch);
+    let opener = match origin {
+        Some(origin) => claims
+            .iter()
+            .find(|claim| claim.source == origin.runtime && claim.session_id == origin.session),
+        None if is_capture_branch(branch) => claims
+            .iter()
+            .find(|claim| capture_branch(&claim.source, &claim.session_id) == branch),
+        None => return None,
+    };
     match opener.and_then(start) {
         Some(start)
             if projects
@@ -1284,7 +1633,8 @@ pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option
             None => links.insert(link::list(&Store::at(config::store_root()?))),
         };
         let claims = recording_into(links, &owner, &agent, branch);
-        verdicts.push(judge(&projects, branch, &claims));
+        let origin = capture_origin(slug, branch)?;
+        verdicts.push(judge(&projects, branch, &claims, origin.as_ref()));
     }
     Ok(verdicts)
 }
@@ -1371,7 +1721,10 @@ fn recheck() -> Result<()> {
         let claims = recording_into(&all, &owner, &agent, &branch);
         // A start that cannot be found is withheld at publication but not dropped: the claim
         // may be sound, and only the user can tell.
-        match judge(&bound, &branch, &claims) {
+        // A branch whose metadata cannot be read is judged by its name here and so is not dropped;
+        // publication reads the metadata again and refuses on the error.
+        let origin = capture_origin(&slug, &branch).ok().flatten();
+        match judge(&bound, &branch, &claims, origin.as_ref()) {
             None | Some(Withholding::UnknownStart) => {}
             Some(reason) => release(&store, &slug, &branch, &claims, reason, false)?,
         }
@@ -1587,6 +1940,75 @@ pub(crate) fn automatic_upload(
         org: audience.org,
         members_read: audience.members_read,
     })
+}
+
+fn caught_path(root: &Path) -> Result<PathBuf> {
+    Ok(state_path(root)?.with_extension("caught"))
+}
+
+/// The transcript modification time each session had when it was last uploaded, so a catch-up
+/// reads only transcripts that changed since.
+fn caught(root: &Path) -> std::collections::BTreeMap<String, u64> {
+    caught_path(root)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn record_caught(root: &Path, candidate: &Candidate, modified: u64) -> Result<()> {
+    let mut map = caught(root);
+    map.insert(key(&candidate.runtime, &candidate.session_id), modified);
+    let mut file = tempfile::NamedTempFile::new_in(home()?)?;
+    file.write_all(&serde_json::to_vec(&map)?)?;
+    file.persist(caught_path(root)?).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn transcript_modified(candidate: &Candidate) -> Option<u64> {
+    let adapter = adapter::get(&candidate.runtime).ok()?;
+    let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+/// Whether the Hub lacks some of this session: it was never imported, its branch differs from
+/// what the Hub was last seen to have, or its transcript changed after its last upload.
+fn behind(
+    project: &Project,
+    candidate: &Candidate,
+    caught: &std::collections::BTreeMap<String, u64>,
+) -> bool {
+    let session_key = key(&candidate.runtime, &candidate.session_id);
+    if project.excluded.contains(&session_key) {
+        return false;
+    }
+    match placement(project, candidate) {
+        // A session whose first turn has not finished, such as the one whose start asked for this
+        // catch-up, has nothing to upload; its Stop uploads it.
+        Ok(Placement::New) => adapter::get(&candidate.runtime)
+            .ok()
+            .and_then(|adapter| {
+                let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
+                adapter.parse_at(&path).ok()
+            })
+            .is_some_and(|session| crate::domain::turn::completed_count(&session) > 0),
+        Ok(Placement::Claim(branch)) => {
+            let Ok(repo) = checkout(project) else {
+                return false;
+            };
+            let tip =
+                |reference: String| repo.git_opt(&["rev-parse", "--verify", "--quiet", &reference]);
+            tip(format!("refs/heads/{branch}")) != tip(format!("refs/remotes/origin/{branch}"))
+                || transcript_modified(candidate) != caught.get(&session_key).copied()
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn registration_scope(cwd: &Path) -> bool {
@@ -2221,6 +2643,51 @@ mod tests {
         assert!(announced("fresh", &inside).is_none());
     }
 
+    /// Moving a folder to another repository releases its routing first; a move that then fails
+    /// must leave the folder exactly as it was. Restoring only the policy, and not the directory
+    /// binding, or leaving a file the failed move created, routes the folder to neither
+    /// repository. The move can stop before the binding is rewritten, and the routing still comes
+    /// back. A setup another command committed in between is kept: writing the old routing over it
+    /// would undo a move that already reported success.
+    #[test]
+    fn a_released_folder_is_restored_exactly() {
+        if !isolated("a_released_folder_is_restored_exactly") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        save(&project).unwrap();
+        workspace::bind(&project.root, &project.repository, false).unwrap();
+        let catch_up = state_path(&project.root)
+            .unwrap()
+            .with_extension("catch-up");
+        let previous = unbind_for_move(&project.root).unwrap();
+        assert!(read(&project.root).unwrap().is_none());
+        workspace::bind(&project.root, "alice/elsewhere", true).unwrap();
+        fs::write(&catch_up, b"").unwrap();
+        previous.restore(&project.root, "alice/elsewhere").unwrap();
+        assert_eq!(
+            read(&project.root).unwrap().unwrap().repository,
+            "alice/app"
+        );
+        assert_eq!(workspace::read(&project.root).unwrap().repo, "alice/app");
+        assert!(!catch_up.exists());
+
+        // The binding could not be rewritten: it still names the previous repository.
+        let previous = unbind_for_move(&project.root).unwrap();
+        previous.restore(&project.root, "alice/elsewhere").unwrap();
+        assert_eq!(
+            read(&project.root).unwrap().unwrap().repository,
+            "alice/app"
+        );
+
+        let previous = unbind_for_move(&project.root).unwrap();
+        workspace::bind(&project.root, "alice/third", true).unwrap();
+        assert!(previous.restore(&project.root, "alice/elsewhere").is_err());
+        assert_eq!(workspace::read(&project.root).unwrap().repo, "alice/third");
+        assert!(read(&project.root).unwrap().is_none());
+    }
+
     /// A foreign claim cannot become a new import or silently change publication authority.
     #[test]
     fn project_publication_retains_claims_and_refuses_foreign_authority() {
@@ -2255,10 +2722,10 @@ mod tests {
             Placement::Claim("kept".into())
         );
         let fresh = "eeeeeeee-0000-4000-8000-000000000005";
-        assert!(matches!(
+        assert_eq!(
             placement(&project, &candidate(fresh)).unwrap(),
-            Placement::Claim(branch) if branch.starts_with("project-codex-")
-        ));
+            Placement::New
+        );
         // A claim can move while capture waits for the project lock.
         assert!(publication(&project, &candidate(fresh)).is_ok());
         claim(fresh, "desktop-machine", "project-local", "moved");
@@ -2879,6 +3346,130 @@ mod tests {
         );
         let repo = Repo::init(&work.path().join("repo")).unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", &branch(&strayed)).unwrap());
+    }
+
+    /// A branch is named by the words of the request, never by the markup around a paste.
+    #[test]
+    fn a_pasted_request_names_its_branch_by_what_was_asked() {
+        let name = |text: &str| super::super::front::slug(&without_markup(text), 40);
+        assert_eq!(
+            name("<pasted_content id=\"8d2d\">Next task Y8 from 4a8d</pasted_content>"),
+            "next-task-y8-from-4a8d"
+        );
+        assert_eq!(
+            name("[Pasted text #1 +20 lines] fix the login"),
+            "fix-the-login"
+        );
+        assert_eq!(name("compare a < b and c > d"), "compare-a-b-and-c-d");
+    }
+
+    /// A capture named by its request is known by the conversation its line records as opening
+    /// it, so the capture rule holds when this machine's list of captures is gone (a new machine,
+    /// a wiped AGIT_HOME): a conversation started outside the folder is withheld, and so is one
+    /// whose opener this machine cannot find, and so is one whose opener the user excluded after
+    /// a resume moved the claim to a new session id, while the project's own conversation and a
+    /// branch the user named pass. A gate that knew captures only by their legacy name, or only by
+    /// the local list, would publish the first three.
+    #[test]
+    fn a_capture_named_by_its_request_keeps_the_capture_rule_without_the_local_list() {
+        if !isolated("a_capture_named_by_its_request_keeps_the_capture_rule_without_the_local_list")
+        {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        save(&project).unwrap();
+        let store = Store::at(config::store_root().unwrap());
+        let named = |claim: link::Link, branch: &str| {
+            let mut claim = claim;
+            claim.branch = Some(branch.into());
+            link::write(&store, &claim).unwrap();
+            claim
+        };
+        let inside = named(
+            captured(
+                &project,
+                "aaaaaaaa-0000-4000-8000-000000000031",
+                &project.root,
+            ),
+            "add-dark-mode-1a2b",
+        );
+        let strayed = named(
+            captured(
+                &project,
+                "bbbbbbbb-0000-4000-8000-000000000032",
+                &outside.path().canonicalize().unwrap(),
+            ),
+            "fix-login-redirect-3c4d",
+        );
+        let users = named(
+            captured(
+                &project,
+                "cccccccc-0000-4000-8000-000000000033",
+                &outside.path().canonicalize().unwrap(),
+            ),
+            "my-notes",
+        );
+        let opener = named(
+            captured(
+                &project,
+                "eeeeeeee-0000-4000-8000-000000000035",
+                &project.root,
+            ),
+            "rename-the-tabs-7a8b",
+        );
+        let mut resumed = opener.clone();
+        resumed.session_id = "ffffffff-0000-4000-8000-000000000036".into();
+        link::write(&store, &resumed).unwrap();
+        let mut superseded = opener.clone();
+        superseded.superseded_by = Some(resumed.instance());
+        link::write(&store, &superseded).unwrap();
+        let mut project = project;
+        project
+            .excluded
+            .insert(key(&opener.source, &opener.session_id));
+        save(&project).unwrap();
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        let line = |branch: &str, session: &str, capture: bool| {
+            repo.git(&["checkout", "-q", "-B", branch]).unwrap();
+            let mut metadata = Meta::new(
+                format!("agit-{}", "a".repeat(40)),
+                "claude-code".into(),
+                project.root.to_string_lossy().into_owned(),
+            );
+            metadata.capture = capture.then(|| meta::CaptureOrigin {
+                runtime: "claude-code".into(),
+                session: session.into(),
+            });
+            meta::write(repo.root(), &metadata).unwrap();
+            repo.add_all().unwrap();
+            repo.commit(branch).unwrap();
+        };
+        line("add-dark-mode-1a2b", &inside.session_id, true);
+        line("fix-login-redirect-3c4d", &strayed.session_id, true);
+        line("my-notes", &users.session_id, false);
+        line("rename-the-tabs-7a8b", &opener.session_id, true);
+        line(
+            "lease-notes-5e6f",
+            "dddddddd-0000-4000-8000-000000000034",
+            true,
+        );
+        assert!(!home().unwrap().join(CAPTURED).exists());
+        assert_eq!(withheld("alice/app", "add-dark-mode-1a2b").unwrap(), None);
+        assert_eq!(
+            withheld("alice/app", "fix-login-redirect-3c4d").unwrap(),
+            Some(Withholding::StartedOutside)
+        );
+        assert_eq!(
+            withheld("alice/app", "lease-notes-5e6f").unwrap(),
+            Some(Withholding::UnknownStart)
+        );
+        assert_eq!(withheld("alice/app", "my-notes").unwrap(), None);
+        assert_eq!(
+            withheld("alice/app", "rename-the-tabs-7a8b").unwrap(),
+            Some(Withholding::Excluded)
+        );
     }
 
     /// Existing claims are judged without a command: a claim captured from a conversation started
