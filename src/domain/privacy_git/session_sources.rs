@@ -8,6 +8,17 @@ pub(super) struct Birth {
     pub committer: Option<AccountIdentity>,
 }
 
+impl Birth {
+    /// The Hub the session was born on, as registration reads it: its recorded privacy, or, for
+    /// metadata that predates it, the account of its first committer.
+    pub fn hub(&self) -> Option<&str> {
+        match &self.privacy {
+            Some(privacy) => privacy.hub.as_deref(),
+            None => self.committer.as_ref().map(|account| account.hub.as_str()),
+        }
+    }
+}
+
 pub(super) struct History {
     pub parents: BTreeMap<String, Vec<String>>,
     pub births: BTreeMap<String, Birth>,
