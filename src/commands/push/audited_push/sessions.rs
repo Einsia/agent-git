@@ -9,9 +9,11 @@ pub(super) fn run(
     client: Client,
     repo: Repo,
     branches: &[String],
-    retry_command: &str,
+    named: bool,
+    slug: &str,
     destination: Destination,
 ) -> CmdResult {
+    let retry_command = super::retry_push_command(args, slug, branches);
     let Destination {
         mut intent,
         local_target,
@@ -183,12 +185,44 @@ pub(super) fn run(
         crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
             .context("cannot establish accepted publication history")?;
     let implicit_main = !args.all && !branches.iter().any(|branch| branch == "main");
+    // A branch the Hub refused as withdrawn stays in this checkout and out of later
+    // publications, or every push would meet the same refusal. Naming it asks again, since the
+    // withdrawal may have been restored, and so asks again for every refused version tag, even
+    // when only tags were refused after the branch itself was published. Asking plans them in
+    // this publication only: the record lets a ref go once the Hub has accepted it, so whatever
+    // is still withdrawn, or was never answered for, stays set aside. An automatic push names its
+    // branch too, but never asks again, and fails rather than report a push it did not make.
+    let target = match branches {
+        [branch] => format!("{repository}@{branch}"),
+        _ => repository.clone(),
+    };
+    let unsent = |error: anyhow::Error| {
+        inconsistent(
+            error,
+            format!("cannot push {target}; nothing was sent to the Hub"),
+        )
+    };
+    let withheld = crate::domain::privacy_git::withheld_refs(&repo, &identity).map_err(unsent)?;
+    let ask_again = named && !automatic;
+    let mut asked_again = Vec::new();
+    let mut set_aside = Vec::new();
     let mut selected_branches = Vec::new();
     for head in original.heads() {
         let branch = head
             .name()
             .strip_prefix("refs/heads/")
             .context("invalid publication branch")?;
+        if withheld.contains(head.name()) {
+            if !ask_again {
+                ui::info(format_args!(
+                    "{}",
+                    ui::dim(&format!("  skipping {branch} (withdrawn on the Hub)"))
+                ));
+                set_aside.push(branch.to_owned());
+                continue;
+            }
+            asked_again.push(head.name().to_owned());
+        }
         // A session push cannot require reconciling an independently advanced shared-file line.
         // Explicit selections still admit main through the ordinary publication checks.
         if branch == "main"
@@ -208,17 +242,32 @@ pub(super) fn run(
         }
         selected_branches.push(branch.to_owned());
     }
-    let target = match branches {
-        [branch] => format!("{repository}@{branch}"),
-        _ => repository.clone(),
-    };
-    let unsent = |error: anyhow::Error| {
-        inconsistent(
-            error,
-            format!("cannot push {target}; nothing was sent to the Hub"),
-        )
-    };
-    let selected = SessionPublicationPlan::resolve(
+    if ask_again {
+        asked_again.extend(
+            withheld
+                .iter()
+                .filter(|name| name.starts_with("refs/tags/"))
+                .cloned(),
+        );
+    }
+    // Only an automatic push sets aside a branch it names. The shared-file line may still be
+    // publishable, but the branch the push was for is not, so it fails before any request.
+    if named && !set_aside.is_empty() {
+        let _ = warmed.join();
+        resolving.finish();
+        ui::error(&format!(
+            "{repository}@{} is withdrawn on the Hub; it stays in this checkout and was not pushed",
+            set_aside.join(", ")
+        ));
+        return Ok(ExitCode::Policy);
+    }
+    if selected_branches.is_empty() {
+        let _ = warmed.join();
+        resolving.finish();
+        ui::info(format_args!("{repository}: nothing to publish."));
+        return Ok(ExitCode::Ok);
+    }
+    let mut selected = SessionPublicationPlan::resolve(
         &repo,
         &selected_branches,
         &client,
@@ -229,6 +278,7 @@ pub(super) fn run(
         intent.explicit_hub,
     )
     .map_err(unsent)?;
+    selected.asking_again = asked_again.into_iter().collect();
     let _ = warmed.join();
     resolving.finish();
     ui::publication::notice(format!(
@@ -496,8 +546,69 @@ pub(super) fn run(
         )
     })?;
     show_publication(&report);
+    let accepted: Vec<String> = [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .flat_map(|phase| &phase.attempts)
+        .flat_map(|attempt| &attempt.refs)
+        .filter(|published| published.status != PublicationStatus::Unconfirmed)
+        .map(|published| published.reference.name().to_owned())
+        .filter(|name| selected.asking_again.contains(name))
+        .collect();
+    if !accepted.is_empty() {
+        crate::domain::privacy_git::release_refs(&repo, &identity, &accepted).map_err(|error| {
+            inconsistent(
+                error,
+                format!("{target} is published on the Hub, but agit could not record that the Hub accepted the refs it had set aside as withdrawn"),
+            )
+        })?;
+    }
+    let withdrawn: Vec<String> = [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .flat_map(|phase| phase.withdrawn.iter().cloned())
+        .collect();
+    if !withdrawn.is_empty() {
+        crate::domain::privacy_git::withhold_refs(&repo, &identity, &withdrawn).map_err(|error| {
+            inconsistent(
+                error,
+                format!("the Hub refused refs of {target} as withdrawn, but agit could not record them, so the next push asks the Hub about them again"),
+            )
+        })?;
+        ui::error(&format!(
+            "withdrawn on the Hub, so not published: {}",
+            withdrawn.join(", ")
+        ));
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        let again = withdrawn
+            .iter()
+            .find_map(|name| name.strip_prefix("refs/heads/"))
+            .map(|branch| {
+                format!(
+                    "`agit push {}` publishes it",
+                    quote_arg(&format!("{slug}@{branch}"))
+                )
+            })
+            .unwrap_or_else(|| "naming its branch publishes them".into());
+        ui::hint(&format!(
+            "they stay in this checkout and later pushes leave them out; once the withdrawal is restored on the Hub, {again} again"
+        ));
+        let remaining: Vec<String> = branches
+            .iter()
+            .filter(|branch| !withdrawn.contains(&format!("refs/heads/{branch}")))
+            .cloned()
+            .collect();
+        if !remaining.is_empty() {
+            let retry = super::retry_push_command(args, slug, &remaining);
+            ui::error(&publication_recovery(&report, &retry, &repository));
+        }
+        return Ok(ExitCode::Policy);
+    }
     if !report.ok() {
-        ui::error(&publication_recovery(&report, retry_command, &repository));
+        ui::error(&publication_recovery(&report, &retry_command, &repository));
         return Ok(publication_failure_code(&report));
     }
     verify_receipt_acknowledgements(&report, &receipts)?;

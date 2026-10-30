@@ -21,6 +21,8 @@ pub struct SessionPublicationPlan {
     pub configs: BTreeMap<String, SessionPrivacyResponse>,
     pub(crate) delivery: Option<super::delivery::Delivery>,
     pub(crate) sources: Option<SourceHistory>,
+    /// Withheld refs this publication plans again ([`accepted::Ledger::ask_again`]).
+    pub(crate) asking_again: BTreeSet<String>,
     /// Repositories, `owner/repo`, that introduced snapshots may keep naming as their fork source,
     /// each with the repository identity that vouches for it: the destination itself, and any that
     /// an anonymous lookup on this Hub found public while this publication was resolved. Every
@@ -339,6 +341,7 @@ impl SessionPublicationPlan {
             configs,
             delivery,
             sources: Some(sources),
+            asking_again: BTreeSet::new(),
             fork_sources,
             pinned_source,
         })
@@ -631,6 +634,7 @@ impl ProjectedHistory {
         let root = parent.join(&store);
         let mut ledger = accepted::Ledger::open(&source, identity)?;
         ledger.reconcile(&selected.remote)?;
+        ledger.ask_again(&selected.asking_again);
         // Read before the freeze: a tag added in between is then in the plan but not in the
         // listing, which costs the next push its local shortcut, never the tag.
         let source_tags = super::super::privacy_receipt::current_tag_listing(&source)?;
@@ -2313,6 +2317,7 @@ mod tests {
                     BTreeSet::from(["alice/private".to_owned()]),
                 ),
                 pinned_source: pinned_source(&source, &hub),
+                asking_again: Default::default(),
             };
             let published = ProjectedHistory::prepare_sessions_with_redactor(
                 &source,

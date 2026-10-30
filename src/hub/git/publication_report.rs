@@ -107,6 +107,9 @@ pub struct PublicationPhase {
     pub attempts: Vec<PublicationAttempt>,
     pub unattempted: Vec<FrozenRef>,
     pub error: Option<String>,
+    /// Refs the Hub refused because they are withdrawn from this account. They are among
+    /// `unattempted`.
+    pub withdrawn: Vec<String>,
 }
 
 impl PublicationPhase {

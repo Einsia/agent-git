@@ -330,7 +330,9 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     }
     let mut branches = publishable;
-    if let Some(unchanged) = acknowledged_unchanged(&args, &repo, &client, &branches) {
+    if let Some(unchanged) =
+        acknowledged_unchanged(&args, &repo, &client, &branches, asked_explicitly)
+    {
         if !unchanged.is_empty() {
             ui::info(format_args!(
                 "{}",
@@ -394,6 +396,7 @@ pub fn run(mut args: Args) -> CmdResult {
         &checkout,
         &repo,
         &branches,
+        asked_explicitly,
     )
 }
 
@@ -410,11 +413,19 @@ pub fn run(mut args: Args) -> CmdResult {
 /// `main` carries no receipt: it is the shared file line, published alongside session branches.
 /// While it differs from what the destination last listed for it, every branch takes the full
 /// path, so a session push still carries an advanced `main`.
+///
+/// A push that names its branches while the destination has refs set aside as withdrawn takes the
+/// full path too: naming a branch is what asks the Hub again for those refs, and a set-aside tag
+/// can be in the listing a receipt acknowledged, so the shortcut would report the branch up to
+/// date without asking. A push that names no branch, or an automatic one, never asks again: it
+/// leaves set-aside refs out on either path, so it keeps the shortcut. Whatever decides that a
+/// push asks again has to decide here too.
 fn acknowledged_unchanged(
     args: &Args,
     repo: &Repo,
     client: &crate::hub::Client,
     branches: &[String],
+    named: bool,
 ) -> Option<Vec<String>> {
     use crate::domain::privacy_receipt::{
         PublicationReceipt, acknowledged_tags, outbox::Entry, tag_listing,
@@ -431,6 +442,14 @@ fn acknowledged_unchanged(
     }
     let identity = identity::read(repo).ok()??;
     if identity.hub != identity::normalize_hub(client.base()).ok()? {
+        return None;
+    }
+    if named
+        && std::env::var_os(super::auto_push::AUTOMATIC_ENV).is_none()
+        && !crate::domain::privacy_git::withheld_refs(repo, &identity)
+            .ok()?
+            .is_empty()
+    {
         return None;
     }
     // One listing answers every tip: a lookup per branch costs a Git process each.
@@ -493,7 +512,8 @@ const BRANCHES_PER_PUBLICATION: usize = 48;
 /// they did not ask for. With it, a failing group is published again one branch at a time, so a
 /// branch that cannot be published (a pending privacy check, a refused upload) holds back only
 /// itself. Publishing is idempotent: a branch its group already delivered is reported up to date
-/// the second time.
+/// the second time. `named` says the person named the branches, which is what asks the Hub
+/// again for a branch it set aside as withdrawn; every group carries it.
 fn publish_in_groups(
     args: &Args,
     client: &crate::hub::Client,
@@ -501,6 +521,7 @@ fn publish_in_groups(
     checkout: &super::clone::Checkout,
     repo: &Repo,
     branches: &[String],
+    named: bool,
 ) -> CmdResult {
     let publish = |group: &[String]| {
         audited_push::run(
@@ -510,6 +531,7 @@ fn publish_in_groups(
             checkout.clone(),
             repo.clone(),
             group,
+            named,
         )
     };
     if branches.len() == 1 {

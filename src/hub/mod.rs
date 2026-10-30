@@ -601,6 +601,14 @@ impl PushLimits {
 pub(crate) struct HubConfig {
     #[serde(default)]
     limits: Option<PublishedLimits>,
+    #[serde(default)]
+    capabilities: Option<PublishedCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct PublishedCapabilities {
+    #[serde(default)]
+    publication_planned_refs: bool,
 }
 
 #[derive(Deserialize)]
@@ -616,6 +624,12 @@ struct PublishedPushLimits {
 }
 
 impl HubConfig {
+    pub(crate) fn accepts_planned_refs(&self) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.publication_planned_refs)
+    }
+
     pub(crate) fn push_limits(&self) -> anyhow::Result<PushLimits> {
         let Some(push) = self.limits.as_ref().and_then(|limits| limits.push.as_ref()) else {
             return Ok(PushLimits::UNPUBLISHED);

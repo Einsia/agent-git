@@ -449,19 +449,28 @@ impl FrozenPublication {
                     attempts: Vec::new(),
                     unattempted: self.heads.iter().flatten().cloned().collect(),
                     error: Some(format!("{error:#}")),
+                    withdrawn: Vec::new(),
                 };
                 return (phase, None);
             }
         };
         batches.extend(self.batches(&self.heads, policy));
-        let mut heads = self.push_phase(&batches, held);
+        // Asked once, after the stages have read the limits, so every receipt of this
+        // publication sends the same request.
+        let planned_refs = policy.is_some()
+            && self
+                .transport
+                .client
+                .as_ref()
+                .is_some_and(crate::hub::Client::accepts_planned_refs);
+        let mut heads = self.push_phase(&batches, held, planned_refs);
         // A stage is a means of delivery; only the frozen tips remain owed after a failure.
         heads
             .unattempted
             .retain(|reference| self.plan.heads().contains(reference));
         let tags = heads
             .ok()
-            .then(|| self.push_phase(&self.batches(&self.tags, policy), held));
+            .then(|| self.push_phase(&self.batches(&self.tags, policy), held, planned_refs));
         (heads, tags)
     }
 
@@ -802,6 +811,7 @@ impl FrozenPublication {
         batch: &[FrozenRef],
         held: Option<&BTreeMap<String, String>>,
         delivered: &[ReceiveBatch<'_>],
+        planned_refs: bool,
         before: BTreeMap<String, String>,
     ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
         if let Some(held) = held {
@@ -818,6 +828,7 @@ impl FrozenPublication {
                 .context("publication needs a Hub account")?,
             &before,
             &after,
+            planned_refs,
         )
     }
 
@@ -976,10 +987,13 @@ impl FrozenPublication {
         })
     }
 
+    /// A receipt the Hub refuses because the batch names refs withdrawn from the caller ends the
+    /// phase like any other refused receipt, with those refs in `withdrawn`.
     fn push_phase(
         &self,
         batches: &[ReceiveBatch<'_>],
         held: Option<&BTreeMap<String, String>>,
+        planned_refs: bool,
     ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         let owed = |from: usize| -> Vec<FrozenRef> {
@@ -1024,7 +1038,14 @@ impl FrozenPublication {
                     current = held_refs;
                     let receipt = (!pending.is_empty())
                         .then(|| {
-                            self.receive_receipt(policy, &pending, held, &batches[..index], before)
+                            self.receive_receipt(
+                                policy,
+                                &pending,
+                                held,
+                                &batches[..index],
+                                planned_refs,
+                                before,
+                            )
                         })
                         .transpose()?;
                     Ok::<_, anyhow::Error>((pending, receipt))
@@ -1033,6 +1054,11 @@ impl FrozenPublication {
             {
                 Ok(receipt) => receipt,
                 Err(error) => {
+                    if let Some(refused) =
+                        error.downcast_ref::<crate::hub::privacy::publication::RefsWithdrawn>()
+                    {
+                        phase.withdrawn = refused.refs.clone();
+                    }
                     phase.error = Some(format!("{error:#}"));
                     phase.unattempted = owed(index);
                     break;

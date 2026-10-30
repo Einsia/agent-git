@@ -61,8 +61,9 @@ pub(super) fn run(
     checkout: Checkout,
     repo: Repo,
     branches: &[String],
+    named: bool,
 ) -> CmdResult {
-    let retry_command = retry_push_command(args, &checkout.slug(), branches);
+    let slug = checkout.slug();
     ensure!(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing publication"
@@ -92,7 +93,8 @@ pub(super) fn run(
         client,
         repo,
         branches,
-        &retry_command,
+        named,
+        &slug,
         Destination {
             intent,
             local_target,

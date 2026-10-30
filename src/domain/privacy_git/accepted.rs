@@ -140,6 +140,13 @@ impl Ledger {
         self.save_withheld()
     }
 
+    /// Plans these refs in this publication only, without changing the record: a ref the person
+    /// names may have been restored, but only the Hub accepting it again says so, and then the
+    /// caller releases it.
+    pub fn ask_again(&mut self, refs: &BTreeSet<String>) {
+        self.withheld.retain(|name| !refs.contains(name));
+    }
+
     pub fn release(&mut self, refs: &[String]) -> Result<()> {
         for name in refs {
             self.withheld.remove(name);

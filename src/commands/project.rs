@@ -2019,7 +2019,7 @@ pub(crate) fn registration_scope(cwd: &Path) -> bool {
 }
 
 pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<bool> {
-    if withheld(slug, branch)?.is_some() {
+    if withheld(slug, branch)?.is_some() || refused_as_withdrawn(repo, branch)? {
         return Ok(true);
     }
     let meta = crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))?
@@ -2048,6 +2048,17 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
     Ok(project.repository == slug
         && includes(&project, &cwd)?
         && (!project.enabled || !project.auto_upload))
+}
+
+/// Whether the Hub this checkout publishes to refused `branch` as withdrawn. The push that met
+/// the refusal said so once; later turns leave the branch out quietly, as an excluded session is
+/// left out, until a push that names it asks the Hub again.
+fn refused_as_withdrawn(repo: &Repo, branch: &str) -> Result<bool> {
+    let Some(identity) = crate::hub::identity::read(repo)? else {
+        return Ok(false);
+    };
+    Ok(crate::domain::privacy_git::withheld_refs(repo, &identity)?
+        .contains(&format!("refs/heads/{branch}")))
 }
 
 /// How many of a folder's newest conversations `project list` describes.
@@ -3175,6 +3186,30 @@ mod tests {
         repo.add_all().unwrap();
         repo.commit("Unavailable project directory").unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", "work").is_err());
+    }
+
+    /// A branch the checkout's Hub refused as withdrawn is not pushed after a turn, until a named
+    /// push releases it. Checking only the project policy would start an automatic push on every
+    /// turn and warn each time that it failed, after the refusal was already reported once.
+    #[test]
+    fn a_branch_the_hub_refused_is_not_pushed_automatically() {
+        if !isolated("a_branch_the_hub_refused_is_not_pushed_automatically") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&temp.path().join("repo")).unwrap();
+        repo.git(&["checkout", "-b", "work"]).unwrap();
+        meta::write(repo.root(), &Meta::new_file_line()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("File line").unwrap();
+        let identity = project(temp.path()).identity;
+        crate::hub::identity::pin(&repo, &identity).unwrap();
+        assert!(!blocks_auto_push(&repo, "alice/app", "work").unwrap());
+        let refused = ["refs/heads/work".to_owned()];
+        crate::domain::privacy_git::withhold_refs(&repo, &identity, &refused).unwrap();
+        assert!(blocks_auto_push(&repo, "alice/app", "work").unwrap());
+        crate::domain::privacy_git::release_refs(&repo, &identity, &refused).unwrap();
+        assert!(!blocks_auto_push(&repo, "alice/app", "work").unwrap());
     }
 
     /// Unbind leaves the repository's push.auto as it was before the first folder was bound,

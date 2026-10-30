@@ -256,6 +256,7 @@ fn incomplete_inspection_and_native_failures_keep_their_exit_categories() {
             }],
             unattempted: vec![],
             error: None,
+            withdrawn: vec![],
         };
         let report = PublicationReport {
             lfs: None,
