@@ -8,6 +8,34 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.31] - 2026-10-30
+
+### Changed
+
+- `agit push` splits a publication larger than the Hub's published per-request limits into
+  fast-forward requests within them instead of being refused, and a single commit too large for any
+  request is refused before anything is sent, naming the setting that raises the limit.
+
+### Fixed
+
+- `agit setup --mcp` registers the agit MCP server with Claude Code at user scope, so its tools work
+  in every folder, and `agit doctor` names any folder where a different local entry still overrides
+  it.
+- `agit pr create --branch <owner>/<repo>@<branch>` names the pull request's source, so a pull
+  request can be opened from a cloned repository without a session.
+- `agit project bind --auto-upload` now says plainly that automatic upload is turned on for this
+  computer only, not for teammates or the Hub.
+- A remote-control turn that stops without anyone choosing it, such as a failed turn or a Claude
+  Code harness that exits mid-turn, is now saved as a turn of its own instead of waiting for the
+  next completed turn. A turn you interrupt still stays out of automatic upload until a later turn
+  completes. A conversation's last turn is also no longer queued for archiving forever behind the
+  records Claude Code writes after a reply.
+- Workspace conversation titles and history no longer stay "privacy check pending" while the privacy
+  check is only busy; a withheld title now says why, and a conversation is never named by the
+  pending marker.
+- `agit push` sends a tag added to an already published session branch instead of reporting the
+  branch up to date.
+
 ## [0.2.30] - 2026-10-30
 
 ### Added
