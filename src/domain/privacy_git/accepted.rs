@@ -7,7 +7,7 @@ use crate::hub::{
 };
 use zeroize::Zeroizing;
 
-pub(super) const RECOVERY: &str = "accepted publication mapping is unavailable or inconsistent; keep this checkout to preserve unpublished commits; restore its saved privacy state or clone the accepted remote into a separate checkout before continuing";
+pub(super) use super::InconsistentAcceptedMapping as Inconsistent;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,10 +93,10 @@ impl Ledger {
             .join("agit/privacy-accepted")
             .join(scope.trim_start_matches("sha256:"));
         let branches =
-            if let Some(bytes) = super::state::load(&directory, &scope).context(RECOVERY)? {
+            if let Some(bytes) = super::state::load(&directory, &scope).context(Inconsistent)? {
                 let (version, branches): (u32, BTreeMap<String, Branch>) =
-                    serde_json::from_slice(&bytes).context(RECOVERY)?;
-                ensure!(version == 1, "{RECOVERY}");
+                    serde_json::from_slice(&bytes).context(Inconsistent)?;
+                ensure!(version == 1, Inconsistent);
                 branches
             } else {
                 BTreeMap::new()
@@ -121,7 +121,7 @@ impl Ledger {
                         .mappings
                         .get(&candidate.source_head)
                         .is_some_and(|entry| entry.public == candidate.public_head),
-                    "{RECOVERY}"
+                    Inconsistent
                 );
             }
         }
@@ -266,13 +266,13 @@ impl Ledger {
             let state = self.branches.entry(branch.clone()).or_default();
             for (source, entry) in &candidate.mappings {
                 if let Some(old) = state.accepted.get(source) {
-                    ensure!(same_mapping(old, entry), "{RECOVERY}");
+                    ensure!(same_mapping(old, entry), Inconsistent);
                     continue;
                 }
                 let continues = entry.source_parents.iter().all(|parent| {
                     candidate.mappings.contains_key(parent) || state.accepted.contains_key(parent)
                 });
-                ensure!(continues || held.contains(source), "{RECOVERY}");
+                ensure!(continues || held.contains(source), Inconsistent);
             }
             if !state.pending.iter().any(|old| {
                 old.source_head == candidate.source_head && old.public_head == candidate.public_head
@@ -331,12 +331,12 @@ fn promote(state: &mut Branch, candidate: &Candidate, source: &str) -> Result<()
         let Some(entry) = candidate.mappings.get(&source) else {
             ensure!(
                 below_identity || state.accepted.contains_key(&source),
-                "{RECOVERY}"
+                Inconsistent
             );
             continue;
         };
         if let Some(old) = state.accepted.get(&source) {
-            ensure!(same_mapping(old, entry), "{RECOVERY}");
+            ensure!(same_mapping(old, entry), Inconsistent);
         } else {
             state.accepted.insert(source.clone(), entry.clone());
         }
@@ -380,7 +380,7 @@ fn validate_mappings(
                 && entry.source_parents.len() == entry.public_parents.len()
                 && entry.store.len() == 64
                 && entry.store.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "{RECOVERY}"
+            Inconsistent
         );
         for (source_parent, public_parent) in entry.source_parents.iter().zip(&entry.public_parents)
         {
@@ -388,8 +388,8 @@ fn validate_mappings(
                 .get(source_parent)
                 .or_else(|| accepted.and_then(|accepted| accepted.get(source_parent)));
             match parent {
-                Some(parent) => ensure!(&parent.public == public_parent, "{RECOVERY}"),
-                None => ensure!(is_identity(entry), "{RECOVERY}"),
+                Some(parent) => ensure!(&parent.public == public_parent, Inconsistent),
+                None => ensure!(is_identity(entry), Inconsistent),
             }
         }
         super::super::privacy_envelope::validate_digest(&entry.policy)?;

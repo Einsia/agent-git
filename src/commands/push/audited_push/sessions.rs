@@ -208,6 +208,16 @@ pub(super) fn run(
         }
         selected_branches.push(branch.to_owned());
     }
+    let target = match branches {
+        [branch] => format!("{repository}@{branch}"),
+        _ => repository.clone(),
+    };
+    let unsent = |error: anyhow::Error| {
+        inconsistent(
+            error,
+            format!("cannot push {target}; nothing was sent to the Hub"),
+        )
+    };
     let selected = SessionPublicationPlan::resolve(
         &repo,
         &selected_branches,
@@ -217,7 +227,8 @@ pub(super) fn run(
         remote,
         !args.dry_run,
         intent.explicit_hub,
-    )?;
+    )
+    .map_err(unsent)?;
     let _ = warmed.join();
     resolving.finish();
     ui::publication::notice(format!(
@@ -245,7 +256,7 @@ pub(super) fn run(
                 use crate::ui::session::shell_arg as quote_arg;
                 error.context(format!("fetch the accepted public history with `agit fetch {}` and retry `{retry_command}`; keep this checkout to preserve unpublished commits", quote_arg(&repository)))
             } else {
-                error
+                unsent(error)
             }
         })?;
     let binding = ui::publication::stage("Reading prepared snapshot bindings");
@@ -450,7 +461,7 @@ pub(super) fn run(
         &remote.identity,
         client,
     )?;
-    projected.prepare_acceptance()?;
+    projected.prepare_acceptance().map_err(unsent)?;
     if let (Some(reply), Some(candidate)) = (&mut supervisor, &supervised) {
         reply.prepare(&repo, candidate)?;
     }
@@ -462,7 +473,12 @@ pub(super) fn run(
         &selected.remote,
     ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
     let recording = ui::publication::stage("Recording publication acknowledgements");
-    projected.confirm_acceptance(&report)?;
+    projected.confirm_acceptance(&report).map_err(|error| {
+        inconsistent(
+            error,
+            format!("{target} may already be published on the Hub, but agit could not record which local commits it published"),
+        )
+    })?;
     show_publication(&report);
     if !report.ok() {
         ui::error(&publication_recovery(&report, retry_command, &repository));
@@ -519,6 +535,19 @@ impl Answer {
             || (!self.audit
                 && (self.agit_yes || (!self.encrypted && !self.public && !self.can_ask))))
             .then_some(true)
+    }
+}
+
+/// Names what the push did and did not publish when the accepted ledger refuses it; that
+/// refusal carries no repository or branch of its own.
+fn inconsistent(error: anyhow::Error, outcome: String) -> anyhow::Error {
+    if error
+        .downcast_ref::<crate::domain::privacy_git::InconsistentAcceptedMapping>()
+        .is_some()
+    {
+        error.context(outcome)
+    } else {
+        error
     }
 }
 
