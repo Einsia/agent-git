@@ -262,7 +262,7 @@ impl Prepared {
         let target = destination.clone();
         let readiness = tokio::task::spawn_blocking(move || -> crate::Result<_> {
             let repo = Repo::open(&path).context("publication repository is missing")?;
-            if !repo.auto_push_enabled()? {
+            if !crate::commands::auto_push::publication_allowed(&repo, &target.repository)? {
                 return Ok(Some(crate::protocol::PublicationReason::PushDisabled));
             }
             if !crate::commands::push::automatic_publication_consent(

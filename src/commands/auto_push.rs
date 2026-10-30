@@ -7,6 +7,25 @@ use std::process::Stdio;
 
 pub(super) const AUTOMATIC_ENV: &str = "AGIT_AUTO_PUSH";
 
+/// Whether the person turned automatic publication off for `repository` on this computer: in its
+/// own checkout here, or for every repository when there is none. A repository that publishes to
+/// it on their behalf, such as the device-local one a Hub-enrolled folder uses, carries agit's own
+/// value, so its enrolment and its pushes are judged by this instead; judged by its own value
+/// alone, it keeps uploading after the person turned the destination off.
+pub(crate) fn publication_explicitly_off(repository: &str) -> crate::Result<bool> {
+    let (owner, name) = super::parse_slug(repository)?;
+    match Repo::open(crate::infra::config::repo_dir(&owner, &name)?) {
+        Some(checkout) => checkout.auto_push_explicitly_off(),
+        None => Ok(crate::infra::config::get_global("push.auto")?.as_deref() == Some("false")),
+    }
+}
+
+/// Whether `repo` may publish to `repository` automatically: its own preference allows it, and the
+/// person has not turned automatic publication off for the destination on this computer.
+pub(crate) fn publication_allowed(repo: &Repo, repository: &str) -> crate::Result<bool> {
+    Ok(repo.auto_push_enabled()? && !publication_explicitly_off(repository)?)
+}
+
 /// The refusal an automatic publication meets while its repository's `push.auto` is off.
 pub(crate) const DISABLED_FOR_REPOSITORY: &str =
     "automatic publication is disabled for this repository";

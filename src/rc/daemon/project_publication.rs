@@ -43,6 +43,13 @@ impl std::fmt::Display for Stage {
 
 impl std::error::Error for Stage {}
 
+/// Automatic publication is explicitly off for the repository on this computer. Only a request
+/// that names that setting lifts it, so an enrolment from the Hub leaves the repository, and the
+/// folder it would publish, as the person set them: lifting it would upload what they stopped.
+#[derive(Debug, thiserror::Error)]
+#[error("automatic upload is turned off for this repository on this computer")]
+pub(in crate::rc) struct AutoPushOff;
+
 pub(super) async fn dispatch(
     daemon: Arc<Mutex<Daemon>>,
     frame: &Frame,
@@ -164,8 +171,17 @@ pub(in crate::rc) async fn reconcile_owned(
             )
             .context(Stage::Consent)?;
             current()?;
-            confirm_repository(&repo, &selection, &destination, &consent)
-                .context(Stage::Confirmation)?;
+            match confirm_repository(
+                &repo,
+                &selection,
+                &destination,
+                &consent,
+                &request.repository,
+            ) {
+                // Reconciling never lifts it, and retrying cannot change it.
+                Err(error) if error.is::<AutoPushOff>() => return Ok(()),
+                result => result.context(Stage::Confirmation)?,
+            }
             current()
         }),
     )
@@ -298,7 +314,13 @@ impl Prepared {
         let result = tokio::task::spawn_blocking(move || preparation.confirm(verified, &canceled))
             .await
             .map_err(|_| unavailable())?
-            .map_err(|_| unavailable())?;
+            .map_err(|error| {
+                if error.is::<AutoPushOff>() {
+                    auto_push_off()
+                } else {
+                    unavailable()
+                }
+            })?;
         // Destination settings grant no runtime access; current project authority fences acceptance.
         self.check(&*daemon.lock().await)?;
         serde_json::to_value(result).map_err(|_| unavailable())
@@ -369,6 +391,7 @@ impl Prepared {
             &verified.selection,
             &self.destination,
             &verified.consent,
+            &self.request.repository,
         )?;
         self.current_device(canceled)?;
         Ok(ProjectPublicationBindResult {
@@ -388,12 +411,16 @@ fn confirm_repository(
     selection: &local_repository::publication::Selection,
     destination: &RemoteIdentity,
     consent: &AutoConsent,
+    repository: &str,
 ) -> crate::Result<()> {
     selection.verify(repo)?;
     ensure!(
         consent.hub == destination.hub && consent.agent_id == destination.agent_id,
         "publication enrollment names another destination"
     );
+    if crate::commands::auto_push::publication_explicitly_off(repository)? {
+        return Err(AutoPushOff.into());
+    }
     selection.bind(repo, destination)?;
     consent.save(repo)?;
     repo.set_auto_push(Some(true))?;
@@ -444,6 +471,18 @@ fn forbidden() -> RpcError {
     RpcError::new(
         ErrorCode::Forbidden,
         "project publication authority or folder binding changed",
+    )
+}
+
+fn auto_push_off() -> RpcError {
+    super::classified(
+        RpcError::new(
+            ErrorCode::Forbidden,
+            "automatic upload is turned off for this repository on the device",
+        )
+        .with_hint("turn it on there with `agit config --repo OWNER/NAME push.auto true`"),
+        false,
+        "auto_push_off_on_this_computer",
     )
 }
 
@@ -537,7 +576,12 @@ mod tests {
         assert!(check_owned_binding(&directory, device, &request, &canceled).is_err());
     }
 
-    /// Reconciliation repairs automatic delivery without changing the confirmed destination.
+    /// Reconciliation repairs automatic delivery without changing the confirmed destination, and
+    /// never lifts automatic publication the person turned off for the destination repository on
+    /// this computer, in its checkout or for every repository: it changes nothing and reports that
+    /// instead. Repairing whatever the person chose would upload what they stopped; judging by the
+    /// device-local repository's own off, which is agit's until enrolment, would refuse every
+    /// repair.
     #[test]
     fn project_reconciliation_repairs_delivery_and_preserves_destination_identity() {
         if crate::rc::in_isolated_test(
@@ -580,22 +624,44 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        confirm_repository(&repo, &prepare(), &destination, &consent).unwrap();
+        let confirm = |destination: &RemoteIdentity| {
+            confirm_repository(&repo, &prepare(), destination, &consent, "owner/project")
+        };
+        confirm(&destination).unwrap();
         assert!(repo.auto_push_enabled().unwrap());
         assert!(consent.matches(&repo).unwrap());
+        let consent_file = repo
+            .common_dir()
+            .unwrap()
+            .join("agit/privacy-auto-consent.json");
         repo.set_auto_push(Some(false)).unwrap();
-        std::fs::remove_file(
-            repo.common_dir()
-                .unwrap()
-                .join("agit/privacy-auto-consent.json"),
-        )
-        .unwrap();
-        confirm_repository(&repo, &prepare(), &destination, &consent).unwrap();
+        std::fs::remove_file(&consent_file).unwrap();
+        confirm(&destination).unwrap();
+        assert!(repo.auto_push_enabled().unwrap());
+        assert!(consent.matches(&repo).unwrap());
+
+        let checkout_dir = crate::infra::config::repo_dir("owner", "project").unwrap();
+        std::fs::create_dir_all(&checkout_dir).unwrap();
+        let checkout = crate::domain::repo::Repo::init(&checkout_dir).unwrap();
+        checkout.set_auto_push(Some(false)).unwrap();
+        repo.set_auto_push(Some(false)).unwrap();
+        std::fs::remove_file(&consent_file).unwrap();
+        assert!(confirm(&destination).unwrap_err().is::<AutoPushOff>());
+        assert_eq!(repo.auto_push_override().unwrap(), Some(false));
+        assert!(!consent_file.exists(), "a refused repair changes nothing");
+        checkout.set_auto_push(None).unwrap();
+        crate::infra::config::set_global("push.auto", Some("false")).unwrap();
+        assert!(
+            confirm(&destination).unwrap_err().is::<AutoPushOff>(),
+            "a user-wide off with no repository preference is as explicit"
+        );
+        crate::infra::config::set_global("push.auto", None).unwrap();
+        confirm(&destination).unwrap();
         assert!(repo.auto_push_enabled().unwrap());
         assert!(consent.matches(&repo).unwrap());
         let mut replacement = destination.clone();
         replacement.agent_id = "00000000-0000-0000-0000-000000000002".into();
-        assert!(confirm_repository(&repo, &prepare(), &replacement, &consent).is_err());
+        assert!(confirm(&replacement).is_err());
         assert_eq!(
             local_repository::publication::Destination::load(&repo)
                 .unwrap()
