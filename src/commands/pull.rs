@@ -21,6 +21,10 @@ use super::CmdResult;
 use crate::domain::link;
 use crate::domain::repo::Repo;
 use crate::domain::store::Store;
+#[cfg(windows)]
+use crate::ui::quote_powershell_argument as quote_arg;
+#[cfg(not(windows))]
+use crate::ui::session::shell_arg as quote_arg;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
@@ -307,11 +311,6 @@ fn remote_point(repo: &Repo, branch: &str) -> Option<String> {
 /// A separate function so a test can take the command text and resolve it — "the printed command
 /// runs" is proven only by joining both ends.
 fn ways_out(slug: &str, branch: &str, sha: &str) -> Vec<String> {
-    #[cfg(windows)]
-    use crate::ui::quote_powershell_argument as quote_arg;
-    #[cfg(not(windows))]
-    use crate::ui::session::shell_arg as quote_arg;
-
     let source = quote_arg(&format!("{slug}@{sha}"));
     let target = quote_arg(&format!("{slug}@{branch}"));
     let fork = quote_arg(&format!("{branch}-remote"));
@@ -354,6 +353,98 @@ pub(super) fn fast_forward_to(repo: &Repo, branch: &str, target: &str) -> crate:
     // nobody has checked out only moves its ref.
     let checkout = super::worktree::existing(repo, branch)?.unwrap_or_else(|| repo.clone());
     super::plumbing::update_branch_cas_and_refresh(&checkout, branch, &new, &old, true)
+}
+
+/// Where a local branch stands after [`align_to_published`].
+pub(super) enum Alignment {
+    /// Already at, or ahead of, the published tip (or nothing is published to compare with).
+    Current,
+    /// Fast-forwarded by this many commits to the published tip `to`.
+    FastForwarded { to: String, commits: usize },
+    /// Both sides moved; the refusal and the ways out are already printed.
+    Diverged,
+}
+
+/// Brings local `branch` up to `origin/<branch>` before it is continued.
+///
+/// Continuing reads the local head only, so a local branch the published tip is strictly ahead
+/// of would resume without the turns a collaborator pushed; it is fast-forwarded under the
+/// branch lock first. A branch ahead of the published tip continues as it is. Two lines that
+/// each moved have no lossless answer, so the caller stops and the exact pull, merge and fork
+/// steps are named instead of picking a side.
+pub(super) fn align_to_published(
+    repo: &Repo,
+    store: &Store,
+    slug: &str,
+    branch: &str,
+) -> crate::Result<Alignment> {
+    let local_ref = format!("refs/heads/{branch}");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let tip = |name: &str| {
+        repo.git_opt(&["rev-parse", "--verify", &format!("{name}^{{commit}}")])
+            .map(|sha| sha.trim().to_owned())
+    };
+    match (tip(&local_ref), tip(&remote_ref)) {
+        (Some(local), Some(remote)) if local != remote => {}
+        _ => return Ok(Alignment::Current),
+    }
+    // Same order as `pull`: the startup-recovery evidence first, then the branch lock.
+    let history_update = super::migration::begin_startup_recovery(repo, "continue-history")?;
+    let branch_guard = link::lock_branch(store, slug, branch)?;
+    let alignment = match (tip(&local_ref), tip(&remote_ref)) {
+        (Some(local), Some(remote)) => compare_with_published(repo, slug, branch, &local, remote)?,
+        _ => Alignment::Current,
+    };
+    drop(branch_guard);
+    super::migration::finish_external_history_update(repo, history_update)?;
+    Ok(alignment)
+}
+
+/// The decision of [`align_to_published`] for two tips read under the branch lock.
+fn compare_with_published(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    local: &str,
+    remote: String,
+) -> crate::Result<Alignment> {
+    let counts = repo.git(&[
+        "rev-list",
+        "--left-right",
+        "--count",
+        &format!("{local}...{remote}"),
+    ])?;
+    let mut it = counts.split_whitespace();
+    let ahead: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let behind: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Ok(match (ahead, behind) {
+        (_, 0) => Alignment::Current,
+        (0, behind) => {
+            fast_forward(repo, branch)?;
+            Alignment::FastForwarded {
+                to: remote,
+                commits: behind,
+            }
+        }
+        (ahead, behind) => {
+            ui::error(&format!(
+                "`{branch}` diverged from the published tip: this session continued in two places (local +{ahead} / remote +{behind}) — not continuing either side."
+            ));
+            match remote_point(repo, branch) {
+                Some(sha) if !crate::domain::meta::is_file_line_at(repo, local) => {
+                    eprintln!("  two ways out (origin/{branch} is at {sha}):");
+                    for line in ways_out(slug, branch, &sha) {
+                        eprintln!("    {line}");
+                    }
+                }
+                _ => ui::hint(&format!(
+                    "reconcile first: `agit pull {}`, then run this again",
+                    quote_arg(&format!("{slug}@{branch}"))
+                )),
+            }
+            Alignment::Diverged
+        }
+    })
 }
 
 /// Decide the repo and the context branch.
