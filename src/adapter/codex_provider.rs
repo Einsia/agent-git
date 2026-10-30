@@ -11,7 +11,8 @@ const MAX_CONFIG_FRAMES: usize = 128;
 const MAX_HEADER_BYTES: u64 = 8 * 1024 * 1024;
 
 struct NativeConfig {
-    registered: bool,
+    registered: Option<bool>,
+    configured: Option<String>,
     resume_provider: Option<String>,
 }
 
@@ -28,6 +29,14 @@ fn header(content: &str) -> Option<(std::ops::Range<usize>, Value)> {
     None
 }
 
+/// A header agit wrote itself rather than copied from a native rollout.
+fn synthesized(header: &Value) -> bool {
+    header
+        .pointer("/payload/originator")
+        .and_then(Value::as_str)
+        == Some("agit")
+}
+
 fn header_provider(content: &str) -> Option<String> {
     let (_, value) = header(content)?;
     value
@@ -36,28 +45,46 @@ fn header_provider(content: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn localize_with(content: &str, registered: Option<bool>) -> Option<String> {
-    if registered != Some(false) {
-        return None;
-    }
+fn localize_with(
+    content: &str,
+    registered: Option<bool>,
+    configured: Option<&str>,
+) -> Option<String> {
     let (range, mut value) = header(content)?;
-    if value.pointer("/payload/model_provider")?.as_str()? != "OpenAI" {
+    let current = value.pointer("/payload/model_provider")?.as_str()?;
+    let provider = if synthesized(&value) {
+        configured.filter(|provider| *provider != current)?
+    } else if current == "OpenAI" && registered == Some(false) {
+        "openai"
+    } else {
         return None;
-    }
-    *value.pointer_mut("/payload/model_provider")? = json!("openai");
+    };
+    *value.pointer_mut("/payload/model_provider")? = json!(provider);
     let mut localized = content.to_owned();
     localized.replace_range(range, &serde_json::to_string(&value).ok()?);
     Some(localized)
 }
 
 /// Only an unregistered display label is localized; configured provider identifiers are opaque.
+/// A header agit wrote names a placeholder provider, and Codex refuses to open a rollout whose
+/// header provider differs from the configured one, so that header takes the configured provider.
 pub(super) fn localize(content: &str, cwd: &Path) -> Option<String> {
-    if header_provider(content).as_deref() != Some("OpenAI") {
+    let (_, value) = header(content)?;
+    if !synthesized(&value)
+        && value
+            .pointer("/payload/model_provider")
+            .and_then(Value::as_str)
+            != Some("OpenAI")
+    {
         return None;
     }
+    let config = registered(cwd, None);
     localize_with(
         content,
-        registered(cwd, None).map(|config| config.registered),
+        config.as_ref().and_then(|config| config.registered),
+        config
+            .as_ref()
+            .and_then(|config| config.configured.as_deref()),
     )
 }
 
@@ -101,6 +128,17 @@ fn registry_response(response: &Value) -> Option<bool> {
             .as_object()?
             .contains_key("OpenAI"),
     )
+}
+
+fn configured_provider(response: &Value) -> Option<String> {
+    if response.get("error").is_some() {
+        return None;
+    }
+    response
+        .pointer("/result/config/model_provider")?
+        .as_str()
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_owned)
 }
 
 fn metadata_provider(response: &Value, sid: &str) -> Option<String> {
@@ -187,7 +225,8 @@ async fn read_registry(proc: &mut Proc, cwd: &Path, sid: Option<&str>) -> Option
     proc.write_line(&request).await.ok()?;
     let response = response(proc, 2).await?;
     Some(NativeConfig {
-        registered: registry_response(&response)?,
+        registered: registry_response(&response),
+        configured: configured_provider(&response),
         resume_provider: provider.and_then(|provider| provider_binding(&response, &provider)),
     })
 }
@@ -235,7 +274,7 @@ mod tests {
     #[test]
     fn a_display_label_is_localized_only_after_registry_absence_is_proven() {
         let original = transcript("\"OpenAI\"");
-        let localized = localize_with(&original, Some(false)).unwrap();
+        let localized = localize_with(&original, Some(false), None).unwrap();
         assert_eq!(header_provider(&localized).as_deref(), Some("openai"));
         assert_eq!(
             localized.split_once('\n').unwrap().1,
@@ -245,8 +284,8 @@ mod tests {
             header(&localized).unwrap().1["payload"]["base_instructions"],
             "preserved"
         );
-        assert!(localize_with(&original, Some(true)).is_none());
-        assert!(localize_with(&original, None).is_none());
+        assert!(localize_with(&original, Some(true), None).is_none());
+        assert!(localize_with(&original, None, None).is_none());
         assert_eq!(header_provider(&original).as_deref(), Some("OpenAI"));
     }
 
@@ -261,9 +300,9 @@ mod tests {
             "null",
             "7",
         ] {
-            assert!(localize_with(&transcript(provider), Some(false)).is_none());
+            assert!(localize_with(&transcript(provider), Some(false), Some("sub2api")).is_none());
         }
-        assert!(localize_with("not json\n", Some(false)).is_none());
+        assert!(localize_with("not json\n", Some(false), None).is_none());
     }
 
     #[test]

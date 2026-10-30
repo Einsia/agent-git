@@ -213,8 +213,8 @@ fn ensure_codex_bootstrap(content: &str, format: &str, new_id: &str, cwd: &Path)
     // that was cut away (`turn_context` carries the model, not the provider), and this key cannot
     // be missing — Codex's thread/resume reads a missing one as an empty string and fails hard
     // with "Model provider `` not found". Writing Codex's own default does not point the session
-    // somewhere else: without it the session does not start at all, and a session on a non-OpenAI
-    // backend still overrides explicitly with `codex resume <id> -c model_provider=<x>`.
+    // somewhere else: without it the session does not start at all, and the Codex adapter's
+    // install replaces it with the provider configured on the receiving machine.
     let meta = serde_json::to_string(&serde_json::json!({
         "type": "session_meta",
         "timestamp": now,
