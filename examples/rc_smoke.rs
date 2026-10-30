@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         last_seq: 0,
         title: None,
         gist: None,
+        labels_withheld: None,
         dangerous: false,
         permission_mode,
         created_at: now.clone(),
