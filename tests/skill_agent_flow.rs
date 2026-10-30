@@ -89,6 +89,7 @@ fn installed_skill_supports_explicit_adopt_commit_search_and_prepare() {
     std::fs::create_dir_all(&lab.home).unwrap();
     startup_cache::seed(&lab.agit_home);
     std::fs::create_dir_all(&lab.work).unwrap();
+    git_init(&lab.work);
     let repo = Repo::init(&lab.agit_home.join("repos/me/guide")).unwrap();
     repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
     meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
@@ -235,4 +236,15 @@ fn installed_skill_supports_explicit_adopt_commit_search_and_prepare() {
         settled
     );
     assert!(lab.agit_home.join("store/codex").is_dir());
+}
+
+/// Makes `dir` a Git repository: `setup --agents-md` writes its section only at a repository's
+/// top level.
+fn git_init(dir: &std::path::Path) {
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

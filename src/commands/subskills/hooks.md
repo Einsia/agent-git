@@ -34,14 +34,14 @@ agit hooks settle < hook.json    # Stop
 
 ## Notes
 
-Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful SessionStart returns one structured hook response; Codex and WorkBuddy receive context without Claude's title field. A user's existing title survives resume. Claude ignores titles on `clear`, so that event only receives context. Compact and unknown entry events stay silent. To turn automatic settlement off:
+Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. SessionStart tells the model nothing: an agent that needs the conversation's state runs `agit`, which names it from the runtime's own session variable. In a folder that uploads by itself, every start (resume and `agit continue` included) returns one `systemMessage` for the person, naming the destination, who can read it there, and `agit project drop`. Otherwise SessionStart prints nothing, except to give a Claude Code conversation that an earlier agit renamed its own title back. To turn automatic settlement off:
 
 ```bash
 agit config commit.auto false
 ```
 
-Native startup or `/resume` into an adopted session also receives its last settled `cwd_state` summary when available, even outside a bound workspace. This includes Codex sessions materialized by `agit resume`; the hook adds context without overriding configured developer instructions. This is historical evidence, not current Git status or proof of the same machine. No worktree scan runs in this hook, and no code files are restored. New conversations stay unnamed until the user selects their repo and branch through `agit import` or the TUI naming inbox.
+No worktree scan runs in this hook, and no code files are restored. New conversations stay unnamed until the user selects their repo and branch through `agit import` or the TUI naming inbox.
 
-Hook contracts: [Claude Code](https://code.claude.com/docs/en/hooks) and [Codex](https://learn.chatgpt.com/docs/hooks). Installed Codex hooks must be enabled and trusted in the runtime before they can deliver context.
+Hook contracts: [Claude Code](https://code.claude.com/docs/en/hooks) and [Codex](https://learn.chatgpt.com/docs/hooks). Installed Codex hooks must be enabled and trusted in the runtime before they run.
 
 The input schema is produced by the runtime hook; do not hand-forge it to claim another person's session.

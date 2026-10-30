@@ -242,6 +242,7 @@ fn setup_files(lab: &Lab) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 fn quiet_setup_keeps_installation_and_idempotence_without_routine_notices() {
     for mode in ["flag", "", "0", "ordinary"] {
         let lab = Lab::new();
+        git_init(lab.root.path());
         let claude = lab.home.join(".claude");
         let opencode = lab.home.join(".config/opencode");
         std::fs::create_dir_all(&claude).unwrap();
@@ -610,6 +611,7 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
 fn quiet_setup_retains_refusals_completion_data_and_json_results() {
     for mode in ["flag", "", "0"] {
         let lab = Lab::new();
+        git_init(lab.root.path());
         let settings = lab.home.join(".claude/settings.json");
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         std::fs::write(&settings, "[]").unwrap();
@@ -1684,4 +1686,15 @@ fn quiet_json_branch_noop_preserves_the_recorded_result() {
             );
         }
     }
+}
+
+/// Makes `dir` a Git repository: `setup --agents-md` writes its section only at a repository's
+/// top level.
+fn git_init(dir: &std::path::Path) {
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

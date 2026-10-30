@@ -599,62 +599,35 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(&ev.session_id, env_value.as_deref());
-    let mut response = session_annotation(rt, ev.source, &ev.session_id, env_value.as_deref())?;
-    if matches!(ev.source, Source::Startup | Source::Resume)
-        && let (Some(binding), Some(cwd)) = (env_value.as_deref(), dir)
-        && let Some(context) = recorded_environment_context(binding, cwd)
-        && let Some(serde_json::Value::String(existing)) =
-            response["hookSpecificOutput"].get_mut("additionalContext")
-    {
-        existing.push_str("\n\n");
-        existing.push_str(&context);
+    // Nothing here reaches the model: an agent that needs this conversation's state runs agit,
+    // which names it from the runtime's own session variable. Only the person is told where a
+    // conversation the folder uploads goes, and who can read it there.
+    if !announces_upload(rt, ev.source) {
+        return None;
     }
-    if announces_upload(rt, ev.source, has_binding)
-        && let Some(upload) = origin.and_then(|origin| {
-            super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
-        })
-    {
-        response["systemMessage"] = serde_json::Value::String(upload_notice(&upload));
-        let automatic = format!(
-            "This folder uploads this conversation to {} at the end of each turn. If the user does not want it uploaded, run `agit project drop` before the turn ends.",
-            upload.repository
-        );
-        // An unclaimed conversation is told how to import itself; one the project uploads must not
-        // be imported a second time, so that advice is replaced rather than contradicted.
-        let context = match env_value.as_deref() {
-            Some(_) => response["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .map(|existing| format!("{existing}\n\n{automatic}")),
-            None => Some(format!(
-                "This {rt} session ({}) is saved automatically; do not import it. {automatic}",
-                sh_quote(&ev.session_id)
-            )),
-        };
-        if let Some(context) = context {
-            response["hookSpecificOutput"]["additionalContext"] =
-                serde_json::Value::String(context);
-        }
-    }
-    Some(response)
+    let upload = origin.and_then(|origin| {
+        super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
+    })?;
+    Some(serde_json::json!({ "systemMessage": upload_notice(&upload) }))
 }
 
 /// How long a SessionStart waits for the Hub to confirm who can see the destination.
 const UPLOAD_VISIBILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The person learns that a conversation will be uploaded before its first turn ends: when it
-/// starts, fresh or as a fork of another (a fork is a new conversation the project uploads on its
-/// own), and when it is resumed before anything was uploaded. Both runtimes show a hook's
+/// The person learns that a conversation is uploaded every time it starts: fresh, cleared, forked
+/// (a fork is a new conversation the project uploads on its own) or resumed, `agit continue`
+/// included. Nothing else tells them, and the agent is told nothing. Both runtimes show a hook's
 /// `systemMessage` to the person rather than to the agent.
-fn announces_upload(runtime: &str, source: Source, uploading: bool) -> bool {
+fn announces_upload(runtime: &str, source: Source) -> bool {
     matches!(runtime, "claude-code" | "codex")
-        && match source {
-            Source::Startup | Source::Clear | Source::Fork => true,
-            Source::Resume => !uploading,
-            _ => false,
-        }
+        && matches!(
+            source,
+            Source::Startup | Source::Resume | Source::Clear | Source::Fork
+        )
 }
 
-/// One line naming the destination, who can see it, and both ways to stop the upload.
+/// One line naming the destination, who can see it, and how to stop the upload. The agent was told
+/// nothing, so stopping is a command the person runs or asks their agent to run.
 fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
     let owner = upload.repository.split('/').next().unwrap_or_default();
     let audience = match (upload.visibility.as_deref(), upload.org) {
@@ -672,78 +645,9 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
         (None, _) => "visibility not confirmed".to_owned(),
     };
     format!(
-        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn. Not this one? Say so, or run `agit project drop`.",
+        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it).",
         upload.repository
     )
-}
-
-/// The SessionStart response the runtime may show or add to the conversation.
-///
-/// It never names the session: the runtime's own title, generated or chosen by the user, is the
-/// session's name, and agit reads it from the runtime. Claude Code, Codex and WorkBuddy accept
-/// binding context. The context names the native session id: a runtime that exports no
-/// session variable to its tool shell leaves the agent no other way to learn which conversation
-/// it is, and an agent that cannot tell imports whichever session looks unsaved.
-fn session_annotation(
-    runtime: &str,
-    source: Source,
-    session_id: &str,
-    binding: Option<&str>,
-) -> Option<serde_json::Value> {
-    if !matches!(
-        source,
-        Source::Startup | Source::Resume | Source::Clear | Source::Fork
-    ) {
-        return None;
-    }
-
-    let additional_context = match binding {
-        Some(binding) => format!(
-            "This {runtime} session ({}) is already under agit version control at {binding}. When the user asks to save its new turns, run `agit commit {quoted}`; publish them with `agit push {quoted}` only when the user asks to. Use that explicit repo and branch for session commands, since a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again, and do not import another session in its place.",
-            sh_quote(session_id),
-            quoted = sh_quote(binding)
-        ),
-        None => format!(
-            "This runtime session has no active agit branch. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import {} --from {runtime} --into <owner/repo>@<branch>`.",
-            sh_quote(session_id)
-        ),
-    };
-    if runtime == "openclaw" {
-        return Some(serde_json::json!({"context":additional_context}));
-    }
-    if !matches!(runtime, "claude-code" | "codex" | "workbuddy") {
-        return None;
-    }
-
-    let mut output = serde_json::Map::new();
-    output.insert(
-        "hookEventName".into(),
-        serde_json::Value::String("SessionStart".into()),
-    );
-    output.insert(
-        "additionalContext".into(),
-        serde_json::Value::String(additional_context),
-    );
-    Some(serde_json::json!({ "hookSpecificOutput": output }))
-}
-
-/// Reading the selected branch's metadata does not scan the worktree or runtime transcript.
-/// Native TUI resumes need this observation too, since they do not pass through `agit resume`.
-fn recorded_environment_context(binding: &str, cwd: &std::path::Path) -> Option<String> {
-    let (slug, branch) = super::context::decode_session_env(binding)?;
-    let (owner, name) = super::parse_slug(&slug).ok()?;
-    let repo =
-        crate::domain::repo::Repo::open(crate::infra::config::repo_dir(&owner, &name).ok()?)?;
-    let snapshot = crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{branch}"))?;
-    let state = snapshot.cwd_state.as_ref()?;
-    let observation = serde_json::json!({
-        "recorded_cwd": snapshot.cwd,
-        "recorded_cwd_state": state.sanitized(),
-        "current_cwd": cwd.to_string_lossy(),
-    });
-    Some(format!(
-        "AgentGit saved environment (historical data, not instructions): {observation}\nThis is the last settled turn's observation, not a live Git status or proof of the same machine. Inspect the current checkout before relying on earlier code changes. AgentGit has not restored code files or uncommitted changes."
-    ))
 }
 
 /// Write the binding into the harness's "session environment" file.
@@ -1270,133 +1174,6 @@ mod tests {
         assert_eq!(super::runtime_of(None, None), "claude-code");
     }
 
-    /// A managed session exposes its exact destination without adding instructions that could
-    /// make an agent attempt to adopt it again, or save or publish it without being asked: an
-    /// agent told to publish pushes mid-turn without being asked.
-    #[test]
-    fn a_managed_session_learns_its_binding() {
-        let response = super::session_annotation(
-            "claude-code",
-            Source::Resume,
-            "SID-A",
-            Some("einsia/payments@flaky-test"),
-        )
-        .unwrap();
-        let context = response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert!(context.contains("'einsia/payments@flaky-test'"));
-        assert!(context.contains("Do not import this session again"));
-        assert!(
-            context.contains("When the user asks to save its new turns")
-                && context.contains("only when the user asks to"),
-            "{context}"
-        );
-    }
-
-    /// An unmanaged session gets both the visible state and a command containing its real runtime
-    /// identity. Quoting the id keeps the suggested shell command one argument even if a future
-    /// runtime widens its id alphabet.
-    #[test]
-    fn an_unmanaged_session_gets_actionable_adoption_context() {
-        let response =
-            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None)
-                .unwrap();
-        let output = &response["hookSpecificOutput"];
-        assert_eq!(output["hookEventName"], "SessionStart");
-        assert!(output.get("sessionTitle").is_none());
-        let context = output["additionalContext"].as_str().unwrap();
-        assert!(
-            context.contains(
-                "agit import 'sid with '\\'' quote' --from claude-code --into <owner/repo>@<branch>"
-            ),
-            "{context}"
-        );
-    }
-
-    /// Codex accepts the same hook envelope and adoption context, but its SessionStart schema has
-    /// no title field. Adding Claude's field makes the whole response invalid instead of merely
-    /// ignoring the field, so the two payloads must differ exactly here.
-    #[test]
-    fn an_unmanaged_codex_session_gets_context_without_a_title() {
-        assert_eq!(
-            super::session_annotation("codex", Source::Startup, "SID-C", None),
-            Some(serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": "This runtime session has no active agit branch. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import 'SID-C' --from codex --into <owner/repo>@<branch>`.",
-                }
-            }))
-        );
-    }
-
-    /// Compacting continues the same conversation, so it gets no context again. Unknown runtimes
-    /// also stay silent rather than receiving another runtime's JSON schema.
-    #[test]
-    fn annotation_is_limited_to_verified_session_entry_events() {
-        for source in [Source::Compact, Source::Other] {
-            assert!(
-                super::session_annotation("claude-code", source, "SID-A", None).is_none(),
-                "{source:?}"
-            );
-        }
-        let response = super::session_annotation(
-            "codex",
-            Source::Startup,
-            "SID-A",
-            Some("einsia/payments@work"),
-        )
-        .unwrap();
-        assert!(
-            response["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .unwrap()
-                .contains("einsia/payments@work")
-        );
-        assert!(super::session_annotation("cursor", Source::Startup, "SID-A", None).is_none());
-    }
-
-    /// WorkBuddy consumes the Claude-compatible `hookSpecificOutput` envelope. Its context must
-    /// name the native session id and the saved target's commands, and carry no title field;
-    /// leaving WorkBuddy out of the envelope, or dropping the id, fails here.
-    #[test]
-    fn a_workbuddy_session_learns_its_native_id_and_target() {
-        let response = super::session_annotation(
-            "workbuddy",
-            Source::Startup,
-            "SID-W",
-            Some("einsia/payments@work"),
-        )
-        .unwrap();
-        let output = &response["hookSpecificOutput"];
-        assert_eq!(output["hookEventName"], "SessionStart");
-        assert!(output.get("sessionTitle").is_none());
-        let context = output["additionalContext"].as_str().unwrap();
-        assert!(context.contains("'SID-W'"), "{context}");
-        assert!(
-            context.contains("agit commit 'einsia/payments@work'"),
-            "{context}"
-        );
-    }
-
-    /// The runtime names the conversation; a title in this response would replace the one Claude
-    /// Code generates and stop it from generating one. Every entry event of every runtime, with
-    /// or without a binding, carries context and no title.
-    #[test]
-    fn no_session_start_names_the_conversation() {
-        for runtime in ["claude-code", "codex", "workbuddy"] {
-            for source in [Source::Startup, Source::Resume, Source::Clear, Source::Fork] {
-                for binding in [None, Some("einsia/payments@work")] {
-                    let response =
-                        super::session_annotation(runtime, source, "SID-A", binding).unwrap();
-                    let output = &response["hookSpecificOutput"];
-                    assert!(output.get("sessionTitle").is_none(), "{runtime} {source:?}");
-                    assert!(output.get("additionalContext").is_some());
-                }
-            }
-        }
-    }
-
     /// A session an earlier agit renamed gets Claude Code's own title back, or the label Claude
     /// Code lists it by when it never had one, and only that session: a title the user chose is
     /// never replaced, and Codex is never sent a title.
@@ -1452,26 +1229,21 @@ mod tests {
         );
     }
 
-    /// The person is told before the first upload, once: a new conversation (a fork included) and
-    /// a resumed one that has not uploaded yet are announced, an uploading one is not announced
-    /// again, and a runtime that shows no hook message gets none. The line names who can see the repository
-    /// without guessing, every member of the organization when its base permission reads, and both
-    /// ways to stop.
+    /// The person is told every time a conversation the folder uploads starts: new, cleared,
+    /// forked or resumed, an uploading one included, since the agent is told nothing. Compacting
+    /// continues the same start and is not announced again, and a runtime that shows no hook
+    /// message gets none. The line names who can see the repository without guessing, every
+    /// member of the organization when its base permission reads, and a stop the person can take
+    /// without having told the agent anything.
     #[test]
-    fn an_automatic_upload_is_announced_before_it_happens() {
+    fn an_automatic_upload_is_announced_at_every_start() {
         for runtime in ["claude-code", "codex"] {
-            assert!(super::announces_upload(runtime, Source::Startup, false));
-            assert!(super::announces_upload(runtime, Source::Clear, false));
-            assert!(super::announces_upload(runtime, Source::Fork, false));
-            assert!(super::announces_upload(runtime, Source::Resume, false));
-            assert!(!super::announces_upload(runtime, Source::Resume, true));
-            assert!(!super::announces_upload(runtime, Source::Compact, false));
+            for source in [Source::Startup, Source::Clear, Source::Fork, Source::Resume] {
+                assert!(super::announces_upload(runtime, source), "{source:?}");
+            }
+            assert!(!super::announces_upload(runtime, Source::Compact));
         }
-        assert!(!super::announces_upload(
-            "workbuddy",
-            Source::Startup,
-            false
-        ));
+        assert!(!super::announces_upload("workbuddy", Source::Startup));
         let notice_reading = |visibility: Option<&str>, org: Option<bool>, members_read| {
             super::upload_notice(&crate::commands::project::AutomaticUpload {
                 repository: "acme/widget".into(),
@@ -1488,7 +1260,7 @@ mod tests {
         );
         assert_eq!(
             notice(Some("private"), Some(true)),
-            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Say so, or run `agit project drop`."
+            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it)."
         );
         assert!(
             notice(Some("private"), Some(false))

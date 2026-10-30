@@ -21,9 +21,26 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .env("AGIT_HUB_URL", "http://127.0.0.1:1")
         .env("NO_COLOR", "1")
         .env("CI", "1")
-        .current_dir(root)
+        .current_dir(project(root))
         .stdin(Stdio::null());
     command
+}
+
+/// The project setup runs in: a Git repository apart from the home folder, since
+/// `setup --agents-md` writes its section only at a repository's top level, and never in the home
+/// folder.
+fn project(root: &Path) -> std::path::PathBuf {
+    let project = root.join("project");
+    if !project.join(".git").exists() {
+        std::fs::create_dir_all(&project).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    project
 }
 
 fn success(output: Output) -> Output {
@@ -78,7 +95,7 @@ fn ordinary_and_mixed_setup_emit_the_same_script_as_quiet_completion_only() {
             root.path(),
             &["setup", "--agents-md", "--completions", shell],
         );
-        let agents = root.path().join("AGENTS.md");
+        let agents = project(root.path()).join("AGENTS.md");
         std::fs::remove_file(&agents).unwrap();
         std::fs::create_dir(&agents).unwrap();
         let output = output.output().unwrap();

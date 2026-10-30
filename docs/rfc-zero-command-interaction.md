@@ -148,7 +148,7 @@ Commands that act on one session take an optional `SESSION`:
 
 | Given | Meaning |
 | --- | --- |
-| nothing, inside an agent | this conversation (from the runtime's session variable or the ID the SessionStart hook supplied) |
+| nothing, inside an agent | this conversation (from the runtime's session variable) |
 | nothing, in a terminal | a picker of this folder's sessions, newest first |
 | nothing, neither | `save` saves this folder's unsaved sessions; the others list candidates with the exact command for each and exit `8` — `share` never guesses |
 | a Hub link | that session |
@@ -249,7 +249,7 @@ A test over the front door's message catalog enforces the vocabulary.
 - Every front-door command supports `--json` in the existing v2 envelope. Results name sessions by
   title and link and carry `next` as `{command, why}` or `{human_action, url}`.
 - The skill shrinks to: everything saves itself; use `agit save`, `agit share`, `agit continue`;
-  pass `--json`. The SessionStart context stops instructing agents to run `import` and `commit`.
+  pass `--json`. SessionStart adds nothing to the model's context (CLI #211).
 - MCP tools for `save` and `share` follow the same rules (coordinated with the MCP owners).
 
 ## Command comparison

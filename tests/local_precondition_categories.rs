@@ -491,6 +491,16 @@ fn doctor_reports_missing_git_as_a_local_precondition_without_changing_health_po
 fn setup_storage_failures_preserve_completion_output_and_allow_an_explicit_retry() {
     for mode in ["human", "quiet", "json1", "json2"] {
         let lab = Lab::new();
+        // The section goes only into a repository's top level, so the storage failure below is
+        // the one this run meets.
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(lab.root.path().join("work"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(git.status.success());
         let path = lab.root.path().join("work/AGENTS.md");
         fs::create_dir(&path).unwrap();
         let before = lab.state();

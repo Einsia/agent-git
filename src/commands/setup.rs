@@ -1,5 +1,6 @@
 //! `agit setup` — install every integration in one pass. Idempotent, and installs everything by
-//! default; without it everything still works, at the manual pace.
+//! default except the project `AGENTS.md` section, which only `--agents-md` writes; without it
+//! everything still works, at the manual pace.
 //!
 //! * `--hooks`: settle automatically at the end of a turn (silent; a failure never blocks) +
 //!   `AGIT_SESSION` injection + registering a newly opened unadopted session inside a bound
@@ -19,6 +20,10 @@
 //!   - workbuddy → `skills/agit/` under its config directory (default `~/.workbuddy-ai/`)
 //!     Every directory holds `SKILL.md`, `VERSION` and `references/commands/`; `--skill` does not
 //!     expand the full manual into `AGENTS.md`. Use `--agents-md` for the short adoption rule.
+//!     Installing it also removes an agit section from the home-level instruction files every
+//!     conversation reads (`~/AGENTS.md`, `~/CLAUDE.md`, the Codex and OpenCode ones), where a
+//!     setup run in the home folder once put it: there it reached conversations that have nothing
+//!     to do with AgentGit.
 //! * `--mcp`: register `agit mcp` (stdio MCP server: search/show/view/status/commit) into each
 //!   runtime's native MCP configuration:
 //!   - claude-code → `claude mcp add --scope user`, so every folder sees it; local copies the user
@@ -28,7 +33,9 @@
 //!   - cursor → `mcpServers.agit` in `~/.cursor/mcp.json`
 //!   - workbuddy → `mcpServers.agit` in its MCP file under the config directory
 //!   - hermes → its native MCP configuration; OpenClaw needs none beside its lifecycle plugin
-//! * `--agents-md`: append a marked, idempotent section to the project AGENTS.md.
+//! * `--agents-md`: append a marked, idempotent section to the `AGENTS.md` at the top of the current
+//!   Git repository, and say where and what it is for. Outside a repository, or in the home
+//!   folder, it writes nothing.
 //! * `--completions <shell>`: shell completions.
 
 use super::CmdResult;
@@ -170,11 +177,13 @@ fn run_setup(mut args: Args) -> CmdResult {
     // No flag = install everything (except completions — that one takes a shell argument).
     let all =
         !args.hooks && !args.skill && !args.mcp && !args.agents_md && args.completions.is_none();
+    // The AGENTS.md section is a project's choice, so only `--agents-md` writes it: run from
+    // wherever setup happens to start, it would land in an unrelated project or the home folder.
     let (hooks, skill, mcp, am) = (
         args.hooks || all,
         args.skill || all,
         args.mcp || all,
-        args.agents_md || all,
+        args.agents_md,
     );
 
     if let Some(value) = args.auto_push {
@@ -209,6 +218,7 @@ fn run_setup(mut args: Args) -> CmdResult {
     }
     if skill {
         report.merge(install_skill(rt, args.installed_only));
+        report.merge(remove_home_sections());
     }
     if mcp {
         report.merge(register_mcp(rt));
@@ -1582,18 +1592,112 @@ fn upsert_json_mcp(
 
 // ── project AGENTS.md ─────────────────────────────────────────────────
 
-/// AGENTS.md: a marked, idempotent section.
+/// AGENTS.md: a marked, idempotent section at the top of the current Git repository. Every
+/// conversation in the project reads it, so it goes nowhere else: outside a repository, or in a
+/// repository at the home folder, every conversation under that folder would read it.
 fn append_agents_md() -> SetupReport {
-    let Some(path) = project_agents_path() else {
-        ui::warning("cannot locate project AGENTS.md: current directory is unavailable");
+    let Some(top) = crate::infra::config::repo_root() else {
+        ui::warning(
+            "`--agents-md` writes into a Git repository's top level; run it inside the project",
+        );
         return SetupReport::failure();
     };
-    upsert_marked_block(&path, include_str!("setup_agents_section.md"), "AGENTS.md")
+    if home().is_some_and(|home| same_dir(&home, &top)) {
+        ui::warning(
+            "`--agents-md` writes nothing into the home folder: every conversation under it would read it",
+        );
+        return SetupReport::failure();
+    }
+    let path = project_agents_path_for(&top);
+    let report = upsert_marked_block(&path, include_str!("setup_agents_section.md"), "AGENTS.md");
+    if report.failures == 0 {
+        ui::info(format_args!(
+            "  {} tells coding agents in this project when to use agit. Commit it if your \
+             teammates' agents should follow it; delete the agit section to remove it.",
+            ui::tilde(&path)
+        ));
+    }
+    report
 }
 
-pub(crate) fn project_agents_path() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    Some(project_agents_path_for(&cwd))
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The instruction files that every conversation of a runtime under the home folder reads,
+/// whatever its project: Claude Code reads `CLAUDE.md` in every parent folder.
+fn home_instruction_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = home()
+        .map(|home| {
+            [
+                "AGENTS.md",
+                "CLAUDE.md",
+                ".claude/CLAUDE.md",
+                ".codex/AGENTS.md",
+                ".config/opencode/AGENTS.md",
+            ]
+            .iter()
+            .map(|file| home.join(file))
+            .collect()
+        })
+        .unwrap_or_default();
+    if let Some(codex) = codex_home_path().map(|home| home.join("AGENTS.md"))
+        && !files.contains(&codex)
+    {
+        files.push(codex);
+    }
+    files
+}
+
+/// The home-level instruction files that hold an agit section, which `agit setup --skill`
+/// removes.
+pub(crate) fn home_sections() -> Vec<PathBuf> {
+    home_instruction_files()
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path).is_ok_and(|text| {
+                legacy::without_sections(
+                    &text,
+                    skill_bundle::BEGIN_MARKER,
+                    skill_bundle::END_MARKER,
+                )
+                .is_some()
+            })
+        })
+        .collect()
+}
+
+/// An agit section in a home-level instruction file reaches every conversation, also the ones
+/// that have nothing to do with AgentGit (CLI #211). Only the section goes, and a backup of the
+/// file stays beside it; the user's own text and a legacy skill block, which a native skill
+/// install removes once it has replaced it, are kept.
+fn remove_home_sections() -> SetupReport {
+    let mut report = SetupReport::default();
+    for path in home_instruction_files() {
+        match legacy::remove_sections(&path, skill_bundle::BEGIN_MARKER, skill_bundle::END_MARKER) {
+            Ok(Some(backup)) => {
+                ui::info(format_args!(
+                    "  {} agit section removed from {}, which every conversation reads (backup: {})",
+                    ui::ok(ui::theme::symbols().check),
+                    ui::tilde(&path),
+                    ui::tilde(&backup)
+                ));
+                report.merge(SetupReport::changed_item());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ui::warning(&format!(
+                    "agit section removal failed: {}: {error}",
+                    path.display()
+                ));
+                report.merge(SetupReport::failure());
+            }
+        }
+    }
+    report
 }
 
 fn project_agents_path_for(cwd: &Path) -> PathBuf {

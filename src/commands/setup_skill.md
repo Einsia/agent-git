@@ -138,7 +138,7 @@ When the user asks to upload the current conversation, it takes two commands. Do
 `agit status --json`, `whoami`, `login`, `doctor`, `log`, `push --dry-run` or `--help` first:
 push checks the sign-in and shows the destination, count and visibility itself.
 
-- Already saved (the runtime hook named its `<owner/repo>@<branch>`): `agit commit
+- Already saved (`agit status` names its `<owner/repo>@<branch>`): `agit commit
   <owner/repo>@<branch>`, then `agit push <owner/repo>@<branch> --yes`.
 - Not saved yet: `agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
   --independent`, then `agit push <owner/repo>@<branch> --private --yes`. The repo is the

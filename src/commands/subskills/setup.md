@@ -20,7 +20,7 @@ agit setup [options]
 | `--skill` | Install the progressive-disclosure AgentGit Skill bundle (`SKILL.md`, `VERSION`, and command references) in the selected runtime's native global Skill directory; does not expand the full guide into `AGENTS.md` |
 | `--installed-only` | With `--skill`, refresh only existing native or legacy Skill installations; does not change hooks, MCP, project integration, or auto-push preferences |
 | `--mcp` | Configure the MCP server |
-| `--agents-md` | Write/update the AGENTS.md integration block |
+| `--agents-md` | Write/update the AGENTS.md integration block at the top of the current Git repository; plain `agit setup` writes none, and outside a repository or in the home folder nothing is written |
 | `--completions <shell>` | Generate completion for a shell |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
@@ -60,7 +60,7 @@ The native Skill targets are:
 - OpenCode: `~/.config/opencode/skills/agit/`
 - Cursor: `~/.cursor/skills/agit/`
 
-Use `--agents-md` separately when you want the short, marked project integration block.
+Use `--agents-md` separately, inside the project, when you want the short, marked project integration block. A skill install also removes such a block from the home-level instruction files (`~/AGENTS.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, the Codex and OpenCode `AGENTS.md`), since every conversation reads those; `agit doctor` reports one it finds.
 
 After verifying the native bundle, Skill setup removes complete, version-marked
 legacy manuals from known runtime instruction paths and `~/AGENTS.md`, even when

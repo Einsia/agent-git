@@ -233,8 +233,13 @@ impl Lab {
 
 const HUB: &str = "http://127.0.0.1:1";
 
+/// A session start tells the model nothing, not even for a conversation agit manages: no binding,
+/// no commands and no saved environment, since anything there invites the agent to run agit in
+/// turns that have nothing to do with it. Here a managed conversation resumes in a folder that
+/// does not upload by itself, so the person has nothing to be told either and the hook prints
+/// nothing at all.
 #[test]
-fn native_resume_receives_saved_environment_without_a_workspace_binding() {
+fn a_session_start_tells_the_model_nothing() {
     let lab = Lab::new();
     let git = Command::new("git")
         .args(["init", "-q"])
@@ -285,18 +290,11 @@ fn native_resume_receives_saved_environment_without_a_workspace_binding() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let context = response["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(context.contains("me/qa@s1"), "{context}");
-    assert!(context.contains("\"untracked\":1"), "{context}");
-    assert!(context.contains("not a live Git status"), "{context}");
     assert!(
-        !context.contains("earlier.txt") && !context.contains("later.txt"),
-        "{context}"
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
 }
 
 impl Lab {

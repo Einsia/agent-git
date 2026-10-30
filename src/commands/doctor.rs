@@ -795,6 +795,15 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
             ));
         }
     }
+    for path in super::setup::home_sections() {
+        checks.push((
+            "skill home section".to_owned(),
+            Check::Warn(format!(
+                "an agit section in {} reaches every conversation, also ones unrelated to AgentGit; run `agit setup --skill --installed-only` to remove it",
+                path.display()
+            )),
+        ));
+    }
     if super::setup::legacy_home_skill_exists()
         && let Some(path) = super::setup::legacy_home_skill_path()
     {
