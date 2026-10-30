@@ -49,6 +49,24 @@ pub(crate) fn resume_command(sid: &str, cwd: &Path) -> String {
     format!("codex resume {} --cd '{cwd}'", super::shell_id(sid))
 }
 
+/// Whether a Codex hook comes from a side conversation, which agit leaves to Codex.
+///
+/// Codex keeps a temporary side conversation in memory only and reports no transcript for it, so
+/// there is nothing agit could save; claiming it would announce an upload that never happens. A
+/// persistent side conversation is recorded as attached to the conversation it was opened from;
+/// saving it on its own would publish that conversation's history again as a separate one. A fork
+/// opened as a conversation of its own carries no attachment and stays an ordinary session.
+#[cfg(feature = "cli")]
+pub(crate) fn side_conversation(transcript: Option<&Path>) -> bool {
+    let Some(path) = transcript else {
+        return true;
+    };
+    super::codex_rollout::first_line(path, super::codex_rollout::HEADER_LIMIT)
+        .ok()
+        .and_then(|head| serde_json::from_slice::<serde_json::Value>(&head).ok())
+        .is_some_and(|record| super::session_visibility::attached_codex_header(&record))
+}
+
 /// The output body paired to a tool call replayed from another runtime.
 ///
 /// The real output on the source side cannot be attributed to this call (the IR does not model
@@ -91,8 +109,11 @@ fn primary_meta(path: &Path, choices_only: bool) -> Option<(String, String)> {
         return None;
     }
     let p = v.get("payload")?;
+    // Decided here, where a compressed carrier's header is read, not from the plain name the
+    // listing hands on, which a cold rollout does not have.
     if choices_only
-        && p.pointer("/source/subagent/other").and_then(|v| v.as_str()) == Some("guardian")
+        && (p.pointer("/source/subagent/other").and_then(|v| v.as_str()) == Some("guardian")
+            || super::session_visibility::attached_codex_header(&v))
     {
         return None;
     }
@@ -896,7 +917,7 @@ impl Adapter for Codex {
     }
 
     fn all_session_choices(&self) -> Result<Vec<SessionRef>> {
-        if let Some(threads) = super::codex_index::all_threads() {
+        if let Some(threads) = super::codex_index::all_session_choices() {
             return Ok(named_choices(threads));
         }
         Ok(scan_all_sessions(true)?
@@ -1840,6 +1861,27 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
         }
+        // A side conversation keeps a user origin and only its attachment hides it; the header
+        // is judged where a cold carrier is decoded, since its plain name does not exist.
+        let header = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": "side", "cwd": "/project", "thread_source": "user",
+                        "forked_from_id": "native-id", "attached_thread": true}
+        });
+        let carrier = directory.path().join("side.jsonl.zst");
+        std::fs::write(
+            &carrier,
+            ruzstd::encoding::compress_to_vec(
+                format!("{header}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        assert!(super::primary_meta(&carrier, true).is_none());
+        assert_eq!(
+            super::primary_meta(&carrier, false),
+            Some(("side".to_owned(), "/project".to_owned()))
+        );
     }
 
     use super::*;

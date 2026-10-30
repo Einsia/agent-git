@@ -39,13 +39,20 @@ pub(super) fn internal_codex_source(
         })
 }
 
+/// A side conversation Codex attaches to the conversation it was opened from. Codex lists it only
+/// under that conversation, and its history starts with that conversation's, so it is not a
+/// conversation of its own.
+pub(super) fn attached_codex_header(record: &serde_json::Value) -> bool {
+    record["type"] == "session_meta" && record["payload"]["attached_thread"] == true
+}
+
 pub(super) fn internal_codex_file(path: &Path) -> bool {
     has_internal_metadata(path, |record| {
         (record["type"] == "session_meta").then(|| {
             internal_codex_source(
                 record["payload"]["thread_source"].as_str(),
                 record["payload"].get("source"),
-            )
+            ) || attached_codex_header(record)
         })
     })
 }
@@ -64,5 +71,13 @@ mod tests {
         }
         std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{}}\n").unwrap();
         assert!(!internal_codex_file(&path), "legacy origin remains visible");
+        // A side conversation keeps a user origin; only its attachment hides it.
+        std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"thread_source\":\"user\",\"forked_from_id\":\"main\",\"attached_thread\":true}}\n").unwrap();
+        assert!(internal_codex_file(&path));
+        std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"thread_source\":\"user\",\"forked_from_id\":\"main\"}}\n").unwrap();
+        assert!(
+            !internal_codex_file(&path),
+            "a fork of its own stays visible"
+        );
     }
 }
