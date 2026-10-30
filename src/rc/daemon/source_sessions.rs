@@ -12,10 +12,12 @@ pub(super) fn unavailable(error: impl std::fmt::Display) -> RpcError {
     )
 }
 
-/// The display labels the source catalog holds for a native conversation, if it has scanned it.
+/// The display labels the source catalog holds for a native conversation, if it has scanned it,
+/// protected as the catalog protects them.
 ///
 /// A source-bound session that opens without them reaches clients and the hub with no name, and
-/// the hub keeps a missing label until something reports one.
+/// the hub keeps a missing label until something reports one. The hub also keeps the first label
+/// it is given, so one whose check does not pass is left out, never sent as read.
 pub(super) fn catalog_labels(
     source: &NativeSourceRef,
     native: &str,
@@ -25,7 +27,10 @@ pub(super) fn catalog_labels(
         .ok()
         .flatten()
         .filter(|row| row.source_id == source.source_id && row.native_session_id == native)
-        .map_or((None, None), |row| (row.title, row.gist))
+        .map_or((None, None), |mut row| {
+            protect_catalog_labels(std::slice::from_mut(&mut row));
+            (row.title, row.gist)
+        })
 }
 
 /// A transcript still being restored is a busy conversation that clients retry, not a missing one.

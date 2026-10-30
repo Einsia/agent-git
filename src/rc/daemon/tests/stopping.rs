@@ -1514,8 +1514,9 @@ fn local_session_wire_previews_bound_indexed_and_parsed_prompts() {
     );
 }
 
-/// Every session label that leaves in the session list, the opening-prompt gist and the runtime's
-/// title, passes through the redactor, and each keeps its own row. A listing that sent labels
+/// Every session label that leaves in the session list or the runtime catalog, the opening-prompt
+/// gist and the runtime's title, passes through the redactor, and each keeps its own row. A
+/// listing that sent labels
 /// as read would publish the opening prompt and a home path raw; one that misaligned the protected
 /// labels would show one session's prompt on another; one that sent a session's labels when its
 /// repository could not be resolved would skip the rules registered there.
@@ -1544,13 +1545,18 @@ fn session_labels_leave_only_through_the_redactor() {
     let mut unattributable = row(Some("third prompt"), Some("third title"));
     unattributable.runtime_session_id = "unattributable".into();
     rows.push(unattributable);
-    protect_labels_with(&mut rows, &redactor, |item| {
-        anyhow::ensure!(
-            item.runtime_session_id != "unattributable",
-            "the session's repository cannot be resolved"
-        );
-        Ok(None)
-    });
+    protect_labels_with(
+        &mut rows,
+        &redactor,
+        |item| {
+            anyhow::ensure!(
+                item.runtime_session_id != "unattributable",
+                "the session's repository cannot be resolved"
+            );
+            Ok(None)
+        },
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT),
+    );
     assert_eq!(rows[0].gist.as_deref(), Some("fix ~/app"));
     assert_eq!(rows[1].title.as_deref(), Some("title in ~/docs"));
     assert_eq!(rows[2].gist.as_deref(), Some("second prompt"));
@@ -1561,6 +1567,39 @@ fn session_labels_leave_only_through_the_redactor() {
             Some(crate::domain::redact::PROTECTION_ERROR_TEXT)
         );
     }
+
+    // Catalog rows name the same conversations in the sidebar; one whose labels cannot be
+    // protected carries none rather than the marker or its text.
+    let catalog_row = |native: &str| crate::rc::runtime_context::CatalogRow {
+        session_ref: format!("local-{native}"),
+        source_id: "source".into(),
+        source_generation: 1,
+        runtime: "codex".into(),
+        native_session_id: native.into(),
+        cwd: "/fixture".into(),
+        title: Some("title in /cluster/home/nana/docs".into()),
+        gist: Some("fix /cluster/home/nana/app".into()),
+        updated_at_ms: None,
+        writer_active: None,
+        parent_session_ref: None,
+        technical: false,
+    };
+    let mut catalog = vec![catalog_row("native"), catalog_row("unattributable")];
+    protect_labels_with(
+        &mut catalog,
+        &redactor,
+        |row| {
+            anyhow::ensure!(
+                row.native_session_id != "unattributable",
+                "the session's repository cannot be resolved"
+            );
+            Ok(None)
+        },
+        None,
+    );
+    assert_eq!(catalog[0].title.as_deref(), Some("title in ~/docs"));
+    assert_eq!(catalog[0].gist.as_deref(), Some("fix ~/app"));
+    assert_eq!((&catalog[1].title, &catalog[1].gist), (&None, &None));
 }
 
 #[test]

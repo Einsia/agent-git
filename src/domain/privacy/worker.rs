@@ -56,6 +56,14 @@ thread_local! {
     static INLINE_STATE: std::cell::RefCell<Option<Loaded>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Makes this process check content in place, as the worker process does, so a unit test, whose
+/// binary cannot host the worker, gets the worker's own outcome instead of an unprocessed one that
+/// a unit-test binary counts as passed. Only a test running alone in its own process calls it.
+#[cfg(test)]
+pub(crate) fn check_in_process() {
+    IN_WORKER.store(true, Ordering::Relaxed);
+}
+
 /// Nested projection uses the disposable worker's own dependencies and watchdog.
 pub(crate) fn inline(repo: Option<&Path>, text: &str, mode: Mode) -> Option<Outcome> {
     if !IN_WORKER.load(Ordering::Relaxed) {

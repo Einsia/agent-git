@@ -2574,17 +2574,51 @@ pub fn protect_session_labels(sessions: &mut [LocalSession]) {
                 std::path::Path::new(&item.cwd),
             )
         },
+        Some(crate::domain::redact::PROTECTION_ERROR_TEXT),
     );
 }
 
-fn protect_labels_with(
-    sessions: &mut [LocalSession],
+/// Catalog rows carry the same labels as the session list and are protected the same way. A
+/// label whose check does not pass is left out instead of shown as the marker: the catalog is
+/// the conversation's name in the sidebar, and a row without labels is named by its runtime and
+/// time.
+pub(crate) fn protect_catalog_labels(rows: &mut [crate::rc::runtime_context::CatalogRow]) {
+    protect_labels_with(
+        rows,
+        &crate::domain::redact::Redactor::this_machine(),
+        crate::rc::protection::catalog_repository,
+        None,
+    );
+}
+
+/// A row whose labels leave the device: the opening-prompt gist and the runtime's title.
+trait Labelled {
+    fn labels(&mut self) -> [&mut Option<String>; 2];
+}
+
+impl Labelled for LocalSession {
+    fn labels(&mut self) -> [&mut Option<String>; 2] {
+        [&mut self.gist, &mut self.title]
+    }
+}
+
+impl Labelled for crate::rc::runtime_context::CatalogRow {
+    fn labels(&mut self) -> [&mut Option<String>; 2] {
+        [&mut self.gist, &mut self.title]
+    }
+}
+
+/// Protect the labels of `rows`, each under its own repository's rules; a label whose check does
+/// not pass becomes `withheld`.
+fn protect_labels_with<T: Labelled>(
+    rows: &mut [T],
     base: &crate::domain::redact::Redactor,
-    repository: impl Fn(&LocalSession) -> crate::Result<Option<std::path::PathBuf>>,
+    repository: impl Fn(&T) -> crate::Result<Option<std::path::PathBuf>>,
+    withheld: Option<&str>,
 ) {
     let mut groups = std::collections::BTreeMap::<Option<std::path::PathBuf>, Vec<usize>>::new();
     let mut unresolved = Vec::new();
-    for (index, item) in sessions.iter().enumerate() {
+    for (index, item) in rows.iter().enumerate() {
         match repository(item) {
             Ok(root) => groups.entry(root).or_default().push(index),
             Err(_) => unresolved.push(index),
@@ -2596,46 +2630,47 @@ fn protect_labels_with(
             None => Ok(base.clone()),
         };
         match redactor {
-            Ok(redactor) => protect_label_group(sessions, &indexes, &redactor),
+            Ok(redactor) => protect_label_group(rows, &indexes, &redactor, withheld),
             Err(_) => unresolved.extend(indexes),
         }
     }
     for index in unresolved {
-        let item = &mut sessions[index];
-        for label in item.gist.iter_mut().chain(item.title.iter_mut()) {
-            *label = crate::domain::redact::PROTECTION_ERROR_TEXT.to_owned();
+        for label in rows[index].labels() {
+            if label.is_some() {
+                *label = withheld.map(str::to_owned);
+            }
         }
     }
 }
 
-/// Protect the labels of `sessions[indexes]` in one request.
-fn protect_label_group(
-    sessions: &mut [LocalSession],
+/// Protect the labels of `rows[indexes]` in one request.
+fn protect_label_group<T: Labelled>(
+    rows: &mut [T],
     indexes: &[usize],
     redactor: &crate::domain::redact::Redactor,
+    withheld: Option<&str>,
 ) {
-    let labels: Vec<serde_json::Value> = indexes
-        .iter()
-        .flat_map(|&index| {
-            let item = &sessions[index];
-            item.gist.iter().chain(item.title.iter())
-        })
-        .map(|label| serde_json::Value::String(label.clone()))
-        .collect();
+    let mut labels = Vec::new();
+    for &index in indexes {
+        for label in rows[index].labels().into_iter().flatten() {
+            labels.push(serde_json::Value::String(label.clone()));
+        }
+    }
     if labels.is_empty() {
         return;
     }
     let protected = redactor.scrub_json(&serde_json::Value::Array(labels)).value;
     let mut protected = protected.as_array().map(|labels| labels.iter());
     for &index in indexes {
-        let item = &mut sessions[index];
-        for label in item.gist.iter_mut().chain(item.title.iter_mut()) {
-            *label = protected
-                .as_mut()
-                .and_then(Iterator::next)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(crate::domain::redact::PROTECTION_ERROR_TEXT)
-                .to_owned();
+        for label in rows[index].labels() {
+            if label.is_some() {
+                *label = protected
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .and_then(serde_json::Value::as_str)
+                    .or(withheld)
+                    .map(str::to_owned);
+            }
         }
     }
 }
