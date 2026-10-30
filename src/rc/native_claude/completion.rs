@@ -50,6 +50,111 @@ pub(crate) fn record(
     ensure!(reason == "aborted", "invalid native completion reason");
     let registration = super::register(session, generation)?;
     let transcript = registration.transcript_path()?.canonicalize()?;
+    write(session, generation, turn, transcript, None, || {
+        ensure!(
+            registration.is_registered(),
+            "native completion generation changed"
+        );
+        Ok(())
+    })
+}
+
+/// Where a turn that just ended stops in its transcript, as the completed-only cut will see it.
+pub(crate) struct TurnEnd {
+    pub(crate) at: u64,
+    /// Conversation follows the last boundary, so no cut reaches `at` yet.
+    pub(crate) open: bool,
+}
+
+/// A turn that ended on its own stops at its own completion; the bookkeeping Claude appends after
+/// it belongs to the next snapshot, and a job that counted it would wait for a cut no commit makes.
+/// A turn still awaiting its reply is open through the whole prefix, so an earlier completion
+/// cannot acknowledge its prompt. A `stopped` turn, one its harness stopped before completing,
+/// gets an end receipt there: Claude marks such a stop only with a tool denial or synthetic text,
+/// which also occur in turns that go on, so no transcript rule can close it, and a conversation
+/// that is never continued would never settle it.
+pub(crate) fn turn_end(
+    session: &str,
+    transcript: &Path,
+    consumed: u64,
+    stopped: Option<(&str, &str)>,
+) -> crate::Result<TurnEnd> {
+    let transcript = transcript.canonicalize()?;
+    let mut prefix = read_prefix(&transcript, consumed)?;
+    // A record still being written belongs to a later read.
+    prefix.truncate(
+        prefix
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1),
+    );
+    let closed = boundaries_in(
+        &directory(session, &transcript)?,
+        session,
+        &transcript,
+        &prefix,
+    )?
+    .last()
+    .copied()
+    .unwrap_or(0);
+    let text = std::str::from_utf8(&prefix).context("native transcript is not UTF-8")?;
+    if !crate::adapter::claude_code::awaits_reply(&text[closed..]) {
+        let own = crate::adapter::claude_code::completed_turn_boundary(text).unwrap_or(0);
+        return Ok(TurnEnd {
+            at: closed.max(own) as u64,
+            open: false,
+        });
+    }
+    let Some((generation, turn)) = stopped else {
+        return Ok(TurnEnd {
+            at: prefix.len() as u64,
+            open: true,
+        });
+    };
+    ensure!(
+        crate::rc::native_inbox::valid_id(turn),
+        "native completion requires an exact turn UUID"
+    );
+    let receipt = write(
+        session,
+        generation,
+        turn,
+        transcript,
+        Some(prefix.len() as u64),
+        || Ok(()),
+    )?;
+    Ok(TurnEnd {
+        at: receipt.bytes,
+        open: false,
+    })
+}
+
+fn read_prefix(transcript: &Path, end: u64) -> crate::Result<Vec<u8>> {
+    ensure!(
+        end <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
+        "native completion exceeds its capture budget"
+    );
+    let mut bytes = Vec::new();
+    crate::rc::native_inbox::open_regular(transcript)?
+        .take(end)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == end,
+        "native transcript is shorter than what was read"
+    );
+    Ok(bytes)
+}
+
+/// Receipts are written once per turn: a replay returns the saved boundary, never a later one.
+fn write(
+    session: &str,
+    generation: &str,
+    turn: &str,
+    transcript: PathBuf,
+    end: Option<u64>,
+    current: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<Receipt> {
+    let reason = "aborted";
     let directory = directory(session, &transcript)?;
     crate::infra::config::create_state_dir(&directory)?;
     let path = directory.join(format!("{generation}-{turn}.json"));
@@ -65,22 +170,16 @@ pub(crate) fn record(
         );
         return Ok(saved);
     }
-    let file = crate::rc::native_inbox::open_regular(&transcript)?;
-    let size = file.metadata()?.len();
+    let size = match end {
+        Some(end) => end,
+        None => std::fs::metadata(&transcript)?.len(),
+    };
+    let bytes = read_prefix(&transcript, size)?;
     ensure!(
-        size <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
-        "native completion exceeds its capture budget"
-    );
-    let mut bytes = Vec::new();
-    file.take(size).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 == size && bytes.last() == Some(&b'\n'),
+        bytes.last() == Some(&b'\n'),
         "native completion has an incomplete transcript record"
     );
-    ensure!(
-        registration.is_registered(),
-        "native completion generation changed"
-    );
+    current()?;
     let receipt = Receipt {
         version: 1,
         session: session.into(),
@@ -168,54 +267,6 @@ fn boundaries_in(
         }
     }
     Ok(boundaries)
-}
-
-pub(crate) fn turn_boundary(
-    session: &str,
-    transcript: &Path,
-    turn: &str,
-) -> crate::Result<Option<u64>> {
-    ensure!(
-        crate::rc::native_inbox::valid_id(turn),
-        "native completion requires an exact turn UUID"
-    );
-    let transcript = transcript.canonicalize()?;
-    let entries = match std::fs::read_dir(directory(session, &transcript)?) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let suffix = format!("-{turn}.json");
-    let mut selected = None;
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().ends_with(&suffix) {
-            continue;
-        }
-        let receipt = read(&entry.path())?;
-        ensure!(
-            receipt.version == 1
-                && receipt.session == session
-                && receipt.transcript == transcript
-                && receipt.turn == turn
-                && receipt.bytes <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
-            "native completion receipt names another turn"
-        );
-        let file = crate::rc::native_inbox::open_regular(&transcript)?;
-        let mut bytes = Vec::new();
-        file.take(receipt.bytes).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 == receipt.bytes
-                && hex::encode(Sha256::digest(&bytes)) == receipt.sha256,
-            "native completion prefix changed"
-        );
-        ensure!(
-            selected.is_none_or(|end| end == receipt.bytes),
-            "native completion boundary is ambiguous"
-        );
-        selected = Some(receipt.bytes);
-    }
-    Ok(selected)
 }
 
 #[cfg(test)]

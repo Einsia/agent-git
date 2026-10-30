@@ -898,6 +898,9 @@ pub struct Session {
     reported_settlement_failure: Option<String>,
     local_settlement: Option<settlement_io::LocalSettlement>,
     settlement_due: bool,
+    /// The daemon told this session to stop, by its own exit or restart. That can be a person's stop,
+    /// so a turn it cuts off is theirs; a harness that ends on its own stopped without anyone.
+    stop_requested: bool,
     completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// See [`SettlementChild`]: test-only, always `None` in production.
     settlement_child: Option<SettlementChild>,
@@ -1611,6 +1614,7 @@ impl Session {
             reported_settlement_failure: None,
             local_settlement: None,
             settlement_due: false,
+            stop_requested: false,
             completed_boundary: None,
             settlement_child: None,
             queued_initial_turn: None,
@@ -2452,6 +2456,7 @@ impl Session {
                         }
                     match cmd {
                         None | Some(Command::Shutdown) => {
+                            self.stop_requested = true;
                             self.abandon_pending_approvals().await;
                             self.set_status(SessionStatus::Ended).await;
                             return;
@@ -3196,7 +3201,14 @@ impl Session {
                 // allowed — the harness may already be dead).
                 self.settle_transcript().await;
                 if self.settlement.borrow().local_owner
-                    && let Err(error) = self.retain_completed_archive(&turn_id)
+                    && let Err(error) = self.retain_completed_archive(
+                        &turn_id,
+                        match outcome {
+                            TurnOutcome::Ok => archive_recovery::TurnEnding::Completed,
+                            TurnOutcome::Interrupted => archive_recovery::TurnEnding::Interrupted,
+                            TurnOutcome::Error => archive_recovery::TurnEnding::Stopped,
+                        },
+                    )
                 {
                     self.publication_retry.failed();
                     tracing_note(&format!(
@@ -3508,6 +3520,21 @@ impl Session {
         self.flush_all_deltas().await;
         self.drain_transcript().await;
         self.release_held().await;
+        // A turn the reaped harness was still running when it ended on its own ends here, as a
+        // turn of its own; otherwise the exit commit finds no completion and the turn waits for one
+        // that may never come. A turn cut off by a requested stop is held like an interrupt.
+        if let AnyDriver::ClaudeCode(driver) = &self.driver
+            && let Some(turn_id) = driver.current_turn()
+            && !self.stop_requested
+            && self.settlement.borrow().local_owner
+            && let Err(error) =
+                self.retain_completed_archive(turn_id, archive_recovery::TurnEnding::Stopped)
+        {
+            tracing_note(&format!(
+                "[{}] stopped turn archive remains unrecorded: {error:#}",
+                self.info.session_id
+            ));
+        }
         self.settle_and_push(SettlementBoundary::SessionExit).await;
     }
 

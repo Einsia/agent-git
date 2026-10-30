@@ -1374,6 +1374,11 @@ impl ClaudeCodeDriver {
         self.proc.shutdown().await
     }
 
+    /// The turn that had not reached its `result` when the harness stopped.
+    pub(crate) fn current_turn(&self) -> Option<&str> {
+        self.current_turn.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_driver() -> ClaudeCodeDriver {
         ClaudeCodeDriver {
@@ -1403,6 +1408,11 @@ impl ClaudeCodeDriver {
     #[cfg(test)]
     pub(crate) fn clear_test_current_turn(&mut self) {
         self.current_turn = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_current_turn(&mut self, turn: &str) {
+        self.current_turn = Some(turn.into());
     }
 
     #[cfg(test)]
