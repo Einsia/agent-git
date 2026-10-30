@@ -44,8 +44,12 @@ explicit analytics destination. See `docs/telemetry.md` and
 
 Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) only when `codex features list` reports the
-hooks capability. Codex may ask the user to trust the installed commands before running them; agit
-does not grant that trust on the user's behalf.
+hooks capability. Codex runs a hook only after the user approves its exact command, and nothing
+from Codex is saved until then; agit does not grant that approval on the user's behalf. Setup leaves
+an existing hook that runs the `agit` on `PATH` unchanged, so an approval survives another copy of
+agit running setup. Setup, `agit doctor` and `agit project status` ask Codex (`codex app-server`,
+`hooks/list`) and name the AgentGit hooks it will not run: not yet approved, changed since approval,
+or disabled. The user approves them in Codex's startup hooks review or in `/hooks`.
 
 Claude Code's MCP server is registered at user scope (`claude mcp add --scope user`), so every
 folder sees it. A project-local `agit` entry is removed only when the user entry fully replaces it;

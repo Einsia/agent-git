@@ -42,8 +42,11 @@ use super::CmdResult;
 use super::skill_bundle;
 use crate::{ExitCode, ui};
 pub(crate) mod claude_mcp;
+mod codex_trust;
 mod legacy;
 mod native;
+
+pub(crate) use codex_trust::codex_hooks;
 
 use clap::Args as ClapArgs;
 use std::borrow::Cow;
@@ -396,10 +399,7 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
                     report.merge(installed);
                     if installed.succeeded() {
                         if capability.enabled {
-                            ui::info(format_args!(
-                                "  {} Codex may ask you to trust these hooks when their command changes",
-                                ui::dim("·")
-                            ));
+                            report_codex_review(installed.changed > 0);
                         } else {
                             ui::warning(
                                 "Codex hooks are configured but its `hooks` feature is disabled",
@@ -449,6 +449,24 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
     }
 
     report
+}
+
+/// Codex runs a hook only once the person has approved its exact command, so after a change, or
+/// while Codex still reports a hook as unapproved, setup says that nothing from Codex is saved
+/// until then. Codex's own answer is preferred; a changed command always needs a new approval.
+fn report_codex_review(changed: bool) {
+    let cwd = std::env::current_dir().ok().or_else(home);
+    match cwd.as_deref().and_then(codex_hooks) {
+        Some(hooks) => {
+            if let Some(problem) = hooks.problem() {
+                ui::warning(&problem);
+            }
+        }
+        None if changed => ui::warning(
+            "Codex will ask you to review the AgentGit hooks when it next starts; nothing from Codex is saved until you approve them",
+        ),
+        None => {}
+    }
 }
 
 fn claude_settings() -> Option<PathBuf> {
@@ -792,6 +810,7 @@ fn install_hook_file(
     for (event, argv) in RETIRED_HOOKS {
         added += retire_hook(hooks, event, argv);
     }
+    let on_path = agit_on_path();
     for (event, argv) in HOOKS {
         added += upsert_hook(
             hooks,
@@ -799,6 +818,7 @@ fn install_hook_file(
             &hook_command(exe, argv, runtime_flag),
             &hook_arguments(argv, runtime_flag),
             None,
+            on_path.as_deref(),
         );
     }
     for (event, argv, timeout) in extra {
@@ -808,6 +828,7 @@ fn install_hook_file(
             &hook_command(exe, argv, runtime_flag),
             &hook_arguments(argv, runtime_flag),
             Some(*timeout),
+            on_path.as_deref(),
         );
     }
     if added > 0 {
@@ -829,13 +850,14 @@ fn install_hook_file(
             ui::ok(ui::theme::symbols().check),
             ui::tilde(path)
         ));
+        SetupReport::changed_item()
     } else {
         ui::info(format_args!(
             "  {} {label} hooks already in place",
             ui::dim("·")
         ));
+        SetupReport::item()
     }
-    SetupReport::item()
 }
 
 /// Retire a hook that is no longer used. Returns how many commands were removed.
@@ -925,12 +947,17 @@ fn retire_hook(hooks: &mut serde_json::Value, event: &str, argv: &str) -> usize 
 /// same entry: the first one found is pointed at the current executable and the others are
 /// removed. Keeping them would run the same hook once per stale path, concurrently, on every
 /// event. Other entries, including ones that merely mention the arguments, are left untouched.
+///
+/// An entry whose executable is `on_path`, the `agit` a shell runs by name, also stays as it is
+/// when setup runs from another copy of agit: Codex approves a hook by its exact command, and
+/// pointing an approved hook at the copy that ran setup leaves it unapproved, saving nothing.
 fn upsert_hook(
     hooks: &mut serde_json::Value,
     event: &str,
     cmd: &str,
     arguments: &str,
     timeout: Option<u64>,
+    on_path: Option<&Path>,
 ) -> usize {
     let arr = hooks
         .as_object_mut()
@@ -961,7 +988,10 @@ fn upsert_hook(
             .and_then(|value| value.as_str())
             .is_some_and(|command| {
                 command == cmd
-                    || hook_program(command, arguments).is_some_and(|exe| runs_this_agit(&exe))
+                    || hook_program(command, arguments).is_some_and(|exe| {
+                        on_path.is_some_and(|on_path| Path::new(&*exe) == on_path)
+                            || runs_this_agit(&exe)
+                    })
             })
     };
     // Prefer an entry that already carries the current command, so a settled file stays as is.
@@ -1837,6 +1867,17 @@ fn launcher_on_path(
         })
 }
 
+/// The `agit` a person's shell runs by name: the first one on `PATH` outside the places a cleanup
+/// removes. An installer that `npx` runs puts its cached copy first on `PATH`; stopping there finds
+/// no lasting `agit`, and the person's approved hooks are then moved to the copy running setup.
+fn agit_on_path() -> Option<PathBuf> {
+    let name = format!("agit{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file() && !ephemeral(candidate))
+}
+
 /// Whether an existing hook's executable runs the agit setup would write, so the hook stays byte
 /// for byte as it is: a runtime that trusts a hook by its command (Codex) keeps trusting it when
 /// setup runs again by another path to the same program, for example from a second AGIT_HOME.
@@ -2182,7 +2223,14 @@ mod tests {
             ]);
             let mut hooks = serde_json::json!({"SessionStart": original.clone()});
             assert_eq!(
-                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest", None),
+                upsert_hook(
+                    &mut hooks,
+                    "SessionStart",
+                    command,
+                    "hooks ingest",
+                    None,
+                    None
+                ),
                 1
             );
             let groups = hooks["SessionStart"].as_array().unwrap();
@@ -2190,7 +2238,14 @@ mod tests {
             assert_eq!(groups[3]["hooks"][0]["command"], command);
             let installed = hooks.clone();
             assert_eq!(
-                upsert_hook(&mut hooks, "SessionStart", command, "hooks ingest", None),
+                upsert_hook(
+                    &mut hooks,
+                    "SessionStart",
+                    command,
+                    "hooks ingest",
+                    None,
+                    None
+                ),
                 0
             );
             assert_eq!(hooks, installed);
@@ -2230,7 +2285,7 @@ mod tests {
         );
         let command = hook_command(exe, argv, None);
         assert_eq!(
-            upsert_hook(&mut hooks, event, &command, &arguments, None),
+            upsert_hook(&mut hooks, event, &command, &arguments, None, None),
             1
         );
         assert_eq!(
@@ -2341,7 +2396,7 @@ mod tests {
                     "SessionStart": [
                         {"hooks": [
                             {"type": "command", "command": "/usr/bin/user-hook"},
-                            {"type": "command", "command": "/usr/local/bin/agit hooks ingest --runtime workbuddy"}
+                            {"type": "command", "command": "/opt/agit-old/bin/agit hooks ingest --runtime workbuddy"}
                         ]},
                         {"hooks": [{"type": "command", "command": "/tmp/npx-cache/agit hooks ingest --runtime workbuddy"}]}
                     ]
@@ -2491,7 +2546,8 @@ mod tests {
                     event,
                     &hook_command("agit", argv, None),
                     &hook_arguments(argv, None),
-                    None
+                    None,
+                    None,
                 ),
                 1
             );
@@ -2507,7 +2563,8 @@ mod tests {
                     event,
                     &hook_command("agit", argv, None),
                     &hook_arguments(argv, None),
-                    None
+                    None,
+                    None,
                 ),
                 0
             );
@@ -2541,6 +2598,7 @@ mod tests {
                 event,
                 &hook_command("agit", argv, None),
                 &hook_arguments(argv, None),
+                None,
                 None,
             );
         }
@@ -2614,6 +2672,7 @@ mod tests {
                 "Stop",
                 "agit hooks settle",
                 "hooks settle",
+                None,
                 None
             ),
             1

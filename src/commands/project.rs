@@ -626,6 +626,13 @@ pub fn run(args: Args) -> CmdResult {
             let root = root(&path)?;
             let project = read(&root)?.context("directory has no project policy")?;
             println!("{}", serde_json::to_string(&project)?);
+            // Codex captures this directory only through hooks it has approved.
+            if project.enabled
+                && let Some(problem) =
+                    super::setup::codex_hooks(&root).and_then(|hooks| hooks.problem())
+            {
+                ui::warning(&problem);
+            }
             Ok(ExitCode::Ok)
         }
         Action::Unbind { path } => {

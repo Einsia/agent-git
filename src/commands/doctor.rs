@@ -137,6 +137,9 @@ pub fn run(args: Args) -> CmdResult {
     checks.extend(skill_installation_checks());
     checks.extend(claude_mcp_check());
     checks.extend(unloadable_skill_checks());
+    if let Some(row) = codex_hooks_row() {
+        checks.push(("codex hooks".into(), row));
+    }
 
     // ── git ──
     match crate::infra::git_runtime::command()
@@ -775,6 +778,17 @@ fn runtime_row(ad: &dyn adapter::Adapter) -> (String, Check) {
             (label, Check::Ok(format!("{info} · {}", cap.next_hint())))
         }
     }
+}
+
+/// Whether Codex runs AgentGit's hooks, as Codex itself reports them for this directory. No row
+/// when Codex cannot say or lists none of them: an unknown state is not reported as a problem.
+fn codex_hooks_row() -> Option<Check> {
+    let cwd = std::env::current_dir().ok()?;
+    let hooks = super::setup::codex_hooks(&cwd)?;
+    if let Some(problem) = hooks.problem() {
+        return Some(Check::Warn(problem));
+    }
+    (hooks.listed > 0).then(|| Check::Ok(format!("{} approved and enabled", hooks.listed)))
 }
 
 fn skill_installation_checks() -> Vec<(String, Check)> {
