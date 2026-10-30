@@ -21,6 +21,7 @@ use crate::domain::store::Store;
 use crate::infra::config;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+use std::collections::BTreeSet;
 
 mod branches;
 mod merges;
@@ -155,12 +156,18 @@ pub fn run(args: Args) -> CmdResult {
         ui::section("agent repos");
         let mut rows = Vec::new();
         let mut omitted = 0;
+        let mut aside_example = None;
+        let mut aside_unreadable = false;
         for (index, (owner, name, path)) in agents.iter().enumerate() {
             if rows.len() >= 128 {
                 omitted += agents.len() - index;
                 break;
             }
             let slug = format!("{owner}/{name}");
+            let aside = set_aside(&Repo::at(path)).unwrap_or_else(|_| {
+                aside_unreadable = true;
+                BTreeSet::new()
+            });
             match branches::inspect(&Repo::at(path), 128 - rows.len()) {
                 Ok(page) if page.branches.is_empty() => rows.push(vec![
                     slug,
@@ -172,6 +179,12 @@ pub fn run(args: Args) -> CmdResult {
                 Ok(page) => {
                     omitted += page.omitted;
                     for branch in page.branches {
+                        let state = if aside.contains(&branch.name) {
+                            aside_example.get_or_insert_with(|| format!("{slug}@{}", branch.name));
+                            format!("{}; withdrawn on the Hub, set aside", branch.state)
+                        } else {
+                            branch.state
+                        };
                         rows.push(vec![
                             slug.clone(),
                             branch.name,
@@ -181,7 +194,7 @@ pub fn run(args: Args) -> CmdResult {
                             } else {
                                 branch.tracking
                             },
-                            branch.state,
+                            state,
                         ]);
                     }
                 }
@@ -207,6 +220,21 @@ pub fn run(args: Args) -> CmdResult {
             );
             ui::hint(
                 "inspect a repository with `agit branch --repo <owner/repo> --all` for its remaining branches",
+            );
+        }
+        if let Some(example) = aside_example {
+            #[cfg(windows)]
+            use crate::ui::quote_powershell_argument as quote_arg;
+            #[cfg(not(windows))]
+            use crate::ui::session::shell_arg as quote_arg;
+            ui::hint(&format!(
+                "pushes leave out a branch set aside as withdrawn on the Hub; once the withdrawal is restored, `agit push {}` asks the Hub again",
+                quote_arg(&example)
+            ));
+        }
+        if aside_unreadable {
+            ui::warning(
+                "the record of branches withdrawn on the Hub cannot be read; set-aside branches are not marked",
             );
         }
         let shared = shared::inspect(&agents);
@@ -438,8 +466,13 @@ fn structured(args: &Args) -> CmdResult {
                 serde_json::json!({"items": null, "omitted": null, "error": format!("{error:#}")})
             }
         };
+        let set_aside = match set_aside(&Repo::at(path)) {
+            Ok(branches) => serde_json::json!({"branches": branches, "error": null}),
+            Err(error) => serde_json::json!({"branches": null, "error": format!("{error:#}")}),
+        };
         repositories.push(serde_json::json!({
             "repo": format!("{owner}/{name}"), "path": path, "branches": branch_sync,
+            "set_aside": set_aside,
         }));
     }
     let shared_files = shared::inspect(&agents);
@@ -484,6 +517,19 @@ fn structured(args: &Args) -> CmdResult {
     });
     println!("{}", serde_json::to_string(&result)?);
     Ok(ExitCode::Ok)
+}
+
+/// Branches the checkout's Hub refused as withdrawn, which pushes leave out until the person names
+/// one again. An unreadable record is an error, so status never presents it as none.
+fn set_aside(repo: &Repo) -> crate::Result<BTreeSet<String>> {
+    let Some(identity) = crate::hub::identity::read(repo)? else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(crate::domain::privacy_git::withheld_refs(repo, &identity)?
+        .iter()
+        .filter_map(|name| name.strip_prefix("refs/heads/"))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn observe_page(

@@ -204,7 +204,6 @@ impl ProjectedHistory {
 
 /// Destination refs publications to `identity` leave out because the Hub refused them as
 /// withdrawn (see `accepted::Ledger::withheld`).
-#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
 pub(crate) fn withheld_refs(
     source: &Repo,
     identity: &crate::hub::identity::RemoteIdentity,
@@ -213,7 +212,6 @@ pub(crate) fn withheld_refs(
 }
 
 /// Record refs the Hub refused as withdrawn, so later publications to `identity` leave them out.
-#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
 pub(crate) fn withhold_refs(
     source: &Repo,
     identity: &crate::hub::identity::RemoteIdentity,
@@ -223,7 +221,6 @@ pub(crate) fn withhold_refs(
 }
 
 /// Let publications to `identity` plan these refs again, as when the person names one explicitly.
-#[cfg_attr(not(test), allow(dead_code))] // the publication's refs_withdrawn handler calls it
 pub(crate) fn release_refs(
     source: &Repo,
     identity: &crate::hub::identity::RemoteIdentity,

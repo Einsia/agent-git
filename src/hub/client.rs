@@ -41,6 +41,8 @@ pub struct ApiError {
     pub detail: String,
     base: String,
     remedies: Vec<Remediation>,
+    /// Refs a `refs_withdrawn` refusal names; the Hub names only refs the request proposed.
+    refused_refs: Vec<String>,
 }
 
 /// A server recipe names a local capability; it never supplies executable arguments or routing.
@@ -57,6 +59,10 @@ impl ApiError {
 
     pub(crate) fn remedies(&self) -> &[Remediation] {
         &self.remedies
+    }
+
+    pub(crate) fn refused_refs(&self) -> &[String] {
+        &self.refused_refs
     }
 }
 
@@ -110,6 +116,8 @@ struct ErrorBody {
     kind: String,
     #[serde(default)]
     fix: serde_json::Value,
+    #[serde(default)]
+    refused_refs: Vec<String>,
 }
 
 impl ErrorBody {
@@ -608,23 +616,26 @@ impl Client {
         // Left empty when the body cannot be read (not JSON, rewritten by a proxy). Display
         // then falls back to "the hub returned HTTP <code>" — imprecise, but more honest than
         // inventing an explanation.
-        let (kind, detail, remedies) = match super::json_response::read::<ErrorBody>(resp) {
-            Ok(b) => {
-                let remedies = b.remedies(status);
-                (b.kind, b.error, remedies)
-            }
-            Err(_) => (
-                String::new(),
-                format!("the hub returned HTTP {status} ({path})"),
-                Vec::new(),
-            ),
-        };
+        let (kind, detail, remedies, refused_refs) =
+            match super::json_response::read::<ErrorBody>(resp) {
+                Ok(b) => {
+                    let remedies = b.remedies(status);
+                    (b.kind, b.error, remedies, b.refused_refs)
+                }
+                Err(_) => (
+                    String::new(),
+                    format!("the hub returned HTTP {status} ({path})"),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
         anyhow::Error::new(ApiError {
             status,
             kind,
             detail,
             base: self.base.clone(),
             remedies,
+            refused_refs,
         })
     }
 
@@ -1127,6 +1138,13 @@ impl Client {
     pub fn push_limits(&self) -> Result<super::PushLimits> {
         self.get::<super::HubConfig>("api/hub/config")?
             .push_limits()
+    }
+
+    /// Whether this Hub takes `planned_refs` on a publication preview. An older one refuses the
+    /// field outright, so an unreadable configuration counts as no.
+    pub fn accepts_planned_refs(&self) -> bool {
+        self.get::<super::HubConfig>("api/hub/config")
+            .is_ok_and(|config| config.accepts_planned_refs())
     }
 
     /// "What the newest version is right now" — the source for self-upgrade. A failure must not
@@ -2888,6 +2906,7 @@ mod tests {
             detail: detail.into(),
             base: "http://h".into(),
             remedies: Vec::new(),
+            refused_refs: Vec::new(),
         }
     }
 

@@ -51,6 +51,11 @@ struct Hub {
     previews: Arc<Mutex<Vec<serde_json::Value>>>,
     /// A ref the next strategy registration moves before answering: `(name, oid)`.
     move_on_strategy: Arc<Mutex<Option<(String, String)>>>,
+    /// A ref withdrawn from the caller: Git transport hides it, and a preview planning it is
+    /// refused by name, as a Hub advertising `publication_planned_refs` does.
+    withdrawn: Arc<Mutex<Option<String>>>,
+    /// Publication previews fail as unavailable, answering nothing about the refs they plan.
+    previews_unavailable: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -93,6 +98,10 @@ impl Hub {
         let recorded_previews = Arc::clone(&previews);
         let move_on_strategy = Arc::new(Mutex::new(None::<(String, String)>));
         let strategy_move = Arc::clone(&move_on_strategy);
+        let withdrawn = Arc::new(Mutex::new(None::<String>));
+        let hidden = Arc::clone(&withdrawn);
+        let previews_unavailable = Arc::new(AtomicBool::new(false));
+        let preview_unavailable = Arc::clone(&previews_unavailable);
         let visibility = Arc::new(Mutex::new("private"));
         let served_visibility = Arc::clone(&visibility);
         let resolver_hub = base.clone();
@@ -224,6 +233,7 @@ impl Hub {
                     write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
                 }
+                let hidden_ref = hidden.lock().unwrap().clone();
                 let json = match (method, target) {
                     ("POST", path)
                         if path.starts_with("/api/agents/alice/app/sessions/")
@@ -364,12 +374,29 @@ impl Hub {
                         Some(strategy.clone())
                     }
                     ("POST", "/api/agents/alice/app/privacy/publication/preview") => {
+                        if preview_unavailable.load(Ordering::Acquire) {
+                            let body = r#"{"error":"unavailable"}"#;
+                            write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            continue;
+                        }
                         preview = serde_json::from_slice(&body).unwrap();
                         recorded_previews.lock().unwrap().push(preview.clone());
+                        let planned = preview
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("planned_refs")
+                            .expect("a Hub that advertises planned refs gets them");
+                        if let Some(name) = &hidden_ref
+                            && planned.as_array().unwrap().contains(&json!(name))
+                        {
+                            let body = json!({"kind":"refs_withdrawn","error":"these refs are withdrawn on the Hub","fix":[],"refused_refs":[name]}).to_string();
+                            write!(stream, "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            continue;
+                        }
                         assert_eq!(preview["policy_digest"], strategy["policy_digest"]);
                         assert_eq!(
                             preview["expected_refs_digest"],
-                            remote_refs_digest(&root.join("alice/app.git"))
+                            remote_refs_digest(&root.join("alice/app.git"), hidden_ref.as_deref())
                         );
                         assert_eq!(preview["envelope_format_version"], 2);
                         let manifest: agit::domain::session_privacy::SessionPublicationManifest =
@@ -417,7 +444,8 @@ impl Hub {
                     // A publication plans against the limits the Hub publishes.
                     ("GET", "/api/hub/config") => Some(json!({
                         "mode":"live",
-                        "limits":{"push":{"max_new_commits":4096,"max_request_bytes":2147483648u64}}
+                        "limits":{"push":{"max_new_commits":4096,"max_request_bytes":2147483648u64}},
+                        "capabilities":{"publication_planned_refs":true}
                     })),
                     _ => None,
                 };
@@ -441,7 +469,7 @@ impl Hub {
                         );
                         assert_eq!(
                             receipt["expected_refs_digest"],
-                            remote_refs_digest(&root.join("alice/app.git"))
+                            remote_refs_digest(&root.join("alice/app.git"), hidden_ref.as_deref())
                         );
                         assert!(
                             body.windows(b" atomic".len())
@@ -452,6 +480,12 @@ impl Hub {
                     }
                     let (path, query) = target.split_once('?').unwrap_or((target, ""));
                     let mut command = git_command(&root);
+                    if let Some(name) = &hidden_ref {
+                        command
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "transfer.hideRefs")
+                            .env("GIT_CONFIG_VALUE_0", name);
+                    }
                     let mut child = command
                         .arg("http-backend")
                         .env("GIT_PROJECT_ROOT", &root)
@@ -473,7 +507,7 @@ impl Hub {
                     if method == "POST" && target.ends_with("/git-receive-pack") {
                         assert_eq!(
                             preview["target_refs_digest"],
-                            remote_refs_digest(&root.join("alice/app.git"))
+                            remote_refs_digest(&root.join("alice/app.git"), hidden_ref.as_deref())
                         );
                     }
                     let split = response
@@ -510,19 +544,25 @@ impl Hub {
             key_requests,
             previews,
             move_on_strategy,
+            withdrawn,
+            previews_unavailable,
             stop,
             worker: Some(worker),
         }
     }
 }
 
-fn remote_refs_digest(repository: &Path) -> String {
+/// The digest of the refs the caller is shown: every ref but `hidden`.
+fn remote_refs_digest(repository: &Path, hidden: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let output = git(
         repository,
         &["for-each-ref", "--format=%(refname)%00%(objectname)"],
     );
-    let mut refs: Vec<_> = output.lines().collect();
+    let mut refs: Vec<_> = output
+        .lines()
+        .filter(|line| hidden.is_none_or(|hidden| line.split('\0').next() != Some(hidden)))
+        .collect();
     refs.sort();
     let mut digest = Sha256::new();
     for reference in refs {
@@ -2642,6 +2682,213 @@ fn continued_encrypted_session_keeps_its_public_identity() {
             assert_eq!(snapshot.binding.published_session_id, accepted_identity);
         }
     }
+}
+
+/// A branch the Hub refused as withdrawn stays in the checkout and out of later pushes until it is
+/// named again, and `agit status` lists it as set aside for as long as it is. The refusal comes
+/// from the preview, before anything is sent, so the Hub keeps the branch where the withdrawal left
+/// it. The next push publishes the other branches and leaves the withdrawn one out. An automatic
+/// push names its branch but does not ask again, and fails without a request rather than report a
+/// push it did not make. A push that names the branch asks again and publishes it once the
+/// withdrawal is restored, and so are version tags refused after their branch was already
+/// published, even once a later push published the branch without them and local records show it
+/// unchanged. Only the Hub accepting a named ref lets it go: a named push whose preview fails
+/// leaves it set aside. A client that forgets the refusal, or lets go on being asked, meets it on
+/// every push and publishes nothing else; one that never asks again keeps a restored branch, or a
+/// refused tag whose branch it never had to set aside, off the Hub for good.
+#[test]
+fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str], automatic: bool| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        if automatic {
+            command.env("AGIT_AUTO_PUSH", "1");
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"], false));
+    let turn = |branch: &str, session: char, content: &str| {
+        repo.git(&["checkout", "-q", branch]).unwrap();
+        let session = meta::Meta::new(
+            format!("agit-{}", session.to_string().repeat(40)),
+            "claude-code".into(),
+            String::new(),
+        );
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    repo.git(&["branch", "kept"]).unwrap();
+    repo.git(&["branch", "pulled"]).unwrap();
+    let kept = turn("kept", 'b', "kept turn 0");
+    let pulled = turn("pulled", 'e', "pulled turn 0");
+    assert_success(&run(&["--yes", "push", "alice/app", "--all"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/pulled"]), pulled);
+
+    // The owner withdraws `pulled` on the Hub; both branches gain a turn.
+    *hub.withdrawn.lock().unwrap() = Some("refs/heads/pulled".into());
+    let kept_next = turn("kept", 'b', "kept turn 1");
+    let pulled_next = turn("pulled", 'e', "pulled turn 1");
+    let received = hub.posts.load(Ordering::Acquire);
+    let refused = run(&["--yes", "push", "alice/app", "--all"], false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("withdrawn on the Hub, so not published: refs/heads/pulled"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), received);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/pulled"]), pulled);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/kept"]), kept);
+    let set_aside = || {
+        let status = run(&["status", "--json"], false);
+        assert_success(&status);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        status["result"]["value"]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|repository| repository["repo"] == "alice/app")
+            .unwrap()["set_aside"]
+            .clone()
+    };
+    assert_eq!(set_aside(), json!({"branches": ["pulled"], "error": null}));
+
+    let planned = |from: usize| -> Vec<serde_json::Value> {
+        hub.previews.lock().unwrap()[from..]
+            .iter()
+            .flat_map(|preview| preview["planned_refs"].as_array().unwrap().clone())
+            .collect()
+    };
+    let earlier = hub.previews.lock().unwrap().len();
+    let automatic = run(&["--yes", "push", "alice/app@pulled"], true);
+    assert!(!automatic.status.success(), "{automatic:?}");
+    assert_success(&run(&["--yes", "push", "alice/app", "--all"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/kept"]), kept_next);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/pulled"]), pulled);
+    assert!(!planned(earlier).contains(&json!("refs/heads/pulled")));
+
+    // Naming it while the Hub answers nothing about it leaves it set aside: the next push still
+    // publishes without it rather than meeting the refusal again.
+    hub.previews_unavailable.store(true, Ordering::Release);
+    assert!(
+        !run(&["--yes", "push", "alice/app@pulled"], false)
+            .status
+            .success()
+    );
+    hub.previews_unavailable.store(false, Ordering::Release);
+    let earlier = hub.previews.lock().unwrap().len();
+    let after = turn("kept", 'b', "kept turn after the unanswered push");
+    assert_success(&run(&["--yes", "push", "alice/app", "--all"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/kept"]), after);
+    assert!(!planned(earlier).contains(&json!("refs/heads/pulled")));
+
+    // Restored on the Hub: naming the branch asks again and publishes it.
+    *hub.withdrawn.lock().unwrap() = None;
+    let earlier = hub.previews.lock().unwrap().len();
+    assert_success(&run(&["--yes", "push", "alice/app@pulled"], false));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/pulled"]),
+        pulled_next
+    );
+    assert!(planned(earlier).contains(&json!("refs/heads/pulled")));
+    assert_eq!(set_aside(), json!({"branches": [], "error": null}));
+
+    // Only a version tag is refused: its branch publishes, the tag waits for a named push.
+    let tagged = turn("kept", 'b', "kept turn 2");
+    let version = format!("refs/tags/agit-{tagged}");
+    *hub.withdrawn.lock().unwrap() = Some(version.clone());
+    let refused = run(&["--yes", "push", "alice/app@kept"], false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/kept"]), tagged);
+    // A push that names no branch publishes the next turn without the tag. Once main is the one
+    // last fetched, local records show the branch unchanged, with the set-aside tag in the listing
+    // its publication acknowledged.
+    let next = turn("kept", 'b', "kept turn 3");
+    assert_success(&run(&["--yes", "push", "alice/app", "--all"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/kept"]), next);
+    git(
+        repo.root(),
+        &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+    );
+    assert_success(&run(&["--yes", "push", "alice/app", "--all"], false));
+    let unchanged = run(&["--yes", "push", "alice/app", "--all"], false);
+    assert_success(&unchanged);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unchanged.stdout),
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+    assert!(
+        said.contains("unchanged since their acknowledged publication") && said.contains("kept"),
+        "{unchanged:?}"
+    );
+    *hub.withdrawn.lock().unwrap() = None;
+    assert_success(&run(&["--yes", "push", "alice/app@kept"], false));
+    assert_eq!(git(&remote, &["rev-parse", &version]), tagged);
 }
 
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.

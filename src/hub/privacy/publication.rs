@@ -76,6 +76,21 @@ pub(crate) struct ReceiveReceipt {
     scope: String,
 }
 
+/// The Hub refused a receipt because these planned ref updates name refs withdrawn from the
+/// caller. Nothing of the request was sent; the refs stay in the checkout.
+#[derive(Debug)]
+pub(crate) struct RefsWithdrawn {
+    pub refs: Vec<String>,
+}
+
+impl std::fmt::Display for RefsWithdrawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the Hub refused {} as withdrawn", self.refs.join(", "))
+    }
+}
+
+impl std::error::Error for RefsWithdrawn {}
+
 impl ReceiveReceipt {
     pub(crate) fn headers(&self) -> [(&'static str, &str); 2] {
         [
@@ -183,17 +198,30 @@ impl PublicationPolicy {
         })
     }
 
+    /// `planned_refs` sends the names of the refs the transition changes, so a Hub that withdrew
+    /// some of them from this caller refuses those by name ([`RefsWithdrawn`]) before anything is
+    /// sent. Only a Hub that advertises the field may get it; an older one refuses it outright.
     pub(crate) fn confirm(
         &self,
         client: &Client,
         before: &BTreeMap<String, String>,
         after: &BTreeMap<String, String>,
+        planned_refs: bool,
     ) -> Result<ReceiveReceipt> {
         let binding = self.binding(before, after)?;
         let mut request = serde_json::to_value(&binding)?;
         request["manifest"] = serde_json::to_value(&self.session_manifest)?;
-        let preview: Preview =
-            client.post(&format!("{}/publication/preview", self.path), &request)?;
+        let planned = changed_refs(before, after);
+        let mut preview_request = request.clone();
+        if planned_refs {
+            preview_request["planned_refs"] = json!(planned);
+        }
+        let preview: Preview = client
+            .post(
+                &format!("{}/publication/preview", self.path),
+                &preview_request,
+            )
+            .map_err(|error| refused_as_withdrawn(error, &planned))?;
         self.verify(&preview.confirmation, &binding, None)?;
         let expires = chrono::DateTime::parse_from_rfc3339(&preview.expires_at)
             .context("invalid publication receipt expiry")?;
@@ -227,6 +255,45 @@ impl PublicationPolicy {
         );
         Ok(())
     }
+}
+
+/// Names of the refs `after` creates, moves or deletes relative to `before`.
+fn changed_refs(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| before.get(*name) != after.get(*name))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A `refs_withdrawn` refusal as [`RefsWithdrawn`]. It is believed only when it names refs this
+/// request planned, all of them: the refusal decides what later publications leave out, and a
+/// Hub naming anything else must not reach that record.
+fn refused_as_withdrawn(error: anyhow::Error, planned: &[String]) -> anyhow::Error {
+    let Some(api) = error.downcast_ref::<crate::hub::client::ApiError>() else {
+        return error;
+    };
+    let refused = api.refused_refs();
+    if api.status != 409
+        || api.kind != "refs_withdrawn"
+        || refused.is_empty()
+        || !refused.iter().all(|name| planned.contains(name))
+    {
+        return error;
+    }
+    let refs = refused
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    anyhow::Error::new(RefsWithdrawn { refs })
 }
 
 pub(crate) fn refs_digest(refs: &BTreeMap<String, String>) -> String {
@@ -323,7 +390,11 @@ mod tests {
         );
     }
 
-    /// The server must confirm the same manifest even when the ref targets are unchanged.
+    /// The server must confirm the same manifest even when the ref targets are unchanged. The
+    /// preview names the refs the transition changes and the confirmation does not, since only
+    /// the preview takes them. A `refs_withdrawn` refusal becomes [`RefsWithdrawn`] only when it
+    /// names refs the request planned; one naming any other ref stays an ordinary refusal, or a
+    /// Hub could make later publications leave out refs it never had to refuse.
     #[test]
     fn session_receive_receipts_bind_manifest_authority_and_ref_transitions() {
         use crate::domain::session_privacy::{AcceptedSnapshot, PublishedSnapshot};
@@ -383,10 +454,13 @@ mod tests {
             "mandatory_policy_digest":expected.mandatory_policy_digest,
             "mandatory_policy":mandatory,
         });
+        let refusal = |refs: &[&str]| json!({"kind":"refs_withdrawn","error":"withdrawn","fix":[],"refused_refs":refs});
         let (anonymous, identity, worker) = super::super::test_server::server(vec![
             (200, strategy),
             (200, preview),
             (200, confirmed.clone()),
+            (409, refusal(&["refs/heads/work"])),
+            (409, refusal(&["refs/heads/legacy"])),
         ]);
         let client = Client::for_hub_with_token(anonymous.base(), "synthetic-session-token");
         let policy = PublicationPolicy::register_sessions(
@@ -398,11 +472,28 @@ mod tests {
             "private",
         )
         .unwrap();
-        let receipt = policy.confirm(&client, &before, &after).unwrap();
+        let receipt = policy.confirm(&client, &before, &after, true).unwrap();
         assert_eq!(receipt.headers()[0].1, "session-preview");
         assert_eq!(receipt.headers()[1].1, expected.receiver_scope);
+        let refused = || match policy.confirm(&client, &before, &after, true) {
+            Ok(_) => panic!("the Hub refused this receipt"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            refused().downcast_ref::<RefsWithdrawn>().unwrap().refs,
+            vec!["refs/heads/work".to_owned()]
+        );
+        assert!(refused().downcast_ref::<RefsWithdrawn>().is_none());
         let requests = worker.join().unwrap();
         assert!(requests[0].starts_with("PUT /api/agents/team/notes/privacy/strategy "));
+        let planned = |request: &String| {
+            serde_json::from_str::<serde_json::Value>(request.split_once("\r\n\r\n").unwrap().1)
+                .unwrap()
+                .get("planned_refs")
+                .cloned()
+        };
+        assert_eq!(planned(&requests[1]), Some(json!(["refs/heads/work"])));
+        assert_eq!(planned(&requests[2]), None);
         for (request, operation) in requests[1..].iter().zip(["preview", "confirm"]) {
             assert!(request.starts_with(&format!(
                 "POST /api/agents/team/notes/privacy/publication/{operation} "
