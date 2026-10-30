@@ -21,7 +21,8 @@
 //!     expand the full manual into `AGENTS.md`. Use `--agents-md` for the short adoption rule.
 //! * `--mcp`: register `agit mcp` (stdio MCP server: search/show/view/status/commit) into each
 //!   runtime's native MCP configuration:
-//!   - claude-code → `claude mcp add` (prints guidance instead of failing when it cannot install)
+//!   - claude-code → `claude mcp add --scope user`, so every folder sees it; local copies the user
+//!     entry fully replaces are removed (prints guidance instead of failing when it cannot install)
 //!   - codex → `[mcp_servers.agit]` in `~/.codex/config.toml`
 //!   - opencode → `mcp.agit` in `~/.config/opencode/opencode.json`
 //!   - cursor → `mcpServers.agit` in `~/.cursor/mcp.json`
@@ -33,6 +34,7 @@
 use super::CmdResult;
 use super::skill_bundle;
 use crate::{ExitCode, ui};
+pub(crate) mod claude_mcp;
 mod legacy;
 mod native;
 
@@ -1381,28 +1383,7 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
     let mut report = SetupReport::default();
 
     if wants(runtime, "claude-code") {
-        let ok = std::process::Command::new("claude")
-            .args(["mcp", "add", "agit", "--", &exe, "mcp"])
-            .stdout(if ui::info_uses_stderr() {
-                std::process::Stdio::from(std::io::stderr())
-            } else {
-                std::process::Stdio::inherit()
-            })
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            ui::info(format_args!(
-                "  {} mcp → claude mcp add agit",
-                ui::ok(ui::theme::symbols().check)
-            ));
-        } else {
-            ui::hint(&format!(
-                "register MCP manually with `claude mcp add agit -- {} mcp`",
-                shell_word(&exe)
-            ));
-        }
-        report.merge(SetupReport::item());
+        report.merge(claude_mcp::register(&exe));
     }
 
     if wants(runtime, "codex") {

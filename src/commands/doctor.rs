@@ -135,6 +135,7 @@ pub fn run(args: Args) -> CmdResult {
     // missing one is a warning, since a user may have installed only one runtime — but an
     // installation that exists must be complete and at the current version.
     checks.extend(skill_installation_checks());
+    checks.extend(claude_mcp_check());
     checks.extend(unloadable_skill_checks());
 
     // ── git ──
@@ -806,6 +807,43 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
         ));
     }
     checks
+}
+
+/// Claude Code is the runtime whose MCP registration has a scope: a local entry serves its own
+/// folder only, so every other folder lacks the agit tools although setup reported success.
+fn claude_mcp_check() -> Option<(String, Check)> {
+    use super::setup::claude_mcp::{Health, REMOVE_LOCAL};
+    let fix = "run `agit setup --runtime claude-code --mcp`";
+    let row = match super::setup::claude_mcp::health()? {
+        Health::User { overridden } if overridden.is_empty() => {
+            Check::Ok("user scope, available in every folder".into())
+        }
+        Health::User { overridden } => Check::Warn(format!(
+            "user scope, but a different project-local registration overrides it in {}; run `{REMOVE_LOCAL}` there to use the user one",
+            folder_list(&overridden)
+        )),
+        Health::LocalOnly(folders) => Check::Warn(format!(
+            "registered only for {} (local scope), so other folders have no agit tools; {fix}",
+            folder_list(&folders)
+        )),
+        Health::Missing => Check::Warn(format!("not registered; {fix}")),
+        Health::Unreadable(problem) => Check::Warn(format!("cannot be inspected: {problem}")),
+    };
+    Some(("mcp claude-code".into(), row))
+}
+
+fn folder_list(folders: &[PathBuf]) -> String {
+    const SHOWN: usize = 3;
+    let mut list = folders
+        .iter()
+        .take(SHOWN)
+        .map(|folder| ui::tilde(folder))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if folders.len() > SHOWN {
+        list.push_str(&format!(" and {} more", folders.len() - SHOWN));
+    }
+    list
 }
 
 /// Skill folders Claude Code or Codex would skip without saying so, for a conversation started
