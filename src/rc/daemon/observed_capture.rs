@@ -8,12 +8,27 @@ pub(super) struct Collector {
     cursor: usize,
     recorded: HashMap<String, Recorded>,
     reported: HashMap<String, String>,
+    /// Conversations whose capture recorded no carrier, and when each may be read again. Each
+    /// attempt reads and hashes the whole transcript.
+    delayed: HashMap<String, Delay>,
 }
 
-/// The completed boundary last recorded for a conversation and the carrier it was read from.
+/// The first delay after a capture records no carrier, and the longest; each further one doubles.
+const DELAYS: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(10 * 60),
+);
+
+struct Delay {
+    failures: u32,
+    until: tokio::time::Instant,
+}
+
+/// The completed boundary last recorded for a conversation, if it has one yet, and the carrier
+/// it was read from.
 #[derive(Clone, Debug)]
 struct Recorded {
-    digest: String,
+    digest: Option<String>,
     carrier: Carrier,
 }
 
@@ -24,18 +39,32 @@ struct Carrier {
     modified: Option<std::time::SystemTime>,
     #[cfg(unix)]
     file: (u64, u64),
+    /// Claude Code's completion receipts, which end a turn without changing the transcript.
+    receipts: Vec<std::ffi::OsString>,
 }
 
 impl Carrier {
-    fn of(path: &std::path::Path, metadata: &std::fs::Metadata) -> Self {
+    fn of(entry: &roster::Entry, path: &std::path::Path, metadata: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let receipts = if entry.runtime == "claude-code" {
+            crate::rc::native_claude::completion::receipt_names(&entry.thread_id, path)
+        } else {
+            vec![]
+        };
+        #[cfg(not(unix))]
+        let receipts = {
+            let _ = entry;
+            vec![]
+        };
         Self {
             path: normalized(path),
             len: metadata.len(),
             modified: metadata.modified().ok(),
             #[cfg(unix)]
             file: (metadata.dev(), metadata.ino()),
+            receipts,
         }
     }
 
@@ -48,7 +77,7 @@ impl Carrier {
             return false;
         }
         match std::fs::metadata(&self.path) {
-            Ok(metadata) => Self::of(&self.path, &metadata) == *self,
+            Ok(metadata) => Self::of(entry, &self.path, &metadata) == *self,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 entry.runtime == "codex" && crate::adapter::codex_rollout::is_cold(&self.path)
             }
@@ -111,6 +140,7 @@ impl Collector {
             .retain(|logical, _| sessions.contains(logical));
         self.reported
             .retain(|logical, _| sessions.contains(logical));
+        self.delayed.retain(|logical, _| sessions.contains(logical));
         let offset = self.cursor % sessions.len();
         sessions.rotate_left(offset);
         self.cursor = self.cursor.wrapping_add(16);
@@ -118,6 +148,9 @@ impl Collector {
             let Some(_work) = admission.enter() else {
                 return;
             };
+            if self.is_delayed(&logical, tokio::time::Instant::now()) {
+                continue;
+            }
             if let Some(recorded) = self.recorded.get(&logical).cloned() {
                 let entry = daemon.lock().await.roster.get(&logical).cloned();
                 if let Some(entry) = entry
@@ -139,10 +172,15 @@ impl Collector {
                 biased;
                 _ = stop.wait_for(|stopped| *stopped) => None,
                 result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                    collect(daemon, request, self.recorded.get(&logical).map(|recorded| recorded.digest.clone()))) => Some(result),
+                    collect(daemon, request, self.recorded.get(&logical).and_then(|recorded| recorded.digest.clone()))) => Some(result),
             };
             daemon.lock().await.opening_sessions.remove(&logical);
             let Some(result) = result else { return };
+            self.settled(
+                &logical,
+                matches!(result, Ok(Ok(Some(_)))),
+                tokio::time::Instant::now(),
+            );
             match result {
                 Ok(Ok(recorded)) => {
                     self.reported.remove(&logical);
@@ -162,6 +200,32 @@ impl Collector {
                 }
             }
         }
+    }
+}
+
+impl Collector {
+    fn is_delayed(&self, logical: &str, now: tokio::time::Instant) -> bool {
+        self.delayed
+            .get(logical)
+            .is_some_and(|delay| now < delay.until)
+    }
+
+    /// Notes how a capture of `logical` ended: with a carrier recorded, or not.
+    fn settled(&mut self, logical: &str, recorded: bool, now: tokio::time::Instant) {
+        if recorded {
+            self.delayed.remove(logical);
+            return;
+        }
+        let delay = self.delayed.entry(logical.into()).or_insert(Delay {
+            failures: 0,
+            until: now,
+        });
+        delay.failures = delay.failures.saturating_add(1);
+        delay.until = now
+            + DELAYS
+                .0
+                .saturating_mul(1 << (delay.failures - 1).min(16))
+                .min(DELAYS.1);
     }
 }
 
@@ -262,7 +326,7 @@ fn capture_boundary(
         .context("Observed native transcript is missing")?;
     let file = std::fs::File::open(&path)?;
     let metadata = file.metadata()?;
-    let carrier = Carrier::of(&path, &metadata);
+    let carrier = Carrier::of(entry, &path, &metadata);
     let size = metadata.len();
     ensure!(
         size <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
@@ -270,8 +334,14 @@ fn capture_boundary(
     );
     let mut bytes = vec![];
     file.take(size).read_to_end(&mut bytes)?;
+    let pending = || {
+        Ok(Some(Recorded {
+            digest: None,
+            carrier: carrier.clone(),
+        }))
+    };
     let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return Ok(None);
+        return pending();
     };
     let text = std::str::from_utf8(&bytes[..=end])?;
     let boundary = crate::commands::commit::completed_native_boundary(&entry.runtime, text)?;
@@ -287,11 +357,14 @@ fn capture_boundary(
         boundary
     };
     let Some(boundary) = boundary else {
-        return Ok(None);
+        return pending();
     };
     let digest = format!("{:x}", Sha256::digest(&bytes[..boundary as usize]));
     if recorded == Some(digest.as_str()) {
-        return Ok(Some(Recorded { digest, carrier }));
+        return Ok(Some(Recorded {
+            digest: Some(digest),
+            carrier,
+        }));
     }
     let job = crate::rc::archive_jobs::Job::capture(
         logical,
@@ -306,7 +379,10 @@ fn capture_boundary(
         None,
     )?;
     job.record()?;
-    Ok(Some(Recorded { digest, carrier }))
+    Ok(Some(Recorded {
+        digest: Some(digest),
+        carrier,
+    }))
 }
 
 impl Daemon {
@@ -505,7 +581,8 @@ mod tests {
             "runtime": "codex", "thread_id": thread, "cwd": home.path(), "workspace_id": "local",
         }))
         .unwrap();
-        let read = |path: &std::path::Path| Carrier::of(path, &std::fs::metadata(path).unwrap());
+        let read =
+            |path: &std::path::Path| Carrier::of(&entry, path, &std::fs::metadata(path).unwrap());
 
         let carrier = read(&root);
         assert!(carrier.current_and_unchanged(&entry));
@@ -548,6 +625,71 @@ mod tests {
             !carrier.current_and_unchanged(&entry),
             "a rollover moves the current carrier"
         );
+        drop(restore_home);
+    }
+
+    /// A conversation whose capture records no carrier is read again only after a delay that
+    /// doubles up to its cap, and a capture that records one ends the delay. Without it, every
+    /// cycle reads and hashes the whole transcript of each such conversation again.
+    #[test]
+    fn captures_without_a_carrier_back_off_until_one_is_recorded() {
+        let (first, longest) = DELAYS;
+        let mut collector = Collector::default();
+        let start = tokio::time::Instant::now();
+        assert!(!collector.is_delayed("logical", start));
+        collector.settled("logical", false, start);
+        assert!(collector.is_delayed("logical", start + first / 2));
+        assert!(!collector.is_delayed("logical", start + first));
+        assert!(!collector.is_delayed("other", start));
+        collector.settled("logical", false, start);
+        assert!(collector.is_delayed("logical", start + first));
+        assert!(!collector.is_delayed("logical", start + first * 2));
+        for _ in 0..32 {
+            collector.settled("logical", false, start);
+        }
+        assert!(collector.is_delayed("logical", start + longest / 2));
+        assert!(!collector.is_delayed("logical", start + longest));
+        collector.settled("logical", true, start);
+        assert!(!collector.is_delayed("logical", start));
+    }
+
+    /// A Claude Code turn can end by a completion receipt alone, with the transcript unchanged,
+    /// so its carrier changes when a receipt arrives. A carrier made of file metadata only
+    /// would skip that conversation until the transcript grew again.
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_receipt_changes_an_unchanged_claude_carrier() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("AGIT_HOME");
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("AGIT_HOME", home.path()) };
+        let restore_home = scopeguard(move || match previous {
+            // SAFETY: the configuration lock is still held.
+            Some(previous) => unsafe { std::env::set_var("AGIT_HOME", previous) },
+            None => unsafe { std::env::remove_var("AGIT_HOME") },
+        });
+        let thread = "71717171-7171-4171-8171-717171717171";
+        let transcript = home.path().join("native.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
+        let entry: roster::Entry = serde_json::from_value(serde_json::json!({
+            "runtime": "claude-code", "thread_id": thread, "cwd": home.path(), "workspace_id": "local",
+        }))
+        .unwrap();
+        let read = || {
+            Carrier::of(
+                &entry,
+                &transcript,
+                &std::fs::metadata(&transcript).unwrap(),
+            )
+        };
+
+        let carrier = read();
+        assert_eq!(read(), carrier);
+        let receipts = crate::rc::native_claude::completion::receipt_directory(thread, &transcript);
+        std::fs::create_dir_all(&receipts).unwrap();
+        std::fs::write(receipts.join("generation-turn.json"), "{}").unwrap();
+        assert_ne!(read(), carrier, "a receipt can end a turn");
         drop(restore_home);
     }
 

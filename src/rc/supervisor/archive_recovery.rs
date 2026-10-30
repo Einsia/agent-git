@@ -124,6 +124,18 @@ pub(crate) enum Interrupted {
     LandTimedOut,
 }
 
+/// Recovery cannot go further until state outside the job changes: another attempt meets the
+/// same refusal, so the job waits for that state rather than backing off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Waiting {
+    /// The session's settlement waits for the privacy check (`agit status` names its reason).
+    #[error("archive settlement waits for the privacy check")]
+    Privacy,
+    /// The turn is committed locally; automatic publication is turned off.
+    #[error("automatic archive publication is not enabled")]
+    PushDisabled,
+}
+
 /// A recovery subprocess exited unsuccessfully; its exit code tells a refusal from a fault.
 #[derive(Debug, thiserror::Error)]
 #[error("archive {stage} failed ({status}): {detail}")]
@@ -272,17 +284,19 @@ pub(crate) async fn prepare(
         "archive exploration is withheld from publication"
     );
     let end = verify_native(&job, &lineage, false).await?;
-    ensure!(
-        committed.output.status.success() && job.covered_by(&repo, &committed.after, end)?,
-        "archive commit does not cover the completed native turn"
-    );
+    if !job.covered_by(&repo, &committed.after, end)? {
+        // Settlement that stops at the privacy check exits successfully and records the wait.
+        if crate::domain::privacy::pending::load().contains_key(&job.claim_key()) {
+            return Err(Waiting::Privacy.into());
+        }
+        anyhow::bail!("archive commit does not cover the completed native turn");
+    }
     let destination =
         crate::rc::capture::destination(&repo, &lineage, &crate::infra::config::hub_url())?
             .context("archive publication destination is not configured")?;
-    ensure!(
-        repo.auto_push_enabled()?,
-        "automatic archive publication is not enabled"
-    );
+    if !repo.auto_push_enabled()? {
+        return Err(Waiting::PushDisabled.into());
+    }
     let mut request = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::now_v7().to_string(),

@@ -27,6 +27,11 @@ fn directory(session: &str, transcript: &Path) -> crate::Result<PathBuf> {
         .join(hex::encode(Sha256::digest(key))))
 }
 
+#[cfg(test)]
+pub(crate) fn receipt_directory(session: &str, transcript: &Path) -> PathBuf {
+    directory(session, &transcript.canonicalize().unwrap()).unwrap()
+}
+
 fn read(path: &Path) -> crate::Result<Receipt> {
     let file = crate::rc::native_inbox::open_regular(path)?;
     ensure!(
@@ -214,6 +219,30 @@ pub(crate) fn boundaries(
     let transcript = transcript.canonicalize()?;
     let directory = directory(session, &transcript)?;
     boundaries_in(&directory, session, &transcript, bytes)
+}
+
+/// The receipts recorded for `transcript`, by name: a receipt can end a turn without the
+/// transcript changing, so a reader that skips an unchanged transcript compares these too.
+pub(crate) fn receipt_names(session: &str, transcript: &Path) -> Vec<std::ffi::OsString> {
+    let Some(directory) = transcript
+        .canonicalize()
+        .ok()
+        .and_then(|transcript| directory(session, &transcript).ok())
+    else {
+        return vec![];
+    };
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some(entry.ok()?.file_name()))
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn boundaries_in(
