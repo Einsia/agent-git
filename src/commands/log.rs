@@ -225,7 +225,7 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     };
-    let rows = match read_turn_history(
+    let (rows, matched) = match read_turn_history(
         &repo,
         &head,
         args.limit,
@@ -235,11 +235,13 @@ pub fn run(args: Args) -> CmdResult {
         &args.paths,
     )
     .and_then(|history| {
-        if super::json::requested() {
+        let matched = history.matched;
+        let rows = if super::json::requested() {
             Ok(history.metadata())
         } else {
             history.with_activity(&repo)
-        }
+        };
+        rows.map(|rows| (rows, matched))
     }) {
         Ok(rows) => rows,
         Err(e) => {
@@ -256,6 +258,8 @@ pub fn run(args: Args) -> CmdResult {
                 "repo": slug,
                 "target": format!("{slug}@{head}"),
                 "head_oid": head,
+                "total": matched,
+                "truncated": matched > rows.len(),
                 "turns": rows.iter().map(|row| serde_json::json!({
                     "oid": row.oid,
                     "turn": row.turn,
@@ -280,6 +284,16 @@ pub fn run(args: Args) -> CmdResult {
     if rows.is_empty() {
         println!("no turns match.");
         return Ok(ExitCode::Ok);
+    }
+    // Rows run oldest to newest and the limit keeps the newest, so the omission sits on top.
+    if matched > rows.len() {
+        println!(
+            "{}",
+            ui::dim(&format!(
+                "… {} earlier of {matched} entries not shown (-n {matched} shows all)",
+                matched - rows.len()
+            ))
+        );
     }
     for r in &rows {
         let activity = r.activity_label();
@@ -399,6 +413,8 @@ pub fn turns(
 struct TurnHistory {
     chain: crate::domain::refs::Chain,
     rows: Vec<(Option<usize>, Turn)>,
+    /// Entries that passed every filter, before the limit kept the newest of them.
+    matched: usize,
 }
 
 impl TurnHistory {
@@ -513,10 +529,15 @@ fn read_turn_history(
     }
     // Take the last `limit` rows from the tail (`--reverse` plus `limit` means "most recent",
     // not "earliest").
+    let matched = rows.len();
     if rows.len() > limit {
         rows.drain(..rows.len() - limit);
     }
-    Ok(TurnHistory { chain, rows })
+    Ok(TurnHistory {
+        chain,
+        rows,
+        matched,
+    })
 }
 
 /// Every tag in the repo, grouped by the commit it points at, asked for in one `for-each-ref`.
