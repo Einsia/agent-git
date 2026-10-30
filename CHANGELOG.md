@@ -8,13 +8,130 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.30] - 2026-10-30
+
+### Added
+
+- `agit project list` shows every folder this machine saves conversations for: whether it uploads
+  automatically and where, its last upload result, its newest Claude Code and Codex conversations,
+  and, as blocked, a folder whose repository has `push.auto` off on this machine; `--json` gives the
+  same offline for tools that poll it.
+- With statistics on, agit reports once per installation when it first uploads a session and when it
+  first shares one, carrying no content, path, repository, session or link.
+
+### Changed
+
+- The agit skill tells agents to follow an error's hint instead of guessing, how to take an upload
+  down, and how to invite someone or search the team's past work.
+- `agit push` of a session that was published before sends only the turns added since, so each push
+  costs what it adds rather than the whole session, and a plain session longer than one publication
+  keeps publishing its new turns.
+- Publishing to a public organization repository you write only as a member of the organization,
+  through its base permission, asks you first, at the terminal or with `--yes` for that one push; an
+  automatic upload never publishes there, and the Hub refuses such a push unless agit says you
+  confirmed it.
+- The notice that a conversation is uploaded automatically names every member of the organization as
+  readers of a private organization repository while its base permission lets members read, instead
+  of only its owners and granted teams.
+- Before `agit setup` rewrites a hook file, it keeps the file as it was before agit first changed it
+  beside it, readable only by you, with `.agit-backup` added to the name.
+- New placeholders are short and say what they replaced, for example `‹secret:github-
+  pat:k3m7x2q6w4ab›`, instead of a long `{{AGIT_SECRET_V2:…}}` token; existing tokens keep restoring
+  on every device of the account, and a value replaced before under the old spelling gets the new
+  one the next time it is captured.
+- Continuing a published encrypted session publishes only the turns it adds and keeps the public
+  session identity it was accepted under.
+- The upload notice and the `agit import` refusal for organization repositories name the people
+  granted access and the base permission instead of teams, which the Hub no longer has.
+- `agit push` of many branches publishes them together, paying the publication's fixed cost once,
+  and leaves branches the Hub already holds out of the upload; `--keep-going` publishes a failing
+  group one branch at a time so only the failing branch is held back.
+
 ### Fixed
 
-- `agit push` publishes a session that another account registered first in the repository, or
-  that a different local choice recorded, under the configuration the Hub holds for it instead
-  of stopping with "session publication mode is already registered and differs from the local
-  choice". A session first published on another Hub publishes as a new plain session of your
-  account instead of stopping with "session creator belongs to another Hub".
+- `agit push` publishes a session that another account registered first in the repository, or that a
+  different local choice recorded, under the configuration the Hub holds for it instead of stopping
+  with "session publication mode is already registered and differs from the local choice". A session
+  first published on another Hub publishes as a new plain session of your account only when this
+  device is signed in there as the account that created it, or when the session names no Hub;
+  otherwise `agit push` stops and names it instead of stopping with "session creator belongs to
+  another Hub".
+- A session started with agit run in a folder that's switched off, or with upload off, now saves its
+  turns locally instead of losing them.
+- A fork made with agit fork or run records where it came from, so its Hub page shows 'forked from';
+  a merge's opening names the merged branch, or says 'another conversation' when that one isn't
+  public.
+- In a Codex app conversation each prompt is read as the request you typed, without the in-app
+  browser state and the request marker the app wraps around it, so its titles and search results
+  show what you asked.
+- `agit search "stall author:sim-lin since:2026-10-24"` no longer finds nothing: `author:`, `since:`
+  and `before:` written into the query are read as `--author`, `--since` and `--before`, with a hint
+  naming the flag; in a batch they are refused with the flag to pass instead.
+- Answering a Claude Code permission request from AgentGit works again where Claude Code's built-in
+  security default is in force (Team and Enterprise organizations, computers with managed settings):
+  `agit setup` adds a PermissionRequest hook that offers the request to shared control while the
+  terminal's dialog stays up, and answers only with what a person chose there; run `agit setup`
+  again to add it.
+- Installing @einsia/agent-git as a project dependency or with `npm install --prefix` no longer runs
+  `agit setup` or records an installation; only a global install (`npm install -g`) or `npx create-
+  agit` sets up hooks, Skills and MCP, so deleting a local install can no longer break every agit
+  hook on the machine.
+- `agit rc start`, `stop` and `status` work again after an agit home is copied, restored or moved: a
+  leftover control socket that nothing can still hold is removed with a one-line note when the
+  daemon that published it is gone, and a leftover elsewhere (such as on macOS) still needs `agit rc
+  local recover --confirm-stopped`.
+- Old publication records are reclaimed however long a session grows, and a reclaim that cannot run
+  is reported instead of stopping silently.
+- The last Claude Code turn before /exit is now saved with its reply and uploaded, instead of
+  staying unsettled.
+- Publishing a new branch that reuses already-published history from another branch no longer
+  mistakes an inherited identity boundary with omitted ancestors for an inconsistent publication
+  mapping.
+- The device daemon lists and watches a runtime's local conversations whether or not its program is
+  on the daemon's PATH, as when a desktop app or service manager starts it, and installs Claude
+  Code's native integration when Claude Code is found in its installers' directories.
+- `agit push` no longer fails every session with "unsupported session candidate cache" or "invalid
+  session candidate cache" when another agit version on the same computer wrote that cache; agit
+  says once that it is rebuilding it and keeps the sessions' published identities. An agit older
+  than 0.2.26 still refuses the cache a newer one wrote, so update every agit copy on a computer,
+  including any `npx` copy.
+- `agit status` and `agit doctor` answer sooner on a computer with many conversations, reading each
+  repository's checkouts at once and ruling out branches kept from the storage migration in one
+  batched read.
+- `agit push` on a branch that moved on the Hub prints why on its own line and the next commands
+  (`agit pull` when only the Hub moved, `agit fork … -b …` or `agit fetch` + `agit merge … --into …`
+  when both sides did), and a failed automatic push after `agit commit` shows the same reason.
+- `agit init` for a repository that already exists binds the current directory to it instead of
+  refusing with "already exists", keeping the repository's settings and naming the options that
+  apply only to a new repository.
+- `agit doctor` no longer reports a large session that agit commits and pushes as unreadable
+  storage; it reads committed sessions with agit's own limits and lists one past them as not
+  inspected.
+- `agit push` publishes a session first published on another Hub as yours only when this device is
+  signed in to that Hub as the account that created it, and the published session no longer names
+  that Hub's registration or accounts. Otherwise it stops and names the session, instead of
+  registering someone else's session as yours.
+- Publishing a fork of a private session into another repository no longer names the private source
+  in the fork's commit messages or milestone.
+- agit run and resume continue a branch at its published tip when the local copy is behind, and stop
+  with the exact next step when it has diverged, instead of silently continuing an older head.
+- An agit rc daemon no longer spends a CPU core for about a minute on every archive-recovery retry:
+  a settlement that proved a session's committed history records that proof, and moving a claim to
+  another branch forgets the proof it held for the old one.
+- A checkout bound to an old Hub address explains how to keep its work, with a delivery command that
+  keeps the recorded source Hub, and that freeing its local name is only for disposable work and
+  needs `--local`; `agit doctor` reports the mismatch without contacting the Hub.
+
+### Security
+
+- `agit push --to` no longer names a private fork source (repository, branch, commit or fork origin)
+  when it publishes a fork into another repository that can't already see that source.
+
+### Known issues
+
+- `agit push` can report a branch as up to date without sending a tag added to its
+  already-published history since the last push; `agit push --verify` sends the tag, and so does
+  the next push that publishes new turns on that branch.
 
 ## [0.2.29] - 2026-10-29
 
