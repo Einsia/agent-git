@@ -697,13 +697,13 @@ fn quiet_setup_preserves_native_registration_output_and_manual_recovery() {
             assert_eq!(stderr.contains("register MCP manually"), child_exit != "0");
             let arguments = std::fs::read_to_string(&recorded).unwrap();
             let args: Vec<_> = arguments.lines().collect();
-            assert_eq!(&args[..4], &["mcp", "add", "agit", "--"]);
+            assert_eq!(&args[..6], &["mcp", "add", "--scope", "user", "agit", "--"]);
             assert_eq!(
-                std::path::Path::new(args[4]),
+                std::path::Path::new(args[6]),
                 std::path::Path::new(env!("CARGO_BIN_EXE_agit"))
             );
-            assert_eq!(args[5], "mcp");
-            assert_eq!(args.len(), 6);
+            assert_eq!(args[7], "mcp");
+            assert_eq!(args.len(), 8);
         }
     }
 }

@@ -47,6 +47,12 @@ Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged i
 hooks capability. Codex may ask the user to trust the installed commands before running them; agit
 does not grant that trust on the user's behalf.
 
+Claude Code's MCP server is registered at user scope (`claude mcp add --scope user`), so every
+folder sees it. A project-local `agit` entry is removed only when the user entry fully replaces it;
+any other project-local entry overrides the user one in its folder, stays, and is named with the
+command that removes it. Codex, OpenCode and Cursor receive the server in their user-level
+configuration files.
+
 The native Skill targets are:
 
 - Claude Code: `~/.claude/skills/agit/`
