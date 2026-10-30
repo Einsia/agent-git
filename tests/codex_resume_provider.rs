@@ -75,6 +75,10 @@ fn main() {
             "relative receiving directory",
             relative_cwd_is_resolved_once,
         ),
+        (
+            "converted session provider",
+            converted_session_takes_configured_provider,
+        ),
     ];
     for (name, run) in cases {
         println!("running: {name}");
@@ -759,6 +763,59 @@ fn registered_registry() -> Value {
     json!({"result":{"config":{"model_providers":{"OpenAI":{
         "name":"A distinct custom provider","base_url":"http://127.0.0.1:1/custom",
         "env_key":"SYNTHETIC_PROVIDER_KEY"}},"private_probe":PRIVATE}}})
+}
+
+/// Codex opens a rollout only when its header names the configured provider. A header rendered
+/// from another runtime that kept a fixed default would be refused by every non-openai Codex, on
+/// the fork path and on the resume path alike.
+fn converted_session_takes_configured_provider() {
+    const CLAUDE_SID: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+    let lab = Lab::new(
+        "openai",
+        json!({"result":{"config":{"model_provider":"sub2api","model_providers":{"sub2api":{
+            "name":"Sub2API","base_url":"http://127.0.0.1:1/v1"}},"private_probe":PRIVATE}}}),
+    );
+    let project = lab.home.join(".claude/projects/fixture");
+    fs::create_dir_all(&project).unwrap();
+    let turn = [
+        json!({"type":"user","sessionId":CLAUDE_SID,"cwd":lab.work,"uuid":"u1",
+            "message":{"role":"user","content":"SYNTHETIC-CONVERTED-QUESTION"}}),
+        json!({"type":"assistant","sessionId":CLAUDE_SID,"cwd":lab.work,"uuid":"a1",
+            "message":{"role":"assistant","content":[{"type":"text","text":"SYNTHETIC-CONVERTED-ANSWER"}]}}),
+    ];
+    fs::write(
+        project.join(format!("{CLAUDE_SID}.jsonl")),
+        turn.iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    lab.success(&[
+        "import",
+        CLAUDE_SID,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@claude",
+        "--independent",
+    ]);
+    lab.success(&[
+        "fork",
+        "me/qa@claude",
+        "-b",
+        "converted",
+        "--resume",
+        "--as",
+        "codex",
+        "--no-launch",
+    ]);
+    lab.success(&["resume", "me/qa@claude", "--as", "codex", "--no-launch"]);
+    for branch in ["converted", "claude"] {
+        let (id, _) = lab.claim(branch);
+        let header = &records(&lab.rollout(&id))[0];
+        assert_eq!(header["payload"]["model_provider"], "sub2api", "{branch}");
+        assert_eq!(header["payload"]["id"], id.as_str());
+    }
 }
 
 fn records(path: &Path) -> Vec<Value> {

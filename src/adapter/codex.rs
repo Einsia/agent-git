@@ -1045,8 +1045,9 @@ impl Adapter for Codex {
         // `source` decides which entry point this session belongs to in Codex's index; leaving it
         // out makes it vscode.
         //
-        // `model_provider` is hard-coded to "openai" (the Codex default). A user on a non-openai
-        // backend overrides it at launch: `codex resume <id> -c model_provider=<x>`.
+        // `model_provider` is a placeholder for the Codex default: Codex refuses a rollout whose
+        // header provider differs from the configured one, so `install` replaces it with the
+        // provider configured on the receiving machine (`codex_provider::localize`).
         out.push_str(&serde_json::to_string(&serde_json::json!({
             "type": "session_meta",
             "timestamp": now,
