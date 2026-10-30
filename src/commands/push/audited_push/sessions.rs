@@ -490,6 +490,11 @@ pub(super) fn run(
     }
     for receipt in &receipts {
         receipt.save(&repo)?;
+        crate::domain::privacy_receipt::save_acknowledged_tags(
+            &repo,
+            receipt,
+            projected.source_tags(),
+        )?;
     }
     if let (Some(reply), Some(candidate)) = (supervisor, supervised) {
         reply.complete(&repo, candidate)?;

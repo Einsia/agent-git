@@ -72,6 +72,9 @@ pub struct ProjectedHistory {
     /// Boundary commits mapped under their own ids because the destination's advertisement
     /// reaches them; only these may leave their ancestry out of a candidate.
     held_boundary: BTreeSet<String>,
+    /// [`super::privacy_receipt::tag_listing`] of the source's tags, read before `source` was
+    /// frozen.
+    source_tags: String,
     session_manifest: super::session_privacy::SessionPublicationManifest,
     #[cfg(test)]
     preparations: usize,
@@ -96,6 +99,12 @@ impl ProjectedHistory {
 
     pub fn policy_digest(&self) -> &str {
         &self.policy_digest
+    }
+
+    /// The source's tag listing this publication may be acknowledged with; see
+    /// [`super::privacy_receipt::save_acknowledged_tags`].
+    pub(crate) fn source_tags(&self) -> &str {
+        &self.source_tags
     }
 
     pub fn session_manifest(&self) -> &super::session_privacy::SessionPublicationManifest {

@@ -632,6 +632,9 @@ impl ProjectedHistory {
         let root = parent.join(&store);
         let mut ledger = accepted::Ledger::open(&source, identity)?;
         ledger.reconcile(&selected.remote)?;
+        // Read before the freeze: a tag added in between is then in the plan but not in the
+        // listing, which costs the next push its local shortcut, never the tag.
+        let source_tags = super::super::privacy_receipt::current_tag_listing(&source)?;
         // What the destination already holds, read from the advertisement the receipts are bound to.
         let held = PublicationPlan::held_history(&source, &selected.remote.heads)?;
         let source_plan = freeze_publication(
@@ -1266,6 +1269,7 @@ impl ProjectedHistory {
             accepted_ledger: ledger,
             candidates,
             held_boundary,
+            source_tags,
             session_manifest: manifest,
             #[cfg(test)]
             preparations,
