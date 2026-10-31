@@ -668,33 +668,102 @@ fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Commits whose tree carries `privacy/envelope.json`, answered by one batch lookup.
-fn enveloped_commits(repo: &Repo, commits: &[String]) -> Result<BTreeSet<String>> {
-    let specs = commits
-        .iter()
-        .map(|commit| format!("{commit}:privacy/envelope.json"))
-        .collect();
-    let mut found = BTreeSet::new();
-    let mut answered = 0;
+/// The largest `privacy` directory [`enveloped_commits`] reads; a larger one is refused.
+const MAX_PRIVACY_TREE: u64 = 1024 * 1024;
+
+/// Commits whose tree has an entry at `privacy/envelope.json`, whatever its type, read from local
+/// objects through at most two batch processes. The `privacy` directory is read rather than the
+/// whole path resolved: Git versions differ in whether a submodule at that path is reported or
+/// reported missing, and a missing report would let the entry through as absent. A commit that is
+/// not available locally is an error, never a commit without an envelope.
+pub(crate) fn enveloped_commits(repo: &Repo, commits: &[String]) -> Result<BTreeSet<String>> {
+    let mut specs = Vec::with_capacity(commits.len() * 2);
+    for commit in commits {
+        ensure!(
+            valid_oid(commit),
+            "privacy envelope lookup needs commit ids"
+        );
+        specs.push(commit.clone());
+        specs.push(format!("{commit}:privacy"));
+    }
+    let mut answers = Vec::with_capacity(specs.len());
     repo.git_cat_file_batch_check_with_policy(
         specs,
         super::repo::ReadPolicy::LocalOnly,
-        |_, kind, _| {
-            let commit = commits
-                .get(answered)
-                .context("privacy envelope lookup returned extra answers")?;
-            if kind != "missing" {
-                found.insert(commit.clone());
-            }
-            answered += 1;
+        |oid, kind, size| {
+            answers.push((oid.to_owned(), kind.to_owned(), size));
             Ok(())
         },
     )?;
     ensure!(
-        answered == commits.len(),
+        answers.len() == commits.len() * 2,
+        "privacy envelope lookup is incomplete"
+    );
+    // A `privacy` that is absent, a file or a submodule has nothing below it.
+    let mut directories = BTreeMap::<String, Vec<&String>>::new();
+    for (commit, answer) in commits.iter().zip(answers.chunks(2)) {
+        ensure!(
+            answer[0].1 == "commit",
+            "privacy source object is unavailable"
+        );
+        let (tree, kind, size) = &answer[1];
+        if kind == "tree" {
+            ensure!(
+                *size <= MAX_PRIVACY_TREE,
+                "privacy directory exceeds the size limit"
+            );
+            directories.entry(tree.clone()).or_default().push(commit);
+        }
+    }
+    let trees: Vec<String> = directories.keys().cloned().collect();
+    let oid_bytes = commits.first().map_or(0, |commit| commit.len() / 2);
+    let mut found = BTreeSet::new();
+    let mut answered = 0;
+    // The sizes are checked above; a cap here would start another check process.
+    repo.git_cat_file_batch_with_policy(
+        trees.clone(),
+        usize::MAX,
+        super::repo::ReadPolicy::LocalOnly,
+        |_, kind, body| {
+            let tree = trees
+                .get(answered)
+                .context("privacy envelope lookup returned extra answers")?;
+            answered += 1;
+            let super::repo::ObjectBody::Read(bytes) = body else {
+                anyhow::bail!("privacy source object is unavailable");
+            };
+            ensure!(kind == "tree", "privacy source object is unavailable");
+            if tree_has_entry(bytes, b"envelope.json", oid_bytes)? {
+                found.extend(directories[tree].iter().map(|commit| (*commit).clone()));
+            }
+            Ok(())
+        },
+    )?;
+    ensure!(
+        answered == trees.len(),
         "privacy envelope lookup is incomplete"
     );
     Ok(found)
+}
+
+/// Whether a raw tree object has an entry called `name`, of any mode.
+fn tree_has_entry(mut tree: &[u8], name: &[u8], oid_bytes: usize) -> Result<bool> {
+    while !tree.is_empty() {
+        let space = tree.iter().position(|byte| *byte == b' ');
+        let nul = tree.iter().position(|byte| *byte == 0);
+        let (Some(space), Some(nul)) = (space, nul) else {
+            anyhow::bail!("privacy directory is malformed");
+        };
+        ensure!(
+            space < nul && tree.len() >= nul + 1 + oid_bytes,
+            "privacy directory is malformed"
+        );
+        if &tree[space + 1..nul] == name {
+            return Ok(true);
+        }
+        tree = &tree[nul + 1 + oid_bytes..];
+    }
+    Ok(false)
 }
 
 /// Raw parent lists of local commits, read through one batch process.
