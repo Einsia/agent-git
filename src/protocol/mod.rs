@@ -559,6 +559,9 @@ pub mod method {
     pub const TERMINAL_EXITED: &str = "terminal.exited";
     pub const SESSION_START: &str = "session.start";
     pub const SESSION_RESUME: &str = "session.resume";
+    /// The owner adopts a conversation found on this machine into a workspace without launching
+    /// it, so the workspace's members can read it.
+    pub const SESSION_SHARE: &str = "session.share";
     pub const SESSION_CATALOG_LIST: &str = "session.catalog.list";
     pub const SESSION_CATALOG_SETTINGS: &str = "session.catalog.settings";
     pub const SESSION_LIST: &str = "session.list";

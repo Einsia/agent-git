@@ -572,6 +572,21 @@ pub struct SessionResumeResult {
     pub session: SessionInfo,
 }
 
+/// Adopt one row of `session.list`'s `local` into the workspace without launching its runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionShare {
+    pub workspace_id: String,
+    pub project_id: String,
+    pub runtime: String,
+    pub runtime_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionShareResult {
+    pub session: SessionInfo,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionList {
     pub workspace_id: String,

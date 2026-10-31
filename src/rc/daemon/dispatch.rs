@@ -379,6 +379,8 @@ impl Daemon {
                 self.finish_watch_scan(f, prepared, frames)
             }
 
+            method::SESSION_SHARE => self.share_session(f),
+
             // A viewer stops watching. The last one out shuts the tail task down — without this,
             // every session ever watched leaves this machine one more permanent file poll.
             method::SESSION_UNWATCH => {

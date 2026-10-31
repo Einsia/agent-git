@@ -24,6 +24,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "source-catalog-v1",
     "source-catalog-resolve-v1",
     "source-catalog-delta-v1",
+    "session-share-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -320,6 +320,14 @@ pub fn authorize(
             }
             (Target::Session(session), need)
         }
+        // Sharing decides who else reads a conversation, which is the device owner's call.
+        "session.share" => {
+            let project = params["project_id"].as_str().ok_or_else(denied)?.to_owned();
+            if !resources.projects.contains_key(&project) {
+                return Err(denied());
+            }
+            (Target::Project(project), Need::Admin)
+        }
         "session.start" => {
             let project = params["project_id"].as_str().ok_or_else(denied)?.to_owned();
             if !resources.projects.contains_key(&project) {
@@ -846,5 +854,75 @@ mod tests {
         assert!(redacted.result.is_none());
         let forged = Frame::request("peer.connect", json!({"peer_id":"other-machine"}));
         assert!(authorize(forged, &principal, &policy, &mut resources).is_err());
+    }
+
+    /// A first share through the cloud entry answers with the identity it just minted: the reply
+    /// is admitted only once that identity is a known, readable resource, so a share whose new
+    /// identity was not recorded would reach the owner as a refusal although it was saved. Members
+    /// and project readers cannot share at all.
+    #[test]
+    fn sharing_through_the_cloud_entry_is_the_owners_and_answers_with_the_new_identity() {
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "controller".into(),
+        };
+        let policy = |access| {
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Project("project".into()),
+                    access,
+                }],
+            )
+            .unwrap()
+        };
+        let mut resources = Resources::default();
+        resources
+            .projects
+            .insert("project".into(), "/trusted".into());
+        let share = |ceiling: &str| {
+            Frame::request(
+                "session.share",
+                json!({"access_ceiling":ceiling, "project_id":"project",
+                    "runtime":"claude-code", "runtime_session_id":"native"}),
+            )
+        };
+        assert!(
+            authorize(
+                share("control"),
+                &principal,
+                &policy(Access::Admin),
+                &mut resources
+            )
+            .is_err()
+        );
+        assert!(
+            authorize(
+                share("admin"),
+                &principal,
+                &policy(Access::Read),
+                &mut resources
+            )
+            .is_err()
+        );
+        let admin = policy(Access::Admin);
+        let (request, permit) =
+            authorize(share("admin"), &principal, &admin, &mut resources).unwrap();
+        let result = json!({"session":{"session_id":"agit-shared", "runtime_session_id":"native",
+            "runtime":"claude-code", "workspace_id":crate::rc::endpoint::WORKSPACE,
+            "project_id":"project", "status":"ended"}});
+        permit.observe(&mut resources, &result);
+        let reply = permit.response(
+            Frame::response(request.id.clone().unwrap(), result),
+            &resources,
+            &admin,
+            &principal,
+        );
+        assert!(reply.error.is_none(), "{reply:?}");
+        assert_eq!(
+            reply.result.unwrap()["session"]["session_id"],
+            "agit-shared"
+        );
     }
 }

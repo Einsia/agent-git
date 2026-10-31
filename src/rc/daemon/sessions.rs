@@ -228,6 +228,128 @@ impl Daemon {
         Ok(serde_json::to_value(SessionListResult { sessions, local }).unwrap())
     }
 
+    /// Adopt a conversation found on this machine into the workspace without launching it.
+    ///
+    /// The owner shares it on purpose: from then on the workspace lists it under a logical
+    /// identity like any session continued there, and members read it. Nothing runs and the
+    /// transcript is untouched; a later resume takes over the same identity, so sharing twice,
+    /// or sharing one that already runs here, returns the identity it has.
+    pub(super) fn share_session(&mut self, frame: &Frame) -> Result<serde_json::Value, RpcError> {
+        let caller = caller_scope(frame)?;
+        require_role(&caller, frame.method())?;
+        let p: crate::protocol::SessionShare = frame.params_as()?;
+        if !self.mirror.has_workspace(&caller.workspace_id) {
+            return Err(RpcError::new(
+                ErrorCode::WorkspaceNotFound,
+                "workspace is not bound on this machine",
+            ));
+        }
+        let elsewhere = || {
+            RpcError::new(
+                ErrorCode::SessionNotFound,
+                "that conversation is not in this project; refresh the session list",
+            )
+        };
+        // A conversation running here is already shared; the scan below skips it.
+        if let Some(info) = self.supervised_in(&p.runtime_session_id, &caller) {
+            if info.runtime != p.runtime || info.project_id.as_deref() != Some(&p.project_id) {
+                return Err(elsewhere());
+            }
+            return Ok(serde_json::to_value(crate::protocol::SessionShareResult {
+                session: self.stamped(info),
+            })
+            .unwrap());
+        }
+        let located = self.locate_local(&caller.workspace_id, &p.runtime_session_id)?;
+        if located.runtime != p.runtime || located.project_id.as_deref() != Some(&p.project_id) {
+            return Err(elsewhere());
+        }
+        let workspace = caller.workspace_id.clone();
+        let cwd = located.cwd.to_string_lossy().into_owned();
+        let logical =
+            match self
+                .roster
+                .logical_for_thread(&p.runtime, &p.runtime_session_id, &workspace)
+            {
+                Some(logical) => logical,
+                None => {
+                    let logical = crate::domain::meta::mint_session_id();
+                    let previous = self.roster.clone();
+                    let ever_dangerous = self.roster.transcript_ever_dangerous(
+                        &p.runtime,
+                        &p.runtime_session_id,
+                        &workspace,
+                        &cwd,
+                    );
+                    let entry = roster::Entry {
+                        native_source: None,
+                        runtime: p.runtime.clone(),
+                        thread_id: p.runtime_session_id.clone(),
+                        cwd: cwd.clone(),
+                        workspace_id: workspace.clone(),
+                        project_id: Some(p.project_id.clone()),
+                        agit_session: None,
+                        expected_agent_id: None,
+                        permission_mode: None,
+                        guard_attempts: Default::default(),
+                        prior_threads: Vec::new(),
+                        ever_dangerous,
+                    };
+                    if let Err(error) = self.roster.record(&logical, entry) {
+                        self.roster = previous;
+                        return Err(RpcError::new(ErrorCode::Forbidden, error.to_string()));
+                    }
+                    if self.roster.save().is_err() {
+                        self.roster = previous;
+                        return Err(classified(
+                            RpcError::new(
+                                ErrorCode::Internal,
+                                "the share could not be persisted; nothing changed",
+                            ),
+                            false,
+                            "state_unwritable",
+                        ));
+                    }
+                    logical
+                }
+            };
+        let entry = self
+            .roster
+            .get(&logical)
+            .ok_or_else(|| RpcError::new(ErrorCode::Internal, "shared identity is missing"))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let info = SessionInfo {
+            interrupt_fenced: None,
+            publication: None,
+            native_source: None,
+            session_id: logical.clone(),
+            runtime_session_id: Some(entry.thread_id.clone()),
+            workspace_id: workspace.clone(),
+            project_id: entry.project_id.clone(),
+            runtime: entry.runtime.clone(),
+            agent: None,
+            branch: None,
+            status: SessionStatus::Ended,
+            last_seq: 0,
+            title: located.title,
+            labels_withheld: located.labels_withheld,
+            gist: located.gist,
+            dangerous: self.roster.transcript_ever_dangerous(
+                &entry.runtime,
+                &entry.thread_id,
+                &workspace,
+                &entry.cwd,
+            ),
+            permission_mode: entry.restart_permission_mode(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        Ok(serde_json::to_value(crate::protocol::SessionShareResult {
+            session: self.stamped(info),
+        })
+        .unwrap())
+    }
+
     /// Take over a local session.
     ///
     /// Same semantics as `agit resume`: the fast path resumes natively (the harness's own
@@ -1537,10 +1659,8 @@ impl LocalSessionSnapshot {
                 // `(archived, cwd, updated_at_ms DESC)` index, Claude Code is one readdir of
                 // `projects/<cwd-slug>/`. So the cost follows "how many sessions this project
                 // has", not how many rollouts piled up on disk.
-                let refs = match purpose {
-                    LocalSessionScan::Listing => adapter.session_choices_for(root),
-                    LocalSessionScan::Locate => adapter.sessions_for(root),
-                };
+                let refs =
+                    adapter.workspace_sessions_for(root, purpose == LocalSessionScan::Listing);
                 let Ok(mut refs) = refs else {
                     continue;
                 };

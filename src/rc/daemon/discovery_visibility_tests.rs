@@ -218,7 +218,7 @@ fn claude_fixture(project: &Path) -> BTreeSet<String> {
         ("sidechain", json!({"isSidechain":true})),
         ("agent-legacy", json!({})),
     ] {
-        let record = json!({"type":"user","message":{"role":"user","content":"fixture"},"sessionId":name,"parentUuid":"previous-message"});
+        let record = json!({"type":"user","message":{"role":"user","content":"fixture"},"sessionId":name,"parentUuid":"previous-message","cwd":project});
         let mut record = record.as_object().unwrap().clone();
         record.extend(metadata.as_object().unwrap().clone());
         std::fs::write(

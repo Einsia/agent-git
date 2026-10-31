@@ -263,6 +263,44 @@ fn base36(mut value: u64) -> String {
     String::from_utf8(digits).expect("base-36 digits are ASCII")
 }
 
+/// Whether a transcript in `slug`'s directory belongs to the folder `cwd`, by the directory its
+/// own records name: another folder can map to the same directory, as `/work/a-b` and
+/// `/work/a/b` do, and listing its transcripts under `cwd` would hand that folder's conversations
+/// to whoever `cwd` is shared with. A transcript recorded in a folder that maps elsewhere was
+/// installed here on purpose and belongs. `None` while no complete record names a directory.
+fn recorded_in_folder(transcript: &Path, cwd: &Path, slug: &str) -> Option<bool> {
+    let recorded = super::transcript_cwd::recorded_cwd(transcript)?;
+    let recorded = Path::new(&recorded);
+    Some(
+        canonical_cwd(recorded) == cwd
+            || !project_slugs(recorded).iter().any(|other| other == slug),
+    )
+}
+
+/// The conversations filed in the directories `repo` maps to. One that names no directory yet
+/// is kept for this device's own pickers, and left out when `attributed_only`: a workspace would
+/// show it to the members of every folder that maps to the same directory. It is listed once a
+/// record names its folder.
+fn folder_sessions(repo: &Path, attributed_only: bool) -> Result<Vec<SessionRef>> {
+    let root = projects_dir()?;
+    let cwd = canonical_cwd(repo);
+    let mut sessions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for slug in project_slugs(repo) {
+        let path = root.join(&slug);
+        if path.is_dir() {
+            for session in collect_dir(&path, Some(cwd.to_string_lossy().into_owned()))? {
+                if recorded_in_folder(&session.path, &cwd, &slug).unwrap_or(!attributed_only)
+                    && seen.insert(session.id.clone())
+                {
+                    sessions.push(session);
+                }
+            }
+        }
+    }
+    Ok(sessions)
+}
+
 /// Every project directory name a transcript for `cwd` may sit under, current spelling first.
 ///
 /// Installed transcripts may sit under the lexical key of the physical or the given path; a
@@ -361,21 +399,16 @@ impl Adapter for ClaudeCode {
     }
 
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
-        let root = projects_dir()?;
-        let cwd = canonical_cwd(repo);
-        let mut sessions = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for slug in project_slugs(repo) {
-            let path = root.join(slug);
-            if path.is_dir() {
-                for session in collect_dir(&path, Some(cwd.to_string_lossy().into_owned()))? {
-                    if seen.insert(session.id.clone()) {
-                        sessions.push(session);
-                    }
-                }
-            }
-        }
-        Ok(sessions)
+        folder_sessions(repo, false)
+    }
+
+    fn workspace_sessions_for(&self, repo: &Path, choices: bool) -> Result<Vec<SessionRef>> {
+        let sessions = folder_sessions(repo, true)?;
+        Ok(if choices {
+            sessions.into_iter().filter(is_user_session).collect()
+        } else {
+            sessions
+        })
     }
 
     fn all_sessions(&self) -> Result<Vec<SessionRef>> {
@@ -2421,6 +2454,84 @@ mod config_directory_tests {
         std::fs::remove_file(&installed.path).unwrap();
         assert_eq!(ClaudeCode.resolve(id, Some(&alias)), Some(legacy.clone()));
         assert_eq!(ClaudeCode.resolve(id, Some(&workspace)), Some(legacy));
+    }
+
+    /// Two folders whose names map to one project directory keep their own conversations: a
+    /// lookup that trusted the directory alone would list `/work/a-b`'s transcripts for
+    /// `/work/a/b`, and so for everyone `/work/a/b` is shared with. A transcript that names no
+    /// folder yet is in neither workspace listing, though this device's own pickers still find it;
+    /// keeping it in the listing would show it to both folders' members.
+    #[cfg(all(unix, feature = "rc"))]
+    #[test]
+    fn folders_sharing_a_project_directory_keep_their_own_conversations() {
+        if crate::rc::in_isolated_test(
+            "adapter::claude_code::config_directory_tests::folders_sharing_a_project_directory_keep_their_own_conversations",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let nested = root_path.join("a").join("b");
+        let dashed = root_path.join("a-b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&dashed).unwrap();
+        let config = root_path.join("claude");
+        // The subprocess isolates the runtime's process-wide configuration directory.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &config) };
+        let slug = slug_for(&nested);
+        assert_eq!(slug, slug_for(&dashed));
+        let directory = config.join("projects").join(&slug);
+        std::fs::create_dir_all(&directory).unwrap();
+        for (id, cwd) in [
+            ("nested", nested.to_str().unwrap()),
+            ("dashed", dashed.to_str().unwrap()),
+            ("installed", "/source"),
+        ] {
+            std::fs::write(
+                directory.join(format!("{id}.jsonl")),
+                serde_json::json!({"type":"user","sessionId":id,"cwd":cwd,
+                    "message":{"role":"user","content":"hello"}})
+                .to_string()
+                    + "\n",
+            )
+            .unwrap();
+        }
+        let cut =
+            serde_json::json!({"type":"user","sessionId":"cut","cwd":nested.to_str().unwrap(),
+            "message":{"role":"user","content":"hello"}})
+            .to_string();
+        std::fs::write(directory.join("cut.jsonl"), &cut[..cut.len() / 2]).unwrap();
+        std::fs::write(
+            directory.join("summary.jsonl"),
+            "{\"type\":\"summary\",\"summary\":\"Earlier work\",\"leafUuid\":\"leaf\"}\n",
+        )
+        .unwrap();
+        let ids = |sessions: Vec<SessionRef>| {
+            let mut ids = sessions
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        for (folder, own, other) in [(&nested, "nested", "dashed"), (&dashed, "dashed", "nested")] {
+            let mut expected = vec![own.to_string(), "installed".to_string()];
+            expected.sort();
+            for choices in [false, true] {
+                assert_eq!(
+                    ids(ClaudeCode.workspace_sessions_for(folder, choices).unwrap()),
+                    expected,
+                    "{} choices {choices}",
+                    folder.display()
+                );
+            }
+            let device = ids(ClaudeCode.sessions_for(folder).unwrap());
+            assert!(
+                device.iter().any(|id| id == "cut") && !device.iter().any(|id| id == other),
+                "{}: {device:?}",
+                folder.display()
+            );
+        }
     }
 
     #[test]
