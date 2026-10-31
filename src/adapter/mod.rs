@@ -47,6 +47,7 @@ pub(crate) mod preview;
 pub(crate) mod protocol_ids;
 mod session_visibility;
 mod sqlite_native;
+pub(crate) mod transcript_cwd;
 pub mod workbuddy;
 
 use crate::Result;
@@ -647,6 +648,19 @@ pub trait Adapter {
     /// Explicit discovery remains available for inspecting and importing those records.
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         self.sessions_for(repo)
+    }
+
+    /// The sessions of `repo` a workspace may show to everyone `repo` is shared with: the
+    /// choices, or with `choices` false every session, that this device's own discovery finds. A
+    /// runtime that files several folders' sessions in one place leaves out those it cannot yet
+    /// attribute to `repo`, since listing them would show one folder's conversations to another
+    /// folder's members.
+    fn workspace_sessions_for(&self, repo: &Path, choices: bool) -> Result<Vec<SessionRef>> {
+        if choices {
+            self.session_choices_for(repo)
+        } else {
+            self.sessions_for(repo)
+        }
     }
 
     /// Look a transcript file up by session id.

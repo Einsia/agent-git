@@ -411,7 +411,11 @@ impl Resources {
         }
         if matches!(
             method,
-            "session.start" | "session.resume" | "session.watch" | "session.subscribe"
+            "session.start"
+                | "session.resume"
+                | "session.share"
+                | "session.watch"
+                | "session.subscribe"
         ) {
             self.observe_session(&result["session"]);
         }

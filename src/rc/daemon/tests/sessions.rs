@@ -3195,6 +3195,122 @@ async fn subscribing_to_a_dormant_conversation_asks_for_resume_without_leaking_o
     }
 }
 
+/// Sharing is the owner's decision and adopts the conversation without running it: a member who
+/// asks is refused, the owner's share gives it a logical identity that every member then lists as
+/// a workspace session, sharing again, also while it runs, returns the same identity, and nothing
+/// is launched. A share
+/// that only flagged the row, or launched the runtime, would leave members unable to read it or
+/// start work the owner never asked for.
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_shares_a_local_conversation_that_members_then_list_without_running_it() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "AGIT_SESSION_SHARE_TEST_CHILD";
+    let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rc::daemon::tests::sessions::owner_shares_a_local_conversation_that_members_then_list_without_running_it", "--nocapture"])
+            .env(CHILD, directory.path())
+            .env("CLAUDE_CONFIG_DIR", directory.path().join("claude"))
+            .env("AGIT_HOME", directory.path().join("agit"))
+            .env("HOME", directory.path().join("home"))
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(directory.path().join("completed").exists());
+        return;
+    };
+    let cwd = root.join("project");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let transcripts = root
+        .join("claude/projects")
+        .join(crate::domain::store::slug_for(&cwd));
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let native = "11111111-1111-4111-8111-111111111111";
+    std::fs::write(
+        transcripts.join(format!("{native}.jsonl")),
+        serde_json::json!({"type":"user","sessionId":native,"cwd":cwd,
+            "message":{"role":"user","content":"Plan the launch"}})
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", &cwd).unwrap();
+    let share = |role: &str, project: &str| {
+        let mut frame = Frame::request(
+            method::SESSION_SHARE,
+            serde_json::json!({"workspace_id":"ws-a","project_id":project,
+                "runtime":"claude-code","runtime_session_id":native}),
+        );
+        frame.caller = Some(claim(role, "ws-a"));
+        frame
+    };
+    for member in ["viewer", "operator"] {
+        assert!(state.share_session(&share(member, "project")).is_err());
+    }
+    assert!(
+        state
+            .roster
+            .logical_for_thread("claude-code", native, "ws-a")
+            .is_none()
+    );
+    assert!(state.share_session(&share("owner", "elsewhere")).is_err());
+    let shared: crate::protocol::SessionShareResult =
+        serde_json::from_value(state.share_session(&share("owner", "project")).unwrap()).unwrap();
+    assert!(shared.session.session_id.starts_with("agit-"));
+    assert_eq!(shared.session.runtime_session_id.as_deref(), Some(native));
+    assert_eq!(shared.session.status, SessionStatus::Ended);
+    let again: crate::protocol::SessionShareResult =
+        serde_json::from_value(state.share_session(&share("owner", "project")).unwrap()).unwrap();
+    assert_eq!(again.session.session_id, shared.session.session_id);
+    assert!(state.sessions.is_empty());
+    // Once it runs here the scan no longer offers it, and sharing still answers its identity.
+    let (tx, _rx) = mpsc::channel(1);
+    let mut live = rpc_test_live(
+        &shared.session.session_id,
+        1,
+        tx,
+        crate::protocol::PermissionMode::Default,
+    );
+    live.info.runtime = "claude-code".into();
+    live.info.project_id = Some("project".into());
+    live.runtime_thread_id = Some(native.into());
+    state
+        .sessions
+        .insert(shared.session.session_id.clone(), live);
+    let running: crate::protocol::SessionShareResult =
+        serde_json::from_value(state.share_session(&share("owner", "project")).unwrap()).unwrap();
+    assert_eq!(running.session.session_id, shared.session.session_id);
+    assert!(state.share_session(&share("owner", "elsewhere")).is_err());
+    state.sessions.clear();
+    let frame = frame_with(
+        Some(claim("viewer", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a", "include_local":true}),
+    );
+    let snapshot = state.prepare_session_list(&frame).unwrap();
+    let listed = snapshot.clone().scan(LocalSessionScan::Listing);
+    let result: SessionListResult = serde_json::from_value(
+        state
+            .finish_session_list(&frame, &snapshot.roots, listed)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result.sessions.iter().any(|session| {
+        session.session_id == shared.session.session_id
+            && session.runtime_session_id.as_deref() == Some(native)
+    }));
+    std::fs::write(root.join("completed"), b"").unwrap();
+}
+
 /// The local rows of `session.list` carry a Codex conversation's title and opening prompt. A
 /// conversation read through a registered source is linked under that source's qualified key,
 /// so a listing that looked its repository up by the bare thread id alone would protect the

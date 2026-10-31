@@ -181,6 +181,22 @@ Custom prompt catalogs and prompt expansion use the controlled source's runtime
 home. Identically named prompts in different homes remain independent; a missing
 prompt in one source does not fall back to the daemon's default home.
 
+## Sharing a conversation found on the device
+
+The Hub shows a workspace member only the sessions started or continued in the
+workspace; a conversation the device found on its own (a `local` row of
+`session.list`, a `session.catalog.list` row, a source reference) reaches a
+member only once the owner shares it.
+
+Executors advertising `session-share-v1` accept `session.share` with
+`{workspace_id, project_id, runtime, runtime_session_id}` naming a `local` row of
+that project. Only the owner may call it. It records the conversation in the
+workspace roster under a logical identity without launching the runtime and
+returns `{session}`. `session.list` then lists it as a workspace session for
+every member, and a later resume continues the same identity. Sharing a
+conversation that is already shared or running returns its identity. Source
+catalog rows cannot be shared yet.
+
 ## Shared session settings
 
 Attaching to an existing shared session preserves its native defaults. Resume
