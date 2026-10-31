@@ -19,6 +19,10 @@ name: Release
 #
 #  The archive root holds `agit.exe` on Windows and `agit` elsewhere.
 #  SHA256SUMS lists every archive by bare filename, in `sha256sum` format.
+#
+#  The source of the bundled Git runtime's copyleft components rides along as
+#  source-* archives listed in SOURCES-SHA256SUMS; no source asset name starts
+#  with `agit-`, and SHA256SUMS does not list them.
 # ────────────────────────────────────────────────────────────────────────────
 #
 # Publishing to npm is a separate workflow (.github/workflows/npm-publish.yml):
@@ -339,6 +343,18 @@ jobs:
           node scripts/release-notes.mjs "${RELEASE_TAG#agit-v}" > "$RUNNER_TEMP/RELEASE_NOTES.md"
           cat "$RUNNER_TEMP/RELEASE_NOTES.md"
 
+      # The bundled Git runtime includes GPL- and LGPL-licensed components, so the Release
+      # carries their corresponding source, built here from the pins the binaries were built
+      # from, and the notes list each archive's checksum. A source that cannot be built from its
+      # pins, or a copyleft runtime pin without one, stops the job before anything is published.
+      # The archives are uploaded nowhere but to this Release.
+      - name: Source of the bundled Git runtime
+        run: |
+          set -euo pipefail
+          python3 scripts/git-runtime-sources.py dist-sources --notes "$RUNNER_TEMP/SOURCES.md"
+          cat dist-sources/SOURCES-SHA256SUMS
+          { echo; cat "$RUNNER_TEMP/SOURCES.md"; } >> "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -347,12 +363,28 @@ jobs:
           files: |
             dist/agit-*.tar.gz
             dist/SHA256SUMS
+            dist-sources/*
           fail_on_unmatched_files: true
           generate_release_notes: true
           # A pre-release version (agit-v0.2.0-rc.1 and the like) is marked
           # pre-release on GitHub, and "Latest release" keeps pointing at the last
           # stable release. The decision is made in the step above.
           prerelease: ${{ steps.meta.outputs.prerelease }}
+
+      # The Release must carry every source archive this job built, at the size it was built.
+      # A failure here also keeps npm from publishing, since that workflow starts only after this
+      # one succeeds.
+      - name: The Release carries every source archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > "$RUNNER_TEMP/attached.txt"
+          for file in dist-sources/*; do
+            grep -qxF "$(basename "$file") $(stat -c %s "$file")" "$RUNNER_TEMP/attached.txt" \
+              || { echo "::error::the Release is missing $(basename "$file")"; exit 1; }
+          done
 
       # prerelease / Latest is decided by this step, not inferred by the action
       # above.

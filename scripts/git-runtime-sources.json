@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "asset": "source-alpine-git-2.54.0-r0.tar",
+      "covers": [
+        "5a2c6782774d2e891fc2fc3fdc50c3c2743b8eb2dc7cda69b6b723af2eedcf78",
+        "ea41e2f837f1f6a8b66e72a5ece0fc75cca44f76f49cf5500d467fc5627d0ab7",
+        "e8094a47bfa6e66b7d550ae12a7a8bcab0bc4af502aacd5d2a6fc62d2c5e488d",
+        "bad163db30bfd90c99f86fac54e7ac082040024d214c0e1d0c7d98a4f5a7edb5"
+      ],
+      "aports": {
+        "commit": "b3ed5f8f4ce6b2ef13adeaf7494557add6546bda",
+        "directory": "main/git",
+        "files": {
+          "APKBUILD": "af43f6de15a7de1402a4ae17ea5fc8cde5383897f1c01dfd890ad24af3b3138e",
+          "fix-t4219-with-sticky-bit.patch": "2ae5b4901a7ef98ffb35eaba1d201d97b556fca1bf4688f88f79ca24d51a8cd6",
+          "git-daemon.confd": "4703ba2372c661fb674a29fea7f64983f8b1b3136d971663509249655bca6e21",
+          "git-daemon.initd": "ff9b5beefbe55ba6340f1c4acced195515002d0ccb431a8fcd5b1078eacd2e59"
+        }
+      },
+      "downloads": [
+        {
+          "name": "git-2.54.0.tar.xz",
+          "urls": [
+            "https://www.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz",
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/git-2.54.0.tar.xz"
+          ],
+          "sha256": "f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3"
+        }
+      ]
+    },
+    {
+      "asset": "source-alpine-libidn2-2.3.8-r0.tar",
+      "covers": [
+        "7d038ac558dde464964b033ce5126dd2eaf84cc414dc15e77c5424a321d0ebee",
+        "d02ffda4510652f89c5fb89cd2e7ff721afb0c74e7d75476ad60bebe7ac0ae20"
+      ],
+      "aports": {
+        "commit": "8240e09aa2fdd8f9979b2016be082273965aff0c",
+        "directory": "main/libidn2",
+        "files": {
+          "APKBUILD": "b10c820249ffdf9eea4864bee27618a56163a297f06708362203d553de54a34a"
+        }
+      },
+      "downloads": [
+        {
+          "name": "libidn2-2.3.8.tar.gz",
+          "urls": [
+            "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/libidn2-2.3.8.tar.gz"
+          ],
+          "sha256": "f557911bf6171621e1f72ff35f5b1825bb35b52ed45325dcdee931e5d3c0787a"
+        }
+      ]
+    },
+    {
+      "asset": "source-alpine-libunistring-1.4.2-r0.tar",
+      "covers": [
+        "3aa6030e603e34d96192742f327c0509f409c6769ce2e7b1463685dede38d714",
+        "58abfcbce2459071c505771a572a79953d6043d72b643ed0d5285ca39cdaf85c"
+      ],
+      "aports": {
+        "commit": "30d9f19340385b2cd16eaf1cc6a9a8b30c4afe1c",
+        "directory": "main/libunistring",
+        "files": {
+          "APKBUILD": "897e2505f928b37f16ebae9fa0b31d0ef67a8523f3dd5c4dcebc825c13d2fcfa"
+        }
+      },
+      "downloads": [
+        {
+          "name": "libunistring-1.4.2.tar.xz",
+          "urls": [
+            "https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz",
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/libunistring-1.4.2.tar.xz"
+          ],
+          "sha256": "5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c"
+        }
+      ]
+    },
+    {
+      "asset": "source-dugite-native-v2.53.0-4.tar.gz",
+      "covers": [
+        "f9dc64635a5b62fbd7ad95db73268bbb8912255ac516d65d37bf7af22fcb8ffe",
+        "ae6686718aa34f4140424db16b92a47dcffd6d1f312eb8b5f3b267f7404e2680"
+      ],
+      "trees": [
+        {
+          "repository": "https://github.com/desktop/dugite-native.git",
+          "tag": "v2.53.0-4",
+          "commit": "4098283a7ecb8a227b9d43580336c78a06f90e5d",
+          "prefix": "dugite-native-v2.53.0-4"
+        },
+        {
+          "repository": "https://github.com/git/git.git",
+          "submodule": "git",
+          "commit": "67ad42147a7acc2af6074753ebd03d904476118f",
+          "prefix": "dugite-native-v2.53.0-4/git"
+        }
+      ]
+    },
+    {
+      "asset": "source-git-for-windows-v2.55.0.windows.5.tar.gz",
+      "component": "Git for Windows",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "trees": [
+        {
+          "repository": "https://github.com/git-for-windows/git.git",
+          "tag": "v2.55.0.windows.5",
+          "commit": "32c4f7689275d233577576630e1ac5b7eb354eb0",
+          "prefix": "git-for-windows-v2.55.0.windows.5"
+        }
+      ]
+    }
+  ]
+}

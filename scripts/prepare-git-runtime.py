@@ -246,7 +246,9 @@ def assemble(lock, target, cache):
         b"runtime-manifest.json records immutable upstream versions, package checksums, and Linux source recipes.\n"
         b"Git sources: https://github.com/git/git/tags\n"
         b"Git for Windows sources: https://github.com/git-for-windows/git/tags\n"
-        b"Git LFS sources: https://github.com/git-lfs/git-lfs/tags\n", 0o644)
+        b"Git LFS sources: https://github.com/git-lfs/git-lfs/tags\n"
+        b"Each agit release at https://github.com/Einsia/agent-git/releases carries the corresponding source of\n"
+        b"this runtime's GPL- and LGPL-licensed components as source-* assets, listed in SOURCES-SHA256SUMS.\n", 0o644)
     return files
 
 
