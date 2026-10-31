@@ -46,7 +46,7 @@ mod codex_trust;
 mod legacy;
 mod native;
 
-pub(crate) use codex_trust::codex_hooks;
+pub(crate) use codex_trust::{CodexHooks, codex_hooks};
 
 use clap::Args as ClapArgs;
 use std::borrow::Cow;

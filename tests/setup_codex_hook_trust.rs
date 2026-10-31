@@ -139,3 +139,54 @@ fn approved_codex_hooks_survive_setup_and_unapproved_ones_are_reported() {
         assert!(row.contains(expected), "{expected}: {row}");
     }
 }
+
+/// A person who deleted AgentGit's Stop hook keeps the approved SessionStart one, so every hook
+/// Codex lists runs while no turn is saved. Doctor names the missing hook and the setup command
+/// that adds it back; one that judged only the hooks Codex lists would report them approved.
+#[test]
+fn doctor_reports_a_deleted_stop_hook() {
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let home = root.path();
+    let person_agit = home.join(".local/bin/agit");
+    executable(&person_agit, "#!/bin/sh\nexit 0\n");
+    let tools = home.join("tools");
+    executable(&tools.join("codex"), FAKE_CODEX);
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        person_agit.parent().unwrap().display(),
+        tools.display()
+    );
+    let ingest = format!("{} hooks ingest --runtime codex", person_agit.display());
+    let hooks_file = home.join(".codex/hooks.json");
+    std::fs::create_dir_all(hooks_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hooks_file,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {"SessionStart": [{"hooks": [{"command": ingest, "type": "command"}]}]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tools.join("hooks-list.json"),
+        serde_json::to_string(&serde_json::json!({"data": [{
+            "cwd": home,
+            "hooks": [hook("sessionStart", &ingest, true, "trusted")],
+            "warnings": [],
+            "errors": [],
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let doctor = agit(home, &path, &["doctor"]);
+    let said = String::from_utf8_lossy(&doctor.stdout).into_owned()
+        + &String::from_utf8_lossy(&doctor.stderr);
+    let row = said
+        .lines()
+        .find(|line| line.contains("codex hooks"))
+        .unwrap_or_else(|| panic!("{said}"));
+    assert!(row.contains("no AgentGit Stop hook"), "{row}");
+    assert!(row.contains("agit setup --runtime codex --hooks"), "{row}");
+    assert!(!row.contains("approved and enabled"), "{row}");
+}

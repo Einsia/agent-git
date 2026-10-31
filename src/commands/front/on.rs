@@ -312,7 +312,7 @@ pub(super) fn run_child(arguments: &[&str], cwd: &Path) -> Result<()> {
 
 fn report(root: &Path, enabled: &Enabled) -> CmdResult {
     let earlier = crate::commands::project::excluded_count(root);
-    let runtimes = runtimes();
+    let runtimes = runtimes(root);
     if crate::commands::json::is_capturing() {
         println!(
             "{}",
@@ -328,7 +328,7 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "teams_granted": enabled.granted,
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
-                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state})).collect::<Vec<_>>(),
+                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).collect::<Vec<_>>(),
                 "next": (earlier > 0).then(|| serde_json::json!({
                     "command": "agit save --all",
                     "why": "upload the sessions that ran here before",
@@ -390,48 +390,80 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 enum RuntimeState {
     /// Each finished turn saves and uploads.
     Automatic,
-    /// Codex runs the hooks only after the person trusts them in Codex.
+    /// Codex runs the hooks only after the person trusts them in Codex, and it did not say
+    /// whether it does.
     NeedsTrust,
+    /// Codex will not run one of AgentGit's hooks here, or lists none for one of their events:
+    /// the line names it, what that costs and how to fix it.
+    Inactive(String),
+    /// Codex lists none of AgentGit's hooks, so nothing from Codex saves.
+    Missing,
     /// This Codex reports no hooks; its sessions upload when caught up.
     CatchUp,
 }
 
 impl RuntimeState {
-    fn describe(self) -> &'static str {
+    /// The state's name in `--json`, which only gains values: `inactive` and `missing` are new.
+    fn name(&self) -> &'static str {
         match self {
-            Self::Automatic => "every finished turn saves and uploads",
+            Self::Automatic => "automatic",
+            Self::NeedsTrust => "needs_trust",
+            Self::Inactive(_) => "inactive",
+            Self::Missing => "missing",
+            Self::CatchUp => "catch_up",
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Automatic => "every finished turn saves and uploads".into(),
             Self::NeedsTrust => {
-                "every finished turn saves and uploads once you trust AgentGit's hooks: in Codex, open /hooks and trust both"
+                "every finished turn saves and uploads once you trust AgentGit's hooks: in Codex, open /hooks and trust both".into()
+            }
+            Self::Inactive(problem) => problem.clone(),
+            Self::Missing => {
+                "nothing is saved yet: Codex lists none of AgentGit's hooks; to add them: `agit setup --runtime codex --hooks`".into()
             }
             Self::CatchUp => {
-                "this Codex has no hooks; its sessions here upload when you run `agit save`"
+                "this Codex has no hooks; its sessions here upload when you run `agit save`".into()
             }
         }
     }
 }
 
-fn runtimes() -> Vec<(&'static str, RuntimeState)> {
+/// What each agent here does with the folder's conversations. Codex is asked whether it runs
+/// AgentGit's hooks in `root`: a folder can be on while Codex holds the hooks for review, and then
+/// nothing from Codex saves, so its line says so rather than that every turn saves.
+fn runtimes(root: &Path) -> Vec<(&'static str, RuntimeState)> {
     let mut runtimes = Vec::new();
     if crate::adapter::get("claude-code").is_ok_and(|a| a.available()) {
         runtimes.push(("claude-code", RuntimeState::Automatic));
     }
     if crate::adapter::get("codex").is_ok_and(|a| a.available()) {
-        let hooks = crate::commands::setup::codex_hooks_enabled();
-        runtimes.push((
-            "codex",
-            if hooks {
-                RuntimeState::NeedsTrust
-            } else {
-                RuntimeState::CatchUp
-            },
-        ));
+        let state = if crate::commands::setup::codex_hooks_enabled() {
+            codex_state(crate::commands::setup::codex_hooks(root))
+        } else {
+            RuntimeState::CatchUp
+        };
+        runtimes.push(("codex", state));
     }
     runtimes
+}
+
+/// Codex's state from what it said about AgentGit's hooks, `None` when it did not answer.
+fn codex_state(hooks: Option<crate::commands::setup::CodexHooks>) -> RuntimeState {
+    match hooks {
+        None => RuntimeState::NeedsTrust,
+        Some(hooks) if hooks.listed == 0 => RuntimeState::Missing,
+        Some(hooks) => match hooks.problem() {
+            Some(problem) => RuntimeState::Inactive(problem),
+            None => RuntimeState::Automatic,
+        },
+    }
 }
 
 fn turn_off(args: OffArgs) -> CmdResult {
@@ -460,5 +492,66 @@ fn turn_off(args: OffArgs) -> CmdResult {
             }
             Ok(ExitCode::Ok)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeState, codex_state};
+    use crate::commands::setup::CodexHooks;
+
+    /// A folder is on for Codex only in name while Codex holds AgentGit's hooks for review: nothing
+    /// from Codex saves until the person approves them. `agit on` then says that nothing is saved
+    /// yet and how to approve them, and says every turn saves only when Codex runs an AgentGit
+    /// hook for every event. One that judged by the hooks feature alone would call an unapproved
+    /// Codex saving (#250, #138); one that trusted a Codex that lists no AgentGit hook would too,
+    /// and so would one that trusted every hook listed while the Stop hook was deleted.
+    #[test]
+    fn agit_on_says_nothing_saves_while_codex_holds_the_hooks_for_review() {
+        let held = codex_state(Some(CodexHooks {
+            listed: 2,
+            inactive: vec![
+                ("SessionStart".into(), "not yet approved"),
+                ("Stop".into(), "changed since it was approved"),
+            ],
+            missing: Vec::new(),
+        }));
+        assert_eq!(held.name(), "inactive");
+        let said = held.describe();
+        assert!(said.contains("Nothing from Codex is saved"), "{said}");
+        assert!(
+            said.contains("SessionStart (not yet approved)")
+                && said.contains("Stop (changed since it was approved)")
+                && said.contains("approve them in its hooks review"),
+            "{said}"
+        );
+
+        let running = codex_state(Some(CodexHooks {
+            listed: 2,
+            inactive: Vec::new(),
+            missing: Vec::new(),
+        }));
+        assert!(matches!(running, RuntimeState::Automatic), "{running:?}");
+        // The Stop hook was deleted and the approved SessionStart hook kept.
+        let no_stop = codex_state(Some(CodexHooks {
+            listed: 1,
+            inactive: Vec::new(),
+            missing: vec!["Stop"],
+        }));
+        assert_eq!(no_stop.name(), "inactive");
+        let said = no_stop.describe();
+        assert!(
+            said.contains("no Codex turn here is saved")
+                && said.contains("`agit setup --runtime codex --hooks`"),
+            "{said}"
+        );
+        let none = codex_state(Some(CodexHooks::default()));
+        assert_eq!(none.name(), "missing");
+        assert!(
+            none.describe()
+                .contains("`agit setup --runtime codex --hooks`")
+        );
+        // Codex that does not answer is not claimed either way.
+        assert_eq!(codex_state(None).name(), "needs_trust");
     }
 }
