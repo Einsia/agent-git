@@ -56,7 +56,7 @@ agit push [owner/repo@branch] [options]
 | `--all` | Publish all settled local branches |
 | `--keep-going` | With several branches, publish each on its own when publishing them together fails |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
-| `--to <owner/repo>` | Select the retained Hub publication target for a device-local RC repository |
+| `--to <owner/repo>` | Publish to another repository the account can write to; the checkout keeps its own repository as the default. For a device-local RC repository, selects its retained Hub destination |
 | `--allow-secrets` | Compatibility flag for servers that require secret-findings acceptance |
 | `--audit` | Review frozen outgoing content with an interactive agent, then confirm publication separately |
 | `--dry-run` | Inspect registered sessions without creating a repository, registering sessions, or uploading history |
@@ -207,9 +207,11 @@ an existing registered destination and sessions. Audited push cannot run with `-
 URL and audience; delivery rechecks current authority and each session's configuration. Automatic
 continuation retains the session owner and uses the same capture and receipt checks as manual push.
 
-A device-local RC repository can select its initial Hub destination with `--to owner/repo`. Later
-pushes retain that confirmed destination and the device's independent local identity. Cross-repository
-push copies require source-publication authority and are currently refused before mutation.
+`--to owner/repo` publishes the selected branches to another repository on the same Hub that the
+signed-in account can write to. The destination is checked by its own repository identity right
+before anything is written, and the checkout keeps its own repository as its default destination.
+A device-local RC repository instead uses `--to owner/repo` to select its initial Hub destination;
+later pushes retain that confirmed destination and the device's independent local identity.
 
 ## Many branches
 

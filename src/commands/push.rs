@@ -38,7 +38,9 @@ pub struct Args {
     #[arg(value_name = "owner/repo@branch")]
     pub agent: Option<String>,
 
-    /// Select the retained Hub publication target for a device-local RC repository.
+    /// Publish to another repository the account can write to (`owner/repo`); the checkout keeps
+    /// its own repository as the default destination. For a device-local RC repository, select its
+    /// retained Hub publication target.
     #[arg(long, value_name = "owner/repo")]
     pub to: Option<String>,
 

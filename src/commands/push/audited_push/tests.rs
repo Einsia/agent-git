@@ -143,6 +143,7 @@ fn intent() -> Intent {
         visibility: remote.visibility.clone(),
         accept_secret_findings: false,
         explicit_hub: false,
+        explicit_repository: false,
         source_identity: None,
         action: Action::Existing(remote),
     }
