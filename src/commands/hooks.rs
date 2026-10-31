@@ -117,7 +117,9 @@ pub enum Action {
         #[arg(long)]
         generation: String,
     },
-    /// Retain an exact completion boundary from the calling native writer.
+    /// Accepted from native plugins that report a turn the person aborted before any output. It
+    /// records nothing: that turn waits for a later turn's cut or an explicit publication, like
+    /// any interrupt.
     #[command(hide = true)]
     NativeComplete {
         #[arg(long)]
@@ -191,26 +193,7 @@ pub fn run(args: Args) -> CmdResult {
         Action::NativeEvents { .. } => {
             anyhow::bail!("Native Claude Code shared control is not supported on this platform")
         }
-        #[cfg(unix)]
-        Action::NativeComplete {
-            session,
-            generation,
-            turn,
-            reason,
-        } => {
-            let receipt = crate::rc::native_claude::completion::record(
-                &session,
-                &generation,
-                &turn,
-                &reason,
-            )?;
-            println!("{}", serde_json::to_string(&receipt)?);
-            Ok(ExitCode::Ok)
-        }
-        #[cfg(not(unix))]
-        Action::NativeComplete { .. } => {
-            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
-        }
+        Action::NativeComplete { .. } => Ok(ExitCode::Ok),
     }
 }
 
@@ -860,7 +843,7 @@ fn tail_awaits_reply(transcript: &std::path::Path) -> bool {
     let tail = String::from_utf8_lossy(&tail);
     // A window that starts inside the file and holds no completed turn may be cut through the
     // stopped turn's own record, which then parses as nothing; it cannot show the turn answered.
-    (start > 0 && crate::adapter::claude_code::completed_turn_boundary(&tail).is_none())
+    (start > 0 && crate::adapter::claude_code::ended_turn_boundary(&tail).is_none())
         || crate::adapter::claude_code::awaits_reply(&tail)
 }
 

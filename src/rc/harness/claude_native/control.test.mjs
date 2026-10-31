@@ -210,37 +210,6 @@ test("acknowledged operations do not exhaust a long session or allow old effects
   assert.deepEqual(f.latest().results, [{ id: "prompt-0", outcome: "accepted" }]);
 });
 
-test("an unanswered native interruption persists its boundary outside the cancelled turn context", async () => {
-  const f = await fixture();
-  const saved = deferred();
-  const run = f.api.process.run;
-  const completed = [];
-  f.api.process.run = async argv => {
-    if (argv[2] !== "native-complete") return run(argv);
-    completed.push(argv);
-    await saved.promise;
-    return { exitCode: 0, stdout: "{}" };
-  };
-  await f.fire("session.start");
-  await f.fire("turn.start", { turnId: "stopped" });
-  const cancelled = { env: { get: () => { throw new Error("Turn cancelled"); } },
-    process: { run: () => { throw new Error("Turn cancelled"); } } };
-  const stopping = f.fire("turn.complete", { turnId: "stopped", reason: "aborted", answer: "" },
-    async () => ({}), cancelled);
-  await flush();
-  assert.equal(completed.length, 1);
-  await f.poll();
-  assert.equal(f.latest().turn, "stopped", "completion cannot overtake its durable boundary");
-  saved.resolve();
-  await stopping;
-  await f.poll();
-  assert.equal(f.latest().turn, null);
-  assert.ok(f.latest().events.some(event => event.kind === "turn_completed" && event.turn === "stopped"));
-  await f.fire("turn.start", { turnId: "answered" });
-  await f.fire("turn.complete", { turnId: "answered", reason: "answer", answer: "Done", usage: {} });
-  assert.equal(completed.length, 1, "answered turns must wait for their native transcript flush");
-});
-
 test("model changes remain pending until native confirmation and honor live policy locks", async () => {
   const f = await fixture();
   const row = { key: "model", kind: "choice", value: "sonnet", options: ["default", "sonnet", "haiku"],

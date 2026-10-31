@@ -38,7 +38,6 @@ const operations = new Map();
 let queue = null;
 let journal = null;
 let modelChange = null;
-let recordCompletion = null;
 
 function rotate(session, cwd) {
   identity = { session, cwd, generation: randomId() };
@@ -324,13 +323,6 @@ export function registerControl(on) {
       }
       return reply;
     };
-    recordCompletion = async (target, e) => {
-      const executable = await $.env.get("AGIT_NATIVE_CONTROL_CLI") || DEFAULT_AGIT_CLI;
-      return $.process.run([executable, "hooks", "native-complete", "--session", target.session,
-        "--generation", target.generation, "--turn", e.turnId, "--reason", e.reason],
-      { cwd: target.cwd, timeoutMs: 5000,
-        ...(descriptor ? { env: { AGIT_NATIVE_CONTROL_DESCRIPTOR: descriptor } } : {}) });
-    };
     await current($);
     $.clock.every(200, () => poll($));
     return next(e);
@@ -356,17 +348,7 @@ export function registerControl(on) {
   on("turn.complete", async ($, e, next) => {
     const result = await next(e);
     if (e.agentId === undefined && turn === e.turnId) {
-      const target = identity;
-      try {
-        // An interrupted turn cancels its own APIs; the session context outlives that turn.
-        // Answered turns can flush their native reply after this hook returns.
-        if (e.reason === "aborted" && !e.usage && e.answer === "") {
-          await recordCompletion?.(target, e);
-        }
-      } catch {
-        // Native input remains usable when local archive metadata cannot be written.
-      }
-      if (!matches(target)) return result;
+      if (!matches(identity)) return result;
       turn = null;
       await event("turn_completed", { turn: e.turnId, reason: e.reason,
         duration_ms: Number.isFinite(e.durationMs) && e.durationMs >= 0 ? Math.round(e.durationMs) : undefined });

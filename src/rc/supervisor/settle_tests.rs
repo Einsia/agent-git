@@ -329,7 +329,15 @@ fn archived_turns_end_where_the_completed_only_cut_ends() {
         + &prompt("[Request interrupted by user for tool use]");
     let stream_closed =
         "Tool permission request failed: AbortError: Tool permission stream closed before response";
-    let held_stop = interrupted.clone()
+    let escaped = interrupted.clone()
+        + &prompt("another paste")
+        + &tool_call("toolu_e")
+        + &denial(
+            "toolu_e",
+            "interrupted",
+            "[Request interrupted by user for tool use]",
+        );
+    let held_stop = escaped.clone()
         + &prompt("second")
         + &tool_call("toolu_2")
         + &denial("toolu_2", "permission-rule", stream_closed);
@@ -424,6 +432,15 @@ fn archived_turns_end_where_the_completed_only_cut_ends() {
             "an interrupt queues nothing"
         );
         assert_eq!(cut(&interrupted), finished.len() as u64);
+
+        read(&mut session, &escaped);
+        retain(&session, TurnEnding::Stopped);
+        assert_eq!(
+            queued(),
+            finished.len() as u64,
+            "a turn the transcript shows the person stopped queues nothing, whoever reports it"
+        );
+        assert_eq!(cut(&escaped), finished.len() as u64);
 
         read(&mut session, &held_stop);
         exit(&mut session, true);

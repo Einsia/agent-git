@@ -41,34 +41,14 @@ fn read(path: &Path) -> crate::Result<Receipt> {
     Ok(serde_json::from_reader(file.take(super::RECORD_LIMIT))?)
 }
 
-/// The hook waits for this child before allowing another native turn to start.
-pub(crate) fn record(
-    session: &str,
-    generation: &str,
-    turn: &str,
-    reason: &str,
-) -> crate::Result<Receipt> {
-    ensure!(
-        crate::rc::native_inbox::valid_id(turn),
-        "native completion requires an exact turn UUID"
-    );
-    ensure!(reason == "aborted", "invalid native completion reason");
-    let registration = super::register(session, generation)?;
-    let transcript = registration.transcript_path()?.canonicalize()?;
-    write(session, generation, turn, transcript, None, || {
-        ensure!(
-            registration.is_registered(),
-            "native completion generation changed"
-        );
-        Ok(())
-    })
-}
-
 /// Where a turn that just ended stops in its transcript, as the completed-only cut will see it.
-pub(crate) struct TurnEnd {
-    pub(crate) at: u64,
-    /// Conversation follows the last boundary, so no cut reaches `at` yet.
-    pub(crate) open: bool,
+pub(crate) enum TurnEnd {
+    /// It closed here: at its own completion, or at an end receipt.
+    Closed(u64),
+    /// Conversation awaits a reply through here, so no cut reaches it yet.
+    Open(u64),
+    /// The person stopped it; it waits for a later turn's cut or an explicit publication.
+    Held,
 }
 
 /// A turn that ended on its own stops at its own completion; the bookkeeping Claude appends after
@@ -77,7 +57,8 @@ pub(crate) struct TurnEnd {
 /// cannot acknowledge its prompt. A `stopped` turn, one its harness stopped before completing,
 /// gets an end receipt there: Claude marks such a stop only with a tool denial or synthetic text,
 /// which also occur in turns that go on, so no transcript rule can close it, and a conversation
-/// that is never continued would never settle it.
+/// that is never continued would never settle it. A turn the transcript shows the person stopped
+/// gets no receipt, whoever reports it.
 pub(crate) fn turn_end(
     session: &str,
     transcript: &Path,
@@ -104,34 +85,26 @@ pub(crate) fn turn_end(
     .unwrap_or(0);
     let text = std::str::from_utf8(&prefix).context("native transcript is not UTF-8")?;
     if !crate::adapter::claude_code::awaits_reply(&text[closed..]) {
-        let own = crate::adapter::claude_code::completed_turn_boundary(text).unwrap_or(0);
-        return Ok(TurnEnd {
-            at: closed.max(own) as u64,
-            open: false,
+        let own = crate::adapter::claude_code::completed_turn_boundary(text)
+            .unwrap_or(0)
+            .max(closed);
+        let ended = crate::adapter::claude_code::ended_turn_boundary(text).unwrap_or(0);
+        return Ok(if ended > own {
+            TurnEnd::Held
+        } else {
+            TurnEnd::Closed(own as u64)
         });
     }
     let Some((generation, turn)) = stopped else {
-        return Ok(TurnEnd {
-            at: prefix.len() as u64,
-            open: true,
-        });
+        return Ok(TurnEnd::Open(prefix.len() as u64));
     };
     ensure!(
         crate::rc::native_inbox::valid_id(turn),
         "native completion requires an exact turn UUID"
     );
-    let receipt = write(
-        session,
-        generation,
-        turn,
-        transcript,
-        Some(prefix.len() as u64),
-        || Ok(()),
-    )?;
-    Ok(TurnEnd {
-        at: receipt.bytes,
-        open: false,
-    })
+    Ok(TurnEnd::Closed(
+        write(session, generation, turn, transcript, &prefix)?.bytes,
+    ))
 }
 
 fn read_prefix(transcript: &Path, end: u64) -> crate::Result<Vec<u8>> {
@@ -156,8 +129,7 @@ fn write(
     generation: &str,
     turn: &str,
     transcript: PathBuf,
-    end: Option<u64>,
-    current: impl FnOnce() -> crate::Result<()>,
+    bytes: &[u8],
 ) -> crate::Result<Receipt> {
     let reason = "aborted";
     let directory = directory(session, &transcript)?;
@@ -175,16 +147,10 @@ fn write(
         );
         return Ok(saved);
     }
-    let size = match end {
-        Some(end) => end,
-        None => std::fs::metadata(&transcript)?.len(),
-    };
-    let bytes = read_prefix(&transcript, size)?;
     ensure!(
         bytes.last() == Some(&b'\n'),
         "native completion has an incomplete transcript record"
     );
-    current()?;
     let receipt = Receipt {
         version: 1,
         session: session.into(),
@@ -192,14 +158,14 @@ fn write(
         turn: turn.into(),
         reason: reason.into(),
         transcript,
-        bytes: size,
-        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes: bytes.len() as u64,
+        sha256: hex::encode(Sha256::digest(bytes)),
     };
     let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
     serde_json::to_writer(&mut temporary, &receipt)?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    // A repeated callback must never move the original turn boundary into a later turn.
+    // A repeated stop must never move the original turn boundary into a later turn.
     match temporary.persist_noclobber(&path) {
         Ok(_) => {}
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {

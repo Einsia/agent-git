@@ -26,7 +26,7 @@ impl Session {
     /// Queues the archive of a turn that ended, through the end its completed-only cut will reach.
     ///
     /// Only a harness this supervisor starts and reaps gets an end receipt for a stopped turn: an
-    /// attached Claude outlives the supervisor, and its plugin ends its own turns.
+    /// attached Claude outlives the supervisor and goes on to close its own transcript.
     pub(super) fn retain_completed_archive(
         &self,
         turn_id: &str,
@@ -51,16 +51,13 @@ impl Session {
                 let stopped = (ending == TurnEnding::Stopped
                     && matches!(self.driver, AnyDriver::ClaudeCode(_)))
                 .then_some((generation.as_str(), turn_id));
-                let end = crate::rc::native_claude::completion::turn_end(
-                    &native,
-                    tailer.path(),
-                    boundary,
-                    stopped,
-                )?;
-                if end.open && ending == TurnEnding::Interrupted {
-                    return Ok(());
+                use crate::rc::native_claude::completion::{TurnEnd, turn_end};
+                match turn_end(&native, tailer.path(), boundary, stopped)? {
+                    TurnEnd::Closed(at) => at,
+                    TurnEnd::Open(_) if ending == TurnEnding::Interrupted => return Ok(()),
+                    TurnEnd::Open(at) => at,
+                    TurnEnd::Held => return Ok(()),
                 }
-                end.at
             }
             _ => boundary,
         };
