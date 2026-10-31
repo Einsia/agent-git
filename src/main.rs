@@ -78,10 +78,27 @@ fn main() {
         return;
     }
     agit::telemetry::begin(&raw_args, telemetry_restart.as_deref());
-    let code = run(raw_args);
+    let hook = hook_invocation(&raw_args);
+    let mut code = run(raw_args);
+    // Hook runtimes read exit 2 as "block, and hand stderr to the model". No outcome of a hook
+    // means that, so a usage failure leaves a hook as a plain failure.
+    if hook && code == agit::ExitCode::Usage.as_i32() {
+        code = agit::ExitCode::Failure.as_i32();
+    }
     agit::domain::privacy::service::shutdown();
     agit::telemetry::finish(code);
     exit(code);
+}
+
+/// Whether a runtime started this process as a hook. Judged from argv before parsing, so an
+/// argument this build cannot parse is still a hook's failure: every hook command agit writes
+/// starts with `hooks`, and the retired Stop hook is `commit --from-hook`.
+fn hook_invocation(raw_args: &[std::ffi::OsString]) -> bool {
+    match raw_args.get(1).and_then(|arg| arg.to_str()) {
+        Some("hooks") => true,
+        Some("commit") => raw_args.iter().any(|arg| arg == "--from-hook"),
+        _ => false,
+    }
 }
 
 fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {

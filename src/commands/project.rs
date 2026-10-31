@@ -730,19 +730,73 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
             .filter(|d| d["level"] == "error")
             .filter_map(|d| d["message"].as_str())
             .collect();
-        anyhow::bail!(
-            "{}",
-            if messages.is_empty() {
-                format!(
-                    "`agit {}` failed",
-                    arguments.first().map_or("command", String::as_str)
-                )
-            } else {
-                messages.join("; ")
-            }
-        );
+        let said = if messages.is_empty() {
+            format!(
+                "`agit {}` failed",
+                arguments.first().map_or("command", String::as_str)
+            )
+        } else {
+            messages.join("; ")
+        };
+        return Err(anyhow::Error::new(ChildFailed {
+            exit_code: output.status.code(),
+            message: said,
+        }));
     }
     Ok(value)
+}
+
+/// A child command that failed, with the category its exit status reports.
+#[derive(Debug)]
+struct ChildFailed {
+    exit_code: Option<i32>,
+    /// What the child reported, which is all a person is shown of the failure.
+    message: String,
+}
+
+impl std::fmt::Display for ChildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ChildFailed {}
+
+/// Why an automatic upload failed, in words that carry nothing of the error itself. The reason is
+/// shown in the conversation, and a Hub response or an error chain can hold URLs with query
+/// tokens, header values or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UploadFailure {
+    SignedOut,
+    Hub,
+    PrivacyIncomplete,
+    Other,
+}
+
+impl UploadFailure {
+    fn of(error: &anyhow::Error, project: &Project) -> Self {
+        let code = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ChildFailed>())
+            .and_then(|failed| failed.exit_code);
+        match code {
+            Some(code) if code == ExitCode::Auth.as_i32() => Self::SignedOut,
+            Some(code) if code == ExitCode::Network.as_i32() => Self::Hub,
+            Some(code) if code == ExitCode::Policy.as_i32() => Self::PrivacyIncomplete,
+            _ if sign_in(project) == SignIn::Absent => Self::SignedOut,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::SignedOut => "agit is signed out; run `agit login` and the next turn uploads it",
+            Self::Hub => "the Hub could not be reached or refused it",
+            Self::PrivacyIncomplete => "its privacy check did not complete",
+            Self::Other => "it could not be completed on this computer",
+        }
+    }
 }
 
 /// A project can publish only its own claims; foreign claims retain their source authority.
@@ -1618,12 +1672,19 @@ pub(crate) fn earlier_count(root: &Path) -> usize {
         .count()
 }
 
+/// Whether a project captures this runtime's conversations by itself: only the runtimes whose
+/// hooks call [`capture`]. Any other runtime's conversation is saved only when someone imports it,
+/// so telling its agent the project saves it would leave it unsaved.
+fn captured_runtime(runtime: &str) -> bool {
+    matches!(runtime, "codex" | "claude-code")
+}
+
 /// Exact hook identity remains authoritative; a project policy never overrides another claim.
 pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result<bool> {
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
         return Ok(false);
     };
-    if !matches!(runtime, "codex" | "claude-code") {
+    if !captured_runtime(runtime) {
         return Ok(false);
     }
     let Some((project, _)) = governing(&cwd)? else {
@@ -1871,9 +1932,14 @@ fn capture_candidate(mut project: Project, candidate: Candidate, let_in: bool) -
     {
         let _ = record_caught(&project.root, &candidate, modified);
     }
+    let reason = result
+        .as_ref()
+        .err()
+        .map(|error| UploadFailure::of(error, &project));
     project.last_result = Some(serde_json::json!({
         "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),
+        "reason": reason,
         "head": result.as_ref().ok().and_then(|(_, head)| head.as_deref()),
     }));
     save(&project)?;
@@ -2595,22 +2661,59 @@ pub(crate) struct AutomaticUpload {
     pub(crate) org: Option<bool>,
     /// Whether every member of that organization reads it, when known.
     pub(crate) members_read: Option<bool>,
+    pub(crate) sign_in: SignIn,
     /// The git worktree the conversation started in and the main checkout whose setting uploads
     /// it, when it started in one.
     pub(crate) worktree: Option<(PathBuf, PathBuf)>,
 }
 
-/// The repository a project uploads this conversation to by itself, judged by the folder the
-/// conversation started in. `None` when no project there uploads automatically, the conversation
-/// is excluded, or it records into another repository. Who can see it is the Hub's answer within
-/// `wait`, recorded for later, or else the last recorded answer; the requests never renew
-/// credentials, so a caller may run them inside a hook.
-pub(crate) fn automatic_upload(
-    runtime: &str,
-    session: &str,
-    origin: &Path,
-    wait: std::time::Duration,
-) -> Option<AutomaticUpload> {
+/// What the saved sign-in lets a project do on this device, judged without asking the Hub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignIn {
+    /// Signed in as the project's account, and the sign-in can still be renewed.
+    Current,
+    /// Signed in as the project's account, but the sign-in can no longer be renewed: turns are
+    /// still saved on this device, and their upload waits for `agit login`.
+    Expired,
+    /// Not signed in as the project's account on its Hub: the project neither saves nor uploads
+    /// until `agit login`.
+    Absent,
+}
+
+fn sign_in(project: &Project) -> SignIn {
+    match credentials::load_checked(&project.identity.hub) {
+        Ok(Some(credential))
+            if credential.username == project.account
+                && credential.account_id == project.account_id =>
+        {
+            if credential.refresh_expired() {
+                SignIn::Expired
+            } else {
+                SignIn::Current
+            }
+        }
+        _ => SignIn::Absent,
+    }
+}
+
+impl SignIn {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Expired => "expired",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// The project that saves this conversation by itself, and how it covers the folder the
+/// conversation started in, judged without asking the Hub. `None` when no project there uploads
+/// automatically, the runtime is not one a project captures, the project withholds the
+/// conversation (see [`withholds`]), or it records into another repository.
+fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Via)> {
+    if !captured_runtime(runtime) {
+        return None;
+    }
     let (project, via) = governing(origin).ok()??;
     let candidate = Candidate {
         runtime: runtime.into(),
@@ -2632,9 +2735,35 @@ pub(crate) fn automatic_upload(
                     link.agent.as_deref().unwrap_or_default()
                 ) != project.repository
         });
-    if claimed_elsewhere {
-        return None;
-    }
+    (!claimed_elsewhere).then_some((project, via))
+}
+
+/// The repository a project saves this conversation into by itself, and what the sign-in lets it
+/// do, read from local state alone.
+pub(crate) fn automatic_capture(
+    runtime: &str,
+    session: &str,
+    origin: &Path,
+) -> Option<(String, SignIn)> {
+    let origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    let (project, _) = capturing(runtime, session, &origin)?;
+    let sign_in = sign_in(&project);
+    Some((project.repository, sign_in))
+}
+
+/// The repository a project uploads this conversation to by itself, judged by the folder the
+/// conversation started in, as [`capturing`] judges it. Who can see it is the Hub's answer within
+/// `wait`, recorded for later, or else the last recorded answer; the requests never renew
+/// credentials, so a caller may run them inside a hook.
+pub(crate) fn automatic_upload(
+    runtime: &str,
+    session: &str,
+    origin: &Path,
+    wait: std::time::Duration,
+) -> Option<AutomaticUpload> {
+    let (project, via) = capturing(runtime, session, origin)?;
     let recorded = recorded_audience(&project.root);
     let answered = crate::hub::Client::from_env_with_live_access(wait)
         .filter(|client| {
@@ -2668,16 +2797,44 @@ pub(crate) fn automatic_upload(
         }
         None => recorded,
     };
+    let sign_in = sign_in(&project);
     Some(AutomaticUpload {
         visibility: audience.visibility.filter(|v| !v.is_empty()),
         org: audience.org,
         members_read: audience.members_read,
+        sign_in,
         worktree: match via {
             Via::Worktree(worktree) => Some((worktree, project.root)),
             Via::Folder => None,
         },
         repository: project.repository,
     })
+}
+
+/// The repository and reason of the last automatic upload by the project that saves this
+/// conversation, when it failed and no conversation has been told yet. Each failure is told once:
+/// the upload runs detached after its turn, so only a later turn can tell it, and repeating it on
+/// every turn would bury the next one.
+pub(crate) fn unreported_failure(
+    runtime: &str,
+    session: &str,
+    origin: &Path,
+) -> Option<(String, UploadFailure)> {
+    let (project, _) = capturing(runtime, session, origin)?;
+    let last = project.last_result.as_ref()?;
+    if last["ok"] != false {
+        return None;
+    }
+    let reason = serde_json::from_value::<UploadFailure>(last["reason"].clone()).ok()?;
+    let at = last["at"].as_str()?;
+    let reported = state_path(&project.root).ok()?.with_extension("reported");
+    if fs::read_to_string(&reported).ok().as_deref() == Some(at) {
+        return None;
+    }
+    let mut file = tempfile::NamedTempFile::new_in(home().ok()?).ok()?;
+    file.write_all(at.as_bytes()).ok()?;
+    file.persist(&reported).ok()?;
+    Some((project.repository, reason))
 }
 
 fn caught_path(root: &Path) -> Result<PathBuf> {
@@ -3489,7 +3646,9 @@ mod tests {
     }
 
     /// A conversation is announced as uploading only where the project would upload it: started
-    /// inside an automatic project, not excluded, not recording into another repository. The
+    /// inside an automatic project by a runtime whose hooks capture it, not excluded, not recording
+    /// into another repository. A judgement without the runtime check tells an OpenCode agent the
+    /// project saves its conversation, and hides the import that would. The
     /// visibility comes from the Hub or its last recorded answer, never a default; this policy's
     /// Hub is not the configured one, so no request is sent.
     #[test]
@@ -3508,6 +3667,8 @@ mod tests {
             automatic_upload("codex", id, origin, wait).map(|upload| upload.repository)
         };
         assert_eq!(announced("fresh", &inside).as_deref(), Some("alice/app"));
+        assert!(automatic_capture("codex", "fresh", &inside).is_some());
+        assert!(automatic_capture("opencode", "fresh", &inside).is_none());
         assert!(announced("excluded", &inside).is_none());
         assert!(announced("fresh", policy.root.parent().unwrap()).is_none());
         let store = Store::at(config::store_root().unwrap());

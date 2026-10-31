@@ -378,7 +378,21 @@ fn print_runtime_sessions(sessions: &[super::context::RuntimeSession], with_note
                 None if one.managed => {
                     println!("  {}", ui::dim("saved to: no active complete claim"))
                 }
-                None => println!("  {}", ui::dim("saved to: not saved yet")),
+                None => match &one.project {
+                    Some((repository, sign_in)) => println!(
+                        "  {}",
+                        ui::dim(&format!(
+                            "saved to: {repository} at the end of each turn, by this folder's project{}",
+                            match sign_in {
+                                super::project::SignIn::Current => "",
+                                super::project::SignIn::Expired =>
+                                    " (uploads wait for `agit login`)",
+                                super::project::SignIn::Absent => " (once agit is signed in)",
+                            }
+                        ))
+                    ),
+                    None => println!("  {}", ui::dim("saved to: not saved yet")),
+                },
             }
         }
         many => {
