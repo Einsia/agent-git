@@ -479,6 +479,43 @@ fn inherited_drops(folder: &Path) -> Result<BTreeSet<String>> {
     })
 }
 
+/// What a new binding of `folder` keeps of what the person dropped there (#266): the drops of the
+/// policy it replaces (another repository's, on `--rebind`), of the policy a move to another
+/// repository released (`agit on --repo`), and of the policy that covered it until now.
+fn kept_drops(folder: &Path) -> Result<BTreeSet<String>> {
+    let mut drops = inherited_drops(folder)?;
+    if let Some(replaced) = read(folder)? {
+        drops.extend(replaced.excluded);
+    }
+    drops.extend(moved_drops(folder)?);
+    Ok(drops)
+}
+
+/// The drops of the policy that `unbind_for_move` released at `root`, kept until the binding that
+/// completes the move takes them over, or the move is undone. A record that cannot be read is an
+/// error, never an empty set: binding without the drops would lose them, and the record stays.
+fn moved_drops(root: &Path) -> Result<BTreeSet<String>> {
+    let path = state_path(root)?.with_extension("moved-drops");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "cannot read what was dropped before the folder moved ({})",
+                    path.display()
+                )
+            });
+        }
+    };
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "cannot read what was dropped before the folder moved ({})",
+            path.display()
+        )
+    })
+}
+
 /// The linked git worktrees the policy at `root` covers now.
 pub(crate) fn covered_worktrees(root: &Path) -> Vec<PathBuf> {
     match read(root) {
@@ -1177,7 +1214,7 @@ fn bind(
             project.earlier = existing.earlier;
         }
     }
-    project.excluded.extend(inherited_drops(&root)?);
+    project.excluded.extend(kept_drops(&root)?);
     if history == History::None {
         // Earlier sessions stay out whether or not another repository claims them; only a
         // session already claimed in this repository keeps publishing here. Those of the
@@ -1299,6 +1336,12 @@ fn bind(
     }
     workspace::bind(&root, repository, rebind)?;
     save(&project)?;
+    // The new policy holds what a move released; the record of it has done its work.
+    match fs::remove_file(state_path(&root)?.with_extension("moved-drops")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     drop(repository_guard);
     record_audience(&root, &audience)?;
     // Binding starts the folder's coverage of its git worktrees afresh: with its history, from
@@ -1341,7 +1384,7 @@ pub(crate) struct Routing {
 
 impl Routing {
     fn paths(root: &Path) -> Result<Vec<PathBuf>> {
-        let mut paths: Vec<PathBuf> = ["json", "caught", "catch-up", "worktrees"]
+        let mut paths: Vec<PathBuf> = ["json", "caught", "catch-up", "worktrees", "moved-drops"]
             .iter()
             .map(|extension| Ok(state_path(root)?.with_extension(extension)))
             .collect::<Result<_>>()?;
@@ -1415,7 +1458,20 @@ pub(crate) fn unbind_for_move(root: &Path) -> Result<Routing> {
         };
         files.push((path, bytes));
     }
-    let policy = read(root)?.map(|project| project.repository);
+    let released = read(root)?;
+    // What the person dropped here stays dropped in the repository the folder moves to: the
+    // binding that completes the move takes these over (#266). A move that is undone puts the
+    // policy back and removes this record with the other routing files.
+    if let Some(drops) = released.as_ref().map(|project| &project.excluded)
+        && !drops.is_empty()
+    {
+        let mut file = tempfile::NamedTempFile::new_in(home()?)?;
+        file.write_all(&serde_json::to_vec(drops)?)?;
+        file.as_file().sync_all()?;
+        file.persist(state_path(root)?.with_extension("moved-drops"))
+            .map_err(|e| e.error)?;
+    }
+    let policy = released.map(|project| project.repository);
     let binding = workspace::read(root).map(|binding| binding.repo);
     for (path, _) in files.iter().take(3) {
         match fs::remove_file(path) {
@@ -3601,6 +3657,81 @@ mod tests {
         policy.auto_upload = false;
         save(&policy).unwrap();
         assert!(announced("fresh", &inside).is_none());
+    }
+
+    /// What the person dropped in a folder stays dropped when the folder moves to another
+    /// repository (`agit on --repo`, #266) or is bound to one with `--rebind`: the binding that
+    /// completes the move starts from the drops of the policy it replaces. A move that is undone
+    /// puts the policy back, drops included, and leaves no record behind. A move that forgot them
+    /// would count a dropped conversation as an earlier session, and `agit save --all` would upload
+    /// it to the new repository.
+    #[test]
+    fn a_move_to_another_repository_keeps_what_the_person_dropped() {
+        if !isolated("a_move_to_another_repository_keeps_what_the_person_dropped") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        let dropped = "dddddddd-0000-4000-8000-000000000051";
+        policy.excluded.insert(key("claude-code", dropped));
+        save(&policy).unwrap();
+        workspace::bind(&policy.root, &policy.repository, false).unwrap();
+        let record = state_path(&policy.root)
+            .unwrap()
+            .with_extension("moved-drops");
+
+        // `--rebind` replaces the policy in place: its drops come along.
+        assert!(
+            kept_drops(&policy.root)
+                .unwrap()
+                .contains(&key("claude-code", dropped))
+        );
+
+        // A move releases the policy first; the drops wait for the binding that completes it.
+        let previous = unbind_for_move(&policy.root).unwrap();
+        assert!(read(&policy.root).unwrap().is_none());
+        assert_eq!(moved_drops(&policy.root).unwrap(), policy.excluded);
+        assert!(
+            kept_drops(&policy.root)
+                .unwrap()
+                .contains(&key("claude-code", dropped))
+        );
+        // Undone, the folder is as it was, and the record is gone.
+        previous.restore(&policy.root, "alice/other").unwrap();
+        assert_eq!(
+            read(&policy.root).unwrap().unwrap().excluded,
+            policy.excluded
+        );
+        assert!(!record.exists());
+
+        // Completed: the new repository's policy starts from them, as bind builds it, so a save
+        // that asks for earlier sessions refuses the dropped one and only naming it lets it in.
+        let _previous = unbind_for_move(&policy.root).unwrap();
+        let mut moved = project(&policy.root);
+        moved.repository = "alice/other".into();
+        moved.excluded.extend(kept_drops(&policy.root).unwrap());
+        save(&moved).unwrap();
+        let session = || {
+            (
+                "claude-code".to_string(),
+                dropped.to_string(),
+                policy.root.clone(),
+            )
+        };
+        let saved = save_now(&policy.root, &[session()], true, false).unwrap();
+        assert!(
+            matches!(&saved[..], [Saved::Failed(why)] if why.contains("agit project drop")),
+            "a dropped session was let in after the move"
+        );
+        let _ = save_now(&policy.root, &[session()], false, true).unwrap();
+        assert!(!is_dropped(&policy.root, "claude-code", dropped));
+
+        // A record that cannot be read stops the binding instead of going ahead without the drops,
+        // and it stays for the next try.
+        fs::write(&record, b"not a list").unwrap();
+        let error = kept_drops(&policy.root).unwrap_err();
+        assert!(format!("{error:#}").contains("moved-drops"), "{error:#}");
+        assert!(record.exists());
     }
 
     /// Moving a folder to another repository releases its routing first; a move that then fails
