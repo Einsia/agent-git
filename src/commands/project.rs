@@ -378,6 +378,17 @@ fn nearest(path: &Path) -> Result<Option<Project>> {
     Ok(None)
 }
 
+/// Whether `path` lies in an agit project folder or a bound workspace, where what is written can
+/// be captured by automatic upload.
+pub(crate) fn covers(path: &Path) -> Result<bool> {
+    for ancestor in path.ancestors() {
+        if read(ancestor)?.is_some() || workspace::read(ancestor).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `path` is in the project's folder and no folder between them is set up on its own.
 fn within(project: &Project, path: &Path) -> Result<bool> {
     if !path.starts_with(&project.root) {

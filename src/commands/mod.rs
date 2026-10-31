@@ -62,6 +62,7 @@ pub mod tag;
 pub mod activity;
 pub mod diff;
 pub mod log;
+pub mod month;
 pub mod show;
 pub mod view;
 
@@ -1341,6 +1342,8 @@ pub enum Commands {
     Search(Box<search::Args>),
     /// Query a person's saved conversations by account and time.
     Activity(Box<activity::Args>),
+    /// Write your month in an organization with your own agent and put it on the Hub
+    Month(month::Args),
     /// Create a read-only link to a conversation
     Share(share::Args),
     /// Choose session publication modes, manage original access, and configure privacy policy
@@ -1413,6 +1416,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Pull(_) => "pull",
         Commands::Search(_) => "search",
         Commands::Activity(_) => "activity",
+        Commands::Month(_) => "month",
         Commands::Share(_) => "share",
         Commands::Privacy(_) => "privacy",
         Commands::Pr(_) => "pr",

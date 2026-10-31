@@ -907,6 +907,58 @@ impl Client {
         })
     }
 
+    // ── Month summaries ────────────────────────────────────────────
+
+    fn month_path(org: &str, month: &str) -> String {
+        format!(
+            "api/orgs/{}/activity/months/{}",
+            urlencode(org),
+            urlencode(month)
+        )
+    }
+
+    /// The caller's own month in `org`; `None` while it was never built.
+    pub fn month(&self, org: &str, month: &str) -> Result<Option<serde_json::Value>> {
+        match self.get(&Self::month_path(org, month)) {
+            Ok(view) => Ok(Some(view)),
+            Err(error)
+                if error
+                    .downcast_ref::<ApiError>()
+                    .is_some_and(|api| api.status == 404) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Asks the Hub to build, or rebuild, the caller's own month in `org`.
+    pub fn month_build(&self, org: &str, month: &str) -> Result<serde_json::Value> {
+        self.post(&Self::month_path(org, month), &serde_json::json!({}))
+    }
+
+    /// Puts the caller's own text on the section of repository `repository_id` in their month,
+    /// naming the sessions it was written from and the section `version` their draft read. The
+    /// Hub refuses it with 409 when the section changed since.
+    pub fn month_put_authored(
+        &self,
+        org: &str,
+        month: &str,
+        repository_id: &str,
+        version: &str,
+        text: &str,
+        sources: &[String],
+    ) -> Result<serde_json::Value> {
+        self.put(
+            &format!(
+                "{}/sections/{}/author",
+                Self::month_path(org, month),
+                urlencode(repository_id)
+            ),
+            &serde_json::json!({ "text": text, "sources": sources, "version": version }),
+        )
+    }
+
     // ── PR ─────────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
