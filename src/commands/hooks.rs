@@ -55,6 +55,7 @@
 //! settings.json needs no rewrite.
 
 use super::CmdResult;
+use super::project::SignIn;
 use crate::ExitCode;
 use crate::domain::{link, link::Link, store::Store, workspace};
 use clap::{Args as ClapArgs, Subcommand};
@@ -619,10 +620,30 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     if !announces_upload(rt, ev.source) {
         return None;
     }
-    let upload = origin.and_then(|origin| {
-        super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
-    })?;
-    Some(serde_json::json!({ "systemMessage": upload_notice(&upload) }))
+    let notice = origin
+        .and_then(|origin| {
+            super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
+        })
+        .map(|upload| upload_notice(&upload));
+    let failure = origin.and_then(|origin| failure_line(rt, &ev.session_id, origin));
+    let message = match (notice, failure) {
+        (Some(notice), Some(failure)) => format!("{notice}\n{failure}"),
+        (notice, failure) => notice.or(failure)?,
+    };
+    Some(serde_json::json!({ "systemMessage": message }))
+}
+
+/// One line for the person when the last automatic upload of this folder's project failed, said
+/// once per failure, with a reason from a fixed set and nothing of the error itself.
+fn failure_line(runtime: &str, session: &str, origin: &std::path::Path) -> Option<String> {
+    let origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    let (repository, failure) = super::project::unreported_failure(runtime, session, &origin)?;
+    Some(format!(
+        "agit: the last automatic upload to {repository} failed: {}.",
+        failure.describe()
+    ))
 }
 
 /// How long a SessionStart waits for the Hub to confirm who can see the destination.
@@ -659,6 +680,7 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
         (Some(visibility), _) => visibility.to_owned(),
         (None, _) => "visibility not confirmed".to_owned(),
     };
+    let repository = &upload.repository;
     let because = match &upload.worktree {
         Some((worktree, main)) => format!(
             ", because {} is a git worktree of {}",
@@ -667,10 +689,19 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
         ),
         None => String::new(),
     };
-    format!(
-        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it).",
-        upload.repository
-    )
+    // A signed-out notice says what signing in will do, so the turns held meanwhile do not reach
+    // their audience by surprise when the person signs in.
+    match upload.sign_in {
+        SignIn::Current => format!(
+            "agit: this conversation is uploaded to {repository} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+        ),
+        SignIn::Expired => format!(
+            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to {repository} ({audience}) as before{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+        ),
+        SignIn::Absent => format!(
+            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to {repository} ({audience}){because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+        ),
+    }
 }
 
 /// Write the binding into the harness's "session environment" file.
@@ -806,6 +837,30 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         return Ok(());
     };
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
+    // Claude Code shows a Stop hook's `systemMessage` to the person and does not continue the
+    // turn for it; the detached settlement holds no pipe of the runtime and cannot say anything.
+    let failure = (!await_reply && rt == "claude-code")
+        .then(|| session_origin(&ev))
+        .flatten()
+        .and_then(|origin| failure_line(rt, &ev.session_id, std::path::Path::new(&origin)));
+    let Some(failure) = failure else {
+        return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
+    };
+    println!("{}", serde_json::json!({ "systemMessage": failure }));
+    // Claude Code reads the hook's whole stdout as that one response, so the settlement's own
+    // notices go to stderr.
+    crate::ui::with_info_on_stderr(true, || {
+        settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
+    })
+}
+
+fn settle_event(
+    runtime: Option<&str>,
+    await_reply: bool,
+    payload: Option<&str>,
+    ev: Event,
+    rt: &'static str,
+) -> crate::Result<()> {
     let archive_store = super::commit::archive::process_store()?;
     if archive_store.is_none() && side_conversation(rt, &ev) {
         return Ok(());
@@ -824,7 +879,7 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
             wait_for_reply(transcript, prompt);
         } else if tail_awaits_reply(transcript, prompt)
             && concerns_settlement(&store, rt, &ev)
-            && let Some(payload) = payload.as_deref()
+            && let Some(payload) = payload
             && spawn_awaiting_settlement(runtime, payload).is_ok()
         {
             return Ok(());
@@ -1000,7 +1055,7 @@ fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::R
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, Source, decide};
+    use super::{Decision, SignIn, Source, decide};
     use clap::Parser as _;
 
     /// The Stop hook reads only the transcript's end, so an unanswered record longer than that
@@ -1384,6 +1439,9 @@ mod tests {
     /// message gets none. The line names who can see the repository without guessing, every
     /// member of the organization when its base permission reads, and a stop the person can take
     /// without having told the agent anything.
+    /// Signed out, it says that nothing is uploaded now and what `agit login` will then upload and
+    /// to whom; a notice that still promised an upload would hide the stop, and one that left out
+    /// the login would let the held turns reach their audience by surprise.
     #[test]
     fn an_automatic_upload_is_announced_at_every_start() {
         for runtime in ["claude-code", "codex"] {
@@ -1393,12 +1451,31 @@ mod tests {
             assert!(!super::announces_upload(runtime, Source::Compact));
         }
         assert!(!super::announces_upload("workbuddy", Source::Startup));
+        let signed = |sign_in, visibility: Option<&str>| {
+            super::upload_notice(&crate::commands::project::AutomaticUpload {
+                repository: "acme/widget".into(),
+                visibility: visibility.map(str::to_owned),
+                org: Some(true),
+                members_read: None,
+                sign_in,
+                worktree: None,
+            })
+        };
+        assert_eq!(
+            signed(SignIn::Expired, Some("public")),
+            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to acme/widget (public: anyone can read it) as before. Not this one? Run `agit project drop` (or ask your agent to run it)."
+        );
+        assert_eq!(
+            signed(SignIn::Absent, Some("private")),
+            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to acme/widget (private to acme: its owners and the people granted access can read it). Not this one? Run `agit project drop` (or ask your agent to run it)."
+        );
         let notice_reading = |visibility: Option<&str>, org: Option<bool>, members_read| {
             super::upload_notice(&crate::commands::project::AutomaticUpload {
                 repository: "acme/widget".into(),
                 visibility: visibility.map(str::to_owned),
                 org,
                 members_read,
+                sign_in: SignIn::Current,
                 worktree: None,
             })
         };
@@ -1426,6 +1503,7 @@ mod tests {
             visibility: Some("private".into()),
             org: Some(false),
             members_read: None,
+            sign_in: SignIn::Current,
             worktree: Some(("/w/widget-tree".into(), "/w/widget".into())),
         });
         assert!(

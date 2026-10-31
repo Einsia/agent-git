@@ -1050,6 +1050,29 @@ fn main_branch_target_is_refused_before_adoption() {
     assert_eq!(lab.local_state(), before);
 }
 
+/// No hook exits 2: Claude Code reads a Stop hook's exit 2 as "block, and hand stderr to the
+/// model", which would turn a hook's own failure into the agent's next instruction. An argument
+/// this build cannot parse is the usage failure no dispatch-level mapping can reach, so a mapping
+/// inside `hooks` alone lets clap's 2 through. Outside a hook the same failure keeps exit 2, so a
+/// mapping applied to every command fails too.
+#[test]
+fn hook_usage_failure_exits_as_plain_failure() {
+    let lab = Lab::new();
+    for args in [
+        ["hooks", "settle", "--no-such-flag"],
+        ["commit", "--from-hook", "--no-such-flag"],
+    ] {
+        let output = lab.agit(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--no-such-flag"),
+            "{output:?}"
+        );
+    }
+    let output = lab.agit(&["status", "--no-such-flag"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
 /// Inherited supervisor routing cannot make a runtime helper own the parent branch.
 #[test]
 fn supervised_start_hooks_leave_native_registration_to_the_supervisor() {

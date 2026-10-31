@@ -190,6 +190,9 @@ pub struct RuntimeSession {
     pub managed: bool,
     /// `<owner>/<repo>@<branch>` of an active complete claim; `agit commit` accepts it verbatim.
     pub target: Option<String>,
+    /// The repository the folder's project saves this unclaimed conversation into by itself at
+    /// the end of each turn, and what the sign-in lets it do.
+    pub(crate) project: Option<(String, super::project::SignIn)>,
 }
 
 impl RuntimeSession {
@@ -197,6 +200,9 @@ impl RuntimeSession {
         serde_json::json!({
             "runtime": self.runtime, "session_id": self.session_id, "variable": self.variable,
             "managed": self.managed, "target": self.target,
+            "project": self.project.as_ref().map(|(repository, sign_in)| serde_json::json!({
+                "repository": repository, "sign_in": sign_in.name(),
+            })),
         })
     }
 }
@@ -220,12 +226,27 @@ pub fn runtime_sessions() -> Vec<RuntimeSession> {
                         claim.branch.as_deref()?
                     ))
                 });
+            let managed = claim.as_ref().is_some_and(link::is_managed);
+            // The hook records an unclaimed conversation with the folder it started in; a
+            // conversation it has not recorded yet is judged by the folder the command runs in.
+            let project = (target.is_none() && !managed)
+                .then(|| {
+                    claim
+                        .as_ref()
+                        .and_then(|claim| claim.cwd.as_deref().map(std::path::PathBuf::from))
+                        .or_else(|| std::env::current_dir().ok())
+                })
+                .flatten()
+                .and_then(|origin| {
+                    super::project::automatic_capture(named.runtime, &named.session_id, &origin)
+                });
             RuntimeSession {
                 variable: named.variable,
                 runtime: named.runtime,
                 session_id: named.session_id,
-                managed: claim.as_ref().is_some_and(link::is_managed),
+                managed,
                 target,
+                project,
             }
         })
         .collect()
@@ -240,19 +261,39 @@ pub fn runtime_session_note(sessions: &[RuntimeSession]) -> Option<String> {
     use crate::ui::session::shell_arg;
     match sessions {
         [] => None,
-        [one] => Some(match &one.target {
-            Some(target) => format!(
+        [one] => Some(match (&one.target, &one.project) {
+            (Some(target), _) => format!(
                 "this conversation ({} {}, from {}) is already saved at {target}; when the user asks, save its new turns with `agit commit {quoted}`, and publish them with `agit push {quoted}` only when the user asks to — do not import another session in its place",
                 one.runtime,
                 one.session_id,
                 one.variable,
                 quoted = shell_arg(target)
             ),
-            None if one.managed => format!(
+            (None, _) if one.managed => format!(
                 "this conversation ({} {}, from {}) has an incomplete or superseded claim; inspect it in `agit status` before importing anything",
                 one.runtime, one.session_id, one.variable
             ),
-            None => format!(
+            // The project saves it when a turn ends, so during its first turn it has no claim yet.
+            // An import now would claim it elsewhere, and the project leaves a conversation
+            // claimed elsewhere to that claim.
+            (None, Some((repository, sign_in))) => {
+                let saved = match sign_in {
+                    super::project::SignIn::Current => format!(
+                        "is saved automatically into {repository} at the end of each turn by this folder's project"
+                    ),
+                    super::project::SignIn::Expired => format!(
+                        "is saved automatically for {repository} at the end of each turn by this folder's project, and uploads after `agit login`"
+                    ),
+                    super::project::SignIn::Absent => format!(
+                        "is saved into {repository} by this folder's project once agit is signed in (`agit login`)"
+                    ),
+                };
+                format!(
+                    "this conversation ({} {}, from {}) {saved}; do not import it",
+                    one.runtime, one.session_id, one.variable
+                )
+            }
+            (None, None) => format!(
                 "this conversation is {} {} (from {}) and is not saved yet; save it with `agit import {} --from {} --into <owner>/<repo>@<branch>`",
                 one.runtime,
                 one.session_id,
@@ -450,5 +491,41 @@ mod tests {
         assert_eq!(slug_for("qa", None, Some("me")), "me/qa");
         assert_eq!(slug_for("qa", None, None), "local/qa");
         assert!(super::super::parse_slug(&slug_for("qa", None, None)).is_ok());
+    }
+
+    /// A conversation the folder's project saves has no claim until its first turn ends, and an
+    /// agent asked about it then must be told the project saves it, never to import it: an import
+    /// claims it elsewhere, and the project stops uploading it. Signed out, the note still says
+    /// what `agit login` does. A conversation no project saves keeps the import advice.
+    #[test]
+    fn a_conversation_the_project_saves_is_never_sent_to_import() {
+        use crate::commands::project::SignIn;
+        let session = |project| RuntimeSession {
+            variable: "CLAUDE_CODE_SESSION_ID",
+            runtime: "claude-code",
+            session_id: "S1".into(),
+            managed: false,
+            target: None,
+            project,
+        };
+        for sign_in in [SignIn::Current, SignIn::Expired, SignIn::Absent] {
+            let note =
+                runtime_session_note(&[session(Some(("acme/widget".into(), sign_in)))]).unwrap();
+            assert!(
+                note.contains("acme/widget") && note.ends_with("do not import it"),
+                "{note}"
+            );
+            assert!(!note.contains("agit import"), "{note}");
+            assert_eq!(
+                note.contains("agit login"),
+                sign_in != SignIn::Current,
+                "{note}"
+            );
+        }
+        assert!(
+            runtime_session_note(&[session(None)])
+                .unwrap()
+                .contains("agit import")
+        );
     }
 }
