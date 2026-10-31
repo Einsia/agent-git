@@ -525,6 +525,43 @@ impl Daemon {
                 .unwrap())
             }
 
+            method::SESSION_STOP | method::SESSION_CLOSE => {
+                let p: crate::protocol::SessionStop = f.params_as()?;
+                // A brake, like interrupt: anyone who may instruct the session may stop it,
+                // including on a session whose writer runs in a dangerous mode. Close is
+                // owner-only by `min_role`, checked above before anything here answers. A live
+                // session of another workspace counts as not running, so close tells an unknown
+                // id from someone else's live one no better than any other verb does.
+                let closed = f.method() == method::SESSION_CLOSE;
+                if closed
+                    && !self.sessions.get(&p.session_id).is_some_and(|live| {
+                        !live.ended && live.info.workspace_id == caller.workspace_id
+                    })
+                {
+                    return Err(not_running_to_close());
+                }
+                let d = self.session_channel(&p.session_id, &caller, Need::Brake)?;
+                // The stop's queue slot is held before the roster changes, and the stop is sent
+                // only after the change is saved: a close that cannot save leaves the session
+                // running, so the close can be retried, and a saved close is never left unsent.
+                let stop = d.tx.try_reserve().map_err(|_| {
+                    RpcError::new(
+                        ErrorCode::SessionBusy,
+                        "that session's queue is full; it was not stopped",
+                    )
+                    .with_hint("nothing was sent; retry after its current instruction settles")
+                })?;
+                if closed && self.roster.observed.remove(&p.session_id) {
+                    self.save_close(&p.session_id)?;
+                }
+                stop.send(Command::Shutdown);
+                Ok(serde_json::json!({
+                    "session_id": p.session_id,
+                    "stopping": true,
+                    "closed": closed,
+                }))
+            }
+
             method::TURN_START
             | method::TURN_STEER
             | method::SESSION_SET_PERMISSION_MODE
@@ -539,6 +576,38 @@ impl Daemon {
                 format!("unknown method {other}"),
             )
             .with_hint("inspect this executor with `agit rc local status`; after user work finishes, use `agit rc local restart --if-idle` to load its installed CLI")),
+        }
+    }
+
+    /// Save a roster from which a close has already removed `session_id`'s collection.
+    ///
+    /// A failed save may still have changed what the next load reads (a fallback written before its
+    /// primary failed, or a file renamed before its directory sync failed), so on failure the entry
+    /// is put back and that is saved too. The answer says "not changed" only when the restored
+    /// roster is what was saved, and claims neither state when that save fails too. Save errors
+    /// name paths under the owner's home and the caller may not be the owner, so they stay in the
+    /// local log.
+    fn save_close(&mut self, session_id: &str) -> Result<(), RpcError> {
+        let Err(error) = self.roster.save_fail_closed() else {
+            return Ok(());
+        };
+        eprintln!("agitd: session.close could not save the roster: {error:#}");
+        self.roster.observed.insert(session_id.to_owned());
+        let hint = "the error is in this computer's agit log; retry the close once it is fixed";
+        match self.roster.save_fail_closed() {
+            Ok(()) => Err(RpcError::new(
+                ErrorCode::Internal,
+                "the session was not closed; its collection on this computer was not changed",
+            )
+            .with_hint(hint)),
+            Err(error) => {
+                eprintln!("agitd: session.close could not restore the roster: {error:#}");
+                Err(RpcError::new(
+                    ErrorCode::Internal,
+                    "the session was not closed or stopped; whether this computer keeps collecting it after agit restarts is uncertain",
+                )
+                .with_hint("the error is in this computer's agit log; retry the close, which settles it once it succeeds"))
+            }
         }
     }
 }

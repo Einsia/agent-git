@@ -839,6 +839,12 @@ pub struct SessionSubscribe {
     pub after_seq: u64,
 }
 
+/// Params of `session.stop` and `session.close`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStop {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSubscribeResult {
     pub session: SessionInfo,

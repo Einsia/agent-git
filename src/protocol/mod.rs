@@ -585,6 +585,12 @@ pub mod method {
     pub const TURN_START: &str = "turn.start";
     pub const TURN_STEER: &str = "turn.steer";
     pub const TURN_INTERRUPT: &str = "turn.interrupt";
+    /// End agit's hold on a live session: a harness agit launched exits; a session attached from
+    /// its owner's own terminal is only released, never killed. The session stays resumable.
+    pub const SESSION_STOP: &str = "session.stop";
+    /// [`SESSION_STOP`], and this machine also stops collecting the session's native transcript.
+    /// Owner only.
+    pub const SESSION_CLOSE: &str = "session.close";
 
     // ── agitd → viewer (events; carry seq + stream) ──
     pub const ITEM_STARTED: &str = "item.started";
