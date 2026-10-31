@@ -55,10 +55,12 @@ const nm = join(work, 'node_modules', '@einsia')
 const home = join(work, 'home')
 protectWindowsSmokeHome(work)
 mkdirSync(home, { recursive: true })
+// The installer asks its registry for the newest create-agit; a registry that refuses keeps every
+// run off the network and on the same freshness path.
 const env = { ...process.env, HOME: home, USERPROFILE: home, AGIT_HOME: join(home, '.agit'),
   CODEX_HOME: join(home, '.codex'), CLAUDE_CONFIG_DIR: join(home, '.claude'),
   XDG_DATA_HOME: join(home, '.local', 'share'), XDG_CONFIG_HOME: join(home, '.config'),
-  AGIT_HUB_URL: 'http://127.0.0.1:9', npm_config_yes: 'true' }
+  AGIT_HUB_URL: 'http://127.0.0.1:9', npm_config_registry: 'http://127.0.0.1:9/', npm_config_yes: 'true' }
 for (const key of ['AGIT_TELEMETRY_DISABLED', 'DO_NOT_TRACK', 'AGIT_TELEMETRY_DEFER', 'AGIT_SKIP_SETUP', 'AGIT_SESSION', 'AGIT_TELEMETRY_HOST', 'AGIT_TELEMETRY_KEY']) delete env[key]
 if (process.platform === 'win32') {
   delete env.HOME
