@@ -1545,7 +1545,7 @@ fn read_meta_at_with_policy(
                 || listed.stdout.starts_with(b"100755 blob "),
             "legacy recovery metadata is not a regular Git blob"
         );
-        let output = repo.inspection_output(&["cat-file", "blob", &spec], 1024 * 1024)?;
+        let output = repo.inspection_output(&["cat-file", "blob", &spec], meta::MAX_BYTES)?;
         anyhow::ensure!(
             output.status.success() && output.stderr.is_empty(),
             "legacy recovery metadata is unavailable locally"

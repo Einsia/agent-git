@@ -57,6 +57,7 @@ pub fn git_metadata(storage: &Meta, projection: Option<&Value>) -> Result<(Value
             crate::domain::meta::validate(storage)?;
             value["privacy"] = projection.clone();
             let text = format!("{}\n", serde_json::to_string_pretty(&value)?);
+            crate::domain::meta::ensure_within_limit(text.as_bytes())?;
             Ok((value, text))
         }
         None => Ok((value, crate::domain::meta::to_text(storage)?)),

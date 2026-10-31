@@ -250,7 +250,9 @@ impl Delivery {
             .as_deref()
             .map(|text| redactor.try_scrub(text).map(|report| report.text))
             .transpose()?;
-        files.insert(meta::FILE.into(), serde_json::to_vec_pretty(&public)?);
+        let public = serde_json::to_vec_pretty(&public)?;
+        meta::ensure_within_limit(&public)?;
+        files.insert(meta::FILE.into(), public);
         let projected_tree = write_tree(destination, files)?;
         let mut entries = destination.git_bytes_result(&["ls-tree", "-z", &projected_tree])?;
         for entry in source

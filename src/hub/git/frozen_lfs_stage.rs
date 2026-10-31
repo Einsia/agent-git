@@ -256,7 +256,7 @@ fn selected_pointers(
     byte_budget: u64,
 ) -> Result<Vec<Pointer>, LfsStagingFailure> {
     // Bound caller input as well as the distinct object set before allocation or file access.
-    if missing.len() > 10_000 {
+    if missing.len() > crate::domain::lfs::MAX_HISTORY_OBJECTS {
         return Err(LfsStagingFailure::Budget);
     }
     let mut selected = BTreeMap::new();

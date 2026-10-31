@@ -14,7 +14,7 @@ const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FINDINGS: usize = 100;
 const MAX_ROOT_OUTPUT: usize = 1024 * 1024;
 const MAX_TREE_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_TAG_DEPTH: usize = 32;
+const MAX_TAG_DEPTH: usize = crate::domain::repo::MAX_TAG_CHAIN_DEPTH;
 const MAX_HEADER_BYTES: usize = 256;
 
 #[derive(Debug, Default)]

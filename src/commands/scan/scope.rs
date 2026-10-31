@@ -167,7 +167,12 @@ impl ReviewBudget {
 fn read_chain(reader: &mut Reader<'_>, sha: &str) -> Result<refs::Chain> {
     let mut shas = Vec::new();
     reader.repo.git_stream_split(
-        &["rev-list", "--first-parent", "--max-count=257", sha],
+        &[
+            "rev-list",
+            "--first-parent",
+            format!("--max-count={}", MAX_COMMITS + 1).as_str(),
+            sha,
+        ],
         b'\n',
         |record| {
             if record.is_empty() {

@@ -18,12 +18,15 @@ fn save(
     let mut metadata = Meta::new(sid.into(), "claude-code".into(), "/fixture".into());
     metadata.layout = layout;
     metadata.turn = Some(turn);
+    // Every version carries the largest metadata agit writes: a reader with a smaller cap fails
+    // each of these reads instead of attributing the save.
+    metadata.milestone = Some(String::new());
+    let unpadded = meta::to_text(&metadata).unwrap().len();
+    metadata.milestone = Some("x".repeat(meta::MAX_BYTES - unpadded));
+    let text = meta::to_text(&metadata).unwrap();
+    assert_eq!(text.len(), meta::MAX_BYTES);
     std::fs::create_dir_all(repo.root().join("session")).unwrap();
-    std::fs::write(
-        repo.root().join(meta::FILE),
-        serde_json::to_vec(&metadata).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(repo.root().join(meta::FILE), text).unwrap();
     match layout {
         meta::LayoutVersion::V0 => {
             std::fs::write(repo.root().join(meta::LEGACY_LOG_FILE), log).unwrap()
@@ -633,5 +636,75 @@ fn messages_are_selected_by_the_time_their_harness_recorded() {
             (early.clone(), "sent before range".into()),
             (early, "untimed answer".into()),
         ]
+    );
+}
+
+/// Serves every commit's metadata as `body`, and counts the bytes it handed out.
+struct LargeMetadata {
+    body: Vec<u8>,
+    served: usize,
+}
+
+impl Store for LargeMetadata {
+    fn refs(&mut self) -> Result<Vec<(String, String)>> {
+        unreachable!("only metadata is read")
+    }
+    fn branches(&self) -> &'static [&'static str] {
+        unreachable!("only metadata is read")
+    }
+    fn rev_list(
+        &mut self,
+        _args: &[&str],
+        _visit: &mut dyn FnMut(&str) -> Result<bool>,
+    ) -> Result<()> {
+        unreachable!("only metadata is read")
+    }
+    fn locate(&mut self, _objects: &[(&str, &str)]) -> Result<Vec<Option<(String, u64)>>> {
+        unreachable!("only metadata is read")
+    }
+    fn read(&mut self, objects: &[(&str, &str)], maximum: usize) -> Result<Vec<Blob>> {
+        assert!(self.body.len() <= maximum);
+        self.served += objects.len() * self.body.len();
+        Ok(objects
+            .iter()
+            .map(|_| Blob::Body(self.body.clone()))
+            .collect())
+    }
+    fn blobs(&mut self, _ids: &[&str], _maximum: usize) -> Result<Vec<Blob>> {
+        unreachable!("only metadata is read")
+    }
+}
+
+/// Reading metadata ahead of need leaves the first contribution at least half of what the page can
+/// still read: with metadata as large as agit writes, the commit needed now is read and read-ahead
+/// takes no more than half of the rest. Reading the whole window before charging it ends the page
+/// with no progress, and so does re-halving what is left for every chunk, which adds up to nearly
+/// all of it.
+#[test]
+fn metadata_read_ahead_stays_within_the_page_budget() {
+    let mut metadata = Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        "/fixture".into(),
+    );
+    metadata.milestone = Some(String::new());
+    let unpadded = meta::to_text(&metadata).unwrap().len();
+    metadata.milestone = Some("x".repeat(meta::MAX_BYTES - unpadded));
+    let mut store = LargeMetadata {
+        body: meta::to_text(&metadata).unwrap().into_bytes(),
+        served: 0,
+    };
+    let commits: Vec<String> = (0..16).map(|index| format!("{index:040x}")).collect();
+    let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+    let budget = 8 * meta::MAX_BYTES;
+    let mut extractor = extract::Extractor::new(&mut store, budget);
+    extractor.metas_ahead(&commits, 1).unwrap();
+    assert!(extractor.has_meta(commits[0]));
+    drop(extractor);
+    let after_required = budget - meta::MAX_BYTES;
+    assert!(
+        store.served - meta::MAX_BYTES <= after_required / 2,
+        "read-ahead took {} of {after_required}",
+        store.served - meta::MAX_BYTES
     );
 }

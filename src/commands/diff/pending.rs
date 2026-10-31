@@ -138,7 +138,7 @@ pub(crate) fn inspect_status(
     let limits = status_opencode::limits();
     let output = repo.inspection_output_with_deadline(
         &["show", &format!("{tip}:{}", meta::FILE)],
-        1024 * 1024,
+        meta::MAX_BYTES,
         deadline,
     )?;
     ensure!(

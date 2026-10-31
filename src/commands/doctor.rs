@@ -999,7 +999,7 @@ fn read_worktree_metadata(root: &Path) -> crate::Result<Option<meta::Meta>> {
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    let bytes = crate::domain::storage::read_bytes_capped(&path, 1024 * 1024)?;
+    let bytes = crate::domain::storage::read_bytes_capped(&path, meta::MAX_BYTES)?;
     let text = std::str::from_utf8(&bytes).context("session metadata is not UTF-8")?;
     meta::parse_strict(text, "worktree")
         .map(Some)

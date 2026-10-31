@@ -486,7 +486,7 @@ fn missing_lfs_uploads_with_transport(
         .as_deref()
         .context("LFS repository identity is missing")?;
     let mut missing = Vec::new();
-    for batch in pointers.chunks(100) {
+    for batch in pointers.chunks(crate::domain::lfs::MAX_BATCH_OBJECTS) {
         let mut expected: HashMap<_, _> = batch.iter().map(|p| (p.oid.as_str(), p)).collect();
         anyhow::ensure!(
             expected.len() == batch.len(),

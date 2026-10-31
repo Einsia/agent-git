@@ -2281,7 +2281,7 @@ fn trust_merge_source_identities(
 }
 
 const MERGE_META_BATCH: usize = 256;
-const TRUSTED_META_MAX_BYTES: u64 = 1024 * 1024;
+const TRUSTED_META_MAX_BYTES: u64 = crate::domain::meta::MAX_BYTES as u64;
 /// Merge provenance is only an optimization that suppresses false positives. Once its bounded
 /// validation budget is exhausted we simply stop granting historical identities; the repository
 /// bytes are still scanned normally, so the failure direction remains safe.
@@ -3399,7 +3399,11 @@ pub fn scan_agent_repo_frozen(
     tag_objects: &[String],
 ) -> crate::Result<AgentRepoScan> {
     anyhow::ensure!(
-        !commits.is_empty() && commits.len() <= 4096 && tag_objects.len() <= 4096,
+        !commits.is_empty()
+            && commits.len() <= crate::domain::repo::MAX_PUBLICATION_COMMITS
+            && tag_objects.len()
+                <= crate::domain::repo::MAX_PUBLICATION_REFS
+                    * crate::domain::repo::MAX_TAG_CHAIN_DEPTH,
         "frozen secret scan exceeds its publication root limit"
     );
     anyhow::ensure!(

@@ -1549,7 +1549,7 @@ fn plain_commit(
         let mut value: serde_json::Value = serde_json::from_slice(&read(
             source,
             &["cat-file", "blob", &format!("{oid}:{}", meta::FILE)],
-            1024 * 1024,
+            meta::MAX_BYTES,
         )?)?;
         value["session_privacy"] = serde_json::to_value(&metadata.session_privacy)?;
         value["session"] = json!(metadata.session);
@@ -1573,7 +1573,9 @@ fn plain_commit(
                 kept => fields.insert(key.into(), kept),
             };
         }
-        let blob = write_object(destination, "blob", &serde_json::to_vec(&value)?)?;
+        let text = serde_json::to_vec(&value)?;
+        meta::ensure_within_limit(&text)?;
+        let blob = write_object(destination, "blob", &text)?;
         replace(
             source,
             destination,

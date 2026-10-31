@@ -15,11 +15,12 @@ pub fn reachable(repo: &Repo, references: &[String]) -> Result<Vec<super::Pointe
             && !reference.contains(['\0', '\n', '\r'])),
         "invalid LFS history reference"
     );
+    let filter = pointer_filter();
     let mut args = vec![
         "rev-list",
         "--objects",
         "--no-object-names",
-        "--filter=blob:limit=1024",
+        filter.as_str(),
     ];
     args.extend(references.iter().map(String::as_str));
     args.push("--");
@@ -45,7 +46,7 @@ fn frozen_commits_in(repo: &Repo, commits: &[String]) -> Result<Vec<super::Point
     use std::io::{Seek, Write};
 
     ensure!(
-        !commits.is_empty() && commits.len() <= 4096,
+        !commits.is_empty() && commits.len() <= crate::domain::repo::MAX_PUBLICATION_COMMITS,
         "frozen LFS history exceeds its publication root limit"
     );
     ensure!(
@@ -86,7 +87,7 @@ fn frozen_commits_in(repo: &Repo, commits: &[String]) -> Result<Vec<super::Point
             "--no-walk",
             "--objects",
             "--no-object-names",
-            "--filter=blob:limit=1024",
+            pointer_filter().as_str(),
             "--stdin",
         ],
         Some(input),
@@ -114,7 +115,7 @@ pub(crate) fn for_inspection(
             "--no-walk",
             "--objects",
             "--no-object-names",
-            "--filter=blob:limit=1024",
+            pointer_filter().as_str(),
             "--stdin",
         ],
         Some(input),
@@ -125,6 +126,11 @@ pub(crate) fn for_inspection(
 /// Each group of candidate small blobs costs one batch process; the group size bounds only how
 /// many object IDs are held at once.
 const POINTER_BATCH: usize = 65_536;
+
+/// Lists only blobs small enough to be a pointer: Git omits blobs of at least the given size.
+fn pointer_filter() -> String {
+    format!("--filter=blob:limit={}", super::POINTER_LIMIT)
+}
 
 fn read_pointers(
     repo: &Repo,
@@ -161,7 +167,7 @@ fn read_pointers_excluding(
                         );
                     }
                     ensure!(
-                        pointers.len() <= 10_000,
+                        pointers.len() <= super::MAX_HISTORY_OBJECTS,
                         "LFS history exceeds the supported object count"
                     );
                 }

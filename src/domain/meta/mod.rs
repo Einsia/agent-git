@@ -69,6 +69,10 @@ pub const ID_HEX_LEN: usize = 40;
 /// Path of the session metadata inside the repo.
 pub const FILE: &str = "session/meta.json";
 
+/// The largest [`FILE`] agit writes, which is also what a Hub admits on push. Every reader of the
+/// file accepts this much: a reader with a smaller cap refuses metadata agit itself saved.
+pub const MAX_BYTES: usize = 1024 * 1024;
+
 /// The complete v1 event sequence: one 40-character lowercase hex event id per line.
 pub const LOG_FILE: &str = "LOG";
 
@@ -554,11 +558,10 @@ pub fn ensure_session_dir(repo_root: &Path) -> Result<()> {
 ///
 /// This is the **only** place that produces `session/meta.json`.
 pub fn write(repo_root: &Path, meta: &Meta) -> Result<PathBuf> {
-    validate(meta)?;
+    let bytes = to_text(meta)?;
     ensure_session_dir(repo_root)?;
     let p = path_in(repo_root);
     ensure_regular_file_or_missing(&p)?;
-    let bytes = format!("{}\n", serde_json::to_string_pretty(meta)?);
     let parent = p.parent().expect("FILE always has a directory");
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("cannot create temporary metadata in {}", parent.display()))?;
@@ -676,7 +679,21 @@ pub fn validate(meta: &Meta) -> Result<()> {
 /// to [`write`]).
 pub fn to_text(meta: &Meta) -> Result<String> {
     validate(meta)?;
-    Ok(format!("{}\n", serde_json::to_string_pretty(meta)?))
+    let text = format!("{}\n", serde_json::to_string_pretty(meta)?);
+    ensure_within_limit(text.as_bytes())?;
+    Ok(text)
+}
+
+/// Refuse serialized metadata over [`MAX_BYTES`]. Every writer of [`FILE`] calls it, also one that
+/// edits an existing file's fields instead of serializing a [`Meta`].
+pub fn ensure_within_limit(text: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        text.len() <= MAX_BYTES,
+        "session metadata would be {} bytes, over the {MAX_BYTES}-byte limit a Hub accepts; \
+         use a shorter milestone",
+        text.len()
+    );
+    Ok(())
 }
 
 /// Canonical result of upgrading a v0 metadata blob without discarding extension fields.
@@ -1307,6 +1324,26 @@ fn git_field(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writer's limit is exact: metadata of [`MAX_BYTES`] serializes and one byte more is
+    /// refused before anything reaches the checkout. Enforcing it only at push would leave saved
+    /// versions that readers given [`MAX_BYTES`] refuse.
+    #[test]
+    fn metadata_is_written_up_to_the_shared_limit_and_no_further() {
+        let mut snapshot = Meta::new(
+            "agit-0123456789abcdef0123456789abcdef01234567".into(),
+            "codex".into(),
+            "/synthetic".into(),
+        );
+        snapshot.milestone = Some(String::new());
+        let unpadded = to_text(&snapshot).unwrap().len();
+        snapshot.milestone = Some("x".repeat(MAX_BYTES - unpadded));
+        assert_eq!(to_text(&snapshot).unwrap().len(), MAX_BYTES);
+        snapshot.milestone.as_mut().unwrap().push('x');
+        let root = tempfile::tempdir().unwrap();
+        assert!(write(root.path(), &snapshot).is_err());
+        assert!(!path_in(root.path()).exists());
+    }
 
     fn meta(session: &str) -> Meta {
         Meta::new(session.into(), "codex".into(), "/r".into())

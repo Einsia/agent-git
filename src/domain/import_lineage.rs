@@ -1655,7 +1655,7 @@ mod tests {
             &fixture.repo,
             &metadata_refs,
             ReadPolicy::LocalOnly,
-            64 * 1024,
+            meta::MAX_BYTES,
         );
         let picker_hits = hits.load(Ordering::SeqCst);
         std::fs::write(&metadata_object, metadata_bytes).unwrap();
@@ -1663,7 +1663,7 @@ mod tests {
             &fixture.repo,
             &metadata_refs,
             ReadPolicy::LocalOnly,
-            64 * 1024,
+            meta::MAX_BYTES,
         );
         let oversized_metadata =
             meta::at_refs_with_policy(&fixture.repo, &metadata_refs, ReadPolicy::LocalOnly, 1);

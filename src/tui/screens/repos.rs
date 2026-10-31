@@ -290,7 +290,7 @@ fn gather(from: &str, local_only: bool) -> Input {
                 &repo,
                 &refs,
                 crate::domain::repo::ReadPolicy::LocalOnly,
-                64 * 1024,
+                crate::domain::meta::MAX_BYTES,
             )
             .into_iter()
             .map(|metadata| metadata.map(|metadata| metadata.line))

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 pub(super) const UNAVAILABLE: &str = "unavailable: project evidence";
 const MAX_ORIGIN_BYTES: usize = 16 * 1024;
-const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(PartialEq, Eq)]
 enum Origin {
@@ -130,7 +129,7 @@ fn branch_relation(
     let head = super::sessions::branch_head(&repo, branch, deadline)?;
     let output = repo.inspection_output_with_deadline(
         &["show", &format!("{head}:{}", meta::FILE)],
-        MAX_METADATA_BYTES,
+        meta::MAX_BYTES,
         deadline,
     )?;
     anyhow::ensure!(output.status.success() && output.stderr.is_empty());

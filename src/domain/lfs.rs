@@ -10,6 +10,11 @@ pub mod local;
 
 pub const VERSION: &str = "https://git-lfs.github.com/spec/v1";
 pub const POINTER_LIMIT: usize = 1024;
+/// Objects one LFS batch request names. A Hub refuses a larger batch, so every request a client
+/// makes is split into batches of at most this many.
+pub const MAX_BATCH_OBJECTS: usize = 100;
+/// Distinct LFS objects one history walk, and so one publication, carries.
+pub const MAX_HISTORY_OBJECTS: usize = 10_000;
 
 pub fn cached_object_path(
     repo: &crate::domain::repo::Repo,

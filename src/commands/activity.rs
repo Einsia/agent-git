@@ -46,7 +46,7 @@ pub struct Args {
     #[arg(long)]
     pub cursor: Option<String>,
     /// Maximum message chunks in this page (1-200).
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = crate::domain::activity::DEFAULT_LIMIT)]
     pub limit: usize,
     /// Assistant messages to include: every one, or only the last before each user message.
     #[arg(long, value_enum, default_value = "all")]

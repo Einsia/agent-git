@@ -10,10 +10,10 @@ use anyhow::{Context, Result, ensure};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MAX_REFS: usize = 4096;
+const MAX_REFS: usize = super::MAX_PUBLICATION_REFS;
 const MAX_HEADS: usize = 64;
-pub(crate) const MAX_COMMITS: usize = 4096;
-const MAX_TAG_DEPTH: usize = 32;
+pub(crate) const MAX_COMMITS: usize = super::MAX_PUBLICATION_COMMITS;
+const MAX_TAG_DEPTH: usize = super::MAX_TAG_CHAIN_DEPTH;
 const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READS: usize = 8192;
