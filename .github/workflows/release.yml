@@ -272,7 +272,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write # create the Release, upload its assets
     steps:
@@ -346,7 +346,8 @@ jobs:
       # The bundled Git runtime includes GPL- and LGPL-licensed components, so the Release
       # carries their corresponding source, built here from the pins the binaries were built
       # from, and the notes list each archive's checksum. A source that cannot be built from its
-      # pins, or a copyleft runtime pin without one, stops the job before anything is published.
+      # pins, a copyleft runtime pin without one, or a MinGit file no inventoried package accounts
+      # for stops the job before anything is published.
       # The archives are uploaded nowhere but to this Release.
       - name: Source of the bundled Git runtime
         run: |

@@ -3,12 +3,14 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import ssl
 import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
+import zipfile
 
 spec = importlib.util.spec_from_file_location("runtime", Path(__file__).with_name("prepare-git-runtime.py"))
 runtime = importlib.util.module_from_spec(spec)
@@ -190,15 +192,50 @@ class RuntimeSourceTests(unittest.TestCase):
         """
         lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
         listed = json.loads(Path(__file__).with_name("git-runtime-sources.json").read_text())
-        sources.check_coverage(lock, listed)
+        inventory = json.loads(Path(__file__).with_name("git-runtime-mingit-inventory.json").read_text())
+        sources.check_coverage(lock, listed, inventory)
         dropped = json.loads(json.dumps(listed))
         dropped["sources"][0]["covers"].pop()
         with self.assertRaisesRegex(ValueError, "no source archive covers"):
-            sources.check_coverage(lock, dropped)
+            sources.check_coverage(lock, dropped, inventory)
         stale = json.loads(json.dumps(listed))
         stale["sources"][0]["covers"].append("0" * 64)
         with self.assertRaisesRegex(ValueError, "not a copyleft pin"):
-            sources.check_coverage(lock, stale)
+            sources.check_coverage(lock, stale, inventory)
+        unsourced = json.loads(json.dumps(inventory))
+        package = next(package for package in unsourced["packages"] if "source" in package)
+        del package["source"]
+        with self.assertRaisesRegex(ValueError, re.escape(package["name"]) + " .* names no source archive"):
+            sources.check_coverage(lock, listed, unsourced)
+
+    def test_a_mingit_file_no_inventoried_package_accounts_for_stops_the_release(self):
+        """MinGit's file list must be exactly the inventory's, in both directions.
+
+        A MinGit update that adds a GPL binary would otherwise ship it without its source, and an
+        inventory listing files MinGit no longer has would vouch for a build it was not made from.
+        """
+        def mingit(paths):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                for path in paths:
+                    archive.writestr(path, b"content")
+            return buffer.getvalue()
+
+        inventory = {"packages": [{"name": "sed", "files": ["usr/bin/sed.exe"]}, {"name": "git", "files": ["cmd/git.exe"]}]}
+        cases = {
+            "exact": (["cmd/git.exe", "usr/bin/sed.exe", "usr/bin/"], None),
+            "added file": (["cmd/git.exe", "usr/bin/sed.exe", "usr/bin/grep.exe"], "ships usr/bin/grep.exe, which no inventoried package"),
+            "dropped file": (["cmd/git.exe"], "lists usr/bin/sed.exe, which MinGit does not ship"),
+        }
+        for case, (paths, error) in cases.items():
+            body = mingit(paths)
+            lock = {"windows": {"url": "https://example.invalid/MinGit.zip", "sha256": hashlib.sha256(body).hexdigest()}}
+            with self.subTest(case), patch.object(sources.urllib.request, "urlopen", return_value=io.BytesIO(body)):
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        sources.check_mingit_files(lock, inventory)
+                else:
+                    sources.check_mingit_files(lock, inventory)
 
     def test_alpine_source_archive_holds_what_the_apkbuild_builds_from(self):
         """Every file the APKBUILD's sha512sums names is in the archive, with that checksum.

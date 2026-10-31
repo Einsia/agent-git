@@ -69,9 +69,13 @@ and LGPL-licensed components, built from `scripts/git-runtime-sources.json` (see
 [the release artifact contract](../.github/RELEASE_ARTIFACTS.md#source-archives)).
 A pin refresh that replaces such a component updates its entry there too: the
 Alpine recipe commit and files, the upstream download, or the Git commit the
-binary was built from. The unit tests fail while a copyleft pin has no entry, and
+binary was built from. A MinGit update also redoes
+`scripts/git-runtime-mingit-inventory.json`, which assigns each MinGit file to the
+MSYS2 or Git for Windows package it comes from: the packages and versions are in
+MinGit's `etc/package-versions.txt`, and their file lists in those packages. The
+unit tests fail while a copyleft pin has no entry, and
 `python3 scripts/git-runtime-sources.py <dir>` builds the archives the way the
-release does.
+release does, including the check that the inventory matches MinGit's files.
 
 ## Verification
 
