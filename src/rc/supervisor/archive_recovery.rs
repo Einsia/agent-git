@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     domain::privacy_receipt::outbox::{Capture, Entry},
-    rc::archive_jobs::Job,
+    rc::{archive_jobs::Job, local_repository::Authority},
 };
 use anyhow::{Context, ensure};
 use std::io::Write;
@@ -327,13 +327,81 @@ pub(crate) fn publication_target(
     repo: &crate::domain::repo::Repo,
     lineage: &crate::rc::lineage::AgitSession,
 ) -> crate::Result<crate::rc::capture::PublicationDestination> {
-    let destination =
-        crate::rc::capture::destination(repo, lineage, &crate::infra::config::hub_url())?
-            .context("archive publication destination is not configured")?;
+    publication_target_by(repo, lineage, Authority::Process)
+}
+
+/// [`publication_target`], with a device-local capture repository verified against `authority`.
+fn publication_target_by(
+    repo: &crate::domain::repo::Repo,
+    lineage: &crate::rc::lineage::AgitSession,
+    authority: Authority,
+) -> crate::Result<crate::rc::capture::PublicationDestination> {
+    let destination = crate::rc::capture::destination_by(
+        repo,
+        lineage,
+        &crate::infra::config::hub_url(),
+        authority,
+    )?
+    .context("archive publication destination is not configured")?;
     if !crate::commands::auto_push::publication_allowed(repo, &destination.repository)? {
         return Err(Waiting::PushDisabled.into());
     }
     Ok(destination)
+}
+
+/// A session's queued turns that recovery leaves waiting because automatic publication is off
+/// for them: where they publish, which setting keeps them here, and the narrowest command that
+/// would upload them automatically, when one exists (see [`crate::commands::auto_push::refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicationWait {
+    pub repository: String,
+    /// The repository that records the conversation, named when its own setting keeps the turns.
+    pub capture_repository: String,
+    pub off: crate::commands::auto_push::Off,
+    pub command: Option<String>,
+}
+
+/// The publication waits of the queued archive jobs, keyed by runtime and session id, judged by
+/// [`publication_target`] as recovery judges them. A daemon parks such a job without retrying
+/// or reporting it, so an inspection that judged by another rule would name a wait recovery
+/// does not have, or miss one it has. Each job is judged as the daemon that queued it judges it,
+/// by that daemon's saved identity, whichever namespace this process selected. Reads the queue
+/// and the identities without writing either.
+pub(crate) fn publication_waits()
+-> crate::Result<std::collections::BTreeMap<(String, String), PublicationWait>> {
+    let hub = crate::infra::config::hub_url();
+    let mut waits = std::collections::BTreeMap::new();
+    for (namespace, job) in crate::rc::archive_jobs::observe()? {
+        let authority = Authority::Saved(namespace);
+        let Ok(lineage) = job.session() else {
+            continue;
+        };
+        let Ok(repo) = crate::rc::capture::require_by(&lineage, authority) else {
+            continue;
+        };
+        let waiting = publication_target_by(&repo, &lineage, authority)
+            .err()
+            .is_some_and(|error| error.downcast_ref::<Waiting>() == Some(&Waiting::PushDisabled));
+        if !waiting {
+            continue;
+        }
+        let Ok(Some(destination)) =
+            crate::rc::capture::destination_by(&repo, &lineage, &hub, authority)
+        else {
+            continue;
+        };
+        let (off, command) = crate::commands::auto_push::refusal(&repo, &destination.repository)?;
+        waits.insert(
+            (job.runtime.clone(), job.claim_key()),
+            PublicationWait {
+                repository: destination.repository,
+                capture_repository: lineage.slug(),
+                off,
+                command,
+            },
+        );
+    }
+    Ok(waits)
 }
 
 pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
@@ -463,6 +531,7 @@ async fn verify_native(
 mod tests {
     use super::*;
     use crate::{
+        commands::auto_push::Off,
         domain::repo::Repo,
         rc::{lineage::AgitSession, local_repository::publication::Selection},
     };
@@ -470,7 +539,16 @@ mod tests {
     /// A device-local capture publishes on the person's behalf, so automatic publication turned
     /// off in its destination's checkout makes recovery wait even while the capture repository's
     /// own preference allows it. A gate that read only that preference would let recovery record
-    /// a publication intent and push, which the push then refuses on every retry.
+    /// a publication intent and push, which the push then refuses on every retry. `agit status`
+    /// names the same wait for the queued turn, with a command for the destination's checkout: a
+    /// listing that read the capture repository's preference would show nothing, and a command
+    /// aimed at that repository would leave the turn waiting. Where only the user preference keeps
+    /// the turn (the destination has no checkout here), no command is offered: turning that on
+    /// would start automatic uploads of every repository without a setting of its own. Status runs
+    /// in the plain namespace, not the desktop daemon's that queued the job: judged by the plain
+    /// namespace's identity, the desktop repository fails its ownership check and the wait goes
+    /// unreported, and loading that identity creates it, whether the plain namespace has none or
+    /// one of its own.
     #[test]
     fn recovery_waits_while_its_destination_turned_automatic_publication_off() {
         if crate::rc::in_isolated_test(
@@ -526,7 +604,53 @@ mod tests {
             Some(&Waiting::PushDisabled)
         );
 
+        let transcript = home.path().join("native.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        Job::capture(
+            "logical",
+            "native",
+            "codex",
+            None,
+            home.path(),
+            &lineage,
+            "turn",
+            &transcript,
+            3,
+            None,
+        )
+        .unwrap()
+        .record()
+        .unwrap();
+        // From here on, a plain `agit status`: its own namespace, with no identity saved there.
+        crate::rc::select_plain_authority();
+        let plain = home.path().join("rc");
+        assert!(!plain.exists());
+        let wait = |off, command: Option<&str>| {
+            std::collections::BTreeMap::from([(
+                ("codex".into(), "native".into()),
+                PublicationWait {
+                    repository: "owner/project".into(),
+                    capture_repository: "desktop-local/project".into(),
+                    off,
+                    command: command.map(str::to_owned),
+                },
+            )])
+        };
+        let destination_wait = wait(
+            Off::Destination,
+            Some("agit config --repo owner/project push.auto true"),
+        );
+        assert_eq!(publication_waits().unwrap(), destination_wait);
+        assert!(!plain.exists());
+        let other = crate::rc::identity::identity().unwrap();
+        assert_ne!(other.machine_fingerprint, machine.machine_fingerprint);
+        assert_eq!(publication_waits().unwrap(), destination_wait);
+
         checkout.set_auto_push(None).unwrap();
-        assert!(publication_target(&repo, &lineage).is_ok());
+        assert!(publication_waits().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&checkout_dir).unwrap();
+        crate::infra::config::set_global("push.auto", Some("false")).unwrap();
+        assert_eq!(publication_waits().unwrap(), wait(Off::UserDefault, None));
     }
 }
