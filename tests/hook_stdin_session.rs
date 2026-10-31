@@ -369,6 +369,11 @@ impl Lab {
 /// last turn the session ends with only SessionEnd left to fire. An implementation that settles
 /// solely from what Stop reads leaves that turn unsettled, so automatic upload never sees it; one
 /// that settles the unanswered prompt at Stop lands the turn without its reply.
+///
+/// A session driven over stream-json input runs the Stop before it writes any of the turn, so the
+/// file still ends at the previous turn, answered; only the `prompt_id` the Stop reports shows the
+/// turn is missing. Settling what the file holds then lands nothing new and leaves this turn to a
+/// later Stop, and one that settled the previous turn again would duplicate it.
 #[test]
 fn the_last_turn_before_exit_settles_with_its_reply() {
     let lab = Lab::new();
@@ -427,16 +432,50 @@ fn the_last_turn_before_exit_settles_with_its_reply() {
             .and_then(|lk| lk["native_checkpoint"]["bytes"].as_u64())
             .unwrap_or(0)
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while checkpoint() < answered && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    let settled_through = |end: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while checkpoint() < end && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    };
+    settled_through(answered);
     let log = lab.run(&["log", "me/qa@s1", "--oneline"]);
     assert_eq!(turn_subjects(&log), vec!["A turn 1", "A turn 2"], "{log}");
     assert!(
         checkpoint() >= answered,
         "the last turn settled without its reply: checkpoint {} < {answered}",
         checkpoint()
+    );
+
+    // The session is resumed over stream-json input: its Stop comes before any of the turn.
+    let prompt_id = "aaaaaaaa-0000-4000-8000-0000000000p3";
+    lab.fire(
+        "Stop",
+        A,
+        serde_json::json!({"stop_hook_active": false, "prompt_id": prompt_id}),
+    );
+    let log = lab.run(&["log", "me/qa@s1", "--oneline"]);
+    assert_eq!(turn_subjects(&log), vec!["A turn 1", "A turn 2"], "{log}");
+    let mut records = lab.turn(A, 3, "A turn 3", "A answer 3");
+    let mut prompt: serde_json::Value =
+        serde_json::from_str(&records[..records.find('\n').unwrap()]).unwrap();
+    prompt["promptId"] = prompt_id.into();
+    records.replace_range(..records.find('\n').unwrap(), &prompt.to_string());
+    lab.append(A, &records);
+    let answered = fs::metadata(lab.transcript(A)).unwrap().len();
+    lab.append(
+        A,
+        &format!(
+            "{}\n",
+            serde_json::json!({"type": "system", "subtype": "stop_hook_summary", "sessionId": A}),
+        ),
+    );
+    settled_through(answered);
+    let log = lab.run(&["log", "me/qa@s1", "--oneline"]);
+    assert_eq!(
+        turn_subjects(&log),
+        vec!["A turn 1", "A turn 2", "A turn 3"],
+        "{log}"
     );
 }
 
