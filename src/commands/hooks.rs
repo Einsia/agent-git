@@ -260,6 +260,9 @@ struct Event {
     session_title: Option<String>,
     hook_event_name: Option<String>,
     permission_mode: Option<String>,
+    /// The prompt that opened the turn a Stop ended, as Claude Code names it in the payload and
+    /// in that prompt's own record (`promptId`).
+    prompt_id: Option<String>,
 }
 
 fn parse_event(buf: &str) -> Option<Event> {
@@ -282,6 +285,7 @@ fn parse_event(buf: &str) -> Option<Event> {
         session_title: get("session_title"),
         hook_event_name: get("hook_event_name"),
         permission_mode: get("permission_mode"),
+        prompt_id: get("prompt_id"),
     })
 }
 
@@ -799,9 +803,10 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         && rt == "claude-code"
         && let Some(transcript) = ev.transcript_path.as_deref().map(std::path::Path::new)
     {
+        let prompt = ev.prompt_id.as_deref();
         if await_reply {
-            wait_for_reply(transcript);
-        } else if tail_awaits_reply(transcript)
+            wait_for_reply(transcript, prompt);
+        } else if tail_awaits_reply(transcript, prompt)
             && concerns_settlement(&store, rt, &ev)
             && let Some(payload) = payload.as_deref()
             && spawn_awaiting_settlement(runtime, payload).is_ok()
@@ -840,12 +845,17 @@ const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How much of the transcript's end is read to judge whether the stopped turn is answered.
 const REPLY_TAIL_BYTES: u64 = 1 << 20;
 
-/// Whether the transcript's end holds conversation after its last completed turn.
+/// Whether the transcript's end holds conversation after its last completed turn, or does not yet
+/// hold the prompt that opened the turn the Stop ended.
 ///
 /// Claude Code runs Stop hooks before its transcript writer flushes the turn's final reply. A
 /// Stop that settled what it reads would leave the turn unsettled, and after the last turn before
-/// `/exit` no later Stop comes to settle it.
-fn tail_awaits_reply(transcript: &std::path::Path) -> bool {
+/// `/exit` no later Stop comes to settle it. A session driven over stream-json input runs them
+/// before it writes any of the turn: the file then ends at the previous turn, answered, and
+/// settling it lands that turn while this one waits for a later Stop. The prompt record is looked
+/// for in the read window only; a turn whose records outgrow the window goes to the detached
+/// wait, which finds its prompt further back.
+fn tail_awaits_reply(transcript: &std::path::Path, prompt: Option<&str>) -> bool {
     use std::io::{Read as _, Seek as _};
     let Ok(mut file) = std::fs::File::open(transcript) else {
         return false;
@@ -862,6 +872,11 @@ fn tail_awaits_reply(transcript: &std::path::Path) -> bool {
     {
         return false;
     }
+    if let Some(prompt) = prompt
+        && !holds(&tail, prompt_record(prompt).as_bytes())
+    {
+        return true;
+    }
     let tail = String::from_utf8_lossy(&tail);
     // A window that starts inside the file and holds no completed turn may be cut through the
     // stopped turn's own record, which then parses as nothing; it cannot show the turn answered.
@@ -869,10 +884,65 @@ fn tail_awaits_reply(transcript: &std::path::Path) -> bool {
         || crate::adapter::claude_code::awaits_reply(&tail)
 }
 
-fn wait_for_reply(transcript: &std::path::Path) {
+/// Waits, within [`REPLY_WAIT`], until the transcript holds the Stop's prompt record and the
+/// reply that answers it. The whole transcript is searched for the prompt once, then only what
+/// is appended after; a prompt that never appears ends the wait at its bound, and the turn is
+/// settled from what the transcript holds, as a Stop that reported no prompt would.
+fn wait_for_reply(transcript: &std::path::Path, prompt: Option<&str>) {
     let deadline = std::time::Instant::now() + REPLY_WAIT;
-    while tail_awaits_reply(transcript) && std::time::Instant::now() < deadline {
+    let record = prompt.map(prompt_record);
+    let mut written = record.is_none();
+    let mut searched = 0;
+    loop {
+        if let Some(record) = record.as_deref().filter(|_| !written) {
+            (written, searched) = search_record(transcript, record.as_bytes(), searched);
+        }
+        if (written && !tail_awaits_reply(transcript, None))
+            || std::time::Instant::now() >= deadline
+        {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// How the record of the prompt `id` names it in a Claude Code transcript.
+fn prompt_record(id: &str) -> String {
+    format!("\"promptId\":\"{id}\"")
+}
+
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Whether the transcript holds `record` past `from`, and how far it was searched, so the next
+/// search starts there. A record that straddles `from` is still found.
+fn search_record(transcript: &std::path::Path, record: &[u8], from: u64) -> (bool, u64) {
+    use std::io::{Read as _, Seek as _};
+    let Ok(mut file) = std::fs::File::open(transcript) else {
+        return (false, from);
+    };
+    let overlap = record.len().saturating_sub(1);
+    let start = from.saturating_sub(overlap as u64);
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return (false, from);
+    }
+    let mut end = start;
+    let mut window = Vec::new();
+    let mut chunk = vec![0; 1 << 20];
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) | Err(_) => return (false, end.max(from)),
+            Ok(read) => read,
+        };
+        end += read as u64;
+        window.extend_from_slice(&chunk[..read]);
+        if holds(&window, record) {
+            return (true, end);
+        }
+        window.drain(..window.len().saturating_sub(overlap));
     }
 }
 
@@ -929,7 +999,7 @@ mod tests {
         let text = "x".repeat(super::REPLY_TAIL_BYTES as usize);
         let prompt = serde_json::json!({"type":"user","message":{"role":"user","content":text}});
         std::fs::write(&transcript, format!("{prompt}\n")).unwrap();
-        assert!(super::tail_awaits_reply(&transcript));
+        assert!(super::tail_awaits_reply(&transcript, None));
 
         let reply = serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":"done"}});
         std::fs::OpenOptions::new()
@@ -938,7 +1008,7 @@ mod tests {
             .unwrap()
             .write_all(format!("{reply}\n").as_bytes())
             .unwrap();
-        assert!(!super::tail_awaits_reply(&transcript));
+        assert!(!super::tail_awaits_reply(&transcript, None));
     }
 
     /// Every form the harness runs must parse. A form that does not parse is
