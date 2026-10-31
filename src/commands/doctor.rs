@@ -114,7 +114,13 @@ pub fn run(args: Args) -> CmdResult {
         };
         let repo = repo.local_objects_only();
         if let Err(error) = super::migration::check_readonly_repo_startup(&repo) {
-            ui::error(&format!("local storage inspection failed: {error:#}"));
+            match super::migration::interrupted_step(&error) {
+                Some(step) => {
+                    ui::error(&error.to_string());
+                    ui::hint(step);
+                }
+                None => ui::error(&format!("local storage inspection failed: {error:#}")),
+            }
             return Ok(ExitCode::Precondition);
         }
         Some((owner, name, path))

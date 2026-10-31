@@ -160,14 +160,45 @@ fn status_refuses_pending_recovery_without_consuming_evidence() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(combined.contains("pending recovery"));
-        assert!(combined.contains("original AgentGit store"));
+        assert!(combined.contains("an earlier agit command stopped before it finished"));
+        assert!(combined.contains("`agit config --list` finishes it"));
+        assert!(!combined.contains("agit save"), "{combined}");
         if args.contains(&"--json") {
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(value["exit_code"], 4);
         }
         assert_eq!(files(&home), before);
     }
+}
+
+/// Evidence a running command still holds is not a stopped command: status says to wait for it
+/// rather than naming a step that would contend with it.
+#[test]
+fn status_waits_for_a_command_that_is_still_running() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let recovery = home.join("layout-v1-recovery");
+    fs::create_dir_all(&recovery).unwrap();
+    fs::write(
+        recovery.join("pending-clone-history-1-0"),
+        b"owner/history\n",
+    )
+    .unwrap();
+    let lock = fs::File::create(home.join("layout-v1.lock")).unwrap();
+    lock.lock_shared().unwrap();
+    let before = files(&home);
+    let output = status(&home, "http://127.0.0.1:1", &["status"]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("another agit command is still running"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run this again when it has finished"),
+        "{stderr}"
+    );
+    assert_eq!(files(&home), before);
 }
 
 #[test]

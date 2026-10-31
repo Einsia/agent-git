@@ -204,6 +204,9 @@ pub fn run(mut args: Args) -> CmdResult {
         super::migration::check_readonly_repo_startup_local(&repo.clone().local_objects_only())
     {
         ui::error(&format!("push requires settled local storage: {error:#}"));
+        if let Some(step) = super::migration::interrupted_step(&error) {
+            ui::hint(step);
+        }
         return Ok(ExitCode::Precondition);
     }
 

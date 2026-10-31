@@ -945,10 +945,17 @@ fn v0_review_refuses_selected_or_unknown_recovery_without_consuming_it() {
         ] {
             let output = fixture.run(&args);
             assert_eq!(output.status.code(), Some(4), "{recovery}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("settled local storage"),
-                "{output:?}"
-            );
+            let said = String::from_utf8_lossy(&output.stderr);
+            assert!(said.contains("settled local storage"), "{output:?}");
+            // The selected repository's own evidence says what stopped and the step that finishes
+            // it, never one that uploads.
+            if recovery == SLUG {
+                assert!(
+                    said.contains("`agit config --list` finishes it"),
+                    "{output:?}"
+                );
+            }
+            assert!(!said.contains("agit save"), "{output:?}");
             assert_eq!(fixture.files(), before, "recovery evidence was changed");
         }
     }
