@@ -338,6 +338,20 @@ impl Client {
         c
     }
 
+    /// [`Self::for_hub_with_token`] whose every request must finish within `timeout`. The token
+    /// is used as it stands and never renewed.
+    pub(crate) fn for_hub_with_token_and_timeout(
+        hub: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> Client {
+        let c = Self::for_hub_with_timeout(hub, timeout);
+        if HubAuthority::parse(hub).is_ok() {
+            *c.token.borrow_mut() = Some(token.to_string());
+        }
+        c
+    }
+
     /// Exchange a PAT for a proper pair of session tokens.
     pub fn login_with_pat(&self, pat: &str) -> Result<LoginResponse> {
         self.post_public("api/auth/login", &serde_json::json!({ "token": pat }))
