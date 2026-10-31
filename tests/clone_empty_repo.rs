@@ -219,3 +219,22 @@ fn first_file_commit_lands_on_main_from_the_checkout_an_empty_clone_prints() {
         "the line carries its form and none of init's scaffolding"
     );
 }
+
+/// A clone that fails before anything lands leaves nothing for startup to finish, so `agit status`
+/// still answers afterwards instead of refusing over a command that never got going.
+#[test]
+fn a_clone_that_fails_leaves_status_working() {
+    let lab = Lab::new();
+    std::fs::remove_dir_all(lab.root.path().join("source.git")).unwrap();
+    let out = lab
+        .command(env!("CARGO_BIN_EXE_agit"))
+        .args(["clone", "alice/wiki", "--no-bind", "--auto-push=false"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let pending: Vec<_> = std::fs::read_dir(lab.home.join("layout-v1-recovery"))
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(pending.is_empty(), "{pending:?}");
+    lab.agit(&["status"]);
+}

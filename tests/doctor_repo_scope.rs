@@ -212,7 +212,7 @@ fn global_doctor_preserves_pending_recovery() {
     let output = lab.doctor("http://127.0.0.1:1", &["doctor"]);
     assert_eq!(output.status.code(), Some(4), "{}", text(&output));
     assert!(
-        text(&output).contains("pending recovery"),
+        text(&output).contains("an earlier agit command stopped before it finished"),
         "{}",
         text(&output)
     );
@@ -433,9 +433,36 @@ fn scoped_doctor_refuses_related_and_unattributable_recovery_without_consuming_i
             let output = lab.doctor("http://127.0.0.1:1", &args);
             assert_eq!(output.status.code(), Some(4), "{}", text(&output));
             assert_unchanged(&lab.home, &before);
+            // The selected repository's own evidence names its cause and the step that finishes
+            // it without uploading, as the folder-wide doctor does; evidence agit cannot trace to
+            // a repository is refused as before.
+            if contents == "alice/chosen\n" {
+                let said = text(&output);
+                assert!(
+                    said.contains("an earlier agit command stopped before it finished")
+                        && said.contains("`agit config --list` finishes it"),
+                    "{said}"
+                );
+                assert!(!said.contains("original AgentGit store"), "{said}");
+                assert!(!said.contains("agit save"), "{said}");
+            }
         }
         fs::remove_file(pending).unwrap();
     }
+    // While the command that left it still runs, the doctor says to wait for it.
+    let pending = lab.pending("selected", "alice/chosen\n");
+    let lock = fs::File::create(lab.home.join("layout-v1.lock")).unwrap();
+    lock.lock_shared().unwrap();
+    let output = lab.doctor("http://127.0.0.1:1", &formats()[0]);
+    assert_eq!(output.status.code(), Some(4), "{}", text(&output));
+    assert!(
+        text(&output).contains("another agit command is still running"),
+        "{}",
+        text(&output)
+    );
+    assert!(!text(&output).contains("agit save"), "{}", text(&output));
+    drop(lock);
+    fs::remove_file(pending).unwrap();
     fs::write(
         repo.git_path("agit-checkout-transaction.json").unwrap(),
         b"pending checkout",

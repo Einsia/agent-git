@@ -612,14 +612,83 @@ pub fn migrate_startup() -> Result<Report> {
     migrate_startup_at(&home, &repos)
 }
 
+/// Startup recovery evidence that a read-only command refuses on, in the person's terms: either
+/// another command is still writing, or one stopped part-way and `agit config --list`, which only
+/// reads settings and uploads nothing, finishes it (as does the next `agit save`, `agit on` or
+/// `agit off`).
+#[derive(Debug)]
+pub struct Interrupted {
+    pub running: bool,
+}
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.running {
+            "another agit command is still running"
+        } else {
+            "an earlier agit command stopped before it finished"
+        })
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+impl Interrupted {
+    pub fn step(&self) -> &'static str {
+        if self.running {
+            "run this again when it has finished"
+        } else {
+            "`agit config --list` finishes it (it only reads your settings); then run this again"
+        }
+    }
+}
+
+/// The step for recovery evidence a command found and could not settle, when [`Interrupted`]
+/// names it; every command that reports such a refusal adds it as a hint.
+pub fn interrupted_step(error: &anyhow::Error) -> Option<&'static str> {
+    error.downcast_ref::<Interrupted>().map(Interrupted::step)
+}
+
+/// Whether a live operation still holds its evidence: each one keeps a shared startup lock until
+/// it clears its evidence or exits. A lock file that is missing has no holder. Nothing is created,
+/// and the probe never waits.
+fn operation_running(home: &Path) -> Result<bool> {
+    let lock_path = home.join("layout-v1.lock");
+    let lock = match File::open(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open migration lock {}", lock_path.display()));
+        }
+    };
+    if lock.try_lock_exclusive().is_err() {
+        return Ok(true);
+    }
+    fs2::FileExt::unlock(&lock)?;
+    Ok(false)
+}
+
+/// Finishes what a command that stopped part-way left behind, for the front door's commands that
+/// otherwise skip startup migration. Evidence a running command still holds is left to it.
+pub fn finish_interrupted() -> Result<()> {
+    let home = crate::infra::config::agit_home()?;
+    if startup_recovery_evidence(&home)?.is_empty() || operation_running(&home)? {
+        return Ok(());
+    }
+    migrate_startup().map(|_| ())
+}
+
 /// Inspect recovery prerequisites without creating storage, acquiring locks, or migrating refs.
 /// Legacy history can be displayed, but interrupted publication cannot be reported as settled.
 pub fn check_readonly_startup() -> Result<()> {
     let home = crate::infra::config::agit_home()?;
-    anyhow::ensure!(
-        startup_recovery_evidence(&home)?.is_empty(),
-        "local storage has pending recovery; complete recovery through the original AgentGit store before inspecting status"
-    );
+    if !startup_recovery_evidence(&home)?.is_empty() {
+        return Err(Interrupted {
+            running: operation_running(&home)?,
+        }
+        .into());
+    }
     // Every probe only reads, so a bounded set of repositories, aliases that share a Git directory
     // included, is inspected at once; the first failure in repository order is reported.
     for group in super::clone::list_local()?.chunks(STARTUP_CHECKOUT_WORKERS) {
@@ -741,11 +810,15 @@ fn check_readonly_repo_startup_with_policy(
         let recovered_common_dir = recovered_repo
             .common_dir_with_policy(policy)?
             .canonicalize()?;
-        anyhow::ensure!(
-            !canonical_roots.contains(&recovered_root)
-                && recovered_common_dir != selected_common_dir,
-            "the selected repository has pending recovery; complete recovery through the original AgentGit store before inspecting it"
-        );
+        // The selected repository's own evidence is told as the folder-wide check tells it:
+        // whether a command is still running, or which step finishes what one left.
+        if canonical_roots.contains(&recovered_root) || recovered_common_dir == selected_common_dir
+        {
+            return Err(Interrupted {
+                running: operation_running(&home)?,
+            }
+            .into());
+        }
     }
     // Only the inspection parser keeps `git worktree list`'s branch exactly as Git resolved it.
     let checkouts = checkouts::Checkouts::inspect(
@@ -2238,6 +2311,22 @@ fn rollback_heads_atomically(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal on recovery evidence names a step that only finishes recovery: never `agit save`,
+    /// which uploads and can turn a folder on, whichever command reports it. A command still
+    /// running is waited for, not finished.
+    #[test]
+    fn a_recovery_step_never_points_at_an_upload() {
+        for running in [false, true] {
+            let error = anyhow::Error::new(Interrupted { running });
+            let step = interrupted_step(&error).unwrap();
+            assert!(!step.contains("agit save"), "{step}");
+            assert_eq!(step.contains("`agit config --list`"), !running, "{step}");
+            let wrapped = error.context("guarded revert requires settled local storage");
+            assert_eq!(interrupted_step(&wrapped), Some(step));
+        }
+        assert!(interrupted_step(&anyhow::anyhow!("pending checkout")).is_none());
+    }
     use crate::domain::meta::{Line, Meta};
 
     // Byte-for-byte fixture shared with AgentGit-Backend's migration tests. Keep the parent object

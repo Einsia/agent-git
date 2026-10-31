@@ -160,8 +160,15 @@ pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     let dest = config::repo_dir(owner, name)?;
     let history_update =
         super::migration::begin_startup_recovery_for_path(&dest, "readonly-clone-history")?;
-    let out = crate::hub::git::clone(&a.clone_url, &dest, &identity)?;
+    let out = match crate::hub::git::clone(&a.clone_url, &dest, &identity) {
+        Ok(out) => out,
+        Err(error) => {
+            abandon_failed_clone(history_update, &dest)?;
+            return Err(error);
+        }
+    };
     if !out.ok() {
+        abandon_failed_clone(history_update, &dest)?;
         anyhow::bail!("{}", out.stderr.trim());
     }
     let repo = Repo::at(&dest);
@@ -169,6 +176,19 @@ pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     super::migration::finish_external_history_update(&repo, history_update)?;
     super::config::choose_repo_auto_push()?.apply(&repo, &format!("{owner}/{name}"))?;
     Ok(repo)
+}
+
+/// A fresh clone that failed and left no repository behind published nothing locally, so the
+/// recovery evidence written before it is cleared: startup would have nothing to finish, and until
+/// it ran, `agit status` would refuse to read anything.
+fn abandon_failed_clone(
+    evidence: Option<super::migration::StartupRecoveryEvidence>,
+    dest: &Path,
+) -> crate::Result<()> {
+    match evidence {
+        Some(evidence) if !dest.join(".git").exists() => evidence.clear(),
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn readonly_clone_error_code(error: &anyhow::Error) -> ExitCode {
@@ -428,9 +448,13 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         ));
         let outcome = match crate::hub::git::clone(&clone_url, &dest, &plan.identity) {
             Ok(outcome) => outcome,
-            Err(error) => return local_transport_failure(error),
+            Err(error) => {
+                abandon_failed_clone(history_update, &dest)?;
+                return local_transport_failure(error);
+            }
         };
         if !outcome.ok() {
+            abandon_failed_clone(history_update, &dest)?;
             // The hint names the cause the exit code reports: a grant hint after a transfer that
             // broke off for another reason sends the reader to ask for access they already hold.
             // Any other failure covers a missing repository, a Hub error and a dropped connection

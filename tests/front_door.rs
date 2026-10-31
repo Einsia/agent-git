@@ -778,6 +778,63 @@ fn a_dropped_conversation_is_left_out_of_all_and_today() {
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
 }
 
+/// A command that stopped part-way leaves a recovery note that read-only commands refuse on. The
+/// step they name finishes it without uploading anything, so status answers again. A step that
+/// named `agit save` would steer a person, or an agent reading the hint, into an upload, and in a
+/// folder that was never on, into turning it on.
+#[test]
+fn the_named_step_finishes_what_a_stopped_command_left_without_uploading() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    let recovery = lab.agit_home.join("layout-v1-recovery");
+    std::fs::create_dir_all(&recovery).unwrap();
+    std::fs::write(recovery.join("pending-clone-history-1-0"), b"me/notes\n").unwrap();
+
+    let out = lab.agit(&dir, &["status"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("`agit config --list` finishes it"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("agit save"), "{stderr}");
+
+    let out = lab.agit(&dir, &["config", "--list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 0);
+    let out = lab.agit(&dir, &["status"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What a running command holds is its own: a save meanwhile neither waits for it nor clears it.
+#[test]
+fn a_save_leaves_a_running_commands_recovery_alone() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    let recovery = lab.agit_home.join("layout-v1-recovery");
+    std::fs::create_dir_all(&recovery).unwrap();
+    let pending = recovery.join("pending-clone-history-1-0");
+    std::fs::write(&pending, b"me/notes\n").unwrap();
+    let lock = std::fs::File::create(lab.agit_home.join("layout-v1.lock")).unwrap();
+    lock.lock_shared().unwrap();
+
+    let out = lab.agit(&dir, &["save"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(pending.exists());
+}
+
 /// A folder that is on covers the git worktrees of its checkout (#162), from when it covers each
 /// one. Its overview names each worktree with the sessions there from before; in a worktree, the
 /// overview and `agit status` name the folder whose setting it follows and count those sessions

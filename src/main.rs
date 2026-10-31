@@ -266,6 +266,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     let prepared = match startup {
         Startup::Inspect => commands::migration::check_readonly_startup(),
         Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
+        Startup::Finish => commands::migration::finish_interrupted(),
         Startup::ScopedDoctor
         | Startup::ScopedDiff
         | Startup::ScopedImport
@@ -276,7 +277,12 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         | Startup::ToolDispatcher => Ok(()),
     };
     if let Err(e) = prepared {
-        agit::ui::error(&format!("local storage preparation failed: {e:#}"));
+        if let Some(interrupted) = e.downcast_ref::<commands::migration::Interrupted>() {
+            agit::ui::error(&interrupted.to_string());
+            agit::ui::hint(interrupted.step());
+        } else {
+            agit::ui::error(&format!("local storage preparation failed: {e:#}"));
+        }
         return Some(agit::ExitCode::Precondition.as_i32());
     }
     None
@@ -310,6 +316,9 @@ enum Startup {
     ScopedDiff,
     /// Explicit import inspection checks only its selected local repository before discovery.
     ScopedImport,
+    /// The front door's on, off and save finish what a command that stopped part-way left behind,
+    /// never what a running one holds, and otherwise prepare nothing, like an explicit import.
+    Finish,
     /// Review and guarded edits inspect recovery only after selecting their repository.
     ScopedReview,
     /// Search queries the Hub without inspecting or migrating local repositories.
@@ -328,6 +337,7 @@ impl Startup {
             self,
             Self::ScopedDoctor
                 | Self::ScopedImport
+                | Self::Finish
                 | Self::ScopedReview
                 | Self::RemoteSearch
                 | Self::LocalSearch
@@ -346,7 +356,7 @@ fn startup_for(command: &Commands) -> Startup {
             Startup::ToolDispatcher
         }
         Commands::Status(_) | Commands::Overview => Startup::Inspect,
-        Commands::On(_) | Commands::Off(_) | Commands::Save(_) => Startup::ScopedImport,
+        Commands::On(_) | Commands::Off(_) | Commands::Save(_) => Startup::Finish,
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
@@ -514,6 +524,10 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Err(e) => {
             commands::fix::register_terminal_error(&e);
             agit::ui::error(&commands::terminal_error_message(&e));
+            // A repository a command inspects that another command left part-way names its step.
+            if let Some(step) = commands::migration::interrupted_step(&e) {
+                agit::ui::hint(step);
+            }
             // An unwritable home or a held lock carries its own next steps, including that a
             // lock file must not be deleted while its holder runs.
             for hint in agit::infra::local_state::hints(&e) {

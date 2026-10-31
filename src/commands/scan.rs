@@ -186,6 +186,9 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!(
                 "sensitive review requires settled local storage: {error:#}"
             ));
+            if let Some(step) = super::migration::interrupted_step(&error) {
+                ui::hint(step);
+            }
             return Ok(ExitCode::Precondition);
         }
         return run_sensitive(&repo, &slug, &targets, args.json);

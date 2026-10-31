@@ -11,9 +11,10 @@ Answer "who am I, am I in a session, and is the repo synchronized?" It reports w
 
 Default status reads local state without checking for updates, creating storage, or migrating history.
 Remote state means the refs already fetched locally. If interrupted storage recovery is pending,
-status refuses. Complete recovery through the original AgentGit store before inspecting status
-again; its normal `agit doctor` startup can recover supported local checkouts. Status does not
-change the migration rules for repositories linked from another store.
+status refuses and names the cause: another agit command still running (run status again once it
+has finished), or one that stopped part-way, which `agit config --list` finishes (it only reads
+settings and uploads nothing). Status does not change the migration rules for repositories linked
+from another store.
 
 ## Synopsis
 

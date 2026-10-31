@@ -168,6 +168,9 @@ pub fn run(args: Args) -> CmdResult {
         ui::error(&format!(
             "guarded revert requires settled local storage: {error:#}"
         ));
+        if let Some(step) = super::migration::interrupted_step(&error) {
+            ui::hint(step);
+        }
         return Ok(ExitCode::Precondition);
     }
     if super::branch::is_sealed(&read_repo, &target) {
