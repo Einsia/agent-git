@@ -122,6 +122,33 @@ table; an archive whose checksum does not verify must not be used. The npm side
 downloads no Release archive — the platform binaries come from the registry's
 platform packages, and the registry's SRI (sha512) guarantees their integrity.
 
+## Source archives
+
+The bundled Git runtime includes GPL- and LGPL-licensed components, so the Release
+also carries their corresponding source: one `source-*.tar` or `source-*.tar.gz`
+asset per source, and `SOURCES-SHA256SUMS` listing them in the same format as
+`SHA256SUMS`. The release notes end with a table naming each archive, what it is
+the source of, and its checksum.
+
+`scripts/git-runtime-sources.py` builds them in the release job from
+`scripts/git-runtime-sources.json`, which pins each source and names the
+`scripts/git-runtime-lock.json` pins it covers:
+
+- An Alpine package's archive holds its aports recipe at the pinned commit and the
+  upstream files it builds from, each checked against the APKBUILD's `sha512sums`.
+- A Git tree's archive holds the pinned commit whole. A pinned tag must still name
+  that commit upstream, and dugite-native's Git must be the commit its `git`
+  submodule records.
+
+The job stops before publishing if a source cannot be built from its pins, or if a
+copyleft pin in the lock has no source; after publishing, it checks that every
+source archive is on the Release. `SHA256SUMS` keeps listing the binary archives
+only, and no source asset name starts with `agit-`, so nothing that selects
+binaries by name picks one up.
+
+When a lock change replaces a copyleft pin, the same change updates its entry in
+`git-runtime-sources.json`; `scripts/test_git_runtime.py` fails until it does.
+
 ## Download URLs
 
 ```

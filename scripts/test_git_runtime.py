@@ -16,6 +16,9 @@ spec.loader.exec_module(runtime)
 spec = importlib.util.spec_from_file_location("mirror", Path(__file__).with_name("mirror-git-runtime-archives.py"))
 mirror = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mirror)
+spec = importlib.util.spec_from_file_location("sources", Path(__file__).with_name("git-runtime-sources.py"))
+sources = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sources)
 
 
 class RuntimeArchiveTests(unittest.TestCase):
@@ -175,6 +178,62 @@ class RuntimeArchiveTests(unittest.TestCase):
                     failures = mirror.mirror_missing(lock, api, "87", "job-token", Path(temporary))
                 self.assertEqual(puts, [body] if uploaded else [])
                 self.assertEqual(bool(failures), failed, failures)
+
+
+class RuntimeSourceTests(unittest.TestCase):
+    def test_every_copyleft_runtime_pin_has_a_published_source(self):
+        """A lock change that ships a GPL or LGPL archive must name the archive holding its source.
+
+        The release refuses to publish on the same check, so this reports the gap with the pin
+        change instead. A list that dropped a pin, or still covered one the lock replaced, must be
+        refused too, or a stale list would pass.
+        """
+        lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
+        listed = json.loads(Path(__file__).with_name("git-runtime-sources.json").read_text())
+        sources.check_coverage(lock, listed)
+        dropped = json.loads(json.dumps(listed))
+        dropped["sources"][0]["covers"].pop()
+        with self.assertRaisesRegex(ValueError, "no source archive covers"):
+            sources.check_coverage(lock, dropped)
+        stale = json.loads(json.dumps(listed))
+        stale["sources"][0]["covers"].append("0" * 64)
+        with self.assertRaisesRegex(ValueError, "not a copyleft pin"):
+            sources.check_coverage(lock, stale)
+
+    def test_alpine_source_archive_holds_what_the_apkbuild_builds_from(self):
+        """Every file the APKBUILD's sha512sums names is in the archive, with that checksum.
+
+        Checking only the pins in git-runtime-sources.json would let a forgotten patch, or an upstream
+        tarball Alpine did not compile, be published as the source.
+        """
+        tarball, patch_file = b"upstream source", b"--- a\n+++ b\n"
+        apkbuild = (
+            f'pkgname=x\nsha512sums="\n{hashlib.sha512(tarball).hexdigest()}  x-1.tar.gz\n'
+            f'{hashlib.sha512(patch_file).hexdigest()}  fix.patch\n"\n'
+        ).encode()
+        recipe = {"APKBUILD": apkbuild, "fix.patch": patch_file}
+        cases = {
+            "complete": (["APKBUILD", "fix.patch"], tarball, None),
+            "recipe file left out": (["APKBUILD"], tarball, "builds from fix.patch, which is not pinned"),
+            "another tarball": (["APKBUILD", "fix.patch"], b"other source", "x-1.tar.gz is not the file"),
+        }
+        for case, (pinned, download, error) in cases.items():
+            served = dict(recipe, **{"x-1.tar.gz": download})
+            entry = {
+                "asset": "source-alpine-x-1-r0.tar",
+                "aports": {"commit": "c" * 40, "directory": "main/x", "files": {name: hashlib.sha256(recipe[name]).hexdigest() for name in pinned}},
+                "downloads": [{"name": "x-1.tar.gz", "urls": ["https://example.invalid/x-1.tar.gz"], "sha256": hashlib.sha256(download).hexdigest()}],
+            }
+            with self.subTest(case), patch.object(
+                sources.urllib.request, "urlopen", side_effect=lambda url, timeout: io.BytesIO(served[url.rsplit("/", 1)[1]])
+            ):
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        list(sources.alpine_members(entry))
+                else:
+                    members = {header.name: body for header, body in sources.alpine_members(entry)}
+                    self.assertEqual(members, {f"source-alpine-x-1-r0/main/x/{name}": body for name, body in served.items()})
+
 
 if __name__ == "__main__":
     unittest.main()

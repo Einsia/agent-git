@@ -64,6 +64,15 @@ release, `runtime-manifest.json`, `THIRD-PARTY-NOTICES`, and license texts with
 source references. Refresh the pins and rerun the platform checks when updating
 Git, LFS, certificates, or dependency security fixes.
 
+Every GitHub release also publishes the corresponding source of the runtime's GPL-
+and LGPL-licensed components, built from `scripts/git-runtime-sources.json` (see
+[the release artifact contract](../.github/RELEASE_ARTIFACTS.md#source-archives)).
+A pin refresh that replaces such a component updates its entry there too: the
+Alpine recipe commit and files, the upstream download, or the Git commit the
+binary was built from. The unit tests fail while a copyleft pin has no entry, and
+`python3 scripts/git-runtime-sources.py <dir>` builds the archives the way the
+release does.
+
 ## Verification
 
 ```sh
