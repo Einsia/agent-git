@@ -46,6 +46,23 @@ pub fn run() -> CmdResult {
         None => Vec::new(),
     };
     let total = sessions.len();
+    // A git worktree a main checkout covers says which folder's setting it follows, and both say
+    // how many sessions from before that coverage wait for `agit save --all`.
+    let through = root
+        .as_deref()
+        .and_then(crate::commands::project::worktree_of);
+    let earlier: Vec<(std::path::PathBuf, usize)> = match (&root, &through) {
+        (Some(root), Some(_)) => vec![(root.clone(), super::left_out_in(root, &sessions))],
+        (Some(root), None) => crate::commands::project::covered_worktrees(root)
+            .into_iter()
+            .map(|worktree| {
+                let count = super::left_out_in(&worktree, &sessions);
+                (worktree, count)
+            })
+            .collect(),
+        (None, _) => Vec::new(),
+    };
+    let waiting: usize = earlier.iter().map(|(_, count)| count).sum();
     // The background uploader decides what an on folder still owes the Hub, including turns that
     // never reached a local branch; asking it costs this command nothing.
     if state == FolderState::On
@@ -58,7 +75,12 @@ pub fn run() -> CmdResult {
         .as_deref()
         .and_then(crate::commands::project::last_failure);
     let codex_untrusted = state == FolderState::On && codex_hooks_silent(&sessions);
-    let next = next_step(account.is_some(), root.is_some(), state, total);
+    let next = next_step(account.is_some(), root.is_some(), state, total).or_else(|| {
+        (waiting > 0).then_some((
+            "agit save --all",
+            "upload the sessions that ran before this folder covered them",
+        ))
+    });
 
     if crate::commands::json::is_capturing() {
         println!(
@@ -69,6 +91,12 @@ pub fn run() -> CmdResult {
                 "folder": root,
                 "state": state,
                 "repository": repository,
+                "through": through,
+                "earlier_sessions_not_uploaded": through.as_ref().map(|_| waiting),
+                "worktrees": through.is_none().then(|| earlier.iter().map(|(folder, count)| serde_json::json!({
+                    "folder": folder,
+                    "earlier_sessions_not_uploaded": count,
+                })).collect::<Vec<_>>()),
                 "sessions_here": total,
                 "recent": sessions.iter_mut().map(row_json).collect::<Vec<_>>(),
                 "last_upload_error": failure,
@@ -96,10 +124,17 @@ pub fn run() -> CmdResult {
             let folder = ui::tilde(root);
             let repository = repository.as_deref().unwrap_or_default();
             match state {
-                FolderState::On => println!(
-                    "{folder} is on: sessions upload to {}",
-                    ui::bold(repository)
-                ),
+                FolderState::On => match &through {
+                    Some(main) => println!(
+                        "{folder} is on through {} (git worktree): sessions upload to {}",
+                        ui::tilde(main),
+                        ui::bold(repository)
+                    ),
+                    None => println!(
+                        "{folder} is on: sessions upload to {}",
+                        ui::bold(repository)
+                    ),
+                },
                 FolderState::LocalOnly => println!(
                     "{folder} is set up for {repository}, but its sessions are not saved or uploaded by themselves"
                 ),
@@ -119,8 +154,22 @@ pub fn run() -> CmdResult {
                     ui::truncate(failure, 160)
                 );
             }
+            for (worktree, count) in earlier.iter().filter(|(_, count)| *count > 0) {
+                let place = if through.is_some() {
+                    "here".to_owned()
+                } else {
+                    format!("in {} (git worktree)", ui::tilde(worktree))
+                };
+                println!(
+                    "  {count} earlier session{} {place} {} not uploaded; to upload {} too: {}",
+                    if *count == 1 { "" } else { "s" },
+                    if *count == 1 { "is" } else { "are" },
+                    if *count == 1 { "it" } else { "them" },
+                    ui::accent("agit save --all")
+                );
+            }
             for session in &mut sessions {
-                print_row(session);
+                print_row(session, root);
             }
             if total > SHOWN {
                 println!("  … and {} more", total - SHOWN);
@@ -207,10 +256,16 @@ fn status_key(session: &FolderSession) -> &'static str {
     }
 }
 
-fn print_row(session: &mut FolderSession) {
+/// One session of the folder; one that ran in a git worktree the folder covers names it.
+fn print_row(session: &mut FolderSession, root: &std::path::Path) {
     let title = ui::truncate(&session.title(), 44);
+    let place = if session.cwd.starts_with(root) {
+        String::new()
+    } else {
+        format!("  {}", ui::dim(&ui::tilde(&session.cwd)))
+    };
     println!(
-        "  {:<46} {:<9} {:<10} {}",
+        "  {:<46} {:<9} {:<10} {}{place}",
         title,
         super::runtime_name(session.runtime),
         ui::ago(session.modified),
@@ -225,5 +280,6 @@ fn row_json(session: &mut FolderSession) -> serde_json::Value {
         "session_id": session.id,
         "status": status_key(session),
         "repository": session.saved.as_ref().map(|(r, _)| r),
+        "folder": session.cwd,
     })
 }

@@ -184,6 +184,8 @@ pub mod domain {
     pub mod turn;
     /// Workspaces: the binding between a local directory and a repo, plus the pinned branch.
     pub mod workspace;
+    /// Git worktrees and the main checkout each belongs to, read without running Git.
+    pub mod worktree;
 }
 
 /// Cross-domain infrastructure.

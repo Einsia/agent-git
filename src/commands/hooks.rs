@@ -518,6 +518,13 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
     let origin = session_origin(ev);
     let origin = origin.as_deref().map(std::path::Path::new);
+    // A new conversation in a git worktree an on folder covers is where that coverage begins,
+    // when nothing began it before: from then on, conversations there upload by themselves.
+    if matches!(ev.source, Source::Startup | Source::Clear)
+        && let Some(origin) = origin
+    {
+        super::project::adopt(origin, rt, &ev.session_id);
+    }
     let bound = origin
         .map(|d| workspace::read(d).is_some() || super::project::registration_scope(d))
         .unwrap_or(false);
@@ -633,8 +640,9 @@ fn announces_upload(runtime: &str, source: Source) -> bool {
         )
 }
 
-/// One line naming the destination, who can see it, and how to stop the upload. The agent was told
-/// nothing, so stopping is a command the person runs or asks their agent to run.
+/// One line naming the destination, who can see it, which folder's setting uploads it when that
+/// is not the folder it started in, and how to stop the upload. The agent was told nothing, so
+/// stopping is a command the person runs or asks their agent to run.
 fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
     let owner = upload.repository.split('/').next().unwrap_or_default();
     let audience = match (upload.visibility.as_deref(), upload.org) {
@@ -651,8 +659,16 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
         (Some(visibility), _) => visibility.to_owned(),
         (None, _) => "visibility not confirmed".to_owned(),
     };
+    let because = match &upload.worktree {
+        Some((worktree, main)) => format!(
+            ", because {} is a git worktree of {}",
+            crate::ui::tilde(worktree),
+            crate::ui::tilde(main)
+        ),
+        None => String::new(),
+    };
     format!(
-        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it).",
+        "agit: this conversation is uploaded to {} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it).",
         upload.repository
     )
 }
@@ -1383,6 +1399,7 @@ mod tests {
                 visibility: visibility.map(str::to_owned),
                 org,
                 members_read,
+                worktree: None,
             })
         };
         let notice =
@@ -1402,6 +1419,21 @@ mod tests {
         assert!(notice(Some("private"), None).contains("(private)"));
         assert!(notice(Some("public"), Some(true)).contains("(public: anyone can read it)"));
         assert!(notice(None, None).contains("(visibility not confirmed)"));
+        // A conversation in a git worktree that an on folder covers is told which folder's
+        // setting uploads it.
+        let through = super::upload_notice(&crate::commands::project::AutomaticUpload {
+            repository: "acme/widget".into(),
+            visibility: Some("private".into()),
+            org: Some(false),
+            members_read: None,
+            worktree: Some(("/w/widget-tree".into(), "/w/widget".into())),
+        });
+        assert!(
+            through.contains(
+                "at the end of each turn, because /w/widget-tree is a git worktree of /w/widget."
+            ),
+            "{through}"
+        );
     }
 
     #[test]

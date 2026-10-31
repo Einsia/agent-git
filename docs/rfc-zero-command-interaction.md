@@ -142,6 +142,16 @@ readable by anyone must never be chosen for a person:
 The folder is the Git top level when there is one, else the directory itself. The home directory
 and the filesystem root are refused with an explanation and a suggestion.
 
+A folder that is on and is a Git main checkout also covers the linked worktrees of its checkout
+(`git worktree add`): the ones that share its Git common directory and have no setting of their
+own. A separate clone of the same origin and a submodule are not covered, and a worktree that is
+turned on covers only itself, never the main checkout or other worktrees. `agit on` names each
+worktree it covers; in a worktree, `agit` and `agit status` name the folder whose setting it
+follows; and the notice at the start of a conversation there says why it uploads. Sessions that ran
+in a worktree before the folder covered it are treated like the folder's own earlier sessions:
+they do not upload by themselves, the output counts them, and `agit save --all` uploads them.
+`agit off` in a worktree turns off only that worktree.
+
 ### Selecting a session
 
 Commands that act on one session take an optional `SESSION`:

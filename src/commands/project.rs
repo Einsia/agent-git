@@ -378,7 +378,8 @@ fn nearest(path: &Path) -> Result<Option<Project>> {
     Ok(None)
 }
 
-fn includes(project: &Project, path: &Path) -> Result<bool> {
+/// Whether `path` is in the project's folder and no folder between them is set up on its own.
+fn within(project: &Project, path: &Path) -> Result<bool> {
     if !path.starts_with(&project.root) {
         return Ok(false);
     }
@@ -393,9 +394,230 @@ fn includes(project: &Project, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// How a project covers a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+    /// The path is in the project's folder.
+    Folder,
+    /// The path is in this linked git worktree of the project's folder, which is its main
+    /// checkout.
+    Worktree(PathBuf),
+}
+
+/// How `project` covers `path`, if it does. A folder covers what is in it, and, when it is a main
+/// checkout, the linked git worktrees that share its git common directory, as far as it would
+/// cover the same place in itself. A path with a setting of its own, or below a folder with one,
+/// keeps it: only a path nobody set up is widened. Coverage flows from the main checkout only, so
+/// a worktree turned on covers neither the main checkout nor its siblings, and a separate clone of
+/// the same remote or a submodule is never covered.
+fn coverage(project: &Project, path: &Path) -> Result<Option<Via>> {
+    if path.starts_with(&project.root) {
+        return Ok(within(project, path)?.then_some(Via::Folder));
+    }
+    let Ok(path) = path.canonicalize() else {
+        return Ok(None);
+    };
+    let path = path.as_path();
+    for ancestor in path.ancestors() {
+        if read(ancestor)?.is_some() || workspace::read(ancestor).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(linked) = crate::domain::worktree::linked(path) else {
+        return Ok(None);
+    };
+    if linked.main != project.root {
+        return Ok(None);
+    }
+    let Ok(inside) = path.strip_prefix(&linked.worktree) else {
+        return Ok(None);
+    };
+    Ok(within(project, &linked.main.join(inside))?.then_some(Via::Worktree(linked.worktree)))
+}
+
+fn includes(project: &Project, path: &Path) -> Result<bool> {
+    Ok(coverage(project, path)?.is_some())
+}
+
+/// The project policy that covers `path`, paused or not, and how it covers it.
+fn governing(path: &Path) -> Result<Option<(Project, Via)>> {
+    let project = match nearest(path)? {
+        Some(project) => project,
+        None => match crate::domain::worktree::linked(path) {
+            Some(linked) => match read(&linked.main)? {
+                Some(project) => project,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        },
+    };
+    Ok(coverage(&project, path)?.map(|via| (project, via)))
+}
+
+/// The main checkout whose policy covers `folder` as one of its git worktrees.
+pub(crate) fn worktree_of(folder: &Path) -> Option<PathBuf> {
+    match governing(folder).ok()?? {
+        (project, Via::Worktree(_)) => Some(project.root),
+        _ => None,
+    }
+}
+
+/// The folder whose policy and records decide for `folder`: the main checkout of a git worktree
+/// it covers, else `folder` itself.
+fn policy_root(folder: &Path) -> PathBuf {
+    worktree_of(folder).unwrap_or_else(|| folder.to_path_buf())
+}
+
+/// What the person dropped for conversations in `folder` while another policy decided for it: the
+/// folder above it, or the main checkout of the git worktree it is. A folder that gets a policy of
+/// its own keeps them, so a drop survives `agit off` and `agit on` there and `agit save --all`.
+/// The whole set comes along; keys of sessions that ran elsewhere never match one that runs here.
+fn inherited_drops(folder: &Path) -> Result<BTreeSet<String>> {
+    Ok(match governing(folder)? {
+        Some((covering, _)) if covering.root != folder => covering.excluded,
+        _ => BTreeSet::new(),
+    })
+}
+
+/// The linked git worktrees the policy at `root` covers now.
+pub(crate) fn covered_worktrees(root: &Path) -> Vec<PathBuf> {
+    match read(root) {
+        Ok(Some(project)) => worktrees_of(&project),
+        _ => Vec::new(),
+    }
+}
+
+fn worktrees_of(project: &Project) -> Vec<PathBuf> {
+    crate::domain::worktree::of(&project.root)
+        .into_iter()
+        .filter(|worktree| matches!(coverage(project, worktree), Ok(Some(Via::Worktree(_)))))
+        .collect()
+}
+
+/// When the project at `root` began covering one of its git worktrees, and the conversation
+/// whose start made it begin, if one did.
+#[derive(Clone, Serialize, Deserialize)]
+struct Covered {
+    since: chrono::DateTime<chrono::Utc>,
+    opener: Option<String>,
+}
+
+/// The worktrees the project at `root` covers, by when it began covering each. Kept beside the
+/// policy, as the audience is, so every version still reads the policy file.
+fn covered(root: &Path) -> BTreeMap<PathBuf, Covered> {
+    state_path(root)
+        .ok()
+        .and_then(|path| fs::read(path.with_extension("worktrees")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Read-modify-write of the record of the worktrees the project at `root` covers. It has a lock of
+/// its own, so a caller holding the project lock can change it too.
+fn update_covered<T>(
+    root: &Path,
+    change: impl FnOnce(&mut BTreeMap<PathBuf, Covered>) -> T,
+) -> Result<T> {
+    let _guard = lock_at(
+        state_path(root)?.with_extension("worktrees-lock"),
+        "the worktree record lock",
+    )?;
+    let mut records = covered(root);
+    let result = change(&mut records);
+    let mut file = tempfile::NamedTempFile::new_in(home()?)?;
+    file.write_all(&serde_json::to_vec(&records)?)?;
+    file.persist(state_path(root)?.with_extension("worktrees"))
+        .map_err(|e| e.error)?;
+    Ok(result)
+}
+
+/// Records that the project at `root` covers `worktree` from now on, unless it already does.
+/// `opener` is the conversation whose start is the first sight of the worktree: a runtime may
+/// write a new conversation's first record before it runs the hook, so that conversation counts
+/// as begun after, not before.
+fn adopt_worktree(root: &Path, worktree: &Path, opener: Option<String>) -> Result<Covered> {
+    if let Some(covered) = covered(root).remove(worktree) {
+        return Ok(covered);
+    }
+    update_covered(root, |records| {
+        records
+            .entry(worktree.to_path_buf())
+            .or_insert_with(|| Covered {
+                since: chrono::Utc::now(),
+                opener,
+            })
+            .clone()
+    })
+}
+
+/// Records, as a conversation starts in `origin`, that the git worktree it starts in is covered
+/// from now on, when an on folder covers it and nothing recorded that before.
+pub(crate) fn adopt(origin: &Path, runtime: &str, session: &str) {
+    if let Ok(Some((project, Via::Worktree(worktree)))) = governing(origin) {
+        let _ = adopt_worktree(&project.root, &worktree, Some(key(runtime, session)));
+    }
+}
+
+/// Whether the session is claimed in the project's repository.
+fn claimed_here(project: &Project, runtime: &str, session_id: &str) -> bool {
+    Store::open()
+        .ok()
+        .flatten()
+        .and_then(|store| link::get(&store, runtime, session_id))
+        .is_some_and(|link| {
+            link.branch.is_some()
+                && link.owner.as_deref().zip(link.agent.as_deref())
+                    == project.repository.split_once('/')
+        })
+}
+
+/// Whether `candidate` ran in a git worktree the project covers and began before the project
+/// covered that worktree. Such a conversation is what a folder's earlier sessions are when it is
+/// turned on without its history: it never uploads by itself, and only `agit save --all` or a save
+/// that names it uploads it. Once claimed in the project's repository it is the project's like any
+/// other. A conversation that has recorded nothing yet is only now starting; one whose start
+/// cannot be read counts as earlier. `adopt` records a worktree seen for the first time as covered
+/// from now; otherwise such a worktree reads as covered from now without a record.
+fn before_covered(project: &Project, candidate: &Candidate, adopt: bool) -> Result<bool> {
+    let Some(Via::Worktree(worktree)) = coverage(project, &candidate.cwd)? else {
+        return Ok(false);
+    };
+    let session_key = key(&candidate.runtime, &candidate.session_id);
+    if claimed_here(project, &candidate.runtime, &candidate.session_id) {
+        return Ok(false);
+    }
+    let covered = if adopt {
+        adopt_worktree(&project.root, &worktree, None)?
+    } else {
+        covered(&project.root)
+            .remove(&worktree)
+            .unwrap_or_else(|| Covered {
+                since: chrono::Utc::now(),
+                opener: None,
+            })
+    };
+    if covered.opener.as_deref() == Some(session_key.as_str()) {
+        return Ok(false);
+    }
+    // A transcript stored away is restored only when no readable one is in place.
+    let Some(transcript) = adapter::get(&candidate.runtime).ok().and_then(|adapter| {
+        adapter
+            .resolve_present(&candidate.session_id, Some(&candidate.cwd))
+            .or_else(|| adapter.resolve(&candidate.session_id, Some(&candidate.cwd)))
+    }) else {
+        return Ok(false);
+    };
+    if fs::metadata(&transcript).is_ok_and(|meta| meta.len() == 0) {
+        return Ok(false);
+    }
+    Ok(crate::adapter::transcript_cwd::recorded_start(&transcript)
+        .is_none_or(|start| start < covered.since))
+}
+
 fn candidates(project: &Project) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
     let mut seen = BTreeSet::new();
+    let worktrees = crate::domain::worktree::of(&project.root);
     for runtime in ["codex", "claude-code"] {
         let adapter = adapter::get(runtime)?;
         for session in adapter.all_session_choices()? {
@@ -405,7 +627,10 @@ fn candidates(project: &Project) -> Result<Vec<Candidate>> {
             let Some(cwd) = cwd.and_then(|p| PathBuf::from(p).canonicalize().ok()) else {
                 continue;
             };
-            if includes(project, &cwd)? && seen.insert(key(runtime, &session.id)) {
+            // Only a path in the folder or in one of its worktrees can be covered.
+            let near = cwd.starts_with(&project.root)
+                || worktrees.iter().any(|worktree| cwd.starts_with(worktree));
+            if near && includes(project, &cwd)? && seen.insert(key(runtime, &session.id)) {
                 result.push(Candidate {
                     runtime: runtime.into(),
                     session_id: session.id,
@@ -730,7 +955,9 @@ fn sync(project: &mut Project) -> CmdResult {
     let mut rows = Vec::new();
     let mut failed = false;
     for candidate in candidates(project)? {
-        if project.leaves_out(&key(&candidate.runtime, &candidate.session_id)) {
+        if project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
+            || before_covered(project, &candidate, true).unwrap_or(true)
+        {
             continue;
         }
         let outcome = match sync_one(project, &candidate) {
@@ -800,7 +1027,27 @@ pub fn run(args: Args) -> CmdResult {
         Action::Unbind { path } => {
             let root = root(&path)?;
             let _guard = lock(&root)?;
-            let mut project = read(&root)?.context("directory has no project policy")?;
+            // A git worktree its main checkout covers is stopped on its own: it gets a policy of
+            // its own, turned off, and the main checkout and its repository's settings stay.
+            let mut project = match read(&root)? {
+                Some(project) => project,
+                None => match governing(&root)? {
+                    // What the person dropped there is in the main checkout's set, and stays
+                    // dropped: the whole set comes along, as keys of the main checkout's own
+                    // sessions never match one that ran here.
+                    Some((project, Via::Worktree(worktree))) if worktree == root => Project {
+                        root: root.clone(),
+                        history: History::None,
+                        earlier: BTreeSet::new(),
+                        last_result: None,
+                        // The worktree's own policy replaced nothing; the main checkout keeps its
+                        // record.
+                        push_auto_before: None,
+                        ..project
+                    },
+                    _ => anyhow::bail!("directory has no project policy"),
+                },
+            };
             let _repository = repository_lock(&project.repository)?;
             project.enabled = false;
             save(&project)?;
@@ -899,6 +1146,7 @@ fn bind(
         push_auto_before: None,
     };
     let rows = candidates(&project)?;
+    let in_worktrees = rows.iter().filter(|s| !s.cwd.starts_with(&root)).count();
     // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
     assignable(&root, repository, rebind)?;
     if dry_run {
@@ -908,7 +1156,7 @@ fn bind(
                 "directory": root, "repository": repository, "history": history,
                 "repository_auto_upload": automatic, "repository_auto_push": automatic,
                 "repository_auto_push_scope": automatic.then(|| auto_push_scope(repository)),
-                "candidates": rows,
+                "candidates": rows, "candidates_in_worktrees": in_worktrees,
             })
         );
         return Ok(ExitCode::Ok);
@@ -929,12 +1177,15 @@ fn bind(
             project.earlier = existing.earlier;
         }
     }
+    project.excluded.extend(inherited_drops(&root)?);
     if history == History::None {
         // Earlier sessions stay out whether or not another repository claims them; only a
-        // session already claimed in this repository keeps publishing here.
+        // session already claimed in this repository keeps publishing here. Those of the
+        // folder's git worktrees stay out by when the worktree was covered, recorded below.
         let store = Store::at(config::store_root()?);
         project.earlier.extend(
             rows.iter()
+                .filter(|s| s.cwd.starts_with(&root))
                 .filter(|s| {
                     link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
                         link.branch.is_none()
@@ -990,8 +1241,14 @@ fn bind(
         remote.visibility
     );
     println!(
-        "History: {history:?}; candidates: {}; automatic upload: {automatic}",
-        rows.len()
+        "History: {history:?}; candidates: {} session{}{}; automatic upload: {automatic}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        if in_worktrees > 0 {
+            format!(", {in_worktrees} of them in git worktrees of this folder")
+        } else {
+            String::new()
+        }
     );
     if automatic {
         println!(
@@ -1044,6 +1301,27 @@ fn bind(
     save(&project)?;
     drop(repository_guard);
     record_audience(&root, &audience)?;
+    // Binding starts the folder's coverage of its git worktrees afresh: with its history, from
+    // the beginning, so the sync below takes their sessions too; without, from now.
+    let since = match history {
+        History::All => chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        History::None => chrono::Utc::now(),
+    };
+    let worktrees = worktrees_of(&project);
+    update_covered(&root, |records| {
+        *records = worktrees
+            .into_iter()
+            .map(|worktree| {
+                (
+                    worktree,
+                    Covered {
+                        since,
+                        opener: None,
+                    },
+                )
+            })
+            .collect();
+    })?;
     if history == History::All {
         sync(&mut project)
     } else {
@@ -1063,7 +1341,7 @@ pub(crate) struct Routing {
 
 impl Routing {
     fn paths(root: &Path) -> Result<Vec<PathBuf>> {
-        let mut paths: Vec<PathBuf> = ["json", "caught", "catch-up"]
+        let mut paths: Vec<PathBuf> = ["json", "caught", "catch-up", "worktrees"]
             .iter()
             .map(|extension| Ok(state_path(root)?.with_extension(extension)))
             .collect::<Result<_>>()?;
@@ -1153,10 +1431,11 @@ pub(crate) fn unbind_for_move(root: &Path) -> Result<Routing> {
     })
 }
 
-/// The directory of the project policy that covers `path`, paused or not.
+/// The directory of the project policy that covers `path` from a folder above it, paused or not.
+/// A git worktree is its own folder, whichever main checkout covers it.
 pub(crate) fn covering_root(path: &Path) -> Option<PathBuf> {
     let project = nearest(path).ok().flatten()?;
-    includes(&project, path).ok()?.then_some(project.root)
+    within(&project, path).ok()?.then_some(project.root)
 }
 
 /// The nearest directory at or above `path` that is bound on its own, by a project policy or a
@@ -1173,10 +1452,10 @@ pub(crate) fn bound_root(path: &Path) -> Option<PathBuf> {
 /// Listings call this, so a transcript in a runtime's cold storage is not restored: one that was
 /// moved there is not being written to.
 pub(crate) fn changed_since_upload(runtime: &str, session_id: &str, cwd: &Path) -> bool {
-    let Some(root) = covering_root(cwd) else {
+    let Ok(Some((project, _))) = governing(cwd) else {
         return false;
     };
-    let Some(&uploaded) = caught(&root).get(&key(runtime, session_id)) else {
+    let Some(&uploaded) = caught(&project.root).get(&key(runtime, session_id)) else {
         return false;
     };
     let modified = adapter::get(runtime)
@@ -1187,26 +1466,40 @@ pub(crate) fn changed_since_upload(runtime: &str, session_id: &str, cwd: &Path) 
     modified.is_some_and(|modified| modified.as_secs() != uploaded)
 }
 
-/// Whether the project policy at `root` was turned off (`agit off`, `project unbind`).
+/// Whether the project policy deciding for the folder at `root` was turned off (`agit off`,
+/// `project unbind`).
 pub(crate) fn turned_off(root: &Path) -> bool {
-    read(root)
+    read(&policy_root(root))
         .ok()
         .flatten()
         .is_some_and(|project| !project.enabled)
 }
 
-/// Whether the policy at `root` left this session out when it was bound without earlier history.
-pub(crate) fn is_earlier(root: &Path, runtime: &str, session_id: &str) -> bool {
-    read(root)
-        .ok()
-        .flatten()
-        .is_some_and(|project| project.earlier.contains(&key(runtime, session_id)))
+/// Whether the session, in `cwd`, is one the folder's binding left out until the person lets it
+/// in with `agit save --all`: from before the folder was turned on without its history, or a
+/// session of a covered git worktree from before the worktree was covered.
+pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Path) -> bool {
+    let Some(project) = read(&policy_root(folder)).ok().flatten() else {
+        return false;
+    };
+    project.earlier.contains(&key(runtime, session_id))
+        || before_covered(
+            &project,
+            &Candidate {
+                runtime: runtime.into(),
+                session_id: session_id.into(),
+                cwd: cwd.to_path_buf(),
+            },
+            false,
+        )
+        .unwrap_or(true)
 }
 
-/// Whether the person stopped uploading this session from the folder at `root`
-/// (`agit project drop`). Only a save that names it lets it back in.
+/// Whether the person stopped uploading this session from the folder at `root`, or from the main
+/// checkout whose policy covers it as a git worktree (`agit project drop`). Only a save that names
+/// it lets it back in.
 pub(crate) fn is_dropped(root: &Path, runtime: &str, session_id: &str) -> bool {
-    read(root)
+    read(&policy_root(root))
         .ok()
         .flatten()
         .is_some_and(|project| project.excluded.contains(&key(runtime, session_id)))
@@ -1214,21 +1507,35 @@ pub(crate) fn is_dropped(root: &Path, runtime: &str, session_id: &str) -> bool {
 
 /// The repository of the project policy that covers `path`, paused or not.
 pub(crate) fn policy_repository(path: &Path) -> Option<String> {
-    let project = nearest(path).ok().flatten()?;
-    includes(&project, path).ok()?.then_some(project.repository)
+    governing(path).ok()?.map(|(project, _)| project.repository)
 }
 
 /// Whether the project policy covering `path` uploads automatically, without network access.
 pub(crate) fn uploads_automatically(path: &Path) -> Option<bool> {
-    let project = nearest(path).ok().flatten()?;
-    includes(&project, path)
+    governing(path)
         .ok()?
-        .then_some(project.enabled && project.auto_upload)
+        .map(|(project, _)| project.enabled && project.auto_upload)
+}
+
+/// In a git worktree an on folder covers, the line saying which folder's setting it follows and
+/// where its new sessions go; `None` anywhere else.
+pub(crate) fn worktree_notice(path: &Path) -> Option<String> {
+    let (project, Via::Worktree(worktree)) = governing(path).ok()?? else {
+        return None;
+    };
+    (project.enabled && project.auto_upload).then(|| {
+        format!(
+            "{} is a git worktree of {}, which uploads new sessions to {}; to stop here: `agit off`",
+            ui::tilde(&worktree),
+            ui::tilde(&project.root),
+            project.repository
+        )
+    })
 }
 
 /// The last automatic upload's error, when it failed.
 pub(crate) fn last_failure(path: &Path) -> Option<String> {
-    let project = nearest(path).ok().flatten()?;
+    let (project, _) = governing(path).ok()??;
     let last = project.last_result?;
     (last["ok"] == false).then(|| last["error"].as_str().unwrap_or("unknown error").to_owned())
 }
@@ -1260,12 +1567,12 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
         return Ok(false);
     };
-    let Some(project) = nearest(&cwd)? else {
-        return Ok(false);
-    };
-    if !matches!(runtime, "codex" | "claude-code") || !includes(&project, &cwd)? {
+    if !matches!(runtime, "codex" | "claude-code") {
         return Ok(false);
     }
+    let Some((project, _)) = governing(&cwd)? else {
+        return Ok(false);
+    };
     let candidate = Candidate {
         runtime: runtime.into(),
         session_id: session.into(),
@@ -1277,7 +1584,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         Ok(Placement::New) => None,
         _ => return Ok(false),
     };
-    if withholds(&project, &candidate) {
+    if withholds(&project, &candidate, true) {
         // Pausing the project stops passive capture only. A session claimed on another branch
         // (`agit run`, `resume --as`, an import) is settled from its link; a paused project
         // still blocks its automatic push. A session no project has claimed has nothing to settle.
@@ -1293,11 +1600,14 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
 }
 
 /// Whether `project` keeps `candidate`'s turns from being uploaded: the project is paused, it
-/// uploads nothing, or it leaves the session out (dropped, or from before the folder was on).
-fn withholds(project: &Project, candidate: &Candidate) -> bool {
+/// uploads nothing, it leaves the session out (dropped, or from before the folder was on), or the
+/// session began in one of the folder's git worktrees before the folder covered it. `adopt`
+/// records a worktree seen for the first time as covered from now.
+fn withholds(project: &Project, candidate: &Candidate, adopt: bool) -> bool {
     !project.enabled
         || !project.auto_upload
         || project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
+        || before_covered(project, candidate, adopt).unwrap_or(true)
 }
 
 /// What the project policy of a folder does with one live session. Only team activity reports
@@ -1320,16 +1630,18 @@ pub(crate) enum Capture {
 #[cfg(unix)]
 pub(crate) fn capture_state(runtime: &str, session: &str, cwd: &Path) -> Capture {
     let state = || -> Result<Capture> {
-        let Some(project) = nearest(cwd)? else {
-            return Ok(Capture::Unbound);
+        let project = match governing(cwd)? {
+            Some((project, _)) => project,
+            // A folder below a policy that does not cover it is withheld, not unbound.
+            None if nearest(cwd)?.is_some() => return Ok(Capture::Withheld),
+            None => return Ok(Capture::Unbound),
         };
         let candidate = Candidate {
             runtime: runtime.into(),
             session_id: session.into(),
             cwd: cwd.to_owned(),
         };
-        if !includes(&project, cwd)?
-            || withholds(&project, &candidate)
+        if withholds(&project, &candidate, false)
             || !matches!(
                 placement(&project, &candidate)?,
                 Placement::Claim(_) | Placement::New
@@ -1442,7 +1754,9 @@ fn drain(root: &Path) -> Result<()> {
         {
             let caught = caught(root);
             for candidate in candidates(&project)? {
-                if behind(&project, &candidate, &caught) {
+                if !before_covered(&project, &candidate, true).unwrap_or(true)
+                    && behind(&project, &candidate, &caught)
+                {
                     enqueue(root, &candidate)?;
                 }
             }
@@ -1452,7 +1766,7 @@ fn drain(root: &Path) -> Result<()> {
                 return Ok(());
             };
             // A failure is recorded in the project's last result; the remaining sessions go on.
-            let _ = capture_candidate(project, candidate);
+            let _ = capture_candidate(project, candidate, false);
         }
         drop(worker);
         if markers(root)?.is_empty() && !catch_up_requested(root)? {
@@ -1461,7 +1775,9 @@ fn drain(root: &Path) -> Result<()> {
     }
 }
 
-fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool> {
+/// Uploads a queued or saved session. `let_in` says a save lets in the sessions of the folder's
+/// git worktrees from before the folder covered them; automatic capture never does.
+fn capture_candidate(mut project: Project, candidate: Candidate, let_in: bool) -> Result<bool> {
     // Automatic capture leaves foreign claims to their source repository's settlement.
     if !matches!(
         placement(&project, &candidate),
@@ -1470,12 +1786,18 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
         return Ok(false);
     }
     let session_key = key(&candidate.runtime, &candidate.session_id);
-    if !project.enabled || !project.auto_upload || project.leaves_out(&session_key) {
+    let held = |project: &Project| {
+        !project.enabled
+            || !project.auto_upload
+            || project.leaves_out(&session_key)
+            || (!let_in && before_covered(project, &candidate, true).unwrap_or(true))
+    };
+    if held(&project) {
         return Ok(true);
     }
     let _guard = lock(&project.root)?;
     project = read(&project.root)?.context("project policy disappeared")?;
-    if !project.enabled || !project.auto_upload || project.leaves_out(&session_key) {
+    if held(&project) {
         return Ok(true);
     }
     // A queued capture outlives its Stop: a directory bound on its own in between belongs to
@@ -1514,16 +1836,17 @@ pub(crate) enum Saved {
     Failed(String),
 }
 
-/// Uploads these sessions of the project at `root` now, after any automatic upload already
-/// running there. With `earlier`, sessions the binding left out are let in first. A session the
-/// person dropped is let in only when `named`: the person asked for that one session, and not for
-/// every earlier one.
+/// Uploads these sessions of the project deciding for the folder at `root` now, after any
+/// automatic upload already running there. With `earlier`, sessions the binding left out are let
+/// in first. A session the person dropped is let in only when `named`: the person asked for that
+/// one session, and not for every earlier one.
 pub(crate) fn save_now(
     root: &Path,
     sessions: &[(String, String, PathBuf)],
     earlier: bool,
     named: bool,
 ) -> Result<Vec<Saved>> {
+    let root = &policy_root(root);
     let worker = wait_for_worker(root)?;
     let mut saved = Vec::new();
     for (runtime, session_id, cwd) in sessions {
@@ -1552,7 +1875,7 @@ pub(crate) fn save_now(
             )));
             continue;
         }
-        saved.push(match save_one(project, candidate) {
+        saved.push(match save_one(project, candidate, earlier || named) {
             Ok(outcome) => outcome,
             Err(error) => Saved::Failed(format!("{error:#}")),
         });
@@ -1577,7 +1900,9 @@ fn bound_apart(project: &Project, candidate: &Candidate) -> Result<Option<String
     )))
 }
 
-fn save_one(project: Project, candidate: Candidate) -> Result<Saved> {
+/// Uploads one session for a save. `let_in` says the save lets in sessions of the folder's git
+/// worktrees from before they were covered.
+fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Saved> {
     if let Some(why) = bound_apart(&project, &candidate)? {
         return Ok(Saved::Failed(why));
     }
@@ -1608,7 +1933,7 @@ fn save_one(project: Project, candidate: Candidate) -> Result<Saved> {
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
         return Ok(Saved::Failed(format!("it is saved in {source}")));
     }
-    if !capture_candidate(project.clone(), candidate.clone())? {
+    if !capture_candidate(project.clone(), candidate.clone(), let_in)? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
         return Ok(Saved::Failed(
@@ -1653,10 +1978,10 @@ fn wait_for_worker(root: &Path) -> Result<fs::File> {
 /// not have yet, which a Stop hook that did not run (an untrusted hook, a crash, no network) left
 /// behind. The worker does the work; this returns at once.
 pub(crate) fn catch_up(path: &Path) -> Result<bool> {
-    let Some(project) = nearest(path)? else {
+    let Some((project, _)) = governing(path)? else {
         return Ok(false);
     };
-    if !project.enabled || !project.auto_upload || !includes(&project, path)? {
+    if !project.enabled || !project.auto_upload {
         return Ok(false);
     }
     let marker = state_path(&project.root)?.with_extension("catch-up");
@@ -2149,8 +2474,7 @@ fn this_conversation() -> Result<Option<String>> {
         .and_then(|transcript| crate::tui::screens::selector::recorded_cwd(&transcript))
         .and_then(|start| Path::new(&start).canonicalize().ok());
     if let Some(start) = start
-        && let Some(project) = nearest(&start)?
-        && includes(&project, &start)?
+        && let Some((project, _)) = governing(&start)?
     {
         exclude(&project.root, &key(session.runtime, &session.session_id))?;
     }
@@ -2215,6 +2539,9 @@ pub(crate) struct AutomaticUpload {
     pub(crate) org: Option<bool>,
     /// Whether every member of that organization reads it, when known.
     pub(crate) members_read: Option<bool>,
+    /// The git worktree the conversation started in and the main checkout whose setting uploads
+    /// it, when it started in one.
+    pub(crate) worktree: Option<(PathBuf, PathBuf)>,
 }
 
 /// The repository a project uploads this conversation to by itself, judged by the folder the
@@ -2228,12 +2555,13 @@ pub(crate) fn automatic_upload(
     origin: &Path,
     wait: std::time::Duration,
 ) -> Option<AutomaticUpload> {
-    let project = nearest(origin).ok()??;
-    if !project.enabled
-        || !project.auto_upload
-        || !includes(&project, origin).ok()?
-        || project.leaves_out(&key(runtime, session))
-    {
+    let (project, via) = governing(origin).ok()??;
+    let candidate = Candidate {
+        runtime: runtime.into(),
+        session_id: session.into(),
+        cwd: origin.to_path_buf(),
+    };
+    if withholds(&project, &candidate, false) {
         return None;
     }
     let claimed_elsewhere = Store::open()
@@ -2285,10 +2613,14 @@ pub(crate) fn automatic_upload(
         None => recorded,
     };
     Some(AutomaticUpload {
-        repository: project.repository,
         visibility: audience.visibility.filter(|v| !v.is_empty()),
         org: audience.org,
         members_read: audience.members_read,
+        worktree: match via {
+            Via::Worktree(worktree) => Some((worktree, project.root)),
+            Via::Folder => None,
+        },
+        repository: project.repository,
     })
 }
 
@@ -2362,10 +2694,10 @@ fn behind(
 }
 
 pub(crate) fn registration_scope(cwd: &Path) -> bool {
-    nearest(cwd)
+    governing(cwd)
         .ok()
         .flatten()
-        .is_some_and(|p| p.enabled && p.auto_upload && includes(&p, cwd).unwrap_or(false))
+        .is_some_and(|(p, _)| p.enabled && p.auto_upload)
 }
 
 pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<bool> {
@@ -2392,12 +2724,10 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
     let cwd = Path::new(&cwd)
         .canonicalize()
         .context("cannot resolve the session directory to verify project policy")?;
-    let Some(project) = nearest(&cwd)? else {
+    let Some((project, _)) = governing(&cwd)? else {
         return Ok(false);
     };
-    Ok(project.repository == slug
-        && includes(&project, &cwd)?
-        && (!project.enabled || !project.auto_upload))
+    Ok(project.repository == slug && (!project.enabled || !project.auto_upload))
 }
 
 /// Whether the Hub this checkout publishes to refused `branch` as withdrawn. The push that met
@@ -2956,6 +3286,152 @@ mod tests {
         }
     }
 
+    /// Runs git in `dir`, with no configuration but its own.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// `to` as a path relative to `from`, both canonical: Git is given relative paths only, as it
+    /// does not read every canonical form a platform writes.
+    fn relative(from: &Path, to: &Path) -> PathBuf {
+        let common = from
+            .components()
+            .zip(to.components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut path = PathBuf::new();
+        for _ in from.components().skip(common) {
+            path.push("..");
+        }
+        for part in to.components().skip(common) {
+            path.push(part);
+        }
+        path
+    }
+
+    /// A git checkout at `dir` with one commit.
+    fn git_checkout(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "start"]);
+    }
+
+    /// A linked worktree of the checkout at `main`, made at `at`, both canonical; returns its
+    /// canonical path.
+    fn worktree(main: &Path, at: &Path) -> PathBuf {
+        let path = relative(main, at);
+        git(
+            main,
+            &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
+        );
+        at.canonicalize().unwrap()
+    }
+
+    /// A Claude Code conversation in `cwd` whose first record is stamped `at`.
+    fn transcript(id: &str, cwd: &Path, at: &str) {
+        let native = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+            .join("projects")
+            .join(adapter::claude_code::slug_for(cwd));
+        fs::create_dir_all(&native).unwrap();
+        let record = serde_json::json!({"type": "user", "sessionId": id, "cwd": cwd,
+            "timestamp": at, "message": {"role": "user", "content": "hello"}});
+        fs::write(native.join(format!("{id}.jsonl")), format!("{record}\n")).unwrap();
+    }
+
+    /// A folder covers the linked worktrees that share its git common directory, and nothing else
+    /// that looks alike: not a separate clone, not a submodule, not a copy of a worktree whose Git
+    /// directory names another, not a worktree whose common directory cannot be read, not one that
+    /// is gone. A worktree below a folder set up for another repository, one with a setting of its
+    /// own, and the place where the folder holds a nested setting keep theirs. Coverage flows only
+    /// from the main checkout: a worktree that is on covers neither the main checkout nor its
+    /// siblings. An implementation that matched the remote, the folder name or the `.git` file's
+    /// text alone would cover the clone, the copy or the submodule; one that read coverage both
+    /// ways would let a worktree publish the main checkout's sessions.
+    #[test]
+    fn a_policy_covers_its_worktrees_by_common_dir_only() {
+        if !isolated("a_policy_covers_its_worktrees_by_common_dir_only") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let main = base.join("main");
+        git_checkout(&main);
+        fs::create_dir_all(main.join("pkg")).unwrap();
+        let tree = worktree(&main, &base.join("tree"));
+        fs::create_dir_all(tree.join("src")).unwrap();
+        fs::create_dir_all(tree.join("pkg")).unwrap();
+        git(&base, &["clone", "-q", "main", "clone"]);
+        git_checkout(&base.join("library"));
+        git(&tree, &["submodule", "add", "-q", "../library", "sub"]);
+        let copy = base.join("copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(tree.join(".git"), copy.join(".git")).unwrap();
+        let broken = worktree(&main, &base.join("broken"));
+        fs::remove_file(main.join(".git/worktrees/broken/commondir")).unwrap();
+        let gone = worktree(&main, &base.join("gone"));
+        fs::remove_dir_all(&gone).unwrap();
+        let other = base.join("other");
+        fs::create_dir_all(&other).unwrap();
+        workspace::bind(&other, "alice/other", false).unwrap();
+        let below_other = worktree(&main, &other.join("tree"));
+        let own = worktree(&main, &base.join("own"));
+        let mut paused = project(&own);
+        paused.enabled = false;
+        save(&paused).unwrap();
+        save(&project(&main)).unwrap();
+        let mut nested = project(&main.join("pkg"));
+        nested.repository = "alice/pkg".into();
+        save(&nested).unwrap();
+
+        let via = |path: &Path| {
+            governing(path)
+                .unwrap()
+                .map(|(project, via)| (project.root, via))
+        };
+        let covered = Some((main.clone(), Via::Worktree(tree.clone())));
+        assert_eq!(via(&tree), covered);
+        assert_eq!(via(&tree.join("src")), covered);
+        for path in [
+            base.join("clone"),
+            tree.join("sub"),
+            copy.clone(),
+            broken.clone(),
+            below_other.clone(),
+            tree.join("pkg"),
+        ] {
+            assert_eq!(via(&path), None, "{}", path.display());
+        }
+        assert_eq!(via(&own), Some((own.clone(), Via::Folder)));
+        assert_eq!(covered_worktrees(&main), std::slice::from_ref(&tree));
+        assert_eq!(worktree_of(&tree).as_deref(), Some(main.as_path()));
+        assert_eq!(policy_root(&tree), main);
+
+        let second = base.join("second");
+        git_checkout(&second);
+        let on = worktree(&second, &base.join("second-on"));
+        let sibling = worktree(&second, &base.join("second-sibling"));
+        save(&project(&on)).unwrap();
+        assert_eq!(via(&on), Some((on.clone(), Via::Folder)));
+        assert_eq!(via(&second), None);
+        assert_eq!(via(&sibling), None);
+    }
+
     /// A conversation is announced as uploading only where the project would upload it: started
     /// inside an automatic project, not excluded, not recording into another repository. The
     /// visibility comes from the Hub or its last recorded answer, never a default; this policy's
@@ -2999,6 +3475,128 @@ mod tests {
         )
         .unwrap();
         assert_eq!(audience(), Some((Some("private".into()), Some(true))));
+
+        // In a git worktree the folder covers, a conversation from before the folder covered it
+        // is the folder's earlier history: not announced and not captured; one that began after,
+        // or has recorded nothing yet, uploads and says through which folder. A conversation whose
+        // start was the first sight of a worktree counts as after even when the runtime stamped
+        // it a moment before the hook ran; another stamped the same moment does not. Claimed in
+        // the repository, an earlier one is the folder's like any other; dropped, a later one is
+        // not. A save that lets earlier sessions in lets it in; automatic capture never does.
+        const BEFORE: &str = "aaaaaaaa-0000-4000-8000-000000000041";
+        const UNSTAMPED: &str = "bbbbbbbb-0000-4000-8000-000000000042";
+        const AFTER: &str = "cccccccc-0000-4000-8000-000000000043";
+        const STARTING: &str = "dddddddd-0000-4000-8000-000000000044";
+        const OPENER: &str = "eeeeeeee-0000-4000-8000-000000000045";
+        const SIBLING: &str = "ffffffff-0000-4000-8000-000000000046";
+        git_checkout(&policy.root);
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let tree = worktree(&policy.root, &outside.join("tree"));
+        adopt_worktree(&policy.root, &tree, None).unwrap();
+        let now = chrono::Utc::now();
+        let hours = |offset: i64| (now + chrono::Duration::hours(offset)).to_rfc3339();
+        transcript(BEFORE, &tree, &hours(-1));
+        transcript(UNSTAMPED, &tree, "not a time");
+        transcript(AFTER, &tree, &hours(1));
+        let claude = |id: &str, origin: &Path| automatic_upload("claude-code", id, origin, wait);
+        assert!(claude(BEFORE, &tree).is_none());
+        assert!(claude(UNSTAMPED, &tree).is_none());
+        assert!(left_out(&tree, "claude-code", BEFORE, &tree));
+        assert_eq!(
+            claude(AFTER, &tree).and_then(|upload| upload.worktree),
+            Some((tree.clone(), policy.root.clone()))
+        );
+        assert!(!left_out(&tree, "claude-code", AFTER, &tree));
+        assert!(claude(STARTING, &tree).is_some());
+        let candidate = |id: &str, cwd: &Path| Candidate {
+            runtime: "claude-code".into(),
+            session_id: id.into(),
+            cwd: cwd.to_path_buf(),
+        };
+        let found: BTreeSet<String> = candidates(&policy)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.session_id)
+            .collect();
+        assert!(found.contains(BEFORE) && found.contains(AFTER), "{found:?}");
+        assert!(before_covered(&policy, &candidate(BEFORE, &tree), true).unwrap());
+        assert!(!before_covered(&policy, &candidate(AFTER, &tree), true).unwrap());
+        assert!(withholds(&policy, &candidate(BEFORE, &tree), false));
+        assert!(capture_candidate(policy.clone(), candidate(BEFORE, &tree), false).unwrap());
+        assert!(read(&policy.root).unwrap().unwrap().last_result.is_none());
+        let mut kept = link::Link::new("claude-code", BEFORE, Some(&tree));
+        kept.owner = Some("alice".into());
+        kept.agent = Some("app".into());
+        kept.branch = Some("kept".into());
+        link::write(&store, &kept).unwrap();
+        assert!(claude(BEFORE, &tree).is_some());
+        policy.excluded.insert(key("claude-code", AFTER));
+        save(&policy).unwrap();
+        assert!(claude(AFTER, &tree).is_none());
+        assert!(is_dropped(&tree, "claude-code", AFTER));
+        let fresh = worktree(&policy.root, &outside.join("fresh"));
+        let moment = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        transcript(OPENER, &fresh, &moment);
+        transcript(SIBLING, &fresh, &moment);
+        adopt(&fresh, "claude-code", OPENER);
+        assert!(claude(OPENER, &fresh).is_some());
+        assert!(claude(SIBLING, &fresh).is_none());
+        // Turned off (`agit off`, as after a no once a save turned the folder on), the folder
+        // stops its worktrees with it: a conversation there is neither announced, captured,
+        // caught up nor reported, the worktree reads as off, and a save there is refused as for
+        // the folder. A check that covered a worktree whatever the folder's state would go on
+        // uploading it.
+        const LATER: &str = "abababab-0000-4000-8000-000000000047";
+        transcript(LATER, &tree, &hours(2));
+        assert!(claude(LATER, &tree).is_some());
+        policy.enabled = false;
+        save(&policy).unwrap();
+        assert!(claude(LATER, &tree).is_none());
+        assert_eq!(uploads_automatically(&tree), Some(false));
+        assert!(turned_off(&tree));
+        assert!(!registration_scope(&tree));
+        assert!(!catch_up(&tree).unwrap());
+        assert!(capture("claude-code", LATER, tree.to_str()).unwrap());
+        assert!(markers(&policy.root).unwrap().is_empty());
+        #[cfg(unix)]
+        assert_eq!(
+            capture_state("claude-code", LATER, &tree),
+            Capture::Withheld
+        );
+        policy.enabled = true;
+        save(&policy).unwrap();
+        // What the person dropped in the worktree is in the folder's set. `agit off` in the
+        // worktree gives it a policy of its own, and a folder bound on its own (a worktree or a
+        // folder below) starts from the drops of the policy that covered it, so the drop survives
+        // `agit off`, `agit on` and `agit save --all` there: it is not captured, announced or let
+        // in by a save that asks for earlier sessions, and only a save that names it lets it back.
+        // A policy of its own that started empty would upload it again.
+        assert_eq!(inherited_drops(&tree).unwrap(), policy.excluded);
+        assert_eq!(inherited_drops(&inside).unwrap(), policy.excluded);
+        assert!(inherited_drops(&policy.root).unwrap().is_empty());
+        run(Args {
+            action: Action::Unbind { path: tree.clone() },
+        })
+        .unwrap();
+        let mut own = read(&tree).unwrap().unwrap();
+        assert!(!own.enabled);
+        assert!(own.excluded.contains(&key("claude-code", AFTER)));
+        own.enabled = true;
+        save(&own).unwrap();
+        assert!(is_dropped(&tree, "claude-code", AFTER));
+        assert!(claude(AFTER, &tree).is_none());
+        assert!(capture("claude-code", AFTER, tree.to_str()).unwrap());
+        assert!(markers(&tree).unwrap().is_empty());
+        let session = |id: &str| ("claude-code".to_string(), id.to_string(), tree.clone());
+        let saved = save_now(&tree, &[session(AFTER)], true, false).unwrap();
+        assert!(
+            matches!(&saved[..], [Saved::Failed(why)] if why.contains("agit project drop")),
+            "a dropped session was let in"
+        );
+        let _ = save_now(&tree, &[session(AFTER)], false, true).unwrap();
+        assert!(!is_dropped(&tree, "claude-code", AFTER));
+        fs::remove_file(state_path(&tree).unwrap()).unwrap();
 
         policy.auto_upload = false;
         save(&policy).unwrap();
@@ -3430,7 +4028,7 @@ mod tests {
             .insert(key(&candidate.runtime, &candidate.session_id));
         let guard = lock(&latest.root).unwrap();
         save(&latest).unwrap();
-        let worker = std::thread::spawn(move || capture_candidate(stale, candidate));
+        let worker = std::thread::spawn(move || capture_candidate(stale, candidate, false));
         drop(guard);
         assert!(worker.join().unwrap().unwrap());
         assert!(read(&latest.root).unwrap().unwrap().last_result.is_none());
@@ -3636,7 +4234,12 @@ mod tests {
             judge(std::slice::from_ref(&after), "any", &[], Some(&origin)),
             Some(Withholding::Excluded)
         );
-        assert!(!is_earlier(&policy.root, "claude-code", dropped));
+        assert!(!left_out(
+            &policy.root,
+            "claude-code",
+            dropped,
+            &policy.root
+        ));
         assert!(is_dropped(&policy.root, "claude-code", dropped));
 
         // A policy written before `earlier` existed reads with every entry dropped.
@@ -4121,6 +4724,15 @@ mod tests {
         assert_eq!(unannounced(), 1);
         recheck_claims(true);
         assert_eq!(unannounced(), 0);
+        // The folder it started in becoming a git worktree the project covers does not lift a
+        // record already made: the judgement is not made again.
+        git_checkout(&project.root);
+        let outside = worktree(&project.root, &outside.path().canonicalize().unwrap());
+        assert!(includes(&project, &outside).unwrap());
+        assert_eq!(
+            withheld("alice/app", strayed.branch.as_deref().unwrap()).unwrap(),
+            Some(Withholding::StartedOutside)
+        );
 
         let target = format!("alice/app@{}", inside.branch.as_deref().unwrap());
         run(Args {

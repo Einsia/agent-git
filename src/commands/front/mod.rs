@@ -822,13 +822,29 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// Claude Code and Codex conversations that ran in `root` or below it, newest first, except in a
-/// directory below that is set up on its own: those are that directory's.
+/// Claude Code and Codex conversations that ran in `root` or below it, except in a directory
+/// below that is set up on its own (those are that directory's), and in the git worktrees its
+/// policy covers, newest first.
 pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
+    let worktrees = super::project::covered_worktrees(root);
     sessions_where(|cwd, _| {
-        cwd.starts_with(root)
-            && super::project::bound_root(cwd).is_none_or(|bound| root.starts_with(bound))
+        (cwd.starts_with(root)
+            && super::project::bound_root(cwd).is_none_or(|bound| root.starts_with(bound)))
+            || (worktrees.iter().any(|worktree| cwd.starts_with(worktree))
+                && super::project::worktree_of(cwd).as_deref() == Some(root))
     })
+}
+
+/// How many of `sessions`, in the git worktree `folder` or below it, are left out until the
+/// person lets them in with `agit save --all`: not saved anywhere, not dropped, and from before
+/// the folder's binding covered them.
+pub(crate) fn left_out_in(folder: &Path, sessions: &[FolderSession]) -> usize {
+    sessions
+        .iter()
+        .filter(|s| s.cwd.starts_with(folder) && s.saved.is_none())
+        .filter(|s| !super::project::is_dropped(folder, s.runtime, &s.id))
+        .filter(|s| super::project::left_out(folder, s.runtime, &s.id, &s.cwd))
+        .count()
 }
 
 /// Every Claude Code and Codex conversation modified since `since`, newest first.

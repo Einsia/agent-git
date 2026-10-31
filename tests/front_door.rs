@@ -383,6 +383,103 @@ impl Lab {
         .unwrap();
     }
 
+    /// Turns `dir` on for `repository` as `agit on` records it, without asking the Hub.
+    fn turn_on(&self, dir: &std::path::Path, repository: &str) {
+        use sha2::{Digest, Sha256};
+        let policies = self.agit_home.join("projects");
+        std::fs::create_dir_all(&policies).unwrap();
+        let digest = hex::encode(Sha256::digest(dir.to_string_lossy().as_bytes()));
+        std::fs::write(
+            policies.join(format!("{}.json", &digest[..24])),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "root": dir, "repository": repository,
+                "identity": {"hub": self.hub, "agent_id": "11111111-0000-4000-8000-000000000001"},
+                "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+                "history": "none", "excluded": [], "last_result": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Runs agit at a terminal in `dir`, types `answer` once the screen shows `prompt`, and
+    /// returns what the terminal showed.
+    #[cfg(all(unix, feature = "rc"))]
+    fn agit_at_terminal(
+        &self,
+        dir: &std::path::Path,
+        args: &[&str],
+        prompt: &str,
+        answer: &[u8],
+    ) -> String {
+        use std::time::{Duration, Instant};
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        command.env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(self.bin.clone()).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )),
+            )
+            .unwrap(),
+        );
+        for (name, value) in [
+            ("HOME", self.home.as_os_str()),
+            ("AGIT_HOME", self.agit_home.as_os_str()),
+            ("CLAUDE_CONFIG_DIR", self.home.join(".claude").as_os_str()),
+            ("CODEX_HOME", self.home.join(".codex").as_os_str()),
+        ] {
+            command.env(name, value);
+        }
+        command.env("AGIT_HUB_URL", &self.hub);
+        command.env("AGIT_TELEMETRY_DISABLED", "1");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("TERM", "xterm-256color");
+        command.cwd(dir);
+        command.args(args);
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let mut writer = pty.master.take_writer().unwrap();
+        let screen = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&screen);
+        let output = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                shared.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
+        let mut child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut answered = false;
+        while child.try_wait().unwrap().is_none() {
+            if !answered && String::from_utf8_lossy(&screen.lock().unwrap()).contains(prompt) {
+                writer.write_all(answer).unwrap();
+                writer.flush().unwrap();
+                answered = true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!(
+                    "no exit within a minute: {}",
+                    String::from_utf8_lossy(&screen.lock().unwrap())
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(writer);
+        drop(pty.master);
+        output.join().unwrap();
+        String::from_utf8_lossy(&screen.lock().unwrap()).into_owned()
+    }
+
     fn created(&self) -> Vec<(String, String)> {
         self.created
             .lock()
@@ -678,5 +775,126 @@ fn a_dropped_conversation_is_left_out_of_all_and_today() {
     }
     let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&policy).unwrap()).unwrap();
     assert_eq!(kept["excluded"], serde_json::json!([session]), "{kept}");
+    assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
+
+/// A folder that is on covers the git worktrees of its checkout (#162), from when it covers each
+/// one. Its overview names each worktree with the sessions there from before; in a worktree, the
+/// overview and `agit status` name the folder whose setting it follows and count those sessions
+/// with `agit save --all`; at a terminal `agit save --today` counts a worktree's sessions on a line
+/// of its own before it asks; `agit off` there stops only the worktree. An implementation that
+/// judged by the folder's path alone says nothing in the worktree and saves nothing there; one
+/// that took the worktree's earlier sessions along uploads them unasked; one whose `agit off`
+/// reached the folder turns the folder off too.
+#[test]
+fn a_folder_covers_its_git_worktrees_from_now_on() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    let git = |at: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(at)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "start"]);
+    git(&dir, &["worktree", "add", "-q", "../notes-tree"]);
+    let tree = dir
+        .parent()
+        .unwrap()
+        .join("notes-tree")
+        .canonicalize()
+        .unwrap();
+    lab.turn_on(&dir, "me/notes");
+    lab.conversation(
+        &tree,
+        "14141414-1414-4141-8141-141414141414",
+        "Try the adapter idea",
+    );
+    let value = |at: &std::path::Path, args: &[&str]| {
+        let out = lab.agit(at, args);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"].clone()
+    };
+
+    let main = value(&dir, &["--json"]);
+    assert_eq!(main["state"], "on", "{main}");
+    assert_eq!(
+        main["worktrees"],
+        serde_json::json!([{"folder": tree, "earlier_sessions_not_uploaded": 1}]),
+        "{main}"
+    );
+
+    let here = value(&tree, &["--json"]);
+    assert_eq!(here["state"], "on", "{here}");
+    assert_eq!(here["through"], serde_json::json!(dir), "{here}");
+    assert_eq!(here["repository"], "me/notes", "{here}");
+    assert_eq!(here["earlier_sessions_not_uploaded"], 1, "{here}");
+    assert_eq!(here["next"]["command"], "agit save --all", "{here}");
+    let status = value(&tree, &["status", "--json"]);
+    let said = status["worktree"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("notes-tree is a git worktree of")
+            && said.contains("which uploads new sessions to me/notes"),
+        "{status}"
+    );
+    assert_eq!(
+        status["earlier_sessions_not_uploaded"],
+        serde_json::json!({"count": 1, "command": "agit save --all"}),
+        "{status}"
+    );
+
+    // At a terminal `agit save --today` names the worktree and how many of its sessions would go
+    // before it asks once; no uploads nothing.
+    #[cfg(all(unix, feature = "rc"))]
+    {
+        let screen = lab.agit_at_terminal(&dir, &["save", "--today"], "Upload these", b"n\r");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("notes-tree") && line.contains("1 session(s)")),
+            "{screen}"
+        );
+        assert!(screen.contains("nothing was uploaded"), "{screen}");
+        assert!(lab.created().is_empty(), "nothing is created on the Hub");
+    }
+
+    let off = value(&tree, &["--json", "off"]);
+    assert_eq!(off["through"], serde_json::json!(dir), "{off}");
+    assert_eq!(value(&tree, &["--json"])["state"], "off");
+    assert_eq!(value(&dir, &["--json"])["state"], "on");
+
+    // Turned off, as after the person says no once a save turned it on, the folder stops its
+    // worktrees with it: one that followed it reads as off, and even `agit save --all` there
+    // uploads nothing and says which folder is off.
+    git(&dir, &["worktree", "add", "-q", "../notes-second"]);
+    let second = dir
+        .parent()
+        .unwrap()
+        .join("notes-second")
+        .canonicalize()
+        .unwrap();
+    lab.conversation(
+        &second,
+        "16161616-1616-4161-8161-161616161616",
+        "Sketch the parser",
+    );
+    assert_eq!(value(&second, &["--json"])["state"], "on");
+    let off = value(&dir, &["--json", "off"]);
+    assert_eq!(off["on"], false, "{off}");
+    assert_eq!(value(&second, &["--json"])["state"], "off");
+    let out = lab.agit(&second, &["--json", "save", "--all"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(4), "{document}");
+    assert!(
+        document.to_string().contains("is a git worktree of"),
+        "{document}"
+    );
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
 }
