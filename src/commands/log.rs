@@ -263,6 +263,7 @@ pub fn run(args: Args) -> CmdResult {
                 "turns": rows.iter().map(|row| serde_json::json!({
                     "oid": row.oid,
                     "turn": row.turn,
+                    "continuation": row.continuation,
                     "kind": row.kind,
                     "subject": row.subject,
                     "tags": row.tags,
@@ -305,7 +306,7 @@ pub fn run(args: Args) -> CmdResult {
         if args.oneline {
             println!(
                 "{} {} {} {activity}{}",
-                turn_label(r.turn),
+                r.label(),
                 r.short,
                 kind_badge(&r.kind),
                 r.subject
@@ -313,7 +314,7 @@ pub fn run(args: Args) -> CmdResult {
         } else {
             let mut line = format!(
                 "{} {} {} {activity}{}",
-                turn_label(r.turn),
+                r.label(),
                 r.short,
                 kind_badge(&r.kind),
                 r.subject
@@ -355,6 +356,14 @@ pub struct Turn {
     /// The turn ordinal: only a `kind: turn` commit has one. Birth, fork, file and merge take
     /// no number.
     pub turn: Option<u32>,
+    /// A later commit of a turn settled in several parts: the agent kept working after a native
+    /// completion without a new prompt, and history is never amended.
+    pub continuation: bool,
+    /// The commit `<ref>#n` resolves to for this row's turn: the last part of the turn in the
+    /// unfiltered history. Reading the row reads that whole turn, as `agit show <ref>#n` does;
+    /// reading at the row's own commit would show the first part alone on the `#n` row and
+    /// repeat it on every `+n` row.
+    pub turn_head: Option<String>,
     pub oid: String,
     pub short: String,
     pub kind: Kind,
@@ -368,6 +377,19 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// The left column: `#n` on the commit that opened turn n, `+n` on each later commit of the
+    /// same turn, blank on every commit that settled no turn. `<ref>#n` names the whole turn:
+    /// its events are those of every row numbered n, in order, and as a commit it is the last of
+    /// those rows. Printing `#n` on a continuation as well would show two rows that both claim
+    /// to be what `#n` resolves to.
+    pub fn label(&self) -> String {
+        match self.turn {
+            Some(t) if self.continuation => format!("+{t:>3}"),
+            Some(t) => format!("#{t:>3}"),
+            None => "    ".into(),
+        }
+    }
+
     pub fn activity_label(&self) -> String {
         match self.activity {
             Some(a) => format!("{} events {} ToolUse", a.events, a.tools),
@@ -384,16 +406,6 @@ fn kind_badge(k: &Kind) -> &'static str {
         Kind::View => "[view ]",
         Kind::File => "[file ]",
         Kind::Archive => "[archive]",
-    }
-}
-
-/// The left column: `#n` is printed only on the commit that settled that turn, every other
-/// commit stays blank — so the number in the left column and what `<ref>#n` resolves to are the
-/// same commit.
-fn turn_label(turn: Option<u32>) -> String {
-    match turn {
-        Some(t) => format!("#{t:>3}"),
-        None => "    ".into(),
     }
 }
 
@@ -466,8 +478,17 @@ fn read_turn_history(
     let out = repo.git(&arg_refs)?;
     // Numbering comes from the **unfiltered** chain: a commit dropped by `--since` / `--grep` /
     // a path still holds its place, which is what makes the left-column number and what
-    // `<ref>#n` resolves to the same commit.
+    // `<ref>#n` resolves to the same turn.
     let chain = crate::domain::refs::Chain::read(repo, head)?;
+    // Each turn commit's run: whether it continues the turn of the turn commit before it, and
+    // the last part, which is what `#n` resolves to.
+    let mut runs = std::collections::HashMap::new();
+    for (_, parts) in chain.runs() {
+        let last = *parts.last().expect("a run has a part");
+        for (position, &index) in parts.iter().enumerate() {
+            runs.insert(index, (position > 0, last));
+        }
+    }
     let by_sha: std::collections::HashMap<&str, usize> = chain
         .entries
         .iter()
@@ -515,6 +536,11 @@ fn read_turn_history(
             idx,
             Turn {
                 turn: idx.and_then(|i| chain.label(i)),
+                continuation: idx.is_some_and(|i| runs.get(&i).is_some_and(|run| run.0)),
+                turn_head: idx.filter(|&i| chain.label(i).is_some()).map(|i| {
+                    let last = runs.get(&i).map_or(i, |run| run.1);
+                    chain.entries[last].sha.clone()
+                }),
                 oid: sha.to_string(),
                 short: sha[..9.min(sha.len())].to_string(),
                 kind: k,
@@ -1267,7 +1293,7 @@ mod tests {
         assert_eq!(rows[0].turn, None);
         assert_eq!(rows[0].short, head[..9]);
         assert_eq!(kind_badge(&rows[0].kind), "[archive]");
-        assert_eq!(turn_label(rows[0].turn), "    ");
+        assert_eq!(rows[0].label(), "    ");
         let ordinary = turns(&repo, &head, 50, Some("turn"), None, None, &[]).unwrap();
         assert_eq!(
             ordinary.iter().map(|row| row.turn).collect::<Vec<_>>(),
@@ -1318,8 +1344,9 @@ mod tests {
                 .all(|r| r.turn.is_some() || r.kind != Kind::Turn),
             "every turn commit carries its number"
         );
-        assert_eq!(turn_label(Some(3)), "#  3");
-        assert_eq!(turn_label(None), "    ");
+        let labels: Vec<String> = rows.iter().map(Turn::label).collect();
+        assert_eq!(labels[4], "#  3");
+        assert_eq!(labels[5], "    ");
         // Filtering rows out leaves the remaining numbers unchanged: `--grep` picks only the
         // "turn 3" row, and it is still #3.
         let rows = turns(&r, &head, 50, None, Some("turn 3"), None, &[]).unwrap();
@@ -1329,6 +1356,76 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.turn.is_none()),
             "file commits never get a number"
+        );
+    }
+
+    /// A turn the agent kept working on after a completion, with no new prompt, lands as
+    /// several commits under one ordinal, and every reader treats them as that one turn: the log
+    /// numbers the first `#n` and each later one `+n`, `<ref>#n` (and `#-1`) resolves to the
+    /// last part, which is also what every row of the turn reads in the Timeline, `#n.k` numbers
+    /// the events of every part in order, and the turn count counts ordinals. Resolving to the
+    /// first part would hide everything the continuation did from `show`/`fork`/`revert`;
+    /// numbering parts as separate events lists would make `#n.k` from the first part shift once
+    /// a continuation lands. A commit that settles no turn between the parts (a memory file
+    /// commit) must not split the turn.
+    #[test]
+    fn a_turn_settled_in_parts_keeps_one_number_and_resolves_to_its_last_part() {
+        use crate::domain::refs::{self, fixtures};
+        let (_d, r) = fixtures::forked_history();
+        r.git(&["checkout", "-q", "s1"]).unwrap();
+        let first_part = r.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let before = crate::commands::merge::turn_lines(&r, &first_part, 4).unwrap();
+        fixtures::inherit_commit(&r, Kind::File, "memory: notes");
+        let mut log = r.show("HEAD", meta::LOG_FILE).unwrap();
+        log.push_str(&crate::domain::transcript::wrap_lines(
+            &format!("{}\n", fixtures::assistant_line(40)),
+            "claude-code",
+            &fixtures::claim(),
+        ));
+        crate::domain::storage::write_snapshot(r.root(), &log, &log).unwrap();
+        let mut snapshot = meta::read_at_ref(&r, "HEAD").unwrap();
+        snapshot.kind = Kind::Turn;
+        meta::write(r.root(), &snapshot).unwrap();
+        r.add_all().unwrap();
+        assert!(r.commit("PROMPT-4").unwrap());
+        let continuation = r.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        fixtures::settle_turn(&r, 5);
+
+        let rows = turns(&r, "s1", 50, None, None, None, &[]).unwrap();
+        // (label, commit, what reading the row reads)
+        let labels: Vec<(String, String, String)> = rows
+            .iter()
+            .filter(|row| row.turn.is_some())
+            .map(|row| (row.label(), row.oid.clone(), row.turn_head.clone().unwrap()))
+            .collect();
+        let alone = |label: &str, sha: String| (label.to_owned(), sha.clone(), sha);
+        assert_eq!(
+            labels,
+            vec![
+                alone("#  1", fixtures::turn_sha(&r, 1)),
+                alone("#  2", fixtures::turn_sha(&r, 2)),
+                alone("#  3", fixtures::turn_sha(&r, 3)),
+                ("#  4".to_owned(), first_part.clone(), continuation.clone()),
+                alone("+  4", continuation.clone()),
+                alone("#  5", rows.last().unwrap().oid.clone()),
+            ]
+        );
+        assert_eq!(refs::count_turns(&r, "s1").unwrap(), 5);
+        for (target, sha) in [
+            ("s1#4", &continuation),
+            (&*format!("{first_part}#4"), &first_part),
+        ] {
+            let resolved = refs::resolve(&r, &refs::parse(target).unwrap()).unwrap();
+            assert_eq!((resolved.turn, &resolved.sha), (Some(4), sha), "{target}");
+        }
+        let lines = crate::commands::merge::turn_lines(&r, "s1", 4).unwrap();
+        assert_eq!(lines[..before.len()], before[..]);
+        assert_eq!(lines.len(), before.len() + 1);
+        let last = refs::resolve(&r, &refs::parse("s1#-1").unwrap()).unwrap();
+        assert_eq!(last.turn, Some(5));
+        assert_eq!(
+            crate::commands::merge::turn_lines(&r, "s1", 5).unwrap(),
+            vec![before.last().unwrap() + 2, before.last().unwrap() + 3]
         );
     }
 

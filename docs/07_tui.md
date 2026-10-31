@@ -301,7 +301,8 @@ large counts increase that requirement instead of being clipped.
 `agit show --tui`, and enter from the timeline, land on the same screen: the
 list on the left, the conversation on the right.
 
-* enter reads **that turn**, the same content as `agit show <ref>#n`;
+* enter reads **that turn**, the same content as `agit show <ref>#n` — on every
+  row of a turn settled in several commits (`#n` and each `+n`), the whole turn;
 * a transcript is parsed on demand and cached, keyed by the row's own identity
   rather than by its position — filtering changes positions;
 * parsing a turn is not instantaneous, so the screen paints a frame before it

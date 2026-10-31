@@ -318,13 +318,14 @@ pub enum EventKind {
     /// not line up with the human turn count, in either direction, and it also fires for
     /// interruptions and system turns.
     ///
-    /// It is modelled only so it is **not mistaken for content**: rendering skips it, activity
+    /// It must **not be mistaken for content**: rendering skips it, activity
     /// counts must not score it as a reply, and turn normalization excludes it (otherwise the
     /// same conversation hashes differently under the two runtimes).
     ///
-    /// It **does not affect versions**. Deriving the version from the last closed turn would
-    /// mean the Claude Code side never records its trailing turn; the version comes from the
-    /// snapshot `agit commit` takes, so no terminator signal is needed.
+    /// Settlement cuts at it: a runtime that records completions settles up to its last one,
+    /// and each completion inside one user turn lands as its own commit under that turn's
+    /// ordinal. Claude Code's completions are its terminal replies instead, which settlement
+    /// reads from the transcript itself; the adapter never emits them as this kind.
     TurnEnd,
 
     /// **What a tool spat out** (`tool_result` / `function_call_output`).

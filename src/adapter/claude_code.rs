@@ -49,28 +49,54 @@ pub(crate) fn completed_turn_boundary(text: &str) -> Option<usize> {
     completed_turn_boundaries(text).last().copied()
 }
 
-/// Where automatic publication may cut: turns the model finished, never one the person stopped.
+/// Where automatic publication may cut: executions the model finished, never one the person
+/// stopped; see [`execution_closes`].
 #[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
-    turn_closes(text)
+    execution_closes(text, false)
         .into_iter()
         .filter_map(|(end, close)| (close == TurnClose::Reply).then_some(end))
         .collect()
 }
 
-/// The end of the last turn, finished or stopped; nothing after it awaits a reply.
+/// The end of the last execution, finished or stopped; nothing after it awaits a reply.
 #[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn ended_turn_boundary(text: &str) -> Option<usize> {
-    turn_closes(text).last().map(|(end, _)| *end)
+    execution_closes(text, false).last().map(|(end, _)| *end)
 }
 
-/// Duration records close native executions; adjacent reply blocks share that boundary.
+/// Every execution end, finished or stopped, plus the executions that end without a terminal
+/// reply: the runtime wrote a generated reply in place of a model's (an API error, "No response
+/// requested."), or a manual `/compact` finished. Nothing more of such an execution will ever be
+/// written; without these ends a session whose last turn ended that way would never settle it.
+#[cfg(feature = "cli")]
+pub(crate) fn ended_turn_boundaries(text: &str) -> Vec<usize> {
+    execution_closes(text, true)
+        .into_iter()
+        .map(|(end, _)| end)
+        .collect()
+}
+
+/// Where native executions end, and how. Duration records close an execution on their own;
+/// adjacent reply blocks share one boundary, which a human prompt or the end of the text fixes.
+/// An execution the person stopped closes as an interrupt, through to its duration record.
+///
+/// A reply is not an end while a call made since the last human prompt has no output: another
+/// chain of the same turn, woken by a notification, is still running, or the writer marked a
+/// tool-calling message terminal. Settling there lands that call without its output. Only an
+/// interruption ends an execution regardless, because it abandons every call in flight.
+///
+/// A writer can also stamp every block record of a message with the message's stop reason, so
+/// a record holding only thinking or tool calls is not where the message ends: its calls, or
+/// its reply, follow. Taking it as the end settles the execution before its work.
 #[cfg(any(feature = "cli", feature = "rc"))]
-fn turn_closes(text: &str) -> Vec<(usize, TurnClose)> {
+fn execution_closes(text: &str, include_ended: bool) -> Vec<(usize, TurnClose)> {
     let mut offset = 0;
     let mut pending = None;
     let mut interrupted = false;
     let mut closes = Vec::new();
+    let mut open = std::collections::HashSet::new();
+    let mut manual_compaction = false;
     for line in text.split_inclusive('\n') {
         offset += line.len();
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -79,27 +105,35 @@ fn turn_closes(text: &str) -> Vec<(usize, TurnClose)> {
         if record["isSidechain"] == true || record["isMeta"] == true {
             continue;
         }
-        let user_text = (record["type"] == "user"
-            && extract_tool_results(record.pointer("/message/content")).is_none())
-        .then(|| extract_text(record.pointer("/message/content")).unwrap_or_default());
+        let content = record.pointer("/message/content");
+        let user_text = (record["type"] == "user" && extract_tool_results(content).is_none())
+            .then(|| extract_text(content).unwrap_or_default());
+        // A stop mid-reply leaves no tool denial; this marker is its only record.
+        let marker = user_text
+            .as_deref()
+            .is_some_and(|text| text.trim_start().starts_with("[Request interrupted"));
         if let Some(text) = &user_text
             && !is_system_generated(&record, text)
         {
             closes.extend(pending.take());
-            interrupted = text.starts_with("[Request interrupted");
-            // A stop mid-reply leaves no tool denial; this marker is its only record.
-            if interrupted {
-                pending = Some((offset, TurnClose::Interrupt));
-            }
+            interrupted = false;
         }
-        let terminal_reply = record["type"] == "assistant"
-            && record["message"]["model"] != SYNTHETIC_MODEL
-            && matches!(
-                record
-                    .pointer("/message/stop_reason")
-                    .and_then(|v| v.as_str()),
-                Some("end_turn" | "stop_sequence" | "max_tokens")
-            );
+        track_open_calls(&record, &mut open);
+        let assistant = record["type"] == "assistant";
+        let generated = assistant
+            && (record["message"]["model"] == SYNTHETIC_MODEL
+                || record["isApiErrorMessage"] == true);
+        let terminal_reply = assistant
+            && !generated
+            && match record
+                .pointer("/message/stop_reason")
+                .and_then(|v| v.as_str())
+            {
+                // A refused message is cut where it stands; nothing more of it follows.
+                Some("refusal") => true,
+                Some("end_turn" | "stop_sequence" | "max_tokens") => !opens_message(content),
+                _ => false,
+            };
         let interrupted_tool = record["type"] == "user"
             && record["toolDenialKind"] == "interrupted"
             && record["message"]["content"]
@@ -109,6 +143,19 @@ fn turn_closes(text: &str) -> Vec<(usize, TurnClose)> {
                         .iter()
                         .any(|block| block["type"] == "tool_result" && block["is_error"] == true)
                 });
+        let compacted = std::mem::take(&mut manual_compaction) && is_compact_summary(&record);
+        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
+            manual_compaction = record
+                .pointer("/compactMetadata/trigger")
+                .and_then(serde_json::Value::as_str)
+                == Some("manual");
+        }
+        if interrupted_tool || marker {
+            open.clear();
+        }
+        if !open.is_empty() {
+            continue;
+        }
         if record["type"] == "system" && record["subtype"] == "turn_duration" {
             let close = if interrupted {
                 TurnClose::Interrupt
@@ -120,13 +167,184 @@ fn turn_closes(text: &str) -> Vec<(usize, TurnClose)> {
         } else if terminal_reply {
             pending = Some((offset, TurnClose::Reply));
             interrupted = false;
-        } else if interrupted_tool {
+        } else if interrupted_tool || marker {
             pending = Some((offset, TurnClose::Interrupt));
             interrupted = true;
+        } else if include_ended && (generated || compacted) {
+            let close = if interrupted {
+                TurnClose::Interrupt
+            } else {
+                TurnClose::Reply
+            };
+            pending = Some((offset, close));
         }
     }
     closes.extend(pending);
     closes
+}
+
+/// Whether an assistant record holds only blocks that open a message — thinking or tool calls —
+/// and no reply text.
+#[cfg(any(feature = "cli", feature = "rc"))]
+fn opens_message(content: Option<&serde_json::Value>) -> bool {
+    content
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking" | "tool_use")
+                    )
+                })
+        })
+}
+
+/// Follow which calls the current user turn made that have no output yet. A human prompt
+/// closes the turn before it, so a call left open there no longer counts. Only conversation
+/// records open and answer calls, as in `open_tool_calls`: a request snapshot copies earlier
+/// calls, and counting a copy of an answered call holds every later completion open.
+#[cfg(any(feature = "cli", feature = "rc"))]
+fn track_open_calls(record: &serde_json::Value, open: &mut std::collections::HashSet<String>) {
+    if !matches!(record["type"].as_str(), Some("assistant" | "user"))
+        || is_compact_summary(record)
+        || has_system_prompt_source(record)
+    {
+        return;
+    }
+    let content = record.pointer("/message/content");
+    if record["type"] == "user" && extract_tool_results(content).is_none() {
+        let text = extract_text(content).unwrap_or_default();
+        if !text.is_empty()
+            && !is_system_generated(record, &text)
+            && (!is_synthetic_user_text(&text) || split_leading_injection(content).is_some())
+        {
+            open.clear();
+        }
+        return;
+    }
+    for block in content
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block["type"].as_str() {
+            Some("tool_use") => {
+                if let Some(id) = block["id"].as_str() {
+                    open.insert(id.to_owned());
+                }
+            }
+            Some("tool_result") => {
+                if let Some(id) = block["tool_use_id"].as_str() {
+                    open.remove(id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether the writer of this transcript records why each assistant message stopped.
+///
+/// Settlement takes a terminal reply as the completion of a native execution only for such a
+/// writer. A transcript rendered from another runtime, or written by a build that leaves
+/// `stop_reason` empty, carries no terminal reply at all; requiring one there would leave every
+/// turn unsettled.
+#[cfg(feature = "cli")]
+pub(crate) fn records_stop_reasons(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.contains("\"stop_reason\"")
+            && serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["type"] == "assistant"
+                    && record["message"]["model"] != SYNTHETIC_MODEL
+                    && record
+                        .pointer("/message/stop_reason")
+                        .is_some_and(serde_json::Value::is_string)
+            })
+    })
+}
+
+/// Whether the execution a Stop reports has not reached the file yet.
+///
+/// Claude Code appends transcript records asynchronously, so a Stop hook can read the file
+/// before the final reply lands. The last conversational record then still shows the execution
+/// consuming something it must answer: a tool's result or a runtime-injected record such as a
+/// task notification. Settling from that read leaves the reply for a later Stop that may never
+/// come. A lone thinking block is the start of that reply, not its end. A human prompt, an
+/// interruption, a generated reply or any other model message as the last record means nothing
+/// is outstanding that waiting can bring: a trailing call is either answered
+/// only after the Stop hooks return (`ScheduleWakeup`) or belongs to another chain that is still
+/// running. So does a writer that records no stop reasons, because no terminal reply will ever
+/// arrive to wait for.
+#[cfg(feature = "cli")]
+pub(crate) fn stop_record_pending(text: &str) -> bool {
+    let mut working = false;
+    for line in text.lines().rev() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["isSidechain"] == true || record["isMeta"] == true {
+            continue;
+        }
+        match record["type"].as_str() {
+            Some("assistant") if record["message"]["model"] == SYNTHETIC_MODEL => {
+                if !working {
+                    return false;
+                }
+            }
+            // A message lands block by block, and its thinking block can precede its text or
+            // call on disk while already carrying the message's stop reason. That record ends
+            // nothing, so the execution is still writing whatever the earlier records left it
+            // to answer.
+            Some("assistant") if only_thinking(record.pointer("/message/content")) => {
+                working = true;
+            }
+            Some("assistant") => {
+                return working
+                    && record
+                        .pointer("/message/stop_reason")
+                        .is_some_and(serde_json::Value::is_string);
+            }
+            Some("user") if !working => {
+                let content = record.pointer("/message/content");
+                if extract_tool_results(content).is_some() {
+                    if record["toolDenialKind"] == "interrupted" {
+                        return false;
+                    }
+                } else {
+                    let text = extract_text(content).unwrap_or_default();
+                    let injected =
+                        is_system_generated(&record, &text) || is_synthetic_user_text(&text);
+                    if !injected
+                        || text
+                            .trim_start()
+                            .starts_with("[Request interrupted by user")
+                    {
+                        return false;
+                    }
+                }
+                working = true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a model message's content holds only thinking blocks, with no text or call yet.
+#[cfg(feature = "cli")]
+fn only_thinking(content: Option<&serde_json::Value>) -> bool {
+    content
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+        })
 }
 
 /// Whether conversation follows the last ended turn: a prompt, or a reply whose terminal record is
@@ -1464,17 +1682,17 @@ mod tests {
 
     /// Claude Code writes request snapshots (`api-request-blob`) that copy earlier messages,
     /// including tool_use blocks answered before the snapshot. Counting those copies leaves an
-    /// answered call open after the turn ends, and the turn is never settled.
+    /// answered call open after the turn ends, and the turn is never settled: neither the
+    /// in-flight check nor the completion reader may count them.
     #[test]
     fn request_snapshots_do_not_reopen_answered_calls() {
         let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"sessionId":"s"}"#;
         let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"README.md"}]},"sessionId":"s"}"#;
         let snapshot = r#"{"type":"api-request-blob","hash":"h","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"sessionId":"s"}"#;
-        let reply = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]},"sessionId":"s"}"#;
-        assert_eq!(
-            ClaudeCode.open_tool_calls(&format!("{call}\n{result}\n{snapshot}\n{reply}\n")),
-            Vec::new()
-        );
+        let reply = r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]},"sessionId":"s"}"#;
+        let text = format!("{call}\n{result}\n{snapshot}\n{reply}\n");
+        assert_eq!(ClaudeCode.open_tool_calls(&text), Vec::new());
+        assert_eq!(super::completed_turn_boundaries(&text), vec![text.len()]);
     }
 
     /// **Tool output must not leave a record eventless.**

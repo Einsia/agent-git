@@ -125,14 +125,11 @@ pub fn turn_line(t: &Turn, width: u16) -> Line<'static> {
 }
 
 fn turn_head(t: &Turn) -> String {
-    // The turn ordinal is printed only on the commit that actually settled that turn; the rest
-    // stay blank — so the number in this column and what `<ref>#n` resolves to are the same
-    // commit. Blank is not empty: the placeholder still occupies four columns, otherwise the sha
-    // column jumps left and right between numbered and unnumbered rows.
-    let label = match t.turn {
-        Some(n) => format!("#{n:>3}"),
-        None => "    ".into(),
-    };
+    // The turn ordinal is printed only on commits that settled that turn, marked as `agit log`
+    // marks it ([`Turn::label`]); the rest stay blank. Blank is not empty: the placeholder still
+    // occupies four columns, otherwise the sha column jumps left and right between numbered and
+    // unnumbered rows.
+    let label = t.label();
     let mut head = format!("{label} {} {:<6} ", t.short, kind_word(t.kind));
     let activity = t.activity_label();
     if !activity.is_empty() {
@@ -594,6 +591,8 @@ mod tests {
     fn turn(n: u32, subject: &str) -> Turn {
         Turn {
             turn: Some(n),
+            continuation: false,
+            turn_head: None,
             oid: format!("{n:0>40}"),
             short: format!("{n:0>9}"),
             kind: Kind::Turn,

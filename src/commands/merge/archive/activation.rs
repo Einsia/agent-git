@@ -1072,7 +1072,7 @@ mod tests {
                 }
                 "historical" => {
                     fixture.binding.source.head = fixture.binding.role.origin_head.clone();
-                    "source#1".into()
+                    "source~1".into()
                 }
                 _ => format!("agit-{}", fixture.binding.source.head),
             };

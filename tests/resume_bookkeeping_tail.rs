@@ -151,6 +151,87 @@ fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
         );
     }
 
+    // A writer that records stop reasons settles a reply written after a settled turn, woken by a
+    // task notification with no new prompt, as a further commit of that turn. Until then that
+    // reply is unsettled work, not bookkeeping, whether the claim is the native transcript or a
+    // materialized one: the switch refuses until it is committed, and the merge settles it onto
+    // the branch before it opens. Read as bookkeeping, both would leave the reply behind.
+    for materialized in [false, true] {
+        for merging in [false, true] {
+            let lab = Lab::new();
+            let (live, id) = if materialized {
+                lab.run(&[
+                    "resume",
+                    "alice/qa@work",
+                    "--as",
+                    "claude-code",
+                    "--no-launch",
+                ]);
+                let live = walk(&lab.home.join(".claude/projects"))
+                    .into_iter()
+                    .find(|path| path != &lab.live)
+                    .expect("materialized transcript");
+                let id = live.file_stem().unwrap().to_str().unwrap().to_owned();
+                (live, id)
+            } else {
+                (lab.live.clone(), SID.to_owned())
+            };
+            append(&live, &(lab.tail(&["user", "reply"]) + &lab.tail(EXIT)));
+            let commit = lab.output(&["commit", &id]);
+            let text = combined(&commit);
+            assert!(commit.status.success(), "{materialized}: {text}");
+            assert!(
+                !text.contains("nothing new since"),
+                "{materialized}: {text}"
+            );
+            append(
+                &live,
+                &(lab.tail(&["notification", "reply"]) + &lab.tail(EXIT)),
+            );
+            if merging {
+                let merged = lab.merge();
+                let text = combined(&merged);
+                assert!(merged.status.success(), "{materialized}: {text}");
+                let landed = Command::new("git")
+                    .arg("-C")
+                    .arg(lab.repo())
+                    .args(["rev-list", "--count", "refs/heads/source..refs/heads/work"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&landed.stdout).trim(),
+                    "1",
+                    "{materialized}: {text}"
+                );
+                let log = lab.run(&["log", "alice/qa@work"]);
+                assert!(
+                    log.lines().any(|line| line.trim_start().starts_with('+')),
+                    "{materialized}: {log}"
+                );
+                continue;
+            }
+            let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+            let text = combined(&switched);
+            assert!(!switched.status.success(), "{materialized}: {text}");
+            assert!(
+                text.contains("already has unsettled content"),
+                "{materialized}: {text}"
+            );
+            let commit = lab.output(&["commit", &id]);
+            let text = combined(&commit);
+            assert!(commit.status.success(), "{materialized}: {text}");
+            assert!(
+                !text.contains("nothing new since"),
+                "{materialized}: {text}"
+            );
+            let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+            let text = combined(&switched);
+            assert!(switched.status.success(), "{materialized}: {text}");
+        }
+    }
+
     let lab = Lab::new();
     lab.append(&(lab.turn(3) + &lab.tail(EXIT)));
     let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
@@ -330,6 +411,14 @@ impl Lab {
                 "assistant" => json!({"type":kind, "sessionId":SID, "cwd":self.work,
                     "uuid":format!("a-tail-{i}"), "message":{"role":"assistant",
                     "content":[{"type":"text", "text":format!("synthetic answer {i}")}]}}),
+                // A reply from a writer that records why each message stopped.
+                "reply" => json!({"type":"assistant", "sessionId":SID, "cwd":self.work,
+                    "uuid":format!("a-reply-{i}"), "message":{"role":"assistant", "stop_reason":"end_turn",
+                    "content":[{"type":"text", "text":format!("synthetic reply {i}")}]}}),
+                // A background task's completion waking the agent without a prompt.
+                "notification" => json!({"type":"user", "sessionId":SID, "cwd":self.work,
+                    "uuid":format!("n-tail-{i}"), "promptSource":"system", "message":{"role":"user",
+                    "content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"}}),
                 "api-request-blob" | "api-request" | "attachment" => {
                     json!({"type":kind, "sessionId":SID, "uuid":format!("r-tail-{i}")})
                 }

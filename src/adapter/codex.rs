@@ -49,6 +49,20 @@ pub(crate) fn resume_command(sid: &str, cwd: &Path) -> String {
     format!("codex resume {} --cd '{cwd}'", super::shell_id(sid))
 }
 
+/// Whether this text holds a `task_started` record, which a rollout writer puts ahead of every
+/// native execution. Such a writer closes each execution with `task_complete` or
+/// `turn_aborted`, so its work after the last of those is unfinished even where none is in the
+/// text yet — a resumed rollout's rendered prefix carries no completion records.
+#[cfg(feature = "cli")]
+pub(crate) fn records_execution_starts(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.contains("\"task_started\"")
+            && serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["type"] == "event_msg" && record["payload"]["type"] == "task_started"
+            })
+    })
+}
+
 /// Whether a Codex hook comes from a side conversation, which agit leaves to Codex.
 ///
 /// Codex keeps a temporary side conversation in memory only and reports no transcript for it, so

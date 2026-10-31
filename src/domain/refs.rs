@@ -761,13 +761,125 @@ impl Chain {
             .flatten()
     }
 
-    /// "turn ordinal → the commit that settled it", by first-parent from the root to the head.
+    /// Every turn with the chain indexes of the commits that settled it, by first-parent from
+    /// the root to the head.
+    ///
+    /// History is never amended, so a turn whose agent keeps working after a native completion,
+    /// with no new prompt, lands as further turn commits carrying the same ordinal; only commits
+    /// that settle no turn can sit between those parts. An ordinal that shows up again after
+    /// another turn's commit retells history rewritten from outside: the earliest run is that
+    /// turn and the later one names nothing.
+    pub fn runs(&self) -> Vec<(u32, Vec<usize>)> {
+        let mut runs: Vec<(u32, Vec<usize>)> = vec![];
+        let mut seen = std::collections::HashSet::new();
+        let mut open = None;
+        for i in 0..self.entries.len() {
+            let Some(turn) = self.label(i) else {
+                continue;
+            };
+            if open == Some(turn) {
+                runs.last_mut().expect("an open run").1.push(i);
+            } else if seen.insert(turn) {
+                runs.push((turn, vec![i]));
+                open = Some(turn);
+            } else {
+                open = None;
+            }
+        }
+        runs
+    }
+
+    /// "turn ordinal → the commit that holds all of it": a turn settled in several parts is
+    /// named by its last part, whose snapshot contains every event of the turn.
     pub fn turns(&self) -> Vec<(u32, &str)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| self.label(i).map(|t| (t, e.sha.as_str())))
+        self.runs()
+            .into_iter()
+            .map(|(turn, parts)| {
+                let last = *parts.last().expect("a run has a part");
+                (turn, self.entries[last].sha.as_str())
+            })
             .collect()
+    }
+
+    /// Turn `n` (`#-1` is the last turn) and the chain indexes of its parts, in order.
+    pub fn turn_parts(&self, n: u32) -> Result<(u32, Vec<usize>)> {
+        let mut runs = self.runs();
+        let Some(last) = runs.last() else {
+            anyhow::bail!(
+                "this branch has no settled turns yet, so there is nothing for `#n` to name"
+            );
+        };
+        if n == LAST_TURN {
+            // The last turn is the one the latest turn commit settled. When that commit retells
+            // an earlier turn, it is returned alone so callers that need one unambiguous turn
+            // can see it is not that turn's canonical commit.
+            let latest = (0..self.entries.len())
+                .rev()
+                .find(|&i| self.label(i).is_some())
+                .expect("a run has a labeled commit");
+            if last.1.contains(&latest) {
+                return Ok(runs.pop().expect("a last run"));
+            }
+            let turn = self.label(latest).expect("a labeled commit");
+            return Ok((turn, vec![latest]));
+        }
+        if n == 0 {
+            anyhow::bail!("turn numbers start at 1");
+        }
+        let have: Vec<String> = runs.iter().map(|(t, _)| t.to_string()).collect();
+        runs.into_iter().find(|(t, _)| *t == n).ok_or_else(|| {
+            anyhow::anyhow!(
+                "this branch has no turn {n} (settled turns: {})",
+                have.join(", ")
+            )
+        })
+    }
+
+    /// The LOG line numbers turn `n` added — each part's lines against its first parent, part
+    /// after part — with the last part's sha and LOG. `log_at` reads one commit's LOG.
+    ///
+    /// The LOG is append-only, so what a commit added is the stretch between its parent's line
+    /// count and its own, and a later part of the same turn only appends further numbers: `#n.k`
+    /// keeps its meaning once a continuation lands. The repository reader behind `agit show`,
+    /// `revert`, `cherry-pick` and a merge pick and the frozen archive source both number a
+    /// turn's events here, so they cannot drift apart.
+    pub fn turn_lines_with<L: AsRef<str>>(
+        &self,
+        n: u32,
+        mut log_at: impl FnMut(&str) -> Result<L>,
+    ) -> Result<(u32, Vec<usize>, &str, L)> {
+        let (turn, parts) = self.turn_parts(n)?;
+        let mut lines = Vec::new();
+        let mut last = None;
+        for &index in &parts {
+            let sha = self.entries[index].sha.as_str();
+            let this = log_at(sha)?;
+            let previous = match index.checked_sub(1).map(|parent| &self.entries[parent]) {
+                None => None,
+                Some(parent) => {
+                    let metadata = parent.meta.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "turn {turn}'s commit {sha} has a first parent with no readable {}",
+                            crate::domain::meta::FILE
+                        )
+                    })?;
+                    if metadata.is_file_line() || metadata.session.is_empty() {
+                        None
+                    } else {
+                        Some(log_at(&parent.sha)?)
+                    }
+                }
+            };
+            let previous = previous.as_ref().map_or("", AsRef::as_ref);
+            anyhow::ensure!(
+                this.as_ref().starts_with(previous),
+                "turn {turn}'s commit {sha} rewrites its first parent's LOG instead of appending"
+            );
+            lines.extend(previous.lines().count()..this.as_ref().lines().count());
+            last = Some((sha, this));
+        }
+        let (sha, log) = last.expect("a turn has a part");
+        Ok((turn, lines, sha, log))
     }
 }
 
@@ -791,31 +903,13 @@ pub fn turn_commit(repo: &crate::domain::repo::Repo, head: &str, n: u32) -> Resu
 
 /// [`turn_commit`], but searching a chain that is already read — the two ends of a range do
 /// not read it twice.
+///
+/// A turn settled in several parts resolves to its last part ([`Chain::runs`]): that snapshot
+/// holds the whole turn, and `#n.k` counts the events of every part in order.
 pub fn turn_in(chain: &Chain, n: u32) -> Result<(u32, String)> {
-    let table = chain.turns();
-    let Some(last) = table.last() else {
-        anyhow::bail!("this branch has no settled turns yet, so there is nothing for `#n` to name");
-    };
-    if n == LAST_TURN {
-        return Ok((last.0, last.1.to_string()));
-    }
-    if n == 0 {
-        anyhow::bail!("turn numbers start at 1");
-    }
-    // One turn ordinal is settled once; when a duplicate really shows up (history rewritten
-    // from outside) the **earliest** one wins — the first landing is that turn and the rest
-    // retell it.
-    table
-        .iter()
-        .find(|(t, _)| *t == n)
-        .map(|(t, sha)| (*t, sha.to_string()))
-        .ok_or_else(|| {
-            let have: Vec<String> = table.iter().map(|(t, _)| t.to_string()).collect();
-            anyhow::anyhow!(
-                "this branch has no turn {n} (settled turns: {})",
-                have.join(", ")
-            )
-        })
+    let (turn, parts) = chain.turn_parts(n)?;
+    let last = *parts.last().expect("a run has a part");
+    Ok((turn, chain.entries[last].sha.clone()))
 }
 
 /// How many turns this branch has settled; history with no declared turn ordinal falls back to

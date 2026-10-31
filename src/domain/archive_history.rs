@@ -384,46 +384,20 @@ impl FrozenSourceLog {
         Ok(&self.logs[&self.head])
     }
 
+    /// The LOG lines turn `ordinal` added, numbered as [`refs::Chain::turn_lines_with`] numbers
+    /// them, from the frozen LOGs.
     pub fn turn_lines(&self, ordinal: u32) -> Result<(u32, Vec<usize>)> {
-        let (turn, sha) = refs::turn_in(&self.chain, ordinal)?;
-        let index = self
-            .chain
-            .entries
-            .iter()
-            .position(|entry| entry.sha == sha)
-            .context("selected turn is absent from the frozen source chain")?;
-        let this = self
-            .logs
-            .get(&sha)
-            .context("selected source turn has no valid LOG")?;
-        let previous = match index.checked_sub(1).map(|i| &self.chain.entries[i]) {
-            None => "",
-            Some(parent) => {
-                let metadata = parent
-                    .meta
-                    .as_ref()
-                    .context("selected source turn's first parent has no metadata")?;
-                if metadata.is_file_line() || metadata.session.is_empty() {
-                    ""
-                } else {
-                    self.logs
-                        .get(&parent.sha)
-                        .context("selected source turn's first parent has no valid LOG")?
-                }
-            }
-        };
-        ensure!(
-            this.starts_with(previous),
-            "selected source turn rewrites its first parent's LOG"
-        );
+        let (turn, lines, _, this) = self.chain.turn_lines_with(ordinal, |sha| {
+            self.logs
+                .get(sha)
+                .map(String::as_str)
+                .with_context(|| format!("source commit {sha} has no valid LOG"))
+        })?;
         ensure!(
             self.log_at(&self.head)?.starts_with(this),
             "source head rewrites LOG after the selected turn"
         );
-        Ok((
-            turn,
-            (previous.lines().count()..this.lines().count()).collect(),
-        ))
+        Ok((turn, lines))
     }
 }
 
