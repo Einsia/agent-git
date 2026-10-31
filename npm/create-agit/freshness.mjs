@@ -30,16 +30,27 @@ export function newer(candidate, current) {
  */
 export async function latestVersion(env, fetchImpl = fetch, timeoutMs = 3000) {
   const registry = (env.npm_config_registry || 'https://registry.npmjs.org/').replace(/\/?$/, '/')
+  const ask = async () => {
+    try {
+      const response = await fetchImpl(`${registry}create-agit/latest`, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!response.ok) return null
+      const { version } = await response.json()
+      return typeof version === 'string' && RELEASE.test(version) ? version : null
+    } catch {
+      return null
+    }
+  }
+  // The abort signal's timer does not keep the process alive. While a request holds nothing else
+  // open, only this timer does; without it Node ends the installer mid-check with status 13
+  // ("unsettled top-level await") and no message of the installer's own.
+  let bound
   try {
-    const response = await fetchImpl(`${registry}create-agit/latest`, {
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(timeoutMs),
-    })
-    if (!response.ok) return null
-    const { version } = await response.json()
-    return typeof version === 'string' && RELEASE.test(version) ? version : null
-  } catch {
-    return null
+    return await Promise.race([ask(), new Promise(resolve => { bound = setTimeout(resolve, timeoutMs, null) })])
+  } finally {
+    clearTimeout(bound)
   }
 }
 

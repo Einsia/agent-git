@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
+import { spawnSync } from 'node:child_process'
 import { REEXEC, freshness } from './freshness.mjs'
 
 const NPM = '/usr/lib/node_modules/npm/bin/npm-cli.js'
@@ -62,4 +63,21 @@ test('an installer that cannot hand over installs its own version', async () => 
   const failed = decide({ run: () => 1 })
   assert.equal(await failed.result, 'stale')
   assert.match(failed.notes.at(-1), /installing 0\.2\.9/)
+})
+
+// Pins that the registry check settles within its bound however the request behaves: a request
+// that holds nothing open (here, one that settles only when its abort signal fires) leaves the
+// installer as the only thing to keep the process alive. A bound kept only by the abort signal's
+// timer lets Node end the process with status 13 ("unsettled top-level await") before the check
+// answers, so the child below would exit 13 instead of printing null.
+test('the registry check settles within its bound when the request holds nothing open', () => {
+  const module = new URL('./freshness.mjs', import.meta.url).href
+  const program = `
+    import { latestVersion } from ${JSON.stringify(module)}
+    const inert = (url, { signal }) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)))
+    console.log(JSON.stringify(await latestVersion({}, inert, 50)))
+  `
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', program], { encoding: 'utf8', timeout: 10000 })
+  assert.equal(child.status, 0, child.stderr)
+  assert.equal(child.stdout.trim(), 'null')
 })
