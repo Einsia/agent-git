@@ -14,8 +14,11 @@
 //! A device enrolled for remote control keeps its last team activity report on the Hub, and the
 //! daemon cannot replace it once the credential is gone. So before revoking, the sign-out sends
 //! the Hub an empty report for the device, with the access token as it stands: never renewed and
-//! never after the revoke. It is best effort: a send that fails, is refused or times out changes
-//! nothing about the sign-out, and the Hub's own staleness rules remain the backstop.
+//! never after the revoke. A device can be enrolled under both daemon namespaces, `rc` and the
+//! `desktop-rc` that `agit rc start` uses, each as its own device, so each gets its report. It is
+//! best effort: a send that fails, is refused or times out, or an enrollment that cannot be read,
+//! is said but changes nothing about the sign-out, and the Hub's own staleness rules remain the
+//! backstop.
 
 use super::CmdResult;
 use crate::infra::config;
@@ -159,27 +162,39 @@ fn revoke(hub: &str, cred: &HubCredential, attempted: &mut HashSet<String>) -> c
     result
 }
 
-/// Send `hub` an empty team activity report for this device's enrollment there, if it has one
-/// owned by `cred`'s account, so the team stops seeing its live sessions. The report lists no
-/// session and is sent with `cred`'s access token as it stands; any failure is ignored.
+/// Send `hub` an empty team activity report for each of this device's enrollments there, in
+/// every daemon namespace, owned by `cred`'s account, so the team stops seeing their live
+/// sessions. Each report lists no session and is sent with `cred`'s access token as it stands.
+/// One that cannot be sent, or an enrollment that cannot be read, is said and left to the Hub.
 fn clear_activity(hub: &str, cred: &HubCredential) {
-    let Ok(Some(enrollment)) = crate::rc::cloud::store::load(hub) else {
-        return;
-    };
-    let device = &enrollment.credential.device;
-    if cred
-        .account_id
-        .as_deref()
-        .is_some_and(|account| account != device.owner.account_id)
-    {
-        return;
+    let mut cleared = HashSet::new();
+    for (namespace, enrollment) in crate::rc::cloud::store::enrollments_everywhere(hub) {
+        let result = enrollment.and_then(|enrollment| {
+            let device = enrollment.credential.device;
+            if cred
+                .account_id
+                .as_deref()
+                .is_some_and(|account| account != device.owner.account_id)
+                || !cleared.insert(device.id.clone())
+            {
+                return Ok(());
+            }
+            crate::hub::Client::for_hub_with_token_and_timeout(
+                hub,
+                &cred.access_token,
+                CLEAR_ACTIVITY_TIMEOUT,
+            )
+            .report_device_activity(&device.id, &[])
+            .map(drop)
+        });
+        if let Err(e) = result {
+            ui::warning(&format!(
+                "couldn't clear this device's live sessions ({namespace}) from Team activity at {}: {e:#}",
+                safe_label(hub)
+            ));
+            ui::hint("signing out anyway; the Hub marks the device stale within 3 minutes");
+        }
     }
-    let _ = crate::hub::Client::for_hub_with_token_and_timeout(
-        hub,
-        &cred.access_token,
-        CLEAR_ACTIVITY_TIMEOUT,
-    )
-    .report_device_activity(&device.id, &[]);
 }
 
 /// Revoke the sessions of removed credentials that no revoke of this sign-out attempted: a
@@ -239,8 +254,8 @@ mod tests {
     /// A request as the fake Hub saw it: method and target, bearer, body.
     type Seen = (String, Option<String>, String);
 
-    /// A Hub that answers every request with `{}` and records it, a JSON body in compact form,
-    /// skipping version probes.
+    /// A Hub that answers every request as it answers a report, which a revoke also accepts, and
+    /// records it, a JSON body in compact form, skipping version probes.
     fn fake_hub() -> (String, Arc<Mutex<Vec<Seen>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let hub = format!("http://{}", listener.local_addr().unwrap());
@@ -285,7 +300,7 @@ mod tests {
                     ));
                 }
                 let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"next_report_seconds\":600}",
                 );
             }
         });
@@ -305,10 +320,11 @@ mod tests {
         }
     }
 
-    fn enroll(hub: &str, account: &str) {
+    /// Enroll this device on `hub` as `id`, owned by `account`, under the daemon `namespace`.
+    fn enroll(hub: &str, namespace: &str, id: &str, account: &str) {
         let identity = agit_peer::Identity::generate().unwrap();
         let device = Device {
-            id: "executor".into(),
+            id: id.into(),
             owner: Principal {
                 issuer: hub.into(),
                 account_id: account.into(),
@@ -318,44 +334,64 @@ mod tests {
             certificate: identity.certificate().clone(),
             credential_epoch: 1,
         };
-        crate::rc::cloud::store::save(&crate::rc::cloud::store::Enrollment {
-            identity,
-            inbound_enabled: true,
-            credential: DeviceCredential {
-                device,
-                token: Secret::new("fixture-device-token".into()),
+        crate::rc::cloud::store::save_in(
+            &crate::rc::state_dir(namespace).unwrap(),
+            &crate::rc::cloud::store::Enrollment {
+                identity,
+                inbound_enabled: true,
+                credential: DeviceCredential {
+                    device,
+                    token: Secret::new("fixture-device-token".into()),
+                },
             },
-        })
+        )
         .unwrap();
     }
 
     /// Pins the order and content of a sign-out's requests for an enrolled device: first an
-    /// empty team activity report for that device, with the access token about to be revoked,
-    /// then the revoke, and nothing after it. The report body lists no session and carries no
-    /// other key. A device enrolled under another account gets no report, and the revoke still
-    /// runs.
+    /// empty team activity report for each enrollment of the device, with the access token
+    /// about to be revoked, then the revoke, and nothing after it. A device enrolled by
+    /// `agit rc start`, under `desktop-rc` alone, gets its report whichever namespace this
+    /// process selected; one enrolled under both gets one per namespace. Each body lists no
+    /// session and carries no other key. A device enrolled under another account gets no
+    /// report, and the revoke still runs.
     #[test]
     fn sign_out_empties_the_devices_activity_report_before_revoking() {
         let (hub, seen) = fake_hub();
         let home = tempfile::tempdir().unwrap();
         crate::rc::with_agit_home(home.path(), || {
-            enroll(&hub, "owner");
-            let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
             let bearer = Some(format!("Bearer {TOKEN}"));
+            let cleared = |device: &str| {
+                (
+                    format!("PUT /api/peer/devices/{device}/activity"),
+                    bearer.clone(),
+                    r#"{"sessions":[]}"#.to_owned(),
+                )
+            };
+            let revoked = (
+                "POST /api/auth/logout".to_owned(),
+                bearer.clone(),
+                "{}".to_owned(),
+            );
+
+            enroll(&hub, "desktop-rc", "desktop", "owner");
+            let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
             assert_eq!(
                 *seen.lock().unwrap(),
-                vec![
-                    (
-                        "PUT /api/peer/devices/executor/activity".to_owned(),
-                        bearer.clone(),
-                        r#"{"sessions":[]}"#.to_owned(),
-                    ),
-                    ("POST /api/auth/logout".to_owned(), bearer, "{}".to_owned()),
-                ]
+                vec![cleared("desktop"), revoked.clone()]
             );
 
             seen.lock().unwrap().clear();
-            enroll(&hub, "someone-else");
+            enroll(&hub, "rc", "shared", "owner");
+            let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![cleared("shared"), cleared("desktop"), revoked]
+            );
+
+            seen.lock().unwrap().clear();
+            enroll(&hub, "rc", "shared", "someone-else");
+            enroll(&hub, "desktop-rc", "desktop", "someone-else");
             let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "{seen:?}");
@@ -373,7 +409,7 @@ mod tests {
         };
         let home = tempfile::tempdir().unwrap();
         crate::rc::with_agit_home(home.path(), || {
-            enroll(&hub, "owner");
+            enroll(&hub, "desktop-rc", "desktop", "owner");
             let started = std::time::Instant::now();
             assert!(revoke(&hub, &credential(&hub), &mut HashSet::new()).is_err());
             assert!(started.elapsed() < CLEAR_ACTIVITY_TIMEOUT);
