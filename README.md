@@ -60,7 +60,7 @@ The full command list is in `agit --help`.
 ```sh
 npx -y create-agit@latest          # one-shot: installs agit + wires skills/hooks/MCP
 # or as a global package:
-npm install -g @einsia/agent-git   # pnpm add -g @einsia/agent-git works too
+npm install -g @einsia/agent-git --allow-scripts=@einsia/agent-git
 agit --version
 ```
 
@@ -74,9 +74,11 @@ Windows x64 packages include the native peer RC daemon. On Windows, Linux and ma
 account to control it from Workspaces. Windows owner RPC uses a local named pipe restricted
 to the current user. RC state requires a private, user-owned directory.
 
-pnpm (v10+) does not run dependency install scripts by default, so the
-automatic `agit setup` is skipped there — run `agit setup` once yourself
-after installing.
+The global package wires skills, hooks and MCP from its install script. npm 12 and later
+skip an install script that has not been allowed, which is what `--allow-scripts` above is for;
+an organization policy (`strict-allow-scripts`, `ignore-scripts`) can block or skip it too. Under
+pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If the install
+script did not run, run `agit setup` once yourself.
 
 The Linux artifact is **musl static-linked**, so no minimum glibc — the
 release pipeline runs every Linux binary inside an Alpine / Amazon Linux /

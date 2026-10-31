@@ -7,15 +7,17 @@ its state with curl or `agit doctor`.
 
 Several paths, the same binary either way:
 
-| Who                      | How                                                          | Notes                                               |
-| ------------------------ | ------------------------------------------------------------ | --------------------------------------------------- |
-| Users (one-shot)         | `npx -y create-agit@latest`                                  | one-shot install to `~/.local/bin/agit`, then setup |
-| Users (global)           | `npm install -g @einsia/agent-git`                           | prebuilt binary, no Rust toolchain needed           |
-| People changing the code | `./setup.sh`                                                 | builds from source, installs to `~/.local/bin/agit` |
+| Who                      | How                                                                  | Notes                                               |
+| ------------------------ | -------------------------------------------------------------------- | --------------------------------------------------- |
+| Users (one-shot)         | `npx -y create-agit@latest`                                          | one-shot install to `~/.local/bin/agit`, then setup |
+| Users (global)           | `npm install -g @einsia/agent-git --allow-scripts=@einsia/agent-git` | prebuilt binary; its install script runs setup      |
+| People changing the code | `./setup.sh`                                                         | builds from source, installs to `~/.local/bin/agit` |
 
-pnpm (since v10) does not run a dependency's install
-scripts by default, so the automatic `agit setup` is skipped — run it once by
-hand after installing. What the npm package itself does is in
+The global package wires skills, hooks and MCP from its install script. npm 12 and later
+skip an install script that has not been allowed, which is what `--allow-scripts` above is for;
+an organization policy (`strict-allow-scripts`, `ignore-scripts`) can block or skip it too. Under
+pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If the install
+script did not run, run `agit setup` once yourself. What the npm package itself does is in
 [`../npm/README.md`](../npm/README.md).
 
 Do not install `@einsia/agentgit` (no hyphen) — that is a different CLI from
