@@ -57,6 +57,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "mcp",
     "memory",
     "merge",
+    "month",
     "new",
     "off",
     "on",

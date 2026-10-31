@@ -522,6 +522,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 
         Commands::Search(a) => commands::search::run(*a),
         Commands::Activity(a) => commands::activity::run(*a),
+        Commands::Month(a) => commands::month::run(a),
         Commands::Share(a) => commands::share::run(a),
         Commands::Privacy(a) => commands::privacy::run(a),
         Commands::Pr(a) => commands::pr::run(a),
