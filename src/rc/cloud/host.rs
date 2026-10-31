@@ -162,13 +162,23 @@ impl Service {
     }
 }
 
+/// A task that had no enrollment adopts the first one instead of being retired: it held no
+/// authority to revoke, and its presence worker already follows the enrollment through
+/// `changed`. Retiring it would reset every socket the device opened under the new enrollment.
 fn retire_changed_enrollments(
     tasks: &mut HashMap<String, Task>,
     origins: &[(String, bool, Option<Device>)],
 ) {
     tasks.retain(|hub, task| {
         origins.iter().any(|(origin, _, device)| {
-            origin == hub && same_enrollment(task.device.as_ref(), device.as_ref())
+            if origin != hub {
+                return false;
+            }
+            if task.device.is_none() {
+                task.device.clone_from(device);
+                return true;
+            }
+            same_enrollment(task.device.as_ref(), device.as_ref())
         })
     });
 }
@@ -221,6 +231,49 @@ async fn receive_presence(
     }
 }
 
+/// Waits for the next presence event, or `None` once the enrollment presence opened under is
+/// replaced. A notice for the enrollment presence already uses is absorbed without cancelling the
+/// receive, which may own a consumed ping whose pong is still being written.
+async fn next_offer<F, Fut>(
+    presence: &mut Presence,
+    children: &mut tokio::task::JoinSet<()>,
+    changed: &mut watch::Receiver<()>,
+    still_current: F,
+) -> anyhow::Result<Option<PresenceEvent>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::select! {
+        () = enrollment_replaced(changed, still_current) => Ok(None),
+        offer = receive_presence(presence, children) => offer.map(Some),
+    }
+}
+
+/// A notice is marked seen only after it was checked, so cancelling this future loses none.
+async fn enrollment_replaced<F, Fut>(changed: &mut watch::Receiver<()>, mut still_current: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        let mut notice = changed.clone();
+        if notice.changed().await.is_err() || !still_current().await {
+            return;
+        }
+        *changed = notice;
+    }
+}
+
+async fn still_enrolled(hub: String, device: Device) -> bool {
+    matches!(
+        tokio::task::spawn_blocking(move || store::load(&hub)).await,
+        Ok(Ok(Some(current)))
+            if current.inbound_enabled
+                && same_enrollment(Some(&current.credential.device), Some(&device))
+    )
+}
+
 async fn run_executor(
     hub: String,
     worker: Worker,
@@ -245,72 +298,72 @@ async fn run_executor(
             record(&log, "cloud.presence_connected", serde_json::json!({"hub":hub,"device_id":enrollment.credential.device.id,"epoch":presence.epoch,"worker_pid":presence.worker_pid,"transport_timing":transport_timing}));
             backoff = Duration::from_millis(250);
             loop {
-                tokio::select! {
-                    _ = changed.changed() => {
-                        lifetime.send_replace(());
-                        stopped.borrow_and_update();
-                        children.abort_all();
-                        return Ok(());
-                    }
-                    offer = receive_presence(&mut presence, &mut children) => {
-                        let PresenceEvent::Offer { link_id, source_id, ticket, grant_token, grant } = offer? else { continue };
-                        let Ok(permit) = slots.clone().try_acquire_owned() else {
-                            record(&log, "cloud.offer_capacity", serde_json::json!({"hub":hub,"link_id":link_id}));
-                            continue;
+                let offer = next_offer(&mut presence, &mut children, &mut changed, || {
+                    still_enrolled(hub.clone(), enrollment.credential.device.clone())
+                })
+                .await?;
+                let Some(offer) = offer else {
+                    lifetime.send_replace(());
+                    stopped.borrow_and_update();
+                    children.abort_all();
+                    return Ok(());
+                };
+                let PresenceEvent::Offer { link_id, source_id, ticket, grant_token, grant } = offer else { continue };
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    record(&log, "cloud.offer_capacity", serde_json::json!({"hub":hub,"link_id":link_id}));
+                    continue;
+                };
+                let started = Instant::now();
+                let (hub, worker, incoming, log, stopped, api) = (hub.clone(), worker.clone(), incoming.clone(), log.clone(), stopped.clone(), api.clone());
+                children.spawn(async move {
+                    let _permit = permit;
+                    let mut phase = "enrollment";
+                    let accepted = async {
+                        let origin = hub.clone();
+                        let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
+                            .context("cloud enrollment is missing")?;
+                        ensure!(enrollment.inbound_enabled, "inbound cloud connections are disabled");
+                        let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        phase = "admission";
+                        let config = api.data_config(&enrollment.credential)?;
+                        let inline_grant = grant.is_some();
+                        let verification_source = if grant.is_some() { "presence" } else { "http" };
+                        let verification = async {
+                            let started = Instant::now();
+                            let grant = api.offered_grant(&enrollment.credential, &grant_token, grant.map(|grant| *grant)).await?;
+                            ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
+                            Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
                         };
-                        let started = Instant::now();
-                        let (hub, worker, incoming, log, stopped, api) = (hub.clone(), worker.clone(), incoming.clone(), log.clone(), stopped.clone(), api.clone());
-                        children.spawn(async move {
-                            let _permit = permit;
-                            let mut phase = "enrollment";
-                            let accepted = async {
-                                let origin = hub.clone();
-                                let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
-                                    .context("cloud enrollment is missing")?;
-                                ensure!(enrollment.inbound_enabled, "inbound cloud connections are disabled");
-                                let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
-                                phase = "admission";
-                                let config = api.data_config(&enrollment.credential)?;
-                                let inline_grant = grant.is_some();
-                                let verification_source = if grant.is_some() { "presence" } else { "http" };
-                                let verification = async {
-                                    let started = Instant::now();
-                                    let grant = api.offered_grant(&enrollment.credential, &grant_token, grant.map(|grant| *grant)).await?;
-                                    ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
-                                    Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
-                                };
-                                let transport = |config| async {
-                                    let started = Instant::now();
-                                    let raw = worker.open(config).await?;
-                                    Ok::<_, anyhow::Error>((raw, started.elapsed().as_secs_f64() * 1000.0))
-                                };
-                                // A join-bearing upgrade must follow admission; speculative sockets carry no ticket.
-                                let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = if inline_grant {
-                                    let grant = verification.await?;
-                                    let config = api.admitted_data_config(&enrollment.credential, &grant.0, &ticket)?;
-                                    (grant, transport(config).await?, false)
-                                } else {
-                                    verified_transport(verification, || transport(config.clone())).await?
-                                };
-                                let transport_timing = raw.connect_timing;
-                                phase = "relay_pair";
-                                let paired = Instant::now();
-                                let raw = join_data(raw, &link_id, ticket).await?;
-                                let pairing_ms = paired.elapsed().as_secs_f64() * 1000.0;
-                                phase = "endpoint_tls";
-                                let authenticated = Instant::now();
-                                let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
-                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_timing":transport_timing,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
-                                let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
-                                phase = "ingress";
-                                incoming.try_send(Authenticated { connection, grant, stopped, renewal })
-                                    .map_err(|_| anyhow::anyhow!("executor ingress is full or stopped"))?;
-                                Ok::<_, anyhow::Error>(())
-                            }.await;
-                            if accepted.is_err() { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
-                        });
-                    }
-                }
+                        let transport = |config| async {
+                            let started = Instant::now();
+                            let raw = worker.open(config).await?;
+                            Ok::<_, anyhow::Error>((raw, started.elapsed().as_secs_f64() * 1000.0))
+                        };
+                        // A join-bearing upgrade must follow admission; speculative sockets carry no ticket.
+                        let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = if inline_grant {
+                            let grant = verification.await?;
+                            let config = api.admitted_data_config(&enrollment.credential, &grant.0, &ticket)?;
+                            (grant, transport(config).await?, false)
+                        } else {
+                            verified_transport(verification, || transport(config.clone())).await?
+                        };
+                        let transport_timing = raw.connect_timing;
+                        phase = "relay_pair";
+                        let paired = Instant::now();
+                        let raw = join_data(raw, &link_id, ticket).await?;
+                        let pairing_ms = paired.elapsed().as_secs_f64() * 1000.0;
+                        phase = "endpoint_tls";
+                        let authenticated = Instant::now();
+                        let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
+                        record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_timing":transport_timing,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
+                        let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
+                        phase = "ingress";
+                        incoming.try_send(Authenticated { connection, grant, stopped, renewal })
+                            .map_err(|_| anyhow::anyhow!("executor ingress is full or stopped"))?;
+                        Ok::<_, anyhow::Error>(())
+                    }.await;
+                    if accepted.is_err() { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
+                });
             }
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
@@ -408,9 +461,11 @@ mod presence_tests {
     use futures_util::poll;
     use tokio::sync::oneshot;
 
-    /// An enrollment replacement ends the lifetimes held by old Cloud connections and workers.
+    /// An enrollment replacement ends the lifetimes held by old Cloud connections and workers;
+    /// a first enrollment and a rename keep them. Retiring on the first enrollment would reset
+    /// every socket the device opened just after it enrolled.
     #[tokio::test]
-    async fn replacing_an_enrollment_retires_cloud_authority_without_interrupting_a_rename() {
+    async fn only_a_replaced_enrollment_retires_cloud_authority() {
         let device = Device {
             id: "device".into(),
             owner: agit_peer::access::Principal {
@@ -439,13 +494,15 @@ mod presence_tests {
         let mut tasks = HashMap::from([(
             hub.clone(),
             Task {
-                device: Some(device.clone()),
+                device: None,
                 presence,
                 enrollment: None,
                 publication,
                 changed: watch::channel(()).0,
             },
         )]);
+        retire_changed_enrollments(&mut tasks, &[(hub.clone(), false, Some(device.clone()))]);
+        assert!(stopped.has_changed().is_ok());
         let mut renamed = device.clone();
         renamed.display_name = "renamed".into();
         retire_changed_enrollments(&mut tasks, &[(hub.clone(), false, Some(renamed.clone()))]);
@@ -468,9 +525,12 @@ mod presence_tests {
         );
     }
 
-    /// Finishing an offer worker cannot leave a consumed heartbeat's reply unpolled.
+    /// Neither a finished offer worker nor a notice for the enrollment presence already uses can
+    /// leave a consumed heartbeat's reply unpolled; only a replaced enrollment ends the wait. A
+    /// receive restarted on either event would never write the pong, and the Hub would close the
+    /// socket for a missed heartbeat.
     #[tokio::test]
-    async fn offer_completion_keeps_the_inflight_heartbeat_alive() {
+    async fn offer_completion_and_enrollment_notices_keep_the_inflight_heartbeat_alive() {
         let (packets, incoming) = mpsc::unbounded_channel();
         let source = futures_util::stream::unfold(incoming, |mut incoming| async move {
             incoming.recv().await.map(|packet| (Ok(packet), incoming))
@@ -512,11 +572,21 @@ mod presence_tests {
             completed.send(()).unwrap();
         });
         packets.send(Packet::Ping(vec![1])).unwrap();
-        let mut receiving = Box::pin(receive_presence(&mut presence, &mut children));
+        let (notices, mut changed) = watch::channel(());
+        let mut receiving = Box::pin(next_offer(
+            &mut presence,
+            &mut children,
+            &mut changed,
+            || async { true },
+        ));
         assert!(poll!(&mut receiving).is_pending());
         started.await.unwrap();
         finish_offer.send(()).unwrap();
         completion.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut receiving).is_pending());
+        notices.send_replace(());
+        assert!(poll!(&mut receiving).is_pending());
         tokio::task::yield_now().await;
         assert!(poll!(&mut receiving).is_pending());
         release_pong.send(()).unwrap();
@@ -536,8 +606,17 @@ mod presence_tests {
             .unwrap();
         assert!(matches!(
             receiving.await.unwrap(),
-            PresenceEvent::Offer { .. }
+            Some(PresenceEvent::Offer { .. })
         ));
         assert!(children.is_empty());
+        notices.send_replace(());
+        assert!(
+            next_offer(&mut presence, &mut children, &mut changed, || async {
+                false
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 }
