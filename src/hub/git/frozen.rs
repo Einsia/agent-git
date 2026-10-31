@@ -455,6 +455,20 @@ impl FrozenPublication {
             }
         };
         batches.extend(self.batches(&self.heads, policy));
+        // A session publication sends its tips and every tag in one receive when they fit one: its
+        // receipt makes the receive atomic, so a tag still never lands without its branch, and the
+        // publication costs one receipt and one receive fewer. Tags that do not fit follow their
+        // branch's acknowledged receive.
+        let mut tags = self.tags.clone();
+        let mut alone = None;
+        if let Some(last) = batches
+            .last_mut()
+            .filter(|last| matches!(last.policy, Some(std::borrow::Cow::Borrowed(_))))
+            && let Some(together) = self.together(&last.refs, &tags)
+        {
+            alone = Some(std::mem::replace(&mut last.refs, together));
+            tags.clear();
+        }
         // Asked once, after the stages have read the limits, so every receipt of this
         // publication sends the same request.
         let planned_refs = policy.is_some()
@@ -464,14 +478,44 @@ impl FrozenPublication {
                 .as_ref()
                 .is_some_and(crate::hub::Client::accepts_planned_refs);
         let mut heads = self.push_phase(&batches, held, planned_refs);
-        // A stage is a means of delivery; only the frozen tips remain owed after a failure.
-        heads
-            .unattempted
-            .retain(|reference| self.plan.heads().contains(reference));
+        // A refused receipt sends nothing. When the Hub refused only tags of the shared receive as
+        // withdrawn, the tips go alone and the tags follow as they would unshared, so a withdrawn
+        // tag holds back itself and not its branch.
+        if let Some(alone) = alone
+            && !heads.withdrawn.is_empty()
+            && heads
+                .withdrawn
+                .iter()
+                .all(|name| name.starts_with("refs/tags/"))
+        {
+            let last = batches.len() - 1;
+            batches[last].refs = alone;
+            let retried = self.push_phase_from(&batches, last, held, planned_refs);
+            heads.attempts.extend(retried.attempts);
+            heads.unattempted = retried.unattempted;
+            heads.error = retried.error;
+            heads.withdrawn = retried.withdrawn;
+            tags = self.tags.clone();
+        }
+        // A stage is a means of delivery; only the frozen tips and tags remain owed after a failure.
+        heads.unattempted.retain(|reference| {
+            self.plan.heads().contains(reference) || self.plan.tags().contains(reference)
+        });
         let tags = heads
             .ok()
-            .then(|| self.push_phase(&self.batches(&self.tags, policy), held, planned_refs));
+            .then(|| self.push_phase(&self.batches(&tags, policy), held, planned_refs));
         (heads, tags)
+    }
+
+    /// `heads` and every one of `tags` as one batch, when they fit one command line together.
+    fn together(&self, heads: &[FrozenRef], tags: &[Vec<FrozenRef>]) -> Option<Vec<FrozenRef>> {
+        if tags.is_empty() {
+            return None;
+        }
+        let refs: Vec<FrozenRef> = heads.iter().chain(tags.iter().flatten()).cloned().collect();
+        let oid_length = refs.first()?.oid().len();
+        let mut batches = batches(&refs, &self.url, oid_length).ok()?;
+        (batches.len() == 1).then(|| batches.remove(0))
     }
 
     fn batches<'a>(
@@ -995,6 +1039,17 @@ impl FrozenPublication {
         held: Option<&BTreeMap<String, String>>,
         planned_refs: bool,
     ) -> PublicationPhase {
+        self.push_phase_from(batches, 0, held, planned_refs)
+    }
+
+    /// [`Self::push_phase`] for the batches from `start` on; the ones before it count as delivered.
+    fn push_phase_from(
+        &self,
+        batches: &[ReceiveBatch<'_>],
+        start: usize,
+        held: Option<&BTreeMap<String, String>>,
+        planned_refs: bool,
+    ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         let owed = |from: usize| -> Vec<FrozenRef> {
             batches[from..]
@@ -1008,7 +1063,7 @@ impl FrozenPublication {
                 refs: batch,
                 policy,
             },
-        ) in batches.iter().enumerate()
+        ) in batches.iter().enumerate().skip(start)
         {
             let heads = batch
                 .iter()

@@ -1895,9 +1895,10 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
 }
 
 /// The first upload counts as soon as the Hub acknowledged a branch it updated, before anything
-/// after that can fail. Here the Hub refuses the tag of a push whose branch went up, so the push
-/// fails, and its retry finds the branch up to date. Counting only at the end of a push that
-/// fully succeeded would miss this installation's first upload for good.
+/// after that can fail. Here a push carries more tags than fit in one receive with its branch, so
+/// they follow the branch in receives of their own, and the Hub refuses them: the push fails, and
+/// its retry finds the branch up to date. Counting only at the end of a push that fully succeeded
+/// would miss this installation's first upload for good.
 #[test]
 fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     let temp = tempfile::tempdir().unwrap();
@@ -2004,6 +2005,24 @@ fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     repo.add_all().unwrap();
     repo.commit("Revise file").unwrap();
     git(repo.root(), &["tag", "release-2"]);
+    let head = git(repo.root(), &["rev-parse", "HEAD"]);
+    let more: String = (0..256)
+        .map(|n| format!("create refs/tags/release-2-{n:03} {head}\n"))
+        .collect();
+    let mut update = git_command(repo.root())
+        .arg("-C")
+        .arg(repo.root())
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    update
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(more.as_bytes())
+        .unwrap();
+    assert!(update.wait().unwrap().success());
     let refused = run(&["--yes", "push", "alice/app@main"]);
     assert!(!refused.status.success(), "{refused:?}");
     assert_eq!(
@@ -2402,7 +2421,9 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
 
 /// A plain session that continues its published history declares only what it adds: the next
 /// push preserves just the heads the Hub already holds and snapshots just the new turns, so its
-/// size follows the push, not the session. A walk of the whole history declares every earlier turn
+/// size follows the push, not the session. Its tip and the new turns' version tags go in one
+/// receive under one receipt; sending the tags after the branch costs a second preview,
+/// confirmation and receive on every push. A walk of the whole history declares every earlier turn
 /// again. If a branch head of the advertisement that history was read from moves before a receipt
 /// binds it, the declaration may leave out commits the Hub no longer holds, so the publication is
 /// refused before anything is sent.
@@ -2506,12 +2527,20 @@ fn continued_plain_session_declares_only_what_it_adds() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
 
     let earlier = hub.previews.lock().unwrap().len();
+    let receives = hub.posts.load(Ordering::Acquire);
     let added = std::collections::BTreeSet::from([turn("turn 3"), turn("turn 4")]);
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
     let head = git(repo.root(), &["rev-parse", "HEAD"]);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), head);
+    for turn in &added {
+        assert_eq!(
+            git(&remote, &["rev-parse", &format!("refs/tags/agit-{turn}")]),
+            *turn
+        );
+    }
+    assert_eq!(hub.posts.load(Ordering::Acquire) - receives, 1);
     let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
-    assert!(!previews.is_empty());
+    assert_eq!(previews.len(), 1);
     for preview in previews {
         let declared: SessionPublicationManifest =
             serde_json::from_value(preview["manifest"].clone()).unwrap();
@@ -3298,7 +3327,9 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
     assert!(planned(earlier).contains(&json!("refs/heads/pulled")));
     assert_eq!(set_aside(), json!({"branches": [], "error": null}));
 
-    // Only a version tag is refused: its branch publishes, the tag waits for a named push.
+    // Only a version tag is refused: its branch publishes, the tag waits for a named push. The tag
+    // shares its branch's receive, so a client that does not send the branch alone after that
+    // receive is refused keeps the branch off the Hub with it.
     let tagged = turn("kept", 'b', "kept turn 2");
     let version = format!("refs/tags/agit-{tagged}");
     *hub.withdrawn.lock().unwrap() = Some(version.clone());
