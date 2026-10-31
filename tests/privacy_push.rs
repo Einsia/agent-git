@@ -215,7 +215,9 @@ impl Hub {
                         .unwrap();
                     body = decoded;
                 }
-                if target == "/api/agents/alice/app" && !root.join("alice/app.git").is_dir() {
+                if (target == "/api/agents/alice/app" && !root.join("alice/app.git").is_dir())
+                    || target == "/api/agents/alice/notes"
+                {
                     let body = r#"{"error":"repository is unavailable"}"#;
                     write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     continue;
@@ -1692,6 +1694,103 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         !String::from_utf8_lossy(&published.stdout).contains("main left as on the Hub"),
         "{published:?}"
     );
+}
+
+/// `--to` names any repository the account can write to, and that repository never becomes the
+/// checkout's default destination. A checkout of `alice/notes`, pinned to its own repository
+/// identity, publishes to `alice/app` with `--to`: the history lands there, the checkout keeps its
+/// pinned identity and origin, and a plain push still targets `alice/notes`, where the pin refuses
+/// to create a replacement for the missing repository. An implementation that compared the
+/// destination with the pin would refuse the `--to` push; one that bound the checkout to the
+/// destination would send the plain push to `alice/app`.
+#[test]
+fn an_explicit_destination_publishes_without_rebinding_the_checkout() {
+    use agit::hub::identity::{self, RemoteIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/notes")).unwrap();
+    for (key, value) in [
+        ("http.userAgent", TRANSPORT_USER_AGENT),
+        ("user.name", "Source Writer"),
+        ("user.email", "source@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ] {
+        repo.git(&["config", key, value]).unwrap();
+    }
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Notes shared elsewhere\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Notes").unwrap();
+    let own = RemoteIdentity::new(&hub.base, "1c0de000-0000-4000-8000-000000000001").unwrap();
+    let own_url = format!("{}/alice/notes.git", hub.base);
+    identity::pin(&repo, &own).unwrap();
+    repo.set_remote(&own_url).unwrap();
+
+    assert_success(&run(&[
+        "--yes",
+        "push",
+        "alice/notes@main",
+        "--to",
+        "alice/app",
+    ]));
+    let published = remote_root.join("alice/app.git");
+    assert_eq!(
+        git(&published, &["rev-parse", "refs/heads/main"]),
+        git(repo.root(), &["rev-parse", "refs/heads/main"])
+    );
+    assert_eq!(identity::read(&repo).unwrap(), Some(own));
+    assert_eq!(repo.remote_url().unwrap(), own_url);
+
+    let creations = hub.creations.load(Ordering::Acquire);
+    let refused = run(&["--yes", "push", "alice/notes@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(hub.creations.load(Ordering::Acquire), creations);
 }
 
 /// A migration must send the registered target identity in real Git objects and retain it

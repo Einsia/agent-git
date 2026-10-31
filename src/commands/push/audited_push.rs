@@ -68,7 +68,8 @@ pub(super) fn run(
         client.credential_username().as_deref() == Some(me),
         "the selected account changed while preparing publication"
     );
-    let local_target = if args.to_hub.is_some() {
+    let device_local = crate::rc::local_repository::publication::is_device_local(&repo)?;
+    let local_target = if args.to_hub.is_some() || !device_local {
         None
     } else {
         crate::rc::local_repository::publication::Selection::prepare(
@@ -77,16 +78,29 @@ pub(super) fn run(
             client.base(),
         )?
     };
-    let destination_checkout = local_target
-        .as_ref()
-        .map(|selection| selection.checkout(&checkout.path))
-        .transpose()?;
+    // An ordinary checkout publishes to another repository only when told to, and that repository
+    // never becomes its default destination.
+    let explicit_repository = if device_local {
+        None
+    } else {
+        args.to
+            .as_deref()
+            .map(|slug| explicit_checkout(slug, &checkout))
+            .transpose()?
+            .flatten()
+    };
+    let destination_checkout = match &local_target {
+        Some(selection) => Some(selection.checkout(&checkout.path)?),
+        None => explicit_repository,
+    };
+    let explicit_repository = local_target.is_none() && destination_checkout.is_some();
     let intent = Intent::resolve(
         args,
         &client,
         me,
         destination_checkout.as_ref().unwrap_or(&checkout),
         &repo,
+        explicit_repository,
     )?;
     sessions::run(
         args,
@@ -100,6 +114,24 @@ pub(super) fn run(
             local_target,
         },
     )
+}
+
+/// The repository `--to` names for an ordinary checkout, or `None` when it names the checkout's own
+/// repository: that one stays the default destination, guarded by the checkout's pinned identity.
+fn explicit_checkout(slug: &str, checkout: &Checkout) -> Result<Option<Checkout>> {
+    let (owner, name) = crate::commands::parse_slug(slug)?;
+    ensure!(
+        format!("{owner}/{name}") == slug,
+        "--to requires an explicit owner/repository"
+    );
+    if owner == checkout.owner && name == checkout.name {
+        return Ok(None);
+    }
+    Ok(Some(Checkout {
+        owner,
+        name,
+        path: checkout.path.clone(),
+    }))
 }
 
 fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
@@ -277,6 +309,9 @@ struct Intent {
     visibility: String,
     accept_secret_findings: bool,
     explicit_hub: bool,
+    /// A repository on this Hub named by `--to`: checked by its own identity, never against the
+    /// checkout's pinned one, and never bound to the checkout.
+    explicit_repository: bool,
     source_identity: Option<RemoteIdentity>,
     action: Action,
 }
@@ -288,16 +323,19 @@ impl Intent {
         me: &str,
         checkout: &Checkout,
         repo: &Repo,
+        explicit_repository: bool,
     ) -> Result<Self> {
         let hub = identity::normalize_hub(client.base())?;
         let cross_hub = args.to_hub.is_some();
-        let expected = if cross_hub {
-            None
-        } else {
+        // The checkout's pinned identity guards only its own repository.
+        let pinned_destination = !cross_hub && !explicit_repository;
+        let expected = if pinned_destination {
             identity::expected_for_transport(repo, client.base())?
+        } else {
+            None
         };
         let requires_existing =
-            !cross_hub && (expected.is_some() || identity::read(repo)?.is_some());
+            pinned_destination && (expected.is_some() || identity::read(repo)?.is_some());
         let source = if requires_existing {
             Some(super::super::remote_request(
                 client.get_agent(&checkout.owner, &checkout.name),
@@ -308,7 +346,13 @@ impl Intent {
         let accept_secret_findings = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV)
             .is_none()
             && (args.allow_secrets || config::allow_secrets());
-        let write_denied = if is_read_only(me, &checkout.owner, repo.upstream_url().as_deref()) {
+        // The checkout's upstream says nothing about another repository's write access.
+        let upstream = if explicit_repository {
+            None
+        } else {
+            repo.upstream_url()
+        };
+        let write_denied = if is_read_only(me, &checkout.owner, upstream.as_deref()) {
             match &source {
                 Some(remote) => !matches!(
                     super::super::remote_request(client.push_access_with_secret_acceptance(
@@ -337,7 +381,7 @@ impl Intent {
         );
         let (owner, visibility, url, action) = if let Some(remote) = source {
             verify_agent_location(&hub, &checkout.owner, &checkout.name, &remote)?;
-            if !cross_hub {
+            if pinned_destination {
                 identity::verify_transport_target(
                     repo,
                     &RemoteIdentity::new(&hub, &remote.agent_id)?,
@@ -350,7 +394,7 @@ impl Intent {
                 Action::Existing(remote),
             )
         } else {
-            if !cross_hub {
+            if pinned_destination {
                 ensure!(
                     expected.is_none() && identity::read(repo)?.is_none(),
                     "the pinned remote is unavailable; refusing to create a replacement"
@@ -374,7 +418,7 @@ impl Intent {
         verify_url(&hub, &url)?;
         if let Action::Existing(remote) = &action
             && let Some(pinned) = identity::read(repo)?
-            && !cross_hub
+            && pinned_destination
         {
             ensure!(
                 pinned == RemoteIdentity::new(&hub, &remote.agent_id)?,
@@ -395,6 +439,7 @@ impl Intent {
             visibility,
             accept_secret_findings,
             explicit_hub: cross_hub,
+            explicit_repository,
             source_identity: identity::read(repo)?,
             action,
         };
@@ -451,6 +496,12 @@ impl Intent {
         Ok(())
     }
 
+    /// Whether the destination is the checkout's own repository, which its pinned identity guards
+    /// against a reused owner/name.
+    fn pinned_destination(&self) -> bool {
+        !self.explicit_hub && !self.explicit_repository
+    }
+
     fn verify_before_mutation(&self, client: &Client, repo: &Repo) -> Result<()> {
         if self.explicit_hub {
             ensure!(
@@ -463,7 +514,7 @@ impl Intent {
                 let observed = lookup(client, &self.owner, &self.name)?
                     .context("the publication destination disappeared")?;
                 self.verify_observed(&observed, Some(&expected.agent_id))?;
-                if !self.explicit_hub {
+                if self.pinned_destination() {
                     identity::verify_transport_target(
                         repo,
                         &RemoteIdentity::new(&self.hub, &observed.agent_id)?,
@@ -475,7 +526,7 @@ impl Intent {
                     self.verify_observed(&observed, None)?;
                     self.verify_write_access(client, &observed.agent_id)?;
                 }
-                if !self.explicit_hub {
+                if self.pinned_destination() {
                     ensure!(
                         identity::expected_for_transport(repo, &self.hub)?.is_none(),
                         "the RC identity forbids creating a replacement"
@@ -494,7 +545,7 @@ impl Intent {
             .context("the publication destination disappeared; refusing to create a replacement")?;
         self.verify_observed(&observed, Some(&expected.agent_id))?;
         let identity = RemoteIdentity::new(&self.hub, &observed.agent_id)?;
-        if !self.explicit_hub {
+        if self.pinned_destination() {
             identity::verify_transport_target(&repo, &identity)?;
         }
         let remote = Remote {
@@ -506,7 +557,7 @@ impl Intent {
         };
         self.verify_remote(&remote)?;
         self.verify_write_access(client, &remote.identity.agent_id)?;
-        if !self.explicit_hub {
+        if self.pinned_destination() {
             bind_publication_origin(
                 &repo,
                 &format!("{}/{}", self.owner, self.name),
