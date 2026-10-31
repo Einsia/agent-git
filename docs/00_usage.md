@@ -75,9 +75,14 @@ For merge transaction controls, `recorded-from` describes the source stored in t
 ### 2.1 Install
 
 ```sh
-npm install -g @einsia/agent-git     # prebuilt binary, no Rust toolchain required
+npx -y create-agit@latest            # installs agit, then runs agit setup
+# or as a global package (prebuilt binary, no Rust toolchain required):
+npm install -g @einsia/agent-git --allow-scripts=@einsia/agent-git
 agit --version
 ```
+
+The global package runs `agit setup` from its install script. If npm skipped that script (npm 12
+and later skip a script that has not been allowed), run `agit setup` (2.3) once yourself.
 
 People changing the code install from source:
 `git clone https://github.com/Einsia/agent-git && cd agent-git && ./setup.sh`. Both paths install

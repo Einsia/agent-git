@@ -5,7 +5,7 @@ This package ships the prebuilt **`agit`** CLI — no Rust toolchain needed.
 ```sh
 npx -y create-agit@latest          # one-shot install: binary + skills/hooks/MCP
 # or as a global package:
-npm install -g @einsia/agent-git   # pnpm add -g @einsia/agent-git — same CLI
+npm install -g @einsia/agent-git --allow-scripts=@einsia/agent-git
 agit --help
 ```
 
@@ -37,9 +37,11 @@ global Git configuration are unchanged. Copying or upgrading the single executab
 also carries its Git runtime. External credential helpers and extensions may still
 need your local tools; `AGIT_USE_SYSTEM_GIT=1` uses your system Git installation.
 
-pnpm (v10+) blocks dependency install scripts unless approved, so under pnpm
-the automatic `agit setup` does not run — run it once yourself after
-installing (or `pnpm approve-builds -g` and reinstall).
+The global package wires skills, hooks and MCP from its install script. npm 12 and later
+skip an install script that has not been allowed, which is what `--allow-scripts` above is for;
+an organization policy (`strict-allow-scripts`, `ignore-scripts`) can block or skip it too. Under
+pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If the install
+script did not run, run `agit setup` once yourself.
 
 The hub (**AgentGit**) is not in this package; it deploys separately.
 
@@ -69,6 +71,9 @@ Unsupported operating system and architecture pairs get no prebuilt binary: runn
   recipe.
 - `agit setup` failing in postinstall never blocks the install — the CLI is on
   disk; re-run `agit setup` any time.
+- If npm skips the install script (npm 12 and later without `--allow-scripts`,
+  `--ignore-scripts`, or a policy that blocks it), the CLI is installed but no
+  skills, hooks or MCP are wired: run `agit setup` once.
 - If npm suppresses postinstall, the next invocation of a globally installed
   `agit` schedules a guarded RC daemon reconciliation in the background.
   npm cannot run the daemon handoff at install time when it suppresses scripts.
