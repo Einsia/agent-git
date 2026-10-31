@@ -106,7 +106,7 @@ async fn recover(
                     .map(|job| {
                         let mut evidence = Evidence::read(&job, &privacy);
                         if push.contains(&job.filename()) {
-                            evidence.push = Some(auto_push_enabled(&job));
+                            evidence.push = Some(publication_allowed(&job));
                         }
                         (job, evidence)
                     })
@@ -368,10 +368,13 @@ impl Evidence {
     }
 }
 
-fn auto_push_enabled(job: &Job) -> bool {
+fn publication_allowed(job: &Job) -> bool {
     job.session()
-        .and_then(|lineage| crate::rc::capture::require(&lineage)?.auto_push_enabled())
-        .unwrap_or(false)
+        .and_then(|lineage| {
+            let repo = crate::rc::capture::require(&lineage)?;
+            crate::rc::supervisor::archive_recovery::publication_target(&repo, &lineage)
+        })
+        .is_ok()
 }
 
 /// A job that is not attempted until its claim changes or what it waits for ends.

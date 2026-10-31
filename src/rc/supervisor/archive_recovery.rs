@@ -131,7 +131,8 @@ pub(crate) enum Waiting {
     /// The session's settlement waits for the privacy check (`agit status` names its reason).
     #[error("archive settlement waits for the privacy check")]
     Privacy,
-    /// The turn is committed locally; automatic publication is turned off.
+    /// The turn is committed locally; automatic publication is turned off for its repository or
+    /// its destination (see [`publication_target`]).
     #[error("automatic archive publication is not enabled")]
     PushDisabled,
 }
@@ -291,12 +292,7 @@ pub(crate) async fn prepare(
         }
         anyhow::bail!("archive commit does not cover the completed native turn");
     }
-    let destination =
-        crate::rc::capture::destination(&repo, &lineage, &crate::infra::config::hub_url())?
-            .context("archive publication destination is not configured")?;
-    if !repo.auto_push_enabled()? {
-        return Err(Waiting::PushDisabled.into());
-    }
+    let destination = publication_target(&repo, &lineage)?;
     let mut request = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::now_v7().to_string(),
@@ -324,6 +320,23 @@ pub(crate) async fn prepare(
         state,
         lease,
     })
+}
+
+/// Where the capture's turns publish, while automatic publication may carry them there: the
+/// capture repository's own preference allows it, and the person has not turned it off for the
+/// destination. Recovery and its recheck judge by this one rule; a recheck that read less would
+/// resume a job the destination still refuses, and each resumed attempt lands and commits again.
+pub(crate) fn publication_target(
+    repo: &crate::domain::repo::Repo,
+    lineage: &crate::rc::lineage::AgitSession,
+) -> crate::Result<crate::rc::capture::PublicationDestination> {
+    let destination =
+        crate::rc::capture::destination(repo, lineage, &crate::infra::config::hub_url())?
+            .context("archive publication destination is not configured")?;
+    if !crate::commands::auto_push::publication_allowed(repo, &destination.repository)? {
+        return Err(Waiting::PushDisabled.into());
+    }
+    Ok(destination)
 }
 
 pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
@@ -447,4 +460,76 @@ async fn verify_native(
         job.stream_end(&job.claim()?)
     })
     .await?
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::repo::Repo,
+        rc::{lineage::AgitSession, local_repository::publication::Selection},
+    };
+
+    /// A device-local capture publishes on the person's behalf, so automatic publication turned
+    /// off in its destination's checkout makes recovery wait even while the capture repository's
+    /// own preference allows it. A gate that read only that preference would let recovery record
+    /// a publication intent and push, which the push then refuses on every retry.
+    #[test]
+    fn recovery_waits_while_its_destination_turned_automatic_publication_off() {
+        if crate::rc::in_isolated_test(
+            "rc::supervisor::archive_recovery::tests::recovery_waits_while_its_destination_turned_automatic_publication_off",
+        ) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let hub = "http://127.0.0.1:9";
+        // Process isolation keeps this home and Hub away from every other test.
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+            std::env::set_var("AGIT_HUB_URL", hub);
+        }
+        crate::rc::select_local_authority();
+        let machine = crate::rc::identity::identity().unwrap();
+        let lineage = AgitSession::new(
+            "desktop-local/project",
+            "00000000-0000-0000-0000-000000000001",
+            "s/work",
+        )
+        .unwrap();
+        let repo = Repo::open_or_init(&lineage.repo_dir().unwrap()).unwrap();
+        repo.git(&["config", "agit.desktopIdentity", lineage.agent_id()])
+            .unwrap();
+        repo.git(&[
+            "config",
+            "agit.desktopAuthority",
+            &format!("local:{}", machine.machine_fingerprint),
+        ])
+        .unwrap();
+        let destination =
+            crate::hub::identity::RemoteIdentity::new(hub, "00000000-0000-0000-0000-000000000002")
+                .unwrap();
+        Selection::prepare(&repo, Some("owner/project"), hub)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &destination)
+            .unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        assert_eq!(
+            publication_target(&repo, &lineage).unwrap().repository,
+            "owner/project"
+        );
+
+        let checkout_dir = crate::infra::config::repo_dir("owner", "project").unwrap();
+        std::fs::create_dir_all(&checkout_dir).unwrap();
+        let checkout = Repo::init(&checkout_dir).unwrap();
+        checkout.set_auto_push(Some(false)).unwrap();
+        let refused = publication_target(&repo, &lineage).unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<Waiting>(),
+            Some(&Waiting::PushDisabled)
+        );
+
+        checkout.set_auto_push(None).unwrap();
+        assert!(publication_target(&repo, &lineage).is_ok());
+    }
 }
