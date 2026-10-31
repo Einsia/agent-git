@@ -37,6 +37,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -117,6 +118,14 @@ def check_mingit_files(lock, inventory):
         raise ValueError("git-runtime-mingit-inventory.json does not match the pinned MinGit:\n  " + "\n  ".join(problems))
 
 
+# Hosts that did not answer during this run. One host serves many pins, so without this a host
+# that is down costs every one of its downloads the full retry budget before the fallback is
+# tried, and enough of them exceed the release job's timeout. Only a failure to connect or a
+# timeout puts a host here: an HTTP error or wrong bytes come from a host that answers, so the
+# next pin still asks it.
+UNREACHABLE = set()
+
+
 def get(url):
     for attempt in range(3):
         try:
@@ -125,6 +134,10 @@ def get(url):
         except OSError as error:
             transient = not isinstance(error, urllib.error.HTTPError) or error.code >= 500 or error.code == 429
             if not transient or attempt == 2:
+                if not isinstance(error, urllib.error.HTTPError):
+                    host = urllib.parse.urlsplit(url).netloc
+                    UNREACHABLE.add(host)
+                    print(f"{host} did not answer ({error}); skipping it for the rest of this run", file=sys.stderr)
                 raise
             time.sleep(2 ** attempt)
 
@@ -133,6 +146,9 @@ def fetch(urls, sha256):
     """Return the bytes of the first URL whose content matches the pin."""
     failures = []
     for url in urls:
+        if urllib.parse.urlsplit(url).netloc in UNREACHABLE:
+            failures.append(f"{url}: skipped, its host did not answer earlier in this run")
+            continue
         try:
             body = get(url)
         except OSError as error:
