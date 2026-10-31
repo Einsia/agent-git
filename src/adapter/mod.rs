@@ -676,6 +676,12 @@ pub trait Adapter {
     /// failed direct hit must fall back to the lookup by id.
     fn resolve(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf>;
 
+    /// Why this runtime's local store exists but cannot be read. A store in a format this
+    /// version does not know otherwise looks like one that holds no sessions.
+    fn unreadable_store(&self) -> Option<String> {
+        None
+    }
+
     /// The transcript only when it is readable in place. Metadata and preview readers use this:
     /// resolving may restore a runtime's cold storage, which a listing must never do for every
     /// conversation it shows.

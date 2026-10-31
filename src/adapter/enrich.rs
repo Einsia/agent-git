@@ -242,8 +242,11 @@ fn opencode(lines: &[&str], session: &Session, out: &mut ToolDetails, include_ou
     // In the canonical line set a tool part is one per line and its input and output sit in the
     // state on that same line, so nothing pairs across lines. The export form is not
     // line-per-JSON, so reaching here yields an empty table.
-    assign(session, out, |line, _k| {
+    assign(session, out, |line, k| {
         let v = parse_line(lines.get(line)?)?;
+        if v["kind"] == super::opencode::PROJECTED {
+            return opencode_projected(&v, k, include_output);
+        }
         let state = v.pointer("/data/state")?;
         let input = state.get("input").cloned();
         let error = state.get("status").and_then(|x| x.as_str()) == Some("error");
@@ -277,6 +280,40 @@ fn opencode(lines: &[&str], session: &Session, out: &mut ToolDetails, include_ou
             error,
         })
     });
+}
+
+/// A `session_message` row holds a whole message, so the k-th tool event on its line is the k-th
+/// tool item of its content; a shell row is one call whose input is its command line.
+fn opencode_projected(v: &serde_json::Value, k: usize, include_output: bool) -> Option<ToolDetail> {
+    use super::opencode::{projected_tool_error, projected_tool_output};
+    let data = &v["data"];
+    if v["type"] == "shell" {
+        return (k == 0).then(|| ToolDetail {
+            input: Some(serde_json::json!({ "command": data["command"] })),
+            output: include_output
+                .then(|| data["output"].as_str().map(String::from))
+                .flatten(),
+            error: false,
+        });
+    }
+    let state = &data["content"]
+        .as_array()?
+        .iter()
+        .filter(|item| item["type"] == "tool")
+        .nth(k)?["state"];
+    let error = state["status"] == "error";
+    let output = include_output.then(|| {
+        if error {
+            projected_tool_error(state).unwrap_or_else(|| projected_tool_output(state))
+        } else {
+            projected_tool_output(state)
+        }
+    });
+    Some(ToolDetail {
+        input: state.get("input").cloned(),
+        output,
+        error,
+    })
 }
 
 #[cfg(test)]

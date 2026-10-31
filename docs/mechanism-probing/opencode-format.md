@@ -58,6 +58,42 @@ not; a listing query must not depend on it, and the `schema_ok` defensive check 
 `resolve(session_id)` is therefore a direct PK lookup [observed]: `SELECT … FROM session WHERE
 id = ?`, O(log n).
 
+### 1.1 Sessions driven through the v2 API (`session_message`)
+
+[observed] on OpenCode 1.19.5 in an isolated `HOME`, with a local OpenAI-compatible stub as the
+only provider: a session created and prompted through `opencode serve`'s v2 HTTP API
+(`POST /api/session`, `POST /api/session/{id}/prompt`) still gets its `session` row, but its
+conversation lands **only** in `session_message`; `message` and `part` hold nothing for it.
+Sessions from `opencode run` and the classic TUI in the same database keep writing
+`message`/`part`. One database therefore holds both kinds of session, and a reader that knows one
+layout sees the other kind as an empty conversation. `opencode export` of a v2 session prints
+`"messages": []` as well.
+
+```text
+session_message(id 'msg_…' PK, session_id → session.id, type, seq, time_created, time_updated, data JSON)
+```
+
+`seq` is the session's event sequence (unique per session) and fixes the order. Each row is a
+**whole message**, rewritten in place while it streams; `data` by `type`:
+
+```json
+user:       {"time":{"created":…},"text":"…","files":[{"uri":…,"mime":…,"name":…}]?,"agents":[…]?}
+assistant:  {"time":{"created":…,"completed":…},"agent":"build","model":{"id":…,"providerID":…},
+             "content":[{"type":"text","id":…,"text":…},
+                        {"type":"reasoning",…,"text":…},
+                        {"type":"tool","id":"call_…","name":"write","state":{"status":…,"input":{…},
+                         "content":[{"type":"text","text":…}],"error":{"message":…}?},"time":{…}}],
+             "snapshot":{…},"finish":"stop","cost":0,"tokens":{…}}
+synthetic:  {"text":…}                      shell: {"callID":…,"command":…,"output":…}
+compaction: {"reason":…,"summary":…,"recent":…}
+agent-switched / model-switched / system: bookkeeping
+```
+
+The rows are a projection of the `event` table's `session.next.*` events. A `session_message`
+table without `type`/`seq` belongs to OpenCode versions that never wrote it (the migration that
+added `seq` emptied it), so agit treats such a table as absent. No published OpenCode build has a
+`session_v2` table.
+
 ## 2. Row model and part-type inventory
 
 ### 2.1 message.data
@@ -191,7 +227,15 @@ verification; the verification script and its results are in
 {"id":"ses_…","kind":"opencode.meta","project_id":"…","parent_id":null,"directory":"…","time_created":…,"version":"…"}
 {"id":"msg_…","kind":"message","session_id":"ses_…","time_created":…,"data":{…verbatim…}}
 {"id":"prt_…","kind":"part","message_id":"msg_…","session_id":"ses_…","time_created":…,"data":{…verbatim…}}
+{"id":"msg_…","kind":"session_message","session_id":"ses_…","type":"assistant","seq":…,"time_created":…,"data":{…verbatim…}}
 ```
+
+A `session_message` row (§1.1) sorts after messages and parts of the same millisecond and breaks
+ties by `seq`. Installing such a session rewrites its rows as classic messages and parts, the only
+shape `opencode import` writes: an attachment becomes a file part, and a compaction becomes the §7
+boundary and its `summary` assistant, the pair OpenCode cuts the model's history at. New ids
+ascend in canonical order, because OpenCode reads messages of one millisecond, and the parts of a
+message, in id order.
 
 Rules:
 
