@@ -148,21 +148,66 @@ fn open(path: &Path) -> Option<Connection> {
     .ok()
 }
 
-/// Whether every table and column needed is present. When the schema changes, better wholly
-/// unavailable than guessing from half a schema (the codex_index rule). §1 calls this out:
-/// the `session_message` table exists but is empty, listing does not depend on it, and neither
-/// does anything here.
-fn schema_ok(con: &Connection) -> bool {
-    con.prepare(
+/// Where a database keeps conversations. A session started from the classic interface writes
+/// `message`/`part` rows; a session driven through OpenCode's v2 API (§1.1) writes only
+/// `session_message` rows. One database holds both kinds side by side, so a reader that knows
+/// one layout sees the other kind of session as empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Layout {
+    pub(super) parts: bool,
+    pub(super) projected: bool,
+}
+
+/// The layouts every needed table and column is present for; None when the `session` index or
+/// both conversation layouts are missing. When the schema changes, better wholly unavailable
+/// than guessing from half a schema (the codex_index rule). A `session_message` table without
+/// its ordering columns predates the projection and has never held rows, so it counts as absent.
+pub(super) fn layout(con: &Connection) -> Option<Layout> {
+    let has = |sql: &str| con.prepare(sql).is_ok();
+    if !has(
         "SELECT id, project_id, parent_id, directory, time_created, version FROM session LIMIT 0",
-    )
-    .is_ok()
-        && con
-            .prepare("SELECT id, session_id, time_created, data FROM message LIMIT 0")
-            .is_ok()
-        && con
-            .prepare("SELECT id, message_id, session_id, time_created, data FROM part LIMIT 0")
-            .is_ok()
+    ) {
+        return None;
+    }
+    let layout = Layout {
+        parts: has("SELECT id, session_id, time_created, data FROM message LIMIT 0")
+            && has("SELECT id, message_id, session_id, time_created, data FROM part LIMIT 0"),
+        projected: has(
+            "SELECT id, session_id, type, seq, time_created, data FROM session_message LIMIT 0",
+        ),
+    };
+    (layout.parts || layout.projected).then_some(layout)
+}
+
+fn schema_ok(con: &Connection) -> bool {
+    layout(con).is_some()
+}
+
+/// Why a database that exists cannot be read, named by its session tables so the user can tell
+/// an unread OpenCode format from a session that does not exist.
+fn unreadable(con: &Connection) -> Option<String> {
+    if schema_ok(con) {
+        return None;
+    }
+    let tables = con
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND (name LIKE 'session%' OR name IN ('message', 'part')) ORDER BY name",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let schema = if tables.is_empty() {
+        "no session tables".to_owned()
+    } else {
+        format!("tables {}", tables.join(", "))
+    };
+    Some(format!(
+        "this OpenCode version stores sessions in a format agit doesn't read yet (schema: {schema})"
+    ))
 }
 
 /// epoch milliseconds → RFC3339 (UTC). Millisecond epochs are the shape of every time column in
@@ -283,12 +328,14 @@ fn session_refs_for_repo(repo: &Path, user_only: bool) -> Result<Vec<SessionRef>
 //   {"id":"ses_...","kind":"opencode.meta","project_id":...,...}     ← immutable columns only
 //   {"id":"msg_...","kind":"message","session_id":...,"time_created":...,"data":...}
 //   {"id":"prt_...","kind":"part","message_id":...,"session_id":...,"time_created":...,"data":...}
+//   {"id":"msg_...","kind":"session_message","session_id":...,"type":...,"seq":...,"time_created":...,"data":...}
 //
 // Rules: the meta line carries no title/cost/tokens/time_updated (all of them change); `data` is
 // always the TEXT read out of the database **embedded verbatim**, never reserialized — once a row
 // is at rest, rereading it yields identical bytes. Order per §2.3: (time_created, kind, id), with
 // message before part inside the same millisecond (a part's time_created is observed to be
-// strictly greater than its host message's; the kind order is only a fuse).
+// strictly greater than its host message's; the kind order is only a fuse). A `session_message`
+// row sorts after both and breaks ties by `seq`, the order OpenCode itself projects them in.
 //
 // Envelope key order comes from serde_json's BTreeMap (alphabetical) — the repo's envelope hash
 // discipline already rests on one serialization shape, determinism is the requirement, and the
@@ -297,6 +344,17 @@ fn session_refs_for_repo(repo: &Path, user_only: bool) -> Result<Vec<SessionRef>
 mod native_snapshot;
 #[cfg(feature = "cli")]
 pub(crate) mod status_snapshot;
+
+/// The canonical kind of a `session_message` row.
+pub(crate) const PROJECTED: &str = "session_message";
+
+/// The canonical sort tag of a `session_message` row: after messages and parts, then by `seq`.
+const PROJECTED_ORDER: u8 = 2;
+
+/// Fixed-width so that comparing the tie-breakers as strings orders them by `seq`.
+fn projected_tiebreak(seq: i64) -> String {
+    format!("{seq:020}")
+}
 
 pub(super) enum CanonicalRecord<'a> {
     Meta {
@@ -317,6 +375,15 @@ pub(super) enum CanonicalRecord<'a> {
         id: &'a str,
         message: &'a str,
         session: &'a str,
+        created: i64,
+        data: &'a str,
+    },
+    /// A `session_message` row: one whole message, its content inline in `data`.
+    Projected {
+        id: &'a str,
+        session: &'a str,
+        kind: &'a str,
+        seq: i64,
         created: i64,
         data: &'a str,
     },
@@ -387,6 +454,25 @@ impl CanonicalRecord<'_> {
                 quoted(&mut output, session)?;
                 write!(output, ",\"time_created\":{created},\"data\":{data}}}")?;
             }
+            Self::Projected {
+                id,
+                session,
+                kind,
+                seq,
+                created,
+                data,
+            } => {
+                output.write_all(b"{\"id\":")?;
+                quoted(&mut output, id)?;
+                write!(output, ",\"kind\":\"{PROJECTED}\",\"session_id\":")?;
+                quoted(&mut output, session)?;
+                output.write_all(b",\"type\":")?;
+                quoted(&mut output, kind)?;
+                write!(
+                    output,
+                    ",\"seq\":{seq},\"time_created\":{created},\"data\":{data}}}"
+                )?;
+            }
         }
         Ok(())
     }
@@ -408,6 +494,7 @@ struct Materialized {
 }
 
 fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
+    let layout = layout(con)?;
     let meta = con
         .query_row(
             "SELECT id, project_id, parent_id, directory, time_created, time_updated, version \
@@ -446,11 +533,68 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
         .text(),
     ));
 
+    if layout.parts {
+        materialize_parts(con, &id, &mut lines)?;
+    }
+    if layout.projected {
+        let mut statement = con
+            .prepare(
+                "SELECT id, type, seq, time_created, data FROM session_message \
+                 WHERE session_id = ?1",
+            )
+            .ok()?;
+        let rows = statement
+            .query_map([session_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .ok()?;
+        for (mid, kind, seq, tc, data) in rows.filter_map(|r| r.ok()) {
+            lines.push((
+                tc,
+                PROJECTED_ORDER,
+                projected_tiebreak(seq),
+                CanonicalRecord::Projected {
+                    id: &mid,
+                    session: &id,
+                    kind: &kind,
+                    seq,
+                    created: tc,
+                    data: &data,
+                }
+                .text(),
+            ));
+        }
+    }
+
+    // Canonical order (time_created, kind, id) — the kind order (message=0 before part=1) is
+    // only a fuse for rows that share a millisecond.
+    lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut text = lines
+        .into_iter()
+        .map(|(_, _, _, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    Some(Materialized { text, updated_ms })
+}
+
+/// The `message`/`part` rows of one session, as canonical lines with their sort keys.
+fn materialize_parts(
+    con: &Connection,
+    id: &str,
+    lines: &mut Vec<(i64, u8, String, String)>,
+) -> Option<()> {
     let mut ms = con
         .prepare("SELECT id, time_created, data FROM message WHERE session_id = ?1")
         .ok()?;
     let msg_rows = ms
-        .query_map([session_id], |r| {
+        .query_map([id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
@@ -466,7 +610,7 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
             mid.clone(),
             CanonicalRecord::Message {
                 id: &mid,
-                session: &id,
+                session: id,
                 created: tc,
                 data: &data,
             }
@@ -478,7 +622,7 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
         .prepare("SELECT id, message_id, time_created, data FROM part WHERE session_id = ?1")
         .ok()?;
     let part_rows = ps
-        .query_map([session_id], |r| {
+        .query_map([id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -496,24 +640,14 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
             CanonicalRecord::Part {
                 id: &pid,
                 message: &mid,
-                session: &id,
+                session: id,
                 created: tc,
                 data: &data,
             }
             .text(),
         ));
     }
-
-    // Canonical order (time_created, kind, id) — the kind order (message=0 before part=1) is
-    // only a fuse for rows that share a millisecond.
-    lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut text = lines
-        .into_iter()
-        .map(|(_, _, _, l)| l)
-        .collect::<Vec<_>>()
-        .join("\n");
-    text.push('\n');
-    Some(Materialized { text, updated_ms })
+    Some(())
 }
 
 // ── canonical → IR (the §9.1 mapping table) ──────────────────────────────────
@@ -677,6 +811,14 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
                     time_created: v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0),
                     data: v.get("data").cloned().unwrap_or(serde_json::Value::Null),
                 });
+            }
+            PROJECTED => {
+                if id.is_empty()
+                    && let Some(s) = v.get("session_id").and_then(|x| x.as_str())
+                {
+                    id = s.to_string();
+                }
+                events.extend(projected_events(&v, lineno));
             }
             // An unrecognized outer line in canonical (a kind added by a later version):
             // counted as Other (into dropped), never silently.
@@ -988,6 +1130,129 @@ fn part_event(p: &RawPart, role: &str, host_is_compaction: bool) -> Option<Event
         // discarding silently breaks the rule set at the top of adapter/mod.rs.
         _ => Some(other_event(ts).at_line(p.lineno)),
     }
+}
+
+/// Map one `session_message` row (§1.1) to its events, all located at that row's line. The row
+/// is a whole message: an assistant's text, reasoning and tool calls are items of its `content`
+/// array, in the order the model produced them.
+fn projected_events(v: &serde_json::Value, lineno: usize) -> Vec<Event> {
+    let data = &v["data"];
+    let row_ms = data
+        .pointer("/time/created")
+        .and_then(|x| x.as_i64())
+        .or_else(|| v.get("time_created").and_then(|x| x.as_i64()));
+    let at = |ms: Option<i64>| ms.or(row_ms).and_then(ms_to_rfc3339);
+    let text_of = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .filter(|t| !t.trim().is_empty())
+            .map(String::from)
+    };
+    let mut events = vec![];
+    match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+        "user" => {
+            let files: Vec<String> = data
+                .get("files")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|f| {
+                    f.get("name").and_then(|x| x.as_str()).or_else(|| {
+                        // An inline attachment's uri is its whole body.
+                        f.get("uri")
+                            .and_then(|x| x.as_str())
+                            .filter(|uri| !uri.starts_with("data:"))
+                    })
+                })
+                .map(String::from)
+                .collect();
+            match text_of(&data["text"]) {
+                Some(text) => {
+                    let mut e = Event::text(EventKind::UserPrompt, text, at(None));
+                    e.paths = files;
+                    events.push(e);
+                }
+                // An attachment must not vanish silently, as for a classic message.
+                None => events.extend(
+                    files
+                        .into_iter()
+                        .map(|f| Event::text(EventKind::Other, f, at(None))),
+                ),
+            }
+        }
+        "assistant" => {
+            for item in data
+                .get("content")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let ms = item.pointer("/time/created").and_then(|x| x.as_i64());
+                match item.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = text_of(&item["text"]) {
+                            events.push(Event::text(EventKind::AssistantReply, text, at(ms)));
+                        }
+                    }
+                    "tool" => {
+                        let name = item
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        let input = item.pointer("/state/input");
+                        let paths = ["path", "filePath"]
+                            .iter()
+                            .find_map(|key| input?.get(key)?.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| vec![s.to_string()])
+                            .unwrap_or_default();
+                        events.push(Event {
+                            // The same allowlist as a classic tool part (§9.1).
+                            kind: if matches!(name.as_str(), "edit" | "write") {
+                                EventKind::FileEdit
+                            } else {
+                                EventKind::ToolUse
+                            },
+                            text: Some(name.clone()),
+                            timestamp: at(ms),
+                            paths,
+                            tool: Some(name),
+                            line: None,
+                        });
+                    }
+                    // Reasoning is counted, not rendered, as for a classic part; an unknown
+                    // item type is counted rather than dropped.
+                    _ => events.push(other_event(at(ms))),
+                }
+            }
+        }
+        // A command the user ran directly: a tool call whose input is the command line.
+        "shell" => events.push(Event {
+            kind: EventKind::ToolUse,
+            text: Some("shell".into()),
+            timestamp: at(None),
+            paths: vec![],
+            tool: Some("shell".into()),
+            line: None,
+        }),
+        "compaction" => events.push(Event {
+            kind: EventKind::CompactSummary,
+            text: text_of(&data["summary"]),
+            timestamp: at(None),
+            paths: vec![],
+            tool: None,
+            line: None,
+        }),
+        // Injected text keeps its words but is no prompt (the synthetic rule of §6).
+        "synthetic" => events.push(match text_of(&data["text"]) {
+            Some(text) => Event::text(EventKind::Other, text, at(None)),
+            None => other_event(at(None)),
+        }),
+        // Agent and model switches, system notices and future row types: counted as Other.
+        _ => events.push(other_event(at(None))),
+    }
+    events.into_iter().map(|e| e.at_line(lineno)).collect()
 }
 
 fn is_synthetic(p: &RawPart) -> bool {
@@ -1320,6 +1585,7 @@ fn canonical_to_export(content: &str, new_id: &str, cwd: &Path) -> Result<serde_
     let mut part_order: Vec<(String, String)> = vec![]; // (part_id, message_id)
     let mut part_data: HashMap<String, serde_json::Value> = HashMap::new();
     let mut last_ms: i64 = 0;
+    let mut projected = Projection::new(content, cwd);
 
     for (lineno, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -1356,6 +1622,19 @@ fn canonical_to_export(content: &str, new_id: &str, cwd: &Path) -> Result<serde_
                 part_order.push((id.to_string(), mid.to_string()));
                 part_data.insert(id.to_string(), data);
             }
+            PROJECTED => {
+                last_ms = last_ms.max(v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0));
+                for (id, data, parts) in projected.classic(&v) {
+                    for (index, part) in parts.into_iter().enumerate() {
+                        // A placeholder identity: every part id is reminted below.
+                        let pid = format!("{id}#{index}");
+                        part_order.push((pid.clone(), id.clone()));
+                        part_data.insert(pid, part);
+                    }
+                    msg_order.push(id.clone());
+                    msg_data.insert(id, data);
+                }
+            }
             other => bail!("canonical line {lineno} has unknown kind `{other}`"),
         }
     }
@@ -1366,16 +1645,26 @@ fn canonical_to_export(content: &str, new_id: &str, cwd: &Path) -> Result<serde_
     if let Some(old) = meta.get("id").and_then(|x| x.as_str()) {
         map.insert(old.to_string(), new_id.to_string());
     }
+    // OpenCode reads a session's messages in (time_created, id) order and a message's parts in id
+    // order, so new ids ascend in canonical order: random tails would reorder rows that share a
+    // millisecond, and every part of a message.
+    let ascending = |prefix: &str, count: usize| {
+        let mut ids: Vec<String> = (0..count).map(|_| mint_key(prefix)).collect();
+        ids.sort();
+        ids
+    };
     let msg_new: HashMap<&str, String> = msg_order
         .iter()
-        .map(|m| (m.as_str(), mint_key("msg_")))
+        .map(String::as_str)
+        .zip(ascending("msg_", msg_order.len()))
         .collect();
     for (o, n) in &msg_new {
         map.insert(o.to_string(), n.clone());
     }
     let part_new: HashMap<&str, String> = part_order
         .iter()
-        .map(|(p, _)| (p.as_str(), mint_key("prt_")))
+        .map(|(p, _)| p.as_str())
+        .zip(ascending("prt_", part_order.len()))
         .collect();
     for (o, n) in &part_new {
         map.insert(o.to_string(), n.clone());
@@ -1435,6 +1724,298 @@ fn canonical_to_export(content: &str, new_id: &str, cwd: &Path) -> Result<serde_
         },
         "messages": messages,
     }))
+}
+
+/// Rewrites `session_message` rows (§1.1) as the classic messages and parts `opencode import`
+/// accepts: the importer writes only `message`/`part`, and OpenCode's own export of such a
+/// session carries no messages at all.
+///
+/// A classic user message must name a model, which a projected user row does not carry; it
+/// takes the model of the nearest assistant before it, else the first one in the session.
+struct Projection {
+    cwd: String,
+    model: serde_json::Value,
+    agent: serde_json::Value,
+    parent: Option<String>,
+}
+
+impl Projection {
+    fn new(content: &str, cwd: &Path) -> Self {
+        let first = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["kind"] == PROJECTED && v["type"] == "assistant");
+        let model = first
+            .as_ref()
+            .map(|v| v["data"]["model"].clone())
+            .filter(|model| model["id"].is_string() && model["providerID"].is_string())
+            .unwrap_or_else(|| serde_json::json!({ "id": "unknown", "providerID": "agit" }));
+        let agent = first
+            .as_ref()
+            .map(|v| v["data"]["agent"].clone())
+            .filter(serde_json::Value::is_string)
+            .unwrap_or_else(|| "build".into());
+        Self {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model,
+            agent,
+            parent: None,
+        }
+    }
+
+    /// The classic messages one row becomes, each as (message id, message data, parts): none for
+    /// bookkeeping rows (agent and model switches, system notices), two for a compaction.
+    fn classic(
+        &mut self,
+        v: &serde_json::Value,
+    ) -> Vec<(String, serde_json::Value, Vec<serde_json::Value>)> {
+        let Some(id) = v["id"].as_str().map(String::from) else {
+            return vec![];
+        };
+        let data = &v["data"];
+        let created = data
+            .pointer("/time/created")
+            .and_then(|x| x.as_i64())
+            .or_else(|| v["time_created"].as_i64())
+            .unwrap_or(0);
+        let messages = match v["type"].as_str().unwrap_or_default() {
+            "user" => vec![(id, self.user(created), user_parts(data, false))],
+            "synthetic" => vec![(id, self.user(created), user_parts(data, true))],
+            // The classic shape of a compaction (§7): a user boundary holding a compaction part,
+            // answered by a finished `summary` assistant. OpenCode drops the history before a
+            // boundary only when both are there; `recent` is the context the summary keeps
+            // verbatim, so it travels with the summary.
+            "compaction" => {
+                let boundary = vec![serde_json::json!({
+                    "type": "compaction",
+                    "auto": data["reason"] == "auto",
+                })];
+                let summary_id = format!("{id}#summary");
+                let mut summary = self.assistant(created, data, Some(&id));
+                for (key, value) in [
+                    ("mode", "compaction".into()),
+                    ("agent", "compaction".into()),
+                    ("summary", true.into()),
+                    ("finish", "stop".into()),
+                ] {
+                    summary[key] = value;
+                }
+                // One part: OpenCode joins a message's text parts without a separator.
+                let text = [&data["summary"], &data["recent"]]
+                    .into_iter()
+                    .filter_map(|text| text.as_str().filter(|t| !t.trim().is_empty()))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let texts = if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![text_part(&text.into())]
+                };
+                vec![
+                    (id, self.user(created), boundary),
+                    (summary_id, summary, texts),
+                ]
+            }
+            "assistant" => {
+                if data["model"]["id"].is_string() && data["model"]["providerID"].is_string() {
+                    self.model = data["model"].clone();
+                }
+                if data["agent"].is_string() {
+                    self.agent = data["agent"].clone();
+                }
+                let parts = data["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| match item["type"].as_str()? {
+                        "text" => Some(text_part(&item["text"])),
+                        "reasoning" => Some(serde_json::json!({
+                            "type": "reasoning",
+                            "text": item["text"].as_str().unwrap_or_default(),
+                            "time": {
+                                "start": item.pointer("/time/created").cloned().unwrap_or(created.into()),
+                                "end": item.pointer("/time/completed").cloned().unwrap_or(created.into()),
+                            },
+                        })),
+                        "tool" => Some(tool_state_part(
+                            item["name"].as_str().unwrap_or("tool"),
+                            item["id"].clone(),
+                            &item["state"],
+                            item.pointer("/time/created").and_then(|x| x.as_i64()).unwrap_or(created),
+                            item.pointer("/time/completed").and_then(|x| x.as_i64()).unwrap_or(created),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let parent = self.parent.clone();
+                vec![(id, self.assistant(created, data, parent.as_deref()), parts)]
+            }
+            "shell" => {
+                let state = serde_json::json!({
+                    "status": "completed",
+                    "input": { "command": data["command"] },
+                    "content": [{ "type": "text", "text": data["output"] }],
+                });
+                let part =
+                    tool_state_part("bash", data["callID"].clone(), &state, created, created);
+                let parent = self.parent.clone();
+                vec![(
+                    id,
+                    self.assistant(created, data, parent.as_deref()),
+                    vec![part],
+                )]
+            }
+            _ => vec![],
+        };
+        if let Some((id, _, _)) = messages.iter().find(|(_, data, _)| data["role"] == "user") {
+            self.parent = Some(id.clone());
+        }
+        messages
+    }
+
+    fn user(&self, created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "time": { "created": created },
+            "agent": self.agent,
+            "model": { "providerID": self.model["providerID"], "modelID": self.model["id"] },
+        })
+    }
+
+    fn assistant(
+        &self,
+        created: i64,
+        data: &serde_json::Value,
+        parent: Option<&str>,
+    ) -> serde_json::Value {
+        let mut info = serde_json::json!({
+            "role": "assistant",
+            "mode": self.agent,
+            "agent": self.agent,
+            "path": { "cwd": self.cwd, "root": self.cwd },
+            "cost": data["cost"].as_f64().unwrap_or(0.0),
+            "tokens": if data["tokens"].is_object() {
+                data["tokens"].clone()
+            } else {
+                serde_json::json!({ "input": 0, "output": 0, "reasoning": 0,
+                                    "cache": { "read": 0, "write": 0 } })
+            },
+            "modelID": self.model["id"],
+            "providerID": self.model["providerID"],
+            "time": {
+                "created": created,
+                "completed": data.pointer("/time/completed").and_then(|x| x.as_i64()).unwrap_or(created),
+            },
+            "finish": data["finish"].as_str().unwrap_or("stop"),
+        });
+        if let Some(parent) = parent {
+            info["parentID"] = parent.into();
+        }
+        info
+    }
+}
+
+fn text_part(text: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "type": "text", "text": text.as_str().unwrap_or_default() })
+}
+
+/// A projected prompt's classic parts: its text, then each attachment as a file part (the url
+/// carries inline content) and each mentioned agent as an agent part. An attachment-only prompt
+/// has no text part.
+fn user_parts(data: &serde_json::Value, synthetic: bool) -> Vec<serde_json::Value> {
+    let mut parts = vec![];
+    if data["text"].as_str().is_some_and(|t| !t.is_empty()) {
+        let mut part = text_part(&data["text"]);
+        if synthetic {
+            part["synthetic"] = true.into();
+        }
+        parts.push(part);
+    }
+    for file in data["files"].as_array().into_iter().flatten() {
+        let Some(url) = file["uri"].as_str() else {
+            continue;
+        };
+        let mut part = serde_json::json!({
+            "type": "file",
+            "mime": file["mime"].as_str().unwrap_or("application/octet-stream"),
+            "url": url,
+        });
+        if let Some(name) = file["name"].as_str() {
+            part["filename"] = name.into();
+        }
+        parts.push(part);
+    }
+    for agent in data["agents"].as_array().into_iter().flatten() {
+        if let Some(name) = agent["name"].as_str() {
+            parts.push(serde_json::json!({ "type": "agent", "name": name }));
+        }
+    }
+    parts
+}
+
+/// A classic tool part from a projected tool state. The output is the text of the state's
+/// content items; a call that never finished is written as the error it ended in, because the
+/// importer accepts only finished calls.
+fn tool_state_part(
+    name: &str,
+    call: serde_json::Value,
+    state: &serde_json::Value,
+    start: i64,
+    end: i64,
+) -> serde_json::Value {
+    let input = match &state["input"] {
+        value @ serde_json::Value::Object(_) => value.clone(),
+        serde_json::Value::Null => serde_json::json!({}),
+        value => serde_json::json!({ "input": value }),
+    };
+    let output = projected_tool_output(state);
+    let mut classic = serde_json::json!({
+        "input": input,
+        "title": name,
+        "metadata": {},
+        "time": { "start": start, "end": end },
+    });
+    match state["status"].as_str() {
+        Some("completed") => {
+            classic["status"] = "completed".into();
+            classic["output"] = output.into();
+        }
+        Some("error") => {
+            classic["status"] = "error".into();
+            classic["error"] = projected_tool_error(state).unwrap_or(output).into();
+        }
+        _ => {
+            classic["status"] = "error".into();
+            classic["error"] = "the tool call did not finish".into();
+        }
+    }
+    serde_json::json!({
+        "type": "tool",
+        "tool": name,
+        "callID": if call.is_string() { call } else { mint_key("call_").into() },
+        "state": classic,
+    })
+}
+
+/// The text a projected tool returned: its text content items, in order.
+pub(crate) fn projected_tool_output(state: &serde_json::Value) -> String {
+    state["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "text")
+        .filter_map(|item| item["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The message a failed projected tool call ended with.
+pub(crate) fn projected_tool_error(state: &serde_json::Value) -> Option<String> {
+    state
+        .pointer("/error/message")
+        .or_else(|| state.pointer("/result/value"))
+        .and_then(|x| x.as_str())
+        .map(String::from)
 }
 
 /// Recursively replace a string **whose value is exactly** an old id with the new id.
@@ -1611,6 +2192,10 @@ impl Adapter for OpenCode {
 
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         session_refs_for_repo(repo, true)
+    }
+
+    fn unreadable_store(&self) -> Option<String> {
+        unreadable(&open(&db_path()?)?)
     }
 
     fn all_sessions(&self) -> Result<Vec<SessionRef>> {
@@ -2608,6 +3193,183 @@ mod tests {
             .unwrap();
         let con = open(&p).unwrap();
         assert!(!schema_ok(&con));
+        assert_eq!(
+            unreadable(&con).as_deref(),
+            Some(
+                "this OpenCode version stores sessions in a format agit doesn't read yet (schema: tables session)"
+            )
+        );
+    }
+
+    /// The fixture database plus the `session_message` table and a session driven through the
+    /// v2 API (§1.1), its rows in the shapes OpenCode 1.19.5 writes. Two rows share a
+    /// millisecond and are inserted against `seq` order, so only ordering by `seq` reads them
+    /// back in conversation order.
+    fn projected_fixture_db() -> (tempfile::TempDir, PathBuf) {
+        let (d, p) = fixture_db();
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TABLE session_message (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                     seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                     time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+                   INSERT INTO session VALUES ('ses_v2', 'proj1', NULL, '/repo/one', 500, 590, '1.19.5');
+                   INSERT INTO session_message VALUES
+                     ('msg_v4', 'ses_v2', 'assistant', 9, 530, 539, '{"time":{"created":530,"completed":538},"agent":"build","model":{"id":"m1","providerID":"p1"},"content":[{"type":"text","id":"text-0","text":"Done."}],"finish":"stop","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+                     ('msg_v1', 'ses_v2', 'user', 2, 510, 510, '{"time":{"created":510},"text":"please write a file"}'),
+                     ('msg_v3', 'ses_v2', 'model-switched', 4, 520, 520, '{"time":{"created":520},"model":{"id":"m1","providerID":"p1"}}'),
+                     ('msg_v2', 'ses_v2', 'assistant', 3, 520, 529, '{"time":{"created":520,"completed":528},"agent":"build","model":{"id":"m1","providerID":"p1"},"content":[{"type":"reasoning","id":"r-0","text":"thinking"},{"type":"tool","id":"call_1","name":"write","state":{"status":"completed","input":{"path":"hello.txt","content":"hi\n"},"content":[{"type":"text","text":"Created file successfully: hello.txt"}],"structured":{}},"time":{"created":521,"ran":522,"completed":523}}],"finish":"tool-calls","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+                     ('msg_v5', 'ses_v2', 'user', 14, 540, 540, '{"time":{"created":540},"text":"thanks"}'),
+                     ('msg_v6', 'ses_v2', 'compaction', 16, 550, 550, '{"time":{"created":550},"reason":"auto","summary":"Summary: wrote the file.","recent":"kept tail"}'),
+                     ('msg_v7', 'ses_v2', 'user', 17, 560, 560, '{"time":{"created":560},"text":"","files":[{"uri":"data:image/png;base64,AAAA","mime":"image/png","name":"shot.png"}]}');"#,
+            )
+            .unwrap();
+        (d, p)
+    }
+
+    /// One database holds classic and v2 sessions (§1.1): each is read from its own layout, the
+    /// v2 conversation comes out in `seq` order as prompts, replies and the file edit, and the
+    /// read-only snapshot used by lineage and status yields the same bytes as the cache. A
+    /// reader of one layout would return the other session's conversation empty.
+    #[test]
+    fn classic_and_projected_sessions_are_read_from_one_database() {
+        let (_d, p) = projected_fixture_db();
+        let con = open(&p).unwrap();
+        assert_eq!(
+            layout(&con),
+            Some(Layout {
+                parts: true,
+                projected: true
+            })
+        );
+        let classic = materialize(&con, "ses_one").unwrap().text;
+        assert!(!classic.contains(PROJECTED));
+        assert_eq!(OpenCode.parse(&classic).unwrap().counts().prompts, 1);
+
+        let text = materialize(&con, "ses_v2").unwrap().text;
+        assert_eq!(
+            text.as_bytes(),
+            native_snapshot::materialize(
+                &con,
+                "ses_v2",
+                crate::adapter::native_snapshot::Limits::default()
+            )
+            .unwrap()
+        );
+        let session = OpenCode.parse(&text).unwrap();
+        assert_eq!(session.id, "ses_v2");
+        let flow: Vec<(EventKind, Option<&str>)> = session
+            .events
+            .iter()
+            .map(|e| (e.kind, e.text.as_deref()))
+            .collect();
+        assert_eq!(
+            flow,
+            vec![
+                (EventKind::UserPrompt, Some("please write a file")),
+                (EventKind::Other, None),
+                (EventKind::FileEdit, Some("write")),
+                (EventKind::Other, None),
+                (EventKind::AssistantReply, Some("Done.")),
+                (EventKind::UserPrompt, Some("thanks")),
+                (EventKind::CompactSummary, Some("Summary: wrote the file.")),
+                (EventKind::Other, Some("shot.png")),
+            ]
+        );
+        let edit = session
+            .events
+            .iter()
+            .position(|e| e.kind == EventKind::FileEdit)
+            .unwrap();
+        assert_eq!(session.events[edit].paths, vec!["hello.txt"]);
+        let details = OpenCode.tool_details(&text, &session, true);
+        let detail = details.get(edit).unwrap();
+        assert_eq!(detail.input.as_ref().unwrap()["path"], "hello.txt");
+        assert_eq!(
+            detail.output.as_deref(),
+            Some("Created file successfully: hello.txt")
+        );
+    }
+
+    /// Installing a v2 session writes classic messages and parts, the only shape
+    /// `opencode import` accepts: a user message borrows the session's model, an assistant
+    /// points at its prompt, a tool call keeps its input and output, an attachment stays a file
+    /// part, a compaction becomes the boundary and summary pair OpenCode cuts history at, and
+    /// bookkeeping rows are left out. New ids ascend in conversation order, the order OpenCode
+    /// reads rows of one millisecond and parts of one message in. Passing the rows through
+    /// unchanged would install an empty conversation.
+    #[test]
+    fn projected_session_installs_as_classic_messages() {
+        let (_d, p) = projected_fixture_db();
+        let text = materialize(&open(&p).unwrap(), "ses_v2").unwrap().text;
+        let v = canonical_to_export(&text, "ses_new", Path::new("/target")).unwrap();
+        assert_eq!(v["info"]["title"], "please write a file");
+        let messages = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["info"]["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                "user",
+                "assistant",
+                "assistant",
+                "user",
+                "user",
+                "assistant",
+                "user"
+            ]
+        );
+        let ids: Vec<&str> = messages
+            .iter()
+            .map(|m| m["info"]["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        let user = &messages[0]["info"];
+        assert_eq!(user["model"]["providerID"], "p1");
+        assert_eq!(user["model"]["modelID"], "m1");
+        let tool_message = &messages[1];
+        assert_eq!(tool_message["info"]["parentID"], user["id"]);
+        assert_eq!(tool_message["info"]["modelID"], "m1");
+        assert_eq!(tool_message["info"]["path"]["cwd"], "/target");
+        let parts = tool_message["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "reasoning");
+        let tool = &parts[1];
+        assert_eq!(tool["tool"], "write");
+        assert_eq!(tool["messageID"], tool_message["info"]["id"]);
+        assert_eq!(tool["state"]["status"], "completed");
+        assert_eq!(tool["state"]["input"]["path"], "hello.txt");
+        assert_eq!(
+            tool["state"]["output"],
+            "Created file successfully: hello.txt"
+        );
+        assert!(tool["state"]["metadata"].is_object());
+        assert!(parts[0]["id"].as_str().unwrap() < tool["id"].as_str().unwrap());
+
+        let (boundary, summary) = (&messages[4], &messages[5]);
+        assert_eq!(boundary["parts"][0]["type"], "compaction");
+        assert_eq!(boundary["parts"][0]["auto"], true);
+        assert_eq!(summary["info"]["parentID"], boundary["info"]["id"]);
+        assert_eq!(summary["info"]["summary"], true);
+        assert_eq!(summary["info"]["mode"], "compaction");
+        assert_eq!(summary["info"]["finish"], "stop");
+        let texts: Vec<&str> = summary["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["Summary: wrote the file.\n\nkept tail"]);
+
+        let attachment = &messages[6]["parts"];
+        assert_eq!(attachment.as_array().unwrap().len(), 1);
+        assert_eq!(attachment[0]["type"], "file");
+        assert_eq!(attachment[0]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(attachment[0]["mime"], "image/png");
+        assert_eq!(attachment[0]["filename"], "shot.png");
+        assert!(!serde_json::to_string(&v).unwrap().contains("msg_v"));
     }
 
     // ── id reminting and install preparation ──

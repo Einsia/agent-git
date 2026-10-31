@@ -1660,7 +1660,19 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
 
     match found.len() {
         0 => {
+            // A store agit cannot read hides its sessions; with the runtime named, that is the
+            // whole explanation.
+            let unreadable = unreadable_stores(&runtimes);
+            if from.is_some()
+                && let Some(reason) = unreadable.first()
+            {
+                ui::error(reason);
+                return Ok(Pick::Explained(ExitCode::Ref));
+            }
             ui::error(&format!("no session named `{selector}`."));
+            for reason in &unreadable {
+                ui::hint(reason);
+            }
             ui::hint(
                 "`agit import -n <name>` without a session argument lists this repo’s candidates",
             );
@@ -1678,6 +1690,14 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
             Ok(Pick::Explained(ExitCode::Interactive))
         }
     }
+}
+
+/// Why the stores of these runtimes exist but cannot be read.
+pub(super) fn unreadable_stores(runtimes: &[&'static str]) -> Vec<String> {
+    runtimes
+        .iter()
+        .filter_map(|rt| adapter::get(rt).ok()?.unreadable_store())
+        .collect()
 }
 
 /// Create an independent native session; the import flow projects it with the selected repository
@@ -1835,6 +1855,13 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
         );
         if let Some(note) = &current_note {
             ui::hint(note);
+        }
+        let considered = match selected_runtime {
+            Some(runtime) => vec![runtime],
+            None => adapter::RUNTIMES.to_vec(),
+        };
+        for reason in unreadable_stores(&considered) {
+            ui::hint(&reason);
         }
         ui::hint(
             "session ran in another directory? give the id directly: agit import <session-id> --from <runtime> --into <owner/repo>@<branch>",

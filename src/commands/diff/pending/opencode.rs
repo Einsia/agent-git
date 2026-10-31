@@ -117,7 +117,9 @@ impl Rows {
                     );
                     meta_seen = true;
                 }
-                "message" | "part" => {
+                // A projected row is compared as a row; turns are attributed only through
+                // classic message headers, so its activity is reported as unattributed.
+                "message" | "part" | crate::adapter::opencode::PROJECTED => {
                     ensure!(
                         text_field(&facts, "session_id") == Some(session),
                         "OpenCode record identifies another native session"

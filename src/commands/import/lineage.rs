@@ -253,6 +253,10 @@ fn selected_args(args: &Args) -> crate::Result<(Destination, &str, Box<dyn adapt
 
 fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
     let (destination, id, adapter) = selected_args(args)?;
+    if let Some(reason) = adapter.unreadable_store() {
+        ui::error(&reason);
+        return Ok(None);
+    }
     let mut report = Report::new(adapter.id(), id, &destination);
     let source = match adapter.lookup_native_readonly(id, native_snapshot::Limits::default()) {
         Ok(source) => source,

@@ -236,6 +236,7 @@ impl Records {
 }
 
 pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> Result<Vec<u8>> {
+    let layout = super::layout(connection).ok_or(Unavailable::Database)?;
     let mut output = Records::new(limits);
     {
         let mut statement = connection.prepare("SELECT id, project_id, parent_id, directory, time_created, version FROM session WHERE id = ?1")
@@ -266,6 +267,40 @@ pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> 
             return Err(Unavailable::Ambiguous);
         }
     }
+    if layout.parts {
+        materialize_parts(connection, id, &mut output)?;
+    }
+    if layout.projected {
+        let mut statement = connection
+            .prepare("SELECT id, session_id, type, seq, time_created, data FROM session_message WHERE session_id = ?1")
+            .map_err(|_| Unavailable::Database)?;
+        let mut rows = statement.query([id]).map_err(|_| Unavailable::Database)?;
+        while let Some(row) = rows.next().map_err(|_| Unavailable::Database)? {
+            let message = text(row, 0)?;
+            if text(row, 1)? != id {
+                return Err(Unavailable::Database);
+            }
+            let seq = integer(row, 3)?;
+            let created = integer(row, 4)?;
+            output.push(
+                created,
+                super::PROJECTED_ORDER,
+                &super::projected_tiebreak(seq),
+                CanonicalRecord::Projected {
+                    id: message,
+                    session: id,
+                    kind: text(row, 2)?,
+                    seq,
+                    created,
+                    data: text(row, 5)?,
+                },
+            )?;
+        }
+    }
+    output.finish()
+}
+
+fn materialize_parts(connection: &Connection, id: &str, output: &mut Records) -> Result<()> {
     {
         let mut statement = connection
             .prepare("SELECT id, session_id, time_created, data FROM message WHERE session_id = ?1")
@@ -315,7 +350,7 @@ pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> 
             )?;
         }
     }
-    output.finish()
+    Ok(())
 }
 
 #[cfg(test)]

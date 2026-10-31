@@ -650,7 +650,10 @@ fn query(bytes: Vec<u8>, id: &str, limits: Limits, deadline: Instant) -> Result<
             hooks::AuthAction::Select => hooks::Authorization::Allow,
             hooks::AuthAction::Read { table_name, .. }
                 if context.database_name == Some("main")
-                    && matches!(table_name, "session" | "message" | "part" | "sqlite_master") =>
+                    && matches!(
+                        table_name,
+                        "session" | "message" | "part" | "session_message" | "sqlite_master"
+                    ) =>
             {
                 hooks::Authorization::Allow
             }
@@ -658,7 +661,7 @@ fn query(bytes: Vec<u8>, id: &str, limits: Limits, deadline: Instant) -> Result<
         }
     }));
     {
-        let mut statement=db.prepare("SELECT name, type, rootpage FROM sqlite_schema WHERE name IN ('session','message','part')").map_err(database_error)?;
+        let mut statement=db.prepare("SELECT name, type, rootpage FROM sqlite_schema WHERE name IN ('session','message','part','session_message')").map_err(database_error)?;
         let mut rows = statement.query([]).map_err(database_error)?;
         let mut names = std::collections::BTreeSet::new();
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -669,7 +672,8 @@ fn query(bytes: Vec<u8>, id: &str, limits: Limits, deadline: Instant) -> Result<
                 return Err(Unavailable::Database);
             }
         }
-        if names.len() != 3 {
+        let parts = names.contains("message") && names.contains("part");
+        if !names.contains("session") || !(parts || names.contains("session_message")) {
             return Err(Unavailable::Database);
         }
     }

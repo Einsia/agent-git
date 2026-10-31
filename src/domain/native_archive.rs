@@ -203,6 +203,42 @@ fn opencode_observable_end(snapshot: &[u8]) -> Result<(usize, BTreeSet<String>),
                     }
                 }
             }
+            // A whole message in one row: an assistant is terminal once it has completed and
+            // every tool call in its content has finished.
+            Some(crate::adapter::opencode::PROJECTED) => {
+                if session.is_none() || record["session_id"].as_str() != session.as_deref() {
+                    return Err(invalid());
+                }
+                let data = record["data"].as_object().ok_or_else(invalid)?;
+                let assistant = record["type"].as_str().ok_or_else(invalid)? == "assistant";
+                let terminal = !assistant
+                    || (data
+                        .get("time")
+                        .and_then(|time| time.get("completed"))
+                        .and_then(|completed| completed.as_u64())
+                        .is_some()
+                        && data
+                            .get("content")
+                            .and_then(|content| content.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter(|item| item["type"] == "tool")
+                            .all(|item| {
+                                matches!(
+                                    item["state"]["status"].as_str(),
+                                    Some("completed" | "error")
+                                )
+                            }));
+                messages.insert(
+                    id.to_owned(),
+                    Message {
+                        start: offset,
+                        end,
+                        assistant,
+                        terminal,
+                    },
+                );
+            }
             _ => return Err(invalid()),
         }
         offset = end;
