@@ -8,6 +8,93 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.33] - 2026-10-31
+
+### Added
+
+- `agit on` turns a folder on once so that every Claude Code or Codex conversation there saves and
+  uploads itself after each turn, to a private repository it names; `agit off` stops that without
+  deleting anything, and plain `agit` shows the folder's state and next step.
+- `agit save` uploads now with no other argument: this conversation inside an agent, what the
+  folder still owes the Hub in a terminal, `--all` for earlier sessions and `--today` for the day's
+  sessions everywhere. `--all` and `--today` never upload a conversation you stopped uploading with
+  `agit project drop`; only naming it does. A first save turns the folder on privately, and the
+  agent then asks once whether to keep uploading there.
+- `agit push --to owner/repo` publishes to another repository on the same Hub that your account can
+  write to; that repository is checked right before anything is written, and the checkout keeps its
+  own repository as the default destination.
+- `agit push` publishes a session whose new history is more than one publication can carry in
+  parts: one confirmation, then each part is prepared, checked and sent in turn with its own
+  privacy preview file, never past the commits you confirmed. Dropping the project or turning
+  automatic upload off stops the parts not yet sent, and rerunning after an interruption continues
+  from what the Hub holds.
+- Team activity shows live status, including "Needs approval", for members' Claude Code sessions in
+  Workspace projects, also ones started in a terminal.
+- The owner of a device can share one of its own conversations with a workspace over remote control
+  without starting it, and the workspace then lists it as one of its sessions for its members.
+- Each GitHub release now includes the corresponding source code of the GPL- and LGPL-licensed parts
+  of the bundled Git runtime, including the MSYS2 and Git for Windows components that the Windows
+  build's MinGit carries, with their checksums listed in the release notes and in
+  `SOURCES-SHA256SUMS`.
+
+### Changed
+
+- One user turn can now land as several commits under the same turn number. When the agent keeps
+  working after it replies, without a new prompt, a further commit is added on top when it
+  finishes, and history is never amended; `agit import`, project capture, or an `agit commit` that
+  collects several finished turns lands one commit per turn. `agit log` and the Timeline show the
+  first commit of a turn as `#n` and later ones as `+n` (`"continuation": true` in `--json`);
+  `<ref>#n` resolves to the turn's last commit and `#n.k` numbers the events of all its commits, so
+  existing addresses keep their meaning.
+- Publishing a session sends its branch and its new tags in one upload when they fit, saving a
+  privacy preview, a confirmation and an upload on each push.
+- A turn you interrupt with Esc in Claude Code is no longer uploaded right away, whether you stopped
+  it before any output or the transcript records the interruption. It is saved and uploaded once a
+  later turn in that session completes, or when you run `agit push` yourself.
+
+### Fixed
+
+- A Claude Code turn that keeps working after it replies, woken by a background task's
+  notification, a monitor event or a finished workflow, is saved and pushed when it next finishes,
+  as a further commit of the same turn, instead of staying local until the next prompt.
+- Codex turns, including goal turns that continue without a new prompt, are saved when they finish
+  instead of one turn late, and no turn leaves a later commit holding only its completion record.
+- Saving a Claude Code or Codex session stops at the last point the runtime recorded as complete,
+  so a turn still in progress is never committed in part; an interrupted turn, an API error, a
+  refusal, "No response requested." or a manual `/compact` is still saved.
+- Session metadata larger than a Hub accepts is refused when it is saved, with the size and the
+  limit, instead of being saved and refused only at push, and `agit activity` and
+  `agit search --local` no longer fail or skip versions whose metadata is between 64 KiB and that
+  limit.
+- `agit push` no longer fails every time on a branch whose session was withdrawn on the Hub: it
+  names the refused branches, keeps them in the checkout and leaves them out of later pushes, and
+  naming such a branch asks the Hub again once the withdrawal is restored.
+- When agit's local record of what a checkout already published does not match its commits,
+  `agit push` now names the repository and branch, says that nothing was sent and local commits are
+  kept, and asks you to report the problem with `agit status` output instead of suggesting recovery
+  steps that don't exist.
+- Enrolling a folder for publication from the Hub no longer turns a repository's automatic upload
+  back on when it was turned off on the device; the device refuses the enrolment with that reason,
+  and only `agit config --repo OWNER/NAME push.auto true` or the menu bar app lifts it.
+- The Remote Control daemon no longer keeps retrying uploads on a timer while a session's privacy
+  check is pending or automatic upload is off for its destination, and no longer re-reads unchanged
+  transcripts every few seconds.
+- A folder whose name maps to the same Claude Code project directory as another, such as
+  `/work/a-b` and `/work/a/b`, no longer lists the other folder's conversations.
+- `agit import` reads OpenCode sessions saved by OpenCode's desktop and web apps, and says plainly
+  when an OpenCode session uses a format agit cannot read yet.
+- `agit setup` no longer moves approved Codex hooks to another copy of agit, and setup,
+  `agit doctor` and `agit project status` now say when Codex has not approved AgentGit's hooks, so
+  nothing is being saved.
+- `agit on` no longer says every Codex turn saves while Codex holds AgentGit's hooks for review; it
+  says nothing is saved yet, which hooks are held, and how to approve them.
+- Codex side chats are no longer picked up, announced as uploaded, or captured by a connected
+  project.
+- `agit log` says when its entry limit hid earlier entries ("… N earlier of M entries not shown"),
+  and `agit --json log` reports `total` and `truncated`.
+- `agit search --local` finds saved turns of ordinary-sized sessions instead of stopping at its work
+  budget, and an incomplete result now says what was skipped and what to do.
+
 ## [0.2.32] - 2026-10-31
 
 ### Changed
