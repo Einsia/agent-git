@@ -21,24 +21,41 @@ pub(crate) struct CodexHooks {
     pub(crate) listed: usize,
     /// The AgentGit hooks Codex will not run, with the reason.
     pub(crate) inactive: Vec<(String, &'static str)>,
+    /// The events AgentGit hooks for that Codex lists none of AgentGit's hooks for.
+    pub(crate) missing: Vec<&'static str>,
 }
 
 impl CodexHooks {
-    /// One line naming the hooks Codex will not run and how to approve them; `None` when Codex
-    /// runs every AgentGit hook it lists.
+    /// One line naming the hooks Codex will not run or does not have, and how to fix that;
+    /// `None` when Codex runs an AgentGit hook for every event. A Codex that lists none of them
+    /// is the caller's to report: the hooks may never have been set up there.
     pub(crate) fn problem(&self) -> Option<String> {
-        if self.inactive.is_empty() {
-            return None;
+        let mut said = Vec::new();
+        if !self.inactive.is_empty() {
+            let hooks = self
+                .inactive
+                .iter()
+                .map(|(event, reason)| format!("{event} ({reason})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            said.push(format!(
+                "Codex will not run these AgentGit hooks: {hooks}. Nothing from Codex is saved until they run: start Codex and approve them in its hooks review, or enable and trust them in Codex's /hooks"
+            ));
         }
-        let hooks = self
-            .inactive
-            .iter()
-            .map(|(event, reason)| format!("{event} ({reason})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!(
-            "Codex will not run these AgentGit hooks: {hooks}. Nothing from Codex is saved until they run: start Codex and approve them in its hooks review, or enable and trust them in Codex's /hooks"
-        ))
+        // A hook the person deleted leaves the rest approved, and `agit on` in a folder already on
+        // does not add it back, so every hook Codex lists can run while one is missing.
+        if self.listed > 0 && !self.missing.is_empty() {
+            let lost = if self.missing.contains(&"Stop") {
+                "no Codex turn here is saved when it finishes"
+            } else {
+                "a Codex conversation here starts without AgentGit recording it"
+            };
+            said.push(format!(
+                "Codex lists no AgentGit {} hook, so {lost}: add it with `agit setup --runtime codex --hooks`, then approve it in Codex's hooks review",
+                self.missing.join(" or ")
+            ));
+        }
+        (!said.is_empty()).then(|| said.join(". "))
     }
 }
 
@@ -117,6 +134,7 @@ fn answer(
 fn read_hooks(result: &serde_json::Value) -> Option<CodexHooks> {
     let mut hooks = CodexHooks::default();
     let mut seen = std::collections::HashSet::new();
+    let mut events = std::collections::HashSet::new();
     for entry in result.get("data")?.as_array()? {
         for hook in entry.get("hooks")?.as_array()? {
             let Some(command) = hook.get("command").and_then(|value| value.as_str()) else {
@@ -132,6 +150,7 @@ fn read_hooks(result: &serde_json::Value) -> Option<CodexHooks> {
                 continue;
             }
             hooks.listed += 1;
+            events.insert(*event);
             let reason = match hook.get("trustStatus").and_then(|value| value.as_str()) {
                 Some("untrusted") => Some("not yet approved"),
                 Some("modified") => Some("changed since it was approved"),
@@ -145,5 +164,56 @@ fn read_hooks(result: &serde_json::Value) -> Option<CodexHooks> {
             }
         }
     }
+    hooks.missing = super::HOOKS
+        .iter()
+        .map(|(event, _)| *event)
+        .filter(|event| !events.contains(event))
+        .collect();
     Some(hooks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_hooks;
+
+    /// A Codex that runs AgentGit's SessionStart hook but lists no Stop hook saves no turn, though
+    /// every hook it lists is approved: the person deleted one, and the folder stays on. The
+    /// problem names the missing hook and the setup command that adds it back. One that judged
+    /// only the hooks Codex lists would call this Codex saving.
+    #[test]
+    fn a_missing_stop_hook_is_a_problem_even_when_the_rest_are_approved() {
+        let listing = |hooks: serde_json::Value| {
+            read_hooks(&serde_json::json!({"data": [{"cwd": "/w", "hooks": hooks}]})).unwrap()
+        };
+        let hook = |event: &str, argv: &str| {
+            serde_json::json!({"key": format!("/h/.codex/hooks.json:{event}:0:0"),
+                "eventName": event, "command": format!("/usr/local/bin/agit hooks {argv} --runtime codex"),
+                "enabled": true, "trustStatus": "trusted"})
+        };
+        let only_start = listing(serde_json::json!([hook("sessionStart", "ingest")]));
+        assert_eq!(only_start.listed, 1);
+        assert_eq!(only_start.missing, ["Stop"]);
+        let problem = only_start
+            .problem()
+            .expect("a missing Stop hook is a problem");
+        assert!(problem.contains("no AgentGit Stop hook"), "{problem}");
+        assert!(problem.contains("no Codex turn here is saved"), "{problem}");
+        assert!(
+            problem.contains("`agit setup --runtime codex --hooks`"),
+            "{problem}"
+        );
+
+        let both = listing(serde_json::json!([
+            hook("sessionStart", "ingest"),
+            hook("stop", "settle")
+        ]));
+        assert!(
+            both.missing.is_empty() && both.problem().is_none(),
+            "{both:?}"
+        );
+        // Listing none of them is left to the caller, which knows whether they were set up.
+        let none = listing(serde_json::json!([]));
+        assert_eq!(none.missing.len(), 2);
+        assert!(none.problem().is_none());
+    }
 }
