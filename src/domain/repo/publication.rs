@@ -71,6 +71,10 @@ pub struct PublicationPlan {
     /// [`PublicationPlan::freeze_selected_after_carrying`]).
     #[serde(skip)]
     carried: Vec<String>,
+    /// Whether the heads are parts of their branches rather than their tips (see
+    /// [`PublicationPlan::freeze_selected_after_at`]).
+    #[serde(skip)]
+    pinned: bool,
 }
 
 /// Inspection selection is independent of the complete publication and verification plan.
@@ -222,6 +226,18 @@ impl PublicationPlan {
             .collect())
     }
 
+    /// Every commit `heads` reach through raw parents, however long the history: what a first
+    /// publication carries, listed without the selected-history bound so that a history longer
+    /// than one publication can be checked before it is sent in parts.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn raw_history(repo: &Repo, heads: &[String]) -> Result<BTreeSet<String>> {
+        ensure!(
+            heads.iter().all(|head| valid_oid(head)),
+            "invalid publication head"
+        );
+        Reader::new(repo).reachable_among(heads, None)
+    }
+
     /// Captured commits whose ancestry the plan leaves out, sorted.
     pub fn boundary(&self) -> &[String] {
         &self.boundary
@@ -241,12 +257,20 @@ impl PublicationPlan {
             true,
             Depth::Until(&BTreeSet::new()),
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
     }
 
     /// The heads `freeze` selects, with none of their history: each head is its own boundary.
     pub fn freeze_tips(repo: &Repo, branches: &[String]) -> Result<Self> {
-        Self::freeze_roots(repo, branches, true, Depth::Tips, &BTreeSet::new())
+        Self::freeze_roots(
+            repo,
+            branches,
+            true,
+            Depth::Tips,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
     }
 
     /// Session publication must not add an independently advancing shared-file line.
@@ -257,6 +281,7 @@ impl PublicationPlan {
             false,
             Depth::Until(&BTreeSet::new()),
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
     }
 
@@ -268,7 +293,14 @@ impl PublicationPlan {
         branches: &[String],
         held: &BTreeSet<String>,
     ) -> Result<Self> {
-        Self::freeze_roots(repo, branches, false, Depth::Until(held), &BTreeSet::new())
+        Self::freeze_roots(
+            repo,
+            branches,
+            false,
+            Depth::Until(held),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
     }
 
     /// As [`PublicationPlan::freeze_selected_after`], and the tags named in `carried` are taken
@@ -280,7 +312,30 @@ impl PublicationPlan {
         held: &BTreeSet<String>,
         carried: &BTreeSet<String>,
     ) -> Result<Self> {
-        Self::freeze_roots(repo, branches, false, Depth::Until(held), carried)
+        Self::freeze_roots(
+            repo,
+            branches,
+            false,
+            Depth::Until(held),
+            carried,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// As [`PublicationPlan::freeze_selected_after_carrying`], with each branch frozen at the
+    /// commit `pins` names for it instead of at its tip: one part of a publication that carries a
+    /// long history in several. The pin must be the branch's tip or one of its ancestors, and
+    /// verification accepts a branch that has since moved forward past it, as when turns are saved
+    /// during a long publication, but not one rewritten without it.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn freeze_selected_after_at(
+        repo: &Repo,
+        pins: &BTreeMap<String, String>,
+        held: &BTreeSet<String>,
+        carried: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let branches: Vec<String> = pins.keys().cloned().collect();
+        Self::freeze_roots(repo, &branches, false, Depth::Until(held), carried, pins)
     }
 
     fn freeze_roots(
@@ -289,6 +344,7 @@ impl PublicationPlan {
         include_main: bool,
         depth: Depth,
         carried: &BTreeSet<String>,
+        pins: &BTreeMap<String, String>,
     ) -> Result<Self> {
         ensure!(
             !branches.is_empty(),
@@ -310,13 +366,24 @@ impl PublicationPlan {
         let heads: Vec<FrozenRef> = names
             .into_iter()
             .map(|name| {
-                let oid = references
+                let live = references
                     .get(&name)
                     .context("a selected publication branch is unavailable")?;
-                Ok(FrozenRef {
-                    name,
-                    oid: oid.clone(),
-                })
+                let pin = name
+                    .strip_prefix("refs/heads/")
+                    .and_then(|branch| pins.get(branch));
+                let oid = match pin {
+                    Some(pin) => {
+                        ensure!(
+                            pin == live || is_raw_ancestor(repo, pin, live)?,
+                            "{name} no longer contains the part of its history this publication \
+                             carries; publish again"
+                        );
+                        pin.clone()
+                    }
+                    None => live.clone(),
+                };
+                Ok(FrozenRef { name, oid })
             })
             .collect::<Result<_>>()?;
 
@@ -381,6 +448,7 @@ impl PublicationPlan {
             tag_objects: tag_objects.into_iter().collect(),
             boundary: boundary.into_iter().collect(),
             carried: carried.iter().cloned().collect(),
+            pinned: !pins.is_empty(),
         })
     }
 
@@ -390,6 +458,17 @@ impl PublicationPlan {
     /// same commits from unchanged heads.
     pub fn verify(&self, repo: &Repo, branches: &[String]) -> Result<()> {
         let held = self.boundary.iter().cloned().collect();
+        let pins: BTreeMap<String, String> = if self.pinned {
+            self.heads
+                .iter()
+                .filter_map(|head| {
+                    let branch = head.name.strip_prefix("refs/heads/")?;
+                    Some((branch.to_owned(), head.oid.clone()))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         ensure!(
             Self::freeze_roots(
                 repo,
@@ -397,6 +476,7 @@ impl PublicationPlan {
                 self.include_main,
                 Depth::Until(&held),
                 &self.carried.iter().cloned().collect(),
+                &pins,
             )? == *self,
             "publication refs changed during audit; rerun the audit before publishing"
         );
@@ -476,6 +556,195 @@ pub(crate) fn is_raw_ancestor(repo: &Repo, ancestor: &str, descendant: &str) -> 
         Some(0) => Ok(true),
         Some(1) if output.stderr.is_empty() => Ok(false),
         _ => anyhow::bail!("audit publication data is unavailable locally"),
+    }
+}
+
+/// New commits one part carries at most, whatever the destination admits. The destination checks a
+/// part's new commits after receiving them and before the part's preview expires, so a part sized
+/// by the destination's limit alone can outlast its preview on a slow destination, and every retry
+/// repeats that same part.
+#[cfg(any(feature = "cli", test))]
+const PART_NEW_COMMITS: usize = 1024;
+
+/// What one part of a publication may carry. Its new commits are bounded by what the destination
+/// admits in one request and by [`PART_NEW_COMMITS`]; with the held commits it stands on, which
+/// the manifest declares and the freeze reads but the destination already has, they are bounded
+/// by the freeze's commit bound, and their metadata by its byte bound. Counting the held commits
+/// against the destination's bound would refuse a step it admits. Tags are not counted here; a
+/// freeze that meets their bounds still refuses.
+#[cfg(any(feature = "cli", test))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartBudget {
+    new_commits: usize,
+    commits: usize,
+    bytes: usize,
+}
+
+#[cfg(any(feature = "cli", test))]
+impl PartBudget {
+    /// `max_new_commits` is what the destination admits in one request.
+    pub(crate) fn new(max_new_commits: usize) -> Self {
+        Self {
+            new_commits: max_new_commits.min(PART_NEW_COMMITS),
+            commits: MAX_COMMITS,
+            bytes: MAX_METADATA_BYTES,
+        }
+    }
+
+    fn fits(&self, part: &Part) -> bool {
+        part.introduced.len() <= self.new_commits
+            && part.introduced.len() + part.boundary.len() <= self.commits
+            && part.bytes <= self.bytes
+    }
+}
+
+/// The history a branch adds above the commits a destination already holds, listed once so that
+/// a publication too long for one request can be planned in parts.
+#[cfg(any(feature = "cli", test))]
+#[derive(Debug)]
+pub(crate) struct NewHistory {
+    /// Raw parents of every commit the branch adds.
+    parents: BTreeMap<String, Vec<String>>,
+    /// Object sizes of those commits and of the held commits they stand on.
+    sizes: BTreeMap<String, usize>,
+    /// The first-parent line from the oldest added commit up to the head.
+    line: Vec<String>,
+    stops: BTreeSet<String>,
+}
+
+#[cfg(any(feature = "cli", test))]
+#[derive(Default)]
+struct Part {
+    introduced: BTreeSet<String>,
+    boundary: BTreeSet<String>,
+    bytes: usize,
+}
+
+#[cfg(any(feature = "cli", test))]
+impl NewHistory {
+    /// One overlay-free walk of `head`'s raw ancestry, cut at `stops` here rather than by Git
+    /// (`--not` stops early on commit dates and would miss old ancestors), and one size read.
+    pub(crate) fn read(repo: &Repo, head: &str, stops: &BTreeSet<String>) -> Result<Self> {
+        ensure!(valid_oid(head), "invalid publication head");
+        let ancestry = Reader::new(repo).raw_ancestry(&[head.to_owned()])?;
+        let mut parents = BTreeMap::new();
+        let mut standing = BTreeSet::new();
+        let mut pending = vec![head.to_owned()];
+        while let Some(oid) = pending.pop() {
+            if stops.contains(&oid) {
+                standing.insert(oid);
+                continue;
+            }
+            if parents.contains_key(&oid) {
+                continue;
+            }
+            let raw = ancestry
+                .get(&oid)
+                .context("audit publication data is unavailable locally")?
+                .clone();
+            pending.extend(raw.iter().cloned());
+            parents.insert(oid, raw);
+        }
+        let mut line = Vec::new();
+        let mut current = Some(head.to_owned());
+        while let Some(oid) = current.filter(|oid| !stops.contains(oid)) {
+            current = parents[&oid].first().cloned();
+            line.push(oid);
+        }
+        line.reverse();
+        let mut sizes = BTreeMap::new();
+        repo.git_cat_file_batch_check_with_policy(
+            parents.keys().chain(&standing).cloned().collect(),
+            crate::domain::repo::ReadPolicy::LocalOnly,
+            |oid, kind, size| {
+                ensure!(
+                    kind == "commit",
+                    "audit publication data is unavailable locally"
+                );
+                sizes.insert(oid.to_owned(), usize::try_from(size)?);
+                Ok(())
+            },
+        )?;
+        ensure!(
+            sizes.len() == parents.len() + standing.len(),
+            "audit publication data is unavailable locally"
+        );
+        Ok(Self {
+            parents,
+            sizes,
+            line,
+            stops: stops.clone(),
+        })
+    }
+
+    /// The commits the branch adds.
+    pub(crate) fn len(&self) -> usize {
+        self.parents.len()
+    }
+
+    /// Where to cut the first-parent line so that every part fits `budget`, oldest first; the last
+    /// cut is the head. Each part takes the furthest line commit `cuttable` admits that still fits,
+    /// and a merge brings its other parents' new history into the part that reaches it. Refused
+    /// when not even the next line commit fits, before any part is published.
+    pub(crate) fn plan_parts(
+        &self,
+        budget: PartBudget,
+        cuttable: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>> {
+        let mut cuts = Vec::new();
+        let mut published = BTreeSet::new();
+        let mut start = 0;
+        while start < self.line.len() {
+            let mut part = Part::default();
+            let mut fitting = None;
+            for index in start..self.line.len() {
+                self.introduce(&self.line[index], &published, &mut part);
+                if !budget.fits(&part) {
+                    break;
+                }
+                fitting = Some(index);
+            }
+            let furthest = fitting.and_then(|last| {
+                (start..=last)
+                    .rev()
+                    .find(|&index| cuttable(&self.line[index]))
+            });
+            let Some(cut) = furthest else {
+                anyhow::bail!(
+                    "the smallest step of this publication, up to {}, is more than one publication \
+                     can carry ({} new commits, {} MiB of commit metadata)",
+                    &self.line[start][..12],
+                    budget.new_commits,
+                    budget.bytes >> 20
+                );
+            };
+            let mut kept = Part::default();
+            for oid in &self.line[start..=cut] {
+                self.introduce(oid, &published, &mut kept);
+            }
+            published.extend(kept.introduced);
+            cuts.push(self.line[cut].clone());
+            start = cut + 1;
+        }
+        Ok(cuts)
+    }
+
+    /// Add what `oid` brings that neither the destination nor an earlier part holds.
+    fn introduce(&self, oid: &str, published: &BTreeSet<String>, part: &mut Part) {
+        let mut pending = vec![oid.to_owned()];
+        while let Some(oid) = pending.pop() {
+            if self.stops.contains(&oid) || published.contains(&oid) {
+                if part.boundary.insert(oid.clone()) {
+                    part.bytes += self.sizes[&oid];
+                }
+                continue;
+            }
+            if !part.introduced.insert(oid.clone()) {
+                continue;
+            }
+            part.bytes += self.sizes[&oid];
+            pending.extend(self.parents[&oid].iter().cloned());
+        }
     }
 }
 
@@ -721,6 +990,49 @@ impl Reader {
         roots: &[String],
         among: Option<&[String]>,
     ) -> Result<BTreeSet<String>> {
+        let mut reachable = BTreeSet::new();
+        self.rev_list(roots, &[], |line| {
+            ensure!(valid_oid(line), "invalid accepted object identity");
+            if among.is_none_or(|among| {
+                among
+                    .binary_search_by(|probe| probe.as_str().cmp(line))
+                    .is_ok()
+            }) {
+                reachable.insert(line.to_owned());
+            }
+            Ok(())
+        })?;
+        Ok(reachable)
+    }
+
+    /// Every commit `roots` reach with its raw parents, under the same overlay-free walk as
+    /// [`Reader::reachable_among`].
+    #[cfg(any(feature = "cli", test))]
+    fn raw_ancestry(&mut self, roots: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut ancestry = BTreeMap::new();
+        self.rev_list(roots, &["--parents"], |line| {
+            let mut ids = line.split(' ');
+            let oid = ids.next().unwrap_or_default();
+            let parents: Vec<String> = ids.map(str::to_owned).collect();
+            ensure!(
+                valid_oid(oid) && parents.iter().all(|parent| valid_oid(parent)),
+                "invalid accepted object identity"
+            );
+            ancestry.insert(oid.to_owned(), parents);
+            Ok(())
+        })?;
+        Ok(ancestry)
+    }
+
+    /// Stream `git rev-list <args> --stdin` over `roots`, one line at a time. Replacement objects,
+    /// grafts, the shallow file and the commit-graph cache are ignored, and the walk is bounded
+    /// only by [`MAX_ACCEPTED_HISTORY`].
+    fn rev_list(
+        &mut self,
+        roots: &[String],
+        args: &[&str],
+        mut on_line: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         use std::io::{BufRead, Seek, Write};
         let mut input = tempfile::tempfile()?;
         for root in roots {
@@ -738,7 +1050,9 @@ impl Reader {
                 "core.commitGraph=false",
             ])
             .args(&self.prefix)
-            .args(["rev-list", "--stdin"])
+            .arg("rev-list")
+            .args(args)
+            .arg("--stdin")
             .stdin(input)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -746,22 +1060,17 @@ impl Reader {
             .spawn()
             .context("local Git inspection could not start")?;
         let stdout = child.stdout.take().expect("piped inspection stdout");
-        let mut reachable = BTreeSet::new();
         let mut walked = 0usize;
         let read = std::io::BufReader::new(stdout)
             .lines()
             .try_for_each(|line| -> Result<()> {
-                let oid = line.context("accepted publication history could not be read")?;
-                ensure!(valid_oid(&oid), "invalid accepted object identity");
+                let line = line.context("accepted publication history could not be read")?;
                 walked += 1;
                 ensure!(
                     walked <= MAX_ACCEPTED_HISTORY,
                     "accepted publication history limit exceeded"
                 );
-                if among.is_none_or(|among| among.binary_search(&oid).is_ok()) {
-                    reachable.insert(oid);
-                }
-                Ok(())
+                on_line(&line)
             });
         if read.is_err() {
             let _ = child.kill();
@@ -774,7 +1083,7 @@ impl Reader {
             status.success(),
             "audit publication data is unavailable locally"
         );
-        Ok(reachable)
+        Ok(())
     }
 
     /// Local branches and tags, and apart from them the version tags (see [`version_tag`]).
@@ -1282,6 +1591,134 @@ mod tests {
         let plan = PublicationPlan::freeze_selected_after(&repo, &["short".into()], &held).unwrap();
         assert_eq!(plan.boundary(), std::slice::from_ref(&base));
         assert_eq!(plan.commit_objects.len(), 2);
+    }
+
+    /// A history built as `base`, `c1`..`c4` on main, a side line `s1`..`s3` from `c2` merged by
+    /// `m`, then `c6`..`c8`; returns the commit ids by name.
+    fn parted_history(root: &std::path::Path, base: &str) -> BTreeMap<&'static str, String> {
+        let mut stream = String::new();
+        let mut commit = |branch: &str,
+                          mark: usize,
+                          name: &str,
+                          from: Option<&str>,
+                          merge: Option<&str>| {
+            stream.push_str(&format!(
+                "commit refs/heads/{branch}\nmark :{mark}\ncommitter W <w@example.invalid> 1700000000 +0000\ndata {}\n{name}\n",
+                name.len() + 1
+            ));
+            if let Some(from) = from {
+                stream.push_str(&format!("from {from}\n"));
+            }
+            if let Some(merge) = merge {
+                stream.push_str(&format!("merge {merge}\n"));
+            }
+        };
+        commit("main", 1, "c1", Some(base), None);
+        commit("main", 2, "c2", None, None);
+        commit("main", 3, "c3", None, None);
+        commit("main", 4, "c4", None, None);
+        commit("side", 11, "s1", Some(":2"), None);
+        commit("side", 12, "s2", None, None);
+        commit("side", 13, "s3", None, None);
+        commit("main", 5, "m", None, Some(":13"));
+        commit("main", 6, "c6", None, None);
+        commit("main", 7, "c7", None, None);
+        commit("main", 8, "c8", None, None);
+        git_with_input(root, &["fast-import", "--quiet"], &stream);
+        let marks = [
+            ("c1", "main~7"),
+            ("c2", "main~6"),
+            ("c3", "main~5"),
+            ("c4", "main~4"),
+            ("m", "main~3"),
+            ("c6", "main~2"),
+            ("c7", "main~1"),
+            ("c8", "main"),
+            ("s3", "side"),
+        ];
+        marks
+            .into_iter()
+            .map(|(name, rev)| (name, git(root, &["rev-parse", rev])))
+            .collect()
+    }
+
+    /// A history too long for one publication is planned in parts that each fit, and the
+    /// planner agrees with the freeze: freezing at each cut above what earlier parts carried adds
+    /// no more new commits than the budget. A merge brings its side line's new history into the
+    /// part that reaches it. When even the next step is more than one part can carry, the plan is
+    /// refused before any part. The held commit a part stands on is not a new commit, so a budget
+    /// of one still advances a line. A planner that counted only the first-parent line would put
+    /// the merge's side line in no part's budget and overrun it; one that counted the held
+    /// commits as new would refuse a line the destination admits one commit at a time.
+    #[test]
+    fn a_long_history_is_planned_in_parts_that_each_fit() {
+        let (_directory, repo, base) = repository();
+        let ids = parted_history(repo.root(), &base);
+        let stops = BTreeSet::from([base.clone()]);
+        let history = NewHistory::read(&repo, &ids["c8"], &stops).unwrap();
+        assert_eq!(history.len(), 11);
+        let cuts = history.plan_parts(PartBudget::new(5), |_| true).unwrap();
+        assert_eq!(
+            cuts,
+            [ids["c4"].clone(), ids["c6"].clone(), ids["c8"].clone()]
+        );
+        let mut held = stops.clone();
+        for cut in &cuts {
+            let plan = PublicationPlan::freeze_selected_after_at(
+                &repo,
+                &BTreeMap::from([("main".to_owned(), cut.clone())]),
+                &held,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let added = plan
+                .commit_objects
+                .iter()
+                .filter(|commit| !held.contains(*commit))
+                .count();
+            assert!(added <= 5, "{cut}: {:?}", plan.commit_objects);
+            held.extend(plan.commit_objects.iter().cloned());
+        }
+        assert!(held.contains(&ids["s3"]));
+        let refused = history
+            .plan_parts(PartBudget::new(3), |_| true)
+            .unwrap_err();
+        assert!(refused.to_string().contains(&ids["m"][..12]), "{refused:#}");
+        let line = NewHistory::read(&repo, &ids["c4"], &stops).unwrap();
+        assert_eq!(
+            line.plan_parts(PartBudget::new(1), |_| true).unwrap(),
+            ["c1", "c2", "c3", "c4"].map(|name| ids[name].clone())
+        );
+    }
+
+    /// A part frozen at a cut stays valid while its branch only moves forward past the cut, as
+    /// when turns are saved during a long publication, and is refused once the branch is
+    /// rewritten without it. Comparing the frozen head with the live branch tip would refuse every
+    /// part but the last; trusting the cut alone would publish history the branch dropped.
+    #[test]
+    fn a_part_frozen_at_a_cut_survives_its_branch_moving_forward_but_not_a_rewrite() {
+        let (_directory, repo, base) = repository();
+        let root = repo.root();
+        let ids = parted_history(root, &base);
+        let pins = BTreeMap::from([("main".to_owned(), ids["c4"].clone())]);
+        let held = BTreeSet::from([base.clone()]);
+        let plan = PublicationPlan::freeze_selected_after_at(&repo, &pins, &held, &BTreeSet::new())
+            .unwrap();
+        assert_eq!(plan.heads()[0].oid(), ids["c4"]);
+        assert_eq!(plan.commit_objects.len(), 5);
+        git(
+            root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "saved during the publication",
+            ],
+        );
+        plan.verify(&repo, &["main".into()]).unwrap();
+        git(root, &["update-ref", "refs/heads/main", &ids["c2"]]);
+        git(root, &["commit", "--allow-empty", "-qm", "rewritten"]);
+        assert!(plan.verify(&repo, &["main".into()]).is_err());
     }
 
     /// A bounded plan takes the tags it is asked to carry when the heads reach their commits below

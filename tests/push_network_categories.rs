@@ -359,7 +359,9 @@ impl Server {
                 }
                 let header = String::from_utf8(header).unwrap();
                 let first = header.lines().next().unwrap();
-                if first.contains(" /api/me/privacy/") {
+                // Neither the privacy rule store nor published push limits are part of what these
+                // scripts pin; a Hub without them answers 404 and the CLI uses its defaults.
+                if first.contains(" /api/me/privacy/") || first.contains(" /api/hub/config ") {
                     stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
                 }

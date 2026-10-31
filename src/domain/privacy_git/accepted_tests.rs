@@ -119,6 +119,7 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     let head = source.git(&["rev-parse", "HEAD"]).unwrap();
     let selected = SessionPublicationPlan {
         sources: None,
+        pins: Default::default(),
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
@@ -352,6 +353,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     let base = save(&legacy, "Accepted plain conversation");
     let mut selected = SessionPublicationPlan {
         sources: None,
+        pins: Default::default(),
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
@@ -875,6 +877,7 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
     let key = SecretKey::from([45; 32]);
     let mut selected = SessionPublicationPlan {
         sources: None,
+        pins: Default::default(),
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
@@ -1141,6 +1144,7 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         .unwrap();
     let mut selected = SessionPublicationPlan {
         sources: None,
+        pins: Default::default(),
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
