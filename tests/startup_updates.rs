@@ -339,7 +339,18 @@ mod terminal {
         );
         let hub = Hub::new(200, Some(fs::read(&tgz).unwrap()));
         let executable = lab.root.path().join("agit-bin");
-        fs::copy(env!("CARGO_BIN_EXE_agit"), &executable).unwrap();
+        // A child process makes the copy. Written here, the copy's writable descriptor passes to
+        // any child a sibling test forks meanwhile and stays open until that child execs; running
+        // a file open for writing fails (ETXTBSY), and portable-pty's spawn turns that failure into
+        // an abort on the terminal instead of an error.
+        assert!(
+            Command::new("cp")
+                .arg(env!("CARGO_BIN_EXE_agit"))
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success()
+        );
         (hub, executable)
     }
 
