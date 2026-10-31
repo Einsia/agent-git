@@ -19,6 +19,7 @@
 //! `/api/agents/for-repo` and lets the server look it up in reverse; the server intersects that
 //! against **the scope the current user may access** and returns a candidate list.
 
+pub(crate) mod activity;
 pub mod catalog;
 pub mod client;
 /// The git subprocesses that talk to the hub (`clone` / `fetch` / `push`): they inject the

@@ -110,6 +110,23 @@ impl Daemon {
                 live.approval_requests.clear();
             }
         }
+        // `updated_at` is the session's last activity: team activity reports it and orders by
+        // it, so a session that stopped moving it would read as long quiet while it works.
+        // Streaming deltas are covered by the item boundaries around them.
+        if matches!(
+            frame.method(),
+            method::SESSION_STATUS
+                | method::TURN_STARTED
+                | method::TURN_STEERED
+                | method::TURN_COMPLETED
+                | method::ITEM_STARTED
+                | method::ITEM_COMPLETED
+                | method::APPROVAL_REQUEST
+                | method::APPROVAL_RESOLVED
+        ) && let Some(live) = self.sessions.get_mut(&stream)
+        {
+            live.info.updated_at = chrono::Utc::now().to_rfc3339();
+        }
         if frame.method() == method::SESSION_PUBLICATION_CHANGED
             && let Some(status) = frame
                 .params
