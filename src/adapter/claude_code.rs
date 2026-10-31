@@ -32,18 +32,45 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
+/// How a turn's last record ended it.
+#[cfg(any(feature = "cli", feature = "rc"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnClose {
+    /// The model finished its reply.
+    Reply,
+    /// The person stopped it. Automatic publication waits for a later turn's cut to carry it: an
+    /// interrupt is their quick stop, often right after sending something they regret.
+    Interrupt,
+}
+
 /// Ordinary tool results and intermediate assistant records cannot settle an observed user turn.
 #[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn completed_turn_boundary(text: &str) -> Option<usize> {
     completed_turn_boundaries(text).last().copied()
 }
 
-/// Duration records close native executions; adjacent reply blocks share that boundary.
+/// Where automatic publication may cut: turns the model finished, never one the person stopped.
 #[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
+    turn_closes(text)
+        .into_iter()
+        .filter_map(|(end, close)| (close == TurnClose::Reply).then_some(end))
+        .collect()
+}
+
+/// The end of the last turn, finished or stopped; nothing after it awaits a reply.
+#[cfg(any(feature = "cli", feature = "rc"))]
+pub(crate) fn ended_turn_boundary(text: &str) -> Option<usize> {
+    turn_closes(text).last().map(|(end, _)| *end)
+}
+
+/// Duration records close native executions; adjacent reply blocks share that boundary.
+#[cfg(any(feature = "cli", feature = "rc"))]
+fn turn_closes(text: &str) -> Vec<(usize, TurnClose)> {
     let mut offset = 0;
-    let mut completed = None;
-    let mut boundaries = Vec::new();
+    let mut pending = None;
+    let mut interrupted = false;
+    let mut closes = Vec::new();
     for line in text.split_inclusive('\n') {
         offset += line.len();
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -52,17 +79,18 @@ pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
         if record["isSidechain"] == true || record["isMeta"] == true {
             continue;
         }
-        if record["type"] == "user"
-            && extract_tool_results(record.pointer("/message/content")).is_none()
-            && !is_system_generated(
-                &record,
-                extract_text(record.pointer("/message/content"))
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-            && let Some(end) = completed.take()
+        let user_text = (record["type"] == "user"
+            && extract_tool_results(record.pointer("/message/content")).is_none())
+        .then(|| extract_text(record.pointer("/message/content")).unwrap_or_default());
+        if let Some(text) = &user_text
+            && !is_system_generated(&record, text)
         {
-            boundaries.push(end);
+            closes.extend(pending.take());
+            interrupted = text.starts_with("[Request interrupted");
+            // A stop mid-reply leaves no tool denial; this marker is its only record.
+            if interrupted {
+                pending = Some((offset, TurnClose::Interrupt));
+            }
         }
         let terminal_reply = record["type"] == "assistant"
             && record["message"]["model"] != SYNTHETIC_MODEL
@@ -82,24 +110,31 @@ pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
                         .any(|block| block["type"] == "tool_result" && block["is_error"] == true)
                 });
         if record["type"] == "system" && record["subtype"] == "turn_duration" {
-            boundaries.push(offset);
-            completed = None;
-        } else if terminal_reply || interrupted_tool {
-            completed = Some(offset);
+            let close = if interrupted {
+                TurnClose::Interrupt
+            } else {
+                TurnClose::Reply
+            };
+            closes.push((offset, close));
+            pending = None;
+        } else if terminal_reply {
+            pending = Some((offset, TurnClose::Reply));
+            interrupted = false;
+        } else if interrupted_tool {
+            pending = Some((offset, TurnClose::Interrupt));
+            interrupted = true;
         }
     }
-    if let Some(end) = completed {
-        boundaries.push(end);
-    }
-    boundaries
+    closes.extend(pending);
+    closes
 }
 
-/// Whether conversation follows the last completed turn: a prompt, or a reply whose terminal
-/// record is not written yet. Bookkeeping and the records Claude Code writes for its own commands
+/// Whether conversation follows the last ended turn: a prompt, or a reply whose terminal record is
+/// not written yet. Bookkeeping and the records Claude Code writes for its own commands
 /// do not count, so a session that ended after its last reply awaits nothing.
 #[cfg(feature = "cli")]
 pub(crate) fn awaits_reply(text: &str) -> bool {
-    let end = completed_turn_boundary(text).unwrap_or(0);
+    let end = ended_turn_boundary(text).unwrap_or(0);
     text[end..].split_inclusive('\n').any(|line| {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
             return false;
@@ -1302,9 +1337,12 @@ fn extract_paths(input: Option<&serde_json::Value>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Capture cuts only where the model finished a turn. A person's interruption ends the turn, so
+    /// nothing after it awaits a reply, but it is no cut of its own: one that cut there would
+    /// publish what the person may have stopped in order to withhold.
     #[cfg(feature = "rc")]
     #[test]
-    fn observed_capture_requires_a_native_completion_or_interruption() {
+    fn observed_capture_cuts_at_a_native_completion_and_holds_an_interruption() {
         let progress = concat!(
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[]}}\n",
@@ -1317,10 +1355,32 @@ mod tests {
             super::completed_turn_boundary(&format!("{progress}{denied}")),
             None
         );
+        let interrupted = "{\"type\":\"user\",\"toolDenialKind\":\"interrupted\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"is_error\":true}]}}\n";
+        let stopped = format!("{progress}{interrupted}");
+        assert_eq!(super::completed_turn_boundary(&stopped), None);
+        assert_eq!(super::ended_turn_boundary(&stopped), Some(stopped.len()));
+        let marked = format!(
+            "{progress}{}",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}]}}\n"
+        );
+        assert_eq!(super::completed_turn_boundary(&marked), None);
+        assert_eq!(
+            super::ended_turn_boundary(&marked),
+            Some(marked.len()),
+            "a stop mid-reply ends the turn at its marker"
+        );
+        let timed = format!("{stopped}{{\"type\":\"system\",\"subtype\":\"turn_duration\"}}\n");
+        assert_eq!(super::completed_turn_boundary(&timed), None);
+        let carried =
+            format!("{stopped}{progress}{{\"type\":\"system\",\"subtype\":\"turn_duration\"}}\n");
+        assert_eq!(
+            super::completed_turn_boundary(&carried),
+            Some(carried.len()),
+            "a later completion carries the interrupted turn"
+        );
         for terminal in [
             "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\"}}\n",
             "{\"type\":\"system\",\"subtype\":\"turn_duration\"}\n",
-            "{\"type\":\"user\",\"toolDenialKind\":\"interrupted\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"is_error\":true}]}}\n",
         ] {
             let complete = format!("{progress}{terminal}");
             assert_eq!(

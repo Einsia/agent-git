@@ -7372,30 +7372,56 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             cc_user("cancelled-prompt", "cancel this write"),
             cc_call.replace("\"u4\"", "\"cancelled-call\"")
         );
-        let mut completed_only = opts();
-        completed_only.completed_only = true;
+        let automatic = || {
+            let mut completed_only = opts();
+            completed_only.completed_only = true;
+            completed_only
+        };
+        settle_bytes(
+            &s,
+            &repo,
+            "alice/photo",
+            "main",
+            lk.clone(),
+            stopped.as_bytes(),
+            "alice",
+            automatic(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            repo.commit_count(),
+            2,
+            "a turn the person interrupted waits for a later completed turn"
+        );
+
+        let carried = format!(
+            "{stopped}{}{{\"type\":\"assistant\",\"sessionId\":\"CC\",\"cwd\":\"/repo/one\",\"uuid\":\"u9\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"left it\"}}]}}}}\n",
+            cc_user("u8", "leave it then"),
+        );
         settle_bytes(
             &s,
             &repo,
             "alice/photo",
             "main",
             lk,
-            stopped.as_bytes(),
+            carried.as_bytes(),
             "alice",
-            completed_only,
+            automatic(),
             false,
             false,
         )
         .unwrap();
-        assert_eq!(repo.commit_count(), 3);
+        assert!(repo.commit_count() > 2);
         assert_eq!(
             meta::read_at_ref(&repo, "HEAD").unwrap().baseline_bytes,
-            Some(stopped.len() as u64)
+            Some(carried.len() as u64)
         );
+        let log = repo.show("HEAD", meta::LOG_FILE).unwrap();
         assert!(
-            repo.show("HEAD", meta::LOG_FILE)
-                .unwrap()
-                .contains("cancel this write")
+            log.contains("cancel this write") && log.contains("left it"),
+            "{log}"
         );
     }
 
