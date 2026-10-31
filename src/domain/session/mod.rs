@@ -28,10 +28,6 @@ use crate::adapter;
 use crate::domain::meta;
 use std::path::{Path, PathBuf};
 
-/// Cap on a single object when batch-reading `session/meta.json`: a meta is far below it, and
-/// anything over the cap is a corrupt object.
-const META_READ_CAP: usize = 1024 * 1024;
-
 /// One materialized session's content.
 #[derive(Debug, Clone)]
 pub struct Stored {
@@ -128,7 +124,7 @@ pub fn list_checked(repo: &crate::domain::repo::Repo) -> (Vec<Stored>, Vec<Strin
         .map(|(name, _)| name.clone())
         .collect();
     let mut read_bodies: Vec<Result<String, String>> = Vec::with_capacity(existing.len());
-    let read = repo.git_cat_file_batch(existing, META_READ_CAP, |_, _, body| {
+    let read = repo.git_cat_file_batch(existing, meta::MAX_BYTES, |_, _, body| {
         read_bodies.push(match body {
             crate::domain::repo::ObjectBody::Read(bytes) => String::from_utf8(bytes.to_vec())
                 .map_err(|_| format!("{} is not valid UTF-8", meta::FILE)),

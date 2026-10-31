@@ -1520,7 +1520,9 @@ impl Client {
             urlencode(&selection.author),
             urlencode(&selection.since),
             urlencode(&selection.before),
-            query.limit.unwrap_or(50)
+            query
+                .limit
+                .unwrap_or(crate::domain::activity::DEFAULT_LIMIT)
         );
         for (key, value) in [("session", &selection.session), ("cursor", &query.cursor)] {
             if let Some(value) = value {

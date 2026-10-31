@@ -209,6 +209,8 @@ impl Args {
     }
 }
 
+/// The most results one page holds; the MCP search tool offers the same range.
+pub(crate) const MAX_LIMIT: usize = 100;
 const MAX_BATCH_QUERIES: usize = 16;
 const BATCH_CONCURRENCY: usize = 4;
 const MAX_QUERY_CHARS: usize = 256;
@@ -498,8 +500,8 @@ fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
         );
     }
     let saved_filters = args.saved_filters()?;
-    if !(1..=100).contains(&args.limit) {
-        return Err("--limit must be between 1 and 100".into());
+    if !(1..=MAX_LIMIT).contains(&args.limit) {
+        return Err(format!("--limit must be between 1 and {MAX_LIMIT}"));
     }
     if args.page == 0 {
         return Err("--page must be at least 1".into());

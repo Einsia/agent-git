@@ -73,6 +73,14 @@ pub const ORIGIN: &str = "origin";
 /// Remote name of the source copy. Only your own copy (`agit clone --mine`) has one.
 pub const UPSTREAM: &str = "upstream";
 
+/// Commits one publication carries. A publication plan refuses more, and every check of a
+/// planned publication (its secret scan, its LFS walk) accepts this many.
+pub const MAX_PUBLICATION_COMMITS: usize = 4096;
+/// Refs one publication considers, branches and tags together.
+pub const MAX_PUBLICATION_REFS: usize = 4096;
+/// Annotated tags one ref may chain through before it reaches its commit.
+pub const MAX_TAG_CHAIN_DEPTH: usize = 32;
+
 /// Whether an agent name (the repo name) is valid.
 ///
 /// Letters, digits, `-` and `_` only: this name doubles as a directory name and a URL path segment.

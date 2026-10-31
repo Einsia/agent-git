@@ -9,7 +9,7 @@ use crate::hub::git::{
 };
 use anyhow::{Context, Result, ensure};
 
-const LFS_BATCH_POINTERS: usize = 100;
+const LFS_BATCH_POINTERS: usize = crate::domain::lfs::MAX_BATCH_OBJECTS;
 
 impl CompleteInspection {
     /// Only a complete deterministic inspection can reach publication.

@@ -478,6 +478,7 @@ fn build_candidate(
     let mut next_metadata = String::new();
     encode_facts(&facts, &mut next_metadata)?;
     next_metadata.push('\n');
+    meta::ensure_within_limit(next_metadata.as_bytes())?;
     let mut files = storage::snapshot_files(envelopes, "")?;
     files.remove(meta::VIEW_FILE);
     let suffix = files

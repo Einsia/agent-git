@@ -28,7 +28,9 @@ const MAX_WORK: usize = 8 * 1024 * 1024;
 const MAX_HITS: usize = 1_024;
 const MAX_REF_BYTES: usize = 128 * 1024;
 const MAX_COMMIT_BYTES: usize = 64 * 1024;
-const MAX_META_BYTES: usize = 64 * 1024;
+/// One read that admits a repository: its root, its worktree Git directory, or that directory's
+/// backlink.
+const MAX_ADMISSION_BYTES: usize = 64 * 1024;
 
 pub(super) fn validate(args: &Args, queries: &[String]) -> Result<Vec<Query>, String> {
     if args.kind != "sessions" || args.counts {
@@ -409,7 +411,7 @@ fn explain(reason: &str) -> String {
 }
 
 fn reserve_verification(initial: &[SavedRef], budget: &mut Budget) -> Option<Budget> {
-    let bytes = MAX_REF_BYTES + MAX_META_BYTES * 3;
+    let bytes = MAX_REF_BYTES + MAX_ADMISSION_BYTES * 3;
     let refs = initial.len().checked_add(1)?;
     if bytes > MAX_READ_BYTES.saturating_sub(budget.bytes)
         || refs > MAX_REFS.saturating_sub(budget.refs)
@@ -555,13 +557,13 @@ fn admit_repository(path: &Path, budget: &mut Budget) -> Result<Repo> {
         "local repository Git carrier is unavailable"
     );
     ensure!(
-        !carrier.is_file() || carrier.len() <= MAX_META_BYTES as u64,
+        !carrier.is_file() || carrier.len() <= MAX_ADMISSION_BYTES as u64,
         "local Git carrier exceeds the metadata budget"
     );
     let root = path.canonicalize()?;
     let repo = Repo::at(&root).local_objects_only();
     let cap = budget
-        .reserve(MAX_META_BYTES)
+        .reserve(MAX_ADMISSION_BYTES)
         .context("local repository admission exceeds the read budget")?;
     let output = repo.inspection_output_in_repository(
         &["rev-parse", "--show-toplevel"],
@@ -585,7 +587,7 @@ fn admit_repository(path: &Path, budget: &mut Budget) -> Result<Repo> {
     budget.bytes -= cap.saturating_sub(output.stdout.len());
     if carrier.is_file() {
         let cap = budget
-            .reserve(MAX_META_BYTES)
+            .reserve(MAX_ADMISSION_BYTES)
             .context("local worktree admission exceeds the read budget")?;
         let output = repo.inspection_output_in_repository(
             &["rev-parse", "--absolute-git-dir"],
@@ -609,7 +611,7 @@ fn admit_repository(path: &Path, budget: &mut Budget) -> Result<Repo> {
         let gitdir = Path::new(text).canonicalize()?;
         budget.bytes -= cap.saturating_sub(output.stdout.len());
         let cap = budget
-            .reserve(MAX_META_BYTES)
+            .reserve(MAX_ADMISSION_BYTES)
             .context("local worktree backlink exceeds the read budget")?;
         let bytes = crate::adapter::native_snapshot::read_file_bytes(
             &gitdir.join("gitdir"),
@@ -812,7 +814,7 @@ fn versions(repo: &Repo, refs: &[SavedRef], budget: &mut Budget) -> Vec<Version>
             }
             queue.push_back((parent, git_ref.clone()));
         }
-        let Some(cap) = budget.reserve(MAX_META_BYTES) else {
+        let Some(cap) = budget.reserve(meta::MAX_BYTES) else {
             break;
         };
         let raw = match read_object(
@@ -1204,7 +1206,7 @@ mod tests {
         admit_repository(&canonical, &mut Budget::default()).unwrap_or_else(|error| {
             let inspection = Repo::at(&canonical).inspection_output_in_repository(
                 &["rev-parse", "--show-toplevel"],
-                MAX_META_BYTES,
+                MAX_ADMISSION_BYTES,
                 crate::infra::local_git::Deadline::new(),
             );
             panic!(

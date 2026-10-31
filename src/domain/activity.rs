@@ -35,8 +35,10 @@ pub const SAVE_TIME_SCHEMA: u32 = 3;
 /// The request header in which a client names the contract it reads. It cannot be a query field:
 /// a Hub refuses a query field it does not know, while it ignores a header.
 pub const SCHEMA_HEADER: &str = "x-agentgit-activity-schema";
-const DEFAULT_LIMIT: usize = 50;
-const MAX_LIMIT: usize = 200;
+/// Message chunks in a page when the caller names no limit.
+pub const DEFAULT_LIMIT: usize = 50;
+/// The most message chunks one page may hold; every surface that takes a limit offers this range.
+pub const MAX_LIMIT: usize = 200;
 const MAX_PAGE_TEXT: usize = 256 * 1024;
 const MAX_PAGE_READ: usize = 128 * 1024 * 1024;
 const PAGE_TIME: Duration = Duration::from_secs(20);

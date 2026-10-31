@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-pub(super) const MAX_META: usize = 64 * 1024;
 const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WINDOW_RECORDS: usize = 1024;
 /// Windows smaller than this are validated on the calling thread; more threads would only add
@@ -173,7 +172,7 @@ impl<'s, S: Store> Extractor<'s, S> {
             return Ok(());
         }
         let objects: Vec<_> = unread.iter().map(|commit| (*commit, meta::FILE)).collect();
-        let blobs = self.store.read(&objects, MAX_META)?;
+        let blobs = self.store.read(&objects, meta::MAX_BYTES)?;
         ensure!(
             blobs.len() == unread.len(),
             "activity metadata reply is incomplete"
@@ -197,6 +196,24 @@ impl<'s, S: Store> Extractor<'s, S> {
             self.metas.insert(commit.into(), state);
         }
         Ok(())
+    }
+
+    /// Read session metadata for the first `required` of `commits` whatever it costs, and for as
+    /// many of the rest as fit, at the size metadata may have ([`meta::MAX_BYTES`]), in half of what
+    /// the page can still read after that. The other half stays for the first contribution: a
+    /// read-ahead that could take the whole page ends it before any progress, with no cursor to
+    /// continue from.
+    pub(super) fn metas_ahead(&mut self, commits: &[&str], required: usize) -> Result<()> {
+        let (now, later) = commits.split_at(required.min(commits.len()));
+        self.metas(now)?;
+        let fit = (self.remaining / 2) / meta::MAX_BYTES;
+        let ahead: Vec<&str> = later
+            .iter()
+            .copied()
+            .filter(|commit| !self.metas.contains_key(*commit))
+            .take(fit)
+            .collect();
+        self.metas(&ahead)
     }
 
     pub(super) fn has_meta(&self, commit: &str) -> bool {

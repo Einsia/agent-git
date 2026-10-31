@@ -3637,6 +3637,7 @@ pub(crate) fn tree_with_current_committer(repo: &Repo, tree: &str) -> Result<Str
     let mut updated = String::new();
     facts.write_json(&mut updated)?;
     updated.push('\n');
+    crate::domain::meta::ensure_within_limit(updated.as_bytes())?;
     tree_apply_owned(
         repo,
         tree,

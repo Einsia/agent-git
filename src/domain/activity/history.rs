@@ -193,7 +193,7 @@ pub(super) fn scope(
     let mut tip_sessions = HashMap::new();
     for (tip, blob) in tips
         .iter()
-        .zip(store.read(&objects, super::extract::MAX_META)?)
+        .zip(store.read(&objects, crate::domain::meta::MAX_BYTES)?)
     {
         if let Blob::Body(raw) = blob
             && let Ok(metadata) = parse_meta(&raw, tip)
@@ -538,7 +538,7 @@ pub(super) fn candidates<S: Store>(
             .flat_map(|(_, entries)| entries.iter().map(Entry::commit))
             .take(PREFETCH.max(current))
             .collect();
-        extractor.metas(&commits)?;
+        extractor.metas_ahead(&commits, current)?;
     }
     let entries = std::mem::take(&mut upcoming[0].1);
     let mut result = Vec::new();

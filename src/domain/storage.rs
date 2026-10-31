@@ -1214,7 +1214,11 @@ fn materialize_pair_with_policy(
     }
     let commit = resolve_commit_with_policy(repo_root, git_ref, policy)?;
     let local = !matches!(policy, ReadPolicy::AllowTransport);
-    let meta_limit = if local { 1024 * 1024 } else { MAX_EVENT_BYTES };
+    let meta_limit = if local {
+        meta::MAX_BYTES
+    } else {
+        MAX_EVENT_BYTES
+    };
     let sequence_limit = if local {
         max_sequence_bytes.min(MAX_MATERIALIZED_BYTES)
     } else {
@@ -2333,7 +2337,7 @@ pub(crate) fn metadata_local(repo_root: &Path, commit: &str) -> Result<meta::Met
         repo_root,
         commit,
         meta::FILE,
-        1024 * 1024,
+        meta::MAX_BYTES,
         ReadPolicy::LocalOnly,
     )?;
     meta::parse_strict(

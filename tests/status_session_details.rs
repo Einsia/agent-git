@@ -1660,8 +1660,18 @@ fn status_project_badges_match_code_origins_without_selecting_or_mutating_sessio
     fs::remove_file(&expected_git).unwrap();
     fs::rename(&separate_git, &expected_git).unwrap();
 
-    snapshot.milestone = Some("x".repeat(1024 * 1024));
-    save_code(&mut lab, &snapshot);
+    // agit refuses to write metadata over its limit, so this is metadata an older agit or a hand
+    // edit left behind: status reports it unavailable instead of reading it.
+    snapshot.milestone = Some("x".repeat(meta::MAX_BYTES));
+    fs::write(
+        lab.repo.root().join(meta::FILE),
+        serde_json::to_vec_pretty(&snapshot).unwrap(),
+    )
+    .unwrap();
+    lab.git(&["add", meta::FILE]);
+    lab.git(&["commit", "-m", "record oversized metadata"]);
+    lab.head = lab.git(&["rev-parse", "HEAD"]);
+    lab.git(&["branch", "-f", "topic", "HEAD"]);
     lab.expect_project("unavailable: project evidence");
     snapshot.milestone = None;
     save_code(&mut lab, &snapshot);
