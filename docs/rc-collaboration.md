@@ -23,6 +23,18 @@ The attribution is RC event metadata; it does not modify the native harness tran
 inject sender text into the model prompt. Journal retention and Hub event retention govern
 its availability when reopening history.
 
+## Stopping and closing
+
+`session.stop {session_id}` ends agit's hold on a live session. A harness that agit launched
+exits; a session attached from its owner's own terminal is only released, never killed. The
+session can be resumed later. `session.close` does the same and also stops this machine's
+collection of the session's native transcript. An operator or the owner may stop a session;
+only the owner may close it. Both are admitted, like `turn.interrupt`, on sessions running in a
+dangerous permission mode. Closing a session that is not running here is refused and leaves its
+collection unchanged. A close saves the release before it stops the session; if the save fails,
+the session keeps running, the close can be retried, and the answer says whether this computer's
+collection is unchanged or, when that cannot be confirmed, that it is uncertain.
+
 The additions are optional JSON fields. Older Hubs retain their existing `by` display label
 without an authenticated sender snapshot. Older daemons can ignore the new caller metadata;
 a viewer must not label unattributed native messages as the current viewer's messages.

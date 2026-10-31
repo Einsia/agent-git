@@ -195,6 +195,8 @@ pub fn authorize(
         | "turn.start"
         | "turn.steer"
         | "turn.interrupt"
+        | "session.stop"
+        | "session.close"
         | "approval.decide"
         | "session.command"
         | "session.setModel"
@@ -220,6 +222,24 @@ pub fn authorize(
             } else {
                 resources.session(&id).cloned()
             };
+            if method == "session.close" {
+                // Owner first, before any answer depends on whether the id runs here: a caller
+                // who may not close must not learn from close which ids are live.
+                let owner = Permit {
+                    method: method.clone(),
+                    target: resolved.clone().map_or(Target::Machine, Target::Session),
+                    need: Need::Admin,
+                    ceiling,
+                    start_id: None,
+                    resolve_session: None,
+                };
+                if !owner.allowed(policy, principal) {
+                    return Err(denied());
+                }
+                if resolved.is_none() {
+                    return Err(super::super::daemon::not_running_to_close());
+                }
+            }
             let session = resolved.ok_or_else(|| {
                 RpcError::new(
                     ErrorCode::SessionNotFound,
@@ -244,6 +264,8 @@ pub fn authorize(
                             | "session.setPermissionMode"
                             | "approval.decide"
                             | "turn.interrupt"
+                            | "session.stop"
+                            | "session.close"
                     );
                 let watch_read =
                     id == super::super::daemon::watch_stream_id(
@@ -292,7 +314,7 @@ pub fn authorize(
                     "refresh the source-qualified session catalog",
                 ));
             }
-            let need = if method == "session.command" {
+            let need = if matches!(method.as_str(), "session.command" | "session.close") {
                 Need::Admin
             } else if matches!(
                 method.as_str(),
@@ -421,6 +443,67 @@ mod tests {
     use super::*;
     use agit_peer::access::{Resource, Rule};
     use serde_json::json;
+
+    /// A cloud `session.close` checks owner access before it says whether the id runs on this
+    /// device: a controller below owner gets the same refusal for a session in the catalog and for
+    /// an unknown id, and only an owner hears that the id is not running here. Resolving the id
+    /// first, or gating close like stop, would let any controller probe which ids are live.
+    #[test]
+    fn close_refuses_non_owners_alike_whether_or_not_the_id_runs_here() {
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "member".into(),
+        };
+        let policy = |access| {
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Machine,
+                    access,
+                }],
+            )
+            .unwrap()
+        };
+        let reference = crate::protocol::NativeSourceRef {
+            source_id: "source-a".into(),
+            generation: 3,
+        }
+        .session_ref("native");
+        let mut resources = Resources::default();
+        resources.observe(
+            "workspace.list",
+            &json!({"workspaces":[{"workspace_id":"local-owner", "projects":[{
+                "project_id":"project", "local_path":"/project"
+            }]}]}),
+        );
+        resources.observe(
+            "session.catalog.list",
+            &json!({"rows":[{
+                "session_ref":reference, "source_id":"source-a", "source_generation":3,
+                "native_session_id":"native", "runtime":"codex", "cwd":"/project"
+            }]}),
+        );
+        assert!(resources.session(&reference).is_some());
+        let close = |id: &str| Frame::request("session.close", json!({"session_id": id}));
+        let mut refusal = |id: &str, access| {
+            authorize(close(id), &principal, &policy(access), &mut resources)
+                .err()
+                .map(|error| (error.code, error.message))
+        };
+        for access in [Access::Read, Access::Control] {
+            let known = refusal(&reference, access);
+            assert!(known.is_some());
+            assert_eq!(known, refusal("unknown", access));
+        }
+        assert_eq!(
+            refusal("unknown", Access::Admin),
+            Some((
+                ErrorCode::SessionNotFound as i32,
+                crate::rc::daemon::not_running_to_close().message
+            ))
+        );
+    }
 
     #[test]
     fn managed_source_operations_preserve_executor_identity_and_access() {

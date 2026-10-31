@@ -1875,3 +1875,230 @@ fn rfc3339_is_sortable_lexicographically() {
     // The list sorts by string in reverse, so this property is a precondition for correct order.
     assert!(newer > older, "{newer} must sort after {older}");
 }
+
+/// `session.close` stops this machine's collection of the session's transcript, so only the
+/// owner may send it: an operator's close is refused with the owner-only message before anything
+/// reaches the session or the roster, while the operator's stop still ends the session and keeps
+/// its capture, and the owner's close ends the session and releases its capture. Gating close like
+/// stop, gating stop like close, or closing without releasing capture would each still produce a
+/// plausible reply for one caller or a session that keeps being collected.
+#[test]
+fn only_the_owner_closes_a_live_session_and_closing_releases_its_capture() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = mpsc::channel(4);
+                let mut roster = Roster::default();
+                roster.observed.insert("session-a".into());
+                let daemon = rpc_test_daemon(
+                    [(
+                        "session-a".into(),
+                        rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    roster,
+                );
+                let mut state = daemon.lock().await;
+                let (frames, _received) = mpsc::channel(1);
+                let mut request = Frame::request(
+                    method::SESSION_CLOSE,
+                    serde_json::json!({"session_id":"session-a"}),
+                );
+                request.caller = Some(claim("operator", "ws-a"));
+                let refused = state.dispatch(&request, &frames).await.unwrap_err();
+                assert!(refused.is(ErrorCode::Forbidden));
+                assert_eq!(
+                    refused.message,
+                    "only the owner of this workspace can do that on this machine"
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "a refused close must not reach the session"
+                );
+                assert!(state.roster.observed.contains("session-a"));
+
+                let mut stop = Frame::request(
+                    method::SESSION_STOP,
+                    serde_json::json!({"session_id":"session-a"}),
+                );
+                stop.caller = Some(claim("operator", "ws-a"));
+                let reply = state.dispatch(&stop, &frames).await.unwrap();
+                assert_eq!(reply["closed"], false);
+                assert!(matches!(rx.try_recv(), Ok(Command::Shutdown)));
+                assert!(state.roster.observed.contains("session-a"));
+
+                request.caller = Some(claim("owner", "ws-a"));
+                let reply = state.dispatch(&request, &frames).await.unwrap();
+                assert_eq!(reply["closed"], true);
+                assert!(matches!(rx.try_recv(), Ok(Command::Shutdown)));
+                assert!(!state.roster.observed.contains("session-a"));
+            });
+    });
+}
+
+/// The owner's `session.close` on a session that is not live here (ended, or never here) is
+/// refused with the fixed "not running" message and leaves its collection as it was. Falling
+/// through to the generic missing-session error, or dropping the id from the observed set anyway,
+/// would read as a stale catalog or silently change what this computer collects.
+#[test]
+fn closing_a_session_that_is_not_running_here_changes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = mpsc::channel(4);
+                let mut roster = Roster::default();
+                roster.observed.insert("session-ended".into());
+                roster.observed.insert("session-gone".into());
+                let mut ended = rpc_test_live(
+                    "session-ended",
+                    1,
+                    tx,
+                    crate::protocol::PermissionMode::Default,
+                );
+                ended.ended = true;
+                let daemon = rpc_test_daemon(
+                    [("session-ended".into(), ended)].into_iter().collect(),
+                    roster,
+                );
+                let mut state = daemon.lock().await;
+                let (frames, _received) = mpsc::channel(1);
+                for id in ["session-ended", "session-gone"] {
+                    let mut request =
+                        Frame::request(method::SESSION_CLOSE, serde_json::json!({"session_id": id}));
+                    request.caller = Some(claim("owner", "ws-a"));
+                    let refused = state.dispatch(&request, &frames).await.unwrap_err();
+                    assert_eq!(
+                        refused.message,
+                        "this session isn't running here; its collection on this computer was not changed"
+                    );
+                    assert!(state.roster.observed.contains(id));
+                }
+                assert!(rx.try_recv().is_err());
+            });
+    });
+}
+
+/// On the device, a `session.close` from someone who may not close a given session answers the
+/// same whether or not that id runs here: an operator gets the owner-only refusal for a live and
+/// an unknown id alike, and an owner of another workspace gets the "not running" answer for this
+/// workspace's live session just as for an unknown id. Answering "not running" before the role
+/// check, or only checking liveness and not the workspace, would let close tell them apart.
+#[test]
+fn close_answers_alike_for_a_live_and_an_unknown_id_when_the_caller_may_not_close_it() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = mpsc::channel(4);
+                let daemon = rpc_test_daemon(
+                    [(
+                        "session-a".into(),
+                        rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    Roster::default(),
+                );
+                let mut state = daemon.lock().await;
+                let (frames, _received) = mpsc::channel(1);
+                for (role, workspace) in [("operator", "ws-a"), ("owner", "ws-b")] {
+                    let mut refusals = vec![];
+                    for id in ["session-a", "session-unknown"] {
+                        let mut request = Frame::request(
+                            method::SESSION_CLOSE,
+                            serde_json::json!({"session_id": id}),
+                        );
+                        request.caller = Some(claim(role, workspace));
+                        let refused = state.dispatch(&request, &frames).await.unwrap_err();
+                        refusals.push((refused.code, refused.message));
+                    }
+                    assert_eq!(refusals[0], refusals[1], "{role} of {workspace}");
+                }
+                assert!(rx.try_recv().is_err());
+            });
+    });
+}
+
+/// A close answers what the roster on disk says, and stops the session only once the release is
+/// saved. A save that fails after writing the fallback is rolled back on disk before the answer
+/// says "not changed"; when that rollback fails too, the answer claims neither state; and in
+/// every failed case the session keeps running, so the close can be retried and
+/// releases collection once saving works. Restoring the entry only in memory, or stopping before
+/// the save, would answer "not changed" over a disk that dropped it, or leave a session that can
+/// no longer be closed.
+#[test]
+fn a_close_that_cannot_save_leaves_the_session_running_and_answers_what_the_disk_says() {
+    use crate::rc::roster::{fail_next_saves, pending_injected_saves};
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = mpsc::channel(4);
+                let mut roster = Roster::default();
+                roster.observed.insert("session-a".into());
+                // The fallback is authoritative on disk, so the next save writes it first.
+                fail_next_saves(1, 0);
+                roster.save_fail_closed().unwrap();
+                assert!(roster.fail_closed_fallback_active.get());
+                let daemon = rpc_test_daemon(
+                    [(
+                        "session-a".into(),
+                        rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    roster,
+                );
+                let mut state = daemon.lock().await;
+                let (frames, _received) = mpsc::channel(1);
+                let mut request = Frame::request(
+                    method::SESSION_CLOSE,
+                    serde_json::json!({"session_id":"session-a"}),
+                );
+                request.caller = Some(claim("owner", "ws-a"));
+                let not_changed =
+                    "the session was not closed; its collection on this computer was not changed";
+                // Fallback written without the entry, primary fails; the rollback saves it back.
+                // Then a total failure whose rollback fails too; then one whose rollback works.
+                for (primary, fallback, answer) in [
+                    (1, 0, not_changed),
+                    (
+                        2,
+                        2,
+                        "the session was not closed or stopped; whether this computer keeps collecting it after agit restarts is uncertain",
+                    ),
+                    (1, 1, not_changed),
+                ] {
+                    fail_next_saves(primary, fallback);
+                    let refused = state.dispatch(&request, &frames).await.unwrap_err();
+                    assert_eq!(pending_injected_saves(), (0, 0));
+                    assert_eq!(refused.message, answer);
+                    assert!(rx.try_recv().is_err(), "a close that did not save must not stop");
+                    assert!(state.roster.observed.contains("session-a"));
+                    // A restart reads this. With both rollback writes failing, nothing was written,
+                    // so the entry is there too; the answer just cannot know that.
+                    assert!(Roster::try_load().unwrap().observed.contains("session-a"));
+                }
+
+                let reply = state.dispatch(&request, &frames).await.unwrap();
+                assert_eq!(reply["closed"], true);
+                assert!(matches!(rx.try_recv(), Ok(Command::Shutdown)));
+                assert!(!Roster::try_load().unwrap().observed.contains("session-a"));
+            });
+    });
+}

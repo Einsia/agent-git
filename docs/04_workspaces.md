@@ -103,6 +103,7 @@ session**. So everything you would do in the terminal has to be here:
 |---|---|---|
 | Talk | `turn.start` (when idle) / `turn.steer` (mid-turn) | see below |
 | Interrupt | `turn.interrupt` | claude-code leaves `[Request interrupted by user]` in the transcript; that turn is recorded as `interrupted` |
+| Stop / close | `session.stop` / `session.close` | ends agit's hold on the session; see [rc-collaboration](rc-collaboration.md#stopping-and-closing) |
 | Answer an approval | `approval.decide` | `session_id` required, `allow` / `deny`, plus a `scope` |
 | Switch permission mode | `session.setPermissionMode` | see the table below |
 
