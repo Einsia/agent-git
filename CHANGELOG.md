@@ -8,6 +8,52 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.34] - 2026-11-01
+
+### Added
+
+- Team activity shows live status, including "Needs approval", for members' terminal Claude Code
+  sessions in folders bound with `agit project bind`, on Hubs that support it.
+
+### Fixed
+
+- 0.2.33 could upload a conversation you had dropped with `agit project drop`: after `agit on --repo`
+  moved its folder to another repository, or `agit project bind --rebind` bound the folder to one,
+  `agit save --all` or `agit save --today` could upload it there. A dropped conversation now stays
+  dropped.
+- A conversation you dropped stays dropped when a subfolder of a folder that is on gets its own
+  setting with `agit project bind`; in 0.2.33, `agit save --all` in the subfolder, or
+  `agit save --today`, could upload it.
+- A folder that is on now also saves and uploads the sessions in the git worktrees of its checkout,
+  from when it covers each one; earlier sessions there wait for `agit save --all`, and `agit off` in
+  a worktree stops only that worktree. A conversation in a git worktree that was already running
+  when you upgraded isn't uploaded until you save it: `agit save` in that conversation, or
+  `agit save --all` in the worktree.
+- A failed first clone no longer leaves `agit status` and `agit doctor` refusing to run, and a
+  leftover recovery note now says whether another agit command is still running or an earlier one
+  stopped and `agit config --list` finishes it.
+- A folder that uploads automatically now says at session start when agit is signed out, and the
+  next turn shows why an automatic upload failed. It no longer promises uploads that never happen.
+- A failing agit hook no longer exits with code 2, which Claude Code treats as an instruction to the
+  agent.
+- `agit push` finds a commit's privacy envelope whatever type of entry it is stored as, including a
+  submodule entry with an older system Git, and refuses such a commit like any other unpublished
+  encrypted snapshot.
+- `agit setup --hooks` adds its hooks to a runtime's existing hook file (Claude Code's
+  `settings.json`, Codex's and WorkBuddy's hooks files) without reordering keys or reflowing the
+  rest of the file, and leaves a file it cannot edit that way, such as one with a key given twice,
+  unchanged.
+- A device that has just connected to the Hub for the first time no longer drops its connections a
+  few seconds later, so Remote Control requests sent at that moment no longer fail with "executor
+  attachment changed".
+- A Claude Code session driven by an SDK host saves each turn at its own Stop, including the
+  session's last turn, instead of one turn late and never the last one.
+
+### Changed
+
+- A first publication to a new repository, and every publication preview, start a fixed number of
+  Git processes instead of one or more per commit.
+
 ## [0.2.33] - 2026-10-31
 
 ### Added
