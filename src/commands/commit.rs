@@ -6,11 +6,17 @@
 //! * The message is the turn's **first line of user prompt** (truncated to 72 characters).
 //! * Every commit updates the VIEW on its own (recognizing a compact the harness did itself).
 //! * Boundaries fall only at real user speech, leaving no dangling `tool_use`.
-//! * **An in-flight trailing turn does not settle** — a turn is atomic, there is no half-turn
-//!   commit. "In flight" has two forms: only a user prompt, with no reply of any kind yet; or a
-//!   tool call the agent started whose output has not arrived (when the agent runs `agit commit`
-//!   from inside a turn, that call is the open one). Both stay in the runtime until the next
-//!   settlement, see [`in_flight_tail`].
+//! * **An in-flight trailing turn does not settle** — there is no half-turn commit. "In
+//!   flight" has two forms: only a user prompt, with no reply of any kind yet; or a tool call the
+//!   agent started whose output has not arrived (when the agent runs `agit commit` from inside a
+//!   turn, that call is the open one). Both stay in the runtime until the next settlement, see
+//!   [`in_flight_tail`]. A runtime that records where its executions complete (a Claude Code
+//!   terminal reply, a Codex `task_complete`) settles up to the last completion only.
+//! * **One user turn can land as several commits.** The agent can keep working after a
+//!   completion without a new prompt — a background task's notification wakes it, a goal turn
+//!   continues. History is never amended, so that work lands as a further commit carrying the
+//!   same turn ordinal, on top of the first. `<ref>#n` names the whole turn (its last commit),
+//!   and `agit log` marks the later commits with `+n`.
 //! * When the content is unchanged, print "nothing new since <version>" and exit 0.
 //! * `--milestone` annotates the last commit with a phase summary, `--tag` also tags it,
 //!   `--code` additionally makes one commit in the cwd's code repo and records the new sha as
@@ -377,6 +383,7 @@ fn run_inner(args: Args) -> CmdResult {
         code: args.code,
         completed_only: args.from_supervisor,
         native_completions: Vec::new(),
+        stop_receipt: None,
         historical: false,
         message: args.message,
         paths: args.paths,
@@ -661,6 +668,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     if Repo::open(&dir).is_none() {
         return Ok(ExitCode::Ok);
     }
+    let stop_receipt = observe_stop(&lk);
     settle(
         store,
         &dir,
@@ -675,6 +683,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             code: false,
             completed_only: false,
             native_completions: Vec::new(),
+            stop_receipt,
             historical: false,
             message: None,
             paths: Vec::new(),
@@ -682,6 +691,89 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             capture: false,
         },
     )
+}
+
+/// How long a Claude Code Stop waits for the stopped execution's last record to reach the file.
+const STOP_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const STOP_RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The transcript prefix a Stop proves complete when the transcript cannot prove it yet.
+///
+/// Codex runs its Stop hooks before it writes the record that closes the turn, so while the hook
+/// runs the transcript holds the finished execution without its completion record. Without the
+/// receipt, a continuation that runs without a new prompt (a goal turn, say) settles only at
+/// some later Stop, and the last one never does. The receipt names the bytes the hook read, and
+/// settlement uses it only while they are still, byte for byte, the transcript's prefix.
+pub(crate) struct StopReceipt {
+    bytes: usize,
+    sha256: String,
+}
+
+impl StopReceipt {
+    fn proves(&self, transcript: &[u8]) -> bool {
+        use sha2::Digest as _;
+        transcript
+            .get(..self.bytes)
+            .is_some_and(|prefix| hex::encode(sha2::Sha256::digest(prefix)) == self.sha256)
+    }
+}
+
+/// Read what a Stop hook proves about the session's transcript.
+///
+/// Claude Code records each completion in the transcript itself (a terminal reply), but writes
+/// it asynchronously: the Stop waits, within [`STOP_RECORD_GRACE`], until that record is on
+/// disk, and then needs no receipt. Codex is blocked until the hook returns, so the bytes it
+/// has written are exactly the finished execution; it gets a receipt unless the execution after
+/// its last completion record still has a call without output, or holds nothing but bookkeeping.
+fn observe_stop(lk: &Link) -> Option<StopReceipt> {
+    match lk.source.as_str() {
+        "claude-code" => {
+            let deadline = std::time::Instant::now() + STOP_RECORD_GRACE;
+            while let Ok(bytes) = lk.read_bytes() {
+                if std::time::Instant::now() >= deadline
+                    || !crate::adapter::claude_code::stop_record_pending(&String::from_utf8_lossy(
+                        &bytes,
+                    ))
+                {
+                    break;
+                }
+                std::thread::sleep(STOP_RECORD_POLL);
+            }
+            None
+        }
+        "codex" => codex_stop_receipt(&lk.read_bytes().ok()?),
+        _ => None,
+    }
+}
+
+/// A Codex Stop's receipt for the bytes its hook read, if they hold a finished execution.
+fn codex_stop_receipt(bytes: &[u8]) -> Option<StopReceipt> {
+    let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
+    let text = std::str::from_utf8(&bytes[..end]).ok()?;
+    let adapter = crate::adapter::get("codex").ok()?;
+    let ir = adapter.parse(text).ok()?;
+    let completed = ir
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::TurnEnd)
+        .filter_map(|event| event.line)
+        .max();
+    let after = |line: usize| completed.is_none_or(|completed| line > completed);
+    let substantive = ir.events.iter().any(|event| {
+        !matches!(event.kind, EventKind::Other | EventKind::TurnEnd)
+            && event.line.is_some_and(after)
+    });
+    let open = adapter
+        .open_tool_calls(text)
+        .iter()
+        .any(|call| after(call.line));
+    (substantive && !open).then(|| {
+        use sha2::Digest as _;
+        StopReceipt {
+            bytes: end,
+            sha256: hex::encode(sha2::Sha256::digest(&bytes[..end])),
+        }
+    })
 }
 
 /// The part we use of the JSON the harness feeds the Stop hook.
@@ -1082,6 +1174,7 @@ struct SettleOpts {
     code: bool,
     completed_only: bool,
     native_completions: Vec<usize>,
+    stop_receipt: Option<StopReceipt>,
     historical: bool,
     message: Option<String>,
     paths: Vec<String>,
@@ -1112,6 +1205,8 @@ enum InFlight {
     /// The agent started a tool call whose result is not written back to the transcript yet;
     /// `name` is that tool.
     OpenCall { name: String },
+    /// The runtime records native completions and the work after the last one has none yet.
+    Unfinished,
 }
 
 /// Whether the last turn is still running.
@@ -1164,14 +1259,24 @@ fn in_flight_tail(ir: &Session, open: &[OpenCall]) -> Option<InFlight> {
 pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<bool> {
     let adapter = crate::adapter::get(runtime)?;
     let session = adapter.parse(text)?;
-    Ok(in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some())
+    if in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some() {
+        return Ok(true);
+    }
+    // Settlement leaves work after the last recorded completion in the runtime.
+    if records_completions(runtime, text, &session) {
+        let (end, _) = completion_boundaries(runtime, text, Vec::new(), false)?;
+        return Ok(substantive_from(text, &session, end));
+    }
+    Ok(false)
 }
 
 /// The end of the last turn that settlement by ordinal counts as landed in a native transcript
 /// whose branch head records `settled` turns; `None` when settlement selects new turns by the
-/// retained LOG prefix instead.
+/// retained LOG prefix instead, as it does for a runtime that closes turns natively and wherever
+/// the transcript records completions ([`records_completions`]): a reply written after a turn
+/// was settled is then a continuation that settles on its own.
 ///
-/// Without terminal native records, every record up to the end of the head's last turn belongs
+/// Without completion records, every record up to the end of the head's last turn belongs
 /// to that turn, including records written after the committed LOG ends: a reply finished after
 /// its turn was settled waits for the next turn and is not offered on its own. A check that
 /// asks whether a claim still holds settleable work must start here, or it demands a commit
@@ -1186,12 +1291,7 @@ pub(crate) fn ordinal_settled_end(
     };
     let adapter = crate::adapter::get(runtime)?;
     let ir = adapter.parse(text)?;
-    if adapter.requires_turn_end()
-        || ir
-            .events
-            .iter()
-            .any(|event| event.kind == EventKind::TurnEnd)
-    {
+    if closes_natively(adapter.as_ref(), &ir) || records_completions(runtime, text, &ir) {
         return Ok(None);
     }
     Ok(turn_chunks(text, &ir, &adapter.open_tool_calls(text))
@@ -1200,22 +1300,19 @@ pub(crate) fn ordinal_settled_end(
 }
 
 /// How much of `region`, a transcript past a materialization baseline, precedes its first user
-/// prompt when settlement selects turns without terminal native records; `None` when the runtime
-/// closes turns natively.
+/// prompt when settlement selects turns without completion records; `None` when the runtime
+/// closes turns natively or the region's records mark where executions complete
+/// ([`records_completions`]).
 ///
 /// Those records open no turn: settlement lands them with the next prompt and offers nothing
 /// for them alone, so a check for settleable work starts after them. A runtime that closes turns
-/// natively may be continuing a turn whose terminal record is not written yet, and a partial
-/// line may be the next prompt, so neither is skipped.
+/// natively may be continuing a turn whose terminal record is not written yet; where completions
+/// are recorded, a reply before the next prompt may be a continuation that settles on its own;
+/// and a partial line may be the next prompt. None of them is skipped.
 pub(crate) fn leading_turnless_len(runtime: &str, region: &str) -> crate::Result<Option<usize>> {
     let adapter = crate::adapter::get(runtime)?;
     let ir = adapter.parse(region)?;
-    if adapter.requires_turn_end()
-        || ir
-            .events
-            .iter()
-            .any(|event| event.kind == EventKind::TurnEnd)
-    {
+    if closes_natively(adapter.as_ref(), &ir) || records_completions(runtime, region, &ir) {
         return Ok(None);
     }
     let prompt = ir
@@ -1359,6 +1456,12 @@ fn explain_in_flight(why: &InFlight) {
                 )
             );
         }
+        InFlight::Unfinished => println!(
+            "{}",
+            ui::dim(
+                "  the agent is still working and has not completed since the last settled point — it settles when the agent finishes"
+            )
+        ),
     }
 }
 
@@ -1482,7 +1585,9 @@ fn annotate_completed_boundaries(
     Ok(())
 }
 
-/// Native completions remain separate snapshots even when recovery collects them together.
+/// One chunk per native completion, under the ordinal of the user turn it completes.
+///
+/// Which of them become commits is the caller's choice (see [`one_commit_per_turn`]).
 fn completed_turn_chunks(
     region: &str,
     ir: &Session,
@@ -1553,6 +1658,8 @@ fn completed_turn_chunks(
             covered = end_byte;
         }
     }
+    let closed = user_chunks.len().saturating_sub(1);
+    let substantive = substantive_starts(region, ir);
     for (index, chunk) in user_chunks.into_iter().enumerate() {
         let mut ends = Vec::new();
         while let Some(&end) = terminal.peek() {
@@ -1565,8 +1672,16 @@ fn completed_turn_chunks(
             }
         }
         // Only legacy groups need an implicit end. Bookkeeping after a native completion
-        // belongs to a later snapshot, not another completion of the same user turn.
-        if ends.is_empty() {
+        // belongs to a later snapshot, not another completion of the same user turn. Work after
+        // it is different once a later prompt has closed the user turn: that work ended there,
+        // however it ended, and without an end of its own it would open the next turn's commit.
+        let last = ends.last().copied().unwrap_or(previous);
+        if ends.is_empty()
+            || (index < closed
+                && substantive
+                    .iter()
+                    .any(|&start| start >= last && start < chunk.end_byte))
+        {
             ends.push(chunk.end_byte);
         }
         for end_byte in ends {
@@ -1583,6 +1698,158 @@ fn completed_turn_chunks(
         previous = chunk.end_byte;
     }
     completed
+}
+
+/// Whether this region's own records mark where native executions complete.
+///
+/// When they do, settlement cuts the region at its last completion: work after it stays in the
+/// runtime even when it has answered and closed every call, because that state cannot be told
+/// apart from a reply the runtime has not written yet. Settling it anyway lands half a turn, and
+/// a continuation that runs without a new prompt (a background task's notification waking the
+/// agent, a goal turn) would otherwise only ever land inside the next prompt's commit. A writer
+/// that records no completions keeps the rule of [`in_flight_tail`].
+///
+/// Every settlement path reads the same evidence, so a hook, `agit commit`, an import and a
+/// project capture cut a transcript at the same place. Claude Code's `stop_hook_summary` record
+/// is not part of it: it exists only when Stop hooks are configured, lands only after they
+/// return (so a Stop never sees its own), and can follow a call that has no output; the
+/// terminal reply it follows is already the completion. A Codex region counts once it holds
+/// the start of an execution: the region after a materialized baseline begins with no
+/// completion record, and so does the region after a settlement that ended at one.
+fn records_completions(runtime: &str, region: &str, ir: &Session) -> bool {
+    if runtime == "claude-code" {
+        return crate::adapter::claude_code::records_stop_reasons(region);
+    }
+    if runtime == "codex" && crate::adapter::codex::records_execution_starts(region) {
+        return true;
+    }
+    crate::adapter::get(runtime).is_ok_and(|adapter| adapter.requires_turn_end())
+        && ir
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::TurnEnd)
+}
+
+/// Whether the runtime closes its turns itself, by its own rule or with completion events.
+fn closes_natively(adapter: &dyn crate::adapter::Adapter, ir: &Session) -> bool {
+    adapter.requires_turn_end()
+        || ir
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::TurnEnd)
+}
+
+/// Every completion that can cut `region`, sorted, and the end of the last one.
+///
+/// `receipts` are completions proven from outside the transcript. Supervised settlement learns
+/// of interrupted executions from its own receipts and so reads only terminal replies here.
+fn completion_boundaries(
+    runtime: &str,
+    region: &str,
+    mut boundaries: Vec<usize>,
+    supervised: bool,
+) -> crate::Result<(usize, Vec<usize>)> {
+    let native = if runtime == "claude-code" {
+        boundaries.extend(if supervised {
+            crate::adapter::claude_code::completed_turn_boundaries(region)
+        } else {
+            crate::adapter::claude_code::ended_turn_boundaries(region)
+        });
+        0
+    } else {
+        completed_native_boundary(runtime, region)?.unwrap_or(0) as usize
+    };
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let end = native.max(boundaries.last().copied().unwrap_or(0));
+    anyhow::ensure!(
+        end <= region.len(),
+        "native completion exceeds the frozen transcript"
+    );
+    Ok((end, boundaries))
+}
+
+/// The byte offset at which each line of `region` starts.
+fn line_starts(region: &str) -> Vec<usize> {
+    let mut offset = 0;
+    region
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            start
+        })
+        .collect()
+}
+
+/// Byte offsets of the lines holding conversation, as opposed to runtime bookkeeping.
+fn substantive_starts(region: &str, ir: &Session) -> Vec<usize> {
+    let starts = line_starts(region);
+    ir.events
+        .iter()
+        .filter(|event| !matches!(event.kind, EventKind::Other | EventKind::TurnEnd))
+        .filter_map(|event| event.line.and_then(|line| starts.get(line).copied()))
+        .collect()
+}
+
+fn substantive_from(region: &str, ir: &Session, from: usize) -> bool {
+    substantive_starts(region, ir)
+        .into_iter()
+        .any(|start| start >= from)
+}
+
+/// Drop native completions that would add only bookkeeping to what is already settled.
+///
+/// A runtime's own end-of-turn record can land after the reply it closes was settled: Codex
+/// writes it once its Stop hooks return. Committing it alone would add a commit to the turn that
+/// carries no conversation. Its bytes join the next commit that does. A chunk cut at a user turn
+/// always holds that turn's prompt and takes its ordinal from its position, so it stays.
+fn without_bookkeeping_only<'a>(
+    chunks: Vec<&'a Chunk>,
+    region: &str,
+    ir: &Session,
+    settled: usize,
+) -> Vec<&'a Chunk> {
+    let substantive = substantive_starts(region, ir);
+    let mut from = settled;
+    chunks
+        .into_iter()
+        .filter(|chunk| {
+            let adds = chunk.user_turn.is_none()
+                || substantive
+                    .iter()
+                    .any(|&start| start >= from && start < chunk.end_byte);
+            if adds {
+                from = chunk.end_byte;
+            }
+            adds
+        })
+        .collect()
+}
+
+/// Keep one commit per user turn a settlement reaches: the last of that turn's completed chunks.
+///
+/// A settlement lands what completed since the previous one. Live, a Stop normally reaches one
+/// execution, so each Stop adds one commit to its turn. A settlement that catches up on several
+/// executions of one turn (an import, a project capture, `agit commit` after several Stops)
+/// lands them together: a commit per execution would bury each prompt under the agent's own
+/// wake-ups in a session that a background task keeps waking. The kept chunk ends at the turn's
+/// last completion inside the settlement, so nothing after that completion settles, and the next
+/// user turn still starts a commit of its own. Legacy chunks (no `user_turn`) are each a turn
+/// and are never merged.
+fn one_commit_per_turn(chunks: Vec<&Chunk>) -> Vec<&Chunk> {
+    let mut kept: Vec<&Chunk> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        match kept.last_mut() {
+            Some(previous)
+                if chunk.user_turn.is_some() && previous.user_turn == chunk.user_turn =>
+            {
+                *previous = chunk;
+            }
+            _ => kept.push(chunk),
+        }
+    }
+    kept
 }
 
 /// Extend a committed snapshot with bytes written after a materialized runtime baseline.
@@ -1945,6 +2212,12 @@ fn settle_local_telemetry_inner(
         }
         opts
     };
+    let mut opts = opts;
+    if let Some(receipt) = opts.stop_receipt.take()
+        && receipt.proves(&bytes)
+    {
+        opts.native_completions.push(receipt.bytes);
+    }
     let memory_link = lk.clone();
     let milestone = opts.milestone.is_some();
     let code = settle_bytes(
@@ -2519,32 +2792,27 @@ fn settle_bytes(
     let open_calls = crate::adapter::get(&runtime)
         .map(|a| a.open_tool_calls(&region))
         .unwrap_or_default();
-    let in_flight = in_flight_tail(&ir, &open_calls);
-    let native_completions = opts.completed_only
+    let mut in_flight = in_flight_tail(&ir, &open_calls);
+    // Receipts name absolute transcript offsets; only those inside this region can cut it.
+    let receipts: Vec<usize> = opts
+        .native_completions
+        .iter()
+        .filter_map(|end| end.checked_sub(region_start).filter(|end| *end > 0))
+        .collect();
+    let completion_cut =
+        opts.completed_only || !receipts.is_empty() || records_completions(&runtime, &region, &ir);
+    let native_completions = completion_cut
         || ir
             .events
             .iter()
             .any(|event| event.kind == EventKind::TurnEnd);
-    let chunks = if opts.completed_only {
+    let chunks = if completion_cut {
         // Recovery can read a newer native snapshot than the completed turn that queued it.
-        let mut boundaries: Vec<_> = opts
-            .native_completions
-            .iter()
-            .filter_map(|end| end.checked_sub(region_start).filter(|end| *end > 0))
-            .collect();
-        if runtime == "claude-code" {
-            boundaries.extend(crate::adapter::claude_code::completed_turn_boundaries(
-                &region,
-            ));
-            boundaries.sort_unstable();
-            boundaries.dedup();
+        let (end, boundaries) =
+            completion_boundaries(&runtime, &region, receipts, opts.completed_only)?;
+        if in_flight.is_none() && substantive_from(&region, &ir, end) {
+            in_flight = Some(InFlight::Unfinished);
         }
-        let end = (completed_native_boundary(&runtime, &region)?.unwrap_or(0) as usize)
-            .max(boundaries.last().copied().unwrap_or(0));
-        anyhow::ensure!(
-            end <= region.len(),
-            "native completion exceeds the frozen transcript"
-        );
         let completed = &region[..end];
         let adapter = crate::adapter::get(&runtime)?;
         let mut completed_ir = adapter.parse(completed)?;
@@ -2566,7 +2834,7 @@ fn settle_bytes(
         turn_chunks(&region, &ir, &open_calls)
     };
 
-    let mut new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
+    let new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
         // The retained prefix proves exact content, including a partially captured user turn.
         // Ordinals cannot skip continuations because several native turns can share one prompt.
         chunks
@@ -2577,6 +2845,22 @@ fn settle_bytes(
         chunks.iter().skip(head_turn_base as usize).collect()
     } else {
         chunks.iter().collect()
+    };
+    let new_chunks = without_bookkeeping_only(
+        new_chunks,
+        &region,
+        &ir,
+        if materialized_mode {
+            0
+        } else {
+            native_prefix.0
+        },
+    );
+    // Supervised settlement keeps each native completion it catches up on as its own commit.
+    let mut new_chunks = if opts.completed_only {
+        new_chunks
+    } else {
+        one_commit_per_turn(new_chunks)
     };
 
     if new_chunks.is_empty() {
@@ -3204,9 +3488,14 @@ fn settle_bytes(
         crate::domain::privacy::pending::clear(&lk.session_id);
     }
     if !quiet {
+        // A commit that continues the turn before it carries the same ordinal; `agit log`
+        // marks it the same way, and `#n` names the whole turn.
+        let mut previous = head_meta.as_ref().and_then(|snapshot| snapshot.turn);
         for (turn_no, subject, sha) in &landed {
+            let marker = if previous == Some(*turn_no) { '+' } else { '#' };
+            previous = Some(*turn_no);
             ui::info(format_args!(
-                "#{turn_no} {} {subject}",
+                "{marker}{turn_no} {} {subject}",
                 &sha[..9.min(sha.len())]
             ));
         }
@@ -4678,6 +4967,7 @@ pub(super) fn record_at(
         code: false,
         completed_only: false,
         native_completions: Vec::new(),
+        stop_receipt: None,
         historical: true,
         message: None,
         paths: vec![],
@@ -4829,12 +5119,298 @@ mod tests {
             code: false,
             completed_only: false,
             native_completions: Vec::new(),
+            stop_receipt: None,
             historical: false,
             message: None,
             paths: vec![],
             quiet: false,
             capture: false,
         }
+    }
+
+    /// A Claude Code turn whose agent is woken again by a background task's notification, with
+    /// no new prompt, settles in parts: the reply the first Stop reports, then at each later Stop
+    /// exactly the work since, as a further commit under the same ordinal, and the next prompt's
+    /// commit starts after all of it. Skipping by turn ordinal would report "nothing new" at the
+    /// later Stops and fold the continuation into the next prompt's commit. A settlement that
+    /// catches up on several Stops lands one commit per turn it reaches, not one per execution.
+    ///
+    /// The cut never lands half an execution, and the merge precondition reads the same cut:
+    /// nothing settles while the work has a call without output or has not written its reply
+    /// (the Stop hook waits for that record), including a reply one chain writes while another
+    /// chain's call is still open, and a thinking or call record its writer stamped terminal.
+    /// An execution that ends without a terminal reply (an interruption, a generated reply) or
+    /// a manual compaction still settles at its Stop instead of reading as unfinished until the
+    /// next reply; work that ends some other way is closed by the next prompt and lands as a
+    /// part of its own turn.
+    #[test]
+    fn claude_notification_continuations_settle_at_their_own_stop_under_the_same_turn() {
+        let (_directory, store) = store();
+        let (_repository, repo) = setup_repo();
+        let records = |text: &str| {
+            text.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let prompt = |text: &str| {
+            line(
+                serde_json::json!({"type": "user", "sessionId": "AB", "cwd": "/repo/one",
+                "message": {"role": "user", "content": text}}),
+            )
+        };
+        let call = |id: &str, command: &str| {
+            line(
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                "model": "claude-opus-4-5", "stop_reason": "tool_use", "content": [
+                    {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}}),
+            )
+        };
+        let output = |id: &str, text: &str| {
+            line(
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}]}}),
+            )
+        };
+        let reply = |text: &str| {
+            line(
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                "model": "claude-opus-4-5", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": text}]}}),
+            )
+        };
+        let stopped = line(
+            serde_json::json!({"type": "system", "subtype": "stop_hook_summary",
+            "hookCount": 1, "hookInfos": [{"command": "agit hooks settle", "durationMs": 1}],
+            "hookErrors": [], "preventedContinuation": false, "stopReason": "",
+            "level": "suggestion"}),
+        );
+        let notification = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command \"cargo test\" completed</summary>\n</task-notification>";
+        let woken = format!(
+            "{stopped}{}{}{}",
+            line(
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                "content": notification})
+            ),
+            line(serde_json::json!({"type": "queue-operation", "operation": "dequeue"})),
+            line(serde_json::json!({"type": "user", "promptSource": "system",
+                "message": {"role": "user", "content": notification}})),
+        );
+        let settle = |text: &str, fresh| {
+            let mut claim = link::get(&store, "claude-code", "AB").unwrap_or_else(|| {
+                let mut claim = link();
+                claim.source = "claude-code".into();
+                claim
+            });
+            claim.source = "claude-code".into();
+            assert_eq!(
+                settle_bytes(
+                    &store,
+                    &repo,
+                    "alice/photo",
+                    "main",
+                    claim,
+                    text.as_bytes(),
+                    "alice",
+                    opts(),
+                    fresh,
+                    true
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned()
+        };
+        let pending = crate::adapter::claude_code::stop_record_pending;
+        let in_flight = |text: &str| has_in_flight_turn("claude-code", text).unwrap();
+        let log_at = |revision: &str| {
+            let (log, _) = storage::materialize_pair_at(repo.root(), revision).unwrap();
+            records(&transcript::unwrap_strict(&log).unwrap())
+        };
+        // Settling `text` lands exactly one further commit of turn 1 on `tip`, holding `settled`.
+        let lands_part = |text: &str, settled: &str, tip: &str| {
+            assert!(!in_flight(text));
+            let landed = settle(text, false);
+            assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(1));
+            assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), tip);
+            assert_eq!(log_at("HEAD"), records(settled));
+            landed
+        };
+
+        let first = format!(
+            "{}{}{}{}",
+            prompt("run the test suite in the background"),
+            call("toolu_1", "cargo test &"),
+            output("toolu_1", "Command running in background with ID: b1"),
+            reply("The suite is running in the background.")
+        );
+        assert!(!pending(&first));
+        let first_tip = settle(&first, true);
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(1));
+
+        let running = format!("{first}{woken}{}", call("toolu_2", "cat b1.output"));
+        let unflushed = format!("{running}{}", output("toolu_2", "test result: ok"));
+        for (text, waits) in [
+            (format!("{first}{woken}"), true),
+            (running, false),
+            (unflushed.clone(), true),
+        ] {
+            assert_eq!(pending(&text), waits);
+            assert_eq!(
+                settle(&text, false),
+                first_tip,
+                "an unfinished continuation settles"
+            );
+        }
+        assert!(in_flight(&unflushed));
+
+        let continued = format!("{unflushed}{}", reply("All tests pass."));
+        assert!(!pending(&continued));
+        let continued_tip = lands_part(&continued, &continued, &first_tip);
+        assert_eq!(log_at("HEAD^"), records(&first));
+        assert_eq!(settle(&continued, false), continued_tip);
+
+        // One message whose writer stamps each block record with the message's stop reason.
+        let stamped = |block: serde_json::Value| {
+            line(
+                serde_json::json!({"type": "assistant", "message": {"id": "msg_3",
+                "role": "assistant", "model": "claude-opus-4-5", "stop_reason": "end_turn",
+                "content": [block]}}),
+            )
+        };
+        let thinking = format!(
+            "{continued}{woken}{}{}{}",
+            call("toolu_w", "date"),
+            output("toolu_w", "Tue"),
+            stamped(serde_json::json!({"type": "thinking", "thinking": "", "signature": "s"}))
+        );
+        let scheduled = format!(
+            "{thinking}{}",
+            stamped(
+                serde_json::json!({"type": "tool_use", "id": "toolu_3", "name": "ScheduleWakeup",
+                "input": {}})
+            )
+        );
+        // The Stop keeps waiting while only the message's thinking block is on disk and stops
+        // once its text lands; a trailing call is answered only after the Stop hooks return.
+        assert!(pending(&thinking));
+        assert!(!pending(&scheduled));
+        let answered = format!(
+            "{thinking}{}",
+            stamped(serde_json::json!({"type": "text", "text": "It is Tuesday."}))
+        );
+        assert!(!pending(&answered));
+        assert!(!in_flight(&answered));
+        let other_chain = format!("{scheduled}{woken}{}", reply("The other chain is done."));
+        for text in [&thinking, &scheduled, &other_chain] {
+            assert_eq!(
+                settle(text, false),
+                continued_tip,
+                "half an execution settles"
+            );
+        }
+        assert!(in_flight(&other_chain));
+        let joined = format!(
+            "{other_chain}{}{}",
+            output("toolu_3", "scheduled"),
+            reply("Both chains are done.")
+        );
+        let mut tip = lands_part(&joined, &joined, &continued_tip);
+        let mut text = joined;
+
+        let interrupted = line(
+            serde_json::json!({"type": "user", "message": {"role": "user",
+            "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}),
+        );
+        let generated = line(
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+            "model": "<synthetic>", "stop_reason": "stop_sequence",
+            "content": [{"type": "text", "text": "No response requested."}]}}),
+        );
+        for (index, ending) in [interrupted, generated].into_iter().enumerate() {
+            let id = format!("toolu_end_{index}");
+            text = format!(
+                "{text}{woken}{}{}{ending}",
+                call(&id, "cargo build"),
+                output(&id, "Finished")
+            );
+            tip = lands_part(&text, &text, &tip);
+        }
+        let compacted = format!(
+            "{text}{}{}",
+            line(
+                serde_json::json!({"type": "system", "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "manual", "preTokens": 1}})
+            ),
+            line(serde_json::json!({"type": "user", "isCompactSummary": true,
+                "message": {"role": "user", "content": "Summary: the suite passes."}})),
+        );
+        text = format!(
+            "{compacted}{}{}",
+            prompt("<command-name>/compact</command-name>"),
+            prompt("<local-command-stdout>Compacted</local-command-stdout>"),
+        );
+        tip = lands_part(&text, &compacted, &tip);
+
+        let abandoned = format!(
+            "{text}{woken}{}{}",
+            call("toolu_4", "cargo fmt"),
+            output("toolu_4", "formatted")
+        );
+        assert!(in_flight(&abandoned));
+        assert_eq!(settle(&abandoned, false), tip);
+        let next = format!(
+            "{abandoned}{}{}",
+            prompt("now fix the warning"),
+            reply("Fixed.")
+        );
+        let second_tip = settle(&next, false);
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(2));
+        assert_eq!(meta::read_at_ref(&repo, "HEAD^").unwrap().turn, Some(1));
+        assert_eq!(repo.git(&["rev-parse", "HEAD~2"]).unwrap().trim(), tip);
+        assert_eq!(log_at("HEAD^"), records(&abandoned));
+        assert_eq!(log_at("HEAD"), records(&next));
+
+        // A settlement that catches up on several Stops lands one commit per turn it reaches:
+        // the rest of turn 2 as one further part, turn 3 as one commit, and nothing of the
+        // execution still running. Each execution closes with the duration record the writer
+        // adds, which is a completion of its own.
+        let duration = line(
+            serde_json::json!({"type": "system", "subtype": "turn_duration",
+            "durationMs": 1}),
+        );
+        let wake = |text: &str, id: &str, said: &str| {
+            format!(
+                "{text}{woken}{}{}{}{duration}",
+                call(id, "cargo test"),
+                output(id, "ok"),
+                reply(said)
+            )
+        };
+        let second_done = wake(
+            &wake(&next, "toolu_5", "Second pass done."),
+            "toolu_6",
+            "Third pass done.",
+        );
+        let third_done = wake(
+            &format!(
+                "{second_done}{}{}{duration}",
+                prompt("now ship it"),
+                reply("Shipping.")
+            ),
+            "toolu_7",
+            "Shipped.",
+        );
+        let shipping = format!("{third_done}{woken}{}", call("toolu_8", "git push"));
+        settle(&shipping, false);
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(3));
+        assert_eq!(meta::read_at_ref(&repo, "HEAD^").unwrap().turn, Some(2));
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD~2"]).unwrap().trim(),
+            second_tip
+        );
+        assert_eq!(log_at("HEAD^"), records(&second_done));
+        assert_eq!(log_at("HEAD"), records(&third_done));
     }
 
     #[test]
@@ -4968,16 +5544,29 @@ mod tests {
         );
     }
 
+    /// Codex closes a native execution with `task_complete`, but only after its Stop hooks
+    /// return; the Stop's receipt is what lets that execution settle at its own Stop. This pins
+    /// that each execution lands exactly once and never in part: a settlement without a receipt
+    /// leaves an execution that has no completion record in the runtime (no half turn), a
+    /// receipt settles it under its user turn's ordinal, a goal continuation with no new prompt
+    /// becomes a further commit of the same turn at its own Stop, and the `task_complete` written
+    /// after a receipt never lands as a commit holding nothing else. A receipt is refused while
+    /// a call made after the last completion has no output. A settlement that catches up on
+    /// several executions lands one commit per user turn, so a commit per execution, or one
+    /// commit spanning two prompts, fails it; supervised catch-up keeps each completion as its
+    /// own commit. A resumed rollout keeps the same cut although its rendered prefix carries no
+    /// completion records.
     #[test]
-    fn settlement_keeps_native_completions_and_extends_a_retained_partial_turn() {
+    fn native_completions_settle_each_execution_once_and_never_a_partial_turn() {
         let (_directory, store) = store();
         let (_repository, repo) = setup_repo();
         let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         let first = format!("{META}\n{}{}{end}", codex_user("first"), codex_asst("done"));
         let active = format!("{first}{}{}", codex_user("second"), codex_asst("working"));
-        let settle = |text: &str, completed_only, fresh| {
+        let settle_with = |text: &str, completed_only, receipts: &[usize], fresh| {
             let mut options = opts();
             options.completed_only = completed_only;
+            options.native_completions = receipts.to_vec();
             let claim = link::get(&store, "codex", "AB").unwrap_or_else(link);
             assert_eq!(
                 settle_bytes(
@@ -4996,53 +5585,67 @@ mod tests {
                 ExitCode::Ok
             );
         };
+        let settle =
+            |text: &str, completed_only, fresh| settle_with(text, completed_only, &[], fresh);
+        // What the Stop hook passes: the receipt is refused or names the bytes the hook read.
+        let stop = |text: &str| {
+            let receipt = codex_stop_receipt(text.as_bytes()).expect("a finished execution");
+            assert_eq!(receipt.bytes, text.len());
+            settle_with(text, false, &[receipt.bytes], false);
+        };
+        let head = || repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
         settle(&active, true, true);
         let completed = meta::read_at_ref(&repo, "HEAD").unwrap();
         assert_eq!(completed.turn, Some(1));
         assert_eq!(completed.baseline_bytes, Some(first.len() as u64));
-
+        let first_tip = head();
         settle(&active, false, false);
-        let partial = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
-        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(2));
-        settle(&active, true, false);
         assert_eq!(
-            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned(),
-            partial
+            head(),
+            first_tip,
+            "no completion and no receipt: nothing settles"
         );
 
-        let finished = format!("{active}{}{end}", codex_asst("final reply"));
-        settle(&finished, true, false);
-        let repaired = meta::read_at_ref(&repo, "HEAD").unwrap();
-        assert_eq!(repaired.turn, Some(2));
-        assert_eq!(repaired.baseline_bytes, Some(finished.len() as u64));
-        assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), partial);
+        let calling = format!(
+            "{active}{}",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec\",\"call_id\":\"open\",\"arguments\":\"{}\"}}\n"
+        );
+        assert!(codex_stop_receipt(calling.as_bytes()).is_none());
+        let answered = format!(
+            "{calling}{}{}",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"open\",\"output\":\"done\"}}\n",
+            codex_asst("final reply")
+        );
+        stop(&answered);
+        let answer = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(answer.turn, Some(2));
+        assert_eq!(answer.baseline_bytes, Some(answered.len() as u64));
+        assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), first_tip);
         let (_, view) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
         assert!(view.contains("final reply"));
-        let tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
-        settle(&finished, true, false);
-        assert_eq!(
-            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned(),
-            tip
-        );
-        // Goal continuations can complete without another user prompt opening a new ordinal.
-        let continued = format!("{finished}{}{end}", codex_asst("goal phase complete"));
-        let still_running = format!("{continued}{}", codex_asst("next phase in progress"));
-        settle(&still_running, false, false);
+        let tip = head();
+        let finished = format!("{answered}{end}");
+        assert!(codex_stop_receipt(finished.as_bytes()).is_none());
+        for completed_only in [false, true] {
+            settle(&finished, completed_only, false);
+            assert_eq!(head(), tip, "a lone task_complete is not a commit");
+        }
+        // Goal continuations complete without another user prompt opening a new ordinal.
+        let continued = format!("{finished}{}", codex_asst("goal phase complete"));
+        stop(&continued);
         let continuation = meta::read_at_ref(&repo, "HEAD").unwrap();
         assert_eq!(continuation.turn, Some(2));
         assert_eq!(continuation.baseline_bytes, Some(continued.len() as u64));
         assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(), tip);
-        let (_, view) = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
-        assert!(view.contains("goal phase complete"));
-        assert!(!view.contains("next phase in progress"));
-        let continued_tip = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
-        settle(&still_running, true, false);
-        assert_eq!(
-            repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
-            continued_tip
-        );
+        let still_running = format!("{continued}{end}{}", codex_asst("next phase in progress"));
+        let continued_tip = head();
+        for completed_only in [false, true] {
+            settle(&still_running, completed_only, false);
+            assert_eq!(head(), continued_tip);
+        }
 
-        // Catch-up keeps each native completion addressable, including goal continuations.
+        // Catching up on several Stops lands one commit per user turn: both phases of the goal
+        // turn as one further part of it, the next prompt's turn as a commit of its own.
         let phase_a = format!("{still_running}{}{end}", codex_asst("phase A complete"));
         let phase_b = format!("{phase_a}{}{end}", codex_asst("phase B complete"));
         let bookkeeping = "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo/one\",\"model\":\"fixture\"}}\n";
@@ -5052,26 +5655,25 @@ mod tests {
             codex_asst("third complete")
         );
         let pending = format!("{next_user}{}", codex_asst("uncompleted continuation"));
-        // Losing the acceleration checkpoint cannot merge or duplicate retained native turns.
+        // Losing the acceleration checkpoint cannot fold settled parts into the catch-up or land
+        // them again.
         let mut claim = link::get(&store, "codex", "AB").unwrap();
         claim.native_checkpoint = None;
         link::write(&store, &claim).unwrap();
         settle(&pending, false, false);
         assert_eq!(
-            repo.git(&["rev-parse", "HEAD~3"]).unwrap().trim(),
+            repo.git(&["rev-parse", "HEAD~2"]).unwrap().trim(),
             continued_tip
         );
-        for (revision, boundary, ordinal) in [
-            ("HEAD~2", phase_a.len(), 2),
-            ("HEAD~1", phase_b.len(), 2),
-            ("HEAD", next_user.len(), 3),
-        ] {
+        for (revision, boundary, ordinal) in
+            [("HEAD~1", phase_b.len(), 2), ("HEAD", next_user.len(), 3)]
+        {
             let metadata = meta::read_at_ref(&repo, revision).unwrap();
             assert_eq!(metadata.turn, Some(ordinal));
             assert_eq!(metadata.baseline_bytes, Some(boundary as u64));
             let (_, view) = storage::materialize_pair_at(repo.root(), revision).unwrap();
             assert!(view.contains("phase A complete"));
-            assert_eq!(view.contains("phase B complete"), revision != "HEAD~2");
+            assert!(view.contains("phase B complete"));
             assert_eq!(view.contains("third complete"), revision == "HEAD");
             assert_eq!(view.contains("turn_context"), revision == "HEAD");
             assert!(!view.contains("uncompleted continuation"));
@@ -5096,7 +5698,8 @@ mod tests {
         assert_eq!(refreshed.bytes, landed.bytes);
         assert_eq!(refreshed.sha256, landed.sha256);
 
-        // A materialized resume can continue its retained user turn without another prompt.
+        // Supervised catch-up keeps each native completion as its own commit, here after a
+        // materialized resume that continues its retained user turn without another prompt.
         use sha2::Digest as _;
         let mut claim = link::get(&store, "codex", "AB").unwrap();
         claim.baseline_bytes = Some(next_user.len() as u64);
@@ -5126,6 +5729,33 @@ mod tests {
         assert_eq!(
             repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
             resumed_tip
+        );
+
+        // After a settlement that ended at a completion record, the region past the baseline
+        // holds none until the running execution completes; its `task_started` alone keeps an
+        // answered execution out of a settlement without a receipt and out of a merge.
+        let rested = format!("{resumed_active}{end}");
+        settle(&rested, false, false);
+        let rested_tip = head();
+        let started = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
+        let fourth = format!(
+            "{rested}{started}{}{}",
+            codex_user("fourth"),
+            codex_asst("working on it")
+        );
+        assert!(has_in_flight_turn("codex", &fourth[rested.len()..]).unwrap());
+        for completed_only in [false, true] {
+            settle(&fourth, completed_only, false);
+            assert_eq!(head(), rested_tip, "an answered execution settles in part");
+        }
+        let fourth_done = format!("{fourth}{end}");
+        settle(&fourth_done, false, false);
+        let done = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(done.turn, Some(4));
+        assert_eq!(done.baseline_bytes, Some(fourth_done.len() as u64));
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD^"]).unwrap().trim(),
+            rested_tip
         );
     }
 

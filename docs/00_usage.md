@@ -820,8 +820,8 @@ owner/repo@<ref>        a ref in someone else's / a remote repo
 <branch> <tag> <sha>    a ref inside the current repo (sha prefix ≥ 4; an ambiguous match is reported, never resolved for you)
 @                       the current session's branch (resolved through AGIT_SESSION, valid only inside a session)
 <ref>~n                 n commits back
-<ref>#n                 the commit the n-th turn settled (#-1 is the last turn)
-<ref>#n.k               the k-th event in the n-th turn
+<ref>#n                 the n-th turn, as its last commit (#-1 is the last turn)
+<ref>#n.k               the k-th event in the n-th turn, counted across all its commits
 <ref>#a..#b             a turn range
 <ref>:<path>            the file contents at that point
 ```
@@ -832,7 +832,10 @@ Two easy traps:
    a fork's identity commit, a `-m` file commit and merge commits take no turn ordinal and leave
    that column blank in the log; point at them with a short sha, a tag or `<ref>~n`. Only when the
    whole history never declared a turn ordinal (an ordinary git branch pushed in from outside)
-   does `#n` fall back to "the n-th commit from the root".
+   does `#n` fall back to "the n-th commit from the root". A turn the agent kept working on after
+   it replied, with no new prompt, can have several commits, one per Stop that settled part of
+   it (an import lands each turn as one commit): the log shows the first as `#n` and the later
+   ones as `+n`, and `#n` resolves to the last of them.
 2. The shell treats a leading `#` as a comment. Always quote a reference containing `#`:
    `agit show 'ratelimit#5.1'`.
 

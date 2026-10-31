@@ -1613,49 +1613,29 @@ fn turns_since(repo: &Repo, head: &str, fork_point: &str) -> crate::Result<usize
         .count())
 }
 
-/// The line numbers turn n contributes to the source transcript (the lines its commit adds
-/// relative to its **first parent**).
-///
-/// The log is append-only, so "the lines this turn added" = the stretch between the two line
-/// counts, and the numbering stays stable through the branch's later history.
+/// The line numbers turn n contributes to the source transcript, as
+/// [`refs::Chain::turn_lines_with`] numbers them, provided the branch head still extends that
+/// turn's LOG.
 pub fn turn_lines(repo: &Repo, head: &str, n: u32) -> crate::Result<Vec<usize>> {
-    let (_, sha) = refs::turn_commit(repo, head, n)?;
-    let this = storage::materialize_at(repo.root(), &sha, meta::LOG_FILE)
-        .with_context(|| format!("turn {n} at {sha} has no valid LOG"))?;
-    let parents = repo.git(&["rev-list", "--parents", "-n", "1", &sha])?;
-    let mut fields = parents.split_whitespace();
-    anyhow::ensure!(
-        fields.next() == Some(sha.as_str()),
-        "git returned the wrong turn commit"
-    );
-    let prev = match fields.next() {
-        None => String::new(),
-        Some(parent) => {
-            let snapshot = meta::read_at_ref(repo, parent).with_context(|| {
-                format!("turn {n}'s first parent has no readable {}", meta::FILE)
-            })?;
-            if snapshot.is_file_line() || snapshot.session.is_empty() {
-                String::new()
-            } else {
-                storage::materialize_at(repo.root(), parent, meta::LOG_FILE).with_context(|| {
-                    format!("turn {n}'s first parent at {parent} has no valid LOG")
-                })?
-            }
-        }
-    };
-    anyhow::ensure!(
-        this.starts_with(&prev),
-        "turn {n} rewrites its first parent's LOG instead of appending"
-    );
-    if head != sha {
-        let latest = storage::materialize_at(repo.root(), head, meta::LOG_FILE)
+    let chain = refs::Chain::read(repo, head)?;
+    let (turn, lines, last_part, this) = chain.turn_lines_with(n, |sha| {
+        storage::materialize_at(repo.root(), sha, meta::LOG_FILE)
+            .with_context(|| format!("commit {sha} has no valid LOG"))
+    })?;
+    let tip = &chain
+        .entries
+        .last()
+        .expect("a resolved turn has a chain")
+        .sha;
+    if tip != last_part {
+        let latest = storage::materialize_at(repo.root(), tip, meta::LOG_FILE)
             .with_context(|| format!("source head {head} has no valid LOG"))?;
         anyhow::ensure!(
             latest.starts_with(&this),
-            "source head {head} rewrites LOG after turn {n}; its event coordinates are no longer stable"
+            "source head {head} rewrites LOG after turn {turn}; its event coordinates are no longer stable"
         );
     }
-    Ok((prev.lines().count()..this.lines().count()).collect())
+    Ok(lines)
 }
 
 #[cfg(test)]

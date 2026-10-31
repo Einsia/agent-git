@@ -281,15 +281,12 @@ pub fn read_turns_inline(
     let entries: Vec<Entry> = turns
         .iter()
         .map(|t| Entry {
-            label: match t.turn {
-                Some(n) => format!("#{n:>3} {}", t.short),
-                None => format!("     {}", t.short),
-            },
+            label: format!("{} {}", t.label(), t.short),
             note: t.subject.clone(),
             when: t.at,
             source: Source::Turn {
                 repo: repo.root().to_path_buf(),
-                sha: t.short.clone(),
+                sha: t.turn_head.clone().unwrap_or_else(|| t.short.clone()),
                 turn: t.turn,
             },
         })

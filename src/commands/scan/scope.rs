@@ -341,6 +341,9 @@ fn locate_log(reader: &mut Reader<'_>, chain: &refs::Chain) -> Result<(Vec<Strin
     let mut previous = Vec::new();
     let mut coordinates = Vec::new();
     let mut settled = HashSet::new();
+    // A turn settled in several parts numbers its events on from part to part, as
+    // `refs::Chain::runs` groups them; commits that settle no turn may sit between the parts.
+    let mut open: Option<(u32, u32)> = None;
     for entry in &chain.entries {
         let snapshot = entry
             .meta
@@ -362,14 +365,26 @@ fn locate_log(reader: &mut Reader<'_>, chain: &refs::Chain) -> Result<(Vec<Strin
         let turn = if snapshot.kind == meta::Kind::Turn {
             snapshot
                 .turn
-                .filter(|turn| *turn > 0 && *turn != refs::LAST_TURN && settled.insert(*turn))
+                .filter(|turn| *turn > 0 && *turn != refs::LAST_TURN)
         } else {
             None
         };
+        let located = match turn {
+            Some(turn) if open.is_some_and(|(current, _)| current == turn) => open,
+            Some(turn) if settled.insert(turn) => Some((turn, 0)),
+            Some(_) => {
+                open = None;
+                None
+            }
+            None => None,
+        };
+        let added = log.len() - previous.len();
         coordinates.extend(
-            (0..log.len() - previous.len())
-                .map(|offset| turn.map(|turn| (turn, offset as u32 + 1))),
+            (0..added).map(|offset| located.map(|(turn, base)| (turn, base + offset as u32 + 1))),
         );
+        if let Some((turn, base)) = located {
+            open = Some((turn, base + added as u32));
+        }
         previous = log;
     }
     Ok((previous, coordinates))
@@ -1122,24 +1137,35 @@ mod tests {
         assert!(error.contains("history order"), "{error}");
     }
 
+    /// A turn commit repeating the ordinal of the turn commit right before it is a later part
+    /// of that turn: its events are numbered on from the earlier part, and `#1`, `#-1` and the
+    /// whole branch all review them. The same ordinal after another turn retells rewritten
+    /// history: those events stay unlocated and `#-1` refuses, because the commit it would
+    /// review is not the one `#1` names.
     #[test]
-    fn last_turn_cannot_silently_select_a_duplicate_settlement() {
+    fn a_continuation_extends_its_turn_but_a_retold_turn_stays_unaddressable() {
         let fixture = Fixture::new(LayoutVersion::V1);
-        let first = event("first settlement", "codex", 'a');
+        let first = event("first part", "codex", 'a');
         fixture.commit(&first, &first, meta::Kind::Turn, Some(1));
-        let duplicate = event("duplicate settlement", "codex", 'a');
-        fixture.commit(
-            &format!("{first}{duplicate}"),
-            &duplicate,
-            meta::Kind::Turn,
-            Some(1),
-        );
+        let continued = event("continuation", "codex", 'a');
+        let log = format!("{first}{continued}");
+        fixture.commit(&log, &log, meta::Kind::Turn, Some(1));
+        for target in ["session", "session#1", "session#-1"] {
+            let scope = fixture.collect(target).unwrap();
+            assert_eq!(locators(&scope[0]), ["@#1.1", "@#1.2"], "{target}");
+            assert_eq!(scope[0].unlocated_events, 0, "{target}");
+        }
+        let log = format!("{log}{}", event("second turn", "codex", 'a'));
+        fixture.commit(&log, &log, meta::Kind::Turn, Some(2));
+        let retold = event("retold settlement", "codex", 'a');
+        let log = format!("{log}{retold}");
+        fixture.commit(&log, &log, meta::Kind::Turn, Some(1));
         for target in ["session#-1", "session#-1.1", "session#1..#-1"] {
             let error = fixture.collect(target).unwrap_err().to_string();
             assert!(error.contains("duplicate settlements"), "{target}: {error}");
         }
         let scope = fixture.collect("session").unwrap();
-        assert!(scope[0].events.is_empty());
+        assert_eq!(locators(&scope[0]), ["@#1.1", "@#1.2", "@#2.1"]);
         assert_eq!(scope[0].unlocated_events, 1);
     }
 
