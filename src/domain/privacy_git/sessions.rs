@@ -2181,33 +2181,83 @@ impl ProjectedHistory {
     /// Plain snapshots report their metadata and sequence lengths; their content is reviewed as the
     /// files each one introduces, and every distinct event is validated against its ID once.
     pub(crate) fn session_preview(&self) -> Result<Vec<serde_json::Value>> {
+        use crate::domain::privacy_envelope::MAX_ENVELOPE_BYTES;
+        use crate::domain::repo::{ObjectBody, ReadPolicy};
+        enum Step {
+            Envelope(usize),
+            Commit(usize),
+        }
         let manifest = &self.session_manifest;
+        // Every snapshot's commit, and the envelope of an encrypted one, stream through one batch
+        // in snapshot order; each is reduced to its preview as it arrives, so no more than one
+        // envelope is held at a time.
+        let mut reads = Vec::new();
+        let mut steps = Vec::new();
+        for (index, entry) in manifest.snapshots.iter().enumerate() {
+            let commit = entry.commit();
+            if matches!(entry, PublishedSnapshot::SessionOwnerV2 { .. }) {
+                reads.push(format!("{commit}:privacy/envelope.json"));
+                steps.push(Step::Envelope(index));
+            }
+            reads.push(commit.to_owned());
+            steps.push(Step::Commit(index));
+        }
+        let mut publics = vec![None; manifest.snapshots.len()];
+        let mut gits = vec![None; manifest.snapshots.len()];
+        let mut steps = steps.into_iter();
+        self.repo.git_cat_file_batch_with_policy(
+            reads,
+            MAX_ENVELOPE_BYTES.max(MAX_COMMIT),
+            ReadPolicy::LocalOnly,
+            |_, kind, body| {
+                let step = steps
+                    .next()
+                    .context("session preview read is unrequested")?;
+                let ObjectBody::Read(bytes) = body else {
+                    anyhow::bail!("privacy source object is unavailable");
+                };
+                match step {
+                    Step::Envelope(index) => {
+                        let PublishedSnapshot::SessionOwnerV2 { snapshot, .. } =
+                            &manifest.snapshots[index]
+                        else {
+                            anyhow::bail!("session preview read is unrequested");
+                        };
+                        ensure!(
+                            kind == "blob" && bytes.len() <= MAX_ENVELOPE_BYTES,
+                            "privacy source object is unavailable"
+                        );
+                        ensure!(
+                            digest_bytes(bytes) == snapshot.envelope_digest,
+                            "session preview envelope differs from its manifest"
+                        );
+                        let envelope = PrivacyEnvelope::parse(bytes)?;
+                        ensure!(
+                            envelope.session_binding.as_ref() == Some(&snapshot.binding),
+                            "session preview authority differs from its manifest"
+                        );
+                        publics[index] = Some(envelope.public_projection);
+                    }
+                    Step::Commit(index) => {
+                        ensure!(
+                            kind == "commit" && bytes.len() <= MAX_COMMIT,
+                            "privacy source object is unavailable"
+                        );
+                        gits[index] = Some(commit_preview(bytes)?);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        ensure!(steps.next().is_none(), "session preview read is truncated");
         let mut validator = super::super::storage::SnapshotValidator::default();
         let mut snapshots = Vec::new();
-        for entry in &manifest.snapshots {
+        for (index, entry) in manifest.snapshots.iter().enumerate() {
             let commit = entry.commit();
             let public = match entry {
-                PublishedSnapshot::SessionOwnerV2 { snapshot, .. } => {
-                    let bytes = read(
-                        &self.repo,
-                        &[
-                            "cat-file",
-                            "blob",
-                            &format!("{commit}:privacy/envelope.json"),
-                        ],
-                        super::super::privacy_envelope::MAX_ENVELOPE_BYTES,
-                    )?;
-                    ensure!(
-                        digest_bytes(&bytes) == snapshot.envelope_digest,
-                        "session preview envelope differs from its manifest"
-                    );
-                    let envelope = PrivacyEnvelope::parse(&bytes)?;
-                    ensure!(
-                        envelope.session_binding.as_ref() == Some(&snapshot.binding),
-                        "session preview authority differs from its manifest"
-                    );
-                    envelope.public_projection
-                }
+                PublishedSnapshot::SessionOwnerV2 { .. } => publics[index]
+                    .take()
+                    .context("session preview read is truncated")?,
                 PublishedSnapshot::Plain { .. } => {
                     let metadata = super::super::storage::metadata_local(self.repo.root(), commit)?;
                     ensure!(
@@ -2231,11 +2281,9 @@ impl ProjectedHistory {
                     json!({"metadata": super::super::storage::metadata_local(self.repo.root(), commit)?})
                 }
             };
-            let git = commit_preview(&read(
-                &self.repo,
-                &["cat-file", "commit", commit],
-                MAX_COMMIT,
-            )?)?;
+            let git = gits[index]
+                .take()
+                .context("session preview read is truncated")?;
             snapshots.push(json!({"commit":commit,"publication":entry,"public":public,"git":git}));
         }
         for commit in &manifest.preserved_commits {

@@ -88,10 +88,12 @@ pub(super) fn run(
         PublicationPlan::freeze_tips(&repo, branches)?
     };
     if intent.explicit_hub {
+        let enveloped =
+            crate::domain::privacy_git::enveloped_commits(&repo, original.commit_objects())?;
         for commit in original.commit_objects() {
             let metadata = crate::domain::storage::metadata_local(repo.root(), commit)?;
             ensure!(
-                crate::domain::privacy_recovery::committed_envelope(&repo, commit)?.is_none()
+                !enveloped.contains(commit)
                     && metadata
                         .session_privacy
                         .as_ref()
@@ -134,13 +136,16 @@ pub(super) fn run(
             .iter()
             .map(|head| head.oid().to_owned())
             .collect();
-        for commit in PublicationPlan::raw_history(&repo, &heads)? {
-            crate::domain::storage::metadata_local(repo.root(), &commit)?;
-            ensure!(
-                crate::domain::privacy_recovery::committed_envelope(&repo, &commit)?.is_none(),
-                "a new destination requires preserved source authority for inherited ciphertext"
-            );
+        let history: Vec<String> = PublicationPlan::raw_history(&repo, &heads)?
+            .into_iter()
+            .collect();
+        for commit in &history {
+            crate::domain::storage::metadata_local(repo.root(), commit)?;
         }
+        ensure!(
+            crate::domain::privacy_git::enveloped_commits(&repo, &history)?.is_empty(),
+            "a new destination requires preserved source authority for inherited ciphertext"
+        );
         let prompt = format!(
             "Create the {} repository {repository} on {} to prepare its session publication preview?",
             intent.visibility, intent.hub
