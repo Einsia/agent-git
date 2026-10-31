@@ -332,7 +332,30 @@ pub(super) fn run_child(arguments: &[&str], cwd: &Path) -> Result<()> {
 }
 
 fn report(root: &Path, enabled: &Enabled) -> CmdResult {
-    let earlier = crate::commands::project::earlier_count(root);
+    // A git worktree its main checkout covers follows that folder's setting; a main checkout
+    // names the worktrees it covers, each with the sessions from before it covered them.
+    let through = crate::commands::project::worktree_of(root);
+    let worktrees = match &through {
+        Some(_) => Vec::new(),
+        None => crate::commands::project::covered_worktrees(root),
+    };
+    let sessions = if through.is_some() || !worktrees.is_empty() {
+        super::sessions_in(root).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let earlier = match &through {
+        Some(_) => super::left_out_in(root, &sessions),
+        None => crate::commands::project::earlier_count(root),
+    };
+    let worktrees: Vec<(std::path::PathBuf, usize)> = worktrees
+        .into_iter()
+        .map(|worktree| {
+            let count = super::left_out_in(&worktree, &sessions);
+            (worktree, count)
+        })
+        .collect();
+    let waiting = earlier + worktrees.iter().map(|(_, count)| count).sum::<usize>();
     let runtimes = runtimes(root);
     if crate::commands::json::is_capturing() {
         println!(
@@ -344,13 +367,18 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "chosen": enabled.chosen,
                 "created": enabled.created,
                 "already_on": enabled.already,
+                "through": through,
+                "worktrees": worktrees.iter().map(|(folder, count)| serde_json::json!({
+                    "folder": folder,
+                    "earlier_sessions_not_uploaded": count,
+                })).collect::<Vec<_>>(),
                 "previous_repository": enabled.previous,
                 "note": enabled.note,
                 "teams_granted": enabled.granted,
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
                 "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).collect::<Vec<_>>(),
-                "next": (earlier > 0).then(|| serde_json::json!({
+                "next": (waiting > 0).then(|| serde_json::json!({
                     "command": "agit save --all",
                     "why": "upload the sessions that ran here before",
                 })),
@@ -359,10 +387,13 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
     let folder = ui::tilde(root);
-    if enabled.already {
-        ui::success(&format!("{folder} is already on"));
-    } else {
-        ui::success(&format!("{folder} is on"));
+    match (&through, enabled.already) {
+        (Some(main), _) => ui::success(&format!(
+            "{folder} is already on through {} (git worktree)",
+            ui::tilde(main)
+        )),
+        (None, true) => ui::success(&format!("{folder} is already on")),
+        (None, false) => ui::success(&format!("{folder} is on")),
     }
     let how = match (enabled.chosen, enabled.created) {
         (Chosen::Org, true) => " (new; its owners and granted teams can read it)",
@@ -380,6 +411,9 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
         "  sessions here upload to {}{visibility}{how}",
         ui::bold(enabled.repository.as_str())
     );
+    for (worktree, _) in &worktrees {
+        println!("  also covers {} (git worktree)", ui::tilde(worktree));
+    }
     if let Some(previous) = &enabled.previous {
         println!(
             "  sessions saved before stay in {previous}; teammates can read them through an invite link: `agit repo invite {previous}`"
@@ -397,13 +431,16 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
     for (runtime, state) in &runtimes {
         println!("  {}: {}", super::runtime_name(runtime), state.describe());
     }
-    if earlier > 0 {
+    let here =
+        std::iter::once(("here".to_owned(), earlier)).chain(worktrees.iter().map(
+            |(worktree, count)| (format!("in {} (git worktree)", ui::tilde(worktree)), *count),
+        ));
+    for (place, count) in here.filter(|(_, count)| *count > 0) {
         println!(
-            "  {} earlier session{} here {} not uploaded; to upload {} too: {}",
-            earlier,
-            if earlier == 1 { "" } else { "s" },
-            if earlier == 1 { "is" } else { "are" },
-            if earlier == 1 { "it" } else { "them" },
+            "  {count} earlier session{} {place} {} not uploaded; to upload {} too: {}",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "is" } else { "are" },
+            if count == 1 { "it" } else { "them" },
             ui::accent("agit save --all")
         );
     }
@@ -492,15 +529,28 @@ fn turn_off(args: OffArgs) -> CmdResult {
     let folder = ui::tilde(&root);
     match crate::commands::project::uploads_automatically(&root) {
         Some(true) => {
+            // A git worktree its main checkout covers is turned off on its own; the main checkout
+            // stays on, and so does its repository's setting.
+            let through = crate::commands::project::worktree_of(&root);
+            let repository = super::bound(&root);
             let root_arg = root.to_string_lossy().into_owned();
             run_child(&["project", "unbind", &root_arg], &root)?;
             if crate::commands::json::is_capturing() {
-                println!("{}", serde_json::json!({"folder": root, "on": false}));
+                println!(
+                    "{}",
+                    serde_json::json!({"folder": root, "on": false, "through": through})
+                );
             } else {
                 ui::success(&format!("{folder} is off"));
-                println!(
-                    "  new sessions here are no longer saved or uploaded; nothing was deleted"
-                );
+                match (&through, &repository) {
+                    (Some(main), Some(repository)) => println!(
+                        "  new sessions in this git worktree are no longer saved or uploaded; {} still uploads to {repository}",
+                        ui::tilde(main)
+                    ),
+                    _ => println!(
+                        "  new sessions here are no longer saved or uploaded; nothing was deleted"
+                    ),
+                }
                 println!("  to turn it back on: {}", ui::accent("agit on"));
             }
             Ok(ExitCode::Ok)

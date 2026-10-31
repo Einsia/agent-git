@@ -152,7 +152,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             .filter(|s| {
                 let earlier = on
                     && !args.all
-                    && crate::commands::project::is_earlier(&root, s.runtime, &s.id);
+                    && crate::commands::project::left_out(&root, s.runtime, &s.id, &s.cwd);
                 left_out += usize::from(earlier);
                 !earlier
             })
@@ -246,7 +246,15 @@ fn save(args: SaveArgs) -> CmdResult {
     for (root, mut sessions) in plan.folders {
         // A folder turned off stays off until the person turns it on again.
         if crate::commands::project::turned_off(&root) {
-            let why = format!("{} is off", ui::tilde(&root));
+            // A git worktree is off when the folder whose setting covers it is.
+            let why = match crate::commands::project::worktree_of(&root) {
+                Some(main) => format!(
+                    "{} is a git worktree of {}, which is off",
+                    ui::tilde(&root),
+                    ui::tilde(&main)
+                ),
+                None => format!("{} is off", ui::tilde(&root)),
+            };
             if args.today {
                 skipped.push((root, format!("{why}; `agit on` there turns it back on")));
                 continue;

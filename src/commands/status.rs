@@ -85,6 +85,17 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(ws) = crate::domain::workspace::read(&cwd) {
         println!("  {}", ui::dim(&format!("bound repo: {}", ws.repo)));
     }
+    if let Some(notice) = super::project::worktree_notice(&cwd) {
+        println!("  {notice}");
+    }
+    if let Some(count) = worktree_left_out(&cwd).filter(|count| *count > 0) {
+        println!(
+            "  {count} earlier session{} here {} not uploaded; to upload {} too: `agit save --all`",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "is" } else { "are" },
+            if count == 1 { "it" } else { "them" },
+        );
+    }
 
     // ── Local store ──
     ui::section("local");
@@ -341,6 +352,15 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// In a git worktree its main checkout's policy covers, how many sessions from before that
+/// coverage wait for `agit save --all`; `None` anywhere else.
+fn worktree_left_out(cwd: &std::path::Path) -> Option<usize> {
+    let folder = super::front::folder(cwd).ok()?;
+    super::project::worktree_of(&folder)?;
+    let sessions = super::front::sessions_in(&folder).ok()?;
+    Some(super::front::left_out_in(&folder, &sessions))
+}
+
 /// The "who am I" lines for the conversation the runtime environment names.
 ///
 /// It is labeled as display only: the explicit-target rule above still decides what commands
@@ -399,6 +419,7 @@ fn runtime_session_json(sessions: &[super::context::RuntimeSession]) -> serde_js
 
 fn structured(args: &Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
+    let earlier = worktree_left_out(&cwd);
     let ClaimInventory {
         store,
         mut links,
@@ -503,6 +524,11 @@ fn structured(args: &Args) -> CmdResult {
         "schema_version": 1, "cwd": cwd, "selection": selection,
         "runtime_session": runtime_session_json(&runtime_sessions),
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
+        "worktree": super::project::worktree_notice(&cwd),
+        "earlier_sessions_not_uploaded": earlier.map(|count| serde_json::json!({
+            "count": count,
+            "command": "agit save --all",
+        })),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,
             "limit": limit, "next_offset": (next < links.len()).then_some(next),

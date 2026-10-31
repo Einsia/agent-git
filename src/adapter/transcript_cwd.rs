@@ -66,18 +66,38 @@ const CWD_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 /// since the records that follow it name the directory too. A record cut by the end of the file
 /// or of the scan budget provides nothing.
 pub(crate) fn recorded_cwd(path: &std::path::Path) -> Option<String> {
+    first_recorded(path, record_cwd)
+}
+
+/// When the conversation began: the time on the first complete record that carries one, read as
+/// [`recorded_cwd`] reads the directory. Claude Code and Codex both stamp records at top level.
+/// Only project capture asks, which the Hub does not link.
+#[cfg(feature = "cli")]
+pub(crate) fn recorded_start(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    first_recorded(path, |record| {
+        let stamp = record.get("timestamp")?.as_str()?;
+        chrono::DateTime::parse_from_rfc3339(stamp)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
+    })
+}
+
+fn first_recorded<T>(
+    path: &std::path::Path,
+    pick: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Option<T> {
     use std::io::Read;
     let file = opening_file(path)?;
     let mut reader = std::io::BufReader::new(file.take(CWD_SCAN_BYTES));
     let mut record = Vec::new();
     while let Some(buffered) = next_record(&mut reader, &mut record).ok()? {
         if buffered
-            && let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&record)
+            && let Some(found) = serde_json::from_slice::<serde_json::Value>(&record)
                 .ok()
                 .as_ref()
-                .and_then(record_cwd)
+                .and_then(&pick)
         {
-            return Some(cwd);
+            return Some(found);
         }
     }
     None

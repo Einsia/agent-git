@@ -21,6 +21,12 @@ A public destination is used only when named with `--repo` and `--public`.
 Earlier sessions are not uploaded; the result says how many there are, and
 `agit save --all` uploads them.
 
+A folder that is a Git main checkout also covers its linked worktrees (`git worktree add`) that
+have no setting of their own, and the result names each one (`also covers … (git worktree)`).
+Sessions that ran in a worktree before the folder covered it count as earlier sessions there. A
+separate clone or a submodule is not covered. In a worktree, `agit on` says which folder covers
+it, and `agit off` turns off only the worktree.
+
 ## Synopsis
 
 ```bash
