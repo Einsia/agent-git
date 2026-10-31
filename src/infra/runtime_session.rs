@@ -26,7 +26,9 @@ pub struct Current {
 ///
 /// Claude Code exports `CLAUDE_CODE_SESSION_ID`; `CLAUDE_SESSION_ID` is agit's own name for it,
 /// carried only by child processes agit starts itself. Both support unmanaged-session safety
-/// checks and stale AGIT_SESSION rejection; neither selects an ordinary command target.
+/// checks and stale AGIT_SESSION rejection; they select no ordinary command target. The front
+/// door's "this conversation" prefers [`FRONT_DOOR_SESSION`], and takes one of these only when it
+/// is the single session they name.
 pub const ENV_SESSIONS: &[(&str, &str)] = &[
     ("CODEBUDDY_SESSION_ID", "workbuddy"),
     ("HERMES_SESSION_ID", "hermes"),
@@ -34,8 +36,35 @@ pub const ENV_SESSIONS: &[(&str, &str)] = &[
     ("CLAUDE_CODE_SESSION_ID", "claude-code"),
     ("CLAUDE_SESSION_ID", "claude-code"),
     ("CODEX_SESSION_ID", "codex"),
+    ("CODEX_THREAD_ID", "codex"),
     ("OPENCODE_SESSION_ID", "opencode"),
 ];
+
+/// `<runtime>:<native id>` of the conversation a Claude Code session environment file belongs
+/// to, written by the SessionStart hook only into the file of that exact session.
+pub const FRONT_DOOR_SESSION: &str = "AGIT_RUNTIME_SESSION";
+
+/// The conversation the front door acts on when none is named: the one the SessionStart hook
+/// recorded for this session, else the single one the runtime variables name. A runtime started
+/// inside another one inherits the outer one's record and variables, so variables of a second
+/// runtime leave the answer open.
+pub fn this_conversation() -> Option<(&'static str, String)> {
+    let named = named();
+    if let Ok(value) = std::env::var(FRONT_DOOR_SESSION)
+        && let Some((runtime, id)) = value.split_once(':')
+        && !id.trim().is_empty()
+        && let Some(&(_, runtime)) = ENV_SESSIONS.iter().find(|(_, r)| *r == runtime)
+    {
+        return named
+            .iter()
+            .all(|n| n.runtime == runtime)
+            .then(|| (runtime, id.to_string()));
+    }
+    match named.as_slice() {
+        [one] => Some((one.runtime, one.session_id.clone())),
+        _ => None,
+    }
+}
 
 /// The form of `AGIT_SESSION`: `<owner>/<name>@<branch>`.
 pub fn encode_env(repo: &str, branch: &str) -> String {
@@ -77,7 +106,7 @@ pub struct Named {
 ///
 /// A nested runtime inherits its parent's variables, so more than one entry means the environment
 /// alone does not say which conversation this process belongs to. Callers report that instead of
-/// choosing one; none of them turns an entry into a command target.
+/// choosing one; only [`this_conversation`] takes a single entry as the front door's default.
 pub fn named() -> Vec<Named> {
     use crate::adapter::native_snapshot::{self, Limits, Unavailable};
     let mut named: Vec<Named> = Vec::new();
@@ -180,6 +209,70 @@ mod tests {
     fn both_claude_session_variables_are_recognized() {
         assert!(ENV_SESSIONS.contains(&("CLAUDE_CODE_SESSION_ID", "claude-code")));
         assert!(ENV_SESSIONS.contains(&("CLAUDE_SESSION_ID", "claude-code")));
+    }
+
+    /// Inside Codex the tool shell carries `CODEX_THREAD_ID`, and that thread is the conversation
+    /// the front door saves. The SessionStart record names this session even when a variable of
+    /// the same runtime is stale; a variable of a second runtime, as in a runtime started inside
+    /// another one, leaves the conversation unnamed instead of picking the outer one. Each case
+    /// runs in a child process so the variables of the test's own environment take no part.
+    #[test]
+    fn this_conversation_follows_the_codex_thread_and_the_session_record() {
+        const CHILD: &str = "AGIT_RUNTIME_SESSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            println!("ANSWER={:?}", this_conversation());
+            return;
+        }
+        const A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+        const B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+        let codex_home = tempfile::tempdir().unwrap();
+        let day = codex_home.path().join("sessions/2026/10/25");
+        std::fs::create_dir_all(&day).unwrap();
+        for id in [A, B] {
+            std::fs::write(
+                day.join(format!("rollout-2026-10-25T00-00-00-{id}.jsonl")),
+                "",
+            )
+            .unwrap();
+        }
+        let ask = |vars: &[(&str, &str)]| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "infra::runtime_session::tests::this_conversation_follows_the_codex_thread_and_the_session_record",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove(FRONT_DOOR_SESSION);
+            for (variable, _) in ENV_SESSIONS {
+                command.env_remove(variable);
+            }
+            command.env("CODEX_HOME", codex_home.path());
+            command.envs(vars.iter().copied());
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("ANSWER=").map(str::to_owned))
+                .unwrap_or_else(|| panic!("{stdout}"))
+        };
+        assert_eq!(
+            ask(&[("CODEX_THREAD_ID", A)]),
+            format!(r#"Some(("codex", "{A}"))"#)
+        );
+        let record = format!("codex:{B}");
+        assert_eq!(
+            ask(&[(FRONT_DOOR_SESSION, &record), ("CODEX_THREAD_ID", A)]),
+            format!(r#"Some(("codex", "{B}"))"#)
+        );
+        assert_eq!(
+            ask(&[
+                (FRONT_DOOR_SESSION, "claude-code:outer"),
+                ("CODEX_THREAD_ID", A)
+            ]),
+            "None"
+        );
     }
 
     #[test]

@@ -16,6 +16,37 @@ work, continue the user's task without running agit. Do not run `agit status` or
 scan transcripts merely to decide whether this skill applies. Reading this skill
 for review or editing does not activate its session-management workflow.
 
+## Save, upload and check a conversation (start here)
+
+For Claude Code and Codex conversations these commands cover what users ask for. Each one finds
+the conversation, its folder's destination and the account by itself, so do not build `import`,
+`commit` or `push` commands for these requests.
+
+| The user asks to… | Run |
+|---|---|
+| save, upload or back up this conversation, or get its link | `agit save --json` |
+| upload all of today's sessions | `agit save --today --json` |
+| upload the sessions that ran in this folder earlier | `agit save --all --json` |
+| save every future session in this folder automatically | `agit on --json` |
+| stop that for this folder | `agit off --json` |
+| see what is saved here | `agit --json` |
+
+- `agit save` run inside a conversation saves that conversation and turns its folder on, so later
+  turns upload after each turn without any command. Send the user `result.value.sessions[].link`.
+- Exit code `8` with `result.value.sign_in_url` means the user must sign in: send them the link,
+  wait until they say they approved it, then run the same command again. It finishes the sign-in
+  by itself; do not run `agit login --complete`.
+- `status` `pending` means this conversation's first reply has not finished; it uploads by itself
+  when the reply ends, and `link` shows it then.
+- A refusal says what happened and ends with the next step (`diagnostics.stderr`, level `hint`).
+  Follow that step or report it to the user.
+- Uploads go to a private destination. A destination is public only when the user names it with
+  `--repo OWNER/NAME --public`.
+- In a folder that is on, never run `agit commit` or `agit push` for its conversations.
+
+The rest of this guide covers explicit and advanced operations, and runtimes other than Claude
+Code and Codex.
+
 AgentGit (`agit`) is a version-control layer for agent conversations. It is not a replacement for the project code repository: it stores conversation context, VIEWs, events, shared memory, and skills in a real Git repository.
 
 The core model:
@@ -134,9 +165,11 @@ Name constraint: a **branch** name must not begin with `agit-`. That prefix is r
 
 ## Adopt the current session when it is not managed yet
 
-When the user asks to upload the current conversation, it takes two commands. Do not run
-`agit status --json`, `whoami`, `login`, `doctor`, `log`, `push --dry-run` or `--help` first:
-push checks the sign-in and shows the destination, count and visibility itself.
+For a Claude Code or Codex conversation use `agit save` (above). For other runtimes, or when
+the user names an explicit repository and branch, uploading the current conversation takes two
+commands. Do not run `agit status --json`, `whoami`, `login`, `doctor`, `log`,
+`push --dry-run` or `--help` before either: save and push check the sign-in and show the
+destination, count and visibility themselves.
 
 - Already saved (`agit status` names its `<owner/repo>@<branch>`): `agit commit
   <owner/repo>@<branch>`, then `agit push <owner/repo>@<branch> --yes`.

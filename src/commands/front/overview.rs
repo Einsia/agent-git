@@ -12,7 +12,7 @@ const SHOWN: usize = 5;
 enum FolderState {
     /// Sessions save and upload by themselves.
     On,
-    /// Sessions save on this computer; uploading is off.
+    /// Bound to a repository, without automatic saving or uploading.
     LocalOnly,
     /// Bound to a project that was turned off.
     Off,
@@ -57,6 +57,7 @@ pub fn run() -> CmdResult {
     let failure = root
         .as_deref()
         .and_then(crate::commands::project::last_failure);
+    let codex_untrusted = state == FolderState::On && codex_hooks_silent(&sessions);
     let next = next_step(account.is_some(), root.is_some(), state, total);
 
     if crate::commands::json::is_capturing() {
@@ -71,6 +72,7 @@ pub fn run() -> CmdResult {
                 "sessions_here": total,
                 "recent": sessions.iter_mut().map(row_json).collect::<Vec<_>>(),
                 "last_upload_error": failure,
+                "codex_hooks_not_running": codex_untrusted,
                 "next": next.map(|(command, why)| serde_json::json!({"command": command, "why": why})),
             })
         );
@@ -99,10 +101,16 @@ pub fn run() -> CmdResult {
                     ui::bold(repository)
                 ),
                 FolderState::LocalOnly => println!(
-                    "{folder} saves sessions on this computer ({repository}) but does not upload them"
+                    "{folder} is set up for {repository}, but its sessions are not saved or uploaded by themselves"
                 ),
                 FolderState::Off => println!("{folder} is off"),
                 FolderState::NotSaved => println!("{folder} is not saved"),
+            }
+            if codex_untrusted {
+                println!(
+                    "  {} in Codex, open /hooks and trust both AgentGit hooks; until then its turns upload when you run `agit` or `agit save`",
+                    ui::warn_text("Codex has not run AgentGit's save hook:")
+                );
             }
             if let Some(failure) = &failure {
                 println!(
@@ -133,6 +141,27 @@ pub fn run() -> CmdResult {
         ),
     }
     Ok(ExitCode::Ok)
+}
+
+/// Whether an idle Codex session here changed well after the last time Codex ran AgentGit's Stop
+/// hook on this computer: the hook is installed, so Codex is not running it, which it does only
+/// for hooks the person trusted. A session still being written may be in the middle of a turn
+/// and says nothing yet.
+fn codex_hooks_silent(sessions: &[FolderSession]) -> bool {
+    const SETTLING: std::time::Duration = std::time::Duration::from_secs(120);
+    let seen = crate::commands::hooks::stop_seen_path("codex")
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok());
+    sessions.iter().any(|session| {
+        session.runtime == "codex"
+            && session.modified.elapsed().is_ok_and(|idle| idle > SETTLING)
+            && seen.is_none_or(|seen| {
+                session
+                    .modified
+                    .duration_since(seen)
+                    .is_ok_and(|after| after > SETTLING)
+            })
+    })
 }
 
 fn next_step(

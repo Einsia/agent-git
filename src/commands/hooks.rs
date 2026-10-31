@@ -601,7 +601,7 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     }
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
-    write_session_env(&ev.session_id, env_value.as_deref());
+    write_session_env(rt, &ev.session_id, env_value.as_deref());
     // Nothing here reaches the model: an agent that needs this conversation's state runs agit,
     // which names it from the runtime's own session variable. Only the person is told where a
     // conversation the folder uploads goes, and who can read it there.
@@ -657,7 +657,7 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
 ///
 /// Only claude-code offers this mechanism (`CLAUDE_ENV_FILE`, one directory per session). codex has
 /// no equivalent; [`super::context`] refuses a known stale supplied identity.
-fn write_session_env(session_id: &str, value: Option<&str>) {
+fn write_session_env(runtime: &str, session_id: &str, value: Option<&str>) {
     let Ok(path) = std::env::var("CLAUDE_ENV_FILE") else {
         return;
     };
@@ -678,10 +678,17 @@ fn write_session_env(session_id: &str, value: Option<&str>) {
     if !env_file_belongs_to(&path, session_id) {
         return;
     }
-    let line = match value {
+    let mut line = match value {
         Some(v) => format!("export AGIT_SESSION={}\n", sh_quote(v)),
         None => "unset AGIT_SESSION\n".to_string(),
     };
+    // The conversation this file belongs to, for the front door's "this conversation": unlike the
+    // runtime's own variable it is rewritten when the person clears or switches the session.
+    line.push_str(&format!(
+        "export {}={}\n",
+        crate::infra::runtime_session::FRONT_DOOR_SESSION,
+        sh_quote(&format!("{runtime}:{session_id}"))
+    ));
     let _ = std::fs::write(path, line);
 }
 
@@ -738,7 +745,22 @@ fn settle(runtime: Option<&str>, await_reply: bool) -> CmdResult {
     }
 }
 
+/// Where the time of a runtime's last Stop hook is kept. A runtime that asks the person to trust
+/// hooks first (Codex) runs none until they do, and nothing else tells AgentGit so.
+pub(crate) fn stop_seen_path(runtime: &str) -> Option<std::path::PathBuf> {
+    Some(
+        crate::infra::config::agit_home()
+            .ok()?
+            .join("hooks-seen")
+            .join(format!("{runtime}-stop")),
+    )
+}
+
 fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
+    if let Some(path) = runtime.and_then(stop_seen_path) {
+        let _ = crate::infra::config::create_state_dir(path.parent().unwrap_or(&path))
+            .and_then(|()| std::fs::write(&path, b""));
+    }
     let payload = read_payload();
     let event = payload
         .as_deref()

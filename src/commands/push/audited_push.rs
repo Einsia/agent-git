@@ -164,7 +164,59 @@ fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
     command
 }
 
+/// What stopped a publication, in the transport's words: the step's own error, a ref the Hub
+/// rejected with its reason, or the last line Git printed. A caller that runs push as a child
+/// reads only the final error line, so the reason has to be in it.
+fn publication_failure(report: &PublicationReport) -> Option<String> {
+    let from_git = |code: i32, stderr: &str| {
+        stderr
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map_or_else(|| format!("Git exit {code}"), str::to_owned)
+    };
+    let lfs = report.lfs.as_ref().and_then(|lfs| {
+        lfs.error.clone().or_else(|| {
+            lfs.attempts
+                .iter()
+                .rfind(|attempt| !attempt.ok())
+                .map(|attempt| {
+                    attempt
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| from_git(attempt.outcome.code, &attempt.outcome.stderr))
+                })
+        })
+    });
+    let refs = [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .find_map(|phase| {
+            phase.error.clone().or_else(|| {
+                phase
+                    .attempts
+                    .iter()
+                    .rfind(|attempt| !attempt.ok())
+                    .map(|attempt| {
+                        attempt
+                            .error
+                            .clone()
+                            .or_else(|| attempt.refs.iter().find_map(|r| r.detail.clone()))
+                            .unwrap_or_else(|| {
+                                from_git(attempt.outcome.code, &attempt.outcome.stderr)
+                            })
+                    })
+            })
+        });
+    let reason = report.error.clone().or(lfs).or(refs)?;
+    Some(crate::ui::truncate(&reason, 200))
+}
+
 fn publication_recovery(report: &PublicationReport, retry: &str, repository: &str) -> String {
+    let stopped = publication_failure(report).map_or_else(
+        || "publication did not complete".to_owned(),
+        |reason| format!("publication did not complete ({reason})"),
+    );
     let attempts: Vec<_> = [&report.heads, &report.tags]
         .into_iter()
         .flatten()
@@ -183,7 +235,7 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
         #[cfg(not(windows))]
         use crate::ui::session::shell_arg as quote_arg;
         return format!(
-            "publication did not complete; some ref updates are unconfirmed; run `agit fetch {}` and inspect `agit status` before rerunning `{retry}`",
+            "{stopped}; some ref updates are unconfirmed; run `agit fetch {}` and inspect `agit status` before rerunning `{retry}`",
             quote_arg(repository)
         );
     }
@@ -193,11 +245,11 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
         .any(|reference| reference.status == PublicationStatus::Updated)
     {
         format!(
-            "publication did not complete; some ref updates were acknowledged; rerunning `{retry}` is safe and rechecks the destination"
+            "{stopped}; some ref updates were acknowledged; rerunning `{retry}` is safe and rechecks the destination"
         )
     } else {
         format!(
-            "publication did not complete; no branch or tag refs were updated; rerunning `{retry}` is safe after resolving the reported error"
+            "{stopped}; no branch or tag refs were updated; rerunning `{retry}` is safe after resolving it"
         )
     }
 }

@@ -4,6 +4,7 @@
     "": {"aliases":[],"args":{}},
     "on": {"aliases":[],"args":{"dir":{"action":"Set","policy":"presence"},"public":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "off": {"aliases":[],"args":{"dir":{"action":"Set","policy":"presence"}}},
+    "save": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"public":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"},"session":{"action":"Set","policy":"presence"},"today":{"action":"SetTrue","policy":"boolean"}}},
     "overview": {"aliases":[],"args":{}},
     "activity": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"author":{"action":"Set","policy":"presence"},"since":{"action":"Set","policy":"presence"},"before":{"action":"Set","policy":"presence"},"session":{"action":"Set","policy":"presence"},"cursor":{"action":"Set","policy":"presence"},"limit":{"action":"Set","policy":"bucket"},"assistant":{"action":"Set","policy":"enum","values":["all","last"]},"format":{"action":"Set","policy":"enum","values":["json","markdown"]}}},
     "branch": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"},"verbose":{"action":"SetTrue","policy":"boolean"}}},
