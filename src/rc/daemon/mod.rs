@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
+mod activity;
 mod archive_recovery;
 mod capture_binding;
 /// The monotonic danger bit's tests plus its credential. **Every path that hands a harness

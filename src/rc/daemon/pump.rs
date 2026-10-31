@@ -60,6 +60,8 @@ impl Daemon {
             confinement: HashMap::new(),
         }));
 
+        tokio::spawn(activity::run(d.clone()));
+
         // Control socket on a blocking thread: `agit rc status` must work even
         // if the async side is wedged talking to an unreachable hub.
         let ctl = control::listen()?;

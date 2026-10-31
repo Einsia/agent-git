@@ -9,6 +9,7 @@ pub(crate) mod status;
 mod transport;
 pub(crate) use approval::wait_approval;
 pub use install::install_plugin;
+pub(crate) use transport::TerminalActivity;
 pub use transport::{Client, Endpoint, Snapshot, Update};
 
 use anyhow::{Context, ensure};

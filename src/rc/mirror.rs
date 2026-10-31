@@ -98,6 +98,16 @@ impl Mirror {
             .collect()
     }
 
+    /// Every binding on this machine as `(project id, canonical root)`, one per workspace that
+    /// binds it.
+    pub fn bound_projects(&self) -> Vec<(String, PathBuf)> {
+        self.verified
+            .values()
+            .flat_map(|projects| projects.iter())
+            .map(|(project, root)| (project.clone(), root.clone()))
+            .collect()
+    }
+
     /// Project metadata returned by workspace discovery.
     pub fn to_local(&self) -> Vec<LocalWorkspace> {
         self.workspaces

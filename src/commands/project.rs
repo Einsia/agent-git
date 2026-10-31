@@ -1131,12 +1131,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         Ok(Placement::New) => None,
         _ => return Ok(false),
     };
-    if !project.enabled
-        || !project.auto_upload
-        || project
-            .excluded
-            .contains(&key(&candidate.runtime, &candidate.session_id))
-    {
+    if withholds(&project, &candidate) {
         // Pausing the project stops passive capture only. A session claimed on another branch
         // (`agit run`, `resume --as`, an import) is settled from its link; a paused project
         // still blocks its automatic push. A session no project has claimed has nothing to settle.
@@ -1149,6 +1144,58 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         drain(&project.root)?;
     }
     Ok(true)
+}
+
+/// Whether `project` keeps `candidate`'s turns from being uploaded: the project is paused, it
+/// uploads nothing, or the session is excluded from it.
+fn withholds(project: &Project, candidate: &Candidate) -> bool {
+    !project.enabled
+        || !project.auto_upload
+        || project
+            .excluded
+            .contains(&key(&candidate.runtime, &candidate.session_id))
+}
+
+/// What the project policy of a folder does with one live session. Only team activity reports
+/// of terminal sessions registered for native control ask, and those run on Unix alone.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Capture {
+    /// No project policy covers the folder.
+    Unbound,
+    /// A policy covers the folder and does not upload this session's turns: it is paused or
+    /// uploads nothing, the session is excluded or claimed by another repository, a nearer
+    /// binding interposes, or the policy cannot be read.
+    Withheld,
+    /// The policy uploads the session's turns to this repository.
+    Uploads(RemoteIdentity),
+}
+
+/// What the project policy covering `cwd`, a canonical directory, does with `runtime`'s
+/// `session`. It answers with the same tests a Stop hook's capture applies, without capturing.
+#[cfg(unix)]
+pub(crate) fn capture_state(runtime: &str, session: &str, cwd: &Path) -> Capture {
+    let state = || -> Result<Capture> {
+        let Some(project) = nearest(cwd)? else {
+            return Ok(Capture::Unbound);
+        };
+        let candidate = Candidate {
+            runtime: runtime.into(),
+            session_id: session.into(),
+            cwd: cwd.to_owned(),
+        };
+        if !includes(&project, cwd)?
+            || withholds(&project, &candidate)
+            || !matches!(
+                placement(&project, &candidate)?,
+                Placement::Claim(_) | Placement::New
+            )
+        {
+            return Ok(Capture::Withheld);
+        }
+        Ok(Capture::Uploads(project.identity))
+    };
+    state().unwrap_or(Capture::Withheld)
 }
 
 /// Import, inspection and upload outlast a runtime's hook budget for a long session, and a
@@ -3133,6 +3180,48 @@ mod tests {
 
     /// A capture queued before its directory was bound on its own is skipped, so the parent
     /// project does not import or publish a session the nested binding now owns.
+    /// Pins that the capture check team activity asks agrees with what a Stop hook's capture
+    /// uploads: a session no repository has claimed yet uploads to the project, while one the
+    /// project excludes, one in a paused project and one in a nested binding of another
+    /// repository do not, and a folder outside every project has no policy.
+    #[cfg(unix)]
+    #[test]
+    fn the_capture_check_answers_what_capture_would_upload() {
+        if !isolated("the_capture_check_answers_what_capture_would_upload") {
+            return;
+        }
+        const RUNTIME: &str = "claude-code";
+        const SESSION: &str = "eeeeeeee-0000-4000-8000-000000000005";
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path().canonicalize().unwrap();
+        let app = work.join("app");
+        let nested = app.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let mut policy = project(&app);
+        save(&policy).unwrap();
+        let state = |cwd: &Path| capture_state(RUNTIME, SESSION, cwd);
+
+        assert_eq!(state(&app), Capture::Uploads(policy.identity.clone()));
+        assert_eq!(state(&work), Capture::Unbound);
+
+        policy.excluded.insert(key(RUNTIME, SESSION));
+        save(&policy).unwrap();
+        assert_eq!(state(&app), Capture::Withheld);
+        policy.excluded.clear();
+        policy.enabled = false;
+        save(&policy).unwrap();
+        assert_eq!(state(&app), Capture::Withheld);
+        policy.enabled = true;
+        save(&policy).unwrap();
+
+        let mut child = project(&nested);
+        child.repository = "alice/nested".into();
+        child.auto_upload = false;
+        save(&child).unwrap();
+        assert_eq!(state(&nested), Capture::Withheld);
+        assert_eq!(state(&app), Capture::Uploads(policy.identity));
+    }
+
     #[test]
     fn queued_capture_respects_a_nested_binding_made_afterwards() {
         if !isolated("queued_capture_respects_a_nested_binding_made_afterwards") {

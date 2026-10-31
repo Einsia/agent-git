@@ -52,6 +52,39 @@ fn require_identity(repository: &Repo, agent_id: &str, machine_id: &str) -> crat
     Ok(())
 }
 
+/// The local repository registry, by project. A registry that does not exist yet is empty.
+fn registry(path: &Path) -> crate::Result<BTreeMap<String, Repository>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("local repository registry is invalid"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The Hub that `project_id`'s device-local repository is confirmed to publish to. A project
+/// without a local repository publishes to none, and asking never creates one.
+pub(crate) fn publication_hub(project_id: &str) -> crate::Result<Option<String>> {
+    Ok(publication_destination(project_id)?.map(|(_, destination)| destination.identity.hub))
+}
+
+/// `project_id`'s device-local repository slug and the destination it is confirmed to publish
+/// to, read as [`publication_hub`] reads it.
+pub(crate) fn publication_destination(
+    project_id: &str,
+) -> crate::Result<Option<(String, publication::Destination)>> {
+    let Some(repository) =
+        registry(&super::rc_dir()?.join("repositories.json"))?.remove(project_id)
+    else {
+        return Ok(None);
+    };
+    let repo = require(&AgitSession::new(
+        &repository.slug,
+        &repository.agent_id,
+        "main",
+    )?)?;
+    Ok(publication::Destination::load(&repo)?.map(|destination| (repository.slug, destination)))
+}
+
 pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Repository> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -60,14 +93,7 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
         .write(true)
         .open(super::rc_dir()?.join("repositories.lock"))?;
     fs2::FileExt::lock_exclusive(&lock)?;
-    let path = super::rc_dir()?.join("repositories.json");
-    let mut repositories: BTreeMap<String, Repository> = match std::fs::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).context("local repository registry is invalid")?
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let mut repositories = registry(&super::rc_dir()?.join("repositories.json"))?;
     let directory = directory.canonicalize()?.to_string_lossy().to_string();
     if let Some(repository) = repositories.get(project_id) {
         ensure!(

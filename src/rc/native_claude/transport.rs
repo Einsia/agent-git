@@ -169,9 +169,63 @@ struct PeerState {
     /// Module reports received for this generation.
     reports: u64,
     reported_mode: Option<String>,
+    /// The id team activity reports this registration under, minted by the daemon so the Hub
+    /// never sees Claude Code's own session id or the generation.
+    report_id: String,
+    /// What the session last did that a reader of team activity can see change, and when it
+    /// last changed.
+    activity: (Value, String),
 }
 
 impl PeerState {
+    fn new(snapshot: Snapshot) -> Self {
+        let mut state = Self {
+            baseline: 0,
+            acknowledged: snapshot
+                .events
+                .first()
+                .and_then(|event| event["seq"].as_u64())
+                .unwrap_or(snapshot.last_seq.saturating_add(1))
+                .saturating_sub(1),
+            snapshot,
+            seen: Instant::now(),
+            events: VecDeque::new(),
+            attached: false,
+            operations: HashMap::new(),
+            next_operation: 0,
+            decisions: HashMap::new(),
+            module_approvals: Vec::new(),
+            module_mode: None,
+            offered: HashMap::new(),
+            sighted: HashMap::new(),
+            reports: 0,
+            reported_mode: None,
+            report_id: uuid::Uuid::new_v4().to_string(),
+            activity: (Value::Null, String::new()),
+        };
+        state.note_activity();
+        state
+    }
+
+    /// Move the last activity time when the turn, the pending asks, the lifecycle sequence or
+    /// compaction changed since the last report.
+    fn note_activity(&mut self) {
+        let snapshot = &self.snapshot;
+        let marker = json!([
+            snapshot.turn,
+            snapshot
+                .approvals
+                .iter()
+                .map(|approval| &approval["id"])
+                .collect::<Vec<_>>(),
+            snapshot.latest_seq.unwrap_or(snapshot.last_seq),
+            snapshot.compacting,
+        ]);
+        if marker != self.activity.0 {
+            self.activity = (marker, chrono::Utc::now().to_rfc3339());
+        }
+    }
+
     fn overlay(&mut self) {
         self.offered
             .retain(|_, (_, seen)| seen.elapsed() < OFFER_LEASE);
@@ -191,6 +245,7 @@ impl PeerState {
             .module_mode
             .clone()
             .or_else(|| self.reported_mode.clone());
+        self.note_activity();
     }
 }
 
@@ -514,28 +569,7 @@ impl Hub {
                 });
                 ensure!(peers.len() < MAX_PEERS, "native control peer limit reached");
                 // Before attachment, native history and the current snapshot establish the baseline.
-                let state = PeerState {
-                    baseline: 0,
-                    snapshot: snapshot.clone(),
-                    seen: Instant::now(),
-                    acknowledged: snapshot
-                        .events
-                        .first()
-                        .and_then(|event| event["seq"].as_u64())
-                        .unwrap_or(snapshot.last_seq.saturating_add(1))
-                        .saturating_sub(1),
-                    events: VecDeque::new(),
-                    attached: false,
-                    operations: HashMap::new(),
-                    next_operation: 0,
-                    decisions: HashMap::new(),
-                    module_approvals: Vec::new(),
-                    module_mode: None,
-                    offered: HashMap::new(),
-                    sighted: HashMap::new(),
-                    reports: 0,
-                    reported_mode: None,
-                };
+                let state = PeerState::new(snapshot.clone());
                 peers.insert(
                     snapshot.generation.clone(),
                     Arc::new(Peer {
@@ -745,6 +779,21 @@ fn record_result(
 }
 
 /// One supervisor holds native control; additional RC viewers share that supervisor.
+/// A terminal Claude Code session registered for native control, as team activity sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalActivity {
+    pub report_id: String,
+    /// Claude Code's own session id: read on the device to judge where the session publishes,
+    /// never reported.
+    pub session: String,
+    /// The working directory, canonical.
+    pub cwd: PathBuf,
+    /// The working directory as the session spells it.
+    pub spelled: PathBuf,
+    pub status: &'static str,
+    pub last_activity_at: String,
+}
+
 pub struct Client {
     peer: Arc<Peer>,
     hub: Arc<Hub>,
@@ -781,6 +830,45 @@ impl Client {
                 let state = peer.state.lock().unwrap();
                 (state.seen.elapsed() < FRESH && state.snapshot.validate().is_ok())
                     .then(|| state.snapshot.registration.clone())
+            })
+            .collect()
+    }
+
+    /// Every current registration no remote-control client holds, as team activity sees it. A
+    /// held one runs as a daemon session and is reported as that session.
+    pub(crate) fn terminal_activity() -> Vec<TerminalActivity> {
+        let Some(hub) = HUB.get().and_then(|hub| hub.lock().unwrap().upgrade()) else {
+            return vec![];
+        };
+        if hub.closed.load(Ordering::Acquire) {
+            return vec![];
+        }
+        let peers: Vec<_> = hub.peers.lock().unwrap().values().cloned().collect();
+        peers
+            .iter()
+            .filter_map(|peer| {
+                let state = peer.state.lock().unwrap();
+                if state.attached
+                    || state.seen.elapsed() >= FRESH
+                    || state.snapshot.validate().is_err()
+                {
+                    return None;
+                }
+                let status = if !state.snapshot.approvals.is_empty() {
+                    "awaiting_approval"
+                } else if state.snapshot.turn.is_some() {
+                    "running"
+                } else {
+                    "idle"
+                };
+                Some(TerminalActivity {
+                    report_id: state.report_id.clone(),
+                    session: state.snapshot.session.clone(),
+                    cwd: state.snapshot.registration.cwd.clone(),
+                    spelled: state.snapshot.cwd.clone(),
+                    status,
+                    last_activity_at: state.activity.1.clone(),
+                })
             })
             .collect()
     }
