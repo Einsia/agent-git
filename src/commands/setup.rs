@@ -2782,6 +2782,25 @@ mod tests {
         assert!(skill.contains("`agit new` cannot take over the session that is already running"));
     }
 
+    /// A save turns a folder that was never on on, and the user's ruling (ledger 121, choice A)
+    /// has the agent ask once afterwards whether new sessions there keep uploading, a no running
+    /// `agit off` for that folder. A skill that only says the folder is now on leaves it uploading
+    /// without the user ever being asked; one that sends the agent to `agit on` after a refusal
+    /// undoes the user's no.
+    #[test]
+    fn skill_asks_once_after_a_save_turns_a_folder_on() {
+        for text in [
+            include_str!("setup_skill.md"),
+            include_str!("subskills/save.md"),
+        ] {
+            assert!(text.contains("folders_turned_on[]"), "{text}");
+            assert!(text.contains("ask once whether they"), "{text}");
+            assert!(text.contains("`agit off --json <folder>`"), "{text}");
+            assert!(text.contains("you do not ask again"), "{text}");
+            assert!(text.contains("only when the user"), "{text}");
+        }
+    }
+
     #[test]
     fn marked_block_upsert_appends_then_replaces_in_place() {
         let dir = std::env::temp_dir().join(format!("agit-setup-test-{}", std::process::id()));
