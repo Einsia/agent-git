@@ -326,6 +326,20 @@ pub(crate) fn pending() -> crate::Result<Vec<Job>> {
     scan(&directory)
 }
 
+/// The jobs queued under either daemon namespace, each with the namespace that queued it, read
+/// without creating or locking anything: an inspection must not write, nor wait for a daemon that
+/// holds the queue. A record is replaced by rename, so a scan sees each one whole or not at all.
+pub(crate) fn observe() -> crate::Result<Vec<(&'static str, Job)>> {
+    let mut jobs = Vec::new();
+    for namespace in ["rc", "desktop-rc"] {
+        let directory = super::namespace_dir(namespace)?.join("pending-archives");
+        if directory.is_dir() {
+            jobs.extend(scan(&directory)?.into_iter().map(|job| (namespace, job)));
+        }
+    }
+    Ok(jobs)
+}
+
 pub(crate) fn publication_confirmed(
     repo: &Repo,
     request: &crate::domain::privacy_receipt::SupervisorPushRequest,

@@ -26,6 +26,55 @@ pub(crate) fn publication_allowed(repo: &Repo, repository: &str) -> crate::Resul
     Ok(repo.auto_push_enabled()? && !publication_explicitly_off(repository)?)
 }
 
+/// Which setting keeps [`publication_allowed`] from letting `repo` publish to a destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Off {
+    /// The destination's own setting in its checkout on this computer.
+    Destination,
+    /// The setting of the repository that records the conversation, when it is not the
+    /// destination's checkout.
+    CaptureRepository,
+    /// The user preference, which covers every repository without a setting of its own, the
+    /// destination included: it has no checkout here to hold one.
+    UserDefault,
+}
+
+impl Off {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Destination => "destination",
+            Self::CaptureRepository => "capture_repository",
+            Self::UserDefault => "user_default",
+        }
+    }
+}
+
+/// Why [`publication_allowed`] refuses `repo` publishing to `repository`, and the narrowest
+/// command that ends the refusal: the destination's own `push.auto` in its checkout here, and only
+/// when turning that on is enough. A wait that only a wider switch ends gets no command. Turning
+/// on the user preference to release one destination's turns would start automatic uploads of
+/// every repository without a setting of its own, which the person did not ask for.
+pub(crate) fn refusal(repo: &Repo, repository: &str) -> crate::Result<(Off, Option<String>)> {
+    let (owner, name) = super::parse_slug(repository)?;
+    let checkout = Repo::open(crate::infra::config::repo_dir(&owner, &name)?);
+    let records_here = checkout.as_ref().is_some_and(|checkout| {
+        matches!(
+            (checkout.root().canonicalize(), repo.root().canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+    });
+    if !records_here && !repo.auto_push_enabled()? {
+        return Ok((Off::CaptureRepository, None));
+    }
+    Ok(match checkout {
+        Some(_) => (
+            Off::Destination,
+            Some(format!("agit config --repo {repository} push.auto true")),
+        ),
+        None => (Off::UserDefault, None),
+    })
+}
+
 /// The refusal an automatic publication meets while its repository's `push.auto` is off.
 pub(crate) const DISABLED_FOR_REPOSITORY: &str =
     "automatic publication is disabled for this repository";

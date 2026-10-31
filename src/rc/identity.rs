@@ -21,6 +21,20 @@ pub(crate) fn desktop_identity() -> crate::Result<Identity> {
     )?)
 }
 
+/// The identity `namespace`'s daemon saved, read without creating a directory or an identity.
+/// `None` when it has none: a namespace that never ran a daemon owns no repository.
+pub(crate) fn saved(namespace: &str) -> crate::Result<Option<Identity>> {
+    let path = super::namespace_dir(namespace)?.join("identity.json");
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    super::windows_security::validate_path(&path, false, true)?;
+    Ok(Some(serde_json::from_slice(
+        &crate::domain::storage::read_bytes_capped(&path, 8192)?,
+    )?))
+}
+
 fn identity_path() -> crate::Result<PathBuf> {
     let path = super::rc_dir()?.join("identity.json");
     #[cfg(windows)]

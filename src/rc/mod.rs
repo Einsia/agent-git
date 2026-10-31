@@ -129,6 +129,13 @@ pub fn select_local_authority() {
     LOCAL_AUTHORITY.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Return an isolated test process to the namespace a plain command uses, after it prepared state
+/// as the desktop daemon.
+#[cfg(all(test, unix))]
+pub(crate) fn select_plain_authority() {
+    LOCAL_AUTHORITY.store(false, std::sync::atomic::Ordering::Release);
+}
+
 /// The selected daemon namespace.
 pub fn rc_dir() -> crate::Result<PathBuf> {
     state_dir(
@@ -155,6 +162,20 @@ pub(crate) fn state_dir(namespace: &str) -> crate::Result<PathBuf> {
     #[cfg(not(windows))]
     crate::infra::config::create_state_dir(&d)?;
     Ok(d)
+}
+
+/// The directory of a daemon namespace, which may not exist: for inspections that must leave no
+/// state behind, where [`state_dir`] would create it.
+pub(crate) fn namespace_dir(namespace: &str) -> crate::Result<PathBuf> {
+    #[cfg(test)]
+    let home = test_agit_home_override()
+        .map(Ok)
+        .unwrap_or_else(crate::infra::config::agit_home)?;
+    #[cfg(not(test))]
+    let home = crate::infra::config::agit_home()?;
+    #[cfg(windows)]
+    windows_security::validate_path(&home, true, false)?;
+    Ok(home.join(namespace))
 }
 
 /// What a workspace confines **right now**: the allowlist plus the command names the owner

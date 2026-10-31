@@ -14,6 +14,7 @@ pub fn native_observation_worker(args: &[std::ffi::OsString]) -> Option<i32> {
 }
 
 use super::CmdResult;
+use super::auto_push::Off;
 use crate::domain::link;
 use crate::domain::meta;
 use crate::domain::repo::Repo;
@@ -151,6 +152,7 @@ pub fn run(args: Args) -> CmdResult {
             println!("{}", ui::dim(&format!("… {remaining} more")));
         }
         print_privacy_waits(&links);
+        print_publication_waits(&links);
     }
 
     if !inventory_complete {
@@ -458,6 +460,7 @@ fn structured(args: &Args) -> CmdResult {
             "reason":"no session target supplied through AGIT_SESSION"}),
         Err(error) => serde_json::json!({"repo":null, "branch":null, "reason":error.to_string()}),
     };
+    let publication_waits = crate::rc::supervisor::archive_recovery::publication_waits();
     let items: Vec<_> = links
         .iter()
         .skip(args.offset)
@@ -468,6 +471,21 @@ fn structured(args: &Args) -> CmdResult {
                 (Some(owner), Some(repo), Some(branch)) => Some(format!("{owner}/{repo}@{branch}")),
                 _ => None,
             };
+            let publication_wait = match &publication_waits {
+                Ok(waits) => waits
+                    .get(&(link.source.clone(), link.session_id.clone()))
+                    .map(|wait| {
+                        serde_json::json!({
+                            "reason": "push_disabled", "repository": wait.repository,
+                            "off": wait.off.name(),
+                            "capture_repository": wait.capture_repository,
+                            "command": wait.command,
+                        })
+                    }),
+                Err(error) => Some(serde_json::json!({
+                    "reason": "unknown", "error": format!("{error:#}"),
+                })),
+            };
             serde_json::json!({
                 "runtime": link.source, "session_id": link.session_id,
                 "owner": link.owner, "repository_name": link.agent, "branch": link.branch,
@@ -475,7 +493,7 @@ fn structured(args: &Args) -> CmdResult {
                 "superseded_by": link.superseded_by,
                 "last_commit": (detail[4] != "—").then_some(&detail[4]),
                 "pending_activity": detail[5], "local_instance": detail[6],
-                "project": detail[7],
+                "project": detail[7], "publication_wait": publication_wait,
             })
         })
         .collect();
@@ -690,6 +708,48 @@ fn uncaptured(links: &[link::Link], complete: bool) -> Discovery {
         }
     }
     out
+}
+
+/// Sessions whose completed turns wait to upload because automatic publication is off for them.
+/// The daemon parks such a turn and says so only in its own log, so this is where the wait
+/// becomes visible. Turning it off is the person's choice, so the line says what is off and where
+/// as a fact, and offers a command only when one setting as narrow as the destination ends it.
+fn print_publication_waits(links: &[crate::domain::link::Link]) {
+    let waits = match crate::rc::supervisor::archive_recovery::publication_waits() {
+        Ok(waits) => waits,
+        Err(error) => {
+            ui::warning(&format!(
+                "turns waiting to upload cannot be listed: {error:#}"
+            ));
+            return;
+        }
+    };
+    for link in links {
+        let Some(wait) = waits.get(&(link.source.clone(), link.session_id.clone())) else {
+            continue;
+        };
+        let session = crate::domain::link::short(&link.session_id);
+        let off = match wait.off {
+            Off::Destination => format!("for {} on this computer", wait.repository),
+            Off::CaptureRepository => format!(
+                "for {}, the repository that records this conversation",
+                wait.capture_repository
+            ),
+            Off::UserDefault => format!(
+                "on this computer for every repository without its own setting, {} included",
+                wait.repository
+            ),
+        };
+        ui::info(format_args!(
+            "{session}: automatic publication is off {off}, so its completed turns stay on this computer until you choose to upload them"
+        ));
+        if let Some(command) = &wait.command {
+            ui::hint(&format!(
+                "if you want them uploaded to {} automatically: `{command}`",
+                wait.repository
+            ));
+        }
+    }
 }
 
 /// Sessions whose settlement waits for the privacy check. A hook settles quietly, so this is

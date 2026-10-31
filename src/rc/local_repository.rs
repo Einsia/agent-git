@@ -15,14 +15,37 @@ pub struct Repository {
     pub authority: String,
 }
 
+/// The daemon whose machine identity a device-local repository's authority must name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Authority<'a> {
+    /// The daemon namespace this process selected; its identity is created when missing.
+    Process,
+    /// The daemon of this namespace, by the identity it saved, read without creating anything.
+    /// An inspection judges a queued job by the namespace that queued it: judged by its own
+    /// namespace, a plain command takes a desktop daemon's repository for another authority's.
+    Saved(&'a str),
+}
+
+impl Authority<'_> {
+    fn fingerprint(self) -> crate::Result<String> {
+        Ok(match self {
+            Self::Process => super::identity::identity()?.machine_fingerprint,
+            Self::Saved(namespace) => {
+                super::identity::saved(namespace)?
+                    .with_context(|| format!("the {namespace} daemon has no saved identity"))?
+                    .machine_fingerprint
+            }
+        })
+    }
+}
+
 pub fn require(lineage: &AgitSession) -> crate::Result<Repo> {
+    require_by(lineage, Authority::Process)
+}
+
+pub(crate) fn require_by(lineage: &AgitSession, authority: Authority) -> crate::Result<Repo> {
     let repository = Repo::open(&lineage.repo_dir()?).context("local repository is missing")?;
-    let machine = super::identity::identity()?;
-    require_identity(
-        &repository,
-        lineage.agent_id(),
-        &machine.machine_fingerprint,
-    )?;
+    require_identity(&repository, lineage.agent_id(), &authority.fingerprint()?)?;
     Ok(repository)
 }
 

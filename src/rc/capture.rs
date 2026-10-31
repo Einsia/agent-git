@@ -3,7 +3,7 @@
 use crate::{
     domain::{link, repo::Repo, store::Store},
     hub::identity::{self, RemoteIdentity},
-    rc::lineage::AgitSession,
+    rc::{lineage::AgitSession, local_repository::Authority},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -25,12 +25,17 @@ pub(crate) enum RepositoryKind {
 
 impl RepositoryKind {
     pub(crate) fn discover(lineage: &AgitSession) -> Result<Self> {
+        Self::discover_by(lineage, Authority::Process)
+    }
+
+    /// The kind of `lineage`'s capture repository, a device-local one owned by `authority`.
+    fn discover_by(lineage: &AgitSession, authority: Authority) -> Result<Self> {
         let repo = Repo::open(&lineage.repo_dir()?).context("capture repository is missing")?;
         if repo
             .git_opt(&["config", "--local", "--get", "agit.desktopIdentity"])
             .is_some()
         {
-            super::local_repository::require(lineage)?;
+            super::local_repository::require_by(lineage, authority)?;
             Ok(Self::DeviceLocal {
                 agent_id: lineage.agent_id().into(),
             })
@@ -45,9 +50,9 @@ impl RepositoryKind {
         }
     }
 
-    pub(crate) fn require(&self, lineage: &AgitSession) -> Result<Repo> {
+    fn require_by(&self, lineage: &AgitSession, authority: Authority) -> Result<Repo> {
         ensure!(
-            Self::discover(lineage)? == *self,
+            Self::discover_by(lineage, authority)? == *self,
             "capture repository kind or identity changed"
         );
         Repo::open(&lineage.repo_dir()?).context("capture repository is missing")
@@ -55,9 +60,15 @@ impl RepositoryKind {
 }
 
 pub(crate) fn require(lineage: &AgitSession) -> Result<Repo> {
+    require_by(lineage, Authority::Process)
+}
+
+/// `lineage`'s capture repository, verified against `authority` as the owner of a device-local
+/// one.
+pub(crate) fn require_by(lineage: &AgitSession, authority: Authority) -> Result<Repo> {
     match &lineage.capture {
-        Some(kind) => kind.require(lineage),
-        None => super::local_repository::require(lineage),
+        Some(kind) => kind.require_by(lineage, authority),
+        None => super::local_repository::require_by(lineage, authority),
     }
 }
 
@@ -232,12 +243,22 @@ pub(crate) fn destination(
     lineage: &AgitSession,
     hub: &str,
 ) -> Result<Option<PublicationDestination>> {
+    destination_by(repo, lineage, hub, Authority::Process)
+}
+
+/// Where `lineage`'s capture publishes, its device-local repository verified against `authority`.
+pub(crate) fn destination_by(
+    repo: &Repo,
+    lineage: &AgitSession,
+    hub: &str,
+    authority: Authority,
+) -> Result<Option<PublicationDestination>> {
     let kind = lineage
         .capture
         .clone()
         .map(Ok)
-        .unwrap_or_else(|| RepositoryKind::discover(lineage))?;
-    kind.require(lineage)?;
+        .unwrap_or_else(|| RepositoryKind::discover_by(lineage, authority))?;
+    kind.require_by(lineage, authority)?;
     let destination = match kind {
         RepositoryKind::DeviceLocal { .. } => {
             let Some(destination) = super::local_repository::publication::Destination::load(repo)?
