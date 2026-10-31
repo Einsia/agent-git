@@ -240,7 +240,7 @@ def assemble(lock, target, cache):
     if "linux" in target:
         manifest["ca_bundle"] = lock["linux_ca_bundle"]
     files["runtime-manifest.json"] = (json.dumps(manifest, indent=2).encode() + b"\n", 0o644)
-    files["THIRD-PARTY-NOTICES.txt"] = (
+    notices = (
         b"Git and Git LFS run as separate programs and retain their upstream licenses.\n"
         b"Git: GPL-2.0-only; Git LFS: MIT. This runtime does not install global Git configuration.\n"
         b"runtime-manifest.json records immutable upstream versions, package checksums, and Linux source recipes.\n"
@@ -248,7 +248,14 @@ def assemble(lock, target, cache):
         b"Git for Windows sources: https://github.com/git-for-windows/git/tags\n"
         b"Git LFS sources: https://github.com/git-lfs/git-lfs/tags\n"
         b"Each agit release at https://github.com/Einsia/agent-git/releases carries the corresponding source of\n"
-        b"this runtime's GPL- and LGPL-licensed components as source-* assets, listed in SOURCES-SHA256SUMS.\n", 0o644)
+        b"this runtime's GPL- and LGPL-licensed components as source-* assets, listed in SOURCES-SHA256SUMS.\n"
+    )
+    if windows:
+        notices += (
+            b"MinGit's usr/bin/msys-gcc_s-seh-1.dll is GCC's runtime library, distributed under the GCC Runtime\n"
+            b"Library Exception 3.1 (usr/share/licenses/gcc-libs/RUNTIME.LIBRARY.EXCEPTION); its source is not included.\n"
+        )
+    files["THIRD-PARTY-NOTICES.txt"] = (notices, 0o644)
     return files
 
 

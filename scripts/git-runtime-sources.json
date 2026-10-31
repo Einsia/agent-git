@@ -100,17 +100,408 @@
       ]
     },
     {
-      "asset": "source-git-for-windows-v2.55.0.windows.5.tar.gz",
-      "component": "Git for Windows",
+      "asset": "source-git-for-windows-bash-5.3.015-2.src.tar.gz",
+      "component": "bash 5.3.015-2 (Git for Windows)",
       "covers": [
         "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
       ],
-      "trees": [
+      "downloads": [
         {
-          "repository": "https://github.com/git-for-windows/git.git",
-          "tag": "v2.55.0.windows.5",
-          "commit": "32c4f7689275d233577576630e1ac5b7eb354eb0",
-          "prefix": "git-for-windows-v2.55.0.windows.5"
+          "name": "bash-5.3.015-2.src.tar.gz",
+          "urls": [
+            "https://github.com/git-for-windows/pacman-repo/releases/download/2026-08-20T13-55-07.365148200Z/bash-5.3.015-2.src.tar.gz"
+          ],
+          "sha256": "817a480aa08f0f112af9496a9335d3a48f4c479ef5e1b1740df6dcc76670d94a"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-coreutils-8.32-5.src.tar.zst",
+      "component": "coreutils 8.32-5 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "coreutils-8.32-5.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/coreutils-8.32-5.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/coreutils-8.32-5.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/coreutils-8.32-5.src.tar.zst"
+          ],
+          "sha256": "2b8689413bc50367a9995adf50ea84cd3caaff0ec68a8f32d8328842c3f83835"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-dash-0.5.13.4-1.src.tar.zst",
+      "component": "dash 0.5.13.4-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "dash-0.5.13.4-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/dash-0.5.13.4-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/dash-0.5.13.4-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/dash-0.5.13.4-1.src.tar.zst"
+          ],
+          "sha256": "ee99c1925fc4cd90ffcd8e5bd100edb40628fd9659423ad8294dc376ceb44c1c"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-diffutils-3.12-1.src.tar.zst",
+      "component": "diffutils 3.12-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "diffutils-3.12-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/diffutils-3.12-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/diffutils-3.12-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/diffutils-3.12-1.src.tar.zst"
+          ],
+          "sha256": "474c4a3528a2afbb8d9608c65ad1bdbbd81ff42c143a438d7d56272a61b1bfac"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-findutils-4.11.0-2.src.tar.zst",
+      "component": "findutils 4.11.0-2 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "findutils-4.11.0-2.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/findutils-4.11.0-2.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/findutils-4.11.0-2.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/findutils-4.11.0-2.src.tar.zst"
+          ],
+          "sha256": "92edf442f61f8873318811a688ba327a0d2878a63a9ed21992b5cce12b0ae146"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-gawk-5.4.1-1.src.tar.zst",
+      "component": "gawk 5.4.1-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "gawk-5.4.1-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/gawk-5.4.1-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/gawk-5.4.1-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/gawk-5.4.1-1.src.tar.zst"
+          ],
+          "sha256": "d8b8cdd6cbf72431c02cb26cf92174aca5b6f1b7791aaf29fa3a11d205a66b39"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-gettext-0.22.5-1.src.tar.zst",
+      "component": "gettext 0.22.5-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "gettext-0.22.5-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/gettext-0.22.5-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/gettext-0.22.5-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/gettext-0.22.5-1.src.tar.zst"
+          ],
+          "sha256": "e07a0b3e6716aae86dc0edd2dcdc8864731d56051345592b53659a3840ccfbd8"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-gmp-6.3.0-2.src.tar.zst",
+      "component": "gmp 6.3.0-2 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "gmp-6.3.0-2.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/gmp-6.3.0-2.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/gmp-6.3.0-2.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/gmp-6.3.0-2.src.tar.zst"
+          ],
+          "sha256": "02356ca25ce362edb883ce7c060050de2cec5f2b1227a1c56ef7c0a0f99ff667"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-grep-1_3.0-7.src.tar.zst",
+      "component": "grep 1~3.0-7 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "grep-1~3.0-7.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/grep-1~3.0-7.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/grep-1~3.0-7.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/grep-1~3.0-7.src.tar.zst"
+          ],
+          "sha256": "acba43b9b2c3eb393f9a75d02a1eca34fa23d959541150a7ac4ffbafce3cae4e"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-libiconv-1.19-1.src.tar.zst",
+      "component": "libiconv 1.19-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "libiconv-1.19-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/libiconv-1.19-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/libiconv-1.19-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/libiconv-1.19-1.src.tar.zst"
+          ],
+          "sha256": "5a8bcd3242e2be94fffd9f03fadcda8d9fd64047430050c5cbd214cd3bf7f0a7"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-libxcrypt-4.5.2-1.src.tar.zst",
+      "component": "libxcrypt 4.5.2-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "libxcrypt-4.5.2-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/libxcrypt-4.5.2-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/libxcrypt-4.5.2-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/libxcrypt-4.5.2-1.src.tar.zst"
+          ],
+          "sha256": "dc3e44cea067417ff61c25c981d7d58bb0f343b824ba10fd2a0a3b8badc55746"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-mingw-w64-gettext-1.0-1.src.tar.zst",
+      "component": "mingw-w64-gettext 1.0-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-gettext-1.0-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/mingw/sources/mingw-w64-gettext-1.0-1.src.tar.zst",
+            "https://mirror.msys2.org/mingw/sources/mingw-w64-gettext-1.0-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/mingw/sources/mingw-w64-gettext-1.0-1.src.tar.zst"
+          ],
+          "sha256": "cca0d0c8f60353faccc5ad40405240014e4a7ccc8b1c6ca9f4626aef3097d26e"
+        }
+      ]
+    },
+    {
+      "asset": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "component": "mingw-w64-git 2.55.0.5-1 (Git for Windows)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-git-2.55.0.5-1.src.tar.gz",
+          "urls": [
+            "https://github.com/git-for-windows/pacman-repo/releases/download/2026-08-20T16-21-04.152533900Z/mingw-w64-git-2.55.0.5-1.src.tar.gz"
+          ],
+          "sha256": "341cee17fc92e67cfbd1dc97583839fbb24bc0b89a6abab7488d1e97186df0cd"
+        }
+      ]
+    },
+    {
+      "asset": "source-git-for-windows-mingw-w64-git-extra-1.1.713.cd940aab6-1.src.tar.gz",
+      "component": "mingw-w64-git-extra 1.1.713.cd940aab6-1 (Git for Windows)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-git-extra-1.1.713.cd940aab6-1.src.tar.gz",
+          "urls": [
+            "https://github.com/git-for-windows/pacman-repo/releases/download/2026-06-19T12-32-31.170628300Z/mingw-w64-git-extra-1.1.713.cd940aab6-1.src.tar.gz"
+          ],
+          "sha256": "fe34fd2ab94930a8d52ce1ffe866a62ac6b7f02dbc8fce3f5e2bf80bfe0c9381"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-mingw-w64-libiconv-1.19-1.src.tar.zst",
+      "component": "mingw-w64-libiconv 1.19-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-libiconv-1.19-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/mingw/sources/mingw-w64-libiconv-1.19-1.src.tar.zst",
+            "https://mirror.msys2.org/mingw/sources/mingw-w64-libiconv-1.19-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/mingw/sources/mingw-w64-libiconv-1.19-1.src.tar.zst"
+          ],
+          "sha256": "74428280c17094da5b702c29b2e1a0abae59556ea5dfdd65705cc8ccc1e000fb"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-mingw-w64-libidn2-2.3.8-4.src.tar.zst",
+      "component": "mingw-w64-libidn2 2.3.8-4 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-libidn2-2.3.8-4.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/mingw/sources/mingw-w64-libidn2-2.3.8-4.src.tar.zst",
+            "https://mirror.msys2.org/mingw/sources/mingw-w64-libidn2-2.3.8-4.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/mingw/sources/mingw-w64-libidn2-2.3.8-4.src.tar.zst"
+          ],
+          "sha256": "cd83e8514fbeb6a4499299b88691b9b9ecc3114cca1e2be4f6c54aab6ae9ddd0"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-mingw-w64-libunistring-1.4.2-1.src.tar.zst",
+      "component": "mingw-w64-libunistring 1.4.2-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mingw-w64-libunistring-1.4.2-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/mingw/sources/mingw-w64-libunistring-1.4.2-1.src.tar.zst",
+            "https://mirror.msys2.org/mingw/sources/mingw-w64-libunistring-1.4.2-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/mingw/sources/mingw-w64-libunistring-1.4.2-1.src.tar.zst"
+          ],
+          "sha256": "a5bafb360d5c13c5c52ef071d5a8288ce2345346b902f20ed6e9322766ec60eb"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-mpfr-4.2.2-1.src.tar.zst",
+      "component": "mpfr 4.2.2-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "mpfr-4.2.2-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/mpfr-4.2.2-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/mpfr-4.2.2-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/mpfr-4.2.2-1.src.tar.zst"
+          ],
+          "sha256": "e0c56e3af3819471e74dd37e32660e4eb8f58761c4d214dabd2d62f57c548869"
+        }
+      ]
+    },
+    {
+      "asset": "source-git-for-windows-msys2-runtime-3.6.10-1.src.tar.gz",
+      "component": "msys2-runtime 3.6.10-1 (Git for Windows)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "msys2-runtime-3.6.10-1.src.tar.gz",
+          "urls": [
+            "https://github.com/git-for-windows/pacman-repo/releases/download/2026-07-28T09-45-11.975207800Z/msys2-runtime-3.6.10-1.src.tar.gz"
+          ],
+          "sha256": "065a779e47383844bba94f4745d3f41377aedf74a9bd4d5831df71143ae78f59"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-readline-8.3.003-1.src.tar.zst",
+      "component": "readline 8.3.003-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "readline-8.3.003-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/readline-8.3.003-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/readline-8.3.003-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/readline-8.3.003-1.src.tar.zst"
+          ],
+          "sha256": "8b9e2370bf80d30cdb1bfeb00be1e2be2c9ec8b92838ffcb5ddc4805ac0a899e"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-rebase-4.5.0-5.src.tar.zst",
+      "component": "rebase 4.5.0-5 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "rebase-4.5.0-5.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/rebase-4.5.0-5.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/rebase-4.5.0-5.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/rebase-4.5.0-5.src.tar.zst"
+          ],
+          "sha256": "5e9c24c35a881888c045aa04b676f79d238e870a7391f595665e9bd9d26b09c9"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-sed-4.9-1.src.tar.zst",
+      "component": "sed 4.9-1 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "sed-4.9-1.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/sed-4.9-1.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/sed-4.9-1.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/sed-4.9-1.src.tar.zst"
+          ],
+          "sha256": "a9686da7c1f3cb2ba7ae5f20f30d9ef38f7bba993f9c777b43bd13c7fbd7cc58"
+        }
+      ]
+    },
+    {
+      "asset": "source-msys2-util-linux-2.40.2-2.src.tar.zst",
+      "component": "util-linux 2.40.2-2 (MSYS2)",
+      "covers": [
+        "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+      ],
+      "downloads": [
+        {
+          "name": "util-linux-2.40.2-2.src.tar.zst",
+          "urls": [
+            "https://repo.msys2.org/msys/sources/util-linux-2.40.2-2.src.tar.zst",
+            "https://mirror.msys2.org/msys/sources/util-linux-2.40.2-2.src.tar.zst",
+            "https://mirrors.dotsrc.org/msys2/msys/sources/util-linux-2.40.2-2.src.tar.zst"
+          ],
+          "sha256": "ea018e116866c0e2d9a3d6cee3f0d09801e6725789b6f99fd1979dfc7a68b703"
         }
       ]
     }

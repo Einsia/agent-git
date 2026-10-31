@@ -139,10 +139,17 @@ the source of, and its checksum.
 - A Git tree's archive holds the pinned commit whole. A pinned tag must still name
   that commit upstream, and dugite-native's Git must be the commit its `git`
   submodule records.
+- MinGit's components are published as their own source packages, verbatim from
+  MSYS2 or Git for Windows, so each checksum and upstream signature still verifies.
+  `scripts/git-runtime-mingit-inventory.json` assigns every file of the pinned MinGit
+  to the package it comes from, and each package that involves the GPL names its
+  source archive or the reason it needs none (GCC's runtime library is under the
+  GCC Runtime Library Exception). The release notes list those reasons.
 
-The job stops before publishing if a source cannot be built from its pins, or if a
-copyleft pin in the lock has no source; after publishing, it checks that every
-source archive is on the Release. `SHA256SUMS` keeps listing the binary archives
+The job stops before publishing if a source cannot be built from its pins, if a
+copyleft pin in the lock has no source, or if the pinned MinGit holds a file the
+inventory does not account for; after publishing, it checks that every source
+archive is on the Release. `SHA256SUMS` keeps listing the binary archives
 only, and no source asset name starts with `agit-`, so nothing that selects
 binaries by name picks one up.
 

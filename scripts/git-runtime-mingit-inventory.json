@@ -1,0 +1,810 @@
+{
+  "schema": 1,
+  "mingit": "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
+  "packages": [
+    {
+      "name": "bash",
+      "version": "5.3.015-2",
+      "license": "GPL",
+      "source": "source-git-for-windows-bash-5.3.015-2.src.tar.gz",
+      "files": [
+        "usr/bin/sh.exe"
+      ]
+    },
+    {
+      "name": "coreutils",
+      "version": "8.32-5",
+      "license": "GPL3",
+      "source": "source-msys2-coreutils-8.32-5.src.tar.zst",
+      "files": [
+        "usr/bin/b2sum.exe",
+        "usr/bin/basename.exe",
+        "usr/bin/basenc.exe",
+        "usr/bin/cat.exe",
+        "usr/bin/comm.exe",
+        "usr/bin/cp.exe",
+        "usr/bin/cut.exe",
+        "usr/bin/date.exe",
+        "usr/bin/dirname.exe",
+        "usr/bin/echo.exe",
+        "usr/bin/env.exe",
+        "usr/bin/expr.exe",
+        "usr/bin/false.exe",
+        "usr/bin/head.exe",
+        "usr/bin/ls.exe",
+        "usr/bin/mkdir.exe",
+        "usr/bin/mktemp.exe",
+        "usr/bin/mv.exe",
+        "usr/bin/pathchk.exe",
+        "usr/bin/printf.exe",
+        "usr/bin/pwd.exe",
+        "usr/bin/readlink.exe",
+        "usr/bin/rm.exe",
+        "usr/bin/rmdir.exe",
+        "usr/bin/sort.exe",
+        "usr/bin/tail.exe",
+        "usr/bin/test.exe",
+        "usr/bin/touch.exe",
+        "usr/bin/tr.exe",
+        "usr/bin/true.exe",
+        "usr/bin/uname.exe",
+        "usr/bin/uniq.exe",
+        "usr/bin/wc.exe"
+      ]
+    },
+    {
+      "name": "dash",
+      "version": "0.5.13.4-1",
+      "license": "BSD",
+      "source": "source-msys2-dash-0.5.13.4-1.src.tar.zst",
+      "files": [
+        "usr/bin/dash.exe"
+      ]
+    },
+    {
+      "name": "diffutils",
+      "version": "3.12-1",
+      "license": "GPL-3.0-or-later",
+      "source": "source-msys2-diffutils-3.12-1.src.tar.zst",
+      "files": [
+        "usr/bin/cmp.exe",
+        "usr/bin/diff.exe",
+        "usr/bin/diff3.exe",
+        "usr/bin/sdiff.exe"
+      ]
+    },
+    {
+      "name": "filesystem",
+      "version": "2026.03.06-1",
+      "license": "BSD-3-Clause",
+      "files": [
+        "etc/bash.bashrc",
+        "etc/fstab",
+        "etc/msystem",
+        "etc/msystem.d/CLANG64",
+        "etc/msystem.d/CLANGARM64",
+        "etc/msystem.d/MINGW32",
+        "etc/msystem.d/MINGW64",
+        "etc/msystem.d/MSYS",
+        "etc/msystem.d/UCRT64",
+        "etc/nsswitch.conf",
+        "etc/profile",
+        "etc/profile.d/lang.sh"
+      ]
+    },
+    {
+      "name": "findutils",
+      "version": "4.11.0-2",
+      "license": "GPL-3.0-or-later",
+      "source": "source-msys2-findutils-4.11.0-2.src.tar.zst",
+      "files": [
+        "usr/bin/find.exe",
+        "usr/bin/xargs.exe"
+      ]
+    },
+    {
+      "name": "gawk",
+      "version": "5.4.1-1",
+      "license": "GPL-3.0-or-later",
+      "source": "source-msys2-gawk-5.4.1-1.src.tar.zst",
+      "files": [
+        "usr/bin/awk.exe",
+        "usr/bin/gawkbug",
+        "usr/etc/profile.d/gawk.csh",
+        "usr/etc/profile.d/gawk.sh",
+        "usr/share/awk/assert.awk",
+        "usr/share/awk/bits2str.awk",
+        "usr/share/awk/cliff_rand.awk",
+        "usr/share/awk/ctime.awk",
+        "usr/share/awk/ftrans.awk",
+        "usr/share/awk/getopt.awk",
+        "usr/share/awk/gettime.awk",
+        "usr/share/awk/group.awk",
+        "usr/share/awk/have_mpfr.awk",
+        "usr/share/awk/inplace.awk",
+        "usr/share/awk/intdiv0.awk",
+        "usr/share/awk/isnumeric.awk",
+        "usr/share/awk/join.awk",
+        "usr/share/awk/libintl.awk",
+        "usr/share/awk/noassign.awk",
+        "usr/share/awk/ns_passwd.awk",
+        "usr/share/awk/ord.awk",
+        "usr/share/awk/passwd.awk",
+        "usr/share/awk/processarray.awk",
+        "usr/share/awk/quicksort.awk",
+        "usr/share/awk/readable.awk",
+        "usr/share/awk/readfile.awk",
+        "usr/share/awk/rewind.awk",
+        "usr/share/awk/round.awk",
+        "usr/share/awk/shellquote.awk",
+        "usr/share/awk/strtonum.awk",
+        "usr/share/awk/tocsv.awk",
+        "usr/share/awk/walkarray.awk",
+        "usr/share/awk/zerofile.awk"
+      ]
+    },
+    {
+      "name": "gcc-libs",
+      "version": "15.3.0-1",
+      "license": "GPL-3.0-or-later AND GPL-2.0-or-later AND LGPL-2.1-or-later AND LGPL-3.0-or-later AND GCC-exception-3.1 AND GFDL-1.3-or-later",
+      "no_source": "GCC's runtime library, distributed under the GCC Runtime Library Exception 3.1",
+      "files": [
+        "usr/bin/msys-gcc_s-seh-1.dll",
+        "usr/share/licenses/gcc-libs/RUNTIME.LIBRARY.EXCEPTION"
+      ]
+    },
+    {
+      "name": "gmp",
+      "version": "6.3.0-2",
+      "license": "LGPL3",
+      "source": "source-msys2-gmp-6.3.0-2.src.tar.zst",
+      "files": [
+        "usr/bin/msys-gmp-10.dll"
+      ]
+    },
+    {
+      "name": "grep",
+      "version": "1~3.0-7",
+      "license": "GPL3",
+      "source": "source-msys2-grep-1_3.0-7.src.tar.zst",
+      "files": [
+        "usr/bin/grep.exe"
+      ]
+    },
+    {
+      "name": "heimdal-libs",
+      "version": "7.8.0-5",
+      "license": "custom",
+      "files": [
+        "usr/bin/msys-asn1-8.dll",
+        "usr/bin/msys-com_err-1.dll",
+        "usr/bin/msys-gssapi-3.dll",
+        "usr/bin/msys-hcrypto-4.dll",
+        "usr/bin/msys-heimbase-1.dll",
+        "usr/bin/msys-heimntlm-0.dll",
+        "usr/bin/msys-hx509-5.dll",
+        "usr/bin/msys-krb5-26.dll",
+        "usr/bin/msys-roken-18.dll",
+        "usr/bin/msys-wind-0.dll"
+      ]
+    },
+    {
+      "name": "libcbor",
+      "version": "0.11.0-1",
+      "license": "MIT",
+      "files": [
+        "usr/bin/msys-cbor-0.11.dll"
+      ]
+    },
+    {
+      "name": "libfido2",
+      "version": "1.15.0-1",
+      "license": "BSD-2-Clause",
+      "files": [
+        "usr/bin/msys-fido2-1.dll"
+      ]
+    },
+    {
+      "name": "libiconv",
+      "version": "1.19-1",
+      "license": "LGPL",
+      "source": "source-msys2-libiconv-1.19-1.src.tar.zst",
+      "files": [
+        "usr/bin/msys-iconv-2.dll"
+      ]
+    },
+    {
+      "name": "libintl",
+      "version": "0.22.5-1",
+      "license": "GPL",
+      "source": "source-msys2-gettext-0.22.5-1.src.tar.zst",
+      "files": [
+        "usr/bin/msys-intl-8.dll"
+      ]
+    },
+    {
+      "name": "libopenssl",
+      "version": "3.5.7-1",
+      "license": "Apache-2.0",
+      "files": [
+        "usr/bin/msys-crypto-3.dll",
+        "usr/share/licenses/libopenssl/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "libpcre",
+      "version": "8.45-5",
+      "license": "BSD",
+      "files": [
+        "usr/bin/msys-pcre-1.dll"
+      ]
+    },
+    {
+      "name": "libreadline",
+      "version": "8.3.003-1",
+      "license": "GPL",
+      "source": "source-msys2-readline-8.3.003-1.src.tar.zst",
+      "files": [
+        "usr/bin/msys-readline8.dll"
+      ]
+    },
+    {
+      "name": "libsqlite",
+      "version": "3.53.4-1",
+      "license": "LicenseRef-Sqlite",
+      "files": [
+        "usr/bin/msys-sqlite3-0.dll",
+        "usr/share/licenses/libsqlite/LICENSE"
+      ]
+    },
+    {
+      "name": "libxcrypt",
+      "version": "4.5.2-1",
+      "license": "LGPL-2.1-or-later",
+      "source": "source-msys2-libxcrypt-4.5.2-1.src.tar.zst",
+      "files": [
+        "usr/bin/msys-crypt-2.dll"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-brotli",
+      "version": "1.2.0-1",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/brotli.exe",
+        "mingw64/bin/libbrotlicommon.dll",
+        "mingw64/bin/libbrotlidec.dll",
+        "mingw64/bin/libbrotlienc.dll",
+        "mingw64/share/licenses/brotli/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-ca-certificates",
+      "version": "20260816-1",
+      "license": "MPL | GPL",
+      "no_source": "certificate data under MPL-2.0; the package's GPL tooling is not shipped",
+      "files": [
+        "mingw64/etc/ssl/cert.pem",
+        "mingw64/etc/ssl/certs/ca-bundle.crt",
+        "mingw64/etc/ssl/certs/ca-bundle.trust.crt"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-curl-openssl-alternate",
+      "version": "8.21.0-2",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/libcurl-openssl-4.dll"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-curl-winssl",
+      "version": "8.21.0-2",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/libcurl-4.dll",
+        "mingw64/bin/wcurl",
+        "mingw64/share/licenses/curl/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-expat",
+      "version": "2.8.3-1",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/libexpat-1.dll",
+        "mingw64/share/doc/expat/AUTHORS",
+        "mingw64/share/doc/expat/changelog",
+        "mingw64/share/licenses/expat/COPYING"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-gcc-libs",
+      "version": "16.2.0-3",
+      "license": "GPL-3.0-or-later WITH GCC-exception-3.1 AND LGPL-2.1-or-later",
+      "no_source": "license texts only",
+      "files": [
+        "mingw64/share/licenses/gcc-libs/COPYING.LIB",
+        "mingw64/share/licenses/gcc-libs/COPYING.RUNTIME",
+        "mingw64/share/licenses/gcc-libs/COPYING3",
+        "mingw64/share/licenses/gcc-libs/README"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-gettext-runtime",
+      "version": "1.0-1",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later",
+      "source": "source-msys2-mingw-w64-gettext-1.0-1.src.tar.zst",
+      "files": [
+        "mingw64/bin/libintl-8.dll",
+        "mingw64/bin/printf_gettext.exe",
+        "mingw64/bin/printf_ngettext.exe",
+        "mingw64/share/licenses/gettext-runtime/COPYING",
+        "mingw64/share/licenses/gettext-runtime/intl/COPYING.LIB",
+        "mingw64/share/licenses/gettext-runtime/libasprintf/COPYING",
+        "mingw64/share/licenses/gettext-runtime/libasprintf/COPYING.LIB"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "mingw64/bin/git-http-fetch.exe",
+        "mingw64/bin/git-http-push.exe",
+        "mingw64/bin/git-remote-https.exe",
+        "mingw64/bin/git-sh-i18n--envsubst.exe",
+        "mingw64/bin/git.exe",
+        "mingw64/bin/headless-git.exe",
+        "mingw64/bin/scalar.exe",
+        "mingw64/libexec/git-core/git-difftool--helper",
+        "mingw64/libexec/git-core/git-filter-branch",
+        "mingw64/libexec/git-core/git-merge-octopus",
+        "mingw64/libexec/git-core/git-merge-one-file",
+        "mingw64/libexec/git-core/git-merge-resolve",
+        "mingw64/libexec/git-core/git-mergetool",
+        "mingw64/libexec/git-core/git-mergetool--lib",
+        "mingw64/libexec/git-core/git-quiltimport",
+        "mingw64/libexec/git-core/git-request-pull",
+        "mingw64/libexec/git-core/git-sh-i18n",
+        "mingw64/libexec/git-core/git-sh-setup",
+        "mingw64/libexec/git-core/git-submodule",
+        "mingw64/libexec/git-core/git-web--browse",
+        "mingw64/libexec/git-core/mergetools/araxis",
+        "mingw64/libexec/git-core/mergetools/bc",
+        "mingw64/libexec/git-core/mergetools/codecompare",
+        "mingw64/libexec/git-core/mergetools/deltawalker",
+        "mingw64/libexec/git-core/mergetools/diffmerge",
+        "mingw64/libexec/git-core/mergetools/diffuse",
+        "mingw64/libexec/git-core/mergetools/ecmerge",
+        "mingw64/libexec/git-core/mergetools/emerge",
+        "mingw64/libexec/git-core/mergetools/examdiff",
+        "mingw64/libexec/git-core/mergetools/guiffy",
+        "mingw64/libexec/git-core/mergetools/gvimdiff",
+        "mingw64/libexec/git-core/mergetools/kdiff3",
+        "mingw64/libexec/git-core/mergetools/kompare",
+        "mingw64/libexec/git-core/mergetools/meld",
+        "mingw64/libexec/git-core/mergetools/nvimdiff",
+        "mingw64/libexec/git-core/mergetools/opendiff",
+        "mingw64/libexec/git-core/mergetools/p4merge",
+        "mingw64/libexec/git-core/mergetools/smerge",
+        "mingw64/libexec/git-core/mergetools/tkdiff",
+        "mingw64/libexec/git-core/mergetools/tortoisemerge",
+        "mingw64/libexec/git-core/mergetools/vimdiff",
+        "mingw64/libexec/git-core/mergetools/vscode",
+        "mingw64/libexec/git-core/mergetools/winmerge",
+        "mingw64/libexec/git-core/mergetools/xxdiff",
+        "mingw64/share/bash-completion/completions/git",
+        "mingw64/share/git-core/templates/description",
+        "mingw64/share/git-core/templates/hooks/applypatch-msg.sample",
+        "mingw64/share/git-core/templates/hooks/commit-msg.sample",
+        "mingw64/share/git-core/templates/hooks/fsmonitor-watchman.sample",
+        "mingw64/share/git-core/templates/hooks/post-update.sample",
+        "mingw64/share/git-core/templates/hooks/pre-applypatch.sample",
+        "mingw64/share/git-core/templates/hooks/pre-commit.sample",
+        "mingw64/share/git-core/templates/hooks/pre-merge-commit.sample",
+        "mingw64/share/git-core/templates/hooks/pre-push.sample",
+        "mingw64/share/git-core/templates/hooks/pre-rebase.sample",
+        "mingw64/share/git-core/templates/hooks/pre-receive.sample",
+        "mingw64/share/git-core/templates/hooks/prepare-commit-msg.sample",
+        "mingw64/share/git-core/templates/hooks/push-to-checkout.sample",
+        "mingw64/share/git-core/templates/hooks/sendemail-validate.sample",
+        "mingw64/share/git-core/templates/hooks/update.sample",
+        "mingw64/share/git-core/templates/info/exclude"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-credential-manager",
+      "version": "2.9.1-1",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/Atlassian.Bitbucket.dll",
+        "mingw64/bin/Avalonia.Base.dll",
+        "mingw64/bin/Avalonia.Controls.dll",
+        "mingw64/bin/Avalonia.DesignerSupport.dll",
+        "mingw64/bin/Avalonia.Dialogs.dll",
+        "mingw64/bin/Avalonia.Markup.Xaml.dll",
+        "mingw64/bin/Avalonia.Markup.dll",
+        "mingw64/bin/Avalonia.Metal.dll",
+        "mingw64/bin/Avalonia.MicroCom.dll",
+        "mingw64/bin/Avalonia.OpenGL.dll",
+        "mingw64/bin/Avalonia.Remote.Protocol.dll",
+        "mingw64/bin/Avalonia.Skia.dll",
+        "mingw64/bin/Avalonia.Themes.Fluent.dll",
+        "mingw64/bin/Avalonia.Vulkan.dll",
+        "mingw64/bin/Avalonia.Win32.dll",
+        "mingw64/bin/Avalonia.dll",
+        "mingw64/bin/GitHub.dll",
+        "mingw64/bin/GitLab.dll",
+        "mingw64/bin/HarfBuzzSharp.dll",
+        "mingw64/bin/MicroCom.Runtime.dll",
+        "mingw64/bin/Microsoft.AzureRepos.dll",
+        "mingw64/bin/Microsoft.Bcl.AsyncInterfaces.dll",
+        "mingw64/bin/Microsoft.Identity.Client.Broker.dll",
+        "mingw64/bin/Microsoft.Identity.Client.Extensions.Msal.dll",
+        "mingw64/bin/Microsoft.Identity.Client.NativeInterop.dll",
+        "mingw64/bin/Microsoft.Identity.Client.dll",
+        "mingw64/bin/Microsoft.IdentityModel.Abstractions.dll",
+        "mingw64/bin/SkiaSharp.dll",
+        "mingw64/bin/System.Buffers.dll",
+        "mingw64/bin/System.CommandLine.dll",
+        "mingw64/bin/System.ComponentModel.Annotations.dll",
+        "mingw64/bin/System.Diagnostics.DiagnosticSource.dll",
+        "mingw64/bin/System.Formats.Asn1.dll",
+        "mingw64/bin/System.IO.FileSystem.AccessControl.dll",
+        "mingw64/bin/System.Memory.dll",
+        "mingw64/bin/System.Numerics.Vectors.dll",
+        "mingw64/bin/System.Runtime.CompilerServices.Unsafe.dll",
+        "mingw64/bin/System.Security.AccessControl.dll",
+        "mingw64/bin/System.Security.Cryptography.ProtectedData.dll",
+        "mingw64/bin/System.Security.Principal.Windows.dll",
+        "mingw64/bin/System.Text.Encodings.Web.dll",
+        "mingw64/bin/System.Text.Json.dll",
+        "mingw64/bin/System.Threading.Tasks.Extensions.dll",
+        "mingw64/bin/System.ValueTuple.dll",
+        "mingw64/bin/av_libglesv2.dll",
+        "mingw64/bin/gcmcore.dll",
+        "mingw64/bin/git-credential-manager.exe",
+        "mingw64/bin/git-credential-manager.exe.config",
+        "mingw64/bin/libHarfBuzzSharp.dll",
+        "mingw64/bin/libSkiaSharp.dll",
+        "mingw64/bin/msalruntime.dll",
+        "mingw64/doc/git-credential-manager/LICENSE",
+        "mingw64/doc/git-credential-manager/NOTICE",
+        "mingw64/doc/git-credential-manager/README.md",
+        "mingw64/share/doc/git-doc/git-credential-manager.html"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-credential-wincred",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "mingw64/libexec/git-core/git-credential-wincred.exe"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-extra",
+      "version": "1.1.713.cd940aab6-1",
+      "license": "GPL",
+      "source": "source-git-for-windows-mingw-w64-git-extra-1.1.713.cd940aab6-1.src.tar.gz",
+      "files": [
+        "etc/post-install/99-post-install-cleanup.post",
+        "etc/profile.d/bash_profile.sh",
+        "mingw64/bin/blocked-file-util.exe",
+        "mingw64/bin/git-askpass.exe",
+        "mingw64/bin/git-askyesno.exe",
+        "mingw64/bin/git-credential-helper-selector.exe",
+        "mingw64/bin/git-update-git-for-windows",
+        "mingw64/bin/proxy-lookup.exe",
+        "mingw64/libexec/git-core/git-update",
+        "usr/share/nano/git.nanorc"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-for-windows-addons",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "cmd/git-receive-pack.exe",
+        "cmd/git-upload-pack.exe",
+        "cmd/git.exe",
+        "cmd/scalar.exe",
+        "mingw64/bin/git-receive-pack.exe",
+        "mingw64/bin/git-remote-http.exe",
+        "mingw64/bin/git-upload-pack.exe",
+        "mingw64/share/doc/git-doc/git-bash.adoc",
+        "mingw64/share/doc/git-doc/git-bash.html",
+        "mingw64/share/git/edit-git-bash.exe",
+        "mingw64/share/git/git-wrapper.exe"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-send-email",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "mingw64/share/doc/git-doc/git-send-email.adoc",
+        "mingw64/share/doc/git-doc/git-send-email.html"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-git-subtree",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "mingw64/libexec/git-core/git-subtree",
+        "mingw64/share/doc/git-doc/git-subtree.html"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-gitk",
+      "version": "2.55.0.5-1",
+      "license": "GPL2",
+      "source": "source-git-for-windows-mingw-w64-git-2.55.0.5-1.src.tar.gz",
+      "files": [
+        "mingw64/share/doc/git-doc/gitk.adoc",
+        "mingw64/share/doc/git-doc/gitk.html"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libffi",
+      "version": "3.8.0-1",
+      "license": "MIT",
+      "files": [
+        "mingw64/share/licenses/libffi/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libiconv",
+      "version": "1.19-1",
+      "license": "LGPL-2.1-or-later | documentation:GPL-3.0-or-later",
+      "source": "source-msys2-mingw-w64-libiconv-1.19-1.src.tar.zst",
+      "files": [
+        "mingw64/bin/libiconv-2.dll",
+        "mingw64/share/licenses/libiconv/COPYING",
+        "mingw64/share/licenses/libiconv/COPYING.LIB",
+        "mingw64/share/licenses/libiconv/README",
+        "mingw64/share/licenses/libiconv/libcharset/COPYING.LIB"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libidn2",
+      "version": "2.3.8-4",
+      "license": "GPL-2.0-or-later | LGPL-3.0-or-later",
+      "source": "source-msys2-mingw-w64-libidn2-2.3.8-4.src.tar.zst",
+      "files": [
+        "mingw64/bin/libidn2-0.dll"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libpsl",
+      "version": "0.21.5-3",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/libpsl-5.dll",
+        "mingw64/bin/psl-make-dafsa",
+        "mingw64/bin/psl.exe",
+        "mingw64/share/licenses/libpsl/COPYING"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libssh2-wincng",
+      "version": "1.11.1-2",
+      "license": "BSD-3-Clause",
+      "files": [
+        "mingw64/bin/libssh2-1.dll",
+        "mingw64/share/licenses/libssh2/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libtasn1",
+      "version": "4.21.0-1",
+      "license": "GPL3, LGPL",
+      "no_source": "license texts only",
+      "files": [
+        "mingw64/share/licenses/libtasn1/COPYING",
+        "mingw64/share/licenses/libtasn1/COPYING.LESSERv2"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libunistring",
+      "version": "1.4.2-1",
+      "license": "LGPL-3.0-or-later OR GPL-3.0-or-later",
+      "source": "source-msys2-mingw-w64-libunistring-1.4.2-1.src.tar.zst",
+      "files": [
+        "mingw64/bin/libunistring-5.dll",
+        "mingw64/share/licenses/libunistring/LICENSE",
+        "mingw64/share/licenses/libunistring/LICENSE.LIB"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-libwinpthread",
+      "version": "14.0.0.r283.ga7cb47123-1",
+      "license": "MIT AND BSD-3-Clause-Clear",
+      "files": [
+        "mingw64/share/licenses/libwinpthread/COPYING"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-nghttp2",
+      "version": "1.70.0-1",
+      "license": "MIT",
+      "files": [
+        "mingw64/bin/libnghttp2-14.dll",
+        "mingw64/share/licenses/nghttp2/COPYING"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-openssl",
+      "version": "3.5.7-1",
+      "license": "Apache-2.0",
+      "files": [
+        "mingw64/bin/c_rehash",
+        "mingw64/bin/libcrypto-3-x64.dll",
+        "mingw64/bin/libssl-3-x64.dll",
+        "mingw64/etc/ssl/ct_log_list.cnf",
+        "mingw64/etc/ssl/ct_log_list.cnf.dist",
+        "mingw64/etc/ssl/misc/CA.pl",
+        "mingw64/etc/ssl/misc/tsget",
+        "mingw64/etc/ssl/misc/tsget.pl",
+        "mingw64/etc/ssl/openssl.cnf",
+        "mingw64/etc/ssl/openssl.cnf.dist",
+        "mingw64/lib/engines-3/capi.dll",
+        "mingw64/lib/engines-3/loader_attic.dll",
+        "mingw64/lib/engines-3/padlock.dll",
+        "mingw64/lib/ossl-modules/legacy.dll",
+        "mingw64/share/licenses/openssl/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-pcre2",
+      "version": "10.47-1",
+      "license": "BSD",
+      "files": [
+        "mingw64/bin/libpcre2-8-0.dll",
+        "mingw64/bin/pcre2-config",
+        "mingw64/share/licenses/pcre2/COPYING",
+        "mingw64/share/licenses/pcre2/LICENCE.md"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-zlib",
+      "version": "1.3.2-2",
+      "license": "Zlib",
+      "files": [
+        "mingw64/bin/zlib1.dll",
+        "mingw64/share/licenses/zlib/LICENSE"
+      ]
+    },
+    {
+      "name": "mingw-w64-x86_64-zstd",
+      "version": "1.5.7-2",
+      "license": "BSD-3-Clause OR GPL-2.0-or-later",
+      "no_source": "used under its BSD-3-Clause alternative",
+      "files": [
+        "mingw64/bin/libzstd.dll",
+        "mingw64/share/licenses/zstd/LICENSE"
+      ]
+    },
+    {
+      "name": "mpfr",
+      "version": "4.2.2-1",
+      "license": "LGPL-3.0-or-later",
+      "source": "source-msys2-mpfr-4.2.2-1.src.tar.zst",
+      "files": [
+        "usr/bin/msys-mpfr-6.dll"
+      ]
+    },
+    {
+      "name": "msys2-runtime",
+      "version": "3.6.10-1",
+      "license": "GPL",
+      "source": "source-git-for-windows-msys2-runtime-3.6.10-1.src.tar.gz",
+      "files": [
+        "usr/bin/chattr.exe",
+        "usr/bin/cygwin-console-helper.exe",
+        "usr/bin/gencat.exe",
+        "usr/bin/getfacl.exe",
+        "usr/bin/gmondump.exe",
+        "usr/bin/lsattr.exe",
+        "usr/bin/msys-2.0.dll",
+        "usr/bin/newgrp.exe",
+        "usr/bin/profiler.exe",
+        "usr/libexec/getprocaddr32.exe",
+        "usr/libexec/getprocaddr64.exe"
+      ]
+    },
+    {
+      "name": "ncurses",
+      "version": "6.6-2",
+      "license": "MIT",
+      "files": [
+        "usr/bin/msys-ncursesw6.dll",
+        "usr/share/licenses/ncurses/LICENSE"
+      ]
+    },
+    {
+      "name": "openssh",
+      "version": "10.5p1-1",
+      "license": "custom:BSD",
+      "files": [
+        "etc/ssh/moduli",
+        "etc/ssh/ssh_config",
+        "etc/ssh/sshd_config",
+        "usr/bin/ssh-add.exe",
+        "usr/bin/ssh-agent.exe",
+        "usr/bin/ssh.exe",
+        "usr/lib/ssh/ssh-keysign.exe",
+        "usr/lib/ssh/ssh-pkcs11-helper.exe",
+        "usr/lib/ssh/ssh-sk-helper.exe",
+        "usr/share/licenses/openssh/LICENCE"
+      ]
+    },
+    {
+      "name": "openssl",
+      "version": "3.5.7-1",
+      "license": "Apache-2.0",
+      "files": [
+        "usr/ssl/ct_log_list.cnf",
+        "usr/ssl/ct_log_list.cnf.dist",
+        "usr/ssl/openssl.cnf",
+        "usr/ssl/openssl.cnf.dist"
+      ]
+    },
+    {
+      "name": "rebase",
+      "version": "4.5.0-5",
+      "license": "GPL-2.0-or-later (rebase.c; the package metadata says custom)",
+      "source": "source-msys2-rebase-4.5.0-5.src.tar.zst",
+      "files": [
+        "usr/bin/rebase.exe",
+        "usr/bin/rebaseall"
+      ]
+    },
+    {
+      "name": "sed",
+      "version": "4.9-1",
+      "license": "GPL3",
+      "source": "source-msys2-sed-4.9-1.src.tar.zst",
+      "files": [
+        "usr/bin/sed.exe"
+      ]
+    },
+    {
+      "name": "util-linux",
+      "version": "2.40.2-2",
+      "license": "GPL-2.0-or-later",
+      "source": "source-msys2-util-linux-2.40.2-2.src.tar.zst",
+      "files": [
+        "usr/bin/getopt.exe"
+      ]
+    },
+    {
+      "name": "zlib",
+      "version": "1.3.2-1",
+      "license": "custom",
+      "files": [
+        "usr/bin/msys-z.dll",
+        "usr/share/licenses/zlib/LICENSE"
+      ]
+    },
+    {
+      "name": "MinGit release files",
+      "version": "2.55.0.windows.5",
+      "license": "text files Git for Windows' MinGit release adds (its license summary, Git configuration, package list)",
+      "files": [
+        "LICENSE.txt",
+        "etc/gitattributes",
+        "etc/gitconfig",
+        "etc/libexec-moved.txt",
+        "etc/package-versions.txt"
+      ]
+    }
+  ]
+}
