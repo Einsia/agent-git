@@ -153,11 +153,30 @@ pub(in crate::rc) fn load_in(directory: &Path, hub: &str) -> crate::Result<Optio
     }))
 }
 
+/// The daemon namespaces a device can be enrolled under: the shared one, and the owner-only one
+/// `agit rc start` selects.
+pub const NAMESPACES: [&str; 2] = ["rc", "desktop-rc"];
+
+/// This device's enrollment on `hub` in every daemon namespace, whichever one this process
+/// selected, as `(namespace, enrollment)`. A namespace without one is left out; one whose
+/// enrollment cannot be read is listed with the error.
+pub fn enrollments_everywhere(hub: &str) -> Vec<(&'static str, crate::Result<Enrollment>)> {
+    NAMESPACES
+        .into_iter()
+        .filter_map(|namespace| {
+            let enrollment = super::super::state_dir(namespace)
+                .and_then(|directory| load_in(&directory, hub))
+                .transpose()?;
+            Some((namespace, enrollment))
+        })
+        .collect()
+}
+
 pub fn save(enrollment: &Enrollment) -> crate::Result<()> {
     save_in(&super::super::rc_dir()?, enrollment)
 }
 
-fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Result<()> {
+pub(crate) fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Result<()> {
     ensure!(
         enrollment.credential.device.certificate == *enrollment.identity.certificate(),
         "cloud enrollment certificate does not match its identity"
