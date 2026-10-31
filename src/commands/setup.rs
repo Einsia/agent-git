@@ -43,6 +43,7 @@ use super::skill_bundle;
 use crate::{ExitCode, ui};
 pub(crate) mod claude_mcp;
 mod codex_trust;
+mod json_text;
 mod legacy;
 mod native;
 
@@ -746,8 +747,11 @@ fn parse_codex_hooks_capability(output: &str) -> Option<CodexHooksCapability> {
 
 /// Add agit's hooks to one runtime-owned JSON file without replacing malformed or non-object
 /// user configuration. `runtime_flag` makes the payload parser independent of transcript paths.
-/// The file is written back whole, so its keys come back sorted; the file as it was before agit
-/// first changed it is kept beside it, and a rewrite that cannot keep it does not happen.
+/// The file is changed in its own text: only agit's hook entries and the groups and events that
+/// hold them are written, and every other byte stays as it was. A change that cannot be placed
+/// that way is refused rather than written as a whole document, which would sort the person's keys
+/// and reflow their file. The file as it was before agit first changed it is kept beside it, and a
+/// change that cannot keep it does not happen.
 fn install_hook_file(
     path: &Path,
     label: &str,
@@ -780,15 +784,15 @@ fn install_hook_file(
             return SetupReport::failure();
         }
     };
-    let Some(root) = doc.as_object_mut() else {
+    let Some(root) = doc.as_object() else {
         ui::warning(&format!(
             "cannot install {label} hooks: {} must contain a JSON object",
             path.display()
         ));
         return SetupReport::failure();
     };
-    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    if !hooks.is_object() {
+    let hooks = root.get("hooks");
+    if hooks.is_some_and(|hooks| !hooks.is_object()) {
         ui::warning(&format!(
             "cannot install {label} hooks: `hooks` in {} must be an object",
             path.display()
@@ -802,7 +806,10 @@ fn install_hook_file(
         .chain(RETIRED_HOOKS.iter().map(|(event, _)| *event))
         .chain(extra.iter().map(|(event, _, _)| *event))
     {
-        if hooks.get(event).is_some_and(|value| !value.is_array()) {
+        if hooks
+            .and_then(|hooks| hooks.get(event))
+            .is_some_and(|value| !value.is_array())
+        {
             ui::warning(&format!(
                 "cannot install {label} hooks: `{event}` in {} must be an array",
                 path.display()
@@ -811,6 +818,63 @@ fn install_hook_file(
         }
     }
 
+    let added = add_hooks(&mut doc, exe, runtime_flag, extra);
+    if added > 0 {
+        let text = match &original {
+            None => serde_json::to_string_pretty(&doc).unwrap(),
+            Some(text) => {
+                let Some(edited) = json_text::edit(text, &doc, |copy| {
+                    add_hooks(copy, exe, runtime_flag, extra);
+                }) else {
+                    ui::warning(&format!(
+                        "cannot install {label} hooks: {} cannot take them without rewriting the rest of it",
+                        path.display()
+                    ));
+                    return SetupReport::failure();
+                };
+                if keep_original(path, text).is_err() {
+                    ui::warning(&format!(
+                        "cannot install {label} hooks: failed to keep a copy of {}",
+                        path.display()
+                    ));
+                    return SetupReport::failure();
+                }
+                edited
+            }
+        };
+        if write_append_overwrite(path, &text).is_err() {
+            ui::warning(&format!("failed to write {}", path.display()));
+            return SetupReport::failure();
+        }
+        ui::info(format_args!(
+            "  {} {label} hooks → {}",
+            ui::ok(ui::theme::symbols().check),
+            ui::tilde(path)
+        ));
+        SetupReport::changed_item()
+    } else {
+        ui::info(format_args!(
+            "  {} {label} hooks already in place",
+            ui::dim("·")
+        ));
+        SetupReport::item()
+    }
+}
+
+/// Retires the hooks agit no longer installs and puts in agit's current ones, in `doc`, an object
+/// whose `hooks`, if present, is an object holding an array under each event agit uses. Returns
+/// how many entries were added, rewritten or removed.
+fn add_hooks(
+    doc: &mut serde_json::Value,
+    exe: &str,
+    runtime_flag: Option<&str>,
+    extra: &[(&str, &[&str], u64)],
+) -> usize {
+    let hooks = doc
+        .as_object_mut()
+        .expect("the hook file holds an object")
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
     let mut added = 0;
     for (event, argv) in RETIRED_HOOKS {
         added += retire_hook(hooks, event, argv);
@@ -836,33 +900,7 @@ fn install_hook_file(
             on_path.as_deref(),
         );
     }
-    if added > 0 {
-        if let Some(text) = &original
-            && keep_original(path, text).is_err()
-        {
-            ui::warning(&format!(
-                "cannot install {label} hooks: failed to keep a copy of {}",
-                path.display()
-            ));
-            return SetupReport::failure();
-        }
-        if write_json(path, &doc).is_err() {
-            ui::warning(&format!("failed to write {}", path.display()));
-            return SetupReport::failure();
-        }
-        ui::info(format_args!(
-            "  {} {label} hooks → {}",
-            ui::ok(ui::theme::symbols().check),
-            ui::tilde(path)
-        ));
-        SetupReport::changed_item()
-    } else {
-        ui::info(format_args!(
-            "  {} {label} hooks already in place",
-            ui::dim("·")
-        ));
-        SetupReport::item()
-    }
+    added
 }
 
 /// Retire a hook that is no longer used. Returns how many commands were removed.
@@ -2443,6 +2481,113 @@ mod tests {
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(install_hook_file(&path, "WorkBuddy", exe, Some("workbuddy"), &[]).succeeded());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+    }
+
+    /// An install changes a hook file only where agit's hooks go. The person's key order,
+    /// indentation and one-line entries stay as written; the retired hook leaves its group and the
+    /// stale path is rewritten where they stand; and agit's new group and new event come in the
+    /// file's own layout. An install that parsed and wrote back the document would move `model`
+    /// below `hooks` and reflow the one-line entry, and one that ignored the layout would misalign
+    /// what it adds. A file whose text holds what a parse reads differently, such as a key given
+    /// twice, is refused and left without a copy beside it: falling back to writing the document
+    /// would be the rewrite this rules out.
+    #[test]
+    fn an_install_changes_the_hook_file_only_where_agit_hooks_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let exe = "/home/me/.local/bin/agit";
+        let extra: &[(&str, &[&str], u64)] =
+            &[("PermissionRequest", &["hooks", "native-permission"], 86_400)];
+        std::fs::write(
+            &path,
+            r#"{
+    "model": "opus",
+    "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    { "type": "command", "command": "~/bin/notify" },
+                    { "type": "command", "command": "/usr/local/bin/agit commit --from-hook" }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/opt/old/agit hooks ingest"
+                    }
+                ]
+            }
+        ]
+    },
+    "permissions": {
+        "allow": ["Bash(ls:*)"]
+    }
+}
+"#,
+        )
+        .unwrap();
+        assert!(install_hook_file(&path, "Claude Code", exe, None, extra).succeeded());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{
+    "model": "opus",
+    "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    { "type": "command", "command": "~/bin/notify" }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "command": "/home/me/.local/bin/agit hooks settle",
+                        "type": "command"
+                    }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/home/me/.local/bin/agit hooks ingest"
+                    }
+                ]
+            }
+        ],
+        "PermissionRequest": [
+            {
+                "hooks": [
+                    {
+                        "command": "/home/me/.local/bin/agit hooks native-permission",
+                        "timeout": 86400,
+                        "type": "command"
+                    }
+                ]
+            }
+        ]
+    },
+    "permissions": {
+        "allow": ["Bash(ls:*)"]
+    }
+}
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let twice = r#"{"model": "opus", "model": "sonnet"}"#;
+        std::fs::write(&path, twice).unwrap();
+        assert!(!install_hook_file(&path, "Claude Code", exe, None, extra).succeeded());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), twice);
+        assert!(!dir.path().join("settings.json.agit-backup").exists());
     }
 
     /// A hook repair (`setup --hooks --installed-only`) changes only the command text of agit's
