@@ -33,6 +33,14 @@ the conversation, its folder's destination and the account by itself, so do not 
 
 - `agit save` run inside a conversation saves that conversation and turns its folder on, so later
   turns upload after each turn without any command. Send the user `result.value.sessions[].link`.
+- When a save turned a folder on (`result.value.folders_turned_on[]`, each with `folder` and
+  `repository`), tell the user, with the link, that new sessions in that folder now upload to
+  that repository by themselves, and ask once whether they should keep doing so, naming each
+  folder when there are several (`result.value.next.ask_user` has the question). If the user
+  says no, run `agit off --json <folder>` for that folder (its `if_no`): new sessions there
+  stay on this computer, and you do not ask again. Saving there again needs the folder turned
+  back on (`agit on --json`), which makes its new sessions upload by themselves again, so run
+  that only when the user asks for it.
 - Exit code `8` with `result.value.sign_in_url` means the user must sign in: send them the link,
   wait until they say they approved it, then run the same command again. It finishes the sign-in
   by itself; do not run `agit login --complete`.

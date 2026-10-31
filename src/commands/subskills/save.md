@@ -31,6 +31,12 @@ With `--json`, `result.value.sessions[]` has `title`, `status` (`uploaded`, `pen
 it uploads by itself when the reply ends. Exit code `8` with `result.value.sign_in_url` means
 the user must approve a sign-in: send them the link, then run the same command again.
 
+`result.value.folders_turned_on[]` (`folder`, `repository`) lists the folders this save turned
+on. Tell the user that new sessions there now upload by themselves and ask once whether they
+should keep doing so (`result.value.next.ask_user`). If the user says no, run
+`agit off --json <folder>` (the folder's `if_no`): new sessions there stay on this computer, and
+you do not ask again. Turn it back on (`agit on --json`) only when the user asks.
+
 ## Examples
 
 ```bash

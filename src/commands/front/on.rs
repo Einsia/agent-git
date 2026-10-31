@@ -332,7 +332,7 @@ pub(super) fn run_child(arguments: &[&str], cwd: &Path) -> Result<()> {
 }
 
 fn report(root: &Path, enabled: &Enabled) -> CmdResult {
-    let earlier = crate::commands::project::excluded_count(root);
+    let earlier = crate::commands::project::earlier_count(root);
     let runtimes = runtimes(root);
     if crate::commands::json::is_capturing() {
         println!(

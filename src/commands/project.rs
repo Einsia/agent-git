@@ -87,13 +87,28 @@ struct Project {
     enabled: bool,
     auto_upload: bool,
     history: History,
+    /// Sessions the person stopped uploading (`agit project drop`). A policy written before
+    /// `earlier` existed also kept its earlier sessions here, and the two cannot be told apart, so
+    /// every entry counts as dropped: only a save that names the session lets it back in.
     excluded: BTreeSet<String>,
+    /// Sessions that ran here before the folder was bound without earlier history. A save that
+    /// asks for earlier sessions (`agit save --all`, `--today`) lets them in.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    earlier: BTreeSet<String>,
     last_result: Option<serde_json::Value>,
     /// The repository's own push.auto override as it stood before bind turned automatic push
     /// on; absent when bind did not turn it on. Unbind puts it back, so a binding never leaves
     /// every managed session of the repository uploading after the folder is unbound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     push_auto_before: Option<PushAutoBefore>,
+}
+
+impl Project {
+    /// Whether the policy keeps this session from uploading by itself: dropped, or from before
+    /// the folder was on.
+    fn leaves_out(&self, session_key: &str) -> bool {
+        self.excluded.contains(session_key) || self.earlier.contains(session_key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -715,10 +730,7 @@ fn sync(project: &mut Project) -> CmdResult {
     let mut rows = Vec::new();
     let mut failed = false;
     for candidate in candidates(project)? {
-        if project
-            .excluded
-            .contains(&key(&candidate.runtime, &candidate.session_id))
-        {
+        if project.leaves_out(&key(&candidate.runtime, &candidate.session_id)) {
             continue;
         }
         let outcome = match sync_one(project, &candidate) {
@@ -804,7 +816,7 @@ pub fn run(args: Args) -> CmdResult {
             if dry_run {
                 println!(
                     "{}",
-                    serde_json::json!({"project":project.root,"candidates":rows,"excluded":project.excluded})
+                    serde_json::json!({"project":project.root,"candidates":rows,"excluded":project.excluded,"earlier":project.earlier})
                 );
                 return Ok(ExitCode::Ok);
             }
@@ -882,6 +894,7 @@ fn bind(
         auto_upload: automatic,
         history,
         excluded: BTreeSet::new(),
+        earlier: BTreeSet::new(),
         last_result: None,
         push_auto_before: None,
     };
@@ -910,15 +923,17 @@ fn bind(
         // The override from before the first bind stays the one unbind restores; push.auto as
         // this bind finds it may be the value an earlier bind set.
         project.push_auto_before = existing.push_auto_before;
+        // What the person dropped stays dropped, whatever history the new binding takes.
+        project.excluded = existing.excluded;
         if history == History::None {
-            project.excluded = existing.excluded;
+            project.earlier = existing.earlier;
         }
     }
     if history == History::None {
         // Earlier sessions stay out whether or not another repository claims them; only a
         // session already claimed in this repository keeps publishing here.
         let store = Store::at(config::store_root()?);
-        project.excluded.extend(
+        project.earlier.extend(
             rows.iter()
                 .filter(|s| {
                     link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
@@ -1181,7 +1196,16 @@ pub(crate) fn turned_off(root: &Path) -> bool {
 }
 
 /// Whether the policy at `root` left this session out when it was bound without earlier history.
-pub(crate) fn is_excluded(root: &Path, runtime: &str, session_id: &str) -> bool {
+pub(crate) fn is_earlier(root: &Path, runtime: &str, session_id: &str) -> bool {
+    read(root)
+        .ok()
+        .flatten()
+        .is_some_and(|project| project.earlier.contains(&key(runtime, session_id)))
+}
+
+/// Whether the person stopped uploading this session from the folder at `root`
+/// (`agit project drop`). Only a save that names it lets it back in.
+pub(crate) fn is_dropped(root: &Path, runtime: &str, session_id: &str) -> bool {
     read(root)
         .ok()
         .flatten()
@@ -1211,13 +1235,13 @@ pub(crate) fn last_failure(path: &Path) -> Option<String> {
 
 /// Sessions under `root` that the policy left out when it was bound without earlier history and
 /// that no repository holds yet.
-pub(crate) fn excluded_count(root: &Path) -> usize {
+pub(crate) fn earlier_count(root: &Path) -> usize {
     let Some(project) = read(root).ok().flatten() else {
         return 0;
     };
     let store = Store::open().ok().flatten();
     project
-        .excluded
+        .earlier
         .iter()
         .filter(|session_key| {
             let Some((runtime, id)) = session_key.split_once(':') else {
@@ -1269,13 +1293,11 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
 }
 
 /// Whether `project` keeps `candidate`'s turns from being uploaded: the project is paused, it
-/// uploads nothing, or the session is excluded from it.
+/// uploads nothing, or it leaves the session out (dropped, or from before the folder was on).
 fn withholds(project: &Project, candidate: &Candidate) -> bool {
     !project.enabled
         || !project.auto_upload
-        || project
-            .excluded
-            .contains(&key(&candidate.runtime, &candidate.session_id))
+        || project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
 }
 
 /// What the project policy of a folder does with one live session. Only team activity reports
@@ -1448,12 +1470,12 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
         return Ok(false);
     }
     let session_key = key(&candidate.runtime, &candidate.session_id);
-    if !project.enabled || !project.auto_upload || project.excluded.contains(&session_key) {
+    if !project.enabled || !project.auto_upload || project.leaves_out(&session_key) {
         return Ok(true);
     }
     let _guard = lock(&project.root)?;
     project = read(&project.root)?.context("project policy disappeared")?;
-    if !project.enabled || !project.auto_upload || project.excluded.contains(&session_key) {
+    if !project.enabled || !project.auto_upload || project.leaves_out(&session_key) {
         return Ok(true);
     }
     // A queued capture outlives its Stop: a directory bound on its own in between belongs to
@@ -1493,11 +1515,14 @@ pub(crate) enum Saved {
 }
 
 /// Uploads these sessions of the project at `root` now, after any automatic upload already
-/// running there. With `earlier`, sessions the binding left out are let in first.
+/// running there. With `earlier`, sessions the binding left out are let in first. A session the
+/// person dropped is let in only when `named`: the person asked for that one session, and not for
+/// every earlier one.
 pub(crate) fn save_now(
     root: &Path,
     sessions: &[(String, String, PathBuf)],
     earlier: bool,
+    named: bool,
 ) -> Result<Vec<Saved>> {
     let worker = wait_for_worker(root)?;
     let mut saved = Vec::new();
@@ -1508,14 +1533,25 @@ pub(crate) fn save_now(
             cwd: cwd.clone(),
         };
         let session_key = key(runtime, session_id);
-        if earlier {
+        if earlier || named {
             let _guard = lock(root)?;
             let mut project = read(root)?.context("folder is not set up")?;
-            if project.excluded.remove(&session_key) {
+            let mut changed = project.earlier.remove(&session_key);
+            if named {
+                changed |= project.excluded.remove(&session_key);
+            }
+            if changed {
                 save(&project)?;
             }
         }
         let project = read(root)?.context("folder is not set up")?;
+        // `--all` and `--today` ask for earlier sessions, never for one the person dropped.
+        if project.excluded.contains(&session_key) {
+            saved.push(Saved::Failed(format!(
+                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`"
+            )));
+            continue;
+        }
         saved.push(match save_one(project, candidate) {
             Ok(outcome) => outcome,
             Err(error) => Saved::Failed(format!("{error:#}")),
@@ -1850,7 +1886,7 @@ fn judge(
     claims: &[link::Link],
     origin: Option<&meta::CaptureOrigin>,
 ) -> Option<Withholding> {
-    let excluded = |session: String| projects.iter().any(|p| p.excluded.contains(&session));
+    let excluded = |session: String| projects.iter().any(|p| p.leaves_out(&session));
     if claims
         .iter()
         .any(|claim| excluded(key(&claim.source, &claim.session_id)))
@@ -1930,11 +1966,14 @@ pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option
             continue;
         }
         // An excluded session's capture branch stays withheld after its claim is gone.
-        let excluded_branch = projects.iter().flat_map(|p| &p.excluded).any(|session| {
-            session
-                .split_once(':')
-                .is_some_and(|(runtime, id)| capture_branch(runtime, id) == *branch)
-        });
+        let excluded_branch = projects
+            .iter()
+            .flat_map(|p| p.excluded.iter().chain(&p.earlier))
+            .any(|session| {
+                session
+                    .split_once(':')
+                    .is_some_and(|(runtime, id)| capture_branch(runtime, id) == *branch)
+            });
         if excluded_branch {
             verdicts.push(Some(Withholding::Excluded));
             continue;
@@ -2193,7 +2232,7 @@ pub(crate) fn automatic_upload(
     if !project.enabled
         || !project.auto_upload
         || !includes(&project, origin).ok()?
-        || project.excluded.contains(&key(runtime, session))
+        || project.leaves_out(&key(runtime, session))
     {
         return None;
     }
@@ -2296,7 +2335,7 @@ fn behind(
     caught: &std::collections::BTreeMap<String, u64>,
 ) -> bool {
     let session_key = key(&candidate.runtime, &candidate.session_id);
-    if project.excluded.contains(&session_key) {
+    if project.leaves_out(&session_key) {
         return false;
     }
     match placement(project, candidate) {
@@ -2911,6 +2950,7 @@ mod tests {
             auto_upload: true,
             history: History::All,
             excluded: BTreeSet::new(),
+            earlier: BTreeSet::new(),
             last_result: None,
             push_auto_before: None,
         }
@@ -3465,6 +3505,11 @@ mod tests {
         save(&policy).unwrap();
         assert_eq!(state(&app), Capture::Withheld);
         policy.excluded.clear();
+        // A session from before the folder was on is neither captured nor reported either.
+        policy.earlier.insert(key(RUNTIME, SESSION));
+        save(&policy).unwrap();
+        assert_eq!(state(&app), Capture::Withheld);
+        policy.earlier.clear();
         policy.enabled = false;
         save(&policy).unwrap();
         assert_eq!(state(&app), Capture::Withheld);
@@ -3529,6 +3574,7 @@ mod tests {
             &parent.root,
             &[("claude-code".into(), id.into(), nested.clone())],
             true,
+            false,
         )
         .unwrap();
         let [Saved::Failed(why)] = saved.as_slice() else {
@@ -3538,6 +3584,79 @@ mod tests {
         assert!(why.contains("nested"), "{why}");
         let store = Store::at(config::store_root().unwrap());
         assert!(link::get(&store, "claude-code", id).is_none());
+    }
+
+    /// `agit project drop` is the person stopping one conversation, while `--all` and `--today` ask
+    /// for the sessions from before the folder was on. A save asking for earlier sessions lets
+    /// those in and refuses a dropped one, which stays withheld from automatic upload; only a save
+    /// that names it lets it back. A policy written before the two sets were apart has every entry
+    /// in `excluded`, so they all count as dropped. One that let any excluded session in on
+    /// `--all` would upload a conversation the person said must not leave the computer.
+    #[test]
+    fn asking_for_earlier_sessions_never_lets_a_dropped_one_in() {
+        if !isolated("asking_for_earlier_sessions_never_lets_a_dropped_one_in") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        let dropped = "dddddddd-0000-4000-8000-000000000041";
+        let before = "eeeeeeee-0000-4000-8000-000000000042";
+        policy.excluded.insert(key("claude-code", dropped));
+        policy.earlier.insert(key("claude-code", before));
+        save(&policy).unwrap();
+        let session = |id: &str| {
+            (
+                "claude-code".to_string(),
+                id.to_string(),
+                policy.root.clone(),
+            )
+        };
+
+        // What `--all` and `--today` pass: earlier sessions wanted, none named.
+        let saved = save_now(
+            &policy.root,
+            &[session(dropped), session(before)],
+            true,
+            false,
+        )
+        .unwrap();
+        let Saved::Failed(why) = &saved[0] else {
+            panic!("a dropped session was saved");
+        };
+        assert!(why.contains("agit project drop"), "{why}");
+        assert!(why.contains(&format!("agit save {dropped}")), "{why}");
+        let after = read(&policy.root).unwrap().unwrap();
+        assert!(after.excluded.contains(&key("claude-code", dropped)));
+        assert!(!after.earlier.contains(&key("claude-code", before)));
+        let origin = meta::CaptureOrigin {
+            runtime: "claude-code".into(),
+            session: dropped.into(),
+        };
+        assert_eq!(
+            judge(std::slice::from_ref(&after), "any", &[], Some(&origin)),
+            Some(Withholding::Excluded)
+        );
+        assert!(!is_earlier(&policy.root, "claude-code", dropped));
+        assert!(is_dropped(&policy.root, "claude-code", dropped));
+
+        // A policy written before `earlier` existed reads with every entry dropped.
+        let mut legacy = serde_json::to_value(&after).unwrap();
+        assert!(
+            legacy.get("earlier").is_none(),
+            "an empty set is not written"
+        );
+        legacy["excluded"] = serde_json::json!([key("claude-code", before)]);
+        let legacy: Project = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.earlier.is_empty() && legacy.leaves_out(&key("claude-code", before)));
+
+        // Naming it lets it back in.
+        save_now(&policy.root, &[session(dropped)], false, true).unwrap();
+        assert!(
+            !read(&policy.root)
+                .unwrap()
+                .unwrap()
+                .leaves_out(&key("claude-code", dropped))
+        );
     }
 
     /// A session uploaded and then continued while its Stop hook did not run (an untrusted hook,

@@ -7,7 +7,7 @@ use crate::{ExitCode, commands::CmdResult, commands::project::Saved, ui};
 use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct SaveArgs {
@@ -41,6 +41,8 @@ struct Plan {
     this_conversation: bool,
     /// Sessions from before the folder was on, which only `--all` uploads.
     left_out: usize,
+    /// Sessions the person stopped uploading (`agit project drop`), which only naming uploads.
+    dropped: usize,
 }
 
 fn again(args: &SaveArgs) -> String {
@@ -72,12 +74,18 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             .and_then(|t| t.and_local_timezone(chrono::Local).single())
             .map(std::time::SystemTime::from)
             .unwrap_or(std::time::UNIX_EPOCH);
+        let mut dropped = 0;
         for session in super::sessions_since(midnight)? {
             if matches!(session.upload(), Some(super::Upload::Uploaded)) {
                 continue;
             }
             // A session outside any project folder has no destination of its own.
             if let Ok(root) = super::folder(&session.cwd) {
+                // The day's sessions are not a request for one the person dropped.
+                if crate::commands::project::is_dropped(&root, session.runtime, &session.id) {
+                    dropped += 1;
+                    continue;
+                }
                 folders.entry(root).or_default().push(session);
             }
         }
@@ -86,6 +94,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             earlier: true,
             this_conversation: false,
             left_out: 0,
+            dropped,
         });
     }
     let this = crate::infra::runtime_session::this_conversation();
@@ -121,21 +130,29 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             earlier: true,
             this_conversation: true,
             left_out: 0,
+            dropped: 0,
         });
     }
     let root = super::folder(&std::env::current_dir()?)?;
     let on = crate::commands::project::uploads_automatically(&root) == Some(true);
     let here = super::sessions_in(&root)?;
     let mut left_out = 0;
+    let mut dropped = 0;
     let chosen: Vec<FolderSession> = match &args.session {
         Some(query) => vec![super::pick(here, query, &root)?],
         None => here
             .into_iter()
             .filter(|s| !matches!(s.upload(), Some(super::Upload::Uploaded)))
+            // `--all` asks for earlier sessions, not for one the person dropped.
+            .filter(|s| {
+                let gone = crate::commands::project::is_dropped(&root, s.runtime, &s.id);
+                dropped += usize::from(gone);
+                !gone
+            })
             .filter(|s| {
                 let earlier = on
                     && !args.all
-                    && crate::commands::project::is_excluded(&root, s.runtime, &s.id);
+                    && crate::commands::project::is_earlier(&root, s.runtime, &s.id);
                 left_out += usize::from(earlier);
                 !earlier
             })
@@ -151,7 +168,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
         };
         return Err(Refusal::new(
             format!("this would upload {count} in {}", ui::tilde(&root)),
-            "name one: `agit save SESSION-ID` (`agit list` shows them), or upload them all: `agit save --all`",
+            "name one: `agit save SESSION-ID` (`agit` shows them), or upload them all: `agit save --all`",
             ExitCode::Interactive,
         )
         .into());
@@ -166,6 +183,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
         earlier,
         this_conversation: false,
         left_out,
+        dropped,
     })
 }
 
@@ -176,6 +194,8 @@ struct Row {
     folder: PathBuf,
     repository: String,
     outcome: Saved,
+    /// The person had stopped uploading it (`agit project drop`), and naming it let it back in.
+    was_dropped: bool,
 }
 
 fn save(args: SaveArgs) -> CmdResult {
@@ -184,15 +204,16 @@ fn save(args: SaveArgs) -> CmdResult {
         if crate::commands::json::is_capturing() {
             println!(
                 "{}",
-                serde_json::json!({"sessions": [], "folders_turned_on": [], "left_out": plan.left_out})
+                serde_json::json!({"sessions": [], "folders_turned_on": [], "left_out": plan.left_out, "dropped": plan.dropped})
             );
         } else {
-            if plan.left_out == 0 {
+            if plan.left_out == 0 && plan.dropped == 0 {
                 println!("Nothing to save: every session here is uploaded.");
             } else {
                 println!("Nothing new to save.");
             }
             report_left_out(plan.left_out);
+            report_dropped(plan.dropped);
         }
         return Ok(ExitCode::Ok);
     }
@@ -277,10 +298,18 @@ fn save(args: SaveArgs) -> CmdResult {
             .iter()
             .map(|s| (s.runtime.to_string(), s.id.clone(), s.cwd.clone()))
             .collect();
+        // Only a session the person names, or this conversation they asked to save, may come back
+        // after they dropped it.
+        let named = args.session.is_some() || plan.this_conversation;
+        let was_dropped: Vec<bool> = sessions
+            .iter()
+            .map(|s| named && crate::commands::project::is_dropped(&root, s.runtime, &s.id))
+            .collect();
         let spinner = ui::spinner(&format!("uploading {} session(s)…", targets.len()));
-        let outcomes = crate::commands::project::save_now(&root, &targets, plan.earlier);
+        let outcomes = crate::commands::project::save_now(&root, &targets, plan.earlier, named);
         spinner.finish_and_clear();
-        for (session, outcome) in sessions.iter_mut().zip(outcomes?) {
+        for ((session, outcome), was_dropped) in sessions.iter_mut().zip(outcomes?).zip(was_dropped)
+        {
             rows.push(Row {
                 title: session.title(),
                 runtime: session.runtime,
@@ -288,14 +317,43 @@ fn save(args: SaveArgs) -> CmdResult {
                 folder: root.clone(),
                 repository: enabled.repository.clone(),
                 outcome,
+                was_dropped,
             });
         }
     }
-    let code = report(&rows, &turned_on, &skipped, plan.this_conversation)?;
+    let code = report(
+        &rows,
+        &turned_on,
+        &skipped,
+        plan.this_conversation,
+        plan.dropped,
+    )?;
     if !crate::commands::json::is_capturing() {
         report_left_out(plan.left_out);
     }
     Ok(code)
+}
+
+/// What `--all`, `--today` or a folder's save left out because the person dropped it.
+fn report_dropped(dropped: usize) {
+    if dropped > 0 {
+        println!(
+            "{dropped} session{} you stopped uploading (`agit project drop`) {} left out; to upload one anyway, name it: {}",
+            if dropped == 1 { "" } else { "s" },
+            if dropped == 1 { "is" } else { "are" },
+            ui::accent("agit save SESSION-ID")
+        );
+    }
+}
+
+/// The command that turns `folder` off again, quoted for this platform's shell.
+fn off_command(folder: &Path) -> String {
+    let folder = folder.to_string_lossy();
+    #[cfg(windows)]
+    let folder = ui::quote_powershell_argument(&folder);
+    #[cfg(not(windows))]
+    let folder = ui::quote_posix_argument(&folder);
+    format!("agit off --json {folder}")
 }
 
 fn report_left_out(left_out: usize) {
@@ -319,6 +377,7 @@ fn report(
     turned_on: &[(PathBuf, String)],
     skipped: &[(PathBuf, String)],
     this_conversation: bool,
+    dropped: usize,
 ) -> CmdResult {
     let failed = rows
         .iter()
@@ -347,6 +406,7 @@ fn report(
                     },
                     "branch": branch,
                     "error": error,
+                    "was_dropped": r.was_dropped,
                 })
             })
             .collect();
@@ -354,9 +414,26 @@ fn report(
             "{}",
             serde_json::json!({
                 "sessions": sessions,
-                "folders_turned_on": turned_on.iter().map(|(f, r)| serde_json::json!({"folder": f, "repository": r})).collect::<Vec<_>>(),
+                "folders_turned_on": turned_on.iter().map(|(f, r)| serde_json::json!({"folder": f, "repository": r, "if_no": off_command(f)})).collect::<Vec<_>>(),
                 "folders_skipped": skipped.iter().map(|(f, why)| serde_json::json!({"folder": f, "why": why})).collect::<Vec<_>>(),
-                "next": if failed > 0 {
+                "dropped": dropped,
+                // A save that turned a folder on did what the person asked and more: whether new
+                // sessions there keep uploading by themselves is theirs to answer, before anything
+                // else (ledger 121, choice A).
+                "next": if let [(folder, repository)] = turned_on {
+                    Some(serde_json::json!({
+                        "ask_user": format!("New sessions in {} now upload to {repository} by themselves. Keep that on?", ui::tilde(folder)),
+                        "if_no": off_command(folder),
+                    }))
+                } else if !turned_on.is_empty() {
+                    Some(serde_json::json!({
+                        "ask_user": format!(
+                            "New sessions in {} now upload by themselves. Keep that on for each?",
+                            turned_on.iter().map(|(f, _)| ui::tilde(f)).collect::<Vec<_>>().join(", ")
+                        ),
+                        "if_no": "for each folder the user says no to, run its `if_no` in folders_turned_on",
+                    }))
+                } else if failed > 0 {
                     Some(serde_json::json!({
                         "command": "agit save",
                         "why": "retry what did not upload; what is already on the Hub is not sent again",
@@ -375,6 +452,9 @@ fn report(
                 Saved::Uploaded(branch) => {
                     ui::success(&format!("uploaded \"{}\"", ui::truncate(&row.title, 60)));
                     println!("  {}", link(&row.repository, branch));
+                    if row.was_dropped {
+                        println!("  you had stopped uploading it; its new turns upload again");
+                    }
                 }
                 Saved::Pending(_) if this_conversation => {
                     ui::success(&format!("saving \"{}\"", ui::truncate(&row.title, 60)));
@@ -408,6 +488,7 @@ fn report(
         for (folder, why) in skipped {
             ui::warning(&format!("skipped {}: {why}", ui::tilde(folder)));
         }
+        report_dropped(dropped);
         if failed > 0 {
             ui::hint("run `agit save` again to retry; `agit` shows what is still waiting");
         } else if this_conversation {

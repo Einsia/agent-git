@@ -634,3 +634,49 @@ fn a_directory_bound_on_its_own_keeps_its_sessions() {
     assert!(text.contains("app/tools"), "{document}");
     assert!(lab.created().is_empty(), "no repository is created");
 }
+
+/// A conversation the person stopped uploading (`agit project drop`) stays on this computer when
+/// an agent asks for a folder's earlier sessions or for the whole day: `agit save --all` and
+/// `--today`, with no terminal, leave it out without asking anyone, say how many they left out,
+/// and leave the drop in place. An implementation that let every left-out session of the folder
+/// in for `--all` or `--today` would upload it.
+#[test]
+fn a_dropped_conversation_is_left_out_of_all_and_today() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    let dir = lab.folder("app", false);
+    let id = "44444444-4444-4444-8444-444444444444";
+    lab.conversation(&dir, id, "Draft the salary review");
+    let session = format!("claude-code:{id}");
+    let policies = lab.agit_home.join("projects");
+    std::fs::create_dir_all(&policies).unwrap();
+    let digest = hex::encode(Sha256::digest(dir.to_string_lossy().as_bytes()));
+    let policy = policies.join(format!("{}.json", &digest[..24]));
+    std::fs::write(
+        &policy,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "root": dir, "repository": "me/notes",
+            "identity": {"hub": lab.hub, "agent_id": "11111111-0000-4000-8000-000000000001"},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [session], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for flag in ["--all", "--today"] {
+        let out = lab.agit(&dir, &["--json", "save", flag]);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}: {document}");
+        let value = &document["result"]["value"];
+        assert_eq!(value["dropped"], 1, "{flag}: {document}");
+        assert_eq!(
+            value["sessions"],
+            serde_json::json!([]),
+            "{flag}: {document}"
+        );
+    }
+    let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&policy).unwrap()).unwrap();
+    assert_eq!(kept["excluded"], serde_json::json!([session]), "{kept}");
+    assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
