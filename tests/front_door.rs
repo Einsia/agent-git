@@ -1,6 +1,8 @@
+//! Contracts of the front door, pinned through the binary against a fake Hub.
+//!
 //! `agit on` uploads every future turn of a folder's sessions without asking again, so the
-//! destination it chooses on its own must never be readable by anyone. Pinned through the binary
-//! against a fake Hub that records every creation request:
+//! destination it chooses on its own must never be readable by anyone. The fake Hub records every
+//! creation request:
 //!
 //! - among the Hub repositories linked to the folder's Git origin, a public one is never chosen,
 //!   even when it is writable;
@@ -13,6 +15,11 @@
 //!
 //! An implementation that filters only on write access, or that takes an existing binding at its
 //! word, sends a creation request naming the public repository, or enables the folder.
+//!
+//! A front-door command that needs an account and finds none starts the sign-in itself: outside a
+//! terminal it records the request and answers with the link and exit code 8, so an agent hands the
+//! link to the person and reruns the same command. One that only says "run agit login" leaves
+//! the agent a second, different command to discover.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -74,7 +81,16 @@ fn fake_hub(created: Arc<Mutex<Vec<serde_json::Value>>>) -> String {
                     "clone_url": format!("{server_base}/{owner}/{name}.git"),
                 })
             };
-            let (status, reply) = if line.starts_with("POST /api/agents ") {
+            let (status, reply) = if line.starts_with("POST /api/auth/cli/session ") {
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "state": "state-1",
+                        "url": format!("{server_base}/auth/cli?state=state-1"),
+                        "expires_in": 600,
+                    }),
+                )
+            } else if line.starts_with("POST /api/agents ") {
                 let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
                 created.lock().unwrap().push(request.clone());
                 let owner = request["owner"].as_str().unwrap_or("me").to_string();
@@ -240,10 +256,9 @@ struct Lab {
 }
 
 impl Lab {
-    fn new() -> Lab {
+    fn signed_out() -> Lab {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
-        let agit_home = tmp.path().join("agit");
         std::fs::create_dir_all(&home).unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -251,30 +266,37 @@ impl Lab {
         std::fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
         let created = Arc::new(Mutex::new(Vec::new()));
         let hub = fake_hub(Arc::clone(&created));
+        Lab {
+            agit_home: tmp.path().join("agit"),
+            _tmp: tmp,
+            hub,
+            home,
+            bin,
+            created,
+        }
+    }
+
+    fn new() -> Lab {
+        let lab = Lab::signed_out();
         let credential = agit::infra::credentials::HubCredential {
             account_id: None,
             username: "me".into(),
             email: None,
-            hub: Some(hub.clone()),
+            hub: Some(lab.hub.clone()),
             access_token: "fake".into(),
             access_expires_at: "2099-01-01T00:00:00Z".into(),
             refresh_token: "fake".into(),
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
-        let key = agit::infra::config::hub_host_key(&hub).unwrap();
+        let key = agit::infra::config::hub_host_key(&lab.hub).unwrap();
         agit::infra::credentials::save_at(
-            &agit_home.join("credentials").join(format!("{key}.json")),
+            &lab.agit_home
+                .join("credentials")
+                .join(format!("{key}.json")),
             &credential,
         )
         .unwrap();
-        Lab {
-            _tmp: tmp,
-            hub,
-            home,
-            agit_home,
-            bin,
-            created,
-        }
+        lab
     }
 
     /// A project folder under the home directory, optionally a Git checkout of [`ORIGIN`].
@@ -326,6 +348,39 @@ impl Lab {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap()
+    }
+
+    /// A Claude Code conversation in `cwd` with one finished reply.
+    fn conversation(&self, cwd: &std::path::Path, id: &str, prompt: &str) {
+        let native = self
+            .home
+            .join(".claude")
+            .join("projects")
+            .join(agit::adapter::claude_code::slug_for(cwd));
+        std::fs::create_dir_all(&native).unwrap();
+        let records = [
+            serde_json::json!({"type":"user","uuid":format!("{id}-u"),"sessionId":id,"cwd":cwd,
+                "timestamp":"2026-10-25T10:00:00Z","message":{"role":"user","content":prompt}}),
+            serde_json::json!({"type":"assistant","uuid":format!("{id}-a"),"parentUuid":format!("{id}-u"),
+                "sessionId":id,"cwd":cwd,"timestamp":"2026-10-25T10:00:05Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}),
+        ];
+        let text: String = records.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(native.join(format!("{id}.jsonl")), text).unwrap();
+    }
+
+    /// Binds `dir` on its own to `repo`, as `agit bind` records it.
+    fn bind(&self, dir: &std::path::Path, repo: &str) {
+        use sha2::{Digest, Sha256};
+        let canonical = dir.canonicalize().unwrap();
+        let id = &hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()))[..16];
+        let bindings = self.agit_home.join("workspaces");
+        std::fs::create_dir_all(&bindings).unwrap();
+        std::fs::write(
+            bindings.join(format!("{id}.json")),
+            serde_json::to_vec(&serde_json::json!({"dir": canonical, "repo": repo})).unwrap(),
+        )
+        .unwrap();
     }
 
     fn created(&self) -> Vec<(String, String)> {
@@ -486,4 +541,96 @@ fn nothing_is_created_for_a_folder_no_agent_here_uploads_from() {
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(stderr.contains("install Claude Code"), "{stderr}");
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
+
+#[test]
+fn a_command_that_needs_an_account_starts_the_sign_in() {
+    let lab = Lab::signed_out();
+    let dir = lab.folder("app", false);
+    let out = lab.agit(&dir, &["--json", "on"]);
+    assert_eq!(out.status.code(), Some(8));
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let value = &document["result"]["value"];
+    assert_eq!(
+        value["sign_in_url"],
+        format!("{}/auth/cli?state=state-1", lab.hub),
+        "{document}"
+    );
+    assert_eq!(value["next"]["then"], "agit on", "{document}");
+    assert!(lab.created().is_empty());
+}
+
+/// Saving a folder for the first time uploads the sessions already in it, so without a person to
+/// ask and without a conversation to name, nothing is uploaded or set up: the refusal names one
+/// session or `--all`. An implementation that uploaded every session there on an agent's bare
+/// `agit save` fails here.
+#[test]
+fn an_unattended_save_does_not_upload_a_folders_earlier_sessions() {
+    let lab = Lab::new();
+    let dir = lab.folder("app", false);
+    lab.conversation(
+        &dir,
+        "11111111-1111-4111-8111-111111111111",
+        "Fix the login page",
+    );
+    lab.conversation(
+        &dir,
+        "22222222-2222-4222-8222-222222222222",
+        "Add a dark mode",
+    );
+
+    let out = lab.agit(&dir, &["--json", "save"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(8), "{document}");
+    let text = document.to_string();
+    assert!(text.contains("all 2 sessions"), "{document}");
+    assert!(text.contains("agit save --all"), "{document}");
+    assert!(lab.created().is_empty(), "no repository is created");
+    let policies = std::fs::read_dir(lab.agit_home.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .count();
+    assert_eq!(policies, 0, "the folder is not turned on");
+}
+
+/// A directory bound on its own inside a project keeps its conversations. Saving the project
+/// leaves them out, and saving from inside the directory takes only them, for its own
+/// destination. An implementation that gathered every conversation below the Git top level would
+/// count the nested conversation in the project, and from inside the directory would save the
+/// whole project.
+#[test]
+fn a_directory_bound_on_its_own_keeps_its_sessions() {
+    let lab = Lab::new();
+    let dir = lab.folder("app", true);
+    let tools = dir.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools = tools.canonicalize().unwrap();
+    lab.bind(&tools, "me/tools");
+    lab.conversation(
+        &dir,
+        "11111111-1111-4111-8111-111111111111",
+        "Fix the login page",
+    );
+    lab.conversation(
+        &tools,
+        "33333333-3333-4333-8333-333333333333",
+        "Add a lint script",
+    );
+
+    let out = lab.agit(&dir, &["--json", "save"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(8), "{document}");
+    let text = document.to_string();
+    assert!(text.contains("the 1 session in"), "{document}");
+    assert!(!text.contains("tools"), "{document}");
+
+    let out = lab.agit(&tools, &["--json", "save"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(8), "{document}");
+    let text = document.to_string();
+    assert!(text.contains("the 1 session in"), "{document}");
+    assert!(text.contains("app/tools"), "{document}");
+    assert!(lab.created().is_empty(), "no repository is created");
 }

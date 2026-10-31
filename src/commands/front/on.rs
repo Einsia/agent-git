@@ -146,6 +146,7 @@ pub(crate) fn enable(
         )
         .into());
     }
+    upload_unpublished(root, &destination)?;
     let (visibility, created) = super::ensure_on_hub(client, &destination, origin.as_deref())?;
     // New sessions go to the named repository; sessions already saved stay where they are. A
     // move that does not complete leaves the folder routed as it was.
@@ -226,6 +227,26 @@ fn grant_teams(
         }
     }
     (granted, page)
+}
+
+/// A repository made with `agit init` and never uploaded has no Hub identity yet. Its first upload
+/// creates the destination, or takes over an empty one, and records that identity, so it comes
+/// before anything else touches the Hub; the upload itself refuses a destination with other
+/// history.
+fn upload_unpublished(root: &Path, destination: &super::Destination) -> Result<()> {
+    let Some(repo) = crate::infra::config::repo_dir(&destination.owner, &destination.name)
+        .ok()
+        .and_then(crate::domain::repo::Repo::open)
+    else {
+        return Ok(());
+    };
+    if crate::hub::identity::read(&repo)?.is_some() {
+        return Ok(());
+    }
+    run_child(
+        &["push", &destination.slug(), "-b", "main", "--private"],
+        root,
+    )
 }
 
 fn public_refusal(root: &Path, destination: &super::Destination) -> Refusal {

@@ -1253,6 +1253,8 @@ pub enum Commands {
     On(front::on::OnArgs),
     /// Stop saving this folder's new sessions (nothing is deleted)
     Off(front::on::OffArgs),
+    /// Upload now: this conversation, this folder's unsaved sessions, or --today / --all
+    Save(front::save::SaveArgs),
     /// (hidden) bare `agit`: what is saved here and the next step
     #[command(hide = true)]
     Overview,
@@ -1377,6 +1379,7 @@ pub fn command_name(command: &Commands) -> &'static str {
     match command {
         Commands::On(_) => "on",
         Commands::Off(_) => "off",
+        Commands::Save(_) => "save",
         Commands::Overview => "overview",
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",

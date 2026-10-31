@@ -270,7 +270,8 @@ fn incomplete_inspection_and_native_failures_keep_their_exit_categories() {
     }
 }
 
-/// Recovery promises depend on acknowledged effects, rather than which later phase failed.
+/// Recovery promises depend on acknowledged effects, rather than which later phase failed, and
+/// the message names what stopped the publication.
 #[test]
 fn publication_recovery_distinguishes_unattempted_acknowledged_and_unknown_ref_updates() {
     let cli = crate::commands::Cli::try_parse_from([
@@ -298,6 +299,10 @@ fn publication_recovery_distinguishes_unattempted_acknowledged_and_unknown_ref_u
     };
     let recovery = publication_recovery(&report, &retry, "team/wiki");
     assert!(recovery.contains("no branch or tag refs were updated") && recovery.contains(&retry));
+    assert!(
+        recovery.contains("(destination ref read failed)"),
+        "{recovery}"
+    );
     let temp = tempfile::tempdir().unwrap();
     let repo = Repo::init(&temp.path().join("repo")).unwrap();
     repo.git(&[
@@ -362,6 +367,9 @@ fn publication_recovery_distinguishes_unattempted_acknowledged_and_unknown_ref_u
     assert!(
         !recovery.contains("is safe") && !recovery.contains("no branch or tag refs were updated")
     );
+    report.error = None;
+    let recovery = publication_recovery(&report, &retry, "team/wiki");
+    assert!(recovery.contains("(lost acknowledgement)"), "{recovery}");
 }
 
 #[test]

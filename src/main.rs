@@ -346,7 +346,7 @@ fn startup_for(command: &Commands) -> Startup {
             Startup::ToolDispatcher
         }
         Commands::Status(_) | Commands::Overview => Startup::Inspect,
-        Commands::On(_) | Commands::Off(_) => Startup::ScopedImport,
+        Commands::On(_) | Commands::Off(_) | Commands::Save(_) => Startup::ScopedImport,
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
@@ -452,6 +452,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
     let result = match cmd {
         Commands::On(a) => commands::front::on::on(a),
         Commands::Off(a) => commands::front::on::off(a),
+        Commands::Save(a) => commands::front::save::run(a),
         Commands::Overview => commands::front::overview::run(),
         Commands::Login(a) => commands::login::run(a),
         Commands::Rc(a) => commands::rc::run(a),

@@ -11,6 +11,7 @@
 
 pub mod on;
 pub mod overview;
+pub mod save;
 
 use crate::{
     ExitCode, adapter,
@@ -96,7 +97,13 @@ pub(crate) fn folder(dir: &Path) -> Result<PathBuf> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("{} does not exist", dir.display()))?;
-    let root = git_top_level(&dir).unwrap_or(dir);
+    let top = git_top_level(&dir).unwrap_or_else(|| dir.clone());
+    let root = match super::project::bound_root(&dir) {
+        // A directory set up on its own below the top level keeps its own sessions and destination.
+        Some(bound) if bound.starts_with(&top) => bound,
+        // A folder already enrolled from a directory above it belongs to that enrollment.
+        _ => super::project::covering_root(&top).unwrap_or(top),
+    };
     let home = config::user_home().and_then(|h| h.canonicalize().ok());
     if root.parent().is_none() || home.as_ref() == Some(&root) {
         return Err(Refusal::new(
@@ -737,6 +744,8 @@ pub(crate) struct FolderSession {
     pub runtime: &'static str,
     pub id: String,
     pub path: PathBuf,
+    /// Where it ran.
+    pub cwd: PathBuf,
     pub modified: std::time::SystemTime,
     /// The runtime's own name for it, or its opening request.
     pub title: Option<String>,
@@ -775,7 +784,14 @@ impl FolderSession {
         ]);
         Some(match (local, remote) {
             (_, None) => Upload::NotUploaded,
-            (local, remote) if local == remote => Upload::Uploaded,
+            // A Stop hook that did not run leaves the branch as it was pushed while the
+            // conversation goes on, so the transcript is compared with its last upload too.
+            (local, remote)
+                if local == remote
+                    && !super::project::changed_since_upload(self.runtime, &self.id, &self.cwd) =>
+            {
+                Upload::Uploaded
+            }
             _ => Upload::Waiting,
         })
     }
@@ -806,8 +822,23 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// Claude Code and Codex conversations that ran in `root` or below it, newest first.
+/// Claude Code and Codex conversations that ran in `root` or below it, newest first, except in a
+/// directory below that is set up on its own: those are that directory's.
 pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
+    sessions_where(|cwd, _| {
+        cwd.starts_with(root)
+            && super::project::bound_root(cwd).is_none_or(|bound| root.starts_with(bound))
+    })
+}
+
+/// Every Claude Code and Codex conversation modified since `since`, newest first.
+pub(crate) fn sessions_since(since: std::time::SystemTime) -> Result<Vec<FolderSession>> {
+    sessions_where(|_, modified| modified >= since)
+}
+
+fn sessions_where(
+    keep: impl Fn(&Path, std::time::SystemTime) -> bool,
+) -> Result<Vec<FolderSession>> {
     let store = Store::open().ok().flatten();
     let mut sessions = Vec::new();
     for runtime in ["claude-code", "codex"] {
@@ -823,7 +854,7 @@ pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
             let Some(cwd) = cwd.and_then(|p| PathBuf::from(p).canonicalize().ok()) else {
                 continue;
             };
-            if !cwd.starts_with(root) {
+            if !keep(&cwd, session.mtime) {
                 continue;
             }
             let saved = store
@@ -839,6 +870,7 @@ pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
                 runtime,
                 id: session.id,
                 path: session.path,
+                cwd,
                 modified: session.mtime,
                 title: session.title.or(session.gist),
                 saved,
@@ -847,6 +879,76 @@ pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(sessions)
+}
+
+/// One conversation, wherever it ran.
+pub(crate) fn sessions_where_id(runtime: &str, id: &str) -> Result<Option<FolderSession>> {
+    Ok(sessions_where(|_, _| true)?
+        .into_iter()
+        .find(|s| s.runtime == runtime && s.id == id))
+}
+
+/// The one session of `here` that `query` names: an ID or the start of one, or words from its
+/// title. Several matches are listed with the command for each.
+pub(crate) fn pick(here: Vec<FolderSession>, query: &str, root: &Path) -> Result<FolderSession> {
+    let query = query.trim();
+    let mut by_id: Vec<FolderSession> = Vec::new();
+    let mut by_title: Vec<FolderSession> = Vec::new();
+    let needle = query.to_lowercase();
+    for mut session in here {
+        if query.len() >= 4 && session.id.starts_with(query) {
+            by_id.push(session);
+        } else if session.title().to_lowercase().contains(&needle) {
+            by_title.push(session);
+        }
+    }
+    let mut matches = if by_id.is_empty() { by_title } else { by_id };
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(Refusal::new(
+            format!("no session in {} matches \"{query}\"", ui::tilde(root)),
+            "`agit` lists this folder's recent sessions",
+            ExitCode::Ref,
+        )
+        .into()),
+        _ => {
+            let listed: Vec<String> = matches
+                .iter_mut()
+                .take(5)
+                .map(|s| format!("{} (`{}`)", ui::truncate(&s.title(), 50), short(&s.id)))
+                .collect();
+            Err(Refusal::new(
+                format!("several sessions match \"{query}\": {}", listed.join(", ")),
+                format!(
+                    "name one by its ID, for example `{}`",
+                    short(&matches[0].id)
+                ),
+                ExitCode::Ref,
+            )
+            .into())
+        }
+    }
+}
+
+/// The Hub page of an uploaded session, or `None` when this computer has not seen it on the Hub.
+pub(crate) fn session_link(repository: &str, branch: &str) -> Option<String> {
+    let (owner, name) = super::parse_slug(repository).ok()?;
+    let repo = Repo::open(config::repo_dir(&owner, &name).ok()?)?;
+    let session = super::repo::published_session(&repo, branch).ok()?.ok()?;
+    let hub = config::hub_url();
+    Some(super::with_sharer(
+        format!(
+            "{}{}",
+            hub.trim_end_matches('/'),
+            super::repo::session_path(&owner, &name, &session, branch)
+        ),
+        super::link_sharer(&hub).as_deref(),
+    ))
+}
+
+/// The Hub page of a repository.
+pub(crate) fn repository_link(repository: &str) -> String {
+    format!("{}/@{repository}", config::hub_url().trim_end_matches('/'))
 }
 
 /// The account signed in to the selected Hub, from local state only.

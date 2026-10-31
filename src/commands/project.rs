@@ -215,7 +215,7 @@ fn restore_auto_push_for(project: &Project) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Candidate {
     runtime: String,
     session_id: String,
@@ -445,12 +445,26 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
     let output = command.output()?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("child command did not return a CLI result")?;
-    ensure!(
-        output.status.success() && value["ok"] == true,
-        "{} failed: {}",
-        arguments.first().map_or("command", String::as_str),
-        value["diagnostics"]["stderr"]
-    );
+    if !(output.status.success() && value["ok"] == true) {
+        let messages: Vec<&str> = value["diagnostics"]["stderr"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|d| d["level"] == "error")
+            .filter_map(|d| d["message"].as_str())
+            .collect();
+        anyhow::bail!(
+            "{}",
+            if messages.is_empty() {
+                format!(
+                    "`agit {}` failed",
+                    arguments.first().map_or("command", String::as_str)
+                )
+            } else {
+                messages.join("; ")
+            }
+        );
+    }
     Ok(value)
 }
 
@@ -567,11 +581,14 @@ fn publication(project: &Project, candidate: &Candidate) -> Result<(String, bool
     }
 }
 
-/// Imports and publishes one session; returns its branch and the head the push started from.
-fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<String>)> {
-    verify(project)?;
-    let (branch, opens) = publication(project, candidate)?;
-    let target = format!("{}@{branch}", project.repository);
+/// Imports `candidate` into `branch` of the project's repository. A branch the capture opens
+/// (`opens`) is marked as a capture by the import and in this machine's list.
+fn import_capture(
+    project: &Project,
+    candidate: &Candidate,
+    branch: &str,
+    opens: bool,
+) -> Result<()> {
     // A capture whose first import settled no turn is marked by the import that settles one.
     let marks = opens
         || captured_records()?.iter().any(|r| {
@@ -586,7 +603,7 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
         "--from".into(),
         candidate.runtime.clone(),
         "--into".into(),
-        target.clone(),
+        format!("{}@{branch}", project.repository),
         "--independent".into(),
     ];
     if marks {
@@ -599,10 +616,24 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
     if opens {
         record_capture(Captured {
             repository: project.repository.clone(),
-            branch: branch.clone(),
+            branch: branch.to_owned(),
             runtime: candidate.runtime.clone(),
             session: candidate.session_id.clone(),
         })?;
+    }
+    Ok(())
+}
+
+/// Imports and publishes one session; returns its branch and the head the push started from.
+fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<String>)> {
+    verify(project)?;
+    let (branch, opens) = publication(project, candidate)?;
+    let target = format!("{}@{branch}", project.repository);
+    import_capture(project, candidate, &branch, opens)?;
+    // The session is claimed, but no turn of it is complete yet; the Stop that completes one
+    // uploads it.
+    if !has_turns(&checkout(project)?, &branch) {
+        return Err(NothingSettled.into());
     }
     let store = Store::at(config::store_root()?);
     let link = link::get(&store, &candidate.runtime, &candidate.session_id)
@@ -628,7 +659,7 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
     if !project.auto_upload {
         args.push("--yes".into());
     }
-    child(&args, &candidate.cwd, project.auto_upload)?;
+    retry_stale(|| child(&args, &candidate.cwd, project.auto_upload))?;
     // A publication does not move the local view of the Hub's branches; fetching does, so local
     // status and links can tell that this branch is on the Hub.
     let _ = child(
@@ -638,6 +669,47 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
     );
     Ok((branch, head))
 }
+
+/// Runs an upload, and once more when the Hub refused its preview as stale: it refuses a preview
+/// made against privacy settings that changed before it was used, as an earlier upload in the same
+/// run can change them, and a second preview is all it needs. A second stale refusal is told in
+/// the person's words, without the Hub's internal terms; any other failure is passed on as it is.
+fn retry_stale<T>(mut upload: impl FnMut() -> Result<T>) -> Result<T> {
+    let stale =
+        |error: &anyhow::Error| format!("{error:#}").contains("is stale; create a new preview");
+    match upload() {
+        Err(error) if stale(&error) => upload().map_err(|again| {
+            if stale(&again) {
+                anyhow::anyhow!(
+                    "the repository's privacy settings changed while this was uploading; run `agit save` again"
+                )
+            } else {
+                again
+            }
+        }),
+        result => result,
+    }
+}
+
+/// Whether the branch records any turn. A claim alone leaves its log empty; a branch whose log
+/// cannot be read is left for the push to judge.
+fn has_turns(repo: &Repo, branch: &str) -> bool {
+    repo.git_opt(&["cat-file", "-s", &format!("refs/heads/{branch}:LOG")])
+        .and_then(|size| size.trim().parse::<u64>().ok())
+        .is_none_or(|size| size > 0)
+}
+
+/// A claimed session with no completed turn: nothing to upload yet, and nothing failed.
+#[derive(Debug)]
+struct NothingSettled;
+
+impl std::fmt::Display for NothingSettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no turn of this session has finished yet")
+    }
+}
+
+impl std::error::Error for NothingSettled {}
 
 fn sync(project: &mut Project) -> CmdResult {
     let mut rows = Vec::new();
@@ -1066,6 +1138,56 @@ pub(crate) fn unbind_for_move(root: &Path) -> Result<Routing> {
     })
 }
 
+/// The directory of the project policy that covers `path`, paused or not.
+pub(crate) fn covering_root(path: &Path) -> Option<PathBuf> {
+    let project = nearest(path).ok().flatten()?;
+    includes(&project, path).ok()?.then_some(project.root)
+}
+
+/// The nearest directory at or above `path` that is bound on its own, by a project policy or a
+/// workspace binding. Its sessions belong to that binding, not to a folder above it.
+pub(crate) fn bound_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|dir| read(dir).ok().flatten().is_some() || workspace::read(dir).is_some())
+        .map(Path::to_path_buf)
+}
+
+/// Whether the transcript of a session the project covering `cwd` uploaded changed after that
+/// upload, as when its Stop hook did not run: the Hub lacks the newer turns although the branch is
+/// still what was pushed. A session uploaded before such records were kept counts by its branch.
+/// Listings call this, so a transcript in a runtime's cold storage is not restored: one that was
+/// moved there is not being written to.
+pub(crate) fn changed_since_upload(runtime: &str, session_id: &str, cwd: &Path) -> bool {
+    let Some(root) = covering_root(cwd) else {
+        return false;
+    };
+    let Some(&uploaded) = caught(&root).get(&key(runtime, session_id)) else {
+        return false;
+    };
+    let modified = adapter::get(runtime)
+        .ok()
+        .and_then(|adapter| adapter.resolve_present(session_id, Some(cwd)))
+        .and_then(|path| fs::metadata(path).ok()?.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok());
+    modified.is_some_and(|modified| modified.as_secs() != uploaded)
+}
+
+/// Whether the project policy at `root` was turned off (`agit off`, `project unbind`).
+pub(crate) fn turned_off(root: &Path) -> bool {
+    read(root)
+        .ok()
+        .flatten()
+        .is_some_and(|project| !project.enabled)
+}
+
+/// Whether the policy at `root` left this session out when it was bound without earlier history.
+pub(crate) fn is_excluded(root: &Path, runtime: &str, session_id: &str) -> bool {
+    read(root)
+        .ok()
+        .flatten()
+        .is_some_and(|project| project.excluded.contains(&key(runtime, session_id)))
+}
+
 /// The repository of the project policy that covers `path`, paused or not.
 pub(crate) fn policy_repository(path: &Path) -> Option<String> {
     let project = nearest(path).ok().flatten()?;
@@ -1294,6 +1416,9 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     }
     let modified = transcript_modified(&candidate);
     let result = sync_one(&project, &candidate);
+    if result.as_ref().is_err_and(|e| e.is::<NothingSettled>()) {
+        return Ok(true);
+    }
     if result.is_ok()
         && let Some(modified) = modified
     {
@@ -1307,6 +1432,138 @@ fn capture_candidate(mut project: Project, candidate: Candidate) -> Result<bool>
     save(&project)?;
     result?;
     Ok(true)
+}
+
+/// What an explicit save did with one session.
+pub(crate) enum Saved {
+    /// On the Hub, on this branch.
+    Uploaded(String),
+    /// Claimed on this branch; its first turn has not finished, and the Stop that finishes it
+    /// uploads it.
+    Pending(String),
+    /// Left where it was, with the reason.
+    Failed(String),
+}
+
+/// Uploads these sessions of the project at `root` now, after any automatic upload already
+/// running there. With `earlier`, sessions the binding left out are let in first.
+pub(crate) fn save_now(
+    root: &Path,
+    sessions: &[(String, String, PathBuf)],
+    earlier: bool,
+) -> Result<Vec<Saved>> {
+    let worker = wait_for_worker(root)?;
+    let mut saved = Vec::new();
+    for (runtime, session_id, cwd) in sessions {
+        let candidate = Candidate {
+            runtime: runtime.clone(),
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+        };
+        let session_key = key(runtime, session_id);
+        if earlier {
+            let _guard = lock(root)?;
+            let mut project = read(root)?.context("folder is not set up")?;
+            if project.excluded.remove(&session_key) {
+                save(&project)?;
+            }
+        }
+        let project = read(root)?.context("folder is not set up")?;
+        saved.push(match save_one(project, candidate) {
+            Ok(outcome) => outcome,
+            Err(error) => Saved::Failed(format!("{error:#}")),
+        });
+    }
+    // A Stop that arrived meanwhile queued its session and left it to the lock holder.
+    drop(worker);
+    if !markers(root)?.is_empty() || catch_up_requested(root)? {
+        let _ = spawn_capture(root);
+    }
+    Ok(saved)
+}
+
+/// Why a folder below the project's that is bound on its own keeps this session.
+fn bound_apart(project: &Project, candidate: &Candidate) -> Result<Option<String>> {
+    if includes(project, &candidate.cwd)? {
+        return Ok(None);
+    }
+    let folder = bound_root(&candidate.cwd).unwrap_or_else(|| candidate.cwd.clone());
+    Ok(Some(format!(
+        "it ran in {}, which is set up on its own; run `agit save` there",
+        ui::tilde(&folder)
+    )))
+}
+
+fn save_one(project: Project, candidate: Candidate) -> Result<Saved> {
+    if let Some(why) = bound_apart(&project, &candidate)? {
+        return Ok(Saved::Failed(why));
+    }
+    let finished = adapter::get(&candidate.runtime)
+        .ok()
+        .and_then(|adapter| {
+            let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
+            adapter.parse_at(&path).ok()
+        })
+        .is_some_and(|session| crate::domain::turn::completed_count(&session) > 0);
+    if let Placement::Foreign(source) = placement(&project, &candidate)? {
+        return Ok(Saved::Failed(format!("it is saved in {source}")));
+    }
+    if !finished {
+        let _guard = lock(&project.root)?;
+        // A folder below may have been set up on its own since the session was picked; the
+        // claim must not take a session that binding now keeps.
+        let project = read(&project.root)?.context("folder is not set up")?;
+        if let Some(why) = bound_apart(&project, &candidate)? {
+            return Ok(Saved::Failed(why));
+        }
+        verify(&project)?;
+        let (branch, opens) = publication(&project, &candidate)?;
+        import_capture(&project, &candidate, &branch, opens)?;
+        return Ok(Saved::Pending(branch));
+    }
+    let store = Store::at(config::store_root()?);
+    if let Placement::Foreign(source) = placement(&project, &candidate)? {
+        return Ok(Saved::Failed(format!("it is saved in {source}")));
+    }
+    if !capture_candidate(project.clone(), candidate.clone())? {
+        // The capture rechecked under the lock and left the session where it now belongs.
+        let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
+        return Ok(Saved::Failed(
+            why.unwrap_or_else(|| "it is saved in another repository".into()),
+        ));
+    }
+    if let Some(link) = link::get(&store, &candidate.runtime, &candidate.session_id)
+        && let Some(branch) = link.branch.clone()
+        && checkout(&project).is_ok_and(|repo| !has_turns(&repo, &branch))
+    {
+        return Ok(Saved::Pending(branch));
+    }
+    let after = read(&project.root)?.context("folder is not set up")?;
+    if let Some(last) = &after.last_result
+        && last["session_id"] == candidate.session_id.as_str()
+        && last["ok"] == false
+    {
+        return Ok(Saved::Failed(
+            last["error"].as_str().unwrap_or("unknown error").to_owned(),
+        ));
+    }
+    let branch = link::get(&store, &candidate.runtime, &candidate.session_id)
+        .and_then(|link| link.branch)
+        .context("the session was not saved")?;
+    Ok(Saved::Uploaded(branch))
+}
+
+/// The capture worker lock, waiting for a worker that holds it.
+fn wait_for_worker(root: &Path) -> Result<fs::File> {
+    config::create_state_dir(&home()?)?;
+    let file = config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state_path(root)?.with_extension("capture"))?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(file)
 }
 
 /// Queues a catch-up of the project covering `path`: every session of it with turns the Hub does
@@ -3161,6 +3418,98 @@ mod tests {
         assert!(read(&parent.root).unwrap().unwrap().last_result.is_none());
     }
 
+    /// An explicit save of the parent folder leaves a session of a directory below that is set up
+    /// on its own to that binding, also while its first reply has not finished: claiming it would
+    /// file it in the parent's repository against the binding's own choices. The refusal names
+    /// the directory, and nothing is claimed.
+    #[test]
+    fn a_save_leaves_a_nested_bindings_session_to_it() {
+        if !isolated("a_save_leaves_a_nested_bindings_session_to_it") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let parent = project(work.path());
+        save(&parent).unwrap();
+        let nested = parent.root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut child = project(&nested);
+        child.repository = "alice/nested".into();
+        save(&child).unwrap();
+        let id = "cccccccc-0000-4000-8000-000000000003";
+        let saved = save_now(
+            &parent.root,
+            &[("claude-code".into(), id.into(), nested.clone())],
+            true,
+        )
+        .unwrap();
+        let [Saved::Failed(why)] = saved.as_slice() else {
+            panic!("the nested session was not refused");
+        };
+        assert!(why.contains("set up on its own"), "{why}");
+        assert!(why.contains("nested"), "{why}");
+        let store = Store::at(config::store_root().unwrap());
+        assert!(link::get(&store, "claude-code", id).is_none());
+    }
+
+    /// A session uploaded and then continued while its Stop hook did not run (an untrusted hook,
+    /// a crash) still has the branch it pushed, so a check of the branch alone calls it uploaded
+    /// and a folder's `agit save` skips the new turns. Its transcript changed after the recorded
+    /// upload, so it is waiting. A session uploaded before any record counts by its branch.
+    #[test]
+    fn a_turn_the_hook_missed_is_still_waiting() {
+        if !isolated("a_turn_the_hook_missed_is_still_waiting") {
+            return;
+        }
+        use crate::commands::front::{FolderSession, Upload};
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        save(&project).unwrap();
+        let id = "eeeeeeee-0000-4000-8000-000000000005";
+        let transcript = adapter::claude_code::session_path(id, &project.root).unwrap();
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "{}\n").unwrap();
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        repo.git(&["checkout", "-q", "-B", "kept"]).unwrap();
+        fs::write(repo.root().join("turn"), "1").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("turn").unwrap();
+        repo.git(&["update-ref", "refs/remotes/origin/kept", "kept"])
+            .unwrap();
+        let session = FolderSession {
+            runtime: "claude-code",
+            id: id.into(),
+            path: transcript.clone(),
+            cwd: project.root.clone(),
+            modified: std::time::SystemTime::now(),
+            title: None,
+            saved: Some(("alice/app".into(), "kept".into())),
+        };
+        assert_eq!(session.upload(), Some(Upload::Uploaded));
+
+        let candidate = Candidate {
+            runtime: "claude-code".into(),
+            session_id: id.into(),
+            cwd: project.root.clone(),
+        };
+        record_caught(
+            &project.root,
+            &candidate,
+            transcript_modified(&candidate).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session.upload(), Some(Upload::Uploaded));
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(b"{}\n").unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(changed_since_upload("claude-code", id, &project.root));
+        assert_eq!(session.upload(), Some(Upload::Waiting));
+    }
+
     #[test]
     fn paused_project_blocks_its_registered_session_directory() {
         if !isolated("paused_project_blocks_its_registered_session_directory") {
@@ -3584,5 +3933,56 @@ mod tests {
                 .excluded
                 .contains(&key(&inside.source, &inside.session_id))
         );
+    }
+
+    /// A stale preview is retried once and then told in the person's words. An implementation
+    /// that gave up at once fails a batch upload whose earlier session changed the settings; one
+    /// that wrapped every second failure would blame the settings for a network error and still
+    /// print the Hub's "policy digest".
+    #[test]
+    fn a_stale_preview_is_retried_once_and_then_told_plainly() {
+        let stale = || {
+            anyhow::anyhow!(
+                "publication did not complete (publication preview policy digest is stale; create a new preview)"
+            )
+        };
+        let mut calls = 0;
+        assert_eq!(
+            retry_stale(|| {
+                calls += 1;
+                if calls == 1 {
+                    Err(stale())
+                } else {
+                    Ok("uploaded")
+                }
+            })
+            .unwrap(),
+            "uploaded"
+        );
+        let mut calls = 0;
+        let twice = retry_stale(|| -> Result<()> {
+            calls += 1;
+            Err(stale())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        let said = format!("{twice:#}");
+        assert!(
+            said.contains(
+                "privacy settings changed while this was uploading; run `agit save` again"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("digest"), "{said}");
+        let other = retry_stale(|| -> Result<()> {
+            calls += 1;
+            if calls == 3 {
+                Err(stale())
+            } else {
+                Err(anyhow::anyhow!("the Hub did not answer"))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(format!("{other:#}"), "the Hub did not answer");
     }
 }

@@ -805,7 +805,7 @@ fn encode_uri_component(value: &str) -> String {
 }
 
 /// The session page as a path on the hub: the value an invite link carries in `next`.
-fn session_path(owner: &str, name: &str, session_id: &str, branch: &str) -> String {
+pub(crate) fn session_path(owner: &str, name: &str, session_id: &str, branch: &str) -> String {
     format!(
         "/@{owner}/{name}/s/{}?ref={}",
         encode_uri_component(session_id),
@@ -839,7 +839,7 @@ fn is_invitation_token(token: &str) -> bool {
 
 /// Why a branch cannot be the landing page of an invite link.
 #[derive(Debug, PartialEq, Eq)]
-enum Unlinkable {
+pub(crate) enum Unlinkable {
     BadName,
     /// Neither a local branch nor a remote-tracking one.
     Missing,
@@ -857,7 +857,10 @@ enum Unlinkable {
 /// The local head may be ahead of it; that is harmless because a branch's session identity is
 /// claimed by its first turn and never changes. What must not happen is naming a session from a
 /// local-only head: the hub has no page for it, and the invitee lands on a 404.
-fn published_session(repo: &Repo, branch: &str) -> crate::Result<Result<String, Unlinkable>> {
+pub(crate) fn published_session(
+    repo: &Repo,
+    branch: &str,
+) -> crate::Result<Result<String, Unlinkable>> {
     let (status, _, _) =
         repo.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
     if status != Some(0) {

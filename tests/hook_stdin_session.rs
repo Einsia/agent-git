@@ -713,9 +713,11 @@ fn ownerless_hook_claims_require_explicit_readoption() {
         None,
         &[("CLAUDE_ENV_FILE", environment_file.to_str().unwrap())],
     );
-    assert_eq!(
-        fs::read_to_string(environment_file).unwrap(),
-        "unset AGIT_SESSION\n"
+    let environment = fs::read_to_string(environment_file).unwrap();
+    assert!(
+        environment.starts_with("unset AGIT_SESSION\n")
+            && !environment.contains("export AGIT_SESSION="),
+        "{environment}"
     );
     let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
     let before = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
