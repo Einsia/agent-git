@@ -9,11 +9,18 @@
 //! names something else, and a project policy that is paused, uploads nothing or excludes the
 //! session.
 //!
+//! A session in a folder no Workspace project binds, under either spelling, may instead be
+//! listed by the opaque id of the Hub repository its folder's CLI binding uploads it to, on the
+//! same terms: exactly one folder binding covers it, agit uploads the session there now
+//! ([`crate::commands::project::sole_upload`]), no remote-control row places it in a project, and
+//! the binding uploads as the account that owns this device's enrollment on that Hub, under which
+//! the report goes out. The reporter sends such a session only to a Hub that says it accepts one.
+//!
 //! It is reported under an id the daemon minted for its registration, never Claude Code's own
 //! session id, and only while that registration is current.
 
 use crate::commands::project::Capture;
-use crate::hub::activity::ReportedSession;
+use crate::hub::activity::{Place, ReportedSession, is_identifier};
 use crate::hub::identity::RemoteIdentity;
 use crate::rc::native_claude::TerminalActivity;
 use std::path::{Path, PathBuf};
@@ -47,6 +54,32 @@ pub(super) struct Publication {
     pub rows: Vec<Row>,
     /// `owner/repo` of the agit claim on the conversation.
     pub claim: Option<String>,
+}
+
+/// What decides whether a terminal session in a folder no Workspace project binds is uploaded,
+/// read on the device.
+#[derive(Debug, Clone)]
+pub(super) struct Folder {
+    /// The repository the folder's one CLI binding uploads the session to, when that is certain.
+    pub upload: Option<RemoteIdentity>,
+    /// The id of the account the binding uploads as, as its policy records it.
+    pub account: Option<String>,
+    /// The id of the account that owns this device's enrollment on the upload's Hub.
+    pub owner: Option<String>,
+    pub rows: Vec<Row>,
+}
+
+/// The repository a session in an unbound-by-Workspace folder may be listed by: the one its
+/// folder uploads it to, unless a remote-control row places the session in a project, the
+/// binding uploads as another account than the one the report goes out under, or either account
+/// is unknown, or the repository's id is not one the Hub takes.
+fn folder_upload(folder: Folder) -> Option<RemoteIdentity> {
+    let upload = folder.upload?;
+    (folder.account.is_some()
+        && folder.account == folder.owner
+        && folder.rows.iter().all(|row| row.project.is_none())
+        && is_identifier(&upload.agent_id))
+    .then_some(upload)
 }
 
 /// The projects bound under a folder that `cwd` lies in.
@@ -92,22 +125,32 @@ fn hub_for(project: &str, publication: Publication) -> Option<String> {
 }
 
 /// Pair each terminal session with the Hub it may be listed to, reading what decides it through
-/// `publication` once its folder resolves to a project. A session with no such Hub is dropped.
+/// `publication` once its folder resolves to a Workspace project, or through `folder` when no
+/// Workspace project binds its folder at all. A session with no such Hub is dropped.
 pub(super) fn attribute(
     terminals: Vec<TerminalActivity>,
     roots: &[(String, PathBuf)],
     mut publication: impl FnMut(&TerminalActivity, &str) -> Publication,
+    mut folder: impl FnMut(&TerminalActivity) -> Folder,
 ) -> Vec<(String, ReportedSession)> {
     terminals
         .into_iter()
         .filter_map(|terminal| {
-            let project = bound_project(&terminal.cwd, &terminal.spelled, roots)?;
-            let hub = hub_for(&project, publication(&terminal, &project))?;
+            let (hub, place) = if containing(&terminal.cwd, roots).is_empty()
+                && containing(&terminal.spelled, roots).is_empty()
+            {
+                let upload = folder_upload(folder(&terminal))?;
+                (upload.hub, Place::AgentId(upload.agent_id))
+            } else {
+                let project = bound_project(&terminal.cwd, &terminal.spelled, roots)?;
+                let hub = hub_for(&project, publication(&terminal, &project))?;
+                (hub, Place::ProjectId(project))
+            };
             Some((
                 hub,
                 ReportedSession {
                     session_id: terminal.report_id,
-                    project_id: project,
+                    place,
                     runtime: RUNTIME.to_owned(),
                     status: terminal.status,
                     last_activity_at: terminal.last_activity_at,
@@ -159,5 +202,33 @@ pub(super) fn read(terminal: &TerminalActivity, project: &str, rows: Vec<Row>) -
         capture: crate::commands::project::capture_state(RUNTIME, &terminal.session, &terminal.cwd),
         rows,
         claim,
+    }
+}
+
+/// What decides whether `terminal`, in a folder no Workspace project binds, is uploaded, read from
+/// this device's state.
+pub(super) fn folder(terminal: &TerminalActivity, rows: Vec<Row>) -> Folder {
+    let Some((upload, account)) = crate::commands::project::sole_upload(
+        RUNTIME,
+        &terminal.session,
+        &terminal.cwd,
+        &terminal.spelled,
+    ) else {
+        return Folder {
+            upload: None,
+            account: None,
+            owner: None,
+            rows,
+        };
+    };
+    let owner = crate::rc::cloud::store::load(&upload.hub)
+        .ok()
+        .flatten()
+        .map(|enrollment| enrollment.credential.device.owner.account_id);
+    Folder {
+        upload: Some(upload),
+        account,
+        owner,
+        rows,
     }
 }
