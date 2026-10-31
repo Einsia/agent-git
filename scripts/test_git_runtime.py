@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -271,6 +272,39 @@ class RuntimeSourceTests(unittest.TestCase):
                     members = {header.name: body for header, body in sources.alpine_members(entry)}
                     self.assertEqual(members, {f"source-alpine-x-1-r0/main/x/{name}": body for name, body in served.items()})
 
+
+    def test_a_host_that_does_not_answer_costs_one_timeout_not_one_per_pin(self):
+        """After a host fails to connect or times out, later pins go straight to their fallback.
+
+        Retrying a dead host for every pin it serves can outlast the release job. A host that
+        answers with an HTTP error or the wrong bytes is not dead, so the next pin still asks it.
+        """
+        bodies = {"first": b"first source", "second": b"second source"}
+        cases = {
+            "timeout": (TimeoutError(), 3, 1),
+            "HTTP error": (urllib.error.HTTPError("https://down.invalid/", 404, "Not Found", {}, None), 2, 0),
+            "wrong bytes": (b"tampered", 2, 0),
+        }
+        for case, (answer, down_calls, logged) in cases.items():
+            calls = []
+
+            def urlopen(url, timeout):
+                calls.append(url)
+                if not url.startswith("https://down.invalid/"):
+                    return io.BytesIO(bodies[url.rsplit("/", 1)[1]])
+                if isinstance(answer, bytes):
+                    return io.BytesIO(answer)
+                raise answer
+
+            log = io.StringIO()
+            with self.subTest(case), patch.object(sources, "UNREACHABLE", set()), patch.object(
+                sources.urllib.request, "urlopen", side_effect=urlopen
+            ), patch.object(sources.time, "sleep"), contextlib.redirect_stderr(log):
+                for name, body in bodies.items():
+                    urls = ["https://down.invalid/" + name, "https://up.invalid/" + name]
+                    self.assertEqual(sources.fetch(urls, hashlib.sha256(body).hexdigest()), body)
+                self.assertEqual(sum(url.startswith("https://down.invalid/") for url in calls), down_calls)
+                self.assertEqual(log.getvalue().count("down.invalid did not answer"), logged)
 
 if __name__ == "__main__":
     unittest.main()
