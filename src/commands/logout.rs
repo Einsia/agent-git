@@ -10,6 +10,12 @@
 //! [`credentials::pending::commit`]). Credentials another sign-in saves after they were read are
 //! among those the removal returns, and are revoked then, so no session a sign-out removes
 //! outlives it on the Hub.
+//!
+//! A device enrolled for remote control keeps its last team activity report on the Hub, and the
+//! daemon cannot replace it once the credential is gone. So before revoking, the sign-out sends
+//! the Hub an empty report for the device, with the access token as it stands: never renewed and
+//! never after the revoke. It is best effort: a send that fails, is refused or times out changes
+//! nothing about the sign-out, and the Hub's own staleness rules remain the backstop.
 
 use super::CmdResult;
 use crate::infra::config;
@@ -18,6 +24,10 @@ use crate::infra::hub_authority::{HubAuthority, safe_label};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 use std::collections::HashSet;
+use std::time::Duration;
+
+/// How long the empty team activity report may hold up a sign-out.
+const CLEAR_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -138,13 +148,38 @@ fn run_all() -> CmdResult {
 }
 
 /// Revoke `cred`'s session at `hub`, renewing an expired access token first, and note every
-/// access token the attempt used, renewed or not, as one this sign-out already revoked.
+/// access token the attempt used, renewed or not, as one this sign-out already revoked. The
+/// device's team activity is cleared first, while the token still works ([`clear_activity`]).
 fn revoke(hub: &str, cred: &HubCredential, attempted: &mut HashSet<String>) -> crate::Result<()> {
+    clear_activity(hub, cred);
     let client = crate::hub::Client::for_credential(hub, cred);
     let result = client.logout();
     attempted.insert(cred.access_token.clone());
     attempted.extend(client.credential_snapshot().map(|used| used.access_token));
     result
+}
+
+/// Send `hub` an empty team activity report for this device's enrollment there, if it has one
+/// owned by `cred`'s account, so the team stops seeing its live sessions. The report lists no
+/// session and is sent with `cred`'s access token as it stands; any failure is ignored.
+fn clear_activity(hub: &str, cred: &HubCredential) {
+    let Ok(Some(enrollment)) = crate::rc::cloud::store::load(hub) else {
+        return;
+    };
+    let device = &enrollment.credential.device;
+    if cred
+        .account_id
+        .as_deref()
+        .is_some_and(|account| account != device.owner.account_id)
+    {
+        return;
+    }
+    let _ = crate::hub::Client::for_hub_with_token_and_timeout(
+        hub,
+        &cred.access_token,
+        CLEAR_ACTIVITY_TIMEOUT,
+    )
+    .report_device_activity(&device.id, &[]);
 }
 
 /// Revoke the sessions of removed credentials that no revoke of this sign-out attempted: a
@@ -189,4 +224,159 @@ fn unauthorized(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::hub::client::ApiError>()
         .is_some_and(|api| api.status == 401)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agit_peer::access::Principal;
+    use agit_peer::cloud::{Device, DeviceCredential, Secret};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    const TOKEN: &str = "access-token";
+
+    /// A request as the fake Hub saw it: method and target, bearer, body.
+    type Seen = (String, Option<String>, String);
+
+    /// A Hub that answers every request with `{}` and records it, a JSON body in compact form,
+    /// skipping version probes.
+    fn fake_hub() -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Seen>>> = Default::default();
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request = line
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let (mut length, mut bearer) = (0, None);
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap_or((header, ""));
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        "authorization" => bearer = Some(value.trim().to_owned()),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                if !request.contains("/api/cli/version") {
+                    record.lock().unwrap().push((
+                        request,
+                        bearer,
+                        serde_json::from_slice::<serde_json::Value>(&body).map_or_else(
+                            |_| String::from_utf8_lossy(&body).into_owned(),
+                            |body| body.to_string(),
+                        ),
+                    ));
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        (hub, seen)
+    }
+
+    fn credential(hub: &str) -> HubCredential {
+        HubCredential {
+            account_id: Some("owner".into()),
+            username: "owner".into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: TOKEN.into(),
+            access_expires_at: "2999-01-01T00:00:00Z".into(),
+            refresh_token: "refresh-token".into(),
+            refresh_expires_at: "2999-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn enroll(hub: &str, account: &str) {
+        let identity = agit_peer::Identity::generate().unwrap();
+        let device = Device {
+            id: "executor".into(),
+            owner: Principal {
+                issuer: hub.into(),
+                account_id: account.into(),
+            },
+            machine_id: "machine".into(),
+            display_name: "Fixture".into(),
+            certificate: identity.certificate().clone(),
+            credential_epoch: 1,
+        };
+        crate::rc::cloud::store::save(&crate::rc::cloud::store::Enrollment {
+            identity,
+            inbound_enabled: true,
+            credential: DeviceCredential {
+                device,
+                token: Secret::new("fixture-device-token".into()),
+            },
+        })
+        .unwrap();
+    }
+
+    /// Pins the order and content of a sign-out's requests for an enrolled device: first an
+    /// empty team activity report for that device, with the access token about to be revoked,
+    /// then the revoke, and nothing after it. The report body lists no session and carries no
+    /// other key. A device enrolled under another account gets no report, and the revoke still
+    /// runs.
+    #[test]
+    fn sign_out_empties_the_devices_activity_report_before_revoking() {
+        let (hub, seen) = fake_hub();
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            enroll(&hub, "owner");
+            let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
+            let bearer = Some(format!("Bearer {TOKEN}"));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    (
+                        "PUT /api/peer/devices/executor/activity".to_owned(),
+                        bearer.clone(),
+                        r#"{"sessions":[]}"#.to_owned(),
+                    ),
+                    ("POST /api/auth/logout".to_owned(), bearer, "{}".to_owned()),
+                ]
+            );
+
+            seen.lock().unwrap().clear();
+            enroll(&hub, "someone-else");
+            let _ = revoke(&hub, &credential(&hub), &mut HashSet::new());
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].0, "POST /api/auth/logout");
+        });
+    }
+
+    /// A Hub that cannot be reached holds up neither the empty report nor the revoke that
+    /// follows: both fail at once, and the sign-out goes on to remove the credential.
+    #[test]
+    fn an_unreachable_hub_does_not_hold_up_the_sign_out() {
+        let hub = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            enroll(&hub, "owner");
+            let started = std::time::Instant::now();
+            assert!(revoke(&hub, &credential(&hub), &mut HashSet::new()).is_err());
+            assert!(started.elapsed() < CLEAR_ACTIVITY_TIMEOUT);
+        });
+    }
 }
