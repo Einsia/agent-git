@@ -1641,6 +1641,10 @@ pub(crate) fn capture_state(runtime: &str, session: &str, cwd: &Path) -> Capture
             session_id: session.into(),
             cwd: cwd.to_owned(),
         };
+        // `placement` reads a claim it cannot read as no claim, which suits capture, whose
+        // import refuses it later. A report cannot wait for that: a claim that exists but cannot
+        // be read leaves the session's owner unconfirmed, so it withholds.
+        link::get_checked(&Store::at(config::store_root()?), runtime, session)?;
         if withholds(&project, &candidate, false)
             || !matches!(
                 placement(&project, &candidate)?,
@@ -1652,6 +1656,60 @@ pub(crate) fn capture_state(runtime: &str, session: &str, cwd: &Path) -> Capture
         Ok(Capture::Uploads(project.identity))
     };
     state().unwrap_or(Capture::Withheld)
+}
+
+/// The folders bound at `path` or above it, by a project policy or a workspace binding, either
+/// of which [`includes`] stops at. A binding file that exists counts even when it cannot be read.
+#[cfg(unix)]
+fn bound_at(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut bound = Vec::new();
+    for ancestor in path.ancestors() {
+        if read(ancestor)?.is_some() || workspace::path_for(ancestor)?.try_exists()? {
+            bound.push(ancestor.to_owned());
+        }
+    }
+    Ok(bound)
+}
+
+/// The policy of the one folder binding that covers `cwd`, a canonical directory. `spelled`, the
+/// folder as the session names it, must lie under that binding alone too. A folder under two
+/// bindings, nested or not, or one whose spelling reaches other bindings, as through a symlink,
+/// has none; so has a folder whose one binding records no policy.
+#[cfg(unix)]
+fn sole_binding(cwd: &Path, spelled: &Path) -> Result<Option<Project>> {
+    let bound = bound_at(cwd)?;
+    let [root] = bound.as_slice() else {
+        return Ok(None);
+    };
+    if bound_at(spelled)? != bound {
+        return Ok(None);
+    }
+    read(root)
+}
+
+/// The repository agit uploads `runtime`'s `session` in `cwd` to when that is certain: one
+/// folder binding covers it ([`sole_binding`]), its policy uploads the session now
+/// ([`capture_state`]), and the repository passes the check an upload makes ([`verify`]).
+/// It comes with the id of the account the binding uploads as, if the policy records one.
+/// Anything less certain, or an error, answers `None`.
+#[cfg(unix)]
+pub(crate) fn sole_upload(
+    runtime: &str,
+    session: &str,
+    cwd: &Path,
+    spelled: &Path,
+) -> Option<(RemoteIdentity, Option<String>)> {
+    let upload = || -> Result<Option<(RemoteIdentity, Option<String>)>> {
+        let Some(project) = sole_binding(cwd, spelled)? else {
+            return Ok(None);
+        };
+        let Capture::Uploads(identity) = capture_state(runtime, session, cwd) else {
+            return Ok(None);
+        };
+        verify(&project)?;
+        Ok((identity == project.identity).then_some((identity, project.account_id)))
+    };
+    upload().ok().flatten()
 }
 
 /// Import, inspection and upload outlast a runtime's hook budget for a long session, and a
@@ -4073,12 +4131,17 @@ mod tests {
         assert!(read(&project.root).unwrap().unwrap().last_result.is_some());
     }
 
-    /// A capture queued before its directory was bound on its own is skipped, so the parent
-    /// project does not import or publish a session the nested binding now owns.
     /// Pins that the capture check team activity asks agrees with what a Stop hook's capture
     /// uploads: a session no repository has claimed yet uploads to the project, while one the
-    /// project excludes, one in a paused project and one in a nested binding of another
-    /// repository do not, and a folder outside every project has no policy.
+    /// person dropped, one that ran before the folder was bound without earlier history, one in
+    /// a paused project and one in a nested binding of another repository do not, and a folder
+    /// outside every project has no policy. Nor does a session whose claim exists but cannot be
+    /// read, since its owner is unconfirmed. In a git worktree the folder covers, a session that
+    /// began before the folder covered it is earlier history too, while one that began after
+    /// uploads. A team activity report of a session rests on this check, so a dropped or earlier
+    /// session, one from before a worktree was covered, or one with an unreadable claim, is never
+    /// reported; nor is any worktree session by repository id, since a worktree outside the
+    /// folder lies under no binding of its own.
     #[cfg(unix)]
     #[test]
     fn the_capture_check_answers_what_capture_would_upload() {
@@ -4114,6 +4177,32 @@ mod tests {
         policy.enabled = true;
         save(&policy).unwrap();
 
+        let claim = link::link_path(&Store::at(config::store_root().unwrap()), RUNTIME, SESSION);
+        fs::create_dir_all(claim.parent().unwrap()).unwrap();
+        fs::write(&claim, b"{ not a claim").unwrap();
+        assert_eq!(state(&app), Capture::Withheld);
+        fs::remove_file(&claim).unwrap();
+        assert_eq!(state(&app), Capture::Uploads(policy.identity.clone()));
+
+        const BEFORE: &str = "aaaaaaaa-0000-4000-8000-000000000051";
+        const AFTER: &str = "cccccccc-0000-4000-8000-000000000053";
+        git_checkout(&policy.root);
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let tree = worktree(&policy.root, &outside.join("tree"));
+        adopt_worktree(&policy.root, &tree, None).unwrap();
+        let now = chrono::Utc::now();
+        let hours = |offset: i64| (now + chrono::Duration::hours(offset)).to_rfc3339();
+        transcript(BEFORE, &tree, &hours(-1));
+        transcript(AFTER, &tree, &hours(1));
+        assert_eq!(capture_state(RUNTIME, BEFORE, &tree), Capture::Withheld);
+        assert_eq!(
+            capture_state(RUNTIME, AFTER, &tree),
+            Capture::Uploads(policy.identity.clone())
+        );
+        assert_eq!(sole_upload(RUNTIME, BEFORE, &tree, &tree), None);
+        assert_eq!(sole_upload(RUNTIME, AFTER, &tree, &tree), None);
+
         let mut child = project(&nested);
         child.repository = "alice/nested".into();
         child.auto_upload = false;
@@ -4122,6 +4211,62 @@ mod tests {
         assert_eq!(state(&app), Capture::Uploads(policy.identity));
     }
 
+    /// Pins when a folder counts as bound by exactly one binding, which is all a team activity
+    /// report of a session there may rest on. The one binding over a folder is found; a nested
+    /// binding, a workspace binding above it, a spelling through a symlink, an unreadable policy
+    /// or an unreadable workspace binding leaves the folder with none, never the nearest one.
+    /// And a folder with one binding uploads nowhere unless agit would upload from it now: this
+    /// policy's Hub is not the one the CLI is configured for.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_bound_for_reporting_only_by_exactly_one_binding() {
+        if !isolated("a_folder_is_bound_for_reporting_only_by_exactly_one_binding") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path().canonicalize().unwrap();
+        let app = work.join("app");
+        let src = app.join("src");
+        let nested = app.join("nested");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let link = work.join("link");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+        save(&project(&app)).unwrap();
+        let sole = |cwd: &Path, spelled: &Path| {
+            sole_binding(cwd, spelled).map(|project| project.map(|project| project.root))
+        };
+
+        assert_eq!(sole(&src, &src).unwrap(), Some(app.clone()));
+        assert_eq!(sole(&nested, &nested).unwrap(), Some(app.clone()));
+        assert_eq!(sole(&src, &link).unwrap(), None);
+        assert_eq!(
+            sole_upload(
+                "claude-code",
+                "dddddddd-0000-4000-8000-000000000004",
+                &src,
+                &src
+            ),
+            None
+        );
+
+        let mut child = project(&nested);
+        child.repository = "alice/nested".into();
+        save(&child).unwrap();
+        assert_eq!(sole(&nested, &nested).unwrap(), None);
+        assert_eq!(sole(&src, &src).unwrap(), Some(app.clone()));
+
+        fs::write(state_path(&work).unwrap(), b"not a policy").unwrap();
+        assert!(sole(&src, &src).is_err());
+        fs::remove_file(state_path(&work).unwrap()).unwrap();
+        let binding = workspace::path_for(&work).unwrap();
+        fs::create_dir_all(binding.parent().unwrap()).unwrap();
+        fs::write(&binding, b"not a binding").unwrap();
+        assert_eq!(sole(&src, &src).unwrap(), None);
+    }
+
+    /// A capture queued before its directory was bound on its own is skipped, so the parent
+    /// project does not import or publish a session the nested binding now owns.
     #[test]
     fn queued_capture_respects_a_nested_binding_made_afterwards() {
         if !isolated("queued_capture_respects_a_nested_binding_made_afterwards") {

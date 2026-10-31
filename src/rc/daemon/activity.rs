@@ -21,7 +21,7 @@
 mod terminal;
 
 use super::Daemon;
-use crate::hub::activity::{ReportAnswer, ReportedSession};
+use crate::hub::activity::{Place, ReportAnswer, ReportedSession};
 use crate::protocol::types::{SessionInfo, SessionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ fn snapshot<'a>(sessions: impl Iterator<Item = &'a SessionInfo>) -> Vec<Reported
             };
             Some(ReportedSession {
                 session_id: info.session_id.clone(),
-                project_id: info.project_id.clone()?,
+                place: Place::ProjectId(info.project_id.clone()?),
                 runtime: info.runtime.clone(),
                 status,
                 last_activity_at: info.updated_at.clone(),
@@ -71,9 +71,12 @@ fn attribute(
     sessions
         .into_iter()
         .filter_map(|session| {
+            let Place::ProjectId(project) = &session.place else {
+                return None;
+            };
             let hub = hubs
-                .entry(session.project_id.clone())
-                .or_insert_with(|| hub_of(&session.project_id))
+                .entry(project.clone())
+                .or_insert_with(|| hub_of(project))
                 .clone()?;
             Some((hub, session))
         })
@@ -89,13 +92,21 @@ fn publication_hub(project: &str) -> Option<String> {
 }
 
 /// The sessions of `live` attributed to `hub`, compared in the normalized form a confirmed
-/// destination records. A Hub address that does not normalize is attributed none.
-fn published_to(hub: &str, live: &[(String, ReportedSession)]) -> Vec<ReportedSession> {
+/// destination records, leaving out those named by a Hub repository unless `accepts_agent_id`.
+/// A Hub address that does not normalize is attributed none.
+fn published_to(
+    hub: &str,
+    live: &[(String, ReportedSession)],
+    accepts_agent_id: bool,
+) -> Vec<ReportedSession> {
     let Ok(hub) = crate::hub::identity::normalize_hub(hub) else {
         return Vec::new();
     };
     live.iter()
-        .filter(|(destination, _)| *destination == hub)
+        .filter(|(destination, session)| {
+            *destination == hub
+                && (accepts_agent_id || matches!(session.place, Place::ProjectId(_)))
+        })
         .map(|(_, session)| session.clone())
         .take(MAX_SESSIONS)
         .collect()
@@ -119,9 +130,10 @@ struct Known {
     /// owner may be someone else, so it starts over from an empty report.
     device: String,
     due: Instant,
-    /// Whether the Hub's latest answer said the owner shares. A report that gets no answer
-    /// leaves it as it was.
+    /// What the Hub's latest answer said: whether the owner shares, and whether it accepts a
+    /// session named by `agent_id`. A report that gets no answer leaves both as they were.
     sharing: bool,
+    accepts_agent_id: bool,
 }
 
 /// The reporter's memory, by Hub.
@@ -142,17 +154,20 @@ impl Hubs {
             .collect()
     }
 
+    /// The latest answer from `hub` about `device`, if there is one.
+    fn known(&self, hub: &str, device: &str) -> Option<&Known> {
+        self.0.get(hub).filter(|known| known.device == device)
+    }
+
     /// Whether the latest answer from `hub` about `device` said the owner shares.
     fn shares(&self, hub: &str, device: &str) -> bool {
-        match self.0.get(hub) {
-            Some(known) => known.device == device && known.sharing,
-            None => false,
-        }
+        self.known(hub, device).is_some_and(|known| known.sharing)
     }
 
     /// Send one report for each enrollment in `ready`, through `send`. A report lists the
     /// sessions of `live` attributed to its Hub, and only if that Hub's latest answer about that
-    /// device said the owner shares; every other report lists no session.
+    /// device said the owner shares; every other report lists no session. A session named by a
+    /// Hub repository is listed only if that answer also said the Hub accepts one.
     async fn report<F>(
         &mut self,
         ready: Vec<(String, String)>,
@@ -165,9 +180,12 @@ impl Hubs {
             + 'static,
     {
         for (hub, device) in ready {
-            let sharing = self.shares(&hub, &device);
+            let (sharing, accepts_agent_id) =
+                self.known(&hub, &device).map_or((false, false), |known| {
+                    (known.sharing, known.accepts_agent_id)
+                });
             let sessions = if sharing {
-                published_to(&hub, live)
+                published_to(&hub, live, accepts_agent_id)
             } else {
                 Vec::new()
             };
@@ -179,14 +197,19 @@ impl Hubs {
                 .await
                 .ok()
                 .and_then(Result::ok);
-            let (wait, sharing) = match answer {
-                Some(answer) => (answer.next_report_seconds, answer.sharing),
-                None => (RETRY.as_secs(), sharing),
+            let (wait, sharing, accepts_agent_id) = match answer {
+                Some(answer) => (
+                    answer.next_report_seconds,
+                    answer.sharing,
+                    answer.accepts_agent_id,
+                ),
+                None => (RETRY.as_secs(), sharing, accepts_agent_id),
             };
             let known = Known {
                 device,
                 due: Instant::now() + Duration::from_secs(wait).clamp(TICK, LONGEST),
                 sharing,
+                accepts_agent_id,
             };
             self.0.insert(hub, known);
         }
@@ -222,13 +245,15 @@ async fn live(daemon: &Arc<Mutex<Daemon>>) -> Vec<(String, ReportedSession)> {
                 .map(|t| (t.session.clone(), terminal::rows(&state.roster, &t.session)))
                 .collect();
             move || {
-                terminal::attribute(terminals, &roots, |t, project| {
-                    terminal::read(
-                        t,
-                        project,
-                        rows.get(&t.session).cloned().unwrap_or_default(),
-                    )
-                })
+                let rows_of = |t: &crate::rc::native_claude::TerminalActivity| {
+                    rows.get(&t.session).cloned().unwrap_or_default()
+                };
+                terminal::attribute(
+                    terminals,
+                    &roots,
+                    |t, project| terminal::read(t, project, rows_of(t)),
+                    |t| terminal::folder(t, rows_of(t)),
+                )
             }
         };
         #[cfg(not(unix))]
@@ -287,7 +312,10 @@ mod tests {
     /// session whose project publishes to no Hub reach no body, nor do terminal sessions whose
     /// folder resolves ambiguously or whose project excludes them ([`terminals`]). A terminal
     /// session waiting for approval is listed under the daemon's id with its status fields
-    /// alone; the body is compared whole, so any extra key fails it. And it is sent them only while
+    /// alone; the body is compared whole, so any extra key fails it. A terminal session in a
+    /// folder bound through the CLI alone is listed by its repository's id, and only to a Hub
+    /// whose latest answer accepts that: an answer without `accepts_agent_id` keeps every such
+    /// session out, since an older Hub refuses the whole report for it. And it is sent them only while
     /// it says the owner shares: the first report lists none, an answer without `sharing` keeps
     /// it that way, `sharing: true` lets the next report list them, `sharing: false` empties
     /// them again, and one Hub's answer does not open another. An implementation that sends
@@ -334,7 +362,7 @@ mod tests {
                 "project-b" => Some(B.to_owned()),
                 _ => None,
             }),
-            terminals(A),
+            terminals(A, B),
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -349,9 +377,16 @@ mod tests {
 
         round(A, r#"{"next_report_seconds":600}"#);
         round(A, r#"{"next_report_seconds":60,"sharing":true}"#);
-        round(B, r#"{"next_report_seconds":60,"sharing":true}"#);
-        round(A, r#"{"next_report_seconds":600,"sharing":false}"#);
+        round(
+            B,
+            r#"{"next_report_seconds":60,"sharing":true,"accepts_agent_id":true}"#,
+        );
+        round(
+            A,
+            r#"{"next_report_seconds":60,"sharing":true,"accepts_agent_id":true}"#,
+        );
         round(B, r#"{"next_report_seconds":600,"sharing":false}"#);
+        round(A, r#"{"next_report_seconds":600,"sharing":false}"#);
         round(A, r#"{"next_report_seconds":600,"sharing":false}"#);
 
         let empty = json!({"sessions": []});
@@ -371,9 +406,28 @@ mod tests {
             (A.to_owned(), empty.clone()),
             // Another Hub, while the first one shares.
             (B.to_owned(), empty.clone()),
-            // After `sharing: true`, each Hub's own sessions and nothing else.
-            (A.to_owned(), on_a(listed("on-a", "project-a"))),
-            (B.to_owned(), listed("on-b", "project-b")),
+            // After `sharing: true` without `accepts_agent_id`, the Hub's own sessions named by
+            // a project and nothing else: none named by a repository.
+            (
+                A.to_owned(),
+                with_terminals(listed("on-a", "project-a"), vec![approval()]),
+            ),
+            // After an answer that also accepts them, the Hub's own sessions named by a
+            // repository too.
+            (
+                B.to_owned(),
+                with_terminals(
+                    listed("on-b", "project-b"),
+                    vec![in_folder("folder-b", "agent-d")],
+                ),
+            ),
+            (
+                A.to_owned(),
+                with_terminals(
+                    listed("on-a", "project-a"),
+                    vec![in_folder("folder-a", "agent-c"), approval()],
+                ),
+            ),
             // After `sharing: false`.
             (A.to_owned(), empty),
         ];
@@ -384,20 +438,26 @@ mod tests {
             "a terminal session is never named by Claude Code's own id"
         );
         assert!(
-            !["tool", "command", "/work"]
+            !["tool", "command", "/work", "acme/"]
                 .iter()
                 .any(|key| sent.contains(key)),
-            "no tool, command or folder behind a status reaches a body"
+            "no tool, command, folder or repository name reaches a body"
         );
     }
 
-    /// The terminal sessions of the report test, attributed: one that waits for approval in a
-    /// project publishing to `hub`, which is listed, and three that would be listed beside it
-    /// were their binding read loosely: one in a folder bound inside another bound folder, one
-    /// whose own spelling of its folder lies in another project, and one its project excludes.
+    /// The terminal sessions of the report test, attributed. In Workspace projects: one that
+    /// waits for approval in a project publishing to `a`, which is listed, and three that would
+    /// be listed beside it were their binding read loosely: one in a folder bound inside another
+    /// bound folder, one whose own spelling of its folder lies in another project, and one its
+    /// project excludes. In folders no Workspace project binds: one whose CLI binding uploads it
+    /// to a repository on each Hub, which are listed by that repository's id, and four that
+    /// are not: one whose binding is not certain to upload it, one a remote-control row places
+    /// in a project, one whose spelling of its folder lies in a Workspace project, and one whose
+    /// binding uploads as another account than the one that owns the device's enrollment.
     #[cfg(unix)]
-    fn terminals(hub: &str) -> Vec<(String, ReportedSession)> {
+    fn terminals(a: &str, b: &str) -> Vec<(String, ReportedSession)> {
         use crate::commands::project::Capture;
+        use crate::hub::identity::RemoteIdentity;
         use std::path::PathBuf;
         let roots: Vec<(String, PathBuf)> = [
             ("project-a", "/work/a"),
@@ -407,69 +467,133 @@ mod tests {
         .into_iter()
         .map(|(project, root)| (project.to_owned(), PathBuf::from(root)))
         .collect();
-        let terminal = |id: &str, cwd: &str, spelled: &str, status| {
+        let terminal = |id: &str, cwd: &str, spelled: &str, status, at: &str| {
             crate::rc::native_claude::TerminalActivity {
                 report_id: id.to_owned(),
                 session: format!("claude-session-{id}"),
                 cwd: cwd.into(),
                 spelled: spelled.into(),
                 status,
-                last_activity_at: "2026-01-02T00:00:00Z".to_owned(),
+                last_activity_at: at.to_owned(),
             }
         };
+        let (moved, later) = ("2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z");
         let terminals = vec![
             terminal(
                 "approval",
                 "/work/a/src",
                 "/work/a/src",
                 "awaiting_approval",
+                moved,
             ),
-            terminal("nested", "/work/a/nested", "/work/a/nested", "running"),
-            terminal("symlinked", "/work/a/src", "/work/b/link", "running"),
-            terminal("excluded", "/work/a/src", "/work/a/src", "running"),
+            terminal(
+                "nested",
+                "/work/a/nested",
+                "/work/a/nested",
+                "running",
+                moved,
+            ),
+            terminal("symlinked", "/work/a/src", "/work/b/link", "running", moved),
+            terminal("excluded", "/work/a/src", "/work/a/src", "running", moved),
+            terminal("folder-a", "/work/c", "/work/c", "running", later),
+            terminal("folder-b", "/work/d", "/work/d", "running", later),
+            terminal("folder-uncertain", "/work/c", "/work/c", "running", later),
+            terminal("folder-claimed", "/work/c", "/work/c", "running", later),
+            terminal("folder-other-owner", "/work/c", "/work/c", "running", later),
+            terminal(
+                "folder-spelled",
+                "/work/c",
+                "/work/a/link",
+                "running",
+                later,
+            ),
         ];
-        let identity = crate::hub::identity::RemoteIdentity {
+        let identity = |hub: &str, agent: &str| RemoteIdentity {
             hub: hub.to_owned(),
-            agent_id: "agent-a".to_owned(),
+            agent_id: agent.to_owned(),
         };
-        terminal::attribute(terminals, &roots, |terminal, _| terminal::Publication {
-            destination: Some(terminal::Destination {
-                identity: identity.clone(),
-                repositories: ["acme/a".to_owned(), "local/a".to_owned()],
-            }),
-            capture: if terminal.report_id == "excluded" {
-                Capture::Withheld
-            } else {
-                Capture::Uploads(identity.clone())
+        terminal::attribute(
+            terminals,
+            &roots,
+            |terminal, _| terminal::Publication {
+                destination: Some(terminal::Destination {
+                    identity: identity(a, "agent-a"),
+                    repositories: ["acme/a".to_owned(), "local/a".to_owned()],
+                }),
+                capture: if terminal.report_id == "excluded" {
+                    Capture::Withheld
+                } else {
+                    Capture::Uploads(identity(a, "agent-a"))
+                },
+                rows: Vec::new(),
+                claim: None,
             },
-            rows: Vec::new(),
-            claim: None,
-        })
+            |terminal| terminal::Folder {
+                upload: match terminal.report_id.as_str() {
+                    "folder-uncertain" => None,
+                    "folder-b" => Some(identity(b, "agent-d")),
+                    _ => Some(identity(a, "agent-c")),
+                },
+                account: Some("owner".to_owned()),
+                owner: Some(
+                    if terminal.report_id == "folder-other-owner" {
+                        "someone-else"
+                    } else {
+                        "owner"
+                    }
+                    .to_owned(),
+                ),
+                rows: if terminal.report_id == "folder-claimed" {
+                    vec![terminal::Row {
+                        project: Some("project-a".to_owned()),
+                        observed: true,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+        )
     }
 
     #[cfg(not(unix))]
-    fn terminals(_: &str) -> Vec<(String, ReportedSession)> {
+    fn terminals(_: &str, _: &str) -> Vec<(String, ReportedSession)> {
         Vec::new()
     }
 
-    /// The report body for the first Hub once it shares: its own daemon session, after the
-    /// terminal session waiting for approval, which moved later. That entry holds the status
-    /// fields and nothing more, so no tool, command or path behind the approval reaches it.
-    fn on_a(mut daemon_session: Value) -> Value {
+    /// `body` with the terminal sessions `listed` before its daemon session, as they moved
+    /// later. Without native control, on Windows, there are none.
+    fn with_terminals(mut body: Value, listed: Vec<Value>) -> Value {
         if cfg!(unix) {
-            let approval = json!({
-                "session_id": "approval",
-                "project_id": "project-a",
-                "runtime": "claude-code",
-                "status": "awaiting_approval",
-                "last_activity_at": "2026-01-02T00:00:00Z"
-            });
-            daemon_session["sessions"]
-                .as_array_mut()
-                .unwrap()
-                .insert(0, approval);
+            let sessions = body["sessions"].as_array_mut().unwrap();
+            for (at, session) in listed.into_iter().enumerate() {
+                sessions.insert(at, session);
+            }
         }
-        daemon_session
+        body
+    }
+
+    /// The terminal session waiting for approval, as a body lists it: its status fields and
+    /// nothing more, so no tool, command or path behind the approval reaches it.
+    fn approval() -> Value {
+        json!({
+            "session_id": "approval",
+            "project_id": "project-a",
+            "runtime": "claude-code",
+            "status": "awaiting_approval",
+            "last_activity_at": "2026-01-02T00:00:00Z"
+        })
+    }
+
+    /// A terminal session in a folder bound through the CLI alone, as a body lists it: named by
+    /// its repository's opaque id, with no project id, and nothing more.
+    fn in_folder(session: &str, agent: &str) -> Value {
+        json!({
+            "session_id": session,
+            "agent_id": agent,
+            "runtime": "claude-code",
+            "status": "running",
+            "last_activity_at": "2026-01-03T00:00:00Z"
+        })
     }
 
     /// Pins that a session's last activity follows its events into the report snapshot: after a
