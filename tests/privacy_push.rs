@@ -51,6 +51,13 @@ struct Hub {
     previews: Arc<Mutex<Vec<serde_json::Value>>>,
     /// A ref the next strategy registration moves before answering: `(name, oid)`.
     move_on_strategy: Arc<Mutex<Option<(String, String)>>>,
+    /// How many more strategy registrations the Hub accepts before it answers 500, as a Hub whose
+    /// database refused the registration does; `None` accepts every one.
+    strategy_budget: Arc<Mutex<Option<usize>>>,
+    /// The `max_new_commits` the Hub publishes in its configuration.
+    max_new_commits: Arc<AtomicUsize>,
+    /// A ref whose arrival on the Hub makes the repository public.
+    publicize_when: Arc<Mutex<Option<String>>>,
     /// A ref withdrawn from the caller: Git transport hides it, and a preview planning it is
     /// refused by name, as a Hub advertising `publication_planned_refs` does.
     withdrawn: Arc<Mutex<Option<String>>>,
@@ -98,12 +105,18 @@ impl Hub {
         let recorded_previews = Arc::clone(&previews);
         let move_on_strategy = Arc::new(Mutex::new(None::<(String, String)>));
         let strategy_move = Arc::clone(&move_on_strategy);
+        let strategy_budget = Arc::new(Mutex::new(None::<usize>));
+        let strategies_left = Arc::clone(&strategy_budget);
+        let max_new_commits = Arc::new(AtomicUsize::new(4096));
+        let published_limit = Arc::clone(&max_new_commits);
         let withdrawn = Arc::new(Mutex::new(None::<String>));
         let hidden = Arc::clone(&withdrawn);
         let previews_unavailable = Arc::new(AtomicBool::new(false));
         let preview_unavailable = Arc::clone(&previews_unavailable);
         let visibility = Arc::new(Mutex::new("private"));
         let served_visibility = Arc::clone(&visibility);
+        let publicize_when = Arc::new(Mutex::new(None::<String>));
+        let publicizing = Arc::clone(&publicize_when);
         let resolver_hub = base.clone();
         let root = root.to_owned();
         let worker = thread::spawn(move || {
@@ -220,6 +233,20 @@ impl Hub {
                     )
                     .unwrap();
                     continue;
+                }
+                if method == "PUT" && target == "/api/agents/alice/app/privacy/strategy" {
+                    let mut left = strategies_left.lock().unwrap();
+                    if *left == Some(0) {
+                        write!(
+                            stream,
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    if let Some(left) = left.as_mut() {
+                        *left -= 1;
+                    }
                 }
                 if target.starts_with("/alice/app.git/") && denied.load(Ordering::Acquire) {
                     write!(
@@ -444,7 +471,10 @@ impl Hub {
                     // A publication plans against the limits the Hub publishes.
                     ("GET", "/api/hub/config") => Some(json!({
                         "mode":"live",
-                        "limits":{"push":{"max_new_commits":4096,"max_request_bytes":2147483648u64}},
+                        "limits":{"push":{
+                            "max_new_commits":published_limit.load(Ordering::Acquire),
+                            "max_request_bytes":2147483648u64
+                        }},
                         "capabilities":{"publication_planned_refs":true}
                     })),
                     _ => None,
@@ -509,6 +539,13 @@ impl Hub {
                             preview["target_refs_digest"],
                             remote_refs_digest(&root.join("alice/app.git"), hidden_ref.as_deref())
                         );
+                        let mut publicizing = publicizing.lock().unwrap();
+                        if publicizing.as_ref().is_some_and(|name| {
+                            !git(&root.join("alice/app.git"), &["for-each-ref", name]).is_empty()
+                        }) {
+                            *publicizing = None;
+                            *served_visibility.lock().unwrap() = "public";
+                        }
                     }
                     let split = response
                         .stdout
@@ -544,6 +581,9 @@ impl Hub {
             key_requests,
             previews,
             move_on_strategy,
+            strategy_budget,
+            max_new_commits,
+            publicize_when,
             withdrawn,
             previews_unavailable,
             stop,
@@ -2521,6 +2561,308 @@ fn continued_plain_session_declares_only_what_it_adds() {
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
     assert_eq!(git(repo.root(), &["rev-parse", "HEAD"]), local);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
+}
+
+/// A session whose new history is more than one publication to this Hub can carry is published in
+/// parts within one push: each part declares no more new turns than the Hub admits per request,
+/// the parts together declare every new turn once, and the branch and every turn's version tag
+/// end up on the Hub. A selected branch with no new history still delivers the tag it owes. A
+/// push that sent the whole history at once exceeds the published limit in its one manifest; one
+/// that stopped after the first part leaves the branch behind the session; one that skipped the
+/// branches with no new history leaves their tags off the Hub. A part refused before it sends
+/// anything names the parts already published, and a rerun continues after them; a message that
+/// nothing was published sends the person looking for a push that did not happen.
+#[test]
+fn a_session_longer_than_one_publication_is_published_in_parts() {
+    use agit::domain::session_privacy::SessionPublicationManifest;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    // main moves on without talk, and a tag on that commit is all main still owes the Hub.
+    repo.git(&["checkout", "main"]).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file, revised").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line revised").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let revised = git(repo.root(), &["rev-parse", "HEAD"]);
+    git(repo.root(), &["tag", "reviewed-main", &revised]);
+    repo.git(&["checkout", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let turns: Vec<String> = (0..9)
+        .map(|index| {
+            let content = format!("turn {index}");
+            let log = transcript::wrap_lines(
+                &format!(
+                    "{}\n",
+                    json!({"type":"user","message":{"role":"user","content":content}})
+                ),
+                "claude-code",
+                &session.session,
+            );
+            storage::write_snapshot(repo.root(), &log, &log).unwrap();
+            meta::write(repo.root(), &session).unwrap();
+            repo.add_all().unwrap();
+            repo.commit(&content).unwrap();
+            git(repo.root(), &["rev-parse", "HEAD"])
+        })
+        .collect();
+
+    hub.max_new_commits.store(4, Ordering::Release);
+    let earlier = hub.previews.lock().unwrap().len();
+    *hub.strategy_budget.lock().unwrap() = Some(1);
+    let stopped = run(&["--yes", "push", "alice/app@talk"]);
+    assert!(!stopped.status.success(), "{stopped:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(said.contains("in 3 parts"), "{stopped:?}");
+    assert!(
+        said.contains("1 of 3 parts are published; part 2 was not sent"),
+        "{stopped:?}"
+    );
+    assert!(
+        !said.contains("no branch or tag refs were published"),
+        "{stopped:?}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), turns[3]);
+    *hub.strategy_budget.lock().unwrap() = None;
+    let pushed = run(&["--yes", "push", "alice/app@talk"]);
+    assert_success(&pushed);
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&pushed.stdout),
+            String::from_utf8_lossy(&pushed.stderr)
+        )
+        .contains("in 2 parts"),
+        "{pushed:?}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), turns[8]);
+    let mut declared = std::collections::BTreeSet::new();
+    let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
+    for preview in &previews {
+        let manifest: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        assert!(manifest.snapshots.len() <= 4, "{manifest:?}");
+        declared.extend(
+            manifest
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.commit().to_owned()),
+        );
+    }
+    assert_eq!(declared, turns.iter().cloned().collect());
+    for turn in &turns {
+        assert_eq!(
+            git(&remote, &["rev-parse", &format!("refs/tags/agit-{turn}")]),
+            *turn
+        );
+    }
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/tags/reviewed-main"]),
+        revised
+    );
+}
+
+/// Every part of a push in parts goes out under a confirmation that covers it. When the repository
+/// turns public after a part lands, the parts not yet sent stay unsent, since the yes was given
+/// for a private audience. Without a terminal, plain parts publish to a private repository on
+/// their own, but a later part carrying an encrypted session stops before it is sent, as a single
+/// publication carrying it is refused. A push that checked the destination only before the first
+/// part sends the rest to the public audience; one that let the first part's unattended yes cover
+/// every part publishes the encrypted session unasked.
+#[test]
+fn every_part_goes_out_under_a_confirmation_that_covers_it() {
+    use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy, SessionScheme};
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let plain = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let mut encrypted = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    encrypted.session_privacy = Some(SessionPrivacy {
+        scheme: SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(
+            AccountIdentity::new(&hub.base, "session-owner").unwrap(),
+        ))
+        .unwrap()
+    });
+    encrypted.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
+    let turn = |session: &meta::Meta, content: &str| {
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let plain_turns: Vec<String> = (0..8)
+        .map(|index| turn(&plain, &format!("plain turn {index}")))
+        .collect();
+    for index in 0..5 {
+        turn(&encrypted, &format!("encrypted turn {index}"));
+    }
+    hub.max_new_commits.store(4, Ordering::Release);
+
+    // The last tag of the first part marks it as landed.
+    *hub.publicize_when.lock().unwrap() = Some(format!("refs/tags/agit-{}", plain_turns[3]));
+    let moved = run(&["--yes", "push", "alice/app@talk"]);
+    assert!(!moved.status.success(), "{moved:?}");
+    assert!(
+        String::from_utf8_lossy(&moved.stderr)
+            .contains("the publication endpoint or audience changed during publication"),
+        "{moved:?}"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/talk"]),
+        plain_turns[3]
+    );
+
+    *hub.visibility.lock().unwrap() = "private";
+    let unattended = run(&["push", "alice/app@talk"]);
+    assert!(!unattended.status.success(), "{unattended:?}");
+    assert!(
+        String::from_utf8_lossy(&unattended.stderr).contains(
+            "1 of 3 parts are published; part 2 carries encrypted sessions, which need the person's confirmation"
+        ),
+        "{unattended:?}"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/talk"]),
+        plain_turns[7]
+    );
 }
 
 /// An encrypted session that continues its published history declares only what it adds, and its

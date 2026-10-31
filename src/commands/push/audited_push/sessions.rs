@@ -14,6 +14,22 @@ pub(super) fn run(
     destination: Destination,
 ) -> CmdResult {
     let retry_command = super::retry_push_command(args, slug, branches);
+    // Read again before every part of a publication sent in several, so that dropping the project
+    // or turning automatic publication off stops the parts not yet sent.
+    let still_publishable = |repo: &Repo, branch: &str| -> Result<()> {
+        if let Some(reason) = crate::commands::project::withheld(slug, branch)? {
+            anyhow::bail!(
+                "`{slug}@{branch}` will not be uploaded from this computer: {}",
+                reason.describe()
+            );
+        }
+        ensure!(
+            std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_none()
+                || !crate::commands::project::blocks_auto_push(repo, slug, branch)?,
+            "automatic publication of `{slug}@{branch}` was turned off"
+        );
+        Ok(())
+    };
     let Destination {
         mut intent,
         local_target,
@@ -61,11 +77,12 @@ pub(super) fn run(
     };
     intent.verify_account(&client)?;
     intent.verify_before_mutation(&client, &repo)?;
-    // A new destination's first publication carries the whole history, which is checked here;
-    // an existing one only needs the selected heads, whatever the length of their history. A
-    // cross-Hub delivery checks every selected commit for plain local history, so it captures
-    // the whole history too.
-    let original = if matches!(intent.action, Action::Create) || intent.explicit_hub {
+    // A destination needs only the selected heads up front, whatever the length of their
+    // history; a new one's first publication carries the whole history, which is listed and
+    // checked below without the bound of one publication, since it may go in parts. A cross-Hub
+    // delivery checks every selected commit for plain local history and is sent whole, so it
+    // captures the whole history.
+    let original = if intent.explicit_hub {
         PublicationPlan::freeze(&repo, branches)?
     } else {
         PublicationPlan::freeze_tips(&repo, branches)?
@@ -112,10 +129,15 @@ pub(super) fn run(
             !args.dry_run,
             "a new destination needs an immutable repository identity before a session publication preview; publish without --dry-run to confirm its creation"
         );
-        for commit in original.commit_objects() {
-            crate::domain::storage::metadata_local(repo.root(), commit)?;
+        let heads: Vec<String> = original
+            .heads()
+            .iter()
+            .map(|head| head.oid().to_owned())
+            .collect();
+        for commit in PublicationPlan::raw_history(&repo, &heads)? {
+            crate::domain::storage::metadata_local(repo.root(), &commit)?;
             ensure!(
-                crate::domain::privacy_recovery::committed_envelope(&repo, commit)?.is_none(),
+                crate::domain::privacy_recovery::committed_envelope(&repo, &commit)?.is_none(),
                 "a new destination requires preserved source authority for inherited ciphertext"
             );
         }
@@ -181,7 +203,7 @@ pub(super) fn run(
         !(person_only && automatic),
         "{repository} is public and you write to it as a member of its organization; automatic upload does not publish there, push it yourself"
     );
-    let remote =
+    let mut remote =
         crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
             .context("cannot establish accepted publication history")?;
     let implicit_main = !args.all && !branches.iter().any(|branch| branch == "main");
@@ -196,13 +218,8 @@ pub(super) fn run(
         [branch] => format!("{repository}@{branch}"),
         _ => repository.clone(),
     };
-    let unsent = |error: anyhow::Error| {
-        inconsistent(
-            error,
-            format!("cannot push {target}; nothing was sent to the Hub"),
-        )
-    };
-    let withheld = crate::domain::privacy_git::withheld_refs(&repo, &identity).map_err(unsent)?;
+    let withheld = crate::domain::privacy_git::withheld_refs(&repo, &identity)
+        .map_err(|error| inconsistent(error, unsent_outcome(&target, 0, 0)))?;
     let ask_again = named && !automatic;
     let mut asked_again = Vec::new();
     let mut set_aside = Vec::new();
@@ -267,37 +284,176 @@ pub(super) fn run(
         ui::info(format_args!("{repository}: nothing to publish."));
         return Ok(ExitCode::Ok);
     }
-    let mut selected = SessionPublicationPlan::resolve(
-        &repo,
-        &selected_branches,
-        &client,
-        &repository,
-        identity.clone(),
-        remote,
-        !args.dry_run,
-        intent.explicit_hub,
-    )
-    .map_err(unsent)?;
-    selected.asking_again = asked_again.into_iter().collect();
+    let mut supervisor = SupervisorReply::from_env()?;
+    // The reviewed heads bound the whole run: no part goes past them, so a turn saved after the
+    // confirmation waits for the next push.
+    let reviewed_heads: std::collections::BTreeMap<String, String> = original
+        .heads()
+        .iter()
+        .filter_map(|head| {
+            let branch = head.name().strip_prefix("refs/heads/")?;
+            Some((branch.to_owned(), head.oid().to_owned()))
+        })
+        .collect();
+    let push_limits = client
+        .push_limits()
+        .unwrap_or(crate::hub::PushLimits::UNPUBLISHED);
+    let explicit_hub = intent.explicit_hub;
+    let plan_parts = |repo: &Repo,
+                      remote: &crate::hub::git::RemoteRefs,
+                      branch: &str|
+     -> Result<(Vec<String>, usize)> {
+        if explicit_hub {
+            return Ok((vec![reviewed_heads[branch].clone()], 0));
+        }
+        SessionPublicationPlan::plan_parts(
+            repo,
+            branch,
+            &reviewed_heads[branch],
+            &identity,
+            remote,
+            push_limits.max_new_commits,
+        )
+    };
+    // A history longer than one publication goes in parts, one branch at a time; otherwise every
+    // selected branch goes in one publication, as always.
+    let mut plans = Vec::new();
+    let mut added = 0;
+    for branch in &selected_branches {
+        // Planning reads the accepted record, so its refusal comes before anything is sent.
+        let (cuts, commits) = plan_parts(&repo, &remote, branch)
+            .map_err(|error| inconsistent(error, unsent_outcome(&target, 0, 0)))?;
+        added += commits;
+        plans.push(cuts);
+    }
+    let in_parts = plans.iter().any(|cuts| cuts.len() > 1);
+    ensure!(
+        !in_parts || supervisor.is_none(),
+        "this session has more history than one publication carries, so it is published in parts; publish it once with `{retry_command}`"
+    );
+    let total: usize = if in_parts {
+        plans.iter().map(Vec::len).sum()
+    } else {
+        1
+    };
+    if in_parts {
+        ui::publication::notice(format!(
+            "{added} new commits go to {repository} in {total} parts, cut at {}",
+            plans
+                .iter()
+                .flatten()
+                .map(|cut| cut.chars().take(12).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    // With nobody to confirm the push (no terminal and no --yes, and no automatic upload or
+    // confirmed delivery standing in for the person), a part goes out only if it may on its own:
+    // plain sessions to a private repository. The first part's yes then covers no later part that
+    // carries encrypted sessions; that part stops before it is sent.
+    let nobody_to_ask = !automatic
+        && !delivery_confirmed
+        && !args.audit
+        && std::env::var_os("AGIT_YES").is_none()
+        && !ui::prompt::can_ask();
     let _ = warmed.join();
-    resolving.finish();
-    ui::publication::notice(format!(
-        "Repository visibility: {}; session modes: {} encrypted, {} plain (new publication)",
-        intent.visibility,
-        selected
-            .configs
-            .values()
-            .filter(|config| config.config.privacy.scheme
-                == crate::domain::session_privacy::SessionScheme::SessionOwnerV2)
-            .count(),
-        selected
-            .configs
-            .values()
-            .filter(|config| config.config.privacy.scheme
-                == crate::domain::session_privacy::SessionScheme::Plain)
-            .count(),
-    ));
-    let mut projected = ProjectedHistory::prepare_sessions(&repo, &selected_branches, &selected, &[])
+    // The first publication resolves its sessions under the stage that read the remote history,
+    // so a refusal there stops that stage; each later part opens its own.
+    let mut reading_history = Some(resolving);
+    let mut branch_index = if in_parts {
+        plans.iter().position(|cuts| !cuts.is_empty()).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut cuts = plans.get(branch_index).cloned().unwrap_or_default();
+    // Branches with no new history may still owe tags (one added to an earlier commit, or a
+    // version tag the Hub lacks); they go together after the branches sent in parts.
+    let mut idle: Vec<String> = if in_parts {
+        selected_branches
+            .iter()
+            .zip(&plans)
+            .filter(|(_, cuts)| cuts.is_empty())
+            .map(|(branch, _)| branch.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut finishing = false;
+    let mut published = 0usize;
+    let mut repo = repo;
+    loop {
+        let part = published + 1;
+        let sent = published;
+        // Nothing of this part reaches the Hub before its upload; the parts before it did.
+        let unsent =
+            |error: anyhow::Error| inconsistent(error, unsent_outcome(&target, sent, total));
+        let part_branches: Vec<String> = if finishing {
+            idle.clone()
+        } else if in_parts {
+            vec![selected_branches[branch_index].clone()]
+        } else {
+            selected_branches.clone()
+        };
+        let resolving = reading_history
+            .take()
+            .unwrap_or_else(|| ui::publication::stage(format!("Preparing part {part} of {total}")));
+        // In parts, every publication stops at what was confirmed: a part at its cut, and the
+        // branches that only owe tags at their reviewed heads.
+        let pins: std::collections::BTreeMap<String, String> = if finishing {
+            part_branches
+                .iter()
+                .map(|branch| (branch.clone(), reviewed_heads[branch].clone()))
+                .collect()
+        } else if in_parts {
+            part_branches
+                .iter()
+                .map(|branch| (branch.clone(), cuts[0].clone()))
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        if part > 1 {
+            // A later part checks the destination as it is now: a repository answer the client
+            // reuses from before the previous part landed would hide an audience that changed
+            // since, and the first part's confirmation covers only the audience it named.
+            client.forget_probes();
+            for branch in &part_branches {
+                still_publishable(&repo, branch).with_context(|| {
+                    format!("{published} of {total} parts are published; nothing more was sent")
+                })?;
+            }
+        }
+        let mut selected = SessionPublicationPlan::resolve(
+            &repo,
+            &part_branches,
+            &client,
+            &repository,
+            identity.clone(),
+            remote.clone(),
+            !args.dry_run,
+            intent.explicit_hub,
+            pins,
+        )
+        .map_err(unsent)?;
+        selected.asking_again = asked_again.iter().cloned().collect();
+        resolving.finish();
+        ui::publication::notice(format!(
+            "Repository visibility: {}; session modes: {} encrypted, {} plain (new publication)",
+            intent.visibility,
+            selected
+                .configs
+                .values()
+                .filter(|config| config.config.privacy.scheme
+                    == crate::domain::session_privacy::SessionScheme::SessionOwnerV2)
+                .count(),
+            selected
+                .configs
+                .values()
+                .filter(|config| config.config.privacy.scheme
+                    == crate::domain::session_privacy::SessionScheme::Plain)
+                .count(),
+        ));
+        let mut projected = ProjectedHistory::prepare_sessions(&repo, &part_branches, &selected, &[])
         .map_err(|error| {
             if error.downcast_ref::<crate::domain::privacy_git::MissingAcceptedObjects>().is_some() {
                 #[cfg(windows)]
@@ -309,325 +465,451 @@ pub(super) fn run(
                 unsent(error)
             }
         })?;
-    let binding = ui::publication::stage("Reading prepared snapshot bindings");
-    let receipts = projected.session_receipts(&repository, &identity, &intent.url)?;
-    let mut supervisor = SupervisorReply::from_env()?;
-    let supervised = supervisor
-        .as_ref()
-        .map(|reply| {
-            ensure!(
-                branches.len() == 1,
-                "supervised publication requires one session branch"
-            );
-            let candidate = receipts
-                .iter()
-                .find(|receipt| receipt.branch == reply.request.branch)
-                .context("supervised publication has no session candidate")?
-                .clone();
-            reply.request.verify(&candidate)?;
-            if reply.request.notification_id.is_some() {
-                crate::domain::privacy_receipt::outbox::Entry::load(&repo, &reply.request)?
-                    .context("publication intent is missing")?;
+        let binding = ui::publication::stage("Reading prepared snapshot bindings");
+        let receipts = projected.session_receipts(&repository, &identity, &intent.url)?;
+        let supervised = supervisor
+            .as_ref()
+            .map(|reply| {
+                ensure!(
+                    branches.len() == 1,
+                    "supervised publication requires one session branch"
+                );
+                let candidate = receipts
+                    .iter()
+                    .find(|receipt| receipt.branch == reply.request.branch)
+                    .context("supervised publication has no session candidate")?
+                    .clone();
+                reply.request.verify(&candidate)?;
+                if reply.request.notification_id.is_some() {
+                    crate::domain::privacy_receipt::outbox::Entry::load(&repo, &reply.request)?
+                        .context("publication intent is missing")?;
+                }
+                Ok::<_, anyhow::Error>(candidate)
+            })
+            .transpose()?;
+        let limits = secrets::ScanLimits::DEFAULT;
+        let baseline = inspection_destination(args, &intent)?;
+        binding.finish();
+        let inspecting = ui::publication::stage("Checking outgoing objects and file payloads");
+        let captured = CapturedPublication::capture_projected_for(
+            &projected,
+            limits.budget_bytes,
+            &repo,
+            baseline
+                .as_ref()
+                .map(|identity| (intent.url.as_str(), identity)),
+            baseline
+                .as_ref()
+                .filter(|identity| **identity == selected.identity)
+                .map(|_| selected.remote.clone()),
+        )?;
+        let inspected = captured.inspect(limits);
+        let complete = match inspected {
+            ContentInspection::Complete(complete) => complete,
+            ContentInspection::Blocked(blocked) => {
+                ui::error(&blocked.reason().to_string());
+                if in_parts {
+                    ui::hint(&format!(
+                        "{published} of {total} parts are published; part {part} was not sent"
+                    ));
+                }
+                return Ok(inspection_failure_code(blocked.reason()));
             }
-            Ok::<_, anyhow::Error>(candidate)
-        })
-        .transpose()?;
-    let limits = secrets::ScanLimits::DEFAULT;
-    let baseline = inspection_destination(args, &intent)?;
-    binding.finish();
-    let inspecting = ui::publication::stage("Checking outgoing objects and file payloads");
-    let captured = CapturedPublication::capture_projected_for(
-        &projected,
-        limits.budget_bytes,
-        &repo,
-        baseline
-            .as_ref()
-            .map(|identity| (intent.url.as_str(), identity)),
-        baseline
-            .as_ref()
-            .filter(|identity| **identity == selected.identity)
-            .map(|_| selected.remote.clone()),
-    )?;
-    let inspected = captured.inspect(limits);
-    let complete = match inspected {
-        ContentInspection::Complete(complete) => complete,
-        ContentInspection::Blocked(blocked) => {
-            ui::error(&blocked.reason().to_string());
-            return Ok(inspection_failure_code(blocked.reason()));
+        };
+        inspecting.finish();
+        let status = ui::publication::stage("Checking publication status");
+        let synchronized = (!in_parts || finishing)
+            && !args.dry_run
+            && !args.audit
+            && !args.show_preview
+            && complete.captured().pointers().is_empty()
+            && receipts_match_current(&repo, &receipts)?
+            && (supervisor.is_some() || no_pending_publication_receipts(&repo, &receipts)?)
+            // The advertisement this publication was planned from decides "already published"; a
+            // second listing only adds a Hub round trip, since nothing is sent on this path.
+            && FrozenPublication::refs_match(projected.plan(), &selected.remote);
+        status.finish();
+        if synchronized && finishing {
+            break;
         }
-    };
-    inspecting.finish();
-    let status = ui::publication::stage("Checking publication status");
-    let synchronized = !args.dry_run
-        && !args.audit
-        && !args.show_preview
-        && complete.captured().pointers().is_empty()
-        && receipts_match_current(&repo, &receipts)?
-        && (supervisor.is_some() || no_pending_publication_receipts(&repo, &receipts)?)
-        // The advertisement this publication was planned from decides "already published"; a
-        // second listing only adds a Hub round trip, since nothing is sent on this path.
-        && FrozenPublication::refs_match(projected.plan(), &selected.remote);
-    status.finish();
-    if synchronized {
-        let checking = ui::publication::stage("Rechecking synchronized publication");
+        if synchronized {
+            let checking = ui::publication::stage("Rechecking synchronized publication");
+            projected.verify_source(&repo)?;
+            complete.verify_source(projected.repo())?;
+            intent.verify_account(&client)?;
+            intent.verify_before_mutation(&client, &repo)?;
+            intent.verify_write_access(&client, &identity.agent_id)?;
+            if let Some(selection) = &local_target {
+                selection.verify(&repo)?;
+            }
+            // Nothing is sent on this path, so a registration can only matter to the receipt a
+            // supervisor records from it.
+            if supervisor.is_some() {
+                selected.verify_configs(&client, &repository)?;
+            }
+            let (repo, destination) = intent.materialize(&client, repo)?;
+            if intent.explicit_hub {
+                intent.bind_delivered_origin(&repo, &destination)?;
+            }
+            if let (Some(mut reply), Some(candidate)) = (supervisor, supervised) {
+                reply.prepare(&repo, &candidate)?;
+                reply.complete(&repo, candidate)?;
+            }
+            checking.finish();
+            ui::info(format_args!("{repository}: already up to date."));
+            return Ok(ExitCode::Ok);
+        }
+        let displayed = intent.json();
+        let previewing = ui::publication::stage("Writing publication preview");
+        let mut preview = super::super::preview::prepare(
+            &projected,
+            &displayed,
+            &repo,
+            complete.captured(),
+            args.show_preview && !automatic,
+        )?;
+        if in_parts {
+            // Every part keeps its own preview, as auditable as a single publication's.
+            let numbered = preview
+                .path
+                .with_file_name(format!("publication-preview-part-{part}.json"));
+            std::fs::rename(&preview.path, &numbered)?;
+            preview.path = numbered;
+        }
+        previewing.finish();
+        let interactive_part = part == 1 || args.audit || (args.show_preview && !automatic);
+        if interactive_part {
+            println!("Publication destination: {}", intent.describe());
+        }
+        println!("Privacy preview: {}", preview.path.display());
+        if !automatic && interactive_part {
+            preview.show(&projected)?;
+        }
+        let reviewed = if args.audit {
+            Some(super::super::audit::review(
+                complete.captured(),
+                &displayed,
+            )?)
+        } else {
+            None
+        };
+        let encrypted = receipts.iter().any(|receipt| receipt.mode.is_encrypted());
+        let public = intent.visibility == "public";
+        let decision = confirm_publication(
+            reviewed.as_ref().is_none_or(|review| review.complete()),
+            args.dry_run,
+            || {
+                if !interactive_part && encrypted && nobody_to_ask {
+                    return Err(crate::commands::InteractionRequired(format!(
+                        "{published} of {total} parts are published; part {part} carries encrypted sessions, which need the person's confirmation: run `{retry_command}` in a terminal, or pass --yes once they have confirmed it in this conversation"
+                    ))
+                    .into());
+                }
+                // The first part's answer covers every later part.
+                if !interactive_part {
+                    return Ok(Some(true));
+                }
+                let answered = Answer {
+                    person_only,
+                    public,
+                    delivery_confirmed,
+                    automatic,
+                    audit: args.audit,
+                    agit_yes: std::env::var_os("AGIT_YES").is_some(),
+                    encrypted,
+                    can_ask: ui::prompt::can_ask(),
+                }
+                .without_asking();
+                if answered == Some(true) {
+                    if person_only {
+                        crate::hub::git::confirm_person_publication();
+                    }
+                    return Ok(Some(true));
+                }
+                if answered == Some(false) {
+                    return Err(crate::commands::InteractionRequired(format!(
+                        "{repository} is public and you write to it as a member of its organization; confirm what goes public at an interactive terminal or with --yes"
+                    ))
+                    .into());
+                }
+                if public && !args.audit && !ui::prompt::can_ask() {
+                    return Err(crate::commands::InteractionRequired("publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation".into()).into());
+                }
+                let question = match (person_only, in_parts, part == 1) {
+                    (true, false, _) => format!(
+                        "{repository} is public and you write to it as a member of its organization. Publish the {} reviewed session(s) and file changes to everyone?",
+                        receipts.len()
+                    ),
+                    (true, true, true) => format!(
+                        "{repository} is public and you write to it as a member of its organization. Publish the reviewed sessions and file changes to everyone, in {total} parts starting with this one?"
+                    ),
+                    (true, true, false) => format!(
+                        "{repository} is public and you write to it as a member of its organization. Publish part {part} of {total} of the reviewed sessions and file changes to everyone?"
+                    ),
+                    (false, true, true) => format!(
+                        "Publish the reviewed sessions to {repository} on {} ({}) in {total} parts, starting with this one?",
+                        intent.hub, intent.visibility
+                    ),
+                    (false, true, false) => format!(
+                        "Publish part {part} of {total} of the reviewed sessions to {repository} on {} ({})?",
+                        intent.hub, intent.visibility
+                    ),
+                    (false, false, _) => format!(
+                        "Publish the reviewed sessions to {repository} on {} ({})?",
+                        intent.hub, intent.visibility
+                    ),
+                };
+                let answer = ui::prompt::confirm(&question, false)?;
+                if answer.is_none() && !args.audit {
+                    return Err(crate::commands::InteractionRequired("session publication requires confirmation of its preview; use --yes or an interactive terminal".into()).into());
+                }
+                if person_only && answer == Some(true) {
+                    crate::hub::git::confirm_person_publication();
+                }
+                Ok(answer)
+            },
+        )?;
+        match decision {
+            Decision::ReviewedOnly => {
+                ui::info("Session preview complete; nothing was published.");
+                return Ok(ExitCode::Ok);
+            }
+            Decision::Declined => {
+                if published > 0 {
+                    ui::info(format_args!(
+                        "Publication stopped; {published} of {total} parts are published."
+                    ));
+                } else {
+                    ui::info("Publication cancelled.");
+                }
+                return Ok(ExitCode::Ok);
+            }
+            Decision::Incomplete => {
+                ui::error("audit review was not complete; publication is blocked");
+                return Ok(ExitCode::Policy);
+            }
+            Decision::Publish => {}
+        }
+        let checking = ui::publication::stage("Rechecking source and destination before upload");
         projected.verify_source(&repo)?;
         complete.verify_source(projected.repo())?;
         intent.verify_account(&client)?;
         intent.verify_before_mutation(&client, &repo)?;
-        intent.verify_write_access(&client, &identity.agent_id)?;
+        selected.verify_configs(&client, &repository)?;
         if let Some(selection) = &local_target {
             selection.verify(&repo)?;
         }
-        // Nothing is sent on this path, so a registration can only matter to the receipt a
-        // supervisor records from it.
-        if supervisor.is_some() {
-            selected.verify_configs(&client, &repository)?;
+        ensure!(
+            !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
+            "automatic publication was disabled during inspection"
+        );
+        // The policy checked before the first part is read again before every later one.
+        if part > 1 {
+            for branch in &part_branches {
+                still_publishable(&repo, branch)?;
+            }
         }
-        let (repo, remote) = intent.materialize(&client, repo)?;
-        if intent.explicit_hub {
-            intent.bind_delivered_origin(&repo, &remote)?;
+        let (materialized, destination) = intent.materialize(&client, repo)?;
+        repo = materialized;
+        let hub = client.base().to_owned();
+        intent.verify_remote(&destination)?;
+        if let Some(selection) = &local_target {
+            selection.bind(&repo, &destination.identity)?;
         }
-        if let (Some(mut reply), Some(candidate)) = (supervisor, supervised) {
-            reply.prepare(&repo, &candidate)?;
-            reply.complete(&repo, candidate)?;
+        projected.verify_source(&repo)?;
+        let prepared = complete.bind_projected_destination_with_client(
+            projected.repo(),
+            &repo,
+            &destination.push_url,
+            &destination.identity,
+            client.clone(),
+        )?;
+        projected.prepare_acceptance().map_err(unsent)?;
+        if let (Some(reply), Some(candidate)) = (&mut supervisor, &supervised) {
+            reply.prepare(&repo, candidate)?;
         }
         checking.finish();
-        ui::info(format_args!("{repository}: already up to date."));
-        return Ok(ExitCode::Ok);
-    }
-    let displayed = intent.json();
-    let previewing = ui::publication::stage("Writing publication preview");
-    let mut preview = super::super::preview::prepare(
-        &projected,
-        &displayed,
-        &repo,
-        complete.captured(),
-        args.show_preview && !automatic,
-    )?;
-    previewing.finish();
-    println!("Publication destination: {}", intent.describe());
-    println!("Privacy preview: {}", preview.path.display());
-    if !automatic {
-        preview.show(&projected)?;
-    }
-    let reviewed = if args.audit {
-        Some(super::super::audit::review(
-            complete.captured(),
-            &displayed,
-        )?)
-    } else {
-        None
-    };
-    let encrypted = receipts.iter().any(|receipt| receipt.mode.is_encrypted());
-    let public = intent.visibility == "public";
-    let decision = confirm_publication(
-        reviewed.as_ref().is_none_or(|review| review.complete()),
-        args.dry_run,
-        || {
-            let answered = Answer {
-                person_only,
-                public,
-                delivery_confirmed,
-                automatic,
-                audit: args.audit,
-                agit_yes: std::env::var_os("AGIT_YES").is_some(),
-                encrypted,
-                can_ask: ui::prompt::can_ask(),
-            }
-            .without_asking();
-            if answered == Some(true) {
-                if person_only {
-                    crate::hub::git::confirm_person_publication();
-                }
-                return Ok(Some(true));
-            }
-            if answered == Some(false) {
-                return Err(crate::commands::InteractionRequired(format!(
-                    "{repository} is public and you write to it as a member of its organization; confirm what goes public at an interactive terminal or with --yes"
-                ))
-                .into());
-            }
-            if public && !args.audit && !ui::prompt::can_ask() {
-                return Err(crate::commands::InteractionRequired("publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation".into()).into());
-            }
-            let question = if person_only {
-                format!(
-                    "{repository} is public and you write to it as a member of its organization. Publish the {} reviewed session(s) and file changes to everyone?",
-                    receipts.len()
-                )
-            } else {
-                format!(
-                    "Publish the reviewed sessions to {repository} on {} ({})?",
-                    intent.hub, intent.visibility
-                )
-            };
-            let answer = ui::prompt::confirm(&question, false)?;
-            if answer.is_none() && !args.audit {
-                return Err(crate::commands::InteractionRequired("session publication requires confirmation of its preview; use --yes or an interactive terminal".into()).into());
-            }
-            if person_only && answer == Some(true) {
-                crate::hub::git::confirm_person_publication();
-            }
-            Ok(answer)
-        },
-    )?;
-    match decision {
-        Decision::ReviewedOnly => {
-            ui::info("Session preview complete; nothing was published.");
-            return Ok(ExitCode::Ok);
-        }
-        Decision::Declined => {
-            ui::info("Publication cancelled.");
-            return Ok(ExitCode::Ok);
-        }
-        Decision::Incomplete => {
-            ui::error("audit review was not complete; publication is blocked");
-            return Ok(ExitCode::Policy);
-        }
-        Decision::Publish => {}
-    }
-    let checking = ui::publication::stage("Rechecking source and destination before upload");
-    projected.verify_source(&repo)?;
-    complete.verify_source(projected.repo())?;
-    intent.verify_account(&client)?;
-    intent.verify_before_mutation(&client, &repo)?;
-    selected.verify_configs(&client, &repository)?;
-    if let Some(selection) = &local_target {
-        selection.verify(&repo)?;
-    }
-    ensure!(
-        !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
-        "automatic publication was disabled during inspection"
-    );
-    let (repo, remote) = intent.materialize(&client, repo)?;
-    let hub = client.base().to_owned();
-    intent.verify_remote(&remote)?;
-    if let Some(selection) = &local_target {
-        selection.bind(&repo, &remote.identity)?;
-    }
-    projected.verify_source(&repo)?;
-    let prepared = complete.bind_projected_destination_with_client(
-        projected.repo(),
-        &repo,
-        &remote.push_url,
-        &remote.identity,
-        client,
-    )?;
-    projected.prepare_acceptance().map_err(unsent)?;
-    if let (Some(reply), Some(candidate)) = (&mut supervisor, &supervised) {
-        reply.prepare(&repo, candidate)?;
-    }
-    checking.finish();
-    let report = prepared.publish_with_session_receipts(
+        let report = prepared.publish_with_session_receipts(
         projected.policy_digest(),
         projected.session_manifest(),
         &intent.visibility,
         &selected.remote,
-    ).with_context(|| format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error"))?;
-    // A branch the Hub acknowledged is uploaded whatever fails after it, in the tag phase or while
-    // saving receipts, and a retry finds it up to date; so it counts now.
-    let updated = report
-        .heads
-        .iter()
-        .flat_map(|phase| &phase.attempts)
-        .flat_map(|attempt| &attempt.refs)
-        .any(|reference| matches!(reference.status, PublicationStatus::Updated));
-    if updated {
-        crate::telemetry::activation::reached(
-            crate::telemetry::activation::Milestone::FirstUpload,
-            &hub,
-        );
-    }
-    let recording = ui::publication::stage("Recording publication acknowledgements");
-    projected.confirm_acceptance(&report).map_err(|error| {
-        inconsistent(
-            error,
-            format!("{target} may already be published on the Hub, but agit could not record which local commits it published"),
-        )
-    })?;
-    show_publication(&report);
-    let accepted: Vec<String> = [&report.heads, &report.tags]
-        .into_iter()
-        .flatten()
-        .flat_map(|phase| &phase.attempts)
-        .flat_map(|attempt| &attempt.refs)
-        .filter(|published| published.status != PublicationStatus::Unconfirmed)
-        .map(|published| published.reference.name().to_owned())
-        .filter(|name| selected.asking_again.contains(name))
-        .collect();
-    if !accepted.is_empty() {
-        crate::domain::privacy_git::release_refs(&repo, &identity, &accepted).map_err(|error| {
-            inconsistent(
-                error,
-                format!("{target} is published on the Hub, but agit could not record that the Hub accepted the refs it had set aside as withdrawn"),
-            )
+    ).with_context(|| {
+            // The parts before this one are acknowledged and stay published, and a rerun plans only
+            // what the Hub lacks, so the message names them instead of saying nothing was published.
+            if published > 0 {
+                format!("{published} of {total} parts are published; part {part} was not sent. Rerunning `{retry_command}` continues from what the Hub holds after resolving the reported error")
+            } else {
+                format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error")
+            }
         })?;
-    }
-    let withdrawn: Vec<String> = [&report.heads, &report.tags]
-        .into_iter()
-        .flatten()
-        .flat_map(|phase| phase.withdrawn.iter().cloned())
-        .collect();
-    if !withdrawn.is_empty() {
-        crate::domain::privacy_git::withhold_refs(&repo, &identity, &withdrawn).map_err(|error| {
-            inconsistent(
-                error,
-                format!("the Hub refused refs of {target} as withdrawn, but agit could not record them, so the next push asks the Hub about them again"),
-            )
-        })?;
-        ui::error(&format!(
-            "withdrawn on the Hub, so not published: {}",
-            withdrawn.join(", ")
-        ));
-        #[cfg(windows)]
-        use crate::ui::quote_powershell_argument as quote_arg;
-        #[cfg(not(windows))]
-        use crate::ui::session::shell_arg as quote_arg;
-        let again = withdrawn
+        // A branch the Hub acknowledged is uploaded whatever fails after it, in the tag phase or
+        // while saving receipts, and a retry finds it up to date; so it counts now.
+        let updated = report
+            .heads
             .iter()
-            .find_map(|name| name.strip_prefix("refs/heads/"))
-            .map(|branch| {
-                format!(
-                    "`agit push {}` publishes it",
-                    quote_arg(&format!("{slug}@{branch}"))
-                )
-            })
-            .unwrap_or_else(|| "naming its branch publishes them".into());
-        ui::hint(&format!(
-            "they stay in this checkout and later pushes leave them out; once the withdrawal is restored on the Hub, {again} again"
-        ));
-        let remaining: Vec<String> = branches
-            .iter()
-            .filter(|branch| !withdrawn.contains(&format!("refs/heads/{branch}")))
-            .cloned()
-            .collect();
-        if !remaining.is_empty() {
-            let retry = super::retry_push_command(args, slug, &remaining);
-            ui::error(&publication_recovery(&report, &retry, &repository));
+            .flat_map(|phase| &phase.attempts)
+            .flat_map(|attempt| &attempt.refs)
+            .any(|reference| matches!(reference.status, PublicationStatus::Updated));
+        if updated {
+            crate::telemetry::activation::reached(
+                crate::telemetry::activation::Milestone::FirstUpload,
+                &hub,
+            );
         }
-        return Ok(ExitCode::Policy);
+        let recording = ui::publication::stage("Recording publication acknowledgements");
+        projected.confirm_acceptance(&report).map_err(|error| {
+            inconsistent(
+                error,
+                format!("{target} may already be published on the Hub, but agit could not record which local commits it published"),
+            )
+        })?;
+        show_publication(&report);
+        let accepted: Vec<String> = [&report.heads, &report.tags]
+            .into_iter()
+            .flatten()
+            .flat_map(|phase| &phase.attempts)
+            .flat_map(|attempt| &attempt.refs)
+            .filter(|published| published.status != PublicationStatus::Unconfirmed)
+            .map(|published| published.reference.name().to_owned())
+            .filter(|name| selected.asking_again.contains(name))
+            .collect();
+        if !accepted.is_empty() {
+            crate::domain::privacy_git::release_refs(&repo, &identity, &accepted).map_err(|error| {
+                inconsistent(
+                    error,
+                    format!("{target} is published on the Hub, but agit could not record that the Hub accepted the refs it had set aside as withdrawn"),
+                )
+            })?;
+        }
+        let withdrawn: Vec<String> = [&report.heads, &report.tags]
+            .into_iter()
+            .flatten()
+            .flat_map(|phase| phase.withdrawn.iter().cloned())
+            .collect();
+        if !withdrawn.is_empty() {
+            crate::domain::privacy_git::withhold_refs(&repo, &identity, &withdrawn).map_err(|error| {
+                inconsistent(
+                    error,
+                    format!("the Hub refused refs of {target} as withdrawn, but agit could not record them, so the next push asks the Hub about them again"),
+                )
+            })?;
+            if in_parts {
+                ui::error(&format!(
+                    "part {part} of {total} did not complete; {published} parts before it are published"
+                ));
+            }
+            ui::error(&format!(
+                "withdrawn on the Hub, so not published: {}",
+                withdrawn.join(", ")
+            ));
+            #[cfg(windows)]
+            use crate::ui::quote_powershell_argument as quote_arg;
+            #[cfg(not(windows))]
+            use crate::ui::session::shell_arg as quote_arg;
+            let again = withdrawn
+                .iter()
+                .find_map(|name| name.strip_prefix("refs/heads/"))
+                .map(|branch| {
+                    format!(
+                        "`agit push {}` publishes it",
+                        quote_arg(&format!("{slug}@{branch}"))
+                    )
+                })
+                .unwrap_or_else(|| "naming its branch publishes them".into());
+            ui::hint(&format!(
+                "they stay in this checkout and later pushes leave them out; once the withdrawal is restored on the Hub, {again} again"
+            ));
+            let remaining: Vec<String> = branches
+                .iter()
+                .filter(|branch| !withdrawn.contains(&format!("refs/heads/{branch}")))
+                .cloned()
+                .collect();
+            if !remaining.is_empty() {
+                let retry = super::retry_push_command(args, slug, &remaining);
+                ui::error(&publication_recovery(&report, &retry, &repository));
+            }
+            return Ok(ExitCode::Policy);
+        }
+        if !report.ok() {
+            if in_parts {
+                ui::error(&format!(
+                    "part {part} of {total} did not complete; {published} parts before it are published"
+                ));
+            }
+            ui::error(&publication_recovery(&report, &retry_command, &repository));
+            return Ok(publication_failure_code(&report));
+        }
+        verify_receipt_acknowledgements(&report, &receipts)?;
+        if intent.explicit_hub {
+            intent.bind_delivered_origin(&repo, &destination)?;
+        }
+        for receipt in &receipts {
+            receipt.save(&repo)?;
+            crate::domain::privacy_receipt::save_acknowledged_tags(
+                &repo,
+                receipt,
+                projected.source_tags(),
+            )?;
+        }
+        if let (Some(reply), Some(candidate)) = (supervisor.take(), supervised) {
+            reply.complete(&repo, candidate)?;
+        }
+        recording.finish();
+        published += 1;
+        if !in_parts {
+            break;
+        }
+        // The next part is planned from what the Hub now holds, not from the first plan.
+        let previous = cuts.first().cloned();
+        remote =
+            crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
+                .context("cannot establish accepted publication history")?;
+        if cuts.len() > 1 {
+            (cuts, _) = plan_parts(&repo, &remote, &part_branches[0])
+                .map_err(|error| inconsistent(error, unsent_outcome(&target, published, total)))?;
+            ensure!(
+                cuts.first()
+                    .zip(previous.as_ref())
+                    .is_some_and(|(next, previous)| {
+                        next != previous && is_raw_ancestor(&repo, previous, next).unwrap_or(false)
+                    }),
+                "{published} of {total} parts are published, and the Hub's copy of the branch moved since; rerun `{retry_command}` to continue"
+            );
+            continue;
+        }
+        if finishing {
+            break;
+        }
+        // This branch is done; the next one with anything left to publish follows.
+        loop {
+            branch_index += 1;
+            let Some(branch) = selected_branches.get(branch_index) else {
+                break;
+            };
+            (cuts, _) = plan_parts(&repo, &remote, branch)
+                .map_err(|error| inconsistent(error, unsent_outcome(&target, published, total)))?;
+            if !cuts.is_empty() {
+                break;
+            }
+            if !idle.contains(branch) {
+                idle.push(branch.clone());
+            }
+        }
+        if branch_index == selected_branches.len() {
+            if idle.is_empty() {
+                break;
+            }
+            finishing = true;
+        }
     }
-    if !report.ok() {
-        ui::error(&publication_recovery(&report, &retry_command, &repository));
-        return Ok(publication_failure_code(&report));
+    if in_parts {
+        ui::success(&format!(
+            "Published reviewed sessions to {repository} in {published} parts."
+        ));
+    } else {
+        ui::success(&format!("Published reviewed sessions to {repository}."));
     }
-    verify_receipt_acknowledgements(&report, &receipts)?;
-    if intent.explicit_hub {
-        intent.bind_delivered_origin(&repo, &remote)?;
-    }
-    for receipt in &receipts {
-        receipt.save(&repo)?;
-        crate::domain::privacy_receipt::save_acknowledged_tags(
-            &repo,
-            receipt,
-            projected.source_tags(),
-        )?;
-    }
-    if let (Some(reply), Some(candidate)) = (supervisor, supervised) {
-        reply.complete(&repo, candidate)?;
-    }
-    recording.finish();
-    ui::success(&format!("Published reviewed sessions to {repository}."));
     Ok(ExitCode::Ok)
 }
 
@@ -680,6 +962,17 @@ fn inconsistent(error: anyhow::Error, outcome: String) -> anyhow::Error {
         error.context(outcome)
     } else {
         error
+    }
+}
+
+/// What a push refused before an upload leaves on the Hub: nothing, or the parts it already sent.
+fn unsent_outcome(target: &str, published: usize, total: usize) -> String {
+    if published == 0 {
+        format!("cannot push {target}; nothing was sent to the Hub")
+    } else {
+        format!(
+            "cannot push {target}; {published} of {total} parts are published, nothing more was sent"
+        )
     }
 }
 

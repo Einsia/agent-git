@@ -21,6 +21,9 @@ pub struct SessionPublicationPlan {
     pub configs: BTreeMap<String, SessionPrivacyResponse>,
     pub(crate) delivery: Option<super::delivery::Delivery>,
     pub(crate) sources: Option<SourceHistory>,
+    /// Branch to commit: where each branch is cut when the publication is one part of several
+    /// (see [`SessionPublicationPlan::plan_parts`]); empty for a whole publication.
+    pub(crate) pins: BTreeMap<String, String>,
     /// Withheld refs this publication plans again ([`accepted::Ledger::ask_again`]).
     pub(crate) asking_again: BTreeSet<String>,
     /// Repositories, `owner/repo`, that introduced snapshots may keep naming as their fork source,
@@ -75,20 +78,34 @@ fn walk_parents(
 /// commit must be one the branch itself accepted, or history the Hub holds under its own id. One
 /// only another branch accepted has its ancestry outside this branch's record, so it makes the
 /// publication carry the whole history. So does a cross-Hub delivery: it admits each session from
-/// its birth, and below a boundary the plan would name a later commit as the birth.
+/// its birth, and below a boundary the plan would name a later commit as the birth. With `pins`,
+/// each branch is cut at its pin, as one part of a publication in several; the whole-history
+/// cases cannot be cut, so they refuse instead.
 fn freeze_publication(
     source: &Repo,
     branches: &[String],
     held: &BTreeSet<String>,
     ledger: &accepted::Ledger,
     delivering: bool,
+    pins: &BTreeMap<String, String>,
 ) -> Result<PublicationPlan> {
+    let whole = |reason: &str| {
+        ensure!(
+            pins.is_empty(),
+            "this publication cannot be sent in parts: {reason}"
+        );
+        PublicationPlan::freeze_selected(source, branches)
+    };
     if delivering {
-        return PublicationPlan::freeze_selected(source, branches);
+        return whole("a cross-Hub delivery carries the whole history");
     }
     let mut stops = ledger.accepted_sources(branches);
     stops.extend(held.iter().cloned());
-    let plan = PublicationPlan::freeze_selected_after(source, branches, &stops)?;
+    let plan = if pins.is_empty() {
+        PublicationPlan::freeze_selected_after(source, branches, &stops)?
+    } else {
+        PublicationPlan::freeze_selected_after_at(source, pins, &stops, &BTreeSet::new())?
+    };
     if plan.boundary().is_empty() {
         return Ok(plan);
     }
@@ -106,7 +123,7 @@ fn freeze_publication(
                 continue;
             }
             if ledger.get(branch, &oid).is_none() && !held.contains(&oid) {
-                return PublicationPlan::freeze_selected(source, branches);
+                return whole("it continues history another branch accepted");
             }
         }
     }
@@ -124,6 +141,7 @@ impl SessionPublicationPlan {
         remote: RemoteRefs,
         register: bool,
         explicit_hub: bool,
+        pins: BTreeMap<String, String>,
     ) -> Result<Self> {
         ensure!(
             crate::domain::session_privacy::canonical_hub(client.base())? == identity.hub,
@@ -133,7 +151,7 @@ impl SessionPublicationPlan {
         let mut ledger = accepted::Ledger::open(source, &identity)?;
         ledger.reconcile(&remote)?;
         let delivering = explicit_hub || super::delivery::Delivery::active(source, &identity)?;
-        let plan = freeze_publication(source, branches, &held, &ledger, delivering)?;
+        let plan = freeze_publication(source, branches, &held, &ledger, delivering, &pins)?;
         let sources = SourceHistory::read(source, &plan)?;
         let history = &sources.history;
         require_remote_ancestry(source, &plan, &ledger, &remote, repository)?;
@@ -341,10 +359,46 @@ impl SessionPublicationPlan {
             configs,
             delivery,
             sources: Some(sources),
+            pins,
             asking_again: BTreeSet::new(),
             fork_sources,
             pinned_source,
         })
+    }
+
+    /// Where to cut `branch` so that it is published up to `head` in parts that each fit one
+    /// publication to a destination admitting `max_new_commits` per request, oldest first, with
+    /// the number of commits it adds: one cut, `head`, when the whole of it fits. The stops are the ones its freeze uses (this
+    /// branch's accepted sources and the history the destination holds), so planner and freeze
+    /// agree on what each part adds. A cut names its own session, since an unclaimed commit takes
+    /// its session from a descendant in the same publication. A destination this checkout
+    /// delivers to across Hubs is published whole.
+    pub fn plan_parts(
+        source: &Repo,
+        branch: &str,
+        head: &str,
+        identity: &RemoteIdentity,
+        remote: &RemoteRefs,
+        max_new_commits: usize,
+    ) -> Result<(Vec<String>, usize)> {
+        let source = source.clone().local_objects_only();
+        if super::delivery::Delivery::active(&source, identity)? {
+            return Ok((vec![head.to_owned()], 0));
+        }
+        let mut ledger = accepted::Ledger::open(&source, identity)?;
+        ledger.reconcile(remote)?;
+        let mut stops = ledger.accepted_sources(&[branch.to_owned()]);
+        stops.extend(PublicationPlan::held_history(&source, &remote.heads)?);
+        let history = crate::domain::repo::publication::NewHistory::read(&source, head, &stops)?;
+        let cuts = history.plan_parts(
+            crate::domain::repo::publication::PartBudget::new(max_new_commits),
+            |oid| {
+                crate::domain::storage::metadata_local(source.root(), oid).is_ok_and(|metadata| {
+                    !metadata.is_session_line() || !metadata.session.is_empty()
+                })
+            },
+        )?;
+        Ok((cuts, history.len()))
     }
 
     /// Withholds `source_ref` and `source_commit` together unless [`Self::fork_sources`] admits
@@ -646,6 +700,7 @@ impl ProjectedHistory {
             &held,
             &ledger,
             selected.delivery.is_some(),
+            &selected.pins,
         )?;
         preparing.detail(format!(
             "0/{} snapshots",
@@ -2311,6 +2366,7 @@ mod tests {
                     .into(),
                 delivery: None,
                 sources: None,
+                pins: Default::default(),
                 fork_sources: readable_fork_sources(
                     &hub,
                     (destination, agent),
