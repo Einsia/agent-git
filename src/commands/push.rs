@@ -528,16 +528,37 @@ fn publish_in_groups(
     branches: &[String],
     named: bool,
 ) -> CmdResult {
+    let yes = audited_push::Yes::from_environment();
+    // The command read the project policy just before this, and that read covers only the push's
+    // first publication. Every later one reads it again: its retry, a branch of a failed group
+    // published on its own, and a later group.
+    let first = std::cell::Cell::new(true);
     let publish = |group: &[String]| {
-        audited_push::run(
-            args,
-            client.clone(),
-            account,
-            checkout.clone(),
-            repo.clone(),
-            group,
-            named,
-        )
+        let attempt = |attempt| {
+            audited_push::run(
+                args,
+                client.clone(),
+                account,
+                checkout.clone(),
+                repo.clone(),
+                group,
+                named,
+                attempt,
+                &yes,
+                first.replace(false),
+            )
+        };
+        // Exactly one more attempt, from the start: a refusal of that one is reported as any other.
+        match attempt(audited_push::Attempt::First) {
+            Err(error) => match error.downcast::<audited_push::RefsMoved>() {
+                Ok(moved) => {
+                    ui::info(format_args!("{moved}; previewing it again"));
+                    attempt(moved.retry())
+                }
+                Err(error) => Err(error),
+            },
+            outcome => outcome,
+        }
     };
     if branches.len() == 1 {
         return publish(branches);

@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex,
@@ -63,6 +63,19 @@ struct Hub {
     withdrawn: Arc<Mutex<Option<String>>>,
     /// Publication previews fail as unavailable, answering nothing about the refs they plan.
     previews_unavailable: Arc<AtomicBool>,
+    /// Receives the Hub refuses as `publication_refs_moved`, one per receive, in order: each
+    /// first moves a ref `(name, oid)`, as another member's push between a preview and its receive
+    /// does, and with a visibility also gives the repository that visibility.
+    refuse_moved: Arc<Mutex<Vec<(String, String, Option<&'static str>)>>>,
+    /// While set, receives go through until one carries this oid, such as a later part's tip; the
+    /// refusals start there.
+    refuse_moved_from: Arc<Mutex<Option<String>>>,
+    /// A file the Hub writes as it refuses a receive as `publication_refs_moved`, standing in for
+    /// a setting the person changes on this computer between the refusal and the retry.
+    write_on_refusal: Arc<Mutex<Option<(PathBuf, String)>>>,
+    /// The refusal line the next refusal carries instead of `publication_refs_moved`, such as one
+    /// the client does not retry.
+    refuse_with: Arc<Mutex<Option<&'static str>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -115,6 +128,16 @@ impl Hub {
         let preview_unavailable = Arc::clone(&previews_unavailable);
         let visibility = Arc::new(Mutex::new("private"));
         let served_visibility = Arc::clone(&visibility);
+        let refuse_moved = Arc::new(Mutex::new(
+            Vec::<(String, String, Option<&'static str>)>::new(),
+        ));
+        let moving = Arc::clone(&refuse_moved);
+        let refuse_moved_from = Arc::new(Mutex::new(None::<String>));
+        let moving_from = Arc::clone(&refuse_moved_from);
+        let write_on_refusal = Arc::new(Mutex::new(None::<(PathBuf, String)>));
+        let writing = Arc::clone(&write_on_refusal);
+        let refuse_with = Arc::new(Mutex::new(None::<&'static str>));
+        let refusing_with = Arc::clone(&refuse_with);
         let publicize_when = Arc::new(Mutex::new(None::<String>));
         let publicizing = Arc::clone(&publicize_when);
         let resolver_hub = base.clone();
@@ -489,6 +512,39 @@ impl Hub {
                         target.starts_with("/alice/app.git/"),
                         "unexpected request: {first}"
                     );
+                    let refusal = (method == "POST" && target.ends_with("/git-receive-pack"))
+                        .then(|| {
+                            let mut from = moving_from.lock().unwrap();
+                            if from.as_ref().is_some_and(|oid| !contains(oid.as_bytes())) {
+                                return None;
+                            }
+                            *from = None;
+                            let mut queued = moving.lock().unwrap();
+                            (!queued.is_empty()).then(|| queued.remove(0))
+                        })
+                        .flatten();
+                    if let Some((name, oid, visibility)) = refusal {
+                        git(&root.join("alice/app.git"), &["update-ref", &name, &oid]);
+                        if let Some(visibility) = visibility {
+                            *served_visibility.lock().unwrap() = visibility;
+                        }
+                        if let Some((path, contents)) = writing.lock().unwrap().take() {
+                            fs::create_dir_all(path.parent().unwrap()).unwrap();
+                            fs::write(path, contents).unwrap();
+                        }
+                        // Framed as the Hub frames a refusal a client acts on, so git prints its
+                        // kind: a fatal packet, inside the side band when the push asked for one.
+                        let line = refusing_with.lock().unwrap().take().unwrap_or(
+                            "ERR HTTP 409 publication_refs_moved: the repository changed after this publication was previewed; preview it again\n",
+                        );
+                        let mut packet = format!("{:04x}{line}", line.len() + 4);
+                        if contains(b"side-band") {
+                            packet = format!("{:04x}\u{1}{packet}", packet.len() + 5);
+                        }
+                        let body = format!("{packet}0000");
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        continue;
+                    }
                     if method == "POST" && target.ends_with("/git-receive-pack") {
                         assert_eq!(user_agent, TRANSPORT_USER_AGENT);
                         let receipt: serde_json::Value = pending_receipt
@@ -588,6 +644,10 @@ impl Hub {
             publicize_when,
             withdrawn,
             previews_unavailable,
+            refuse_moved,
+            refuse_moved_from,
+            write_on_refusal,
+            refuse_with,
             stop,
             worker: Some(worker),
         }
@@ -1888,6 +1948,420 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     fs::write(work.join("README.md"), "Shared file, revised").unwrap();
     git(&work, &["commit", "-am", "Revise file"]);
     assert_success(&run(&["push", "alice/app@work"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+}
+
+/// A receipt the Hub refuses because the repository's refs moved after the preview (another
+/// member's push to any branch) is previewed again, once, from the start. The second attempt reads
+/// the destination and the project again and passes every gate again: a conversation dropped
+/// meanwhile is not sent, by the retry or by any later publication of the push, a branch of a
+/// failed group published again on its own included. A `--yes` given for the first attempt answers
+/// it only while it is the same publication: a repository that became public meanwhile, or sessions
+/// that changed, stop an unattended push before anything is sent. In a push in parts the retry's
+/// first part is compared with the refused one, and when the `--yes` no longer stands, a later part
+/// carrying encrypted sessions is not covered by a first part that went out under the plain-private
+/// policy. A `--yes` withdrawn this way stays withdrawn for the rest of the push, the branches of a
+/// failed group published again one at a time included. A second refusal is reported with the Hub's
+/// reason instead of retried. A push that gave up at the first refusal loses the upload to an
+/// unrelated push; one that resent its first receipt would be refused again; one that reused what
+/// it judged before the move, carried the `--yes` onto content nobody confirmed, let the
+/// plain-private policy stand in for it on a later encrypted part, or gave the `--yes` or the
+/// project's earlier answer back to the next attempt, would publish what nobody checked; and one
+/// that kept retrying would loop.
+#[test]
+fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
+    use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy, SessionScheme};
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let text = |out: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["new", "alice/app", "-b", "work", "--no-launch"]));
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let tip = git(&remote, &["rev-parse", "refs/heads/main"]);
+    let work = home.join("worktrees/alice/app/work");
+    let previews = || hub.previews.lock().unwrap().len();
+
+    let changed = "needs a new answer";
+
+    // Another member's branch lands between the preview and the receive. The retry is the same
+    // publication, so the `--yes` given for it still answers it, and it publishes.
+    *hub.visibility.lock().unwrap() = "public";
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/other".into(), tip.clone(), None)];
+    let pushed = run(&["--yes", "push", "alice/app@work"]);
+    assert_success(&pushed);
+    assert!(text(&pushed).contains("previewing it again"), "{pushed:?}");
+    assert!(!text(&pushed).contains(changed), "{pushed:?}");
+    assert_eq!(previews(), before + 2);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
+    *hub.visibility.lock().unwrap() = "private";
+
+    // A push in three parts, refused at its second part while the repository turned public. The
+    // retry plans from what the Hub holds, so its parts are numbered from one again: its first part
+    // is what remained of the refused one, and a second part follows it. The `--yes` given for a
+    // private publication answers neither, and nothing more is sent.
+    for part in ["one", "two", "three", "four", "five", "six"] {
+        fs::write(work.join("README.md"), format!("Shared file, part {part}")).unwrap();
+        git(&work, &["commit", "-am", &format!("Part {part}")]);
+    }
+    let unpublished: Vec<String> = git(
+        repo.root(),
+        &[
+            "rev-list",
+            "--reverse",
+            &format!("{published}..refs/heads/work"),
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(unpublished.len(), 6);
+    hub.max_new_commits.store(2, Ordering::Release);
+    *hub.refuse_moved_from.lock().unwrap() = Some(unpublished[3].clone());
+    *hub.refuse_moved.lock().unwrap() =
+        vec![("refs/heads/fifth".into(), tip.clone(), Some("public"))];
+    let refused = run(&["--yes", "push", "alice/app@work"]);
+    hub.max_new_commits.store(4096, Ordering::Release);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(text(&refused).contains("in 3 parts"), "{refused:?}");
+    assert!(text(&refused).contains("in 2 parts"), "{refused:?}");
+    assert!(
+        text(&refused).contains("previewing it again"),
+        "{refused:?}"
+    );
+    assert!(text(&refused).contains(changed), "{refused:?}");
+    assert!(
+        text(&refused)
+            .contains("publishing to a public repository needs the person's confirmation"),
+        "{refused:?}"
+    );
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        unpublished[1]
+    );
+    *hub.visibility.lock().unwrap() = "private";
+    let published = unpublished[1].clone();
+
+    // The repository became public meanwhile: the `--yes` given for a private publication does not
+    // answer a public one, and unattended the retry stops.
+    fs::write(work.join("README.md"), "Shared file, revised").unwrap();
+    git(&work, &["commit", "-am", "Revise file"]);
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() =
+        vec![("refs/heads/later".into(), tip.clone(), Some("public"))];
+    let refused = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        text(&refused).contains("previewing it again"),
+        "{refused:?}"
+    );
+    assert!(text(&refused).contains(changed), "{refused:?}");
+    assert!(
+        text(&refused)
+            .contains("publishing to a public repository needs the person's confirmation"),
+        "{refused:?}"
+    );
+    assert_eq!(previews(), before + 1);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
+    *hub.visibility.lock().unwrap() = "private";
+
+    // Refused again on the retry: reported with the Hub's reason, and not tried a third time.
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() = vec![
+        ("refs/heads/third".into(), tip.clone(), None),
+        ("refs/heads/fourth".into(), tip.clone(), None),
+    ];
+    let refused = run(&["push", "alice/app@work"]);
+    assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+    assert!(
+        text(&refused).contains("the repository changed after this publication was previewed"),
+        "{refused:?}"
+    );
+    assert_eq!(previews(), before + 2);
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
+
+    // The person drops the conversation between the refusal and the retry. The retry reads the
+    // project again before its preview and sends nothing.
+    let withheld = home.join("projects").join("withheld");
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/dropped".into(), tip.clone(), None)];
+    *hub.write_on_refusal.lock().unwrap() = Some((
+        withheld.clone(),
+        json!([{"repository":"alice/app","branch":"work","session":null,"reason":"dropped","announced":false}])
+            .to_string(),
+    ));
+    let refused = run(&["push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        text(&refused).contains("will not be uploaded from this computer"),
+        "{refused:?}"
+    );
+    assert!(
+        text(&refused).contains("nothing more was sent"),
+        "{refused:?}"
+    );
+    assert_eq!(previews(), before + 1);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
+    fs::remove_file(&withheld).unwrap();
+
+    // A push in parts whose retry is not the publication the `--yes` was given for: the repository
+    // turned private meanwhile. Unattended, the retry's first part may go out on its own (plain
+    // sessions to a private repository), but that is the policy's answer, not the person's, and it
+    // covers no later part carrying encrypted sessions.
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let plain = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let mut encrypted = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    encrypted.session_privacy = Some(SessionPrivacy {
+        scheme: SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(
+            AccountIdentity::new(&hub.base, "session-owner").unwrap(),
+        ))
+        .unwrap()
+    });
+    encrypted.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
+    let turn = |session: &meta::Meta, content: &str| {
+        let log = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let plain_turns: Vec<String> = (0..4)
+        .map(|index| turn(&plain, &format!("plain turn {index}")))
+        .collect();
+    for index in 0..2 {
+        turn(&encrypted, &format!("encrypted turn {index}"));
+    }
+    repo.git(&["checkout", "main"]).unwrap();
+    hub.max_new_commits.store(4, Ordering::Release);
+    *hub.visibility.lock().unwrap() = "public";
+    *hub.refuse_moved.lock().unwrap() =
+        vec![("refs/heads/sixth".into(), tip.clone(), Some("private"))];
+    let stopped = run(&["--yes", "push", "alice/app@talk"]);
+    hub.max_new_commits.store(4096, Ordering::Release);
+    assert!(!stopped.status.success(), "{stopped:?}");
+    assert!(text(&stopped).contains(changed), "{stopped:?}");
+    assert!(
+        text(&stopped).contains(
+            "1 of 2 parts are published; part 2 carries encrypted sessions, which need the person's confirmation"
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/talk"]),
+        plain_turns[3]
+    );
+    *hub.visibility.lock().unwrap() = "private";
+    let held = git(&remote, &["rev-parse", "refs/heads/work"]);
+
+    // The destination stays as it was, but the sessions change: the Hub gains the first of two
+    // unpublished commits on another branch, so the retry's preview no longer carries it. The
+    // `--yes` given for both does not answer what is left, and unattended the retry stops.
+    let gained = git(repo.root(), &["rev-parse", "refs/heads/work"]);
+    git(
+        &remote,
+        &[
+            "fetch",
+            "--quiet",
+            &repo.root().to_string_lossy(),
+            "refs/heads/work",
+        ],
+    );
+    fs::write(work.join("README.md"), "Shared file, revised again").unwrap();
+    git(&work, &["commit", "-am", "Revise file again"]);
+    *hub.visibility.lock().unwrap() = "public";
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/gained".into(), gained.clone(), None)];
+    let refused = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(text(&refused).contains(changed), "{refused:?}");
+    assert!(
+        text(&refused)
+            .contains("publishing to a public repository needs the person's confirmation"),
+        "{refused:?}"
+    );
+    assert_eq!(previews(), before + 1);
+    let answered = hub.manifests.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        answered["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["commit"] == gained),
+        "{answered}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), held);
+
+    // Several branches with --keep-going, refused while the repository turned public. The group's
+    // retry withdraws the `--yes`, and the branches then published again one at a time do not get
+    // it back: none of them goes out.
+    *hub.visibility.lock().unwrap() = "private";
+    *hub.refuse_moved.lock().unwrap() =
+        vec![("refs/heads/seventh".into(), tip.clone(), Some("public"))];
+    let stopped = run(&["--yes", "push", "alice/app", "--all", "--keep-going"]);
+    assert!(!stopped.status.success(), "{stopped:?}");
+    assert!(text(&stopped).contains("one at a time"), "{stopped:?}");
+    assert!(text(&stopped).contains(changed), "{stopped:?}");
+    assert!(
+        text(&stopped).contains("--yes no longer applies in this push"),
+        "{stopped:?}"
+    );
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), held);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/talk"]),
+        plain_turns[3]
+    );
+
+    // Several branches with --keep-going, and the person drops one conversation as the group is
+    // refused. The group's retry stops on it, and so does that branch when it is published again on
+    // its own: the command read the project before the group, and that read covers no later
+    // publication. The other branch goes out.
+    *hub.visibility.lock().unwrap() = "private";
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/eighth".into(), tip.clone(), None)];
+    *hub.write_on_refusal.lock().unwrap() = Some((
+        withheld.clone(),
+        json!([{"repository":"alice/app","branch":"work","session":null,"reason":"dropped","announced":false}])
+            .to_string(),
+    ));
+    let partly = run(&["--yes", "push", "alice/app", "--all", "--keep-going"]);
+    assert!(!partly.status.success(), "{partly:?}");
+    assert!(text(&partly).contains("one at a time"), "{partly:?}");
+    assert!(
+        text(&partly).contains("`alice/app@work` will not be uploaded from this computer"),
+        "{partly:?}"
+    );
+    assert!(
+        text(&partly).contains("1 of 3 branches were not published: work"),
+        "{partly:?}"
+    );
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), held);
+    // talk ends on encrypted turns, which reach the Hub as their envelopes, not as the local
+    // commits; its remote tip moving past the plain part published before is what shows the
+    // fallback published it.
+    let talk = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(talk, plain_turns[3]);
+    fs::remove_file(&withheld).unwrap();
+
+    // The same without any retry: the group is refused for a reason the push does not retry,
+    // and the person drops a conversation meanwhile. Each branch then published again on its own
+    // is a later publication of the push, so it reads the project again, as a later group does.
+    // talk gains a turn of the session it ended on, so the group reaches its receive whether or
+    // not talk's earlier turns are already on the Hub.
+    repo.git(&["checkout", "talk"]).unwrap();
+    turn(&encrypted, "encrypted turn 2");
+    repo.git(&["checkout", "main"]).unwrap();
+    *hub.visibility.lock().unwrap() = "private";
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/ninth".into(), tip.clone(), None)];
+    *hub.refuse_with.lock().unwrap() =
+        Some("ERR HTTP 413 quota_exceeded: the push exceeds the repository quota\n");
+    *hub.write_on_refusal.lock().unwrap() = Some((
+        withheld.clone(),
+        json!([{"repository":"alice/app","branch":"talk","session":null,"reason":"dropped","announced":false}])
+            .to_string(),
+    ));
+    let partly = run(&["--yes", "push", "alice/app", "--all", "--keep-going"]);
+    assert!(!partly.status.success(), "{partly:?}");
+    assert!(!text(&partly).contains("previewing it again"), "{partly:?}");
+    assert!(text(&partly).contains("one at a time"), "{partly:?}");
+    assert!(
+        text(&partly).contains("`alice/app@talk` will not be uploaded from this computer"),
+        "{partly:?}"
+    );
+    assert!(
+        text(&partly).contains("1 of 3 branches were not published: talk"),
+        "{partly:?}"
+    );
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), talk);
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
         git(repo.root(), &["rev-parse", "refs/heads/work"])

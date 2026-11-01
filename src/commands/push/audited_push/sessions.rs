@@ -4,6 +4,7 @@ use super::*;
 use crate::domain::privacy_git::sessions::SessionPublicationPlan;
 use crate::domain::repo::publication::{PublicationPlan, is_raw_ancestor};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     args: &Args,
     client: Client,
@@ -12,22 +13,30 @@ pub(super) fn run(
     named: bool,
     slug: &str,
     destination: Destination,
+    attempt: super::Attempt,
+    yes: &super::Yes,
+    policy_checked: bool,
 ) -> CmdResult {
     let retry_command = super::retry_push_command(args, slug, branches);
-    // Read again before every part of a publication sent in several, so that dropping the project
-    // or turning automatic publication off stops the parts not yet sent.
-    let still_publishable = |repo: &Repo, branch: &str| -> Result<()> {
-        if let Some(reason) = crate::commands::project::withheld(slug, branch)? {
-            anyhow::bail!(
-                "`{slug}@{branch}` will not be uploaded from this computer: {}",
-                reason.describe()
+    // Read again before every publication the command's own read does not cover, so that dropping
+    // the project or turning automatic publication off stops what is not yet sent. A part's
+    // branches are judged by one read: judged one at a time, a group pays a full scan of the
+    // session store for every branch.
+    let still_publishable = |repo: &Repo, branches: &[String]| -> Result<()> {
+        let verdicts = crate::commands::project::withheld_all(slug, branches)?;
+        for (branch, verdict) in branches.iter().zip(verdicts) {
+            if let Some(reason) = verdict {
+                anyhow::bail!(
+                    "`{slug}@{branch}` will not be uploaded from this computer: {}",
+                    reason.describe()
+                );
+            }
+            ensure!(
+                std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_none()
+                    || !crate::commands::project::blocks_auto_push(repo, slug, branch)?,
+                "automatic publication of `{slug}@{branch}` was turned off"
             );
         }
-        ensure!(
-            std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_none()
-                || !crate::commands::project::blocks_auto_push(repo, slug, branch)?,
-            "automatic publication of `{slug}@{branch}` was turned off"
-        );
         Ok(())
     };
     let Destination {
@@ -111,11 +120,12 @@ pub(super) fn run(
             intent.hub,
             intent.visibility
         );
-        let confirmed = std::env::var_os("AGIT_YES").is_some()
+        let confirmed = yes.answers()
             || ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
                 crate::commands::InteractionRequired(
-                    "cross-Hub delivery requires confirmation; use --yes or an interactive terminal".into()
-                )
+                "cross-Hub delivery requires confirmation; use --yes or an interactive terminal"
+                    .into(),
+            )
             })?;
         if !confirmed {
             ui::info("Cross-Hub delivery cancelled.");
@@ -150,8 +160,7 @@ pub(super) fn run(
             "Create the {} repository {repository} on {} to prepare its session publication preview?",
             intent.visibility, intent.hub
         );
-        let confirmed = if automatic || delivery_confirmed || std::env::var_os("AGIT_YES").is_some()
-        {
+        let confirmed = if automatic || delivery_confirmed || yes.answers() {
             true
         } else {
             ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
@@ -352,15 +361,15 @@ pub(super) fn run(
                 .join(", ")
         ));
     }
-    // With nobody to confirm the push (no terminal and no --yes, and no automatic upload or
-    // confirmed delivery standing in for the person), a part goes out only if it may on its own:
-    // plain sessions to a private repository. The first part's yes then covers no later part that
-    // carries encrypted sessions; that part stops before it is sent.
-    let nobody_to_ask = !automatic
-        && !delivery_confirmed
-        && !args.audit
-        && std::env::var_os("AGIT_YES").is_none()
-        && !ui::prompt::can_ask();
+    // The `--yes`, unless an earlier attempt of this push withdrew it.
+    let yes_given = yes.answers();
+    // Whether the `--yes` this run started with (and a cross-Hub delivery it confirmed) still
+    // stands: always on a first attempt; on a retry, decided by its first preview, before any part
+    // may count as covered.
+    let mut yes_stands = match &attempt {
+        super::Attempt::First => Some(true),
+        super::Attempt::Retry(_) => None,
+    };
     let _ = warmed.join();
     // The first publication resolves its sessions under the stage that read the remote history,
     // so a refusal there stops that stage; each later part opens its own.
@@ -417,16 +426,22 @@ pub(super) fn run(
         } else {
             std::collections::BTreeMap::new()
         };
-        if part > 1 {
-            // A later part checks the destination as it is now: a repository answer the client
-            // reuses from before the previous part landed would hide an audience that changed
-            // since, and the first part's confirmation covers only the audience it named.
+        // Every part but the push's very first checks the destination and the project as they are
+        // now: a repository answer the client reuses from before an earlier part or publication
+        // would hide an audience that changed since, and the project may have dropped or excluded
+        // the conversation meanwhile. The command reads the project only before the push's first
+        // publication; its retry, a branch of a failed group published on its own and a later
+        // group start at part 1 too.
+        let rechecks = part > 1 || !policy_checked;
+        if rechecks {
             client.forget_probes();
-            for branch in &part_branches {
-                still_publishable(&repo, branch).with_context(|| {
+            still_publishable(&repo, &part_branches).with_context(|| {
+                if published > 0 {
                     format!("{published} of {total} parts are published; nothing more was sent")
-                })?;
-            }
+                } else {
+                    "nothing more was sent".to_owned()
+                }
+            })?;
         }
         let mut selected = SessionPublicationPlan::resolve(
             &repo,
@@ -582,7 +597,10 @@ pub(super) fn run(
             preview.path = numbered;
         }
         previewing.finish();
-        let interactive_part = part == 1 || args.audit || (args.show_preview && !automatic);
+        // A retry's first preview is compared with the refused part whatever its number, so it is
+        // shown and answered as a first part is, never covered by an earlier answer.
+        let interactive_part =
+            part == 1 || yes_stands.is_none() || args.audit || (args.show_preview && !automatic);
         if interactive_part {
             println!("Publication destination: {}", intent.describe());
         }
@@ -600,6 +618,28 @@ pub(super) fn run(
         };
         let encrypted = receipts.iter().any(|receipt| receipt.mode.is_encrypted());
         let public = intent.visibility == "public";
+        let previewed = super::Previewed::of(&projected, &intent.visibility)?;
+        // A `--yes` given before the Hub refused the receipt answers the retry only for the same
+        // publication. If the new preview differs, it is asked again at a terminal and stops
+        // without one, as if no `--yes` had been given: a cross-Hub delivery it confirmed included.
+        let stands = *yes_stands.get_or_insert_with(|| match &attempt {
+            super::Attempt::First => true,
+            super::Attempt::Retry(refused) => *refused == previewed,
+        });
+        if yes_given && !stands {
+            yes.withdraw();
+        }
+        let yes_answers = yes_given && stands;
+        let delivery_answers = delivery_confirmed && (stands || !yes_given);
+        // With nobody to confirm the push (no terminal and no standing --yes, and no automatic
+        // upload or confirmed delivery standing in for the person), a part goes out only if it may
+        // on its own: plain sessions to a private repository. The first part's answer then covers
+        // no later part that carries encrypted sessions; that part stops before it is sent.
+        let nobody_to_ask = !automatic
+            && !delivery_answers
+            && !args.audit
+            && !yes_answers
+            && !ui::prompt::can_ask();
         let decision = confirm_publication(
             reviewed.as_ref().is_none_or(|review| review.complete()),
             args.dry_run,
@@ -614,13 +654,22 @@ pub(super) fn run(
                 if !interactive_part {
                     return Ok(Some(true));
                 }
+                if yes_given && !stands {
+                    ui::info(
+                        "the publication changed after --yes was given for it, so it needs a new answer",
+                    );
+                } else if yes.given() && !yes_given {
+                    ui::info(
+                        "--yes no longer applies in this push, because an earlier publication changed after it was given",
+                    );
+                }
                 let answered = Answer {
                     person_only,
                     public,
-                    delivery_confirmed,
+                    delivery_confirmed: delivery_answers,
                     automatic,
                     audit: args.audit,
-                    agit_yes: std::env::var_os("AGIT_YES").is_some(),
+                    agit_yes: yes_answers,
                     encrypted,
                     can_ask: ui::prompt::can_ask(),
                 }
@@ -708,11 +757,9 @@ pub(super) fn run(
             !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
             "automatic publication was disabled during inspection"
         );
-        // The policy checked before the first part is read again before every later one.
-        if part > 1 {
-            for branch in &part_branches {
-                still_publishable(&repo, branch)?;
-            }
+        // The policy checked before the part is read again before its upload.
+        if rechecks {
+            still_publishable(&repo, &part_branches)?;
         }
         let (materialized, destination) = intent.materialize(&client, repo)?;
         repo = materialized;
@@ -837,6 +884,10 @@ pub(super) fn run(
             return Ok(ExitCode::Policy);
         }
         if !report.ok() {
+            // What reached the Hub stays acknowledged above; the next attempt plans only the rest.
+            if matches!(attempt, super::Attempt::First) && super::refs_moved(&report) {
+                return Err(super::RefsMoved { refused: previewed }.into());
+            }
             if in_parts {
                 ui::error(&format!(
                     "part {part} of {total} did not complete; {published} parts before it are published"
