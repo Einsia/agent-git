@@ -3,6 +3,10 @@
 //! still keeps a folder from it.
 #![cfg(unix)]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::json;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -34,7 +38,7 @@ impl Lab {
         );
         Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", path)
             .env("HOME", self.path("home"))
             .env("AGIT_HOME", self.path("agit"))

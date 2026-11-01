@@ -1,5 +1,8 @@
 //! Public lifecycle commands consume retained Archive identity without selecting new authority.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::commands::{merge, plumbing};
 use agit::domain::{
     archive_history,
@@ -17,6 +20,7 @@ use agit::domain::{
     store::Store,
     transcript,
 };
+use lab_env::LabEnv;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -276,7 +280,7 @@ impl Lab {
         command
             .args(args)
             .current_dir(&self.home)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.agit)
@@ -1932,7 +1936,7 @@ impl Lab {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "archive_completion_driver", "--nocapture"])
-            .env_clear()
+            .env_clear_local()
             .current_dir(&self.home)
             .stdin(Stdio::null());
         for (key, value) in environment.get_envs() {

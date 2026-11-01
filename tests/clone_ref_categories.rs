@@ -1,7 +1,11 @@
 //! Acquiring a repository does not make an absent selected branch or version a generic failure.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo};
 use agit::hub::identity::{self, RemoteIdentity};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -251,7 +255,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.env_clear();
+        cmd.env_clear_local();
         for key in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(key) {
                 cmd.env(key, value);

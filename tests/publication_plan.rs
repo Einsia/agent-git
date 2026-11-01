@@ -2,9 +2,13 @@
 
 #![cfg(feature = "cli")]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::repo::Repo;
 use agit::domain::repo::publication::PublicationPlan;
 use agit::domain::secrets::{self, ScanPlan, Source};
+use lab_env::LabEnv;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -50,7 +54,7 @@ fn frozen_plan_drives_scanner_after_live_refs_move() {
             std::fs::create_dir(home.path().join(path)).unwrap();
         }
         let mut child = Command::new(std::env::current_exe().unwrap());
-        child.env_clear();
+        child.env_clear_local();
         for key in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(key) {
                 child.env(key, value);

@@ -2,6 +2,10 @@
 //! the disk: no half-built repository may be left behind for the next attempt to hit
 //! "already exists". `--rebind` is the only way to rebind explicitly.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::path::Path;
 use std::{fs, process::Command};
 
@@ -124,7 +128,7 @@ fn agit_under_agent_terminal(home: &Path, work: &Path, args: &[&str]) -> (bool, 
 
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-    builder.env_clear();
+    builder.env_clear_local();
     let path = std::env::var("PATH").unwrap_or_default();
     let store = home.join("agit");
     for (key, value) in [

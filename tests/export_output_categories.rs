@@ -1,5 +1,10 @@
 //! A valid export with an unavailable output path is a local precondition failure.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
+
 #[path = "support/startup_cache.rs"]
 mod startup_cache;
 
@@ -75,7 +80,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for key in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

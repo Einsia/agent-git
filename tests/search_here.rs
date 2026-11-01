@@ -1,6 +1,10 @@
 //! Code-origin search refuses unproved scopes before returning any candidate content.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::infra::credentials::{HubCredential, save_at};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -187,7 +191,7 @@ impl Lab {
     fn command(&self, program: impl AsRef<OsStr>, base: &str) -> Command {
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
@@ -290,7 +294,7 @@ fn run_bounded(mut command: Command) -> Output {
 fn run_tty(lab: &Lab, base: &str, args: &[&str]) -> (u32, String) {
     let template = lab.command(env!("CARGO_BIN_EXE_agit"), base);
     let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-    command.env_clear();
+    command.env_clear_local();
     for (name, value) in template.get_envs() {
         if name != "CI"
             && let Some(value) = value
@@ -458,7 +462,7 @@ const ORIGIN: &str = "ssh://git@Example.test:2222/team/Repo.git";
 fn git(lab: &Lab, args: &[&str]) -> String {
     let mut command = Command::new("git");
     command
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GIT_CONFIG_GLOBAL", lab.home.join("empty-gitconfig"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

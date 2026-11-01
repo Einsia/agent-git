@@ -1,4 +1,8 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,7 +15,7 @@ const SID: &str = "ses_pending_fixture";
 
 fn isolated(program: impl AsRef<std::ffi::OsStr>, root: &Path) -> Command {
     let mut command = Command::new(program);
-    command.env_clear();
+    command.env_clear_local();
     for key in [
         "PATH",
         "SystemRoot",

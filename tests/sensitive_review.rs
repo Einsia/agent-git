@@ -1,4 +1,8 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -73,7 +77,7 @@ impl Fixture {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for key in [
             "PATH",
             "SystemRoot",

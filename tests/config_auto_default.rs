@@ -1,3 +1,7 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -5,7 +9,7 @@ fn config(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_agit"))
         .arg("config")
         .args(args)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root)
         .env("USERPROFILE", root)

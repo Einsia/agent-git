@@ -1,11 +1,16 @@
 //! JSON recovery is typed advisory data, while explicit version 1 keeps its closed envelope.
 
 #[cfg(unix)]
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+#[cfg(unix)]
 #[path = "support/local_state.rs"]
 mod local_state;
 
 #[cfg(unix)]
 mod unix {
+    use super::lab_env::LabEnv;
     use super::local_state;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -42,7 +47,7 @@ mod unix {
             let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
             command
                 .args(args)
-                .env_clear()
+                .env_clear_local()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &self.home)
                 .env("AGIT_HOME", &self.store)

@@ -1,11 +1,15 @@
 //! Shell completion stdout stays executable when setup also reports integration results.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 fn command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-    command.env_clear();
+    command.env_clear_local();
     for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);

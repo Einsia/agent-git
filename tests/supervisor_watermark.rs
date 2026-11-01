@@ -5,7 +5,11 @@
 //! HEAD is the same on both sides, and a HEAD-based watermark judges every successful settlement
 //! as "HEAD did not move". This pins that contract from the CLI entry point.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::repo::Repo;
+use lab_env::LabEnv;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::{fs, io::Write as _};
@@ -57,7 +61,7 @@ impl Lab {
         let mut c = Command::new(env!("CARGO_BIN_EXE_agit"));
         c.args(args)
             .current_dir(&self.work)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))

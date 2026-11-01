@@ -1,5 +1,10 @@
 //! Quiet remote commands retain data and authority while suppressing their own routine notices.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
+
 #[path = "support/publication_identity.rs"]
 mod publication_identity;
 
@@ -204,7 +209,7 @@ impl Lab {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
@@ -247,7 +252,7 @@ impl Lab {
         let environment = self.command("http://127.0.0.1:1", &[], "ordinary");
         let mut command = Command::new("git");
         command
-            .env_clear()
+            .env_clear_local()
             .envs(
                 environment
                     .get_envs()

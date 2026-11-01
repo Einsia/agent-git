@@ -1,5 +1,9 @@
 //! A discovered native transcript is a candidate, not permission to adopt it.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
 const HUB: &str = "http://127.0.0.1:1";
@@ -103,7 +107,7 @@ impl Lab {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)
@@ -188,7 +192,7 @@ impl Lab {
                 .arg(format!("exec \"$1\" import {tail}"))
                 .arg("import-retry")
                 .arg(env!("CARGO_BIN_EXE_agit"));
-            shell.env_clear().envs(environment);
+            shell.env_clear_local().envs(environment);
             shell
         };
         let output = shell.current_dir(&self.work).output().unwrap();
@@ -1183,7 +1187,7 @@ fn target_selection_state(lab: &Lab) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 fn target_git(lab: &Lab, repo: &std::path::Path, args: &[&str]) -> String {
     let environment = lab.command();
     let mut command = Command::new("git");
-    command.env_clear();
+    command.env_clear_local();
     for (key, value) in environment.get_envs() {
         if let Some(value) = value {
             command.env(key, value);

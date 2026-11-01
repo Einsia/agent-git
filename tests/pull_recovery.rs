@@ -1,6 +1,10 @@
 //! Recovery text retains the selected repository and survives native shell argument parsing.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::meta;
+use lab_env::LabEnv;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -109,7 +113,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>, session: Option<&str>) -> Command {
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for key in [
             "PATH",
             "SystemRoot",

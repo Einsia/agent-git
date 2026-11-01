@@ -2,7 +2,11 @@
 
 //! Privacy export projects the selected snapshot before rendering or writing output.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, privacy::PrivacyPolicy, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::process::Command;
 
@@ -83,7 +87,7 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
 
     let run = |args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

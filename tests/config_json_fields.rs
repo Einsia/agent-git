@@ -1,10 +1,14 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::process::Command;
 
 fn run(root: &std::path::Path, args: &[&str], environment: &[(&str, &str)]) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_agit"))
         .args(["--json", "config"])
         .args(args)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root)
         .env("AGIT_HOME", root.join("agit"))

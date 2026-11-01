@@ -2,6 +2,9 @@
 
 //! A real Git receiver must see projected ancestry while encrypted snapshots retain the originals.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, privacy_envelope::PrivacyEnvelope, repo::Repo, storage, transcript};
 use agit::infra::{
     config,
@@ -9,6 +12,7 @@ use agit::infra::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crypto_box::SecretKey;
+use lab_env::LabEnv;
 use serde_json::json;
 use std::{
     fs,
@@ -686,7 +690,7 @@ impl Drop for Hub {
 
 fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
-    command.env_clear();
+    command.env_clear_local();
     for name in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -753,7 +757,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let run_home = |args: &[&str], automatic: bool, selected_home: &Path| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -1513,7 +1517,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let registered = "zephyr-orchid-7741";
     let environment = git_command(temp.path());
     let mut add = Command::new(env!("CARGO_BIN_EXE_agit"));
-    add.env_clear();
+    add.env_clear_local();
     for (name, value) in environment.get_envs() {
         if let Some(value) = value {
             add.env(name, value);
@@ -1790,7 +1794,7 @@ fn an_explicit_destination_publishes_without_rebinding_the_checkout() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -1887,7 +1891,7 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -1999,7 +2003,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -2400,7 +2404,7 @@ fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -2544,7 +2548,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
     let run_at = |hub: &str, args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3022,7 +3026,7 @@ fn continued_plain_session_declares_only_what_it_adds() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3284,7 +3288,7 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3445,7 +3449,7 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3583,7 +3587,7 @@ fn continued_encrypted_session_keeps_its_public_identity() {
     let run = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3749,7 +3753,7 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
     let run = |args: &[&str], automatic: bool| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -3962,7 +3966,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
     let run_in = |home: &Path, args: &[&str], automatic: bool| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in environment.get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -4012,7 +4016,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         let pair = native_pty_system().openpty(PtySize::default()).unwrap();
         let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-        builder.env_clear();
+        builder.env_clear_local();
         for (name, value) in git_command(temp.path()).get_envs() {
             if let Some(value) = value {
                 builder.env(name, value);
@@ -4328,7 +4332,7 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     sign_in(&laptop);
     let run_in = |home: &Path, args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (name, value) in git_command(temp.path()).get_envs() {
             if let Some(value) = value {
                 command.env(name, value);
@@ -4416,7 +4420,7 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-    builder.env_clear();
+    builder.env_clear_local();
     for (name, value) in git_command(temp.path()).get_envs() {
         if let Some(value) = value {
             builder.env(name, value);

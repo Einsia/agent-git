@@ -1,5 +1,9 @@
 //! Invalid completion shells are argument errors before any requested integration is installed.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,7 +39,7 @@ fn invalid_completion_shells_refuse_before_startup_or_integration_writes() {
             fs::write(work.join("AGENTS.md"), "Synthetic project instructions.\n").unwrap();
             let before = inventory(root.path());
             let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-            command.env_clear();
+            command.env_clear_local();
             for name in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
                 if let Some(value) = std::env::var_os(name) {
                     command.env(name, value);

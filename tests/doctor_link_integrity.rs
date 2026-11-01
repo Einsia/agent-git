@@ -1,6 +1,10 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::meta::{self, Meta};
 use agit::domain::repo::Repo;
 use agit::domain::{link, store::Store};
+use lab_env::LabEnv;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -50,7 +54,7 @@ impl Lab {
         command
             .arg("doctor")
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self._root.path())
             .env("USERPROFILE", self._root.path())

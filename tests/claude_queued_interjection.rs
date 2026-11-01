@@ -4,6 +4,10 @@
 //! entry point this pins two things: after adoption the sentence is readable in the VIEW, and it
 //! does not split one turn into two.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::process::Command;
 use std::{fs, io::Write as _};
 
@@ -55,7 +59,7 @@ impl Lab {
         let out = Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(args)
             .current_dir(&self.work)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.agit_home)

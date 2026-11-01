@@ -1,6 +1,10 @@
 //! A read-only checkout cannot be published through an implicitly created destination.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::meta;
+use lab_env::LabEnv;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -84,7 +88,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -455,7 +459,7 @@ fn audited_push_refuses_captured_stdio_before_startup_or_hub_activity() {
     ] {
         let json = tail.contains(&"--json");
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

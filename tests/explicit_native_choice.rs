@@ -1,5 +1,9 @@
 //! Runtime transcript discovery can list candidates but cannot choose one for adoption.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::{fs, process::Command};
 
 const SESSION: &str = "abababab-0000-4000-8000-000000000001";
@@ -37,7 +41,7 @@ fn refuses_implicit_import(target: Option<&str>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
     command
         .current_dir(&work)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &home)
         .env("AGIT_HOME", &store)

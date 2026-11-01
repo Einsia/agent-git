@@ -1,5 +1,9 @@
 //! Terminal categories distinguish absent references from malformed command syntax.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -43,7 +47,7 @@ impl Lab {
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)

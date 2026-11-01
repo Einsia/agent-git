@@ -1,7 +1,11 @@
 //! Sharing and search preserve terminal categories without changing identity or replaying requests.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, storage, transcript};
 use agit::infra::credentials::{HubCredential, save_at};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -241,7 +245,7 @@ impl Lab {
     fn process(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)

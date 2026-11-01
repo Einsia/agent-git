@@ -1,6 +1,10 @@
 //! Ambiguous selectors refuse before refs or claims change, with diagnostics separate from data.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fs;
@@ -56,7 +60,7 @@ impl Lab {
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)

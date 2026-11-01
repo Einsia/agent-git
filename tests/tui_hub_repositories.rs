@@ -1,5 +1,10 @@
 #![cfg(unix)]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
+
 #[path = "support/terminal_screen.rs"]
 mod terminal_screen;
 
@@ -300,7 +305,7 @@ impl Terminal {
         let runtime_home = lab.temp.path().join("runtime-home");
         std::fs::create_dir_all(&runtime_home).unwrap();
         builder.cwd(&lab.work);
-        builder.env_clear();
+        builder.env_clear_local();
         builder.env("PATH", std::env::var_os("PATH").unwrap_or_default());
         builder.env("HOME", &runtime_home);
         builder.env("CODEX_HOME", runtime_home.join(".codex"));

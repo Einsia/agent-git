@@ -1,5 +1,9 @@
 //! Provider repair changes only the receiving runtime's portable configuration.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::{
@@ -445,7 +449,7 @@ impl Lab {
         let paths = std::iter::once(self.bin.clone()).chain(std::env::split_paths(&inherited_path));
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("HOME", &self.home)
             .env("CODEX_HOME", &self.codex_home)

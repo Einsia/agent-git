@@ -1,5 +1,9 @@
 //! Capturing standard streams preserves command arguments, stdin, and execution count.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
@@ -35,7 +39,7 @@ impl Lab {
         command
             .args(args)
             .current_dir(&self.cwd)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
