@@ -328,6 +328,8 @@ pub fn run(args: Args) -> CmdResult {
         shell_q(&work_dir.to_string_lossy()),
         launch
     );
+    // Asked here, a yes still sets up the hooks this session's runtime is about to load.
+    super::setup::presence::when_ready();
     if args.no_launch {
         println!("\n  {}", ui::accent(&cmd));
         println!(

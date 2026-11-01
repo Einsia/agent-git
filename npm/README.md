@@ -74,6 +74,12 @@ Unsupported operating system and architecture pairs get no prebuilt binary: runn
 - If npm skips the install script (npm 12 and later without `--allow-scripts`,
   `--ignore-scripts`, or a policy that blocks it), the CLI is installed but no
   skills, hooks or MCP are wired: run `agit setup` once.
+- An agit that was never set up says so when a command that starts or records capture
+  runs (`on`, `save`, `import`, `new`, `resume`, `run`, `commit`, and `login`). A
+  terminal a person answers is asked once whether to set it up now, after a list of what
+  that writes; No is the default and is remembered. Any other caller, such as an agent,
+  a script or CI, gets one line a day and nothing is written outside `AGIT_HOME`. Reads
+  never show it. `agit doctor` reports the state, including a decline.
 - If npm suppresses postinstall, the next invocation of a globally installed
   `agit` schedules a guarded RC daemon reconciliation in the background.
   npm cannot run the daemon handoff at install time when it suppresses scripts.
@@ -83,7 +89,7 @@ Unsupported operating system and architecture pairs get no prebuilt binary: runn
 | Variable         | Effect                                                              |
 | ---------------- | ------------------------------------------------------------------- |
 | `AGIT_BINARY`    | Point at an existing `agit` binary; shim and postinstall honor it.  |
-| `AGIT_SKIP_SETUP`| Skip the postinstall `agit setup` (CI, managed environments).       |
+| `AGIT_SKIP_SETUP`| Skip the postinstall `agit setup`, and the notice that agit is not set up (CI, managed environments). |
 | `AGIT_FORCE_INSTALL` | Also run postinstall inside the source checkout (CI smoke tests). |
 | `AGIT_HUB_URL`   | Point the CLI at another hub (default `https://agent-git.com`).  |
 | `AGIT_NPM_REGISTRY` | Registry `agit upgrade` downloads platform packages from.        |

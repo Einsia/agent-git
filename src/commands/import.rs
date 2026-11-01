@@ -498,6 +498,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
                 ui::session::shell_arg(&lk.source)
             ))
         );
+        super::setup::presence::when_ready();
         return Ok(ExitCode::Ok);
     }
 
@@ -550,7 +551,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         landing.rollback();
         restore_attached();
     }
-    outcome
+    super::setup::presence::after(outcome)
 }
 
 /// Warn when an import resolves to a session other than the conversation the environment names,

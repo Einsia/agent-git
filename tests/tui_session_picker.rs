@@ -19,7 +19,30 @@ struct Terminal {
 }
 
 impl Terminal {
+    /// A terminal on a computer where agit is set up; the not-set-up notice has tests of its own.
     fn start(home: &std::path::Path, cwd: &std::path::Path, command: &str, columns: u16) -> Self {
+        Self::spawn(home, cwd, command, columns, &[("AGIT_SKIP_SETUP", "1")])
+    }
+
+    /// The same terminal on a computer where agit was never set up, with `environment` added:
+    /// the runtime folder the test makes holds no agit Skill.
+    fn start_not_set_up(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        command: &str,
+        columns: u16,
+        environment: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn(home, cwd, command, columns, environment)
+    }
+
+    fn spawn(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        command: &str,
+        columns: u16,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -49,6 +72,9 @@ impl Terminal {
         builder.env("CODEX_HOME", runtime_home.join(".codex"));
         builder.env("AGIT_HOME", home);
         builder.env("AGIT_HUB_URL", "http://127.0.0.1:1");
+        for (name, value) in environment {
+            builder.env(name, value);
+        }
         builder.env("TERM", "xterm-256color");
         builder.env("GIT_CONFIG_NOSYSTEM", "1");
         builder.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -280,6 +306,67 @@ fn bare_resume_and_agit_tui_show_the_same_adopted_session() {
         terminal.type_keys("q");
         assert!(terminal.child.wait().unwrap().success());
     }
+}
+
+/// Where agit was never set up, the question waits for a command that is ready to act. Bare
+/// `agit` (the TUI) never asks and writes no notice record; an `agit resume` refused on its
+/// argument says nothing and writes no record either, so the next `agit resume` still asks,
+/// before its picker takes the terminal, and Enter declines. A notice run for the TUI would put
+/// its question under a drawn screen, one asked once the picker had the terminal would never be
+/// seen, and one asked ahead of the argument check holds the refusal behind a question about a
+/// command that does nothing.
+#[test]
+fn a_computer_without_setup_is_asked_once_a_command_is_ready_and_never_under_the_tui() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    let home = tmp.path().join("agit");
+    fixture(&home);
+    native_fixture(&home, &cwd, true);
+    let record = home.join("setup-notice.json");
+    let mut terminal = Terminal::start_not_set_up(&home, &cwd, "--tui", 100, &[]);
+    terminal.wait_for("enter continue");
+    terminal.wait_for("me/fixture");
+    terminal.type_keys("q");
+    assert!(terminal.child.wait().unwrap().success());
+    assert!(!String::from_utf8_lossy(&terminal.captured).contains("Set it up now?"));
+    assert!(!record.exists());
+    let mut terminal = Terminal::start_not_set_up(&home, &cwd, "resume me/fixture", 100, &[]);
+    terminal.wait_for("resolve to a branch");
+    assert!(!terminal.child.wait().unwrap().success());
+    assert!(!String::from_utf8_lossy(&terminal.captured).contains("Set it up now?"));
+    assert!(!record.exists());
+    let mut terminal = Terminal::start_not_set_up(&home, &cwd, "resume", 100, &[]);
+    terminal.wait_for("Set it up now?");
+    terminal.type_keys("\r");
+    terminal.wait_for("enter continue");
+    terminal.wait_for("me/fixture");
+    terminal.type_keys("q");
+    assert!(terminal.child.wait().unwrap().success());
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert!(record["declined_at"].is_string(), "{record}");
+}
+
+/// Under CI nobody answering a terminal is a person agreeing to capture hooks, so a command that
+/// is ready to act gives the unattended line there and asks nothing. A notice that asked whenever
+/// a terminal is attached would hold `agit new` at a question that no one answers.
+#[test]
+fn under_ci_a_terminal_gets_the_unattended_line_and_no_question() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    let home = tmp.path().join("agit");
+    fixture(&home);
+    std::fs::create_dir_all(home.join("test-runtime-home/.claude")).unwrap();
+    let mut terminal = Terminal::start_not_set_up(
+        &home,
+        &cwd,
+        "new me/fixture -b under-ci --no-launch",
+        100,
+        &[("CI", "1")],
+    );
+    terminal.wait_for("nothing is captured");
+    assert!(terminal.child.wait().unwrap().success());
+    assert!(!String::from_utf8_lossy(&terminal.captured).contains("Set it up now?"));
 }
 
 #[test]

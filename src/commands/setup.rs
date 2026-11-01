@@ -46,6 +46,7 @@ mod codex_trust;
 mod json_text;
 mod legacy;
 mod native;
+pub mod presence;
 
 pub(crate) use codex_trust::{CodexHooks, codex_hooks};
 
@@ -86,6 +87,23 @@ pub struct Args {
     /// Set the user default for automatically publishing settled turns.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub auto_push: Option<bool>,
+}
+
+impl Args {
+    /// What `agit setup` with no flags installs.
+    pub(crate) fn everything() -> Self {
+        Self {
+            runtime: None,
+            hooks: false,
+            skill: false,
+            installed_only: false,
+            mcp: false,
+            agents_md: false,
+            remove_agents_md: None,
+            completions: None,
+            auto_push: None,
+        }
+    }
 }
 
 /// The observable result of one setup run.
@@ -255,6 +273,10 @@ fn run_setup(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Precondition);
     }
     if report.items > 0 {
+        // A person who has now set agit up, or declined and then set it up, is past the notice.
+        if (hooks || skill || mcp) && !args.installed_only {
+            presence::forget();
+        }
         ui::success(&format!(
             "All set ({} items). Idempotent: re-running writes nothing twice.",
             report.items
@@ -494,13 +516,72 @@ fn claude_settings() -> Option<PathBuf> {
         })
 }
 
+/// The events of agit's own hooks that Claude Code's settings carry no agit entry for, or `None`
+/// where Claude Code has no profile folder or its settings cannot be read as JSON.
+pub(crate) fn claude_hooks_missing() -> Option<Vec<&'static str>> {
+    let path = claude_settings()?;
+    path.parent()?.symlink_metadata().ok()?;
+    let settings: serde_json::Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).ok()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(_) => return None,
+    };
+    Some(hooks_missing(&settings))
+}
+
+/// The events of [`HOOKS`] with no agit entry in Claude Code's settings, whatever path the entry
+/// names agit by. A retired hook is not one of them.
+fn hooks_missing(settings: &serde_json::Value) -> Vec<&'static str> {
+    HOOKS
+        .iter()
+        .filter(|(event, argv)| !carries_hook(settings, event, &hook_arguments(argv, None)))
+        .map(|(event, _)| *event)
+        .collect()
+}
+
+/// Whether a hook file's `event` holds an agit hook with `arguments`, whatever path names agit.
+fn carries_hook(settings: &serde_json::Value, event: &str, arguments: &str) -> bool {
+    settings["hooks"][event].as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group["hooks"].as_array().is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .is_some_and(|command| is_our_hook(command, arguments))
+                })
+            })
+        })
+    })
+}
+
 /// `setup --hooks --installed-only`: repair, in each runtime's hook file, the agit hooks that name
 /// `exe` in a form a shell does not run as that program, such as a path with a space written
 /// bare. It runs unattended (the menu bar app runs it once per new agit), so it installs nothing,
 /// touches no native integration, and leaves alone every hook that runs another program, even
 /// another agit: pointing those at this one would replace a choice the person made.
 fn repair_hooks(runtime: Option<&str>, exe: &str) -> SetupReport {
-    let files = [
+    let mut report = SetupReport::default();
+    for (id, label, path, runtime_flag) in hook_files() {
+        if wants(runtime, id)
+            && let Some(path) = path
+        {
+            report.merge(repair_hook_file(&path, label, exe, runtime_flag));
+        }
+    }
+    report
+}
+
+/// A JSON hook file `agit setup --hooks` writes: runtime, label, path, and the runtime flag agit's
+/// hook commands in that file carry.
+type HookFile = (
+    &'static str,
+    &'static str,
+    Option<PathBuf>,
+    Option<&'static str>,
+);
+
+fn hook_files() -> [HookFile; 3] {
+    [
         ("claude-code", "Claude Code", claude_settings(), None),
         (
             "codex",
@@ -516,16 +597,72 @@ fn repair_hooks(runtime: Option<&str>, exe: &str) -> SetupReport {
                 .map(|root| root.join("settings.json")),
             Some("workbuddy"),
         ),
-    ];
-    let mut report = SetupReport::default();
-    for (id, label, path, runtime_flag) in files {
-        if wants(runtime, id)
-            && let Some(path) = path
-        {
-            report.merge(repair_hook_file(&path, label, exe, runtime_flag));
+    ]
+}
+
+/// The most of a hook file read to learn whether it carries agit's hooks. A larger file counts as
+/// carrying none, which can only bring the not-set-up notice back, never silence it.
+const HOOK_FILE_LIMIT: usize = 16 << 20;
+
+/// Whether `agit setup --hooks` left agit's hooks for some runtime: an agit hook entry in one of
+/// [`hook_files`], whatever path names agit, agit's hook in Hermes' configuration, or OpenClaw's
+/// agit plugin directory. Hooks capture adopted sessions without the Skill, so such a computer is
+/// set up. Only that yes or no is used; nothing read is kept.
+pub(crate) fn hooks_installed() -> bool {
+    hook_files().into_iter().any(|(_, _, path, runtime_flag)| {
+        path.is_some_and(|path| carries_agit_hooks(&path, runtime_flag))
+    }) || crate::adapter::hermes::home().is_ok_and(|root| {
+        crate::domain::storage::read_bytes_capped(&root.join("config.yaml"), HOOK_FILE_LIMIT)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|text| hermes_carries_agit_hooks(&text))
+    }) || crate::adapter::openclaw::home().is_ok_and(|root| {
+        root.join("extensions/agit/openclaw.plugin.json")
+            .symlink_metadata()
+            .is_ok()
+    })
+}
+
+/// Whether Hermes' YAML configuration holds one of agit's hook commands, found by the arguments
+/// agit's Hermes hooks carry. Hermes writes the file itself and may fold a long command over
+/// several lines: a plain scalar breaks at a space, and a double-quoted one ends the line with an
+/// escaped break and may start the next with an escaped space. The text is unfolded that way
+/// before it is searched, so a folded command still counts. agit has no YAML parser, and a match
+/// elsewhere in the file can only silence the not-set-up notice, never write anything.
+fn hermes_carries_agit_hooks(text: &str) -> bool {
+    let mut unfolded = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some('\n' | '\r')) => {
+                while chars.next_if(|next| next.is_whitespace()).is_some() {}
+            }
+            ('\\', Some(' ')) => {
+                chars.next();
+                unfolded.push(' ');
+            }
+            _ => unfolded.push(c),
         }
     }
-    report
+    let words = unfolded.split_whitespace().collect::<Vec<_>>().join(" ");
+    HOOKS
+        .iter()
+        .any(|(_, argv)| words.contains(&hook_arguments(argv, Some("hermes"))))
+}
+
+/// Whether the hook file at `path` holds one of agit's hooks carrying `runtime_flag`. A file that
+/// cannot be read within [`HOOK_FILE_LIMIT`] or parsed holds none, and nothing about why, or about
+/// what the file holds, reaches any output: these files can carry secrets, such as Claude Code's
+/// `env` block.
+fn carries_agit_hooks(path: &Path, runtime_flag: Option<&str>) -> bool {
+    crate::domain::storage::read_bytes_capped(path, HOOK_FILE_LIMIT)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|settings| {
+            HOOKS.iter().any(|(event, argv)| {
+                carries_hook(&settings, event, &hook_arguments(argv, runtime_flag))
+            })
+        })
 }
 
 /// Repair one hook file in its own text: only the command strings of agit's hooks for `exe`
@@ -2542,9 +2679,34 @@ mod tests {
         assert_eq!(parse_codex_hooks_capability("plugins stable true\n"), None);
     }
 
+    /// Hermes' configuration counts as carrying agit's hooks when it holds agit's Hermes hook
+    /// command, as written plainly, folded as a plain scalar, or folded as a double-quoted one with
+    /// escaped breaks and spaces. A search of the raw text misses both folded forms, and one that
+    /// ignored the runtime flag would take Claude Code's arguments, or an unrelated `hooks:` key,
+    /// for Hermes' hooks.
+    #[test]
+    fn hermes_configuration_carries_agit_hooks_however_hermes_folds_them() {
+        let plain = "hooks:\n  on_session_start:\n  - name: agit\n    command: /home/me/.local/bin/agit hooks ingest --runtime hermes\n    timeout: 60\n";
+        let folded = "hooks:\n  on_session_end:\n  - name: agit\n    command: /home/me/Library/Application/a/very/long/path/to/the/agit hooks\n      settle --runtime hermes\n";
+        let quoted = "hooks:\n  on_session_start:\n  - name: agit\n    command: \"'/home/me/Library/Application Support/agit' hooks\\\n      \\ ingest --runtime hermes\"\n";
+        for (name, text) in [("plain", plain), ("folded", folded), ("quoted", quoted)] {
+            assert!(hermes_carries_agit_hooks(text), "{name}");
+        }
+        for text in [
+            "hooks:\n  on_session_start:\n  - name: notify\n    command: ~/bin/notify\n",
+            "hooks:\n  on_session_start:\n  - command: /usr/bin/agit hooks ingest\n",
+            "model: hermes-4\n",
+        ] {
+            assert!(!hermes_carries_agit_hooks(text), "{text}");
+        }
+    }
+
     /// Installing into Codex keeps unrelated hooks, names the runtime explicitly, and is
     /// idempotent. A malformed file is preserved byte for byte instead of being replaced with an
     /// empty object, because configuration owned by another program is not repairable by guessing.
+    /// The not-set-up check reads the same file: only after the install does it carry agit's hooks,
+    /// and a malformed one carries none. A check that looked for Claude Code's arguments, without
+    /// the runtime flag, would call a Codex computer set up only with hooks not set up.
     #[test]
     fn codex_hook_file_is_merged_without_repairing_user_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -2563,7 +2725,9 @@ mod tests {
         )
         .unwrap();
 
+        assert!(!carries_agit_hooks(&path, Some("codex")));
         assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex"), &[]).succeeded());
+        assert!(carries_agit_hooks(&path, Some("codex")));
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(once.contains("/usr/bin/user-hook"), "{once}");
         assert!(once.contains("agit hooks ingest --runtime codex"), "{once}");
@@ -2577,6 +2741,7 @@ mod tests {
             1
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json\n");
+        assert!(!carries_agit_hooks(&path, Some("codex")));
     }
 
     /// Installs from different executable paths keep one entry per hook: the stale path is
@@ -2646,7 +2811,10 @@ mod tests {
     /// below `hooks` and reflow the one-line entry, and one that ignored the layout would misalign
     /// what it adds. A file whose text holds what a parse reads differently, such as a key given
     /// twice, is refused and left without a copy beside it: falling back to writing the document
-    /// would be the rewrite this rules out.
+    /// would be the rewrite this rules out. Doctor reads the same file: before the install, an
+    /// agit hook at a stale path counts as installed and the retired one does not, and after it
+    /// nothing is missing; a check that matched whole commands, or any mention of agit, would
+    /// call this file set up or not set up wrongly.
     #[test]
     fn an_install_changes_the_hook_file_only_where_agit_hooks_go() {
         let dir = tempfile::tempdir().unwrap();
@@ -2686,7 +2854,12 @@ mod tests {
 "#,
         )
         .unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        assert_eq!(hooks_missing(&read()), ["Stop"]);
         assert!(install_hook_file(&path, "Claude Code", exe, None, extra).succeeded());
+        assert!(hooks_missing(&read()).is_empty());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             r#"{

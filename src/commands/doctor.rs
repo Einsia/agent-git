@@ -135,6 +135,7 @@ pub fn run(args: Args) -> CmdResult {
     for ad in adapter::all() {
         checks.push(runtime_row(ad.as_ref()));
     }
+    checks.push(setup_row());
 
     // ── Skill installation ──
     // The Skill is not part of the session store; it has its own per-runtime home and version. A
@@ -142,6 +143,7 @@ pub fn run(args: Args) -> CmdResult {
     // installation that exists must be complete and at the current version.
     checks.extend(skill_installation_checks());
     checks.extend(claude_mcp_check());
+    checks.extend(claude_hooks_check());
     checks.extend(unloadable_skill_checks());
     if let Some(row) = codex_hooks_row() {
         checks.push(("codex hooks".into(), row));
@@ -784,6 +786,55 @@ fn runtime_row(ad: &dyn adapter::Adapter) -> (String, Check) {
             (label, Check::Ok(format!("{info} · {}", cap.next_hint())))
         }
     }
+}
+
+/// Whether agit is set up on this computer at all, the state a skipped install script leaves.
+/// It names a decline with its date, since a person who declined sees no further notice.
+fn setup_row() -> (String, Check) {
+    use super::setup::presence::{self, Presence};
+    let row = match presence::presence() {
+        Presence::SetUp => Check::Ok("agit's Skill or capture hooks are installed".into()),
+        Presence::NoRuntime => Check::Ok("no runtime agit sets up is on this computer".into()),
+        Presence::NotSetUp(runtimes) => {
+            Check::Warn(setup_warning(&runtimes, presence::record().declined_at))
+        }
+    };
+    ("setup".into(), row)
+}
+
+fn setup_warning(runtimes: &[&str], declined_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let names = runtimes
+        .iter()
+        .map(|id| adapter::runtime_label(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let declined = declined_at
+        .map(|at| {
+            format!(
+                "; you declined setup on {}",
+                at.with_timezone(&chrono::Local).format("%Y-%m-%d")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "not set up: no agit Skill or capture hooks for {names}, so nothing is captured{declined}. Ask the person before running `agit setup`"
+    )
+}
+
+/// Claude Code captures through its SessionStart and Stop hooks, so a Skill without them is a
+/// setup that saves nothing. No row where Claude Code has no profile folder. Agents run doctor
+/// too, and installing capture hooks is the person's decision, so the row says to ask first.
+fn claude_hooks_check() -> Option<(String, Check)> {
+    let missing = super::setup::claude_hooks_missing()?;
+    let row = if missing.is_empty() {
+        Check::Ok("SessionStart and Stop".into())
+    } else {
+        Check::Warn(format!(
+            "{} not installed, so Claude Code conversations are not captured. Ask the person before running `agit setup --runtime claude-code --hooks`",
+            missing.join(" and ")
+        ))
+    };
+    Some(("hooks claude-code".into(), row))
 }
 
 /// Whether Codex runs AgentGit's hooks, as Codex itself reports them for this directory. No row
@@ -1684,7 +1735,7 @@ mod tests {
 
     use super::{
         Check, ContinuityNote, ViewNote, check_continuity, check_skill_dir, check_view,
-        is_old_layout, runtime_row,
+        is_old_layout, runtime_row, setup_warning,
     };
     use crate::adapter::{self, Capability};
     use crate::domain::meta::{self, LayoutVersion, Meta};
@@ -1825,6 +1876,32 @@ mod tests {
 
     /// Resumable while the CLI is not on PATH: a Warn whose row still states capability and
     /// format.
+    /// A computer where setup never ran says so, names the runtimes left without agit, and names
+    /// a decline with its date, since a person who declined gets no further notice anywhere else.
+    /// Like the notice an agent reads, it tells the reader to ask the person before running setup.
+    #[test]
+    fn a_computer_without_setup_names_its_runtimes_and_a_decline() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let day = at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        let declined = setup_warning(&["claude-code", "codex"], Some(at));
+        assert!(declined.contains("Claude Code, Codex"), "{declined}");
+        assert!(declined.contains("nothing is captured"), "{declined}");
+        assert!(
+            declined.contains(&format!("you declined setup on {day}")),
+            "{declined}"
+        );
+        assert!(
+            declined.contains("Ask the person before running `agit setup`"),
+            "{declined}"
+        );
+        assert!(!setup_warning(&["codex"], None).contains("declined"));
+    }
+
     #[test]
     fn a_resumable_row_reports_capability_and_format() {
         let (label, check) = runtime_row(&Stub {

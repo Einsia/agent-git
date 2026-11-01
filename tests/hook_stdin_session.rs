@@ -1022,7 +1022,8 @@ fn reimport_wording_follows_the_claim_state() {
 
 /// A session aimed at `main` is refused before anything is adopted or created, with the reason
 /// and a replacement in the caller's own `--into` spelling. Refusing only at settlement leaves a
-/// new repository and a session link behind.
+/// new repository and a session link behind. The lab is a computer where agit was never set up,
+/// so a not-set-up notice shown ahead of the refusal leaves its record behind as well.
 #[test]
 fn main_branch_target_is_refused_before_adoption() {
     let lab = Lab::new();

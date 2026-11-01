@@ -695,7 +695,7 @@ pub(crate) fn sign_in(again: &str) -> Result<crate::hub::Client> {
     }
     let hub = config::hub_url();
     if ui::prompt::may_prompt() {
-        let code = super::login::run(super::login::Args::default())?;
+        let code = super::login::run_as_step(super::login::Args::default())?;
         if code != ExitCode::Ok {
             return Err(Refusal::new(
                 "not signed in",

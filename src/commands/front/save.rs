@@ -29,7 +29,7 @@ pub struct SaveArgs {
 }
 
 pub fn run(args: SaveArgs) -> CmdResult {
-    super::finish(save(args))
+    super::finish(crate::commands::setup::presence::after(save(args)))
 }
 
 /// The sessions to save, grouped by folder, and whether sessions the folder's binding left out

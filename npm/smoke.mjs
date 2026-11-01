@@ -21,7 +21,8 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, chmodSync, copyFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, chmodSync, copyFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
@@ -168,6 +169,137 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
     events.some(event => event.event === 'cli_install_stage' && event.properties.stage === 'binary_copy' && event.properties.outcome === 'error') &&
     events.some(event => event.event === 'cli_install_stage' && event.properties.stage === 'finished' && event.properties.error_category === 'filesystem') &&
     !events.some(event => event.event === 'cli_install_succeeded'), result.stderr)
+}
+
+// An installation whose install script did not run (npm 12 without --allow-scripts, a policy that
+// skips scripts, pnpm) is installed but not set up. A command that starts or records capture,
+// run by no person, says so once a day once it has done what it was asked, and the one path that
+// notice writes is its record in AGIT_HOME: nothing in the runtime's folder. A command refused
+// before it acts says nothing and writes no record. A read never carries the notice and leaves the
+// home byte for byte as it was, telemetry aside. The first run settles what the command itself
+// writes, with the notice silenced.
+{
+  const bare = join(work, 'not-set-up-home')
+  const project = join(bare, 'project')
+  mkdirSync(join(bare, '.claude'), { recursive: true })
+  mkdirSync(project)
+  const bareEnv = { ...env, HOME: bare, USERPROFILE: bare, AGIT_HOME: join(bare, '.agit'),
+    CODEX_HOME: join(bare, '.codex'), CLAUDE_CONFIG_DIR: join(bare, '.claude'),
+    XDG_DATA_HOME: join(bare, '.local', 'share'), XDG_CONFIG_HOME: join(bare, '.config') }
+  const agit = (args, extra = {}) => spawnSync(bin, args, {
+    encoding: 'utf8', env: { ...bareEnv, ...extra }, cwd: project, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const paths = () => readdirSync(bare, { recursive: true }).map(String).sort()
+  // Files are compared by digest: once a command has run Git, the home holds agit's bundled Git
+  // runtime, which is too large to hold whole in one string.
+  const digest = path => createHash('sha256').update(readFileSync(join(bare, path))).digest('hex')
+  const contents = () => JSON.stringify(paths()
+    .filter(path => !path.startsWith(join('.agit', 'telemetry')))
+    .map(path => [path, statSync(join(bare, path)).isFile() ? digest(path) : null]))
+  const notice = 'agit is not set up on this computer, so nothing is captured'
+  const silenced = agit(['save'], { AGIT_SKIP_SETUP: '1' })
+  const before = paths()
+  const home = contents()
+  const read = agit(['status'])
+  const afterRead = contents()
+  const json = agit(['--json', 'save'])
+  let document = null
+  try { document = JSON.parse(json.stdout) } catch {}
+  const afterJson = paths()
+  const refused = agit(['commit'])
+  const recordAfterRefusal = existsSync(join(bare, '.agit', 'setup-notice.json'))
+  const beforeFirst = paths()
+  const first = agit(['save'])
+  const added = paths().filter(path => !beforeFirst.includes(path))
+  const second = agit(['save'])
+  check('a command refused before it acts says nothing about setup and writes no record',
+    refused.status !== 0 && !refused.stderr.includes(notice) && !recordAfterRefusal,
+    `${refused.status} ${refused.stderr}`)
+  check('an agit that was never set up says so once and writes only its record',
+    !silenced.stderr.includes(notice) && first.stderr.includes(notice) && !second.stderr.includes(notice) &&
+    added.length === 1 && added[0] === join('.agit', 'setup-notice.json'),
+    `added ${JSON.stringify(added)} :: ${first.stderr}`)
+  check('a read of an agit that was never set up says nothing and leaves its home unchanged',
+    !read.stderr.includes(notice) && !read.stdout.includes(notice) && afterRead === home,
+    `${read.status} ${read.stderr}`)
+  check('a JSON run of an agit that was never set up keeps stdout one document and writes nothing',
+    document !== null && !json.stdout.includes(notice) && !json.stderr.includes(notice) &&
+    JSON.stringify(afterJson) === JSON.stringify(before),
+    `${json.status} ${json.stdout} ${json.stderr}`)
+}
+
+// `agit setup --hooks` installs capture hooks and no Skill. Hooks capture adopted sessions, so a
+// home set up that way is set up: a capture command says nothing about setup and writes no notice
+// record, and doctor does not call it not set up. The hook files can hold secrets (Claude Code's
+// `env` block, Hermes' provider keys), so once the one that set up agit no longer parses, nothing
+// either holds reaches any output of save or doctor, though both are read.
+{
+  const hooksOnly = join(work, 'hooks-only-home')
+  const project = join(hooksOnly, 'project')
+  mkdirSync(join(hooksOnly, '.claude'), { recursive: true })
+  mkdirSync(project)
+  const hooksEnv = { ...env, HOME: hooksOnly, USERPROFILE: hooksOnly, AGIT_HOME: join(hooksOnly, '.agit'),
+    CODEX_HOME: join(hooksOnly, '.codex'), CLAUDE_CONFIG_DIR: join(hooksOnly, '.claude'),
+    HERMES_HOME: join(hooksOnly, '.hermes'),
+    XDG_DATA_HOME: join(hooksOnly, '.local', 'share'), XDG_CONFIG_HOME: join(hooksOnly, '.config') }
+  const agit = args => spawnSync(bin, args, {
+    encoding: 'utf8', env: hooksEnv, cwd: project, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const notice = 'agit is not set up on this computer, so nothing is captured'
+  const record = join(hooksOnly, '.agit', 'setup-notice.json')
+  const setup = agit(['setup', '--hooks', '--runtime', 'claude-code'])
+  const skill = existsSync(join(hooksOnly, '.claude', 'skills', 'agit', 'SKILL.md'))
+  const saved = [agit(['save']), agit(['save'])]
+  const doctor = agit(['doctor'])
+  const doctorText = doctor.stdout + doctor.stderr
+  check('a home set up with hooks only is not told that nothing is captured',
+    setup.status === 0 && !skill && saved.every(run => !run.stderr.includes(notice)) && !existsSync(record) &&
+    !doctorText.includes('not set up') && doctorText.includes('capture hooks are installed'),
+    `${setup.status} ${skill} ${saved.map(run => run.stderr).join(' :: ')} :: ${doctorText}`)
+  const canary = 'agit-smoke-settings-canary-5c1e'
+  writeFileSync(join(hooksOnly, '.claude', 'settings.json'), `{"env": {"SMOKE_TOKEN": "${canary}"}, "hooks": `)
+  mkdirSync(join(hooksOnly, '.hermes'), { recursive: true })
+  writeFileSync(join(hooksOnly, '.hermes', 'config.yaml'), `model:\n  api_key: ${canary}\nhooks: [\n`)
+  const broken = [agit(['save']), agit(['doctor'])]
+  check('a hook file that no longer parses leaks nothing it holds',
+    broken.every(run => !run.stdout.includes(canary) && !run.stderr.includes(canary)),
+    broken.map(run => `${run.status}`).join(' '))
+}
+
+// A runtime counts as here once it has run and made its folder, not because its program is on
+// PATH: a home with `claude` on PATH and no Claude Code folder is not told anything, so the result
+// is the same on every machine. Once the folder exists it is. `agit setup` does not use that
+// test, and still installs for a runtime that is only on PATH, whose first conversation would
+// otherwise go uncaptured.
+if (process.platform !== 'win32') {
+  const pathOnly = join(work, 'path-only-home')
+  const project = join(pathOnly, 'project')
+  mkdirSync(join(pathOnly, 'bin'), { recursive: true })
+  mkdirSync(project)
+  writeFileSync(join(pathOnly, 'bin', 'claude'), '#!/bin/sh\nexit 0\n')
+  chmodSync(join(pathOnly, 'bin', 'claude'), 0o755)
+  const pathOnlyEnv = { ...env, HOME: pathOnly, AGIT_HOME: join(pathOnly, '.agit'),
+    CODEX_HOME: join(pathOnly, '.codex'), CLAUDE_CONFIG_DIR: join(pathOnly, '.claude'),
+    XDG_DATA_HOME: join(pathOnly, '.local', 'share'), XDG_CONFIG_HOME: join(pathOnly, '.config'),
+    PATH: `${join(pathOnly, 'bin')}:${env.PATH}` }
+  const agit = (args, extra = {}) => spawnSync(bin, args, {
+    encoding: 'utf8', env: { ...pathOnlyEnv, ...extra }, cwd: project, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const notice = 'agit is not set up on this computer, so nothing is captured'
+  const record = join(pathOnly, '.agit', 'setup-notice.json')
+  agit(['save'], { AGIT_SKIP_SETUP: '1' })
+  const onPath = agit(['save'])
+  mkdirSync(join(pathOnly, '.claude'))
+  const ran = agit(['save'])
+  check('a runtime only on PATH is not reason to say agit is not set up; its folder is',
+    !onPath.stderr.includes(notice) && ran.stderr.includes(notice),
+    `${onPath.stderr} :: ${ran.stderr}`)
+  rmSync(join(pathOnly, '.claude'), { recursive: true, force: true })
+  rmSync(record, { force: true })
+  const setup = agit(['setup', '--skill'])
+  check('setup still installs for a runtime that is only on PATH',
+    setup.status === 0 && existsSync(join(pathOnly, '.claude', 'skills', 'agit', 'SKILL.md')),
+    `${setup.status} ${setup.stderr}`)
 }
 
 // npm controls lifecycle visibility; running postinstall directly cannot exercise that boundary.
