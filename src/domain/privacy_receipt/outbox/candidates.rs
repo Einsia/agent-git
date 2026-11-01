@@ -106,7 +106,7 @@ mod tests {
         });
         // A live mutation excludes another writer; an inherited descriptor cannot extend its scope.
         let (_, mutation) = locked_path(&repo, &request).unwrap();
-        let inherited = mutation.0.try_clone().unwrap();
+        let inherited = mutation.forked_copy();
         let unchanged = fs::read(&legacy_path).unwrap();
         assert!(Entry::prepare_candidate(&repo, &request, &receipt).is_err());
         assert_eq!(fs::read(&legacy_path).unwrap(), unchanged);
