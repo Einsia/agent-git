@@ -104,6 +104,10 @@ pub struct Prepared {
     pub(crate) authority: super::authority::Guard,
     pub(crate) confinement: Option<tokio::sync::watch::Receiver<super::Confinement>>,
     pub(crate) allow_dangerous: bool,
+    /// For a non-owner's message to a source conversation, the loosest mode its thread may be in
+    /// when the message is submitted, checked against the index's current mode right before each
+    /// submission.
+    pub(crate) mode_bound: Option<crate::protocol::PermissionMode>,
     pub request: Request,
     pub transcript: PathBuf,
     pub cwd: PathBuf,
@@ -164,7 +168,7 @@ pub(super) fn verify_open_transcript(file: &mut std::fs::File, session: &str) ->
 }
 
 impl Prepared {
-    fn validate_source(&self) -> crate::Result<()> {
+    pub(crate) fn validate_source(&self) -> crate::Result<()> {
         self.authority
             .check()
             .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -182,12 +186,14 @@ impl Prepared {
                 thread.cwd == self.cwd && thread.transcript == self.transcript,
                 "native inbox source changed before delivery"
             );
-            if !self.allow_dangerous {
-                let mode = context.settings(&thread)?.permission_mode;
-                ensure!(
-                    mode.is_some() && mode != Some(crate::protocol::PermissionMode::Bypass),
-                    "native permissions changed; only the owner can queue work in this session"
-                );
+            let current = context.current_mode(&thread).ok().flatten();
+            if !self.allow_dangerous
+                && !matches!(
+                    (current, self.mode_bound),
+                    (Some(current), Some(bound)) if !current.loosens_from(bound)
+                )
+            {
+                return Err(super::native_settings::mode_changed().into());
             }
             super::local_goal::validate_header(
                 &thread.transcript,
@@ -488,6 +494,7 @@ mod tests {
             authority: Default::default(),
             confinement: None,
             allow_dangerous: true,
+            mode_bound: None,
             request: Request {
                 workspace_id: "workspace".into(),
                 session_id: session.into(),

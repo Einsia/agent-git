@@ -136,6 +136,8 @@ fn transcript_records_unchecked(runtime: &str, thread_id: &str, cwd: &str) -> bo
     read(&transcript).unwrap_or(true)
 }
 
+pub(super) use crate::rc::native_settings::require_mode_held as require_native_mode_held;
+
 /// The mode a resume starts in for `caller`, from the mode the conversation would restart in.
 /// The owner gets it back as it was. Anyone else starts in Default, or in Plan when Plan was the
 /// last mode: never Auto or AcceptEdits, which would let a non-owner run tools the owner chose to
