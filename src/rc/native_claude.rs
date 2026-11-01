@@ -10,6 +10,8 @@ mod transport;
 pub(crate) use approval::wait_approval;
 pub use install::install_plugin;
 pub(crate) use transport::TerminalActivity;
+#[cfg(test)]
+pub(crate) use transport::fixture;
 pub use transport::{Client, Endpoint, Snapshot, Update};
 
 use anyhow::{Context, ensure};

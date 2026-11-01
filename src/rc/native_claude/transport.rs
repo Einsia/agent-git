@@ -1302,6 +1302,63 @@ impl Drop for Client {
     }
 }
 
+/// A terminal Claude Code session registered for native control, for tests outside this module.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    /// What keeps a registered session current: the daemon's endpoint and the terminal's socket.
+    pub(crate) struct Registered {
+        pub(crate) endpoint: Endpoint,
+        pub(crate) registration: Registration,
+        _socket: std::os::unix::net::UnixListener,
+    }
+
+    /// Register this process as a terminal Claude Code session in `root`, start the daemon's
+    /// endpoint and take one module report from it, between turns and with no mode reported, as
+    /// the plugin leaves it. Runs inside a Tokio runtime, in a process whose `AGIT_HOME` and
+    /// `CLAUDE_CONFIG_DIR` lie under `root`.
+    pub(crate) fn registered(root: &Path) -> Registered {
+        let cwd = root.canonicalize().unwrap();
+        let registry = cwd.join("sessions");
+        let socket = cwd.join("native.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (process, _) = super::super::process(std::process::id()).unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        crate::rc::claude_inbox::fixture::register(&registry, process.pid, &session, &socket, None);
+        let record_path = registry.join(format!("{}.json", process.pid));
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["cwd"] = json!(cwd);
+        std::fs::write(&record_path, record.to_string()).unwrap();
+        let endpoint = Endpoint::start().unwrap();
+        let registration = Registration {
+            version: 1,
+            session: session.clone(),
+            cwd: cwd.clone(),
+            generation: uuid::Uuid::new_v4().to_string(),
+            revision: process.birth.clone(),
+            process,
+            registry,
+            descriptor: descriptor_path().unwrap(),
+        };
+        super::super::publish(&directory().unwrap(), &registration).unwrap();
+        let snapshot: Snapshot = serde_json::from_value(json!({
+            "registration":registration, "session":session, "cwd":cwd,
+            "generation":registration.generation, "version":1, "saturated":false,
+            "last_seq":0, "events":[], "results":[], "approvals":[], "tools":[],
+            "compacting":false, "permission_mode":null, "turn":null
+        }))
+        .unwrap();
+        endpoint.hub.poll(snapshot).unwrap();
+        Registered {
+            endpoint,
+            registration,
+            _socket: listener,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

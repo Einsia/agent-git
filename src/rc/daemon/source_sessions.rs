@@ -123,8 +123,27 @@ impl Daemon {
             source_id,
             native,
             &thread.cwd.to_string_lossy(),
+            &thread.transcript,
             settings.permission_mode,
         )?;
+        // A shared native thread resumes in the mode it is set to; the request cannot tighten it.
+        // So a non-owner may resume it only where that mode is already no looser than Default
+        // (Default or Plan), and the session opens in exactly that mode; Auto or Accept edits stay
+        // the owner's. A private fallback launch takes the same mode from the spec.
+        let mode = danger::resume_mode(caller, settings.permission_mode);
+        if mode != settings.permission_mode {
+            return Err(classified(
+                RpcError::new(
+                    ErrorCode::Forbidden,
+                    "this conversation is set to act without asking; only its owner may resume it",
+                )
+                .with_hint(
+                    "set it to Default or Plan in the native client, or ask the owner to resume it",
+                ),
+                false,
+                "native_mode_owner_only",
+            ));
+        }
         let logical = if prior.is_some() {
             p.session_id.clone()
         } else {
@@ -214,7 +233,7 @@ impl Daemon {
             title,
             labels_withheld: None,
             dangerous: false,
-            permission_mode: settings.permission_mode,
+            permission_mode: mode,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -224,7 +243,7 @@ impl Daemon {
             agit_session: lineage,
             model: None,
             dangerous: false,
-            permission_mode: settings.permission_mode,
+            permission_mode: mode,
         };
         context.validate().map_err(unavailable)?;
         let spawn = self.prepare_spawn(
@@ -261,10 +280,12 @@ mod tests {
                 std::fs::write(
                     &transcript,
                     format!(
-                        "{}\n",
+                        "{}\n{}\n",
                         serde_json::json!({
                             "type":"session_meta", "payload":{"id":native,"cwd":project}
-                        })
+                        }),
+                        serde_json::json!({"type":"turn_context","payload":{
+                            "approval_policy":"never","sandbox_policy":{"type":"read-only"}}})
                     ),
                 )
                 .unwrap();
@@ -411,6 +432,194 @@ mod tests {
                     .is_err()
             );
             assert!(state.opening_sessions.is_empty());
+        });
+    }
+
+    /// A Codex conversation of one native source in `project`, whose rollout records `turns`
+    /// (approval, sandbox type) and whose index records `index` as its current settings.
+    fn source_conversation(
+        root: &std::path::Path,
+        project: &std::path::Path,
+        native: &str,
+        turns: &[(&str, &str)],
+        index: (&str, &str),
+    ) -> crate::rc::runtime_sources::RuntimeSource {
+        let home = root.join(format!("home-{native}"));
+        std::fs::create_dir(&home).unwrap();
+        let transcript = home.join(format!("rollout-{native}.jsonl"));
+        let mut lines = vec![
+            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":project}})
+                .to_string(),
+        ];
+        for (approval, sandbox) in turns {
+            lines.push(
+                serde_json::json!({"type":"turn_context","payload":{
+                    "approval_policy":approval,"sandbox_policy":{"type":sandbox}}})
+                .to_string(),
+            );
+        }
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, model TEXT, reasoning_effort TEXT, approval_mode TEXT, sandbox_policy TEXT)").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1,?2,?3,'question','cli',1,0,'fixture','high',?4,?5)",
+            rusqlite::params![
+                native,
+                transcript.to_str(),
+                project.to_str(),
+                index.0,
+                serde_json::json!({"type": index.1}).to_string()
+            ],
+        )
+        .unwrap();
+        Registry::open()
+            .unwrap()
+            .register(&home, None, None, None)
+            .unwrap()
+    }
+
+    /// Pins that a source-scoped Codex conversation is judged by its rollout's whole history and
+    /// resumes for a non-owner in no looser a mode than Default. A rollout with an earlier turn
+    /// run with full access is owner-only, by resume and by native message, although it is set
+    /// back to Default now. One whose native mode acts without asking (Auto: never with
+    /// workspace-write) is owner-only to resume, since a shared thread keeps its native mode;
+    /// the owner's resume opens it in Auto. One set to Default opens for an operator in Default.
+    /// A source path that judged only the ledger and the current mode, or kept the native mode
+    /// for every caller, let the operator through.
+    #[tokio::test]
+    async fn a_source_conversation_is_judged_by_its_history_and_resumes_no_looser_than_default() {
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let earlier = uuid::Uuid::new_v4().to_string();
+            let auto = uuid::Uuid::new_v4().to_string();
+            let default = uuid::Uuid::new_v4().to_string();
+            let sources = [
+                source_conversation(
+                    root.path(),
+                    &project,
+                    &earlier,
+                    &[
+                        ("never", "danger-full-access"),
+                        ("on-request", "workspace-write"),
+                    ],
+                    ("on-request", "workspace-write"),
+                ),
+                source_conversation(
+                    root.path(),
+                    &project,
+                    &auto,
+                    &[("never", "workspace-write")],
+                    ("never", "workspace-write"),
+                ),
+                source_conversation(
+                    root.path(),
+                    &project,
+                    &default,
+                    &[("on-request", "workspace-write")],
+                    ("on-request", "workspace-write"),
+                ),
+            ];
+            let roots = policy::CanonicalRoots::from_untrusted([project.clone()]);
+            let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
+            for _ in &sources {
+                catalog.reconcile(&roots).unwrap();
+            }
+            let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.try_lock().unwrap();
+            state.opts.local_owner = true;
+            state.mirror.bind("ws", "project", &project).unwrap();
+            let (frames, _) = mpsc::channel(16);
+            let claim = |role: &str| crate::protocol::CallerClaim {
+                account_id: Some("member".into()),
+                username: None,
+                role: role.into(),
+                workspace_id: "ws".into(),
+            };
+            let mut resume =
+                |source: &crate::rc::runtime_sources::RuntimeSource, native: &str, role: &str| {
+                    let result = state.prepare_source_resume(
+                        SessionResume {
+                            project_id: None,
+                            workspace_id: "ws".into(),
+                            session_id: source.session_ref(native),
+                            prompt: None,
+                            by: None,
+                            agent: None,
+                            expected_agent_id: None,
+                            branch: None,
+                        },
+                        &claim(role),
+                        &frames,
+                        (&source.source_id, native),
+                        None,
+                        &Default::default(),
+                    );
+                    state.opening_sessions.clear();
+                    result.map(|opening| match opening {
+                        SessionOpening::Launch(spawn, _) => {
+                            (spawn.info.permission_mode, spawn.spec.permission_mode)
+                        }
+                        SessionOpening::Ready(_) => panic!("nothing runs this conversation yet"),
+                    })
+                };
+            use crate::protocol::PermissionMode as M;
+
+            let error = resume(&sources[0], &earlier, "operator").err().unwrap();
+            assert_eq!(
+                error.code,
+                ErrorCode::DangerousSessionLocked as i32,
+                "{}",
+                error.message
+            );
+            assert!(resume(&sources[0], &earlier, "owner").is_ok());
+
+            let error = resume(&sources[1], &auto, "operator").err().unwrap();
+            assert_eq!(error.code, ErrorCode::Forbidden as i32, "{}", error.message);
+            assert_eq!(
+                error.data.as_ref().unwrap()["reason"],
+                "native_mode_owner_only"
+            );
+            assert_eq!(
+                resume(&sources[1], &auto, "owner").unwrap(),
+                (Some(M::Auto), Some(M::Auto))
+            );
+
+            assert_eq!(
+                resume(&sources[2], &default, "operator").unwrap(),
+                (Some(M::Default), Some(M::Default))
+            );
+
+            let enqueue = |source: &crate::rc::runtime_sources::RuntimeSource,
+                           native: &str,
+                           role: &str| {
+                let mut frame = Frame::request(
+                    method::SESSION_ENQUEUE,
+                    serde_json::json!({"workspace_id":"ws","session_id":source.session_ref(native),
+                        "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
+                );
+                frame.caller = Some(claim(role));
+                let watch = super::super::source_watch::SourceWatch::resolve(
+                    &source.session_ref(native),
+                    &roots,
+                )
+                .unwrap()
+                .expect("the source conversation resolves");
+                state
+                    .prepare_inbox_target(&frame, None, Some(watch))
+                    .err()
+                    .map(|error| error.code)
+            };
+            assert_eq!(
+                enqueue(&sources[0], &earlier, "operator"),
+                Some(ErrorCode::DangerousSessionLocked as i32)
+            );
+            assert_ne!(
+                enqueue(&sources[0], &earlier, "owner"),
+                Some(ErrorCode::DangerousSessionLocked as i32)
+            );
         });
     }
 }

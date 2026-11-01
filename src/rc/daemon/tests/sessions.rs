@@ -238,6 +238,251 @@ fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
             });
     });
 }
+/// Pins the takeover of a Claude Code conversation started in a terminal with
+/// `--dangerously-skip-permissions` and closed before the daemon saw it (#267, gap b, the Sim's
+/// variant 3). The ledger has no row for it, so only its transcript says it ran unchecked: an
+/// operator's takeover is refused and mints no identity, while the owner's gets past the danger
+/// gate. Where an earlier build already recorded it under a clean identity, an operator's resume
+/// of that identity is refused too, and the owner's is not. A takeover that asked only the ledger
+/// minted a clean identity any operator could then resume.
+#[test]
+fn an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
+    }
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                const THREAD: &str = "eeeeeeee-0000-4000-8000-0000000002b5";
+                let cwd = std::fs::canonicalize(home.path()).unwrap();
+                let native = home
+                    .path()
+                    .join("claude/projects")
+                    .join(crate::adapter::claude_code::slug_for(&cwd));
+                std::fs::create_dir_all(&native).unwrap();
+                let record = serde_json::json!({"type":"user","sessionId":THREAD,"cwd":cwd,
+                    "timestamp":"2026-11-01T00:00:00Z","permissionMode":"bypassPermissions",
+                    "message":{"role":"user","content":"hello"}});
+                std::fs::write(
+                    native.join(format!("{THREAD}.jsonl")),
+                    format!("{record}\n"),
+                )
+                .unwrap();
+
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let located = || LocatedLocal {
+                    title: None,
+                    gist: None,
+                    labels_withheld: None,
+                    runtime: "claude-code".into(),
+                    cwd: cwd.clone(),
+                    project_id: Some("project-a".into()),
+                    likely_active: false,
+                };
+                let takeover = || SessionResume {
+                    project_id: None,
+                    workspace_id: "ws-a".into(),
+                    session_id: THREAD.into(),
+                    prompt: None,
+                    by: None,
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                };
+                let error = state
+                    .take_over_local_session(
+                        located(),
+                        takeover(),
+                        &claim("operator", "ws-a"),
+                        &frames,
+                    )
+                    .await
+                    .expect_err("a terminal bypass transcript is owner-only");
+                assert_eq!(
+                    error.code,
+                    ErrorCode::DangerousSessionLocked as i32,
+                    "{}",
+                    error.message
+                );
+                assert!(
+                    state
+                        .roster
+                        .logical_for_thread("claude-code", THREAD, "ws-a")
+                        .is_none(),
+                    "a refused takeover mints no identity"
+                );
+                // The owner gets past the danger gate; whatever stops the launch here is not it.
+                if let Err(error) = state
+                    .take_over_local_session(
+                        located(),
+                        takeover(),
+                        &claim("owner", "ws-a"),
+                        &frames,
+                    )
+                    .await
+                {
+                    assert_ne!(
+                        error.code,
+                        ErrorCode::DangerousSessionLocked as i32,
+                        "{}",
+                        error.message
+                    );
+                }
+
+                // A row that records the conversation under a clean identity, as a takeover that
+                // read only the ledger leaves. An operator resuming that identity is still
+                // refused, since the transcript says it ran unchecked; the owner is not.
+                let mut minted =
+                    rpc_test_roster_entry("agit-minted", crate::protocol::PermissionMode::Default);
+                minted.runtime = "claude-code".into();
+                minted.thread_id = THREAD.into();
+                minted.ever_dangerous = false;
+                minted.workspace_id = "ws-a".into();
+                minted.cwd = cwd.to_string_lossy().into_owned();
+                minted.project_id = Some("project-a".into());
+                state
+                    .roster
+                    .sessions
+                    .retain(|_, entry| entry.thread_id != THREAD);
+                state.roster.sessions.insert("agit-minted".into(), minted);
+                let resume = || SessionResume {
+                    session_id: "agit-minted".into(),
+                    ..takeover()
+                };
+                let error = state
+                    .resume_session(resume(), &claim("operator", "ws-a"), &frames)
+                    .await
+                    .expect_err("resuming the clean identity is still owner-only");
+                assert_eq!(
+                    error.code,
+                    ErrorCode::DangerousSessionLocked as i32,
+                    "{}",
+                    error.message
+                );
+                if let Err(error) = state
+                    .resume_session(resume(), &claim("owner", "ws-a"), &frames)
+                    .await
+                {
+                    assert_ne!(
+                        error.code,
+                        ErrorCode::DangerousSessionLocked as i32,
+                        "{}",
+                        error.message
+                    );
+                }
+            });
+    });
+}
+
+/// The Codex form of the same case: a conversation run in a terminal with approvals off and full
+/// sandbox access, then closed. Its rollout records that in its turns' settings and the ledger
+/// knows nothing. The owner shares it, which records it under a logical identity marked as having
+/// run unchecked; an operator's resume of that identity is refused with `DangerousSessionLocked`,
+/// and the owner's gets past the danger gate. A share that judged Codex by the ledger alone
+/// recorded a clean identity any operator could then resume.
+#[cfg(unix)]
+#[test]
+fn an_operator_cannot_resume_a_shared_closed_bypass_codex_conversation() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::an_operator_cannot_resume_a_shared_closed_bypass_codex_conversation",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("CODEX_HOME", home.path().join("codex"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
+    }
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                const THREAD: &str = "ffffffff-0000-4000-8000-0000000002b6";
+                let cwd = home.path().join("project");
+                std::fs::create_dir(&cwd).unwrap();
+                let cwd = cwd.canonicalize().unwrap();
+                let day = home.path().join("codex/sessions/2026/11/01");
+                std::fs::create_dir_all(&day).unwrap();
+                let records = [
+                    serde_json::json!({"timestamp":"2026-11-01T00:00:00Z","type":"session_meta",
+                        "payload":{"id":THREAD,"cwd":cwd,"timestamp":"2026-11-01T00:00:00Z",
+                            "originator":"codex_cli_rs","cli_version":"0.0.0"}}),
+                    serde_json::json!({"timestamp":"2026-11-01T00:00:01Z","type":"turn_context",
+                        "payload":{"cwd":cwd,"approval_policy":"never",
+                            "sandbox_policy":{"type":"danger-full-access"},"model":"gpt-test"}}),
+                ];
+                std::fs::write(
+                    day.join(format!("rollout-2026-11-01T00-00-00-{THREAD}.jsonl")),
+                    records
+                        .iter()
+                        .map(|record| format!("{record}\n"))
+                        .collect::<String>(),
+                )
+                .unwrap();
+
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let mut share = Frame::request(
+                    method::SESSION_SHARE,
+                    serde_json::json!({"workspace_id":"ws-a","project_id":"project-a",
+                        "runtime":"codex","runtime_session_id":THREAD}),
+                );
+                share.caller = Some(claim("owner", "ws-a"));
+                let shared: crate::protocol::SessionShareResult =
+                    serde_json::from_value(state.share_session(&share).unwrap()).unwrap();
+                let logical = shared.session.session_id;
+                assert!(state.roster.get(&logical).unwrap().ever_dangerous);
+                let resume = || SessionResume {
+                    project_id: None,
+                    workspace_id: "ws-a".into(),
+                    session_id: logical.clone(),
+                    prompt: None,
+                    by: None,
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                };
+                let error = state
+                    .resume_session(resume(), &claim("operator", "ws-a"), &frames)
+                    .await
+                    .expect_err("a shared bypass Codex conversation is owner-only");
+                assert_eq!(
+                    error.code,
+                    ErrorCode::DangerousSessionLocked as i32,
+                    "{}",
+                    error.message
+                );
+                if let Err(error) = state
+                    .resume_session(resume(), &claim("owner", "ws-a"), &frames)
+                    .await
+                {
+                    assert_ne!(
+                        error.code,
+                        ErrorCode::DangerousSessionLocked as i32,
+                        "{}",
+                        error.message
+                    );
+                }
+            });
+    });
+}
+
 /// The one above pins the backstop for when the ledger **cannot account for** the transcript.
 /// This one pins the case the ledger **does** account for and still misses, because that row sits
 /// under another workspace.

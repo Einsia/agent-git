@@ -69,6 +69,44 @@ pub(super) fn thread_settings(value: &Value) -> Settings {
     }))
 }
 
+/// Whether a Codex rollout ever ran outside a workspace-write or read-only sandbox, judged turn by
+/// turn on the sandbox each `turn_context` records, whatever its approval policy. The judgment is
+/// its own, not shared control's mode mapping: a mode shared control cannot express is not a
+/// checked one. A turn whose sandbox type is anything else, unknown or missing counts as
+/// unchecked, and so does the rollout when any turn does, when no turn records a context, or when
+/// it cannot be read. A `turn_context` line that does not parse counts as unchecked too, unless it
+/// is the last line and has no newline yet, a write still in progress.
+pub(super) fn codex_ran_unchecked(path: &Path) -> crate::Result<bool> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = Vec::new();
+    let mut turns = 0usize;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.windows(12).any(|window| window == b"turn_context") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            if line.ends_with(b"\n") {
+                return Ok(true);
+            }
+            continue;
+        };
+        if record["type"] != "turn_context" {
+            continue;
+        }
+        turns += 1;
+        match record["payload"]["sandbox_policy"]["type"].as_str() {
+            Some("workspace-write" | "workspaceWrite" | "read-only" | "readOnly") => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(turns == 0)
+}
+
 pub(super) fn context(line: &str) -> Option<Settings> {
     let record: Value = serde_json::from_str(line).ok()?;
     (record["type"] == "turn_context").then(|| settings(&record["payload"]))
@@ -156,6 +194,60 @@ pub(super) fn indexed_at(index: &Path, path: &Path, session: &str) -> Option<Set
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A rollout is judged turn by turn on its recorded sandbox, whatever the approval policy:
+    /// a workspace-write or read-only turn is checked, and any other turn makes the rollout
+    /// unchecked, even after checked ones, including a turn whose sandbox type is unknown or
+    /// missing. So does a rollout with no turn context, an unreadable one, and a `turn_context`
+    /// line that does not parse, unless it is a last line still being written. A judgment that
+    /// skipped turns it could not classify let an unknown sandbox through after a checked turn.
+    #[test]
+    fn a_rollout_ran_unchecked_by_any_of_its_turns() {
+        let turn = |approval: &str, sandbox: Value| {
+            json!({"type":"turn_context","payload":{"approval_policy":approval,
+                "sandbox_policy":sandbox}})
+            .to_string()
+        };
+        let typed = |approval: &str, sandbox: &str| turn(approval, json!({"type": sandbox}));
+        let verdict = |lines: &[String], last: Option<&str>| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            for line in lines {
+                writeln!(file, "{line}").unwrap();
+            }
+            if let Some(last) = last {
+                write!(file, "{last}").unwrap();
+            }
+            codex_ran_unchecked(file.path()).unwrap()
+        };
+        let checked = [
+            typed("on-request", "read-only"),
+            typed("on-request", "workspace-write"),
+            typed("never", "workspace-write"),
+        ];
+        assert!(!verdict(&checked, None));
+        for unchecked in [
+            typed("on-request", "danger-full-access"),
+            typed("never", "unknown"),
+            json!({"type":"turn_context","payload":{"approval_policy":"on-request"}}).to_string(),
+            json!({"type":"turn_context","payload":"not an object"}).to_string(),
+        ] {
+            let mut lines = checked.to_vec();
+            lines.push(unchecked.clone());
+            assert!(verdict(&lines, None), "{unchecked}");
+            assert!(
+                verdict(&[unchecked.clone(), checked[0].clone()], None),
+                "{unchecked}"
+            );
+        }
+        let torn = "{\"type\":\"turn_context\",\"payload\":";
+        assert!(verdict(&[checked[0].clone(), torn.to_owned()], None));
+        assert!(!verdict(&checked, Some(torn)));
+        assert!(verdict(
+            &[json!({"type":"session_meta","payload":{}}).to_string()],
+            None
+        ));
+        assert!(codex_ran_unchecked(Path::new("/nonexistent/rollout.jsonl")).is_err());
+    }
 
     #[test]
     fn observations_preserve_native_settings_without_granting_controls() {

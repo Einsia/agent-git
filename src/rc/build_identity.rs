@@ -25,6 +25,11 @@ pub const RPC_FEATURES: &[&str] = &[
     "source-catalog-resolve-v1",
     "source-catalog-delta-v1",
     "session-share-v1",
+    // Taking over, sharing, resuming or messaging a Claude Code or Codex conversation reads the
+    // transcript's own permission mode, so one started in a terminal without permission checks
+    // stays owner-only to drive; a non-owner's resume starts no looser than Default; and a
+    // terminal attached for native control stays owner-only to drive, its mode being unknown.
+    "resume-caller-gate-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

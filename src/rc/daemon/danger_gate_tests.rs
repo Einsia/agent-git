@@ -375,3 +375,305 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
             });
     });
 }
+
+/// Pins the mode a resume starts in by caller: the owner gets the last mode back, Auto
+/// included; anyone else starts in Default, or Plan when Plan was last, and never Auto or
+/// AcceptEdits. A daemon that restored the last mode for every caller would let a non-owner
+/// run tools the owner had stopped approving.
+#[test]
+fn a_non_owner_resume_starts_no_looser_than_default() {
+    use crate::protocol::PermissionMode as M;
+    let (owner, operator) = (claim("owner"), claim("operator"));
+    assert_eq!(danger::resume_mode(&owner, Some(M::Auto)), Some(M::Auto));
+    assert_eq!(danger::resume_mode(&owner, None), None);
+    for (last, started) in [
+        (Some(M::Auto), M::Default),
+        (Some(M::AcceptEdits), M::Default),
+        (Some(M::Default), M::Default),
+        (Some(M::Plan), M::Plan),
+        (None, M::Default),
+    ] {
+        assert_eq!(
+            danger::resume_mode(&operator, last),
+            Some(started),
+            "{last:?}"
+        );
+    }
+}
+
+/// Pins that a Claude Code transcript's own permission mode decides whether it ran unchecked,
+/// whatever the ledger knows. A conversation started in a terminal with
+/// `--dangerously-skip-permissions` and closed before the daemon saw it has no ledger row; its
+/// transcript records `bypassPermissions`, and that alone makes it owner-only to drive: the
+/// takeover, the logical-id resume and the Claude `session.enqueue` gate all ask through
+/// `danger::authorize`, and `session.watch` through `danger::judge`. A transcript that records no
+/// mode, or that cannot be found, counts as unchecked too. One that records only checked modes
+/// is open to an operator, and another runtime's unknown thread is judged by the ledger alone, as
+/// before. A judgment that read only the ledger lets the operator through on the bypass
+/// transcript.
+#[test]
+fn a_claude_transcripts_own_bypass_mode_keeps_it_owner_only() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::danger_gate_tests::a_claude_transcripts_own_bypass_mode_keeps_it_owner_only",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
+        std::env::set_var("AGIT_HOME", home.path().join("agit"));
+    }
+    let cwd = std::fs::canonicalize(home.path()).unwrap();
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    let native = home
+        .path()
+        .join("claude/projects")
+        .join(crate::adapter::claude_code::slug_for(&cwd));
+    std::fs::create_dir_all(&native).unwrap();
+    let transcript = |id: &str, mode: Option<&str>| {
+        let mut record = serde_json::json!({"type":"user","sessionId":id,"cwd":cwd_text,
+            "timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"hello"}});
+        if let Some(mode) = mode {
+            record["permissionMode"] = mode.into();
+        }
+        std::fs::write(native.join(format!("{id}.jsonl")), format!("{record}\n")).unwrap();
+    };
+    const BYPASS: &str = "aaaaaaaa-0000-4000-8000-0000000002b1";
+    const CHECKED: &str = "bbbbbbbb-0000-4000-8000-0000000002b2";
+    const SILENT: &str = "cccccccc-0000-4000-8000-0000000002b3";
+    const MISSING: &str = "dddddddd-0000-4000-8000-0000000002b4";
+    transcript(BYPASS, Some("bypassPermissions"));
+    transcript(CHECKED, Some("default"));
+    transcript(SILENT, None);
+    let roster = Roster::default();
+    let (owner, operator) = (claim("owner"), claim("operator"));
+    let authorize = |caller: &CallerClaim, runtime: &str, thread: &str| {
+        danger::authorize(&roster, caller, runtime, thread, "ws1", &cwd_text)
+    };
+
+    for thread in [BYPASS, SILENT, MISSING] {
+        let error = authorize(&operator, "claude-code", thread).expect_err(thread);
+        assert_eq!(
+            error.code,
+            ErrorCode::DangerousSessionLocked as i32,
+            "{thread}"
+        );
+        let allowed = authorize(&owner, "claude-code", thread).expect("the owner drives it");
+        assert!(allowed.ever_dangerous(), "{thread}");
+        assert!(
+            danger::judge(&roster, "claude-code", thread, "ws1", &cwd_text).ever_dangerous(),
+            "{thread}"
+        );
+    }
+    assert!(
+        !authorize(&operator, "claude-code", CHECKED)
+            .unwrap()
+            .ever_dangerous()
+    );
+    assert!(
+        !authorize(&operator, "unsupported-test-runtime", MISSING)
+            .unwrap()
+            .ever_dangerous()
+    );
+}
+
+fn caller_in(role: &str, workspace: &str) -> CallerClaim {
+    CallerClaim {
+        account_id: Some("acct".into()),
+        username: None,
+        role: role.into(),
+        workspace_id: workspace.into(),
+    }
+}
+
+/// Pins the gate on messages sent to a live terminal Claude Code session (`session.enqueue`)
+/// against the transcript's own mode. The terminal runs in a folder of the workspace and the
+/// ledger has no row for it. While its transcript records `bypassPermissions`, an operator's
+/// message is refused with `DangerousSessionLocked` and the owner's passes the gate; once it
+/// records only checked modes, the operator's passes too. A gate that read only the ledger let
+/// the operator's message through to a session that ran with no checks.
+#[cfg(unix)]
+#[test]
+fn a_message_to_a_bypass_terminal_is_owner_only() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::danger_gate_tests::a_message_to_a_bypass_terminal_is_owner_only",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let registered = crate::rc::native_claude::fixture::registered(root.path());
+            let session = registered.registration.session.clone();
+            let cwd = registered.registration.cwd.clone();
+            let native = root
+                .path()
+                .join("projects")
+                .join(crate::adapter::claude_code::slug_for(&cwd));
+            std::fs::create_dir_all(&native).unwrap();
+            let write = |mode: &str| {
+                let record = serde_json::json!({"type":"user","sessionId":session,"cwd":cwd,
+                    "timestamp":"2026-11-01T00:00:00Z","permissionMode":mode,
+                    "message":{"role":"user","content":"hello"}});
+                std::fs::write(
+                    native.join(format!("{session}.jsonl")),
+                    format!("{record}\n"),
+                )
+                .unwrap();
+            };
+            let daemon = super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+            let local = || -> crate::protocol::LocalSession {
+                serde_json::from_value(serde_json::json!({"runtime_session_id":session,
+                    "runtime":"claude-code","cwd":cwd,"modified_at":"2026-11-01T00:00:00Z",
+                    "likely_active":true}))
+                .unwrap()
+            };
+            let enqueue = |role: &str| {
+                let mut frame = Frame::request(
+                    method::SESSION_ENQUEUE,
+                    serde_json::json!({"workspace_id":"ws-a","session_id":session,
+                        "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
+                );
+                frame.caller = Some(caller_in(role, "ws-a"));
+                frame
+            };
+            let refused = |result: Result<_, RpcError>| {
+                result
+                    .err()
+                    .is_some_and(|error| error.code == ErrorCode::DangerousSessionLocked as i32)
+            };
+
+            write("bypassPermissions");
+            assert!(refused(
+                state.prepare_native_inbox(&enqueue("operator"), Some(local()))
+            ));
+            assert!(!refused(
+                state.prepare_native_inbox(&enqueue("owner"), Some(local()))
+            ));
+            write("default");
+            assert!(!refused(
+                state.prepare_native_inbox(&enqueue("operator"), Some(local()))
+            ));
+            drop(registered);
+        });
+}
+
+/// Pins that attaching to a terminal Claude Code session stays fail-closed. The native driver
+/// cannot know what mode the terminal runs in, so the session it opens records no mode and
+/// counts as dangerous: an operator's turn or steer into it is refused with
+/// `DangerousSessionLocked`, and the owner's goes through. This holds whatever the terminal's
+/// transcript says, since the terminal may change mode without recording it. A driver that
+/// reported a known Default mode would let the operator drive a terminal that may run with no
+/// checks.
+#[cfg(unix)]
+#[test]
+fn an_attached_terminal_stays_owner_only_to_drive() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::danger_gate_tests::an_attached_terminal_stays_owner_only_to_drive",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let registered = crate::rc::native_claude::fixture::registered(root.path());
+            let driver = crate::rc::harness::claude_native::ClaudeNativeDriver::attach(
+                crate::rc::harness::LaunchSpec {
+                    cwd: registered.registration.cwd.clone(),
+                    resume_from: Some(registered.registration.session.clone()),
+                    agit_session: None,
+                    model: None,
+                    dangerous: false,
+                    permission_mode: None,
+                },
+            )
+            .map_err(|error| format!("{error:?}"))
+            .expect("the driver attaches to the registered terminal");
+            let driver = crate::rc::harness::AnyDriver::ClaudeNative(Box::new(driver));
+            let (tx, _rx) = mpsc::channel(1);
+            let mut live = super::tests::rpc_test_live(
+                "agit-attached",
+                1,
+                tx,
+                crate::protocol::PermissionMode::Default,
+            );
+            live.info.runtime = "claude-code".into();
+            live.info.dangerous = false;
+            crate::rc::supervisor::record_opening_mode(&driver, &mut live.info);
+            assert_eq!(live.info.permission_mode, None);
+            assert!(live.info.dangerous);
+
+            let daemon = super::tests::rpc_test_daemon(
+                HashMap::from([("agit-attached".to_owned(), live)]),
+                Roster::default(),
+            );
+            let state = daemon.lock().await;
+            let error = state
+                .session_channel("agit-attached", &caller_in("operator", "ws-a"), Need::Drive)
+                .err()
+                .expect("an operator cannot drive an attached terminal");
+            assert_eq!(error.code, ErrorCode::DangerousSessionLocked as i32);
+            assert!(
+                state
+                    .session_channel("agit-attached", &caller_in("owner", "ws-a"), Need::Drive)
+                    .is_ok()
+            );
+            drop(state);
+            drop(driver);
+            drop(registered);
+        });
+}
+
+/// Pins that this build advertises `resume-caller-gate-v1` in the identity the daemon reports
+/// (`rpc_features`). The Hub lifts its stopgap for an executor that advertises it, so it sits
+/// beside the tests of the four parts it promises, all in this module and in the takeover test:
+/// the transcript's own mode on takeover and resume, the same read on a native message, a
+/// non-owner's resume no looser than Default, and attach staying fail-closed. A build that
+/// dropped any of them breaks its test here; one that dropped the advert would leave executors
+/// that enforce them behind the Hub's stopgap.
+#[test]
+fn the_resume_caller_gate_is_advertised() {
+    let identity = crate::rc::build_identity::DaemonIdentity::current().unwrap();
+    assert!(
+        identity
+            .rpc_features
+            .iter()
+            .any(|feature| feature == "resume-caller-gate-v1"),
+        "{:?}",
+        identity.rpc_features
+    );
+}
+
+/// Pins the check a source attach makes on the mode it opened in: it holds only when the runtime
+/// confirms exactly the mode the launch asked for. A non-owner's source resume asks for the
+/// native mode it found to be Default or Plan; an attach that then opened in Auto, or in a mode
+/// it cannot confirm, is refused. A launch that asked for no mode is not held to one. A check that
+/// passed every attach let a native thread loosened between the check and the attach be driven by
+/// an operator.
+#[test]
+fn a_source_attach_holds_only_in_the_mode_it_asked_for() {
+    use crate::protocol::PermissionMode as M;
+    use crate::rc::supervisor::opened_as_asked;
+    assert!(opened_as_asked(Some(M::Default), Some(M::Default)));
+    assert!(opened_as_asked(Some(M::Plan), Some(M::Plan)));
+    assert!(!opened_as_asked(Some(M::Default), Some(M::Auto)));
+    assert!(!opened_as_asked(Some(M::Plan), Some(M::Default)));
+    assert!(!opened_as_asked(Some(M::Default), None));
+    assert!(opened_as_asked(None, None));
+}
