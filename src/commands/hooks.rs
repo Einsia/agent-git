@@ -622,7 +622,8 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     }
     // Nothing here reaches the model: an agent that needs this conversation's state runs agit,
     // which names it from the runtime's own session variable. Only the person is told where a
-    // conversation the folder uploads goes, and who can read it there.
+    // conversation the folder uploads goes, and who can read it there, or, when they resume one
+    // the folder holds back, that it is not uploaded.
     if !announces_upload(rt, ev.source) {
         return None;
     }
@@ -631,12 +632,66 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
             super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
         })
         .map(|upload| upload_notice(&upload));
+    let held = origin
+        .filter(|_| ev.source == Source::Resume)
+        .and_then(|origin| super::project::held_earlier(rt, &ev.session_id, origin))
+        .map(|held| held_notice(&held, &ev.session_id));
     let failure = origin.and_then(|origin| failure_line(rt, &ev.session_id, origin));
-    let message = match (notice, failure) {
-        (Some(notice), Some(failure)) => format!("{notice}\n{failure}"),
-        (notice, failure) => notice.or(failure)?,
+    let lines: Vec<String> = [notice.or(held), failure].into_iter().flatten().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "systemMessage": lines.join("\n") }))
+}
+
+/// Who can read `repository`, as the Hub said; `None` when it has not said.
+fn audience(
+    repository: &str,
+    visibility: Option<&str>,
+    org: Option<bool>,
+    members_read: Option<bool>,
+) -> Option<String> {
+    let owner = repository.split('/').next().unwrap_or_default();
+    Some(match (visibility?, org) {
+        ("public", _) => "public: anyone can read it".to_owned(),
+        ("private", Some(true)) if members_read == Some(true) => {
+            format!("private to {owner}: every member of {owner} can read it")
+        }
+        ("private", Some(true)) => {
+            format!("private to {owner}: its owners and the people granted access can read it")
+        }
+        ("private", Some(false)) => "private: only you and people you add can read it".to_owned(),
+        (visibility, _) => visibility.to_owned(),
+    })
+}
+
+/// One line for the person who resumes a conversation the folder holds back as its earlier
+/// history: it is not uploaded, where it would go and who can read it there, and the two ways to
+/// upload it, each of which uploads only this one, without asking again. Without it, a resume in
+/// a folder that is on says nothing, which reads as being saved. Who can read it is the Hub's last
+/// recorded answer, left out when there is none rather than guessed.
+fn held_notice(held: &super::project::HeldEarlier, session: &str) -> String {
+    let folder = crate::ui::tilde(&held.folder);
+    let since = match &held.worktree {
+        Some(worktree) => format!(
+            "started in {} before agit covered it as a git worktree of {folder}",
+            crate::ui::tilde(worktree)
+        ),
+        None => format!("is from before {folder} was on"),
     };
-    Some(serde_json::json!({ "systemMessage": message }))
+    let mut destination = held.repository.clone();
+    if let Some(audience) = audience(
+        &held.repository,
+        held.visibility.as_deref(),
+        held.org,
+        held.members_read,
+    ) {
+        destination.push_str(&format!(" ({audience})"));
+    }
+    format!(
+        "agit: this conversation {since}, so it is not uploaded. To upload it to {destination}: ask your agent to run `agit save`, or run `agit save {}` in {folder}.",
+        session.chars().take(8).collect::<String>()
+    )
 }
 
 /// One line for the person when the last automatic upload of this folder's project failed, said
@@ -671,21 +726,13 @@ fn announces_upload(runtime: &str, source: Source) -> bool {
 /// is not the folder it started in, and how to stop the upload. The agent was told nothing, so
 /// stopping is a command the person runs or asks their agent to run.
 fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
-    let owner = upload.repository.split('/').next().unwrap_or_default();
-    let audience = match (upload.visibility.as_deref(), upload.org) {
-        (Some("public"), _) => "public: anyone can read it".to_owned(),
-        (Some("private"), Some(true)) if upload.members_read == Some(true) => {
-            format!("private to {owner}: every member of {owner} can read it")
-        }
-        (Some("private"), Some(true)) => {
-            format!("private to {owner}: its owners and the people granted access can read it")
-        }
-        (Some("private"), Some(false)) => {
-            "private: only you and people you add can read it".to_owned()
-        }
-        (Some(visibility), _) => visibility.to_owned(),
-        (None, _) => "visibility not confirmed".to_owned(),
-    };
+    let audience = audience(
+        &upload.repository,
+        upload.visibility.as_deref(),
+        upload.org,
+        upload.members_read,
+    )
+    .unwrap_or_else(|| "visibility not confirmed".to_owned());
     let repository = &upload.repository;
     let because = match &upload.worktree {
         Some((worktree, main)) => format!(
@@ -1517,6 +1564,36 @@ mod tests {
                 "at the end of each turn, because /w/widget-tree is a git worktree of /w/widget."
             ),
             "{through}"
+        );
+    }
+
+    /// A resumed conversation the folder holds back as earlier history tells the person it is not
+    /// uploaded, where it would go and who reads it there in the upload notice's words, and how to
+    /// upload it alone, from inside the conversation or from the folder. Without a recorded
+    /// audience it names none rather than guess; a line that offered the upload without the
+    /// audience it has would publish to readers the person never saw named.
+    #[test]
+    fn a_resumed_earlier_conversation_is_told_it_is_not_uploaded() {
+        let held = |worktree: Option<&str>, visibility: Option<&str>| {
+            super::held_notice(
+                &crate::commands::project::HeldEarlier {
+                    repository: "acme/widget".into(),
+                    visibility: visibility.map(str::to_owned),
+                    org: Some(true),
+                    members_read: Some(true),
+                    folder: "/w/widget".into(),
+                    worktree: worktree.map(Into::into),
+                },
+                "3f2a9c1d-0000-4000-8000-000000000001",
+            )
+        };
+        assert_eq!(
+            held(None, Some("private")),
+            "agit: this conversation is from before /w/widget was on, so it is not uploaded. To upload it to acme/widget (private to acme: every member of acme can read it): ask your agent to run `agit save`, or run `agit save 3f2a9c1d` in /w/widget."
+        );
+        assert_eq!(
+            held(Some("/w/widget-tree"), None),
+            "agit: this conversation started in /w/widget-tree before agit covered it as a git worktree of /w/widget, so it is not uploaded. To upload it to acme/widget: ask your agent to run `agit save`, or run `agit save 3f2a9c1d` in /w/widget."
         );
     }
 

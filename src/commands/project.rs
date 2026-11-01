@@ -2814,10 +2814,15 @@ fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Vi
         session_id: session.into(),
         cwd: origin.to_path_buf(),
     };
-    if withholds(&project, &candidate, false) {
+    if withholds(&project, &candidate, false) || claimed_elsewhere(&project, runtime, session) {
         return None;
     }
-    let claimed_elsewhere = Store::open()
+    Some((project, via))
+}
+
+/// Whether this conversation records into a repository other than `project`'s.
+fn claimed_elsewhere(project: &Project, runtime: &str, session: &str) -> bool {
+    Store::open()
         .ok()
         .flatten()
         .and_then(|store| link::get(&store, runtime, session))
@@ -2828,8 +2833,62 @@ fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Vi
                     link.owner.as_deref().unwrap_or_default(),
                     link.agent.as_deref().unwrap_or_default()
                 ) != project.repository
-        });
-    (!claimed_elsewhere).then_some((project, via))
+        })
+}
+
+/// A conversation a project that uploads automatically holds back as the folder's earlier
+/// history, and what would upload it.
+pub(crate) struct HeldEarlier {
+    pub(crate) repository: String,
+    /// Who can read that repository, as the Hub last said; `None` when it has not said.
+    pub(crate) visibility: Option<String>,
+    pub(crate) org: Option<bool>,
+    pub(crate) members_read: Option<bool>,
+    /// The folder whose setting covers the conversation.
+    pub(crate) folder: PathBuf,
+    /// The git worktree of that folder the conversation started in, when it started in one.
+    pub(crate) worktree: Option<PathBuf>,
+}
+
+/// The project that would upload this conversation by itself but holds it back as earlier
+/// history: it is from before the folder was on, or from before the folder covered the git
+/// worktree it started in (see [`left_out`]). `None` when the project uploads it, the person
+/// dropped it, it records into another repository, or no project there is on and uploads
+/// automatically. Judged from local state alone, the audience included, so a hook may ask.
+pub(crate) fn held_earlier(runtime: &str, session: &str, origin: &Path) -> Option<HeldEarlier> {
+    if !captured_runtime(runtime) {
+        return None;
+    }
+    let origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    let (project, via) = governing(&origin).ok()??;
+    let session_key = key(runtime, session);
+    if !project.enabled || !project.auto_upload || project.excluded.contains(&session_key) {
+        return None;
+    }
+    let candidate = Candidate {
+        runtime: runtime.into(),
+        session_id: session.into(),
+        cwd: origin,
+    };
+    let earlier = project.earlier.contains(&session_key)
+        || before_covered(&project, &candidate, false).unwrap_or(true);
+    if !earlier || claimed_elsewhere(&project, runtime, session) {
+        return None;
+    }
+    let recorded = recorded_audience(&project.root);
+    Some(HeldEarlier {
+        repository: project.repository,
+        visibility: recorded.visibility,
+        org: recorded.org,
+        members_read: recorded.members_read,
+        folder: project.root,
+        worktree: match via {
+            Via::Worktree(worktree) => Some(worktree),
+            Via::Folder => None,
+        },
+    })
 }
 
 /// Whether the project covering `origin` captures this conversation by itself; see [`capturing`].
@@ -3792,6 +3851,9 @@ mod tests {
         let inside = policy.root.join("src");
         fs::create_dir_all(&inside).unwrap();
         policy.excluded.insert(key("codex", "excluded"));
+        for earlier in ["old", "excluded", "elsewhere"] {
+            policy.earlier.insert(key("codex", earlier));
+        }
         save(&policy).unwrap();
         let wait = std::time::Duration::from_millis(1);
         let announced = |id: &str, origin: &Path| {
@@ -3809,6 +3871,25 @@ mod tests {
         claim.branch = Some("work".into());
         link::write(&store, &claim).unwrap();
         assert!(announced("elsewhere", &inside).is_none());
+        // Held back as the folder's earlier history, a conversation is not announced, and a resume
+        // of it is told why; not when the person dropped it, it records into another repository,
+        // or its runtime is not one the project captures.
+        let held = |runtime: &str, id: &str, origin: &Path| {
+            held_earlier(runtime, id, origin).map(|held| (held.repository, held.worktree))
+        };
+        assert!(announced("old", &inside).is_none());
+        assert_eq!(
+            held("codex", "old", &inside),
+            Some(("alice/app".into(), None))
+        );
+        for (runtime, id) in [
+            ("opencode", "old"),
+            ("codex", "fresh"),
+            ("codex", "excluded"),
+            ("codex", "elsewhere"),
+        ] {
+            assert!(held(runtime, id, &inside).is_none(), "{runtime} {id}");
+        }
 
         let audience =
             || automatic_upload("codex", "fresh", &inside, wait).map(|u| (u.visibility, u.org));
@@ -3852,6 +3933,12 @@ mod tests {
         assert!(claude(UNSTAMPED, &tree).is_none());
         assert!(left_out(&tree, "claude-code", BEFORE, &tree));
         assert_eq!(
+            held("claude-code", BEFORE, &tree),
+            Some(("alice/app".into(), Some(tree.clone())))
+        );
+        assert!(held("claude-code", UNSTAMPED, &tree).is_some());
+        assert!(held("claude-code", AFTER, &tree).is_none());
+        assert_eq!(
             claude(AFTER, &tree).and_then(|upload| upload.worktree),
             Some((tree.clone(), policy.root.clone()))
         );
@@ -3879,6 +3966,7 @@ mod tests {
         kept.branch = Some("kept".into());
         link::write(&store, &kept).unwrap();
         assert!(claude(BEFORE, &tree).is_some());
+        assert!(held("claude-code", BEFORE, &tree).is_none());
         policy.excluded.insert(key("claude-code", AFTER));
         save(&policy).unwrap();
         assert!(claude(AFTER, &tree).is_none());
@@ -3901,6 +3989,7 @@ mod tests {
         policy.enabled = false;
         save(&policy).unwrap();
         assert!(claude(LATER, &tree).is_none());
+        assert!(held("claude-code", UNSTAMPED, &tree).is_none());
         assert_eq!(uploads_automatically(&tree), Some(false));
         assert!(turned_off(&tree));
         assert!(!registration_scope(&tree));

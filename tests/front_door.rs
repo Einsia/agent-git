@@ -327,7 +327,40 @@ impl Lab {
     }
 
     fn agit(&self, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_agit"))
+        self.command(dir, args).output().unwrap()
+    }
+
+    /// What the SessionStart hook answers when Claude Code resumes conversation `id` in `cwd`.
+    fn resume(&self, cwd: &std::path::Path, id: &str) -> serde_json::Value {
+        let transcript = self
+            .home
+            .join(".claude")
+            .join("projects")
+            .join(agit::adapter::claude_code::slug_for(cwd))
+            .join(format!("{id}.jsonl"));
+        let event = serde_json::json!({"session_id": id, "cwd": cwd, "transcript_path": transcript,
+            "hook_event_name": "SessionStart", "source": "resume"});
+        let mut child = self
+            .command(cwd, &["hooks", "ingest", "--runtime", "claude-code"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn command(&self, dir: &std::path::Path, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command
             .args(args)
             .current_dir(dir)
             .env_clear()
@@ -345,9 +378,8 @@ impl Lab {
             .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
             .env("CODEX_HOME", self.home.join(".codex"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap()
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
     }
 
     /// A Claude Code conversation in `cwd` with one finished reply.
@@ -838,8 +870,9 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
 /// A folder that is on covers the git worktrees of its checkout (#162), from when it covers each
 /// one. Its overview names each worktree with the sessions there from before; in a worktree, the
 /// overview and `agit status` name the folder whose setting it follows and count those sessions
-/// with `agit save --all`; at a terminal `agit save --today` counts a worktree's sessions on a line
-/// of its own before it asks; `agit off` there stops only the worktree. An implementation that
+/// with `agit save --all`, and a resume of one of those sessions tells the person it is not
+/// uploaded and hands them a save that takes it alone; at a terminal `agit save --today` counts a worktree's sessions on a line of its own
+/// before it asks; `agit off` there stops only the worktree. An implementation that
 /// judged by the folder's path alone says nothing in the worktree and saves nothing there; one
 /// that took the worktree's earlier sessions along uploads them unasked; one whose `agit off`
 /// reached the folder turns the folder off too.
@@ -906,6 +939,24 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
         serde_json::json!({"count": 1, "command": "agit save --all"}),
         "{status}"
     );
+    // Resumed, that conversation tells the person, and only the person, that it is not uploaded
+    // and how to upload it alone. A resume that said nothing reads as being saved, and any field
+    // beside the person's message would reach the model.
+    let resumed = lab.resume(&tree, "14141414-1414-4141-8141-141414141414");
+    assert_eq!(
+        resumed
+            .as_object()
+            .map(|fields| fields.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["systemMessage".to_owned()]),
+        "{resumed}"
+    );
+    let said = resumed["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("before agit covered it as a git worktree of")
+            && said.contains("so it is not uploaded. To upload it to me/notes")
+            && said.contains("`agit save 14141414` in"),
+        "{said}"
+    );
 
     // At a terminal `agit save --today` names the worktree and how many of its sessions would go
     // before it asks once; no uploads nothing.
@@ -921,6 +972,30 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
         assert!(screen.contains("nothing was uploaded"), "{screen}");
         assert!(lab.created().is_empty(), "nothing is created on the Hub");
     }
+
+    // The command that line hands the person, run in the folder as printed, takes that
+    // conversation alone and does not ask: another earlier conversation of the worktree stays out.
+    // A short id that resolved to nothing, or to the other conversation, fails here. The lab's Hub
+    // accepts no upload, so what is pinned is which conversation the save takes.
+    lab.conversation(
+        &tree,
+        "15151515-1515-4151-8151-151515151515",
+        "Sketch another idea",
+    );
+    let out = lab.agit(&dir, &["--json", "save", "14141414"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(out.status.code(), Some(8), "{document}");
+    let taken: Vec<&str> = document["result"]["value"]["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|session| session["session_id"].as_str())
+        .collect();
+    assert_eq!(
+        taken,
+        ["14141414-1414-4141-8141-141414141414"],
+        "{document}"
+    );
 
     let off = value(&tree, &["--json", "off"]);
     assert_eq!(off["through"], serde_json::json!(dir), "{off}");
