@@ -1307,9 +1307,10 @@ impl Drop for Client {
 pub(crate) mod fixture {
     use super::*;
 
-    /// What keeps a registered session current: the daemon's endpoint and the terminal's socket.
+    /// What keeps a registered session current: the daemon's endpoint and the terminal's socket,
+    /// both held only so they stay open.
     pub(crate) struct Registered {
-        pub(crate) endpoint: Endpoint,
+        _endpoint: Endpoint,
         pub(crate) registration: Registration,
         _socket: std::os::unix::net::UnixListener,
     }
@@ -1352,7 +1353,7 @@ pub(crate) mod fixture {
         .unwrap();
         endpoint.hub.poll(snapshot).unwrap();
         Registered {
-            endpoint,
+            _endpoint: endpoint,
             registration,
             _socket: listener,
         }

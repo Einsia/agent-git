@@ -506,6 +506,10 @@ impl Daemon {
                     "native conversation directory changed",
                 ));
             }
+            if need == Need::Drive && !caller.is_owner() {
+                let current = context.current_mode(&thread).ok().flatten();
+                danger::require_native_mode_held(caller, live.admitted_mode, current)?;
+            }
         }
         if need == Need::Drive && !live.restart_guard_attempts.is_empty() {
             return Err(RpcError::new(
@@ -880,6 +884,7 @@ mod bound_lineage_tests {
                         runtime_thread_id: Some("native-1".into()),
                         task: tokio::spawn(async {}),
                         danger_arm: 0,
+                        admitted_mode: None,
                         pending_mode: None,
                         approval_requests: HashMap::new(),
                         rpc_gate: Arc::new(Mutex::new(())),

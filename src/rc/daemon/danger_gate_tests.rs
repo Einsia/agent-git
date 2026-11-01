@@ -290,6 +290,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     runtime_thread_id: Some("native-1".into()),
                     task: tokio::spawn(async {}),
                     danger_arm: 0,
+                    admitted_mode: None,
                     pending_mode: None,
                     approval_requests: [(
                         "approval-1".to_string(),
@@ -676,4 +677,29 @@ fn a_source_attach_holds_only_in_the_mode_it_asked_for() {
     assert!(!opened_as_asked(Some(M::Plan), Some(M::Default)));
     assert!(!opened_as_asked(Some(M::Default), None));
     assert!(opened_as_asked(None, None));
+}
+
+/// Pins the turn-time hold on a native thread's mode: a non-owner holds while the thread is no
+/// looser than the mode admitted, and is refused once it loosens or cannot be read; the owner is
+/// never held. A native message with no admission holds to Default or Plan, as a resume would.
+#[test]
+fn a_non_owner_holds_only_while_the_native_mode_is_no_looser_than_admitted() {
+    use crate::protocol::PermissionMode as M;
+    let (owner, operator) = (claim("owner"), claim("operator"));
+    let held = |caller: &CallerClaim, admitted, current| {
+        danger::require_native_mode_held(caller, admitted, current).is_ok()
+    };
+    assert!(held(&operator, Some(M::Default), Some(M::Default)));
+    assert!(held(&operator, Some(M::Default), Some(M::Plan)));
+    assert!(!held(&operator, Some(M::Default), Some(M::Auto)));
+    assert!(!held(&operator, Some(M::Plan), Some(M::Default)));
+    assert!(!held(&operator, Some(M::Default), None));
+    assert!(!held(&operator, None, Some(M::Default)));
+    assert!(held(&owner, Some(M::Default), Some(M::Bypass)));
+    assert!(held(&owner, None, None));
+    let message = |current| held(&operator, danger::resume_mode(&operator, current), current);
+    assert!(message(Some(M::Default)));
+    assert!(message(Some(M::Plan)));
+    assert!(!message(Some(M::Auto)));
+    assert!(!message(None));
 }

@@ -42,6 +42,7 @@ pub(super) fn rpc_test_live(
         runtime_thread_id: None,
         task: tokio::spawn(async {}),
         danger_arm: 0,
+        admitted_mode: None,
         pending_mode: None,
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),

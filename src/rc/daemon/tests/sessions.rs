@@ -2045,6 +2045,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         runtime_thread_id: None,
         task: tokio::spawn(async {}),
         danger_arm: 0,
+        admitted_mode: None,
         pending_mode: Some(crate::protocol::PermissionMode::Plan),
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),

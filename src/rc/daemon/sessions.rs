@@ -899,6 +899,7 @@ impl Daemon {
             .validate_message()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
         frame.authority.check()?;
+        let mut mode_bound = None;
         let (cwd, transcript, native, source) = if let Some(watch) = enrolled {
             use super::source_sessions::unavailable;
             if watch.context.source.session_ref(&watch.native_id) != request.session_id {
@@ -932,7 +933,24 @@ impl Daemon {
                 .context
                 .locate(&watch.native_id, &self.mirror.roots(&request.workspace_id))
                 .map_err(unavailable)?;
-            let settings = watch.context.settings(&thread).map_err(unavailable)?;
+            // A non-owner is judged only by the mode the index records now; one that cannot be
+            // read now, or only from the rollout's history, is refused.
+            let mode = if caller.is_owner() {
+                watch
+                    .context
+                    .settings(&thread)
+                    .map_err(unavailable)?
+                    .permission_mode
+            } else {
+                Some(
+                    watch
+                        .context
+                        .current_mode(&thread)
+                        .ok()
+                        .flatten()
+                        .ok_or_else(crate::rc::native_settings::mode_changed)?,
+                )
+            };
             let _ = danger::authorize_source(
                 &self.roster,
                 &caller,
@@ -940,8 +958,12 @@ impl Daemon {
                 &watch.native_id,
                 &watch.cwd.to_string_lossy(),
                 &thread.transcript,
-                settings.permission_mode,
+                mode,
             )?;
+            // Nothing admitted this caller to the thread: hold its message to the mode a resume
+            // would have admitted, Default or Plan.
+            mode_bound = danger::resume_mode(&caller, mode);
+            danger::require_native_mode_held(&caller, mode_bound, mode)?;
             let native = watch.context.source.native().map_err(unavailable)?;
             request.session_id = watch.native_id;
             (
@@ -1041,6 +1063,7 @@ impl Daemon {
             authority: frame.authority.clone(),
             confinement: None,
             allow_dangerous: caller.is_owner(),
+            mode_bound,
             request,
             transcript,
             cwd,

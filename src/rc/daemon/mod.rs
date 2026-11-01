@@ -548,6 +548,10 @@ struct Live {
     /// The note is asynchronous: while it travels, the same session may be armed again, and
     /// flipping back then erases the **new** arming — which may really have taken effect.
     danger_arm: u64,
+    /// The mode the runtime confirmed when this session opened. For a Codex conversation of a
+    /// native source, whose mode a native client can change at any time, a non-owner's turns hold
+    /// only while the thread's mode is no looser than this (`danger::require_native_mode_held`).
+    admitted_mode: Option<crate::protocol::PermissionMode>,
     /// The mode already queued that takes effect only on the **next turn** (codex's `next_turn`).
     ///
     /// It is not decoration. Deciding whether something "loosens" needs a starting point, and
