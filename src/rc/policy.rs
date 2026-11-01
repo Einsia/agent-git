@@ -275,6 +275,17 @@ const CONTROL_SURFACES: &[&str] = &[
     // gradle init script are the same.
     ".cargo", ".rustup", ".npmrc", ".yarnrc", ".yarnrc.yml", ".yarn",
     ".gradle", ".mvn", ".bundle", ".pre-commit-config.yaml",
+    // Project config of the runtimes agit drives, beside `.claude` and `.codex` above. Each is
+    // loaded as config that runs a program or changes what is allowed: Claude Code starts the
+    // `command` of every stdio server in `.mcp.json`; OpenCode reads `opencode.json(c)` (its
+    // `permission`, local `mcp` commands, `plugin` packages) and runs the plugins, tools,
+    // agents and permissions under `.opencode/`. Plugin marketplaces a runtime looks up in the
+    // repository (`.agents`, `.claude-plugin`, `.cursor-plugin`) name what it may install.
+    ".mcp.json", "opencode.json", "opencode.jsonc", ".opencode",
+    ".agents", ".claude-plugin", ".cursor-plugin",
+    // Files a runtime loads into later sessions without being asked: its instruction files,
+    // read at the start of every session in this folder. Folded names, as compared below.
+    "claude.md", "claude.local.md", "agents.md", "agents.override.md",
 ];
 
 /// Fold one name into "what the filesystem sees". **Every name comparison in this file goes
@@ -3177,6 +3188,48 @@ mod tests {
         // Inside the workspace, allowed as usual.
         for cmd in ["grep -rn -e TODO src", "rg -e TODO src", "rg --files src"] {
             assert_eq!(bash(cmd), None, "`{cmd}`");
+        }
+    }
+
+    /// Pins the project config of the runtimes agit drives as control surfaces: an operator's
+    /// write to Claude Code's `.mcp.json`, OpenCode's `opencode.json` / `opencode.jsonc`, anything
+    /// under `.opencode/` or a repository plugin marketplace, or a file a runtime loads into later
+    /// sessions without being asked (its instruction files), goes to the owner, in any case. Each
+    /// takes effect the next time that runtime starts here, with no second approval. The write
+    /// is asked of the owner, not refused.
+    #[test]
+    fn writing_a_runtimes_project_config_needs_the_owner() {
+        for p in [
+            ".mcp.json",
+            "opencode.json",
+            "opencode.jsonc",
+            ".opencode/plugin/run.ts",
+            ".opencode/agent/build.md",
+            "sub/.MCP.json",
+            "OpenCode.JSON",
+            ".agents/plugins/marketplace.json",
+            ".claude-plugin/marketplace.json",
+            ".cursor-plugin/marketplace.json",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "src/AGENTS.md",
+            "docs/claude.md",
+        ] {
+            assert_eq!(
+                reason("Write", serde_json::json!({ "file_path": p })),
+                Some(OwnerReason::Escalates),
+                "writing `{p}`"
+            );
+        }
+        // A note that only mentions a runtime is ordinary work.
+        for p in ["notes/opencode.md", "notes/agents-guide.md"] {
+            assert_eq!(
+                reason("Write", serde_json::json!({ "file_path": p })),
+                None,
+                "`{p}`"
+            );
         }
     }
 
