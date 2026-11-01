@@ -286,6 +286,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     generation: 3,
                     info,
                     shared_executor: false,
+                    started_process: true,
                     tx: cmd_tx,
                     runtime_thread_id: Some("native-1".into()),
                     task: tokio::spawn(async {}),
@@ -602,6 +603,7 @@ fn an_attached_terminal_stays_owner_only_to_drive() {
                     model: None,
                     dangerous: false,
                     permission_mode: None,
+                    attach_only: false,
                 },
             )
             .map_err(|error| format!("{error:?}"))
@@ -677,6 +679,191 @@ fn a_source_attach_holds_only_in_the_mode_it_asked_for() {
     assert!(!opened_as_asked(Some(M::Plan), Some(M::Default)));
     assert!(!opened_as_asked(Some(M::Default), None));
     assert!(opened_as_asked(None, None));
+}
+
+/// Pins that `attach_only` lets a takeover through to a Claude Code terminal registered for
+/// native control: the owner's takeover with the flag reaches a launch, which attaches to the
+/// running terminal, while the same conversation with no terminal registered is refused with
+/// `not_running` and nothing reserved. `attach_only` widens nothing: an operator's takeover of the
+/// registered terminal is still refused by the gate that keeps an open terminal's writer the
+/// owner's, and nothing is reserved for it.
+#[cfg(unix)]
+#[test]
+fn attach_only_joins_a_live_terminal() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::danger_gate_tests::attach_only_joins_a_live_terminal",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let registered = crate::rc::native_claude::fixture::registered(root.path());
+            let session = registered.registration.session.clone();
+            let cwd = registered.registration.cwd.clone();
+            let daemon = super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+            let (frames, _frames_rx) = mpsc::channel(1);
+            let takeover = |thread: &str| {
+                (
+                    LocatedLocal {
+                        title: None,
+                        gist: None,
+                        labels_withheld: None,
+                        runtime: "claude-code".into(),
+                        cwd: cwd.clone(),
+                        project_id: Some("project-a".into()),
+                        likely_active: true,
+                    },
+                    SessionResume {
+                        project_id: None,
+                        workspace_id: "ws-a".into(),
+                        session_id: thread.into(),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: true,
+                    },
+                )
+            };
+            let (located, resume) = takeover(&session);
+            let error = state
+                .prepare_local_takeover(located, resume, &caller_in("operator", "ws-a"), &frames)
+                .err()
+                .expect("an operator cannot attach to the owner's terminal");
+            assert_eq!(
+                error.code,
+                ErrorCode::SessionBusy as i32,
+                "{}",
+                error.message
+            );
+            let reason = error.data.as_ref().and_then(|data| data["reason"].as_str());
+            assert!(
+                matches!(
+                    reason,
+                    Some("native_writer_active" | "native_recent_activity")
+                ),
+                "{:?}",
+                error.data
+            );
+            assert!(state.opening_sessions.is_empty());
+            assert!(state.sessions.is_empty());
+
+            let (located, resume) = takeover(&session);
+            let opening = state
+                .prepare_local_takeover(located, resume, &caller_in("owner", "ws-a"), &frames)
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            assert!(matches!(opening, SessionOpening::Launch(..)));
+            state.opening_sessions.clear();
+
+            let (mut located, resume) = takeover("bbbbbbbb-0000-4000-8000-000000000a02");
+            located.likely_active = false;
+            let error = state
+                .prepare_local_takeover(located, resume, &caller_in("owner", "ws-a"), &frames)
+                .err()
+                .expect("no terminal runs this conversation");
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"retryable": false, "reason": "not_running"}))
+            );
+            assert!(state.opening_sessions.is_empty());
+            drop(state);
+            drop(registered);
+        });
+}
+
+/// The terminal an attach-only takeover was admitted for exits before its driver is chosen: the
+/// prepared opening refuses with `not_running` and launches nothing, instead of starting Claude
+/// Code itself, and leaves nothing reserved.
+#[cfg(unix)]
+#[test]
+fn attach_only_launches_nothing_when_the_terminal_exits_before_the_driver_is_chosen() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::danger_gate_tests::attach_only_launches_nothing_when_the_terminal_exits_before_the_driver_is_chosen",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let registered = crate::rc::native_claude::fixture::registered(root.path());
+            let session = registered.registration.session.clone();
+            let cwd = registered.registration.cwd.clone();
+            let daemon = super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+            let (frames, _frames_rx) = mpsc::channel(1);
+            let opening = state
+                .prepare_local_takeover(
+                    LocatedLocal {
+                        title: None,
+                        gist: None,
+                        labels_withheld: None,
+                        runtime: "claude-code".into(),
+                        cwd: cwd.clone(),
+                        project_id: Some("project-a".into()),
+                        likely_active: true,
+                    },
+                    SessionResume {
+                        project_id: None,
+                        workspace_id: "ws-a".into(),
+                        session_id: session.clone(),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: true,
+                    },
+                    &caller_in("owner", "ws-a"),
+                    &frames,
+                )
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            let SessionOpening::Launch(spawn, _) = opening else {
+                panic!("the owner's attach-only takeover of a live terminal is admitted");
+            };
+            assert!(spawn.spec.attach_only);
+            drop(state);
+
+            // The terminal exits: its control endpoint closes and its registry record goes.
+            drop(registered);
+            let _ = std::fs::remove_file(
+                cwd.join("sessions")
+                    .join(format!("{}.json", std::process::id())),
+            );
+            let result = spawn.execute().await;
+            let mut state = daemon.lock().await;
+            let failure = state
+                .finish_spawn(*spawn, result)
+                .err()
+                .expect("an attach-only opening never launches");
+            assert!(!failure.reached_launch, "{}", failure.error.message);
+            assert_eq!(
+                failure.error.data,
+                Some(serde_json::json!({"retryable": false, "reason": "not_running"})),
+                "{}",
+                failure.error.message
+            );
+            assert!(state.opening_sessions.is_empty());
+            assert!(state.sessions.is_empty());
+        });
 }
 
 /// Pins the turn-time hold on a native thread's mode: a non-owner holds while the thread is no

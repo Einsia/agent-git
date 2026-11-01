@@ -437,6 +437,7 @@ mod tests {
                 model: Some("must-not-override".into()),
                 dangerous: true,
                 permission_mode: Some(PermissionMode::Bypass),
+                attach_only: false,
             },
             &source,
         )
@@ -515,6 +516,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Plan),
+            attach_only: false,
         };
         let mut first = CodexDriver::launch_shared(spec.clone(), &source)
             .await
@@ -523,11 +525,13 @@ mod tests {
             panic!("shared client required")
         };
         let _cleanup = Cleanup(client.started_pid().expect("isolated test owns its server"));
+        assert!(first.started_process());
         first.confirm_opening().await.unwrap();
         let native = first.runtime_thread_id().unwrap().to_owned();
         let mut resume = spec;
         resume.resume_from = Some(native.clone());
         let mut second = CodexDriver::launch_shared(resume, &source).await.unwrap();
+        assert!(!second.started_process());
         second.confirm_opening().await.unwrap();
         assert_eq!(second.runtime_thread_id(), Some(native.as_str()));
         assert_eq!(second.permission_mode(), PermissionMode::Plan);

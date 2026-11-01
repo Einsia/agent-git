@@ -806,6 +806,9 @@ impl CodexDriver {
     pub(super) fn shared_executor(&self) -> bool {
         self.proc.shared()
     }
+    pub(super) fn started_process(&self) -> bool {
+        self.proc.started_process()
+    }
     pub(super) fn permission_mode_known(&self) -> bool {
         !self.native_mode_unknown
     }

@@ -21,6 +21,37 @@ fn shared_claude_available(
     }
 }
 
+/// What `session.resume` with `attach_only` may do here: join only a Claude Code terminal it can
+/// attach to for native control. Anything else would launch the runtime, so it is refused with
+/// the reason `not_running`, before any launch is reserved. A conversation already running in
+/// the daemon is answered before this is asked.
+pub(super) fn attach_only_refusal(
+    attach_only: bool,
+    runtime: &str,
+    thread: &str,
+    cwd: &Path,
+) -> Result<(), RpcError> {
+    if !attach_only {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if runtime == "claude-code" && crate::rc::native_claude::Client::available(thread, cwd) {
+        return Ok(());
+    }
+    let _ = (runtime, thread, cwd);
+    Err(not_running_error())
+}
+
+/// The refusal of an attach-only opening that finds no terminal to join.
+pub(super) fn not_running_error() -> RpcError {
+    let mut error = RpcError::new(
+        ErrorCode::SessionBusy,
+        crate::rc::harness::AttachOnlyNotRunning.to_string(),
+    );
+    error.data = Some(serde_json::json!({"retryable": false, "reason": "not_running"}));
+    error
+}
+
 fn active_writer_error(
     runtime: &str,
     session: &str,
@@ -428,6 +459,7 @@ impl Daemon {
             return Ok(SessionOpening::Ready(
                 serde_json::to_value(SessionResumeResult {
                     session: self.stamped(info),
+                    launched: None,
                 })
                 .unwrap(),
             ));
@@ -511,6 +543,7 @@ impl Daemon {
                         "that session's working directory is outside this workspace's bound folders",
                     )
                 })?;
+            attach_only_refusal(p.attach_only, &entry.runtime, &entry.thread_id, &cwd)?;
             if transcript_likely_active(&entry.runtime, &entry.thread_id, &cwd)
                 && !shared_claude_available(&entry.runtime, &entry.thread_id, &cwd, caller)
             {
@@ -582,6 +615,7 @@ impl Daemon {
                 // Resume brings back the guard it ran under, never looser than Default for
                 // anyone but the owner.
                 permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
+                attach_only: p.attach_only,
             };
             let spawn = self.prepare_spawn(
                 info,
@@ -730,6 +764,7 @@ impl Daemon {
                 "that session's working directory is outside this workspace's bound folders",
             )
         })?;
+        attach_only_refusal(p.attach_only, &runtime, &p.session_id, &cwd)?;
 
         // Taking over a session opened in a terminal: if it was ever registered, reuse that
         // logical id — one conversation has one identity, or the web grows two rows pointing at
@@ -855,6 +890,7 @@ impl Daemon {
             // session deliberately confined to `plan` silently takes write access back on one
             // takeover.
             permission_mode: Some(inherited_mode),
+            attach_only: p.attach_only,
         };
         let spawn = self.prepare_spawn(
             info,
@@ -1268,6 +1304,7 @@ impl Daemon {
             model: p.model.clone(),
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
+            attach_only: false,
         };
 
         let Some(start_id) = start_id else {

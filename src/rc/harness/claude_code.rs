@@ -1574,6 +1574,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: None,
+            attach_only: false,
         };
         let args = argv(&spec, "sid", spec.resume_from.is_some());
         assert!(
@@ -1601,6 +1602,7 @@ mod tests {
             model: None,
             dangerous: true,
             permission_mode: None,
+            attach_only: false,
         };
         let mut fresh = spec(None);
         let refused = admit_mode(&mut fresh, true).err().unwrap();
@@ -1643,6 +1645,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: None,
+            attach_only: false,
         };
         assert!(
             !reopen(&spec).unwrap(),
@@ -2641,6 +2644,7 @@ for line in sys.stdin:
             model: None,
             dangerous,
             permission_mode,
+            attach_only: false,
         };
         assert_eq!(spec(true, None).effective_mode(), PermissionMode::Bypass);
         assert_eq!(

@@ -30,6 +30,9 @@ pub const RPC_FEATURES: &[&str] = &[
     // stays owner-only to drive; a non-owner's resume starts no looser than Default; and a
     // terminal attached for native control stays owner-only to drive, its mode being unknown.
     "resume-caller-gate-v1",
+    // `session.resume` takes `attach_only` (join a running conversation, never launch one) and
+    // replies `launched: true` when it started the runtime.
+    "session-resume-attach-only-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -356,6 +356,18 @@ impl Client {
         }
     }
 
+    /// Whether connecting started the shared server, rather than finding one already listening.
+    pub(crate) fn started_server(&self) -> bool {
+        self.starter.is_some()
+    }
+
+    /// A client as `connect_or_start` returns it after starting the server itself.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_starter(mut self, starter: tokio::process::Child) -> Self {
+        self.starter = Some(starter);
+        self
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn started_pid(&self) -> Option<u32> {
         self.starter.as_ref().and_then(tokio::process::Child::id)

@@ -1316,6 +1316,9 @@ impl Session {
     pub(crate) fn shared_executor(&self) -> bool {
         self.driver.shared_executor()
     }
+    pub(crate) fn started_process(&self) -> bool {
+        self.driver.started_process()
+    }
 
     /// Send the card once its summary, paths and input all pass the privacy check, and only then
     /// accept an answer to it; until then it waits in `unshown`. Callers settle the note after.
@@ -1559,6 +1562,11 @@ impl Session {
             })
             .transpose()
             .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
+        if spec.attach_only && source_context.is_some() {
+            return Err(crate::rc::harness::proc::LaunchError::not_spawned(
+                crate::rc::harness::AttachOnlyNotRunning.into(),
+            ));
+        }
         let mut driver = match &source_context {
             Some(context) => {
                 let source = context

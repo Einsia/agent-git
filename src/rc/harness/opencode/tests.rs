@@ -22,6 +22,7 @@ fn engine() -> (tempfile::TempDir, OpenCodeEngine) {
             model: None,
             dangerous: false,
             permission_mode: None,
+            attach_only: false,
         },
         agent: "owned-agent".into(),
         phase: Phase::Ready,
@@ -442,6 +443,7 @@ async fn native_exit_captures_durable_incomplete_turns() {
         model: None,
         dangerous: false,
         permission_mode: None,
+        attach_only: false,
     })
     .await
     .unwrap();
@@ -517,6 +519,7 @@ async fn native_cancelled_approval_does_not_block_the_next_turn() {
         model: None,
         dangerous: false,
         permission_mode: None,
+        attach_only: false,
     })
     .await
     .unwrap();
@@ -595,6 +598,7 @@ async fn native_opencode_smoke() {
             model: None,
             dangerous: false,
             permission_mode: None,
+            attach_only: false,
         })
         .await
         .unwrap();
