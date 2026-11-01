@@ -32,6 +32,8 @@ impl Lab {
             .env("AGIT_HOME", &self.store)
             .env("AGIT_HUB_URL", HUB)
             .env("AGIT_TELEMETRY_DISABLED", "1")
+            // A lab is a computer where agit is set up; the not-set-up notice has tests of its own.
+            .env("AGIT_SKIP_SETUP", "1")
             .env(
                 "AGIT_SECRETS_KEYSTORE",
                 if cfg!(windows) { "os" } else { "file" },

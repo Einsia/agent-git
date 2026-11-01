@@ -165,7 +165,7 @@ pub fn run(args: Args) -> CmdResult {
         .is_some_and(|repo| checkout_state(repo) == CheckoutState::HasHistory);
     if auto_push && !binds_only && crate::infra::credentials::current_user().is_none() {
         ui::info("Sign in to enable automatic pushing for this repository.");
-        let result = super::login::run(super::login::Args {
+        let result = super::login::run_as_step(super::login::Args {
             hub: None,
             with_token: false,
             device: false,

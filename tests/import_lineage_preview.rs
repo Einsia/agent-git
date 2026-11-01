@@ -998,6 +998,9 @@ impl Dialogue {
             command.env(key, value);
         }
         command.env("TERM", "xterm-256color");
+        // A dialogue's terminal is a computer where agit is set up: an import that succeeds would
+        // otherwise ask about setup here, and the not-set-up notice has tests of its own.
+        command.env("AGIT_SKIP_SETUP", "1");
         command.args(args);
         command.cwd(&lab.work);
         let pty = portable_pty::native_pty_system()

@@ -224,7 +224,7 @@ impl std::error::Error for LocalStoreFailure {}
 pub fn run(args: Args) -> CmdResult {
     let from_hook = args.from_hook;
     match run_inner(args) {
-        Ok(c) => Ok(c),
+        Ok(c) => super::setup::presence::after(Ok(c)),
         // Ordinary hook failures stay quiet; archive capture failures must remain observable.
         Err(ref error) if from_hook && !archive::is_failure(error) => Ok(ExitCode::Ok),
         // A hand-typed `agit commit` runs the same run_inner, so this arm must test from_hook:

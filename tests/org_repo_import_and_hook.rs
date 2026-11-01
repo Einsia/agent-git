@@ -231,6 +231,8 @@ impl Lab {
             .env("AGIT_YES", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0");
+        // A lab is a computer where agit is set up; the not-set-up notice has tests of its own.
+        c.env("AGIT_SKIP_SETUP", "1");
         c
     }
 
@@ -2045,7 +2047,9 @@ fn check_quiet_legacy_hook_claim(state: &str) {
     let stdout_path = lab._tmp.path().join("quiet-hook.stdout");
     let stderr_path = lab._tmp.path().join("quiet-hook.stderr");
     let mut child = QuietHookChild(
+        // The lab's Claude Code home has no agit Skill, and a hook still prints nothing.
         lab.agit(&["commit", "--from-hook", SID])
+            .env_remove("AGIT_SKIP_SETUP")
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout_path).unwrap())
             .stderr(fs::File::create(&stderr_path).unwrap())

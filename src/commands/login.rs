@@ -81,6 +81,11 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    super::setup::presence::after(run_as_step(args))
+}
+
+/// `agit login` as a step of another command, which shows its own notice once it is ready.
+pub(crate) fn run_as_step(args: Args) -> CmdResult {
     let hub = args.hub.clone().unwrap_or_else(config::hub_url);
     if crate::infra::hub_authority::HubAuthority::parse(&hub).is_err() {
         ui::error(

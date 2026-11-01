@@ -308,6 +308,9 @@ fn memory_targets_distinguish_explicit_input_from_execution_failures() {
     }
 }
 
+/// Lineage arguments an import cannot use are refused as usage, before anything local changes.
+/// The lab holds a Claude Code folder and no agit Skill, a computer where agit was never set up,
+/// so a not-set-up notice shown ahead of the refusal leaves its record and changes the state.
 #[test]
 fn lineage_arguments_keep_usage_and_git_failures_keep_their_unclassified_cause() {
     const ID: &str = "ed152010-1111-4444-8888-123456789abc";

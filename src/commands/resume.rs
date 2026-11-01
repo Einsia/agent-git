@@ -99,7 +99,11 @@ pub(crate) fn run_when_ready<T>(args: Args, ready: impl FnOnce() -> T) -> CmdRes
             // agent session (suspend the terminal → start the runtime → come back → refresh), so
             // the rest of this command never runs. `--no-launch` is the exception — that one
             // means "prepare only, do not launch".
-            crate::tui::Verdict::Enter => return crate::tui::screens::sessions::run(&cwd_now),
+            crate::tui::Verdict::Enter => {
+                // The screen keeps the terminal until the person leaves, so the notice goes first.
+                super::setup::presence::when_ready();
+                return crate::tui::screens::sessions::run(&cwd_now);
+            }
             crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
             crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
             crate::tui::Verdict::Skip => {}
@@ -2369,6 +2373,7 @@ fn finish(res: Resumed, no_launch: bool) -> CmdResult {
 
 /// The finish that fork / run reuse.
 pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
+    super::setup::presence::when_ready();
     match res.cmd {
         Some(cmd) => {
             if no_launch {

@@ -45,6 +45,8 @@ impl Lab {
             .env("AGIT_HOME", &self.store)
             .env("AGIT_HUB_URL", hub)
             .env("AGIT_TELEMETRY_DEFER", "1")
+            // A lab is a computer where agit is set up; the not-set-up notice has tests of its own.
+            .env("AGIT_SKIP_SETUP", "1")
             .env("NO_COLOR", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(self.root.path());
@@ -252,6 +254,7 @@ mod terminal {
             builder.env("AGIT_HOME", &lab.store);
             builder.env("AGIT_HUB_URL", "http://127.0.0.1:1");
             builder.env("AGIT_TELEMETRY_DEFER", "1");
+            builder.env("AGIT_SKIP_SETUP", "1");
             builder.env("NO_COLOR", "1");
             builder.env("TERM", "xterm");
             builder.env("GIT_CONFIG_NOSYSTEM", "1");

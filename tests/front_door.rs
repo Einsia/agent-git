@@ -375,6 +375,8 @@ impl Lab {
             .env("AGIT_HOME", &self.agit_home)
             .env("AGIT_HUB_URL", &self.hub)
             .env("AGIT_TELEMETRY_DISABLED", "1")
+            // A lab is a computer where agit is set up; the not-set-up notice has tests of its own.
+            .env("AGIT_SKIP_SETUP", "1")
             .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
             .env("CODEX_HOME", self.home.join(".codex"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -466,6 +468,7 @@ impl Lab {
         }
         command.env("AGIT_HUB_URL", &self.hub);
         command.env("AGIT_TELEMETRY_DISABLED", "1");
+        command.env("AGIT_SKIP_SETUP", "1");
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
         command.env("TERM", "xterm-256color");
@@ -661,6 +664,7 @@ fn nothing_is_created_for_a_folder_no_agent_here_uploads_from() {
         .env("AGIT_HOME", &lab.agit_home)
         .env("AGIT_HUB_URL", &lab.hub)
         .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("AGIT_SKIP_SETUP", "1")
         .env("CLAUDE_CONFIG_DIR", lab.home.join(".claude"))
         .env("CODEX_HOME", lab.home.join(".codex"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

@@ -126,6 +126,8 @@ impl Fixture {
             .env("AGIT_TUI", "0")
             .env("CI", "1")
             .env("NO_COLOR", "1")
+            // A lab is a computer where agit is set up; the not-set-up notice has tests of its own.
+            .env("AGIT_SKIP_SETUP", "1")
             .current_dir(&self.work);
         #[cfg(windows)]
         command.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");

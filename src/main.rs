@@ -253,6 +253,14 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
     {
         return commands::upgrade::restart_after_upgrade(&exe, &raw_args);
     }
+    // A hook's output reaches its runtime, and hooks run where setup already happened. The command
+    // shows the notice itself once it has passed its checks, so a refused one says nothing.
+    if !json
+        && let Some(may_ask) = setup_notice(&command)
+        && !hook_invocation(&raw_args)
+    {
+        commands::setup::presence::arm(may_ask);
+    }
     if json {
         let directory = cli.directory.clone();
         let code = commands::json::capture_version(command_name, json_version, || {
@@ -351,6 +359,27 @@ enum Startup {
     /// update check or claim judgement. It checks recovery for that checkout alone, so another
     /// repository's interrupted state never blocks it and the listing never writes.
     OfflineListing,
+}
+
+/// Whether a command carries the not-set-up notice, and if so whether it may put the question to
+/// a person. The commands that carry it start or record capture, where "nothing is captured" is
+/// what the person needs to know, and write local state by design; `login`, the first step a new
+/// installation is pointed to, carries the line only, since its own sign-in flow holds the
+/// terminal. The notice may write its record, so a read never carries it, and a command added
+/// later carries it only once it is named here.
+fn setup_notice(command: &Commands) -> Option<bool> {
+    match command {
+        Commands::On(_)
+        | Commands::Save(_)
+        | Commands::New(_)
+        | Commands::Resume(_)
+        | Commands::Run(_)
+        | Commands::Commit(_) => Some(true),
+        // A lineage proposal only previews.
+        Commands::Import(args) if !args.propose_lineage => Some(true),
+        Commands::Login(_) => Some(false),
+        _ => None,
+    }
 }
 
 impl Startup {
@@ -568,6 +597,50 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 mod startup_tests {
     use super::*;
     use clap::Parser;
+
+    /// The not-set-up notice is carried by the commands that start or record capture, login only
+    /// as a line, and by no read: a read that carried it would write its record where the state
+    /// must stay as it was, and a login that asked would interrupt its own sign-in.
+    #[test]
+    fn only_capture_commands_and_login_carry_the_setup_notice() {
+        let notice = |arguments: &[&str]| {
+            setup_notice(&Cli::try_parse_from(arguments).unwrap().command.unwrap())
+        };
+        for arguments in [
+            &["agit", "on"][..],
+            &["agit", "save"],
+            &["agit", "new"],
+            &["agit", "resume"],
+            &["agit", "run", "me/repo@work"],
+            &["agit", "commit"],
+            &["agit", "import", "abc", "--into", "me/repo@work"],
+        ] {
+            assert_eq!(notice(arguments), Some(true), "{arguments:?}");
+        }
+        assert_eq!(notice(&["agit", "login"]), Some(false));
+        for arguments in [
+            &["agit", "status"][..],
+            &["agit", "show", "me/repo@work"],
+            &["agit", "log", "me/repo@work"],
+            &["agit", "whoami"],
+            &["agit", "doctor"],
+            &["agit", "diff"],
+            &["agit", "fetch"],
+            &["agit", "setup"],
+            &[
+                "agit",
+                "import",
+                "abc",
+                "--from",
+                "claude-code",
+                "--into",
+                "me/repo@work",
+                "--propose-lineage",
+            ],
+        ] {
+            assert_eq!(notice(arguments), None, "{arguments:?}");
+        }
+    }
 
     #[test]
     fn desktop_protocol_commands_do_not_migrate_unrelated_repositories() {

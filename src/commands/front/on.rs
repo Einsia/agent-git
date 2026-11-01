@@ -26,7 +26,7 @@ pub struct OffArgs {
 }
 
 pub fn on(args: OnArgs) -> CmdResult {
-    super::finish(turn_on(args))
+    super::finish(crate::commands::setup::presence::after(turn_on(args)))
 }
 
 pub fn off(args: OffArgs) -> CmdResult {
