@@ -735,6 +735,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: None,
+            attach_only: false,
         };
         let refused = state.require_launch_slot(&alias.info, &spec).unwrap_err();
         assert_eq!(refused.error.data.as_ref().unwrap()["retryable"], true);

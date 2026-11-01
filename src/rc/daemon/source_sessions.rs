@@ -184,10 +184,15 @@ impl Daemon {
             return Ok(SessionOpening::Ready(
                 serde_json::to_value(SessionResumeResult {
                     session: self.stamped(info),
+                    launched: None,
                 })
                 .unwrap(),
             ));
         }
+        // Nothing here runs this conversation. Resuming it loads it into a Codex server, even one
+        // already listening for a terminal that has it open, and that starts it: `attach_only`
+        // never joins a conversation open only in a terminal.
+        super::sessions::attach_only_refusal(p.attach_only, "codex", native, &thread.cwd)?;
         // A resume outranks recovery of the same conversation.
         self.preempt_archive(&logical, "codex", Some(&source), Some(native));
         let prior = prior.or_else(|| self.roster.get(&logical).cloned());
@@ -263,6 +268,7 @@ impl Daemon {
             model: None,
             dangerous: false,
             permission_mode: mode,
+            attach_only: p.attach_only,
         };
         context.validate().map_err(unavailable)?;
         let spawn = self.prepare_spawn(
@@ -335,6 +341,7 @@ mod tests {
                 agent: None,
                 expected_agent_id: None,
                 branch: None,
+                attach_only: false,
             };
             // A conversation opens under the name the catalog shows for it, not unnamed.
             let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
@@ -343,6 +350,7 @@ mod tests {
                 catalog.reconcile(&roots).unwrap();
             }
             let mut ids = vec![];
+            let mut infos = vec![];
             for source in &sources {
                 let opening = state
                     .prepare_source_resume(
@@ -369,11 +377,79 @@ mod tests {
                 );
                 assert!(!spawn.info.dangerous);
                 assert_eq!(spawn.info.gist.as_deref(), Some("question"));
-                ids.push(spawn.info.session_id);
+                ids.push(spawn.info.session_id.clone());
+                infos.push(spawn.info);
             }
             assert_ne!(ids[0], ids[1]);
             assert_eq!(state.opening_sessions.len(), 2);
             state.opening_sessions.clear();
+            // A source conversation is loaded into a Codex server to resume it, so `attach_only`
+            // refuses it, for the owner too, and reserves nothing.
+            let error = state
+                .prepare_source_resume(
+                    SessionResume {
+                        attach_only: true,
+                        ..request(&sources[0])
+                    },
+                    &claim("owner"),
+                    &frames,
+                    (&sources[0].source_id, &native),
+                    None,
+                    &Default::default(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"retryable": false, "reason": "not_running"}))
+            );
+            assert!(state.opening_sessions.is_empty());
+            // Once the daemon runs it, the same `attach_only` resume joins that session, and the
+            // reply does not say it launched anything. A running session has its roster row,
+            // which is how a resume finds its logical id.
+            state.roster.sessions.insert(
+                ids[0].clone(),
+                serde_json::from_value(serde_json::json!({
+                    "native_source": infos[0].native_source,
+                    "runtime": "codex",
+                    "thread_id": native,
+                    "cwd": project,
+                    "workspace_id": "ws",
+                    "project_id": "project",
+                }))
+                .unwrap(),
+            );
+            let (tx, _rx) = mpsc::channel(1);
+            let mut live = super::super::tests::rpc_test_live(
+                &ids[0],
+                1,
+                tx,
+                crate::protocol::PermissionMode::Plan,
+            );
+            live.info = infos[0].clone();
+            state.sessions.insert(ids[0].clone(), live);
+            let opening = state
+                .prepare_source_resume(
+                    SessionResume {
+                        attach_only: true,
+                        ..request(&sources[0])
+                    },
+                    &claim("owner"),
+                    &frames,
+                    (&sources[0].source_id, &native),
+                    None,
+                    &Default::default(),
+                )
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            let SessionOpening::Ready(value) = opening else {
+                panic!("a running session is joined, not launched");
+            };
+            let joined = serde_json::from_value::<SessionResumeResult>(value).unwrap();
+            assert_eq!(joined.session.session_id, ids[0]);
+            assert_eq!(joined.launched, None);
+            assert!(state.opening_sessions.is_empty());
+            state.sessions.clear();
+            state.roster.sessions.remove(&ids[0]);
             databases[0]
                 .execute(
                     "UPDATE threads SET sandbox_policy='{\"type\":\"danger-full-access\"}'",
@@ -572,6 +648,7 @@ mod tests {
                             agent: None,
                             expected_agent_id: None,
                             branch: None,
+                            attach_only: false,
                         },
                         &claim(role),
                         &frames,
@@ -934,6 +1011,7 @@ mod tests {
                         agent: None,
                         expected_agent_id: None,
                         branch: None,
+                        attach_only: false,
                     },
                     &claim(role),
                     &frames,

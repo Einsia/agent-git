@@ -776,6 +776,7 @@ mod tests {
                         model: None,
                         dangerous: false,
                         permission_mode: None,
+                        attach_only: false,
                     },
                 )
                 .err()

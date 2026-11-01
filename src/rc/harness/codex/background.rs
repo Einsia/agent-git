@@ -432,6 +432,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
+            attach_only: false,
         };
         let mut driver = CodexDriver::launch_shared(spec.clone(), &source)
             .await

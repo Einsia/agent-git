@@ -565,11 +565,21 @@ pub struct SessionResume {
     pub expected_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Join the conversation only where something already runs it: the daemon itself, or a
+    /// Claude Code terminal registered for native control. Otherwise refuse with reason
+    /// `not_running` and launch nothing, so a page that only wants to follow a conversation never
+    /// starts it on the owner's machine. Advertised as `session-resume-attach-only-v1`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attach_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResumeResult {
     pub session: SessionInfo,
+    /// `true` when this resume started the runtime, rather than finding the conversation
+    /// already running here or attaching to its terminal; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched: Option<bool>,
 }
 
 /// Adopt one row of `session.list`'s `local` into the workspace without launching its runtime.

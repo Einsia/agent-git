@@ -529,6 +529,9 @@ struct Live {
     info: SessionInfo,
     /// A shared native server outlives this supervisor connection during a daemon replacement.
     shared_executor: bool,
+    /// Whether opening this session started the runtime's process (`launched` on the resume
+    /// reply), rather than attaching to a terminal or a shared server already running.
+    started_process: bool,
     tx: mpsc::Sender<Command>,
     /// The harness's own session id. **It exists only in this table** and never goes on the
     /// wire — viewers address sessions by logical session id alone, which is why "continue on

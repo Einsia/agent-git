@@ -140,6 +140,227 @@ fn an_unaccounted_dangerous_start_locks_unknown_threads_to_the_owner() {
     assert!(roster.transcript_ever_dangerous("codex", "native-9", "ws-a", "/tmp/project"));
 }
 
+/// Pins `attach_only` on a takeover: a Claude Code conversation no terminal runs for native
+/// control, and a Codex conversation the daemon does not run, are each refused with
+/// `{retryable: false, reason: "not_running"}`, and nothing is launched, reserved or recorded for
+/// them. Without `attach_only` the same takeover goes on to a launch. A daemon that ignored the
+/// flag would start the conversation on the owner's machine because a page asked only to follow
+/// it.
+#[test]
+fn attach_only_never_launches_a_conversation_nothing_runs() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cwd = std::fs::canonicalize(home.path()).unwrap();
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let located = |runtime: &str| LocatedLocal {
+                    title: None,
+                    gist: None,
+                    labels_withheld: None,
+                    runtime: runtime.into(),
+                    cwd: cwd.clone(),
+                    project_id: Some("project-a".into()),
+                    likely_active: false,
+                };
+                let takeover = |thread: &str, attach_only: bool| SessionResume {
+                    project_id: None,
+                    workspace_id: "ws-a".into(),
+                    session_id: thread.into(),
+                    prompt: None,
+                    by: None,
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                    attach_only,
+                };
+                for (runtime, thread) in [
+                    ("claude-code", "aaaaaaaa-0000-4000-8000-000000000a01"),
+                    ("codex", "aaaaaaaa-0000-4000-8000-000000000a03"),
+                ] {
+                    let recorded = state.roster.sessions.len();
+                    let error = state
+                        .prepare_local_takeover(
+                            located(runtime),
+                            takeover(thread, true),
+                            &claim("owner", "ws-a"),
+                            &frames,
+                        )
+                        .err()
+                        .unwrap_or_else(|| panic!("{runtime}: nothing runs this conversation"));
+                    assert_eq!(
+                        error.code,
+                        ErrorCode::SessionBusy as i32,
+                        "{runtime}: {}",
+                        error.message
+                    );
+                    assert_eq!(
+                        error.data,
+                        Some(serde_json::json!({"retryable": false, "reason": "not_running"})),
+                        "{runtime}"
+                    );
+                    assert!(state.opening_sessions.is_empty(), "{runtime}");
+                    assert!(state.sessions.is_empty(), "{runtime}");
+                    assert_eq!(state.roster.sessions.len(), recorded, "{runtime}");
+
+                    let opening = state
+                        .prepare_local_takeover(
+                            located(runtime),
+                            takeover(thread, false),
+                            &claim("owner", "ws-a"),
+                            &frames,
+                        )
+                        .unwrap_or_else(|error| panic!("{runtime}: {}", error.message));
+                    assert!(matches!(opening, SessionOpening::Launch(..)), "{runtime}");
+                    state.opening_sessions.clear();
+                }
+            });
+    });
+}
+
+/// Pins `attach_only` on the resume of a registered session by its logical id, the path a page
+/// uses: a Codex session in the roster that nothing runs is refused with
+/// `{retryable: false, reason: "not_running"}`, with nothing reserved, launched or recorded.
+/// Without `attach_only` the same resume goes on to a launch. A resume that skipped the check
+/// would start the conversation on the owner's machine because a page asked only to follow it.
+#[test]
+fn attach_only_never_resumes_a_registered_session_nothing_runs() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cwd = home.path().canonicalize().unwrap();
+                let roster: Roster = serde_json::from_value(serde_json::json!({
+                    "sessions": {"agit-registered": {
+                        "runtime": "codex",
+                        "thread_id": "codex-thread-registered",
+                        "cwd": cwd,
+                        "workspace_id": "ws",
+                    }},
+                }))
+                .unwrap();
+                roster.save().unwrap();
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::try_load().unwrap());
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws", "project", &cwd).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let resume = |attach_only: bool| SessionResume {
+                    project_id: None,
+                    workspace_id: "ws".into(),
+                    session_id: "agit-registered".into(),
+                    prompt: None,
+                    by: None,
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                    attach_only,
+                };
+                let starts = state.roster.starts.len();
+                let error = state
+                    .prepare_resume_session(
+                        resume(true),
+                        &claim("owner", "ws"),
+                        &frames,
+                        &Default::default(),
+                    )
+                    .err()
+                    .expect("nothing runs this conversation");
+                assert_eq!(
+                    error.code,
+                    ErrorCode::SessionBusy as i32,
+                    "{}",
+                    error.message
+                );
+                assert_eq!(
+                    error.data,
+                    Some(serde_json::json!({"retryable": false, "reason": "not_running"}))
+                );
+                assert!(state.opening_sessions.is_empty());
+                assert!(state.sessions.is_empty());
+                assert_eq!(state.roster.starts.len(), starts);
+
+                let opening = state
+                    .prepare_resume_session(
+                        resume(false),
+                        &claim("owner", "ws"),
+                        &frames,
+                        &Default::default(),
+                    )
+                    .unwrap_or_else(|error| panic!("{}", error.message));
+                assert!(matches!(opening, SessionOpening::Launch(..)));
+            });
+    });
+}
+
+/// Pins that `attach_only` joins a Codex conversation the daemon already supervises: resumed by
+/// its logical id or by its Codex thread id, the running session comes back and the reply does not
+/// say it launched anything; nothing is reserved. A daemon that asked `attach_only` before looking
+/// for the running session would refuse a page following a conversation that is running.
+#[test]
+fn attach_only_joins_a_supervised_codex_session() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, _rx) = mpsc::channel(1);
+                let mut live = rpc_test_live(
+                    "agit-running",
+                    1,
+                    tx,
+                    crate::protocol::PermissionMode::Default,
+                );
+                live.runtime_thread_id = Some("codex-thread-running".into());
+                let daemon = rpc_test_daemon(
+                    HashMap::from([("agit-running".to_owned(), live)]),
+                    Roster::default(),
+                );
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                for id in ["agit-running", "codex-thread-running"] {
+                    let opening = state
+                        .prepare_resume_session(
+                            SessionResume {
+                                project_id: None,
+                                workspace_id: "ws-a".into(),
+                                session_id: id.into(),
+                                prompt: None,
+                                by: None,
+                                agent: None,
+                                expected_agent_id: None,
+                                branch: None,
+                                attach_only: true,
+                            },
+                            &claim("owner", "ws-a"),
+                            &frames,
+                            &Default::default(),
+                        )
+                        .unwrap_or_else(|error| panic!("{id}: {}", error.message));
+                    let SessionOpening::Ready(value) = opening else {
+                        panic!("{id}: a running session is joined, not launched");
+                    };
+                    let joined = serde_json::from_value::<SessionResumeResult>(value).unwrap();
+                    assert_eq!(joined.session.session_id, "agit-running");
+                    assert_eq!(joined.launched, None);
+                }
+                assert!(state.opening_sessions.is_empty());
+                assert_eq!(state.sessions.len(), 1);
+            });
+    });
+}
+
 /// The one above pins only the test itself. **This one pins that the takeover path actually asks
 /// it.**
 ///
@@ -199,6 +420,7 @@ fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
                     agent: None,
                     expected_agent_id: None,
                     branch: None,
+                    attach_only: false,
                 };
 
                 for workspace in ["ws-a", "ws-b"] {
@@ -300,6 +522,7 @@ fn an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation() {
                     agent: None,
                     expected_agent_id: None,
                     branch: None,
+                    attach_only: false,
                 };
                 let error = state
                     .take_over_local_session(
@@ -457,6 +680,7 @@ fn an_operator_cannot_resume_a_shared_closed_bypass_codex_conversation() {
                     agent: None,
                     expected_agent_id: None,
                     branch: None,
+                    attach_only: false,
                 };
                 let error = state
                     .resume_session(resume(), &claim("operator", "ws-a"), &frames)
@@ -551,6 +775,7 @@ fn a_bound_dangerous_transcript_stays_owner_only_from_a_second_workspace_sharing
                     agent: None,
                     expected_agent_id: None,
                     branch: None,
+                    attach_only: false,
                 };
 
                 for workspace in ["ws-a", "ws-b"] {
@@ -666,6 +891,7 @@ fn resuming_by_logical_id_judges_the_transcript_not_just_its_own_roster_row() {
                     agent: None,
                     expected_agent_id: None,
                     branch: None,
+                    attach_only: false,
                 };
 
                 let error = state
@@ -763,6 +989,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                     model: None,
                     dangerous: true,
                     permission_mode: Some(crate::protocol::PermissionMode::Bypass),
+                    attach_only: false,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -850,6 +1077,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     model: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
+                    attach_only: false,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -917,6 +1145,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     model: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
+                    attach_only: false,
                 };
                 let watched = danger::judge(
                     &state.roster,
@@ -976,6 +1205,7 @@ fn a_session_that_crashed_before_binding_cannot_be_resumed_by_logical_id() {
                             agent: None,
                             expected_agent_id: None,
                             branch: None,
+                            attach_only: false,
                         },
                         &claim("owner", "ws-a"),
                         &frames,
@@ -2020,6 +2250,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
     let mut live = Live {
         generation: 1,
         shared_executor: false,
+        started_process: true,
         info: SessionInfo {
             interrupt_fenced: None,
             publication: None,
@@ -2837,6 +3068,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         model: None,
         dangerous: false,
         permission_mode: Some(crate::protocol::PermissionMode::Plan),
+        attach_only: false,
     };
     let (frames, _frames_rx) = mpsc::channel(4);
 
@@ -3231,7 +3463,7 @@ fn resumed_launch_does_not_replay_the_initial_model() {
             let opening = state.prepare_resume_session(SessionResume {
                 project_id: None,
                 workspace_id:"ws".into(), session_id:"logical".into(), prompt:None,
-                by:None, agent:None, expected_agent_id:None, branch:None,
+                by:None, agent:None, expected_agent_id:None, branch:None, attach_only: false,
             }, &claim("owner", "ws"), &frames, &Default::default()).unwrap();
             let SessionOpening::Launch(spawn, _) = opening else { panic!("expected a native resume"); };
             assert_eq!(spawn.spec.resume_from.as_deref(), Some("native-model-changed"));

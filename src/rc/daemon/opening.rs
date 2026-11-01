@@ -198,7 +198,19 @@ impl OpeningReply {
     ) -> Result<serde_json::Value, RpcError> {
         match self {
             Self::Resume => {
-                Ok(serde_json::to_value(SessionResumeResult { session: result? }).unwrap())
+                let session = result?;
+                // `true` only when opening this session started the runtime's process: not for a
+                // Claude Code terminal attached for native control, nor a shared Codex server
+                // that was already listening.
+                let launched = daemon
+                    .sessions
+                    .get(&session.session_id)
+                    .is_some_and(|live| live.started_process);
+                Ok(serde_json::to_value(SessionResumeResult {
+                    session,
+                    launched: launched.then_some(true),
+                })
+                .unwrap())
             }
             Self::Start(start_id) => {
                 let session = result.map_err(|failure| match &start_id {
@@ -447,6 +459,9 @@ impl PreparedSpawn {
                     release_reservation: true,
                     exiting: None,
                 };
+            }
+            if failure.is::<crate::rc::harness::AttachOnlyNotRunning>() {
+                return SpawnFailure::before_launch(super::sessions::not_running_error());
             }
             let reached_spawn = failure.reached_spawn();
             let error = RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string());
@@ -820,6 +835,7 @@ impl Daemon {
                 .map_err(|_| unknown_launch("the initial instruction could not be queued"))?;
         }
         let shared_executor = session.shared_executor();
+        let started_process = session.started_process();
         let runtime_thread_id = session.runtime_thread_id().or(spec.resume_from);
         let task = tokio::spawn(session.run(cmd_rx));
         self.sessions.insert(
@@ -842,6 +858,7 @@ impl Daemon {
                 ended: false,
                 info: info.clone(),
                 shared_executor,
+                started_process,
                 tx: cmd_tx,
                 runtime_thread_id,
             },
@@ -862,6 +879,41 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins `launched` on a resume reply: `true` only when opening the session started the
+    /// runtime's process, absent when it attached to a Claude Code terminal or to a shared Codex
+    /// server that was already listening. A web that read a missing field as "started" would tell
+    /// the person the wrong thing about what is running on the device.
+    #[tokio::test]
+    async fn a_resume_reply_says_whether_it_launched_the_runtime() {
+        let reply = |runtime: &str, shared: bool, started: bool| {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut live = super::super::tests::rpc_test_live(
+                "agit-resumed",
+                1,
+                tx,
+                crate::protocol::PermissionMode::Default,
+            );
+            live.info.runtime = runtime.into();
+            live.shared_executor = shared;
+            live.started_process = started;
+            let info = live.info.clone();
+            let daemon = super::super::tests::rpc_test_daemon(
+                HashMap::from([("agit-resumed".to_owned(), live)]),
+                Roster::default(),
+            );
+            let mut state = daemon.try_lock().unwrap();
+            let value = OpeningReply::Resume.finish(&mut state, Ok(info)).unwrap();
+            serde_json::from_value::<SessionResumeResult>(value)
+                .unwrap()
+                .launched
+        };
+        assert_eq!(reply("claude-code", true, false), None);
+        assert_eq!(reply("claude-code", false, true), Some(true));
+        assert_eq!(reply("codex", true, false), None);
+        assert_eq!(reply("codex", true, true), Some(true));
+        assert_eq!(reply("codex", false, true), Some(true));
+    }
 
     #[tokio::test]
     async fn delegated_start_checks_current_binding_before_creating_repository_or_session() {
@@ -947,6 +999,7 @@ mod tests {
             model: None,
             dangerous: false,
             permission_mode: info.permission_mode,
+            attach_only: false,
         };
         let (frames, _) = mpsc::channel(1);
         let spawn = state

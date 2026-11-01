@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         model: std::env::var("AGIT_SMOKE_MODEL").ok(),
         dangerous: false,
         permission_mode,
+        attach_only: false,
     };
 
     let (ftx, mut frx) = mpsc::channel::<Frame>(4096);

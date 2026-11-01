@@ -880,6 +880,7 @@ mod bound_lineage_tests {
                         generation: 3,
                         info,
                         shared_executor: false,
+                        started_process: true,
                         tx: cmd_tx,
                         runtime_thread_id: Some("native-1".into()),
                         task: tokio::spawn(async {}),

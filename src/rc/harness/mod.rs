@@ -50,6 +50,19 @@ impl std::fmt::Display for TurnNotRunning {
 
 impl std::error::Error for TurnNotRunning {}
 
+/// An attach-only opening found no terminal to join when its driver was chosen (it may have
+/// exited after the opening was admitted). Nothing was launched.
+#[derive(Debug)]
+pub(crate) struct AttachOnlyNotRunning;
+
+impl std::fmt::Display for AttachOnlyNotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this conversation is not running on this device")
+    }
+}
+
+impl std::error::Error for AttachOnlyNotRunning {}
+
 use crate::protocol::{
     ApprovalRequest, ApprovalResponse, Delivery, ItemKind, PermissionApply, PermissionMode,
     RuntimeCapability,
@@ -248,6 +261,9 @@ pub struct LaunchSpec {
     pub dangerous: bool,
     /// How much the agent may do unattended. `None` = [`PermissionMode::Default`].
     pub permission_mode: Option<PermissionMode>,
+    /// Join a conversation that already runs in a terminal, never launch one: when no terminal
+    /// can be attached at driver selection, the launch is refused with `AttachOnlyNotRunning`.
+    pub attach_only: bool,
 }
 
 impl LaunchSpec {
@@ -606,11 +622,20 @@ impl AnyDriver {
                     claude_native::ClaudeNativeDriver::attach(spec)?,
                 )));
             }
+            // The terminal admitted at the request may be gone by now; joining is all this
+            // opening may do.
+            if spec.attach_only {
+                return Err(proc::LaunchError::not_spawned(AttachOnlyNotRunning.into()));
+            }
             if crate::rc::claude_inbox::session_is_live(session) {
                 return Err(proc::LaunchError::not_spawned(anyhow::anyhow!(
                     "native Claude control is still attaching"
                 )));
             }
+        }
+        // Nothing but a native Claude Code terminal can be joined; everything below launches.
+        if spec.attach_only {
+            return Err(proc::LaunchError::not_spawned(AttachOnlyNotRunning.into()));
         }
         match runtime {
             "claude-code" => Ok(AnyDriver::ClaudeCode(Box::new(
@@ -860,6 +885,18 @@ impl AnyDriver {
             #[cfg(unix)]
             Self::ClaudeNative(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether launching this driver started the runtime's process. A Claude Code terminal
+    /// attached for native control was already running, and so was a shared Codex server the
+    /// launch found listening.
+    pub fn started_process(&self) -> bool {
+        match self {
+            Self::Codex(driver) => driver.started_process(),
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => false,
+            _ => true,
         }
     }
 
