@@ -2067,7 +2067,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
         )
         .unwrap();
     }
-    let run = |hub: &Hub, args: &[&str]| {
+    let run_at = |hub: &str, args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear();
@@ -2081,7 +2081,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
             .env("AGIT_HOME", &home)
             .env("CODEX_HOME", home.join("codex"))
             .env("CLAUDE_CONFIG_DIR", home.join("claude"))
-            .env("AGIT_HUB_URL", &hub.base)
+            .env("AGIT_HUB_URL", hub)
             .env("CI", "1")
             .env("AGIT_TUI", "0")
             .env("AGIT_USE_SYSTEM_GIT", "1")
@@ -2094,6 +2094,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
             .output()
             .unwrap()
     };
+    let run = |hub: &Hub, args: &[&str]| run_at(&hub.base, args);
     let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
     for (key, value) in [
         ("http.userAgent", TRANSPORT_USER_AGENT),
@@ -2416,6 +2417,87 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
                 assert_eq!(session, &target_session);
             }
         }
+    }
+
+    // The remote list is read from this checkout alone: with both Hubs gone it still names the
+    // delivered destination as origin, and the account, or the sign-in command, is the one for
+    // that Hub, not for the Hub `AGIT_HUB_URL` selects. A list derived from the selected Hub names
+    // the source.
+    let (source_base, target_base) = (source.base.clone(), target.base.clone());
+    drop(source);
+    drop(target);
+    // Listing prepares nothing, even in a state directory whose startup migration has not been
+    // recorded: nothing under it but usage statistics is created or changed. A listing that took
+    // the default startup would migrate, record the migration and judge project claims first.
+    let _ = std::fs::remove_file(home.join("layout-v1.complete"));
+    let state = || {
+        walkdir::WalkDir::new(&home)
+            .into_iter()
+            .filter_entry(|entry| entry.path() != home.join("telemetry"))
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let meta = entry.metadata().unwrap();
+                (entry.into_path(), meta.len(), meta.modified().unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = state();
+    let listed = run_at(&source_base, &["--json", "remote", "-v", "alice/app"]);
+    assert_success(&listed);
+    assert!(
+        run_at(&source_base, &["remote", "alice/app"])
+            .status
+            .success()
+    );
+    assert_eq!(state(), before);
+    assert!(!home.join("layout-v1.complete").exists());
+    let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        document["result"]["value"],
+        serde_json::json!({
+            "repository": "alice/app",
+            "remotes": [{
+                "name": "origin",
+                "hub": target_base,
+                "address": format!("{target_base}/alice/app"),
+                "account": "alice",
+                "upstream": true,
+            }],
+        })
+    );
+    std::fs::remove_file(home.join("credentials").join(format!(
+        "{}.json",
+        config::hub_host_key(&target_base).unwrap()
+    )))
+    .unwrap();
+    let signed_out = run_at(&source_base, &["remote", "-v", "alice/app"]);
+    assert_success(&signed_out);
+    assert_eq!(
+        String::from_utf8_lossy(&signed_out.stdout),
+        format!(
+            "origin\t{target_base}/alice/app\tnot signed in: agit login --hub {target_base} · upstream\n"
+        )
+    );
+    // An origin on that Hub that carries a query is not an address to print: the code-origin
+    // sanitizer would change it, so neither the text nor the JSON shows any of it.
+    repo.set_remote(&format!("{target_base}/alice/app.git?token=SENTINEL"))
+        .unwrap();
+    for args in [
+        &["remote", "-v", "alice/app"][..],
+        &["--json", "remote", "-v", "alice/app"],
+    ] {
+        let listed = run_at(&source_base, args);
+        assert_success(&listed);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&listed.stdout),
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        assert!(
+            said.contains("origin") && !said.contains("SENTINEL"),
+            "{said}"
+        );
     }
 }
 
