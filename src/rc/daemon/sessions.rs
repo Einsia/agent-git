@@ -275,12 +275,14 @@ impl Daemon {
                 None => {
                     let logical = crate::domain::meta::mint_session_id();
                     let previous = self.roster.clone();
-                    let ever_dangerous = self.roster.transcript_ever_dangerous(
+                    let ever_dangerous = danger::judge(
+                        &self.roster,
                         &p.runtime,
                         &p.runtime_session_id,
                         &workspace,
                         &cwd,
-                    );
+                    )
+                    .ever_dangerous();
                     let entry = roster::Entry {
                         native_source: None,
                         runtime: p.runtime.clone(),
@@ -566,7 +568,7 @@ impl Daemon {
                 // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
                 dangerous: false,
-                permission_mode: entry.restart_permission_mode(),
+                permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -577,8 +579,9 @@ impl Daemon {
                 // Native resume owns the current model; start receipts are immutable history.
                 model: None,
                 dangerous: false,
-                // Resume brings back the guard it ran under.
-                permission_mode: entry.restart_permission_mode(),
+                // Resume brings back the guard it ran under, never looser than Default for
+                // anyone but the owner.
+                permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
             };
             let spawn = self.prepare_spawn(
                 info,
@@ -809,10 +812,13 @@ impl Daemon {
             &p.workspace_id,
             &cwd.to_string_lossy(),
         )?;
-        let inherited_mode = prior
-            .as_ref()
-            .and_then(roster::Entry::restart_permission_mode)
-            .unwrap_or(crate::protocol::PermissionMode::Default);
+        let inherited_mode = danger::resume_mode(
+            caller,
+            prior
+                .as_ref()
+                .and_then(roster::Entry::restart_permission_mode),
+        )
+        .unwrap_or(crate::protocol::PermissionMode::Default);
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
@@ -933,6 +939,7 @@ impl Daemon {
                 &watch.context.source.source_id,
                 &watch.native_id,
                 &watch.cwd.to_string_lossy(),
+                &thread.transcript,
                 settings.permission_mode,
             )?;
             let native = watch.context.source.native().map_err(unavailable)?;

@@ -39,7 +39,9 @@
 //! So "add a new resume path" either asks the transcript or does not compile / does not launch.
 
 use super::{RpcError, require_owner_to_drive};
+use crate::protocol::PermissionMode;
 use crate::rc::roster::Roster;
+use std::path::Path;
 
 /// The danger verdict on one transcript — **only this module produces one**.
 ///
@@ -101,9 +103,55 @@ pub(super) fn judge(
     cwd: &str,
 ) -> TranscriptDanger {
     TranscriptDanger {
-        judged: Some(roster.transcript_ever_dangerous(runtime, thread_id, workspace_id, cwd)),
+        judged: Some(
+            roster.transcript_ever_dangerous(runtime, thread_id, workspace_id, cwd)
+                || transcript_records_unchecked(runtime, thread_id, cwd),
+        ),
         authorized: false,
     }
+}
+
+/// Whether the harness transcript itself says it ran without permission checks, whatever the
+/// ledger knows. A conversation run in a terminal with checks off (Claude Code's
+/// `--dangerously-skip-permissions`, or Codex outside a workspace-write or read-only sandbox) and closed
+/// before the daemon saw it has no row that says so, and its takeover or share would otherwise
+/// mint a clean identity. Its own records do say so. A Claude Code or Codex transcript that
+/// cannot be found or read, or that records no mode, counts as unchecked: nothing shows it was
+/// supervised. A runtime that records no mode at all is judged by the ledger alone.
+fn transcript_records_unchecked(runtime: &str, thread_id: &str, cwd: &str) -> bool {
+    let read: fn(&Path) -> crate::Result<bool> = match runtime {
+        "claude-code" => crate::rc::claude_inbox::transcript_ran_unchecked,
+        "codex" => crate::rc::native_settings::codex_ran_unchecked,
+        _ => return false,
+    };
+    if thread_id.is_empty() {
+        return false;
+    }
+    let Some(transcript) = crate::adapter::get(runtime)
+        .ok()
+        .and_then(|adapter| adapter.resolve(thread_id, Some(Path::new(cwd))))
+    else {
+        return true;
+    };
+    read(&transcript).unwrap_or(true)
+}
+
+/// The mode a resume starts in for `caller`, from the mode the conversation would restart in.
+/// The owner gets it back as it was. Anyone else starts in Default, or in Plan when Plan was the
+/// last mode: never Auto or AcceptEdits, which would let a non-owner run tools the owner chose to
+/// stop approving, and never a looser mode than Default. The daemon decides this from the caller
+/// it authenticated and the mode it recorded, not from anything the request names.
+pub(super) fn resume_mode(
+    caller: &crate::protocol::CallerClaim,
+    last: Option<PermissionMode>,
+) -> Option<PermissionMode> {
+    if caller.is_owner() {
+        return last;
+    }
+    Some(match last {
+        Some(PermissionMode::Plan) => PermissionMode::Plan,
+        _ => PermissionMode::Default,
+    })
 }
 
 /// Ask + judge the caller: whether handing a transcript **to this caller** is allowed.
@@ -131,12 +179,18 @@ pub(super) fn authorize(
     })
 }
 
+/// Ask + judge the caller for a Codex conversation of a native source, located at `transcript`.
+/// It ran unchecked if the ledger says so, if its current mode is Bypass or unknown, or if any
+/// turn its rollout records ran outside a workspace-write or read-only sandbox, whatever mode it
+/// is in now: a conversation switched back to Default still holds what it read with full access.
+/// A rollout that cannot be read counts as unchecked.
 pub(super) fn authorize_source(
     roster: &Roster,
     caller: &crate::protocol::CallerClaim,
     source: &str,
     thread: &str,
     cwd: &str,
+    transcript: &Path,
     mode: Option<crate::protocol::PermissionMode>,
 ) -> Result<TranscriptDanger, RpcError> {
     let dangerous = roster.transcript_ever_dangerous_in(
@@ -145,7 +199,8 @@ pub(super) fn authorize_source(
         thread,
         &caller.workspace_id,
         cwd,
-    ) || mode.is_none_or(|mode| mode == crate::protocol::PermissionMode::Bypass);
+    ) || mode.is_none_or(|mode| mode == crate::protocol::PermissionMode::Bypass)
+        || crate::rc::native_settings::codex_ran_unchecked(transcript).unwrap_or(true);
     require_owner_to_drive(Some(caller), dangerous)?;
     Ok(TranscriptDanger {
         judged: Some(dangerous),

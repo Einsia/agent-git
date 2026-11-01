@@ -60,6 +60,29 @@ use crate::rc::harness::{
 use crate::rc::tail::Tailer;
 use crate::rc::ticket::Ticket;
 use std::path::PathBuf;
+
+/// Whether a native source attached in the mode its launch asked for. A shared native thread
+/// keeps the mode it is set to and the launch cannot change it, so the daemon admits a resume
+/// only for the mode it found there, and an attach that opened in another mode, or in one it
+/// cannot confirm, is refused rather than driven: it may have loosened since. A launch that asked
+/// for no mode, which only the owner's resume of an unknown native mode does, asks nothing here.
+pub(crate) fn opened_as_asked(
+    asked: Option<PermissionMode>,
+    opened: Option<PermissionMode>,
+) -> bool {
+    asked.is_none_or(|asked| opened == Some(asked))
+}
+
+/// Record the mode `driver` opened in, and whether the session is dangerous for it. A driver
+/// that cannot know its mode, as a Claude Code terminal attached for native control cannot,
+/// records none and counts as dangerous: nothing shows the terminal ran with checks, so only its
+/// owner may drive it. The bit only ever goes from false to true here.
+pub(crate) fn record_opening_mode(driver: &AnyDriver, info: &mut SessionInfo) {
+    info.permission_mode = driver
+        .permission_mode_known()
+        .then(|| driver.permission_mode());
+    info.dangerous |= info.permission_mode.is_none_or(|mode| mode.is_dangerous());
+}
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -1516,6 +1539,7 @@ impl Session {
         // The test must not be a time-sensitive observation, but the **intent** of this
         // launch.
         let resuming = spec.resume_from.is_some();
+        let asked_mode = spec.permission_mode;
         let launching = std::time::Instant::now();
         let source_context = info
             .native_source
@@ -1562,6 +1586,15 @@ impl Session {
                             && driver.permission_mode() != crate::protocol::PermissionMode::Bypass),
                     "native permissions changed during attachment; refresh the session before driving"
                 );
+                anyhow::ensure!(
+                    opened_as_asked(
+                        asked_mode,
+                        driver
+                            .permission_mode_known()
+                            .then(|| driver.permission_mode())
+                    ),
+                    "native permissions changed during attachment; refresh the session before driving"
+                );
                 let roots = confinement.borrow().roots.clone();
                 let native = driver
                     .runtime_thread_id()
@@ -1579,10 +1612,7 @@ impl Session {
             }
         }
         info.interrupt_fenced = Some(driver.interrupt_fenced());
-        info.permission_mode = driver
-            .permission_mode_known()
-            .then(|| driver.permission_mode());
-        info.dangerous |= info.permission_mode.is_none_or(|mode| mode.is_dangerous());
+        record_opening_mode(&driver, &mut info);
         if driver.has_active_turn() {
             info.status = SessionStatus::Running;
         }

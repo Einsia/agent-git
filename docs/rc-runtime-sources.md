@@ -197,6 +197,21 @@ every member, and a later resume continues the same identity. Sharing a
 conversation that is already shared or running returns its identity. Source
 catalog rows cannot be shared yet.
 
+Executors advertising `resume-caller-gate-v1` judge a Claude Code or Codex
+conversation by its transcript's own permission mode as well as by the roster
+when it is taken over, shared, resumed, sent a native message or watched: a
+Claude Code transcript that records `bypassPermissions`, a Codex rollout with
+any turn run outside a workspace-write or read-only sandbox, a transcript that
+records no mode,
+or one that cannot be read counts as having run without permission checks, and only the owner may resume it or send
+it messages (`DangerousSessionLocked` otherwise). A resume by anyone but the
+owner starts in Default, or Plan when Plan was the last mode, never Auto or
+AcceptEdits; the owner's resume restores the last mode. A Codex conversation
+opened from its native source keeps the mode it is set to there, so anyone but
+the owner may resume it only while that mode is Default or Plan. A terminal session
+attached for native control reports no mode, since the terminal can change it
+without telling agit, and so only its owner may start or steer turns in it.
+
 ## Shared session settings
 
 Attaching to an existing shared session preserves its native defaults. Resume
