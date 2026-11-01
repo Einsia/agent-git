@@ -69,6 +69,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "pull",
     "push",
     "rc",
+    "remote",
     "repo",
     "resume",
     "revert",

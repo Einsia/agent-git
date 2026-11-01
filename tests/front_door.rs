@@ -894,6 +894,16 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
     assert_eq!(here["repository"], "me/notes", "{here}");
     assert_eq!(here["earlier_sessions_not_uploaded"], 1, "{here}");
     assert_eq!(here["next"]["command"], "agit save --all", "{here}");
+    // `agit remote` lists the remotes of the repository the folder saves to, from the worktree
+    // too; this lab has no checkout of it, so it names the repository and how to get it. One that
+    // fell back to AGIT_SESSION alone could not tell which repository a folder means.
+    let remote = lab.agit(&tree, &["remote"]);
+    assert_eq!(remote.status.code(), Some(4), "{remote:?}");
+    let said = String::from_utf8_lossy(&remote.stderr);
+    assert!(
+        said.contains("me/notes") && said.contains("agit clone me/notes"),
+        "{said}"
+    );
     let status = value(&tree, &["status", "--json"]);
     let said = status["worktree"].as_str().unwrap_or_default();
     assert!(

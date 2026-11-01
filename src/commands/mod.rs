@@ -80,6 +80,7 @@ pub mod revert;
 pub mod fetch;
 pub mod pull;
 pub mod push;
+pub mod remote;
 
 // Discovery and sharing
 pub mod pr;
@@ -1336,6 +1337,8 @@ pub enum Commands {
     Fetch(fetch::Args),
     /// fetch + fast-forward only; a real fork offers merge / fork as the two exits
     Pull(pull::Args),
+    /// List the Hubs that hold this repository (offline; -v adds address, account, upstream)
+    Remote(remote::Args),
 
     // ── Discovery and sharing ───────────────────────────────────────
     /// Find matching sessions, repositories, pull requests, or people
@@ -1414,6 +1417,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Push(_) => "push",
         Commands::Fetch(_) => "fetch",
         Commands::Pull(_) => "pull",
+        Commands::Remote(_) => "remote",
         Commands::Search(_) => "search",
         Commands::Activity(_) => "activity",
         Commands::Month(_) => "month",

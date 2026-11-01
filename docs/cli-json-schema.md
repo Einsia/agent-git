@@ -51,6 +51,12 @@ and refresh token states with expiry timestamps, and `check` fields including
 whether an online check was requested and whether the server was reachable.
 Token values themselves are never included.
 
+`remote` returns `repository` and `remotes` in `result.value`, read offline from
+the checkout. Each remote has `name`, `hub`, `address` (the repository's page on
+that Hub, or `null` when the checkout records none there), `account` (the
+account saved for that Hub, or `null`), and `upstream`. A checkout holds one
+pinned Hub, so the list is empty or holds `origin` as the upstream.
+
 ## Platforms and execution
 
 The envelope is available on macOS, Linux, and native Windows MSVC builds.

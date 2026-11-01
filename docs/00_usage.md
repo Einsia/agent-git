@@ -877,7 +877,7 @@ agit branch --repo alice/payments
 | Inspect                | `log` `show` `diff` `view`                                |
 | New line / continue    | `fork` `new` `resume` `run`                               |
 | Merge / undo           | `merge` (pick/drop/summary) `cherry-pick` `revert`        |
-| Remote                 | `push` `pull` `fetch`                                     |
+| Remote                 | `push` `pull` `fetch` `remote`                            |
 | Discover / share       | `search` `share` (list/rm) `pr` (create/list/show/fetch/merge) |
 | Export / diagnostics   | `export` `scan` `setup` `upgrade` `doctor`                |
 | Remote control         | `rc` (start/stop/status/list/pair/revoke)                 |

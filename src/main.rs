@@ -291,6 +291,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         | Startup::RemoteSearch
         | Startup::LocalSearch
         | Startup::ScopedActivity
+        | Startup::OfflineListing
         | Startup::ToolDispatcher => Ok(()),
     };
     if let Err(e) = prepared {
@@ -346,6 +347,10 @@ enum Startup {
     ScopedActivity,
     /// Each dispatched tool prepares its own storage; the protocol parent has no local scope.
     ToolDispatcher,
+    /// A listing read offline from one checkout's configuration prepares nothing: no migration,
+    /// update check or claim judgement. It checks recovery for that checkout alone, so another
+    /// repository's interrupted state never blocks it and the listing never writes.
+    OfflineListing,
 }
 
 impl Startup {
@@ -359,6 +364,7 @@ impl Startup {
                 | Self::RemoteSearch
                 | Self::LocalSearch
                 | Self::ScopedActivity
+                | Self::OfflineListing
                 | Self::ToolDispatcher
         )
     }
@@ -378,6 +384,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
         Commands::Activity(_) => Startup::ScopedActivity,
+        Commands::Remote(_) => Startup::OfflineListing,
         Commands::Mcp(_) => Startup::ToolDispatcher,
         // A relay outlives the hook that starts it and touches only its own message queue.
         Commands::Hooks(args)
@@ -519,6 +526,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Push(a) => commands::push::run(a),
         Commands::Fetch(a) => commands::fetch::run(a),
         Commands::Pull(a) => commands::pull::run(a),
+        Commands::Remote(a) => commands::remote::run(a),
 
         Commands::Search(a) => commands::search::run(*a),
         Commands::Activity(a) => commands::activity::run(*a),
@@ -608,6 +616,21 @@ mod startup_tests {
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(startup_for(&cli.command.unwrap()), Startup::Migrate);
+        }
+    }
+
+    /// Listing remotes is offline: a development build never checks for updates, so only this
+    /// classification shows that a release build would not ask the version service either.
+    #[test]
+    fn listing_remotes_neither_prepares_storage_nor_checks_for_updates() {
+        for arguments in [
+            vec!["agit", "remote"],
+            vec!["agit", "--json", "remote", "-v", "a/b"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let startup = startup_for(&cli.command.unwrap());
+            assert_eq!(startup, Startup::OfflineListing);
+            assert!(!startup.allows_nudge());
         }
     }
 
