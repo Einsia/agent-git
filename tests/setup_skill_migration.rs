@@ -263,3 +263,139 @@ fn the_agents_md_section_is_written_only_at_a_repository_top_level_on_request() 
         "{said}"
     );
 }
+
+/// The section setup wrote from 0.8.0 until 09-10, which told agents to run `agit status` at the
+/// start of every session, so an agent answering a plain greeting ran agit first (ledger 150).
+const OLD_SECTION: &str = "## Session version control (agit)\n\nThis project's agent sessions are managed by agit. Rules:\n\n- Settle when a phase completes: `agit commit --milestone \"<summary>\"` (add `--code` when relevant).\n- `agit status` at session start; if you were resumed as a merge agent, follow the `AGIT_MERGE_TX` protocol (see the agit skill).\n- Never rebase / force-push; remove context with `agit revert @#n.k`.";
+
+/// Runs agit in `dir` with the isolated home of [`setup`].
+fn agit_in(root: &Path, dir: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+    command.env_clear();
+    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec", "PATH"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .args(args)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("CODEX_HOME", root.join("custom-codex"))
+        .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+        .env("AGIT_HOME", root.join("agit"))
+        .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+        .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// A skill refresh, which `agit upgrade` runs, removes the old section from the home folder also
+/// where the 0.8.0 setup doubled its markers and left an extra end marker, and it never edits a
+/// project's own file, which is often committed. For a folder agit set up, `agit doctor` and the
+/// `agit` overview name that file with the removal-only command, which removes the section and
+/// says to commit the change when Git tracks the file; after it, neither names the folder. A
+/// refresh that kept the rule against nested markers would leave the old instruction in every
+/// conversation; one that edited the project would change a committed file unasked.
+#[test]
+fn the_old_session_start_section_goes_at_home_and_is_named_in_projects() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let (begin, end) = ("<!-- agit:begin -->", "<!-- agit:end -->");
+    std::fs::write(
+        root.path().join("AGENTS.md"),
+        format!("User rules\n\n{begin}\n{begin}\n{OLD_SECTION}\n{end}\n{end}\n{end}\n"),
+    )
+    .unwrap();
+    let app = root.path().join("code").join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let project_text = format!("Team rules\n\n{begin}\n{OLD_SECTION}\n{end}\n");
+    std::fs::write(app.join("AGENTS.md"), &project_text).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&app)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "AGENTS.md"]);
+    git(&["commit", "-q", "-m", "rules"]);
+    let app = app.canonicalize().unwrap();
+    let id = &hex::encode(Sha256::digest(app.to_string_lossy().as_bytes()))[..16];
+    let bindings = root.path().join("agit").join("workspaces");
+    std::fs::create_dir_all(&bindings).unwrap();
+    std::fs::write(
+        bindings.join(format!("{id}.json")),
+        serde_json::to_vec(&serde_json::json!({"dir": app, "repo": "me/app"})).unwrap(),
+    )
+    .unwrap();
+
+    let refreshed = setup(root.path(), &["--installed-only"]);
+    assert!(refreshed.status.success(), "{refreshed:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap(),
+        "User rules\n\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("AGENTS.md")).unwrap(),
+        project_text
+    );
+
+    let doctor = agit_in(root.path(), &app, &["--no-tui", "doctor"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        said.contains("tells agents to run `agit status` at every session start")
+            && said.contains("agit setup --remove-agents-md")
+            && said.contains("commit the change"),
+        "{said}"
+    );
+    let overview = |dir: &Path| {
+        let out = agit_in(root.path(), dir, &["--json"]);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"]["legacy_agents_sections"].clone()
+    };
+    let listed = overview(&app);
+    assert_eq!(listed[0]["tracked"], true, "{listed}");
+    assert!(
+        listed[0]["command"]
+            .as_str()
+            .is_some_and(|command| command.starts_with("agit setup --remove-agents-md ")),
+        "{listed}"
+    );
+
+    let removed = agit_in(
+        root.path(),
+        root.path(),
+        &[
+            "--json",
+            "setup",
+            "--remove-agents-md",
+            app.to_str().unwrap(),
+        ],
+    );
+    let document: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert!(removed.status.success(), "{document}");
+    assert_eq!(
+        document["result"]["value"]["removed"][0]["tracked"], true,
+        "{document}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("AGENTS.md")).unwrap(),
+        "Team rules\n\n"
+    );
+    assert_eq!(overview(&app), serde_json::json!([]));
+}

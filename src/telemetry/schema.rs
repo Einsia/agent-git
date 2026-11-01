@@ -573,6 +573,22 @@ mod tests {
         assert_eq!(value["command_path"], "project drop");
         assert_eq!(value["arg_target"], true);
         assert!(!value.to_string().contains("private-canary"));
+
+        // The folder whose agit section is removed stays on the device; only that it was named.
+        for args in [
+            &[
+                "agit",
+                "setup",
+                "--remove-agents-md",
+                "/private-canary/project",
+            ][..],
+            &["agit", "setup", "--remove-agents-md"][..],
+        ] {
+            let value = capture(args);
+            assert_eq!(value["command_path"], "setup");
+            assert_eq!(value["arg_remove_agents_md"], true, "{value}");
+            assert!(!value.to_string().contains("private-canary"));
+        }
     }
 
     #[test]

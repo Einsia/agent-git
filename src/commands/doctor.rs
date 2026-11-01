@@ -824,6 +824,12 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
             )),
         ));
     }
+    for section in super::setup::legacy_folder_sections() {
+        checks.push((
+            "agents-md legacy".to_owned(),
+            Check::Warn(super::setup::legacy_folder_section_line(&section)),
+        ));
+    }
     if super::setup::legacy_home_skill_exists()
         && let Some(path) = super::setup::legacy_home_skill_path()
     {

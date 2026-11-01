@@ -71,6 +71,16 @@ pub struct Args {
     pub mcp: bool,
     #[arg(long = "agents-md")]
     pub agents_md: bool,
+    /// Remove agit's section from the `AGENTS.md` and `CLAUDE.md` of a folder (default: this
+    /// one), and write nothing else.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        conflicts_with_all = ["hooks", "skill", "installed_only", "mcp", "agents_md", "completions", "auto_push"]
+    )]
+    pub remove_agents_md: Option<PathBuf>,
     #[arg(long, value_name = "shell", value_parser = ["bash", "zsh", "fish"])]
     pub completions: Option<String>,
     /// Set the user default for automatically publishing settled turns.
@@ -169,6 +179,9 @@ fn run_setup(mut args: Args) -> CmdResult {
     if args.installed_only && !args.skill && !args.hooks {
         ui::error("`--installed-only` refreshes `--skill` or `--hooks`; name one of them");
         return Ok(ExitCode::Usage);
+    }
+    if let Some(dir) = &args.remove_agents_md {
+        return remove_agents_sections(dir);
     }
 
     if args.completions.is_none() && !args.installed_only {
@@ -1772,6 +1785,148 @@ fn remove_home_sections() -> SetupReport {
         }
     }
     report
+}
+
+/// The instruction files in a folder that a setup run there once wrote agit's section into.
+const FOLDER_INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// `setup --remove-agents-md`: removes agit's section from the instruction files of one folder,
+/// with a backup beside each, and changes nothing else. A file that Git tracks is a change the
+/// person commits, so their teammates' agents stop reading it too.
+fn remove_agents_sections(dir: &Path) -> CmdResult {
+    let Ok(folder) = dir.canonicalize() else {
+        ui::error(&format!("{} does not exist", dir.display()));
+        return Ok(ExitCode::Usage);
+    };
+    let mut removed = Vec::new();
+    let mut failed = false;
+    for name in FOLDER_INSTRUCTION_FILES {
+        let path = folder.join(name);
+        match legacy::remove_sections(&path, skill_bundle::BEGIN_MARKER, skill_bundle::END_MARKER) {
+            Ok(Some(backup)) => {
+                let tracked = tracked_in_git(&folder, name);
+                if !super::json::requested() {
+                    ui::success(&format!(
+                        "agit section removed from {} (backup: {})",
+                        ui::tilde(&path),
+                        ui::tilde(&backup)
+                    ));
+                    if tracked {
+                        ui::hint(&format!(
+                            "{name} is tracked in Git: commit this change so your teammates' agents stop reading the section too"
+                        ));
+                    }
+                }
+                removed
+                    .push(serde_json::json!({"file": path, "backup": backup, "tracked": tracked}));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ui::warning(&format!(
+                    "agit section removal failed: {}: {error}",
+                    path.display()
+                ));
+                failed = true;
+            }
+        }
+    }
+    if super::json::requested() {
+        println!(
+            "{}",
+            serde_json::json!({"folder": folder, "removed": removed})
+        );
+    } else if removed.is_empty() && !failed {
+        println!(
+            "No agit section in {}'s AGENTS.md or CLAUDE.md.",
+            ui::tilde(&folder)
+        );
+    }
+    Ok(if failed {
+        ExitCode::Failure
+    } else {
+        ExitCode::Ok
+    })
+}
+
+/// An instruction file in a folder agit knows that still holds the section agit's setup wrote
+/// from 0.8.0 until 09-10, which tells agents to run `agit status` at every session start.
+pub(crate) struct LegacyFolderSection {
+    pub(crate) file: PathBuf,
+    pub(crate) tracked: bool,
+    /// The command that removes it, and nothing else.
+    pub(crate) command: String,
+}
+
+/// Each instruction file in a folder agit set up (a project policy or a workspace binding) that
+/// holds that old section. Nothing is changed: these files are often committed, so removing the
+/// section is the person's step.
+pub(crate) fn legacy_folder_sections() -> Vec<LegacyFolderSection> {
+    let home = home().and_then(|home| home.canonicalize().ok());
+    let mut folders: Vec<PathBuf> = super::project::policy_roots();
+    if let Ok((bindings, _)) = crate::domain::workspace::all() {
+        folders.extend(
+            bindings
+                .into_iter()
+                .map(|binding| PathBuf::from(binding.dir)),
+        );
+    }
+    let mut folders: Vec<PathBuf> = folders
+        .into_iter()
+        .filter_map(|folder| folder.canonicalize().ok())
+        .filter(|folder| home.as_ref() != Some(folder))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    let mut found = Vec::new();
+    for folder in folders {
+        for name in FOLDER_INSTRUCTION_FILES {
+            let file = folder.join(name);
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if legacy::has_legacy_section(
+                &text,
+                skill_bundle::BEGIN_MARKER,
+                skill_bundle::END_MARKER,
+            ) {
+                found.push(LegacyFolderSection {
+                    tracked: tracked_in_git(&folder, name),
+                    command: format!(
+                        "agit setup --remove-agents-md {}",
+                        shell_word(&folder.to_string_lossy())
+                    ),
+                    file,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// The one line that names an old section and the step that removes it, for `agit doctor` and
+/// the `agit` overview.
+pub(crate) fn legacy_folder_section_line(section: &LegacyFolderSection) -> String {
+    format!(
+        "{} still holds an old agit section that tells agents to run `agit status` at every session start; to remove it: `{}`{}",
+        ui::tilde(&section.file),
+        section.command,
+        if section.tracked {
+            ", then commit the change, as the file is tracked in Git"
+        } else {
+            ""
+        }
+    )
+}
+
+fn tracked_in_git(folder: &Path, name: &str) -> bool {
+    crate::infra::git_runtime::command()
+        .arg("-C")
+        .arg(folder)
+        .args(["ls-files", "--error-unmatch", "--", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn project_agents_path_for(cwd: &Path) -> PathBuf {
