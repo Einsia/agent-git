@@ -6,8 +6,13 @@
 //! registration for its session, a subagent's ask, an unreachable or slow daemon, or a malformed
 //! reply, decides nothing, and the terminal's dialog, which stays up while the hook waits,
 //! decides alone.
+//!
+//! Claude Code leaves the hook running when the terminal answers, so the hook also leaves once
+//! the daemon says its ask is gone (the session moved past it) or once the process that ran it
+//! is gone. A hook that kept checking in would keep the answered ask pending for as long as the
+//! session lives.
 
-use super::Registration;
+use super::{Process, Registration};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -35,21 +40,31 @@ pub(super) fn decide_for(registration: &Registration, payload: &Value) -> Option
     let body = json!({
         "session": registration.session, "generation": registration.generation,
         "cwd": registration.cwd, "id": id, "tool": tool, "input": payload["tool_input"],
-        "permission_mode": payload["permission_mode"],
+        "permission_mode": payload["permission_mode"], "tool_use": payload["tool_use_id"],
     });
+    let parent = super::process(std::process::id())
+        .and_then(|(_, parent)| super::process(parent))
+        .map(|(parent, _)| parent);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
     runtime.block_on(async {
         let mut asked_in = None;
-        while registration.is_registered() {
+        while registration.is_registered() && present(parent.as_ref()) {
             let reply = tokio::time::timeout(
                 Duration::from_secs(2),
                 super::approval::post(registration, "/permission", &body),
             )
             .await;
             // A reply with no turn is from a daemon that has not taken the ask yet.
+            if let Ok(Ok(reply)) = &reply
+                && reply["generation"] == registration.generation.as_str()
+                && reply["id"] == id.as_str()
+                && reply["gone"] == true
+            {
+                return None;
+            }
             if let Ok(Ok(reply)) = reply
                 && reply["generation"] == registration.generation.as_str()
                 && reply["id"] == id.as_str()
@@ -67,6 +82,14 @@ pub(super) fn decide_for(registration: &Registration, payload: &Value) -> Option
             tokio::time::sleep(CHECK_IN).await;
         }
         None
+    })
+}
+
+/// Whether `parent`, the process that ran the hook as it was when the hook started, still runs.
+/// A parent that could not be read at the start does not end the wait.
+fn present(parent: Option<&Process>) -> bool {
+    parent.is_none_or(|parent| {
+        super::process(parent.pid).is_some_and(|(current, _)| current == *parent)
     })
 }
 
@@ -152,5 +175,22 @@ mod tests {
             Some(json!({"behavior": "deny"}))
         );
         assert_eq!(permitted(&json!({"behavior": "ask"})), None);
+    }
+
+    /// A waiting hook stops waiting once the process that ran it is gone, as when Claude Code
+    /// ends the hook's shell, so a hook left behind does not keep its ask pending. A parent that
+    /// could not be read at the start leaves the wait to the registration alone.
+    #[test]
+    fn a_waiting_hook_leaves_once_its_parent_is_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (parent, _) = super::super::process(child.id()).unwrap();
+        assert!(present(Some(&parent)));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!present(Some(&parent)));
+        assert!(present(None));
     }
 }
