@@ -88,7 +88,7 @@ pub struct PublicationReceipt {
 pub(crate) struct PublishedHistory {
     store: Repo,
     published: String,
-    _lock: Option<std::fs::File>,
+    _lock: Option<crate::infra::local_state::HeldLock>,
 }
 
 impl PublishedHistory {

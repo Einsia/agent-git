@@ -30,13 +30,18 @@ impl Delivery {
             return Ok(None);
         }
         crate::infra::config::create_state_dir(&directory)?;
+        let lock_path = directory.join("lock");
         let lock = crate::infra::config::state_file_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(directory.join("lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).context("delivery state is busy; retry")?;
+            .open(&lock_path)?;
+        let _lock = crate::infra::local_state::HeldLock::try_exclusive(
+            lock,
+            &lock_path,
+            "delivery state is busy; retry",
+        )?;
         let saved = state::load(&directory, &scope)?;
         let mut delivery: Self = if let Some(bytes) = saved {
             serde_json::from_slice(&bytes).context("invalid cross-Hub delivery state")?

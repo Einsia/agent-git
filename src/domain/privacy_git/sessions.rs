@@ -674,13 +674,18 @@ impl ProjectedHistory {
         let policy_digest = policy.digest()?;
         let parent = source.common_dir()?.join("agit/privacy-publication");
         crate::infra::config::create_state_dir(&parent)?;
+        let lock_path = parent.join("lock");
         let lock = crate::infra::config::state_file_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(parent.join("lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock)?;
+            .open(&lock_path)?;
+        let lock = crate::infra::local_state::HeldLock::try_exclusive(
+            lock,
+            &lock_path,
+            "privacy publication cache is being updated; retry",
+        )?;
         let scope = digest_json(
             &json!({"version": SESSION_ENVELOPE_VERSION, "kind":"session-owner", "identity":identity}),
         )?;

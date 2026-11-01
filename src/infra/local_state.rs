@@ -187,6 +187,59 @@ pub fn lock_patiently(
     .map_err(|error| io_failure("cannot lock", path, error))
 }
 
+/// A lock taken without waiting, released when the guard drops.
+///
+/// agit opens every file close-on-exec, and spawning a child returns only once the child has
+/// exec'd, so a holder's own children never keep its lock. The one other copy of the open file
+/// description is in a child that some thread has forked and that has not exec'd yet. `flock`
+/// belongs to the description, so a guard that only closed its descriptor would leave the lock
+/// held by that copy, and the next taker would report a finished holder as busy. Dropping
+/// therefore unlocks explicitly, which releases the lock however many copies remain open.
+pub struct HeldLock(std::fs::File);
+
+impl HeldLock {
+    /// Take an exclusive lock on `file`; contention reads as `busy`.
+    pub fn try_exclusive(
+        file: std::fs::File,
+        path: &Path,
+        busy: &'static str,
+    ) -> crate::Result<Self> {
+        Self::take(file, path, busy, fs2::FileExt::try_lock_exclusive)
+    }
+
+    /// Take a shared lock on `file`; contention reads as `busy`.
+    pub fn try_shared(file: std::fs::File, path: &Path, busy: &'static str) -> crate::Result<Self> {
+        Self::take(file, path, busy, fs2::FileExt::try_lock_shared)
+    }
+
+    /// A second descriptor for the same open file description, as a forked child holds one.
+    #[cfg(test)]
+    pub(crate) fn forked_copy(&self) -> std::fs::File {
+        self.0.try_clone().unwrap()
+    }
+
+    /// Only contention means another holder: any other failure keeps its own message, since
+    /// retrying would not help.
+    fn take(
+        file: std::fs::File,
+        path: &Path,
+        busy: &'static str,
+        attempt: fn(&std::fs::File) -> std::io::Result<()>,
+    ) -> crate::Result<Self> {
+        match attempt(&file) {
+            Ok(()) => Ok(Self(file)),
+            Err(error) if is_contended(&error) => Err(anyhow::Error::new(error).context(busy)),
+            Err(error) => Err(io_failure("cannot lock", path, error)),
+        }
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +279,34 @@ mod tests {
                 .iter()
                 .any(|hint| hint.contains("do not delete"))
         );
+    }
+
+    /// Dropping a [`HeldLock`] must release the lock while a copy of its open file description
+    /// stays open, as it does in a child forked and not yet exec'd. A guard that only closes its
+    /// descriptor leaves the lock with the copy, and the next taker sees a busy holder that has
+    /// already finished.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_forked_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let held = HeldLock::try_exclusive(open(), &path, "busy; retry").unwrap();
+        let forked = held.forked_copy();
+        let contended = HeldLock::try_shared(open(), &path, "busy; retry")
+            .err()
+            .expect("an exclusive lock refuses a shared taker");
+        assert_eq!(contended.to_string(), "busy; retry");
+
+        drop(held);
+        HeldLock::try_shared(open(), &path, "busy; retry").unwrap();
+        drop(forked);
     }
 }

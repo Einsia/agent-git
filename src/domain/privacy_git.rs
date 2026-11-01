@@ -87,7 +87,7 @@ pub struct ProjectedHistory {
     session_manifest: super::session_privacy::SessionPublicationManifest,
     #[cfg(test)]
     preparations: usize,
-    _lock: fs::File,
+    _lock: crate::infra::local_state::HeldLock,
 }
 
 pub(crate) enum PreviewEntry<'a> {
@@ -266,7 +266,7 @@ pub(crate) fn receipt_session_id(
 pub(crate) fn receipt_store(
     source: &Repo,
     receipt: &super::privacy_receipt::PublicationReceipt,
-) -> Result<(Repo, fs::File)> {
+) -> Result<(Repo, crate::infra::local_state::HeldLock)> {
     receipt_cache(source, receipt)
 }
 
@@ -292,14 +292,16 @@ pub(crate) fn publication_envelope(
 ) -> Result<(String, Option<Vec<u8>>)> {
     super::session_privacy::validate_oid(commit)?;
     let parent = source.common_dir()?.join("agit/privacy-publication");
+    let lock_path = parent.join("lock");
     let lock = crate::infra::config::state_file_options()
         .read(true)
-        .open(parent.join("lock"));
+        .open(&lock_path);
     let _lock = match lock {
-        Ok(lock) => {
-            fs2::FileExt::try_lock_shared(&lock).context("publication state is busy; retry")?;
-            Some(lock)
-        }
+        Ok(lock) => Some(crate::infra::local_state::HeldLock::try_shared(
+            lock,
+            &lock_path,
+            "publication state is busy; retry",
+        )?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
@@ -336,18 +338,22 @@ pub(crate) fn publication_envelope(
 fn receipt_cache(
     source: &Repo,
     receipt: &super::privacy_receipt::PublicationReceipt,
-) -> Result<(Repo, fs::File)> {
+) -> Result<(Repo, crate::infra::local_state::HeldLock)> {
     receipt.validate()?;
     ensure!(
         receipt.mode.uses_generated_history(),
         "ordinary publication does not use generated history"
     );
     let parent = source.common_dir()?.join("agit/privacy-publication");
+    let lock_path = parent.join("lock");
     let lock = crate::infra::config::state_file_options()
         .read(true)
-        .open(parent.join("lock"))?;
-    fs2::FileExt::try_lock_shared(&lock)
-        .context("privacy publication cache is being updated; retry")?;
+        .open(&lock_path)?;
+    let lock = crate::infra::local_state::HeldLock::try_shared(
+        lock,
+        &lock_path,
+        "privacy publication cache is being updated; retry",
+    )?;
     let ledger = accepted::Ledger::open(source, &receipt.destination)?;
     let store = ledger
         .receipt_store(receipt)?
@@ -541,16 +547,21 @@ pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
         return Some(4);
     }
     let compacted = (|| -> Result<()> {
+        let lock_path = root.join(".git/agit-compact.lock");
         let lock = crate::infra::config::state_file_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.join(".git/agit-compact.lock"))?;
+            .open(&lock_path)?;
         // Another compaction of this store is already running; one is enough.
-        if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+        let Ok(_lock) = crate::infra::local_state::HeldLock::try_exclusive(
+            lock,
+            &lock_path,
+            "the store is being compacted",
+        ) else {
             return Ok(());
-        }
+        };
         compact_store(root)?;
         Ok(())
     })();

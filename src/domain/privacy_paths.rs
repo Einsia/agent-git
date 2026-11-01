@@ -78,13 +78,18 @@ impl PathAliasStore {
         let path = alias_path(repo)?;
         let parent = path.parent().context("path alias store has no parent")?;
         crate::infra::config::create_state_dir(parent)?;
+        let lock_path = parent.join("privacy-path-aliases.lock");
         let lock = crate::infra::config::state_file_options()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(parent.join("privacy-path-aliases.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).context("cannot lock privacy path aliases")?;
+            .open(&lock_path)?;
+        let _lock = crate::infra::local_state::HeldLock::try_exclusive(
+            lock,
+            &lock_path,
+            "cannot lock privacy path aliases",
+        )?;
         let mut aliases = Self::load(repo)?;
         let result = operation(&mut aliases)?;
         aliases.save(repo)?;

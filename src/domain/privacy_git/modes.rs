@@ -71,18 +71,25 @@ fn location(repo: &Repo, hub: &str, session: &str) -> Result<(std::path::PathBuf
 }
 
 /// Selection and first registration serialize locally so a confirmed choice cannot be overtaken.
-pub(crate) fn lock(repo: &Repo, hub: &str, session: &str) -> Result<fs::File> {
+pub(crate) fn lock(
+    repo: &Repo,
+    hub: &str,
+    session: &str,
+) -> Result<crate::infra::local_state::HeldLock> {
     let (directory, _) = location(repo, hub, session)?;
     crate::infra::config::create_state_dir(&directory)?;
+    let lock_path = directory.join("lock");
     let lock = crate::infra::config::state_file_options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(directory.join("lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("session publication mode is being selected or registered; retry")?;
-    Ok(lock)
+        .open(&lock_path)?;
+    crate::infra::local_state::HeldLock::try_exclusive(
+        lock,
+        &lock_path,
+        "session publication mode is being selected or registered; retry",
+    )
 }
 
 pub(crate) fn load(repo: &Repo, hub: &str, session: &str) -> Result<Option<Choice>> {
