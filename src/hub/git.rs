@@ -728,6 +728,16 @@ impl Outcome {
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse().ok())
     }
+
+    /// The kind the Hub named its refusal by. The Hub frames a refusal a client acts on as a fatal
+    /// packet, which git prints as `HTTP <status> <kind>: <message>`; a refusal answered as a bare
+    /// HTTP error, and every local failure, carries no kind.
+    pub fn refusal_kind(&self) -> Option<&str> {
+        let re = regex::Regex::new(r"\bHTTP [45]\d\d ([a-z][a-z0-9_]*):").ok()?;
+        re.captures(&self.stderr)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+    }
 }
 
 /// Run a git command that needs authentication.
@@ -1658,6 +1668,28 @@ mod tests {
         );
         // A 2xx is not a failure reason; only 4xx/5xx count.
         assert_eq!(outcome("HTTP 200 OK").http_status(), None);
+    }
+
+    /// The Hub's refusal kind is read from the line git prints for a framed refusal, as the Hub
+    /// sends it (AgentGit-backend gitsync `printable_refusal`); a bare status names no kind. A
+    /// reader that matched the message text, or took curl's words after a bare status for a kind,
+    /// would retry on refusals that no new preview cures.
+    #[test]
+    fn the_hubs_refusal_kind_is_read_from_its_framed_line() {
+        let moved = outcome(
+            "fatal: remote error: HTTP 409 publication_refs_moved: the repository changed after this publication was previewed; preview it again",
+        );
+        assert_eq!(moved.refusal_kind(), Some("publication_refs_moved"));
+        assert_eq!(moved.http_status(), Some(409));
+        assert_eq!(
+            outcome("error: RPC failed; HTTP 409 curl 22 The requested URL returned error: 409")
+                .refusal_kind(),
+            None
+        );
+        assert_eq!(
+            outcome("! [rejected] main -> main (fetch first)").refusal_kind(),
+            None
+        );
     }
 
     #[test]

@@ -189,7 +189,7 @@ impl PublicationPolicy {
     ) -> Result<Binding> {
         let target_refs_digest = refs_digest(after);
         Ok(Binding {
-            snapshot_digest: digest_bytes(&serde_json::to_vec(&self.session_manifest)?),
+            snapshot_digest: snapshot_digest(&self.session_manifest)?,
             policy_digest: self.policy_digest.clone(),
             receiver_scope: self.receiver_scope.clone(),
             envelope_format_version: SESSION_ENVELOPE_VERSION,
@@ -294,6 +294,12 @@ fn refused_as_withdrawn(error: anyhow::Error, planned: &[String]) -> anyhow::Err
         .into_iter()
         .collect();
     anyhow::Error::new(RefsWithdrawn { refs })
+}
+
+/// The digest a receipt binds for a session manifest. A preview compared with another by this
+/// digest is the same publication the Hub would bind.
+pub(crate) fn snapshot_digest(manifest: &SessionPublicationManifest) -> Result<String> {
+    Ok(digest_bytes(&serde_json::to_vec(manifest)?))
 }
 
 pub(crate) fn refs_digest(refs: &BTreeMap<String, String>) -> String {

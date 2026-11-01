@@ -54,6 +54,104 @@ pub(super) fn check_environment(
     Ok(())
 }
 
+/// Whether a publication may still be run again from its preview when the Hub refuses its receipt
+/// because the repository's refs moved meanwhile.
+#[derive(Debug)]
+pub(super) enum Attempt {
+    First,
+    /// Carries the part the refused attempt sent. The retry plans from what the Hub holds, so its
+    /// first part is what remained of that one; a `--yes` given for it answers the retry only
+    /// while that first preview is the same publication.
+    Retry(Previewed),
+}
+
+/// This push's `--yes`. A retry whose preview is not the publication it was given for withdraws it,
+/// and from then on it answers nothing this push publishes: not that retry, not the branches of a
+/// failed group published again one at a time, and not a later group. Read afresh by each
+/// attempt, it would answer again what the person never confirmed.
+pub(super) struct Yes {
+    given: bool,
+    withdrawn: std::cell::Cell<bool>,
+}
+
+impl Yes {
+    pub(super) fn from_environment() -> Self {
+        Self {
+            given: std::env::var_os("AGIT_YES").is_some(),
+            withdrawn: std::cell::Cell::new(false),
+        }
+    }
+
+    fn given(&self) -> bool {
+        self.given
+    }
+
+    fn answers(&self) -> bool {
+        self.given && !self.withdrawn.get()
+    }
+
+    fn withdraw(&self) {
+        self.withdrawn.set(true);
+    }
+}
+
+/// What a publication preview puts before the person: where it goes, and the sessions and policy
+/// its receipt binds. Equal values are the same publication; any difference is one nobody
+/// answered for yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Previewed {
+    visibility: String,
+    policy_digest: String,
+    snapshot_digest: String,
+}
+
+impl Previewed {
+    fn of(projected: &ProjectedHistory, visibility: &str) -> Result<Self> {
+        Ok(Self {
+            visibility: visibility.to_owned(),
+            policy_digest: projected.policy_digest().to_owned(),
+            snapshot_digest: crate::hub::privacy::publication::snapshot_digest(
+                projected.session_manifest(),
+            )?,
+        })
+    }
+}
+
+/// The kind the Hub gives a publication receipt it refuses because the repository's refs changed
+/// after the publication was previewed, as another member's push to any branch does. A new
+/// preview of the same publication can pass; no other receipt refusal promises that.
+const REFS_MOVED: &str = "publication_refs_moved";
+
+/// A first attempt the Hub refused as [`REFS_MOVED`]. Its caller runs the publication once more
+/// from the start: destination, preview, every gate and confirmation, receipt and pack.
+#[derive(Debug)]
+pub(super) struct RefsMoved {
+    refused: Previewed,
+}
+
+impl RefsMoved {
+    pub(super) fn retry(self) -> Attempt {
+        Attempt::Retry(self.refused)
+    }
+}
+
+impl std::fmt::Display for RefsMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the repository changed on the Hub while this publication was being checked")
+    }
+}
+
+impl std::error::Error for RefsMoved {}
+
+fn refs_moved(report: &PublicationReport) -> bool {
+    [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .flat_map(|phase| &phase.attempts)
+        .any(|attempt| !attempt.ok() && attempt.outcome.refusal_kind() == Some(REFS_MOVED))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     args: &Args,
     client: Client,
@@ -62,6 +160,9 @@ pub(super) fn run(
     repo: Repo,
     branches: &[String],
     named: bool,
+    attempt: Attempt,
+    yes: &Yes,
+    policy_checked: bool,
 ) -> CmdResult {
     let slug = checkout.slug();
     ensure!(
@@ -113,6 +214,9 @@ pub(super) fn run(
             intent,
             local_target,
         },
+        attempt,
+        yes,
+        policy_checked,
     )
 }
 
