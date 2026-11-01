@@ -7,6 +7,9 @@
 //!    still resolve to the same repo — the claim records the namespace, Stop no longer fills the
 //!    owner in from the signed-in account to look for `<me>/<name>`, and the `AGIT_SESSION`
 //!    SessionStart writes back is the org's too.
+//!
+//! A folder set up to upload into the org repo automatically is entered the same way, through
+//! the hooks and the project's own worker.
 
 use agit::domain::repo::Repo;
 use std::io::{Read as _, Write as _};
@@ -3808,4 +3811,80 @@ fn resume_tracking_recovery_hint_resolves_the_frozen_graph() {
         assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
         assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
     }
+}
+
+/// An automatic upload never publishes a conversation with no finished turn. A terminal reopened
+/// with `claude --resume` starts a conversation of its own and can be left before its first reply;
+/// the folder's catch-up at that SessionStart claims it, and publishing that claim would list an
+/// empty, nameless session on the Hub. The worker must stop at the claim and record no result: a
+/// worker that published every claim would try the push, and the push leaves its result, failed
+/// against this Hub, in the project's state.
+#[test]
+fn a_folder_never_uploads_a_conversation_with_no_finished_turn() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    checkout.set_auto_push(Some(true)).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    // The folder uploads to einsia/qa automatically, as `agit on` records it. The imported
+    // conversation is left out, so the catch-up has only the new one to judge.
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let policy = state.with_extension("json");
+    fs::write(
+        &policy,
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = "dddddddd-0000-4000-8000-000000000004";
+    let prompt = serde_json::json!({"type": "user", "sessionId": fresh, "cwd": lab.work,
+        "uuid": "fresh-u1", "timestamp": "2026-10-31T01:00:00.000Z",
+        "message": {"role": "user", "content": "hello"}});
+    fs::write(lab.transcript(fresh), format!("{prompt}\n")).unwrap();
+
+    // Holding the worker's lock leaves the catch-up queued instead of detached, so the worker
+    // below runs it in the foreground and has finished when it returns.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.with_extension("capture"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let started = lab.hook("ingest", fresh, &[("source", "resume")], &[]);
+    assert!(started.status.success(), "{started:?}");
+    drop(lock);
+    let worker = lab
+        .agit(&["--quiet", "project", "capture"])
+        .arg(&lab.work)
+        .output()
+        .unwrap();
+    assert!(worker.status.success(), "{worker:?}");
+
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claim =
+        agit::domain::link::get(&store, "claude-code", fresh).expect("the worker claims it");
+    assert!(claim.branch.is_some(), "{claim:?}");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    assert!(state["last_result"].is_null(), "{state}");
 }
