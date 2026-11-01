@@ -255,7 +255,7 @@ pub fn refuse_damaged_parents(repo: &Repo, parents: &[&str]) -> Result<()> {
         std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
     > = std::sync::OnceLock::new();
     let intact = INTACT.get_or_init(Default::default);
-    let store = repo.git_path("objects")?;
+    let store = store_key(repo)?;
     if intact.lock().is_ok_and(|seen| seen.contains(&store)) {
         return Ok(());
     }
@@ -278,6 +278,28 @@ pub fn refuse_damaged_parents(repo: &Repo, parents: &[&str]) -> Result<()> {
         seen.insert(store);
     }
     Ok(())
+}
+
+/// The object store `repo` writes to, as the memo of intact stores names it, read in-process
+/// unless the environment redirects Git's directories, which only Git resolves. A key in another
+/// form than an earlier one only costs another listing, never a skipped one.
+fn store_key(repo: &Repo) -> Result<std::path::PathBuf> {
+    let redirected = [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    if !redirected
+        && repo.root().is_absolute()
+        && let Ok(native) = gix::open(repo.root())
+    {
+        return Ok(native.common_dir().join("objects"));
+    }
+    repo.git_path("objects")
 }
 
 /// "1 damaged Git object", "2 damaged Git objects".

@@ -251,17 +251,34 @@ pub fn tree_apply_owned(
         }
     }
 
-    // Resolve the immutable tree through the same no-replacement boundary as ref publication.
-    let tree_expr = format!("{base_commitish}^{{tree}}");
-    let base_tree = repo.git(&["rev-parse", "--verify", &tree_expr])?;
-    let base_tree = base_tree.trim();
+    let objects = open_objects(repo);
+    let base_tree = base_tree(repo, objects.as_ref().ok(), base_commitish)?;
     if edits.is_empty() {
-        return Ok(base_tree.to_string());
+        return Ok(base_tree);
     }
     if base_tree.is_empty() || !base_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
         anyhow::bail!("git rev-parse returned an invalid tree object id");
     }
+    let objects = objects?;
+    let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
+    let mut editor = objects.edit_tree(base_id)?;
+    for (path, content) in edits {
+        match content {
+            Some(bytes) => {
+                let id = objects.write_blob(&bytes)?.detach();
+                editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
+            }
+            None => {
+                editor.remove_leaf(path.as_str())?;
+            }
+        }
+    }
+    Ok(editor.write()?.to_string())
+}
 
+/// The repository's object database, read with replacements ignored: the same no-replacement
+/// boundary as ref publication.
+fn open_objects(repo: &Repo) -> Result<gix::Repository> {
     let mut objects = gix::open_opts(
         repo.root(),
         gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
@@ -277,20 +294,46 @@ pub fn tree_apply_owned(
         )?;
     }
     objects.objects.ignore_replacements = true;
-    let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
-    let mut editor = objects.edit_tree(base_id)?;
-    for (path, content) in edits {
-        match content {
-            Some(bytes) => {
-                let id = objects.write_blob(&bytes)?.detach();
-                editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
+    Ok(objects)
+}
+
+/// `base^{tree}`. A full object id whose chain down to its tree is all in the local store and well
+/// formed is peeled in-process, through tags and commits as `^{tree}` peels; anything else, every
+/// name included, goes to `git rev-parse --verify`, so ref lookup, an object Git would fetch, a
+/// damaged object and every refusal stay Git's.
+fn base_tree(repo: &Repo, objects: Option<&gix::Repository>, base: &str) -> Result<String> {
+    if let Some(tree) = objects.and_then(|objects| local_tree(objects, base)) {
+        return Ok(tree.to_string());
+    }
+    let tree = repo.git(&["rev-parse", "--verify", &format!("{base}^{{tree}}")])?;
+    Ok(tree.trim().to_owned())
+}
+
+/// The tree a full object id peels to, or `None` when a step needs more than reading one
+/// well-formed local object.
+fn local_tree(objects: &gix::Repository, base: &str) -> Option<gix::ObjectId> {
+    // Deeper tag chains are left to Git.
+    const MAX_TAGS: usize = 8;
+    let mut id = gix::ObjectId::from_hex(base.as_bytes()).ok()?;
+    for _ in 0..=MAX_TAGS {
+        let object = objects.find_object(id).ok()?;
+        match object.kind {
+            gix::object::Kind::Tree => return Some(id),
+            gix::object::Kind::Commit => {
+                // The tree is read, not only looked up: an empty object file is present without
+                // being a tree, and a malformed commit can name a blob.
+                let tree = object.try_to_commit_ref().ok()?.tree();
+                return objects
+                    .find_object(tree)
+                    .ok()
+                    .filter(|tree| tree.kind == gix::object::Kind::Tree)
+                    .map(|_| tree);
             }
-            None => {
-                editor.remove_leaf(path.as_str())?;
-            }
+            gix::object::Kind::Tag => id = object.try_to_tag_ref().ok()?.target(),
+            gix::object::Kind::Blob => return None,
         }
     }
-    Ok(editor.write()?.to_string())
+    None
 }
 
 /// Rebuild a complete v1 session snapshot on top of `base_commitish`.
@@ -4524,6 +4567,87 @@ mod tests {
         let tree =
             tree_apply_owned(&repo, &head, vec![("new".into(), Some(b"right".to_vec()))]).unwrap();
         assert_eq!(repo.ls_tree_result(&tree).unwrap(), vec!["new", "original"]);
+    }
+
+    /// The base of an edit is `base^{tree}` as Git resolves it, for every kind of base: a commit,
+    /// an annotated tag or a tree given by full object id, and a name. A blob, or an id with no
+    /// object, is refused, and so is a commit whose tree Git cannot read as a tree: an empty
+    /// object file, or a malformed commit naming a blob. A resolver that stops peeling at the
+    /// commit or the tag, takes any object it finds for a tree, or only asks whether the commit's
+    /// tree exists, builds on the wrong base or returns an id Git refuses.
+    #[test]
+    fn owned_tree_apply_peels_every_base_as_git_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        std::fs::write(repo.root().join("page"), "content\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("base").unwrap();
+        repo.git(&["tag", "-a", "-m", "release", "release"])
+            .unwrap();
+        let commit = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let tag = repo.git(&["rev-parse", "release"]).unwrap();
+        let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        let blob = repo.git(&["rev-parse", "HEAD:page"]).unwrap();
+        let added = || vec![("added".to_owned(), Some(b"x".to_vec()))];
+        for base in [commit.as_str(), &tag, &tree, "HEAD", "release"] {
+            let expected = repo
+                .git(&["rev-parse", "--verify", &format!("{base}^{{tree}}")])
+                .unwrap();
+            assert_eq!(
+                tree_apply_owned(&repo, base, Vec::new()).unwrap(),
+                expected,
+                "{base}"
+            );
+            let edited = tree_apply_owned(&repo, base, added()).unwrap();
+            assert_eq!(
+                repo.ls_tree_result(&edited).unwrap(),
+                vec!["added", "page"],
+                "{base}"
+            );
+        }
+        let message = directory.path().join("message");
+        std::fs::write(
+            &message,
+            format!("tree {blob}\nauthor t <t@example.com> 0 +0000\ncommitter t <t@example.com> 0 +0000\n\nnames a blob\n"),
+        )
+        .unwrap();
+        let names_blob = repo
+            .git(&[
+                "hash-object",
+                "-t",
+                "commit",
+                "--literally",
+                "-w",
+                message.to_str().unwrap(),
+            ])
+            .unwrap();
+        // Last, since it damages the store: a commit whose tree object file is empty.
+        std::fs::write(repo.root().join("other"), "only in this tree\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("other").unwrap();
+        let emptied = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let lost = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        let loose = repo
+            .git_path("objects")
+            .unwrap()
+            .join(&lost[..2])
+            .join(&lost[2..]);
+        std::fs::remove_file(&loose).unwrap();
+        std::fs::File::create(&loose).unwrap();
+        for base in [
+            blob.as_str(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &names_blob,
+            &emptied,
+        ] {
+            assert!(
+                repo.git(&["rev-parse", "--verify", &format!("{base}^{{tree}}")])
+                    .is_err(),
+                "Git refuses {base}"
+            );
+            assert!(tree_apply_owned(&repo, base, Vec::new()).is_err(), "{base}");
+            assert!(tree_apply_owned(&repo, base, added()).is_err(), "{base}");
+        }
     }
 
     #[test]
