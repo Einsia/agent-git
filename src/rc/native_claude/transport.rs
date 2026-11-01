@@ -30,9 +30,9 @@ const MAX_PEERS: usize = 128;
 const MAX_OPERATIONS: usize = 4096;
 const MAX_EVENTS: usize = 1024;
 const FRESH: Duration = Duration::from_secs(3);
-/// How long an ask a settings hook offers stays pending without the hook checking in again. The
-/// hook checks in well inside it while it waits, so an ask disappears soon after the terminal
-/// answers it and ends the hook.
+/// How long an ask a settings hook offers stays pending without the hook checking in again, and
+/// how long an ask the session moved past is still answered as gone. The hook checks in well
+/// inside it while it waits.
 const OFFER_LEASE: Duration = Duration::from_secs(5);
 const MAX_OFFERS: usize = 64;
 static HUB: OnceLock<Mutex<Weak<Hub>>> = OnceLock::new();
@@ -161,8 +161,12 @@ struct PeerState {
     /// user plugins over on its classic events.
     module_approvals: Vec<Value>,
     module_mode: Option<String>,
-    /// Asks a settings PermissionRequest hook holds open, by id, with its last check-in.
-    offered: HashMap<String, (Value, Instant)>,
+    /// Asks a settings PermissionRequest hook holds open, by id.
+    offered: HashMap<String, Offer>,
+    /// Asks the session moved past while their hook still checked in, by id, with the hook's
+    /// last check-in. Claude Code leaves a hook running when the terminal answers its ask, so
+    /// such a hook is told its ask is gone, and it is never taken again in a later turn.
+    gone: HashMap<String, Instant>,
     /// Asks a hook has checked in with that are not taken yet, by id: how many module reports
     /// had arrived at its first check-in, and its last check-in.
     sighted: HashMap<String, (u64, Instant)>,
@@ -197,6 +201,7 @@ impl PeerState {
             module_approvals: Vec::new(),
             module_mode: None,
             offered: HashMap::new(),
+            gone: HashMap::new(),
             sighted: HashMap::new(),
             reports: 0,
             reported_mode: None,
@@ -226,13 +231,42 @@ impl PeerState {
         }
     }
 
+    /// Move the asks the session has moved past out of `offered`: one raised in a turn that
+    /// has ended or given way to another, and one whose tool call completed. An ask's turn
+    /// cannot lead the snapshot's: it is copied from the snapshot when the ask is taken, which
+    /// is only from the second module report after the hook first checked in, and the module
+    /// sends one report at a time, so that report began after the ask and carries its turn.
+    /// Before then the ask is only sighted, and nothing here touches it.
+    fn settle(&mut self, completed: &[String]) {
+        let turn = self.snapshot.turn.as_deref();
+        let settled: Vec<String> = self
+            .offered
+            .iter()
+            .filter(|(_, offer)| {
+                offer.wire["turn"].as_str() != turn
+                    || offer
+                        .tool_use
+                        .as_ref()
+                        .is_some_and(|tool_use| completed.contains(tool_use))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in settled {
+            if let Some(offer) = self.offered.remove(&id) {
+                self.gone.insert(id, offer.seen);
+            }
+        }
+    }
+
     fn overlay(&mut self) {
+        self.settle(&[]);
         self.offered
-            .retain(|_, (_, seen)| seen.elapsed() < OFFER_LEASE);
+            .retain(|_, offer| offer.seen.elapsed() < OFFER_LEASE);
+        self.gone.retain(|_, seen| seen.elapsed() < OFFER_LEASE);
         self.sighted
             .retain(|_, (_, seen)| seen.elapsed() < OFFER_LEASE);
         let mut approvals = self.module_approvals.clone();
-        for (wire, _) in self.offered.values() {
+        for Offer { wire, .. } in self.offered.values() {
             if !approvals
                 .iter()
                 .any(|approval| approval["id"] == wire["id"])
@@ -247,6 +281,14 @@ impl PeerState {
             .or_else(|| self.reported_mode.clone());
         self.note_activity();
     }
+}
+
+/// An ask a settings hook holds open: what shared control sees of it, the hook's last check-in,
+/// and the tool call it asks for, when Claude Code names it.
+struct Offer {
+    wire: Value,
+    seen: Instant,
+    tool_use: Option<String>,
 }
 
 fn pending_commands(operations: &HashMap<String, Operation>) -> Vec<Value> {
@@ -500,6 +542,11 @@ impl Hub {
             }
             "/permission" => {
                 let tool = body["tool"].as_str().context("missing tool name")?;
+                // The session moved past this ask; its hook outlived the terminal's answer.
+                if let Some(seen) = state.gone.get_mut(id) {
+                    *seen = Instant::now();
+                    return Ok(json!({"generation":generation, "id":id, "gone":true}));
+                }
                 // An ask joins the turn the module reports running, read from a report the
                 // module began after the ask arrived. The module sends one report at a time, so
                 // the second report to arrive after the ask's first check-in began after that
@@ -507,11 +554,11 @@ impl Hub {
                 // is not taken and its hook checks in again: an ask taken from an earlier report
                 // would keep that turn, and shared control would show it under the wrong one.
                 let reports = state.reports;
-                let fresh = if let Some((_, seen)) = state.offered.get_mut(id) {
-                    *seen = Instant::now();
+                let fresh = if let Some(offer) = state.offered.get_mut(id) {
+                    offer.seen = Instant::now();
                     false
                 } else {
-                    let count = state.offered.len() + state.sighted.len();
+                    let count = state.offered.len() + state.gone.len() + state.sighted.len();
                     let first = match state.sighted.get_mut(id) {
                         Some((first, seen)) => {
                             *seen = Instant::now();
@@ -530,7 +577,18 @@ impl Hub {
                             state.sighted.remove(id);
                             let wire =
                                 json!({"id":id, "turn":turn, "tool":tool, "input":body["input"]});
-                            state.offered.insert(id.to_owned(), (wire, Instant::now()));
+                            let tool_use = body["tool_use"]
+                                .as_str()
+                                .filter(|tool_use| !tool_use.is_empty() && tool_use.len() <= 256)
+                                .map(str::to_owned);
+                            state.offered.insert(
+                                id.to_owned(),
+                                Offer {
+                                    wire,
+                                    seen: Instant::now(),
+                                    tool_use,
+                                },
+                            );
                             true
                         }
                         _ => false,
@@ -546,7 +604,7 @@ impl Hub {
                 let turn = state
                     .offered
                     .get(id)
-                    .map_or(Value::Null, |(wire, _)| wire["turn"].clone());
+                    .map_or(Value::Null, |offer| offer.wire["turn"].clone());
                 let decision = state.decisions.get(id).cloned();
                 drop(state);
                 if fresh {
@@ -618,12 +676,19 @@ impl Hub {
         }
         state.events.extend(events);
         state.acknowledged = acknowledged;
+        let completed: Vec<String> = snapshot
+            .events
+            .iter()
+            .filter(|event| event["kind"] == "tool_completed")
+            .filter_map(|event| event["id"].as_str().map(str::to_owned))
+            .collect();
         snapshot.events.clear();
         snapshot.results.clear();
         state.module_approvals = std::mem::take(&mut snapshot.approvals);
         state.module_mode = snapshot.permission_mode.take();
         state.snapshot = snapshot;
         state.reports += 1;
+        state.settle(&completed);
         state.overlay();
         let PeerState {
             decisions,
@@ -1551,6 +1616,192 @@ mod tests {
                     assert_eq!(left, None);
                 });
         }
+    }
+
+    /// Pins that an ask the terminal answered stops being pending once the session moves past
+    /// it, although Claude Code leaves its hook running. While the ask is open, team activity
+    /// reads the session as awaiting approval. When the module reports the turn ended with no
+    /// asks of its own, the session reads idle, the hook's next check-in is told the ask is gone
+    /// and the hook leaves, and a shared-control client no longer sees it. In a later turn the
+    /// session reads running, and the same ask checking in again is still gone, never taken
+    /// again in that turn. An ask whose tool call completes while its turn goes on is gone as
+    /// soon as the module reports the completion. A daemon that waited for the hook to stop
+    /// checking in would report the session as awaiting approval for as long as it lives.
+    #[test]
+    fn an_ask_the_session_moved_past_is_gone_and_its_hook_leaves() {
+        if crate::rc::in_isolated_test(
+            "rc::native_claude::transport::tests::an_ask_the_session_moved_past_is_gone_and_its_hook_leaves",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", root.path());
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cwd = root.path().canonicalize().unwrap();
+                let registry = cwd.join("sessions");
+                let socket = cwd.join("native.sock");
+                let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let (process, _) = super::super::process(std::process::id()).unwrap();
+                let session = uuid::Uuid::new_v4().to_string();
+                crate::rc::claude_inbox::fixture::register(
+                    &registry,
+                    process.pid,
+                    &session,
+                    &socket,
+                    None,
+                );
+                let record_path = registry.join(format!("{}.json", process.pid));
+                let mut record: Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                record["cwd"] = json!(cwd);
+                std::fs::write(&record_path, record.to_string()).unwrap();
+                let endpoint = Endpoint::start().unwrap();
+                let registration = Registration {
+                    version: 1,
+                    session: session.clone(),
+                    cwd: cwd.clone(),
+                    generation: uuid::Uuid::new_v4().to_string(),
+                    revision: process.birth.clone(),
+                    process,
+                    registry,
+                    descriptor: descriptor_path().unwrap(),
+                };
+                super::super::publish(&directory().unwrap(), &registration).unwrap();
+                let report = |turn: Option<&str>, last_seq: u64, events: Value| -> Snapshot {
+                    serde_json::from_value(json!({
+                        "registration":registration, "session":session, "cwd":cwd,
+                        "generation":registration.generation, "version":1, "saturated":false,
+                        "last_seq":last_seq, "events":events, "results":[], "approvals":[],
+                        "tools":[], "compacting":false, "permission_mode":null, "turn":turn
+                    }))
+                    .unwrap()
+                };
+                let status = || {
+                    let listed = Client::terminal_activity();
+                    assert_eq!(listed.len(), 1, "one registration is listed");
+                    listed[0].status
+                };
+                endpoint
+                    .hub
+                    .poll(report(Some("earlier"), 0, json!([])))
+                    .unwrap();
+
+                // An ask raised in a turn, which the terminal answers; its hook keeps waiting.
+                let ask = json!({"session_id":session, "tool_name":"Bash",
+                    "tool_input":{"command":"ls"}, "tool_use_id":"toolu_answered"});
+                let hook = {
+                    let (registration, ask) = (registration.clone(), ask.clone());
+                    std::thread::spawn(move || {
+                        super::super::permission::decide_for(&registration, &ask)
+                    })
+                };
+                let id = loop {
+                    endpoint
+                        .hub
+                        .poll(report(Some("raised-in"), 0, json!([])))
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let state =
+                        endpoint.hub.peers.lock().unwrap()[&registration.generation].clone();
+                    let state = state.state.lock().unwrap();
+                    if let Some(approval) = state.snapshot.approvals.first() {
+                        break approval["id"].as_str().unwrap().to_owned();
+                    }
+                };
+                assert_eq!(status(), "awaiting_approval");
+
+                // The turn ends; the module reports no asks of its own.
+                endpoint.hub.poll(report(None, 0, json!([]))).unwrap();
+                assert_eq!(status(), "idle");
+                let check_in = |id: &str| {
+                    let body = json!({"session":session, "generation":registration.generation,
+                        "cwd":cwd, "id":id, "tool":"Bash", "input":{"command":"ls"}});
+                    endpoint
+                        .hub
+                        .handle("/permission", body.to_string().as_bytes())
+                        .unwrap()
+                };
+                assert_eq!(check_in(&id)["gone"], true);
+                let left = loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if hook.is_finished() {
+                        break hook.join().unwrap();
+                    }
+                };
+                assert_eq!(left, None, "a gone ask decides nothing");
+                let client = Client::attach(&session, &cwd).unwrap();
+                assert!(client.snapshot().unwrap().approvals.is_empty());
+                drop(client);
+
+                // A later turn: running, and the old ask is not taken again.
+                for _ in 0..3 {
+                    endpoint
+                        .hub
+                        .poll(report(Some("next"), 0, json!([])))
+                        .unwrap();
+                    assert_eq!(check_in(&id)["gone"], true);
+                }
+                let peer = endpoint.hub.peers.lock().unwrap()[&registration.generation].clone();
+                peer.state.lock().unwrap().attached = false;
+                assert_eq!(status(), "running");
+
+                // An ask whose tool call completes while its turn goes on.
+                let fresh = uuid::Uuid::new_v4().to_string();
+                let body = json!({"session":session, "generation":registration.generation,
+                    "cwd":cwd, "id":fresh, "tool":"Bash", "input":{"command":"ls"},
+                    "tool_use":"toolu_ran"});
+                // Checked in before any report from its turn arrived: not taken, and not gone.
+                let first = endpoint
+                    .hub
+                    .handle("/permission", body.to_string().as_bytes())
+                    .unwrap();
+                assert!(first["turn"].is_null() && first.get("gone").is_none());
+                endpoint
+                    .hub
+                    .poll(report(Some("next"), 0, json!([])))
+                    .unwrap();
+                let early = endpoint
+                    .hub
+                    .handle("/permission", body.to_string().as_bytes())
+                    .unwrap();
+                assert!(early["turn"].is_null() && early.get("gone").is_none());
+                let offered = loop {
+                    let reply = endpoint
+                        .hub
+                        .handle("/permission", body.to_string().as_bytes())
+                        .unwrap();
+                    if !reply["turn"].is_null() {
+                        break reply;
+                    }
+                    endpoint
+                        .hub
+                        .poll(report(Some("next"), 0, json!([])))
+                        .unwrap();
+                };
+                assert_eq!(offered["turn"], "next");
+                assert_eq!(status(), "awaiting_approval");
+                endpoint
+                    .hub
+                    .poll(report(
+                        Some("next"),
+                        1,
+                        json!([{"seq":1, "kind":"tool_completed", "id":"toolu_ran"}]),
+                    ))
+                    .unwrap();
+                assert_eq!(status(), "running");
+                let reply = endpoint
+                    .hub
+                    .handle("/permission", body.to_string().as_bytes())
+                    .unwrap();
+                assert_eq!(reply["gone"], true);
+            });
     }
 
     #[test]

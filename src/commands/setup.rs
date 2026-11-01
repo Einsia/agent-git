@@ -267,8 +267,9 @@ const HOOKS: &[(&str, &[&str])] = &[
 
 /// Hooks installed for Claude Code alone, each with its timeout in seconds. A PermissionRequest
 /// hook waits for an answer a person gives in shared control while the terminal's dialog stays
-/// up beside it, and Claude Code ends the hook as soon as the terminal answers; its timeout only
-/// bounds how long a remote answer may still arrive. Claude Code passes user plugins over on its
+/// up beside it. Claude Code goes on when the terminal answers but leaves the hook running, so
+/// the hook leaves once the daemon says the session moved past its ask; its timeout only bounds
+/// how long a remote answer may still arrive. Claude Code passes user plugins over on its
 /// classic events where an organization's security default is seated, so this ask reaches agit
 /// only through settings.
 #[cfg(unix)]
