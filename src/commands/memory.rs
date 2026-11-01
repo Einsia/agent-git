@@ -1543,7 +1543,7 @@ fn distill_cmd(
         &commit[..9.min(commit.len())]
     ));
     if !ui::quiet() {
-        ui::hint("publish it: `agit push -b main`");
+        ui::hint(&format!("publish it: `agit push {}@main`", target.slug));
     }
     Ok(ExitCode::Ok)
 }

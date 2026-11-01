@@ -200,7 +200,13 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     );
 
     // distill -y: into main, after which everything is in sync.
-    ok(&agit(&home, &claude, &["distill", "-y", "--into", &into]));
+    let distilled = agit(&home, &claude, &["distill", "-y", "--into", &into]);
+    ok(&distilled);
+    let hint = String::from_utf8_lossy(&distilled.stderr);
+    assert!(
+        hint.contains(&format!("publish it: `agit push {REPO}@main`")),
+        "{hint}"
+    );
     assert_eq!(
         repo.git_bytes(&["show", "refs/heads/main:memory/mine.md"])
             .unwrap(),
