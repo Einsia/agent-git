@@ -2258,6 +2258,22 @@ fn is_policy(path: &Path) -> bool {
             .is_some_and(|stem| stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The folders this machine's project policies set up, paused ones included; a policy that cannot
+/// be read is left out.
+pub(crate) fn policy_roots() -> Vec<PathBuf> {
+    let Ok(entries) = home().and_then(|home| Ok(fs::read_dir(home)?)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| is_policy(path))
+        .filter_map(|path| {
+            let project: Project = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+            Some(project.root)
+        })
+        .collect()
+}
+
 /// Every project policy on this machine. An unreadable policy fails the caller, since it may be
 /// the one that withholds a branch.
 fn policies() -> Result<Vec<Project>> {

@@ -21,6 +21,7 @@ agit setup [options]
 | `--installed-only` | With `--skill`, refresh only existing native or legacy Skill installations; does not change hooks, MCP, project integration, or auto-push preferences |
 | `--mcp` | Configure the MCP server |
 | `--agents-md` | Write/update the AGENTS.md integration block at the top of the current Git repository; plain `agit setup` writes none, and outside a repository or in the home folder nothing is written |
+| `--remove-agents-md [DIR]` | Remove agit's section from the `AGENTS.md` and `CLAUDE.md` of `DIR` (default: the current folder), keeping a backup beside each; writes nothing else |
 | `--completions <shell>` | Generate completion for a shell |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
@@ -64,7 +65,9 @@ The native Skill targets are:
 - OpenCode: `~/.config/opencode/skills/agit/`
 - Cursor: `~/.cursor/skills/agit/`
 
-Use `--agents-md` separately, inside the project, when you want the short, marked project integration block. A skill install also removes such a block from the home-level instruction files (`~/AGENTS.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, the Codex and OpenCode `AGENTS.md`), since every conversation reads those; `agit doctor` reports one it finds.
+Use `--agents-md` separately, inside the project, when you want the short, marked project integration block. A skill install also removes such a block from the home-level instruction files (`~/AGENTS.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, the Codex and OpenCode `AGENTS.md`), since every conversation reads those; `agit doctor` reports one it finds. That includes the section setup wrote from 0.8.0 until 09-10, which told agents to run `agit status` at the start of every session, also where that setup doubled its markers; `agit upgrade` refreshes the skill and so removes it too.
+
+Setup never edits a project's own instruction files by itself, since they are often committed. When a folder agit set up still holds that old section, `agit doctor` and `agit` name the file and the command that removes it, `agit setup --remove-agents-md DIR`; if Git tracks the file, commit the change so teammates' agents stop reading it too.
 
 After verifying the native bundle, Skill setup removes complete, version-marked
 legacy manuals from known runtime instruction paths and `~/AGENTS.md`, even when

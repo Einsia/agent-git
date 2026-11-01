@@ -75,6 +75,9 @@ pub fn run() -> CmdResult {
         .as_deref()
         .and_then(crate::commands::project::last_failure);
     let codex_untrusted = state == FolderState::On && codex_hooks_silent(&sessions);
+    // An old agit section in a folder agit set up still tells agents to run agit at every session
+    // start; the person removes it, as the file may be committed.
+    let legacy = crate::commands::setup::legacy_folder_sections();
     let next = next_step(account.is_some(), root.is_some(), state, total).or_else(|| {
         (waiting > 0).then_some((
             "agit save --all",
@@ -101,6 +104,11 @@ pub fn run() -> CmdResult {
                 "recent": sessions.iter_mut().map(row_json).collect::<Vec<_>>(),
                 "last_upload_error": failure,
                 "codex_hooks_not_running": codex_untrusted,
+                "legacy_agents_sections": legacy.iter().map(|section| serde_json::json!({
+                    "file": section.file,
+                    "tracked": section.tracked,
+                    "command": section.command,
+                })).collect::<Vec<_>>(),
                 "next": next.map(|(command, why)| serde_json::json!({"command": command, "why": why})),
             })
         );
@@ -178,6 +186,13 @@ pub fn run() -> CmdResult {
                 println!("  no Claude Code or Codex sessions have run here yet");
             }
         }
+    }
+    for section in &legacy {
+        println!();
+        println!(
+            "{}",
+            ui::warn_text(&crate::commands::setup::legacy_folder_section_line(section))
+        );
     }
     println!();
     match next {
