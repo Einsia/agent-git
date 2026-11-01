@@ -1,6 +1,10 @@
 //! Offline search binds saved Git evidence and never consults Hub or native state.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -168,7 +172,7 @@ impl Lab {
     fn commit_at(&self, repo: &Repo, second: u8) {
         repo.add_all().unwrap();
         let mut command = Command::new("git");
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

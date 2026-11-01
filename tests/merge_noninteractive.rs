@@ -4,6 +4,10 @@
 //! agent harness.  The setup uses `--no-launch` only for creating the two empty session lines; the
 //! merge itself follows the normal launching path and must stop at its preflight gate.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -33,7 +37,7 @@ impl Lab {
         Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(args)
             .current_dir(&self.work)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.agit_home)

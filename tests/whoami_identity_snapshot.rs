@@ -1,5 +1,9 @@
 //! Identity reports and authenticated checks use the same selected Hub and credential snapshot.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
@@ -189,7 +193,7 @@ impl Lab {
             command.arg("--check");
         }
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
@@ -207,9 +211,12 @@ impl Lab {
         if let Some(system_root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", system_root);
         }
-        if let Some(hub) = hub {
-            command.env("AGIT_HUB_URL", hub);
-        }
+        match hub {
+            Some(hub) => command.env("AGIT_HUB_URL", hub),
+            // The stored config selects the Hub, and every config this file writes names a local
+            // test Hub.
+            None => command.env_remove("AGIT_HUB_URL"),
+        };
         command.output().unwrap()
     }
 }

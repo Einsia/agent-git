@@ -5,6 +5,10 @@
 //! transcript with the current dictionary would then differ from the committed envelopes even
 //! though the runtime never rewrote a byte, and the branch would refuse every resume.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::json;
 use std::{
     fs,
@@ -118,7 +122,7 @@ impl Lab {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agit"));
-        cmd.env_clear()
+        cmd.env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)

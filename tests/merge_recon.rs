@@ -1,6 +1,10 @@
 //! Merge reconnaissance borrows graph evidence without changing either selected repository.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{mergetx, meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 struct Lab {
@@ -49,7 +53,7 @@ impl Lab {
         command
             .args(args)
             .current_dir(self.temporary.path())
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.temporary.path())
             .env("AGIT_HOME", self.temporary.path())

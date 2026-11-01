@@ -1,6 +1,10 @@
 //! Turn activity uses frozen stored records, including evidence hidden from the current VIEW.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::{fs, path::Path, process::Command};
 
@@ -62,7 +66,7 @@ fn log(home: &Path, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agit"))
         .args(["log", "me/counts@main", "--oneline"])
         .args(extra)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGIT_HOME", home)
@@ -320,7 +324,7 @@ fn native_opencode_import_counts_a_late_part_on_an_earlier_turns_host() {
         let run = |args: &[&str]| {
             Command::new(env!("CARGO_BIN_EXE_agit"))
                 .args(args)
-                .env_clear()
+                .env_clear_local()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", home.path())
                 .env("AGIT_HOME", home.path().join("agit"))

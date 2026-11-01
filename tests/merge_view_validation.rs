@@ -1,5 +1,9 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::commands::merge::marker_envelope;
 use agit::domain::{mergetx, meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use std::process::{Command, Output};
 
 const CLAIM: &str = "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -84,7 +88,7 @@ impl MergeFixture {
         Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(["merge", "--into", "local/merge-test@target"])
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("GIT_CONFIG_NOSYSTEM", "1")

@@ -1,6 +1,10 @@
 //! Publish targets require explicit repository and branch selection before publication requests.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, store::Store};
+use lab_env::LabEnv;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
@@ -90,7 +94,7 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
         command
             .args(args)
             .current_dir(temporary.path())
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", temporary.path())
             .env("AGIT_HOME", &home)

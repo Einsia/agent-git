@@ -1,7 +1,11 @@
 //! `agit commit --code` commits in the checkout it runs in, never in the claim's launch directory,
 //! and never stages untracked files.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +24,7 @@ fn message(role: &str, text: &str) -> String {
 
 fn isolated(program: impl AsRef<std::ffi::OsStr>, root: &Path) -> Command {
     let mut command = Command::new(program);
-    command.env_clear();
+    command.env_clear_local();
     for key in [
         "PATH",
         "SystemRoot",

@@ -2,7 +2,11 @@
 //! `origin/<branch>` is strictly ahead of is fast-forwarded first, one that diverged from it is
 //! refused with the ways out named, and one level with it is left alone.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, storage, store, transcript};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -165,7 +169,7 @@ impl Lab {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.temporary.path())
             .env("AGIT_HOME", &self.home)

@@ -2,6 +2,9 @@
 
 //! Unlock, resume and settlement preserve native history and its selected context.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{
     meta,
     privacy_envelope::{PrivacyEnvelope, ViewingRecipient, digest_bytes},
@@ -19,6 +22,7 @@ use agit::infra::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crypto_box::SecretKey;
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -614,7 +618,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     });
     let run = |args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

@@ -1,6 +1,10 @@
 //! Login distinguishes remote refusal, local persistence, and interactive admission.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::infra::credentials::{HubCredential, save_at};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -357,7 +361,7 @@ impl Lab {
     fn command(&self, base: &str, flags: &[&str], args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
@@ -986,7 +990,7 @@ fn an_interrupted_device_login_is_finished_by_a_later_complete_without_a_value()
     let lab = Lab::new(&hub.base);
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
     command
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &lab.home)
         .env("USERPROFILE", &lab.home)
@@ -1765,7 +1769,7 @@ fn terminal_command(
         .unwrap();
     let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
     command.args(args);
-    command.env_clear();
+    command.env_clear_local();
     command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
     command.env("HOME", &lab.home);
     command.env("AGIT_HOME", &lab.store);

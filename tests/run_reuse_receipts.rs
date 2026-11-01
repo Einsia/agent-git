@@ -1,8 +1,12 @@
 //! `agit run` tells the Hub which session it starts from, and the run never depends on the
 //! answer.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
 use agit::hub::identity::{self, RemoteIdentity};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -225,7 +229,7 @@ impl Lab {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.temporary.path())
             .env("AGIT_HOME", &self.home)

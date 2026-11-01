@@ -1,5 +1,9 @@
 //! Skill refresh preserves user instructions and migrates only existing integrations.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -7,7 +11,7 @@ const BLOCK: &str = "<!-- agit:skill-begin -->\n<!-- agit:skill-version:old -->\
 
 fn setup(root: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-    command.env_clear();
+    command.env_clear_local();
     for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec", "PATH"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -227,7 +231,7 @@ fn the_agents_md_section_is_written_only_at_a_repository_top_level_on_request() 
         .unwrap();
     assert!(git.status.success());
     let mut plain = Command::new(env!("CARGO_BIN_EXE_agit"));
-    plain.env_clear();
+    plain.env_clear_local();
     for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec", "PATH"] {
         if let Some(value) = std::env::var_os(name) {
             plain.env(name, value);
@@ -271,7 +275,7 @@ const OLD_SECTION: &str = "## Session version control (agit)\n\nThis project's a
 /// Runs agit in `dir` with the isolated home of [`setup`].
 fn agit_in(root: &Path, dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
-    command.env_clear();
+    command.env_clear_local();
     for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec", "PATH"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);

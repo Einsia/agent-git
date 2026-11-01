@@ -1,4 +1,8 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,7 +69,7 @@ impl Lab {
             command.arg("--deep");
         }
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.directory.path())
             .env("USERPROFILE", self.directory.path())

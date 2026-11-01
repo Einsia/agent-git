@@ -1,12 +1,16 @@
 //! A file-line reference describes its own tree and history without requiring a conversation.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo};
+use lab_env::LabEnv;
 use std::{path::Path, process::Command};
 
 fn show(home: &Path, target: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agit"))
         .args(["show", target])
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGIT_HOME", home)

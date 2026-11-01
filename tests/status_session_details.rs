@@ -1,4 +1,8 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -331,7 +335,7 @@ impl Lab {
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let root = self.root.path();
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

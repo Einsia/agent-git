@@ -1,7 +1,11 @@
 //! Promoting a checkout moves only claims for its fully qualified source repository.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, repo::Repo, store::Store};
 use agit::hub::identity::{self, RemoteIdentity};
+use lab_env::LabEnv;
 use serde_json::json;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -245,7 +249,7 @@ fn promotion(name: &str) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
     command
         .args(["clone", "alice/qa", "--mine", "--no-bind"])
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", temporary.path())
         .env("AGIT_HOME", &home)

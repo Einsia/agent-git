@@ -1,4 +1,8 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::repo::Repo;
+use lab_env::LabEnv;
 use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 
@@ -16,7 +20,7 @@ fn invalid_since_is_a_usage_error_before_repository_resolution() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(["log", "missing/repo@main", "--since", duration])
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", tmp.path())
             .env("AGIT_HOME", tmp.path().join("agit"))

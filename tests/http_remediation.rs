@@ -1,7 +1,12 @@
 //! HTTP recovery belongs to the failure that ends the command, not to an incidental response.
 
 #[cfg(unix)]
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+#[cfg(unix)]
 mod unix {
+    use super::lab_env::LabEnv;
     use agit::infra::credentials::{HubCredential, save_at};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, VecDeque};
@@ -223,7 +228,7 @@ mod unix {
             command
                 .args(args)
                 .stdin(Stdio::null())
-                .env_clear()
+                .env_clear_local()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &self.home)
                 .env("AGIT_HOME", &self.store)
@@ -309,7 +314,7 @@ mod unix {
             let output = Command::new("git")
                 .args(args)
                 .stdin(Stdio::null())
-                .env_clear()
+                .env_clear_local()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &self.home)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -805,7 +810,7 @@ mod unix {
             let script = format!("agit() {{ printf '%s\\n' \"$@\"; }}; {copied}");
             let replay = Command::new("sh")
                 .args(["-c", &script])
-                .env_clear()
+                .env_clear_local()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("AGIT_HUB_URL", "https://different.invalid")
                 .env("HOME", &lab.home)

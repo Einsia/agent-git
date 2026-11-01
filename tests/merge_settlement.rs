@@ -1,5 +1,9 @@
 //! Merge admission preserves every local writer whose evidence is not fully settled.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::{
     fs,
     path::PathBuf,
@@ -87,7 +91,7 @@ impl Lab {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .current_dir(&self.work)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)
@@ -477,7 +481,7 @@ fn transaction_control_is_not_inherited_by_a_running_child() {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--ignored", "--exact", "transaction_control_child_probe"])
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("AGIT_TEST_CONTROL_READY", &ready)
         .env("AGIT_TEST_CONTROL_RELEASE", &release)
@@ -687,7 +691,7 @@ fn settlement_recovery_hint_preserves_the_literal_branch_argument() {
         let result = Command::new("/bin/sh")
             .args(["-c", recovery])
             .current_dir(&lab.work)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", &bin)
             .env("AGIT_TEST_RECOVERY_ARGS", &capture)
             .output()
@@ -859,7 +863,7 @@ impl ArchiveTerminal {
         }
         let template = lab.command();
         let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-        command.env_clear();
+        command.env_clear_local();
         for (key, value) in template.get_envs() {
             if key != "CI"
                 && let Some(value) = value

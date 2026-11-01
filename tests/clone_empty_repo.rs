@@ -4,7 +4,11 @@
 //! metadata. A clone that leaves Git's unborn default branch makes the commit read as a session
 //! settlement; one that leaves HEAD detached sends it to a separate worktree that lacks the page.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo};
+use lab_env::LabEnv;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -133,7 +137,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut cmd = Command::new(program);
-        cmd.env_clear();
+        cmd.env_clear_local();
         for key in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(key) {
                 cmd.env(key, value);

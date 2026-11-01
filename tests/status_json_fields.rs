@@ -1,3 +1,7 @@
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::{fs, path::PathBuf, process::Command};
 
 struct Lab {
@@ -27,7 +31,7 @@ impl Lab {
         let output = Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(args)
             .current_dir(&self.cwd)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)
@@ -235,7 +239,7 @@ fn status_reports_the_conversation_the_runtime_names_and_its_saved_target() {
         let output = command
             .arg("status")
             .current_dir(&lab.cwd)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &lab.home)
             .env("AGIT_HOME", &lab.store)
@@ -284,7 +288,7 @@ fn mcp_commit_without_a_target_settles_nothing_the_environment_names() {
     let mut server = Command::new(env!("CARGO_BIN_EXE_agit"))
         .arg("mcp")
         .current_dir(&lab.cwd)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &lab.home)
         .env("AGIT_HOME", &lab.store)

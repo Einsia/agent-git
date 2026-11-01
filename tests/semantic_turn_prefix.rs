@@ -1,6 +1,10 @@
 //! Semantic reconnaissance reads frozen LOG content without assigning Git ancestry.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{mergetx, meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
@@ -14,7 +18,7 @@ impl Lab {
     fn command(&self, executable: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(executable);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.0.path())
             .env("AGIT_HOME", self.0.path())

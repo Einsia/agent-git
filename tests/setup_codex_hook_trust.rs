@@ -4,6 +4,10 @@
 //! it will not run.
 #![cfg(unix)]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -46,7 +50,7 @@ fn hook(event: &str, command: &str, enabled: bool, trust: &str) -> serde_json::V
 fn agit(home: &Path, path: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_agit"))
         .args(args)
-        .env_clear()
+        .env_clear_local()
         .env("PATH", path)
         .env("HOME", home)
         .env("CODEX_HOME", home.join(".codex"))

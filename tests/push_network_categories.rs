@@ -1,5 +1,10 @@
 //! Push and RC landing preserve known failure categories and never invent replacement history.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
+
 #[path = "support/publication_http.rs"]
 mod publication_http;
 #[path = "support/publication_process.rs"]
@@ -82,7 +87,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

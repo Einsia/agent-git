@@ -1,7 +1,11 @@
 //! The installed agent guide must support adoption and explicit follow-up commands without
 //! inheriting a session target or starting a nested runtime.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage};
+use lab_env::LabEnv;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -22,7 +26,7 @@ impl Lab {
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agit"));
         cmd.args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.agit_home)

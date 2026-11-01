@@ -1,7 +1,11 @@
 //! Native exports preserve paired tool evidence within the selected transcript. Missing outputs
 //! remain placeholders, and output belonging to an unselected call cannot become conversation.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::{collections::HashMap, process::Command};
 
@@ -49,7 +53,7 @@ fn export(home: &std::path::Path, format: &str, view_only: bool) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
     command
         .args(["export", "me/evidence@main", "--format", format])
-        .env_clear()
+        .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGIT_HOME", home)

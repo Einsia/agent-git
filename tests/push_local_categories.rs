@@ -1,5 +1,10 @@
 //! Local publication refusals preserve their category without publishing content or moving refs.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
+
 #[path = "support/publication_http.rs"]
 mod publication_http;
 
@@ -67,7 +72,7 @@ impl Lab {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
-        command.env_clear();
+        command.env_clear_local();
         for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);

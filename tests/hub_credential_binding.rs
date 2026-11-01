@@ -1,5 +1,9 @@
 //! Stored credentials must remain bound to their recorded authority through every CLI path.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -182,7 +186,7 @@ impl Lab {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.user_home)
             .env("USERPROFILE", &self.user_home)

@@ -2,7 +2,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{link, meta, repo::Repo, storage, store::Store, transcript};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -314,7 +318,7 @@ impl Fixture {
         command
             .args(["-y", subcommand])
             .args(args)
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.home())
             .env("AGIT_HOME", self.home())

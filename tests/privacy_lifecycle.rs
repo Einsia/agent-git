@@ -1,6 +1,10 @@
 //! The executable protocol must preserve recovery across independent device homes and retries.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -210,7 +214,7 @@ impl Device {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .env_clear()
+            .env_clear_local()
             .env("AGIT_HOME", &self.home)
             .env("AGIT_HUB_URL", &self.hub)
             .env("HOME", self._root.path())

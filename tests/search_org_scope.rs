@@ -1,6 +1,10 @@
 //! Organization search needs a server-confirmed corpus and never falls back to all repositories.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::infra::credentials::{HubCredential, save_at};
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -196,7 +200,7 @@ impl Lab {
     fn command(&self, base: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)

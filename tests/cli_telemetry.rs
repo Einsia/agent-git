@@ -1,5 +1,9 @@
 #![cfg(feature = "cli")]
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
+use lab_env::LabEnv;
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -1312,7 +1316,7 @@ fn answer_installer_onboarding(fixture: &Fixture, keys: &[u8]) -> String {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
     let mut builder = CommandBuilder::new(BIN);
-    builder.env_clear();
+    builder.env_clear_local();
     for (key, value) in [
         ("HOME", fixture.home.path().to_str().unwrap()),
         (

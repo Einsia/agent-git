@@ -1,6 +1,10 @@
 //! Target notices describe verified CLI selections without becoming part of exported data.
 
+#[path = "support/lab_env.rs"]
+mod lab_env;
+
 use agit::domain::{meta, repo::Repo, storage, transcript};
+use lab_env::LabEnv;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(any(unix, all(windows, target_env = "msvc")))]
@@ -82,7 +86,7 @@ impl Lab {
     fn isolated(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
-            .env_clear()
+            .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("AGIT_HOME", &self.store)
