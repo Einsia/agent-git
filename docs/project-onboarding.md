@@ -85,6 +85,17 @@ owners and the people granted access when an owner has turned that off, or only 
 when it is in your own namespace. The visibility is the Hub's answer when the conversation starts, or its last
 recorded answer when the Hub cannot be reached in time; when neither exists the line says so.
 
+A conversation from before the folder was on, or from before agit covered the git worktree it
+started in, is not uploaded by itself. When you resume one, its line says so instead, and how to
+upload that one conversation:
+
+```text
+agit: this conversation is from before ~/app was on, so it is not uploaded. To upload it to team/app (private to team: every member of team can read it): ask your agent to run `agit save`, or run `agit save 3f2a9c1d` in ~/app.
+```
+
+Here who can read it is the Hub's last recorded answer, since the line asks nothing of the Hub;
+when there is none, the line names the repository alone.
+
 The command installs hooks for available supported runtimes. Codex must report an enabled
 hooks feature and may ask you to trust the installed commands. A runtime without working
 hooks cannot provide automatic capture; its sessions are published by `project sync`, and
