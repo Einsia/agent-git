@@ -614,6 +614,12 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(rt, &ev.session_id, env_value.as_deref());
+    if ev.source != Source::Compact
+        && let Some(origin) = origin
+        && super::project::captured_by_project(rt, &ev.session_id, origin)
+    {
+        let _ = super::project::record_memory_start(rt, &ev.session_id, origin);
+    }
     // Nothing here reaches the model: an agent that needs this conversation's state runs agit,
     // which names it from the runtime's own session variable. Only the person is told where a
     // conversation the folder uploads goes, and who can read it there.

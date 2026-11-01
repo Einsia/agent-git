@@ -931,6 +931,15 @@ fn import_capture(
     branch: &str,
     opens: bool,
 ) -> Result<()> {
+    // Without its start record the first collection takes in nothing, which is safe, so filing it
+    // never stops the upload.
+    if opens && let Ok(primary) = checkout(project) {
+        let _ = super::memory::name_start(
+            &primary,
+            &key(&candidate.runtime, &candidate.session_id),
+            branch,
+        );
+    }
     // A capture whose first import settled no turn is marked by the import that settles one.
     let marks = opens
         || captured_records()?.iter().any(|r| {
@@ -2807,6 +2816,43 @@ fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Vi
     (!claimed_elsewhere).then_some((project, via))
 }
 
+/// Whether the project covering `origin` captures this conversation by itself; see [`capturing`].
+pub(crate) fn captured_by_project(runtime: &str, session: &str, origin: &Path) -> bool {
+    let origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    capturing(runtime, session, &origin).is_some()
+}
+
+/// Record the runtime memory baseline of a conversation the project uploads, as it starts: the
+/// first collection on the branch it is uploaded to then takes in what the conversation itself
+/// writes, and leaves alone the personal memory that was already there. A conversation already
+/// uploaded keeps its branch's own baseline.
+pub(crate) fn record_memory_start(runtime: &str, session: &str, origin: &Path) -> Result<()> {
+    let cwd = origin.canonicalize()?;
+    let Some((project, _)) = capturing(runtime, session, &cwd) else {
+        return Ok(());
+    };
+    let candidate = Candidate {
+        runtime: runtime.into(),
+        session_id: session.into(),
+        cwd,
+    };
+    let branch = match placement(&project, &candidate)? {
+        Placement::Claim(branch) => Some(branch),
+        Placement::New => None,
+        Placement::Foreign(_) => return Ok(()),
+    };
+    super::memory::record_start(
+        &checkout(&project)?,
+        branch.as_deref(),
+        &key(runtime, session),
+        runtime,
+        &candidate.cwd,
+    )?;
+    Ok(())
+}
+
 /// The repository a project saves this conversation into by itself, and what the sign-in lets it
 /// do, read from local state alone.
 pub(crate) fn automatic_capture(
@@ -3887,6 +3933,45 @@ mod tests {
         policy.auto_upload = false;
         save(&policy).unwrap();
         assert!(announced("fresh", &inside).is_none());
+    }
+
+    /// A Claude Code conversation the project uploads records its memory baseline as it starts,
+    /// with the personal memory already there; an excluded one and a Codex one (no per-project
+    /// memory) record nothing. Without the record, the first upload collects nothing the
+    /// conversation wrote; with one for every conversation, folders that never upload leave
+    /// records behind in the repository.
+    #[test]
+    fn a_conversation_the_project_uploads_records_its_memory_start() {
+        if !isolated("a_conversation_the_project_uploads_records_its_memory_start") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        policy.excluded.insert(key("claude-code", "excluded"));
+        save(&policy).unwrap();
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        let mem = crate::infra::runtime_memory::locate("claude-code", &policy.root)
+            .unwrap()
+            .dir;
+        fs::create_dir_all(&mem).unwrap();
+        fs::write(mem.join("personal.md"), "before the start\n").unwrap();
+        let starts = || -> Vec<PathBuf> {
+            fs::read_dir(repo.common_dir().unwrap().join("agit-memory-start"))
+                .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+                .unwrap_or_default()
+        };
+
+        record_memory_start("claude-code", "excluded", &policy.root).unwrap();
+        record_memory_start("codex", "fresh", &policy.root).unwrap();
+        assert!(starts().is_empty());
+        record_memory_start("claude-code", "fresh", &policy.root).unwrap();
+        let recorded = starts();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            fs::read_to_string(&recorded[0])
+                .unwrap()
+                .contains("personal.md")
+        );
     }
 
     /// What the person dropped in a folder stays dropped when the folder moves to another

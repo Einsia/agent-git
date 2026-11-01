@@ -20,11 +20,15 @@
 //! What enters the branch at settlement is the change **against the baseline**: at start, the
 //! hash of every top-level file and of every mirrored file is recorded (the baseline lives in the
 //! git directory of this branch's worktree, independent of the link — a session started by
-//! `agit new` has no link until its first settlement). Personal memory that was already there
-//! before the start and was not touched this session does not enter the branch, even when it
-//! differs from the branch: this is where the privacy boundary is drawn. With no baseline (the
-//! session was not started through agit) settlement only records one and collects nothing; an
-//! explicit `agit memory sync` takes in everything currently at the top level.
+//! `agit new` has no link until its first settlement). A conversation a project uploads by itself
+//! has no branch when it starts: the SessionStart hook records its baseline in the repository's
+//! git directory under the conversation, the capture that opens its branch files it under that
+//! branch, and the first collection or materialization on the branch takes it over. Personal
+//! memory that was already there before the start and was not touched this session does not
+//! enter the branch, even when it differs from the branch: this is where the privacy boundary is
+//! drawn. With no baseline (the session was started neither through agit nor in a project that
+//! uploads it) settlement only records one and collects nothing; an explicit `agit memory sync`
+//! takes in everything currently at the top level.
 //!
 //! Collection computes a "plan" ([`plan_collect`]) first and then executes it; `status` speaks
 //! from the same plan, so every row of its table is what the next `commit` will do. Files the
@@ -79,6 +83,9 @@ pub const INDEX_FILE: &str = "MEMORY.md";
 const INDEX_BEGIN: &str = "<!-- agit:memory:begin";
 const INDEX_END: &str = "<!-- agit:memory:end -->";
 const BASELINE_FILE: &str = "agit-memory-baseline.json";
+/// The directory, in the repository's common git directory, of baselines recorded before their
+/// branch exists.
+const START_BASELINE_DIR: &str = "agit-memory-start";
 /// The `memory.track` setting: `session` (the default) or `off`.
 const TRACK_KEY: &str = "memory.track";
 
@@ -394,9 +401,103 @@ fn baseline_path(checkout: &Repo) -> crate::Result<PathBuf> {
     checkout.git_path(BASELINE_FILE)
 }
 
+/// Where the baseline of a branch that does not exist yet waits. Branch names may hold `/`, so the
+/// file is named by the branch's hash.
+fn start_baseline_path(primary: &Repo, branch: &str) -> crate::Result<PathBuf> {
+    Ok(primary
+        .common_dir()?
+        .join(START_BASELINE_DIR)
+        .join(format!("{}.json", sha(branch.as_bytes()))))
+}
+
+/// Where the baseline of a conversation waits while the branch it will be uploaded to has no name
+/// yet: a capture names a new branch only when it opens it.
+fn conversation_start_path(primary: &Repo, conversation: &str) -> crate::Result<PathBuf> {
+    Ok(primary.common_dir()?.join(START_BASELINE_DIR).join(format!(
+        "conversation-{}.json",
+        sha(conversation.as_bytes())
+    )))
+}
+
+/// Record the baseline of a session whose branch is not born yet, from the runtime memory
+/// directory as it is now: under `branch` when its name is known, else under the conversation
+/// (`runtime:id`) until [`name_start`] files it under the branch it opens. Once the branch exists
+/// its own baseline governs, and an earlier start record is kept: what the session wrote since then
+/// is still its own.
+pub fn record_start(
+    primary: &Repo,
+    branch: Option<&str>,
+    conversation: &str,
+    runtime: &str,
+    cwd: &Path,
+) -> crate::Result<()> {
+    match crate::infra::runtime_memory::locate(runtime, cwd) {
+        Some(mem) => record_start_in(primary, branch, conversation, &mem.dir),
+        None => Ok(()),
+    }
+}
+
+/// The body of [`record_start`], with the directory given explicitly.
+fn record_start_in(
+    primary: &Repo,
+    branch: Option<&str>,
+    conversation: &str,
+    mem_dir: &Path,
+) -> crate::Result<()> {
+    let path = match branch {
+        Some(branch) if primary.has_ref(&format!("refs/heads/{branch}")) => return Ok(()),
+        Some(branch) => start_baseline_path(primary, branch)?,
+        None => conversation_start_path(primary, conversation)?,
+    };
+    if path.exists() {
+        return Ok(());
+    }
+    write_baseline(
+        &path,
+        &Baseline::of(mem_dir, &md_files(mem_dir)?, &BTreeMap::new()),
+    )
+}
+
+/// File a conversation's start baseline under the branch a capture is about to open for it. A
+/// branch that already exists, or already has a start record, keeps its own.
+pub fn name_start(primary: &Repo, conversation: &str, branch: &str) -> crate::Result<()> {
+    let waiting = conversation_start_path(primary, conversation)?;
+    if !waiting.exists() {
+        return Ok(());
+    }
+    let start = start_baseline_path(primary, branch)?;
+    if primary.has_ref(&format!("refs/heads/{branch}")) || start.exists() {
+        std::fs::remove_file(&waiting)?;
+        return Ok(());
+    }
+    std::fs::rename(&waiting, &start)
+        .with_context(|| format!("cannot move {} into place", waiting.display()))
+}
+
+/// Move a start baseline into the branch's checkout, unless the checkout already has its own.
+fn adopt_start_baseline(primary: &Repo, checkout: &Repo, branch: &str) -> crate::Result<()> {
+    let start = start_baseline_path(primary, branch)?;
+    if !start.exists() {
+        return Ok(());
+    }
+    let own = baseline_path(checkout)?;
+    if own.exists() {
+        std::fs::remove_file(&start)?;
+        return Ok(());
+    }
+    if let Some(parent) = own.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&start, &own)
+        .with_context(|| format!("cannot move {} into place", start.display()))
+}
+
 fn read_baseline(checkout: &Repo, mem_dir: &Path) -> crate::Result<Option<Baseline>> {
-    let path = baseline_path(checkout)?;
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    read_baseline_at(&baseline_path(checkout)?, mem_dir)
+}
+
+fn read_baseline_at(path: &Path, mem_dir: &Path) -> crate::Result<Option<Baseline>> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Ok(None);
     };
     let baseline: Baseline = serde_json::from_str(&text)
@@ -410,11 +511,14 @@ fn read_baseline(checkout: &Repo, mem_dir: &Path) -> crate::Result<Option<Baseli
 }
 
 fn store_baseline(checkout: &Repo, baseline: &Baseline) -> crate::Result<()> {
-    let path = baseline_path(checkout)?;
+    write_baseline(&baseline_path(checkout)?, baseline)
+}
+
+fn write_baseline(path: &Path, baseline: &Baseline) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(baseline)?)
+    std::fs::write(path, serde_json::to_string_pretty(baseline)?)
         .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
 }
@@ -678,6 +782,7 @@ pub fn materialize_with(
     policy: Policy,
 ) -> crate::Result<Report> {
     let checkout = super::worktree::checkout(primary, branch)?;
+    adopt_start_baseline(primary, &checkout, branch)?;
     let mirror = mirror_dir(mem_dir, slug, branch);
     let mut report = Report {
         dir: mem_dir.to_path_buf(),
@@ -851,6 +956,7 @@ pub fn collect_with(
         return Ok(report);
     }
     let checkout = super::worktree::checkout(primary, branch)?;
+    adopt_start_baseline(primary, &checkout, branch)?;
     let in_branch = branch_files(&checkout, &tree_ref(branch))?;
     let top = md_files(mem_dir)?;
     let mirror = md_files(&mirror_dir(mem_dir, slug, branch))?;
@@ -1239,6 +1345,10 @@ fn status(target: &Target) -> CmdResult {
                 Some(checkout) => read_baseline(&checkout, dir)?,
                 None => None,
             };
+            let baseline = match baseline {
+                Some(baseline) => Some(baseline),
+                None => read_baseline_at(&start_baseline_path(primary, branch)?, dir)?,
+            };
             let plan = plan_collect(
                 baseline.as_ref(),
                 &top,
@@ -1369,7 +1479,7 @@ fn status(target: &Target) -> CmdResult {
     }
     if plan.no_baseline && runtime.is_some() && !top.is_empty() {
         println!(
-            "  this session has no memory baseline (it was not started through agit): `agit commit` only records one; `agit memory sync` adopts the local files"
+            "  this session has no memory baseline (it was started neither through agit nor in a folder that uploads it): `agit commit` only records one; `agit memory sync` adopts the local files"
         );
     }
     if pending_sync > 0 {
@@ -2029,6 +2139,72 @@ mod tests {
         privacy.save(&repo).unwrap();
         let plan = distill_plan(&repo, "s1").unwrap();
         assert!(distill(&repo, &plan, &plan.items).is_err());
+    }
+
+    /// A conversation a project uploads records its baseline before its branch has a name, the
+    /// capture files it under the branch it opens, and the first collection on the new branch takes in only what the conversation wrote and the local
+    /// allowlist admits. An implementation that records the baseline at the first collection
+    /// collects nothing; one that skips the baseline's privacy boundary collects the personal file
+    /// that predates the start; one that reads the allowlist from the branch is widened by it.
+    #[test]
+    fn a_plain_start_collects_only_what_the_conversation_wrote_and_the_local_allowlist_admits() {
+        let (_d, repo, mem) = fixture();
+        std::fs::write(mem.join("personal.md"), "before the start\n").unwrap();
+        std::fs::write(mem.join(INDEX_FILE), "- [personal](personal.md)\n").unwrap();
+        record_start_in(&repo, None, "claude-code:s2", &mem).unwrap();
+        name_start(&repo, "claude-code:s2", "s2").unwrap();
+
+        let mut privacy = crate::domain::privacy::PrivacyPolicy::load(&repo).unwrap();
+        privacy.memory_allow = vec!["**/*.md".into()];
+        privacy.save(&repo).unwrap();
+        let widening = std::fs::read(
+            repo.common_dir()
+                .unwrap()
+                .join("agit")
+                .join("privacy-policy.json"),
+        )
+        .unwrap();
+        privacy.memory_allow.clear();
+        privacy.save(&repo).unwrap();
+        // The branch is born at the first upload and carries a policy that would admit everything.
+        repo.git(&["branch", "s2", "s1"]).unwrap();
+        let tree = super::super::plumbing::tree_apply_owned(
+            &repo,
+            "refs/heads/s2",
+            vec![("agit/privacy-policy.json".into(), Some(widening))],
+        )
+        .unwrap();
+        let head = repo.git(&["rev-parse", "refs/heads/s2"]).unwrap();
+        let c =
+            super::super::plumbing::commit_tree(&repo, &tree, &[head.trim()], "policy").unwrap();
+        repo.git(&["update-ref", "refs/heads/s2", &c]).unwrap();
+
+        std::fs::write(mem.join("decisions.md"), "presence timeout: 45 s\n").unwrap();
+        std::fs::write(
+            mem.join(INDEX_FILE),
+            "- [personal](personal.md)\n- [decisions](decisions.md)\n",
+        )
+        .unwrap();
+        let refused = collect_with(&repo, "s2", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            refused.collected, 0,
+            "an empty local allowlist admits nothing"
+        );
+        assert!(file(&repo, "refs/heads/s2", "decisions.md").is_none());
+
+        privacy.memory_allow = vec!["**/*.md".into()];
+        privacy.save(&repo).unwrap();
+        let taken = collect_with(&repo, "s2", SLUG, &mem, ON).unwrap();
+        assert_eq!(taken.collected, 1);
+        assert_eq!(
+            file(&repo, "refs/heads/s2", "decisions.md").as_deref(),
+            Some("presence timeout: 45 s\n")
+        );
+        assert!(
+            file(&repo, "refs/heads/s2", "personal.md").is_none(),
+            "memory from before the start stays local"
+        );
+        assert!(file(&repo, "refs/heads/s2", INDEX_FILE).is_none());
     }
 
     /// With no baseline, settlement only records one and collects nothing; an explicit sync
