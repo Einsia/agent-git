@@ -3923,18 +3923,20 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
     assert_eq!(git(&remote, &["rev-parse", &version]), tagged);
 }
 
-/// A session branch the Hub refused for holding more event entries in a snapshot than it reads
-/// stays out of automatic pushes while its tip still holds more than that, and a push the person
-/// names asks the Hub again. The refusal is told as the Hub's limit, and as a push that changed
-/// nothing on the Hub: the Hub turned it down before moving any ref. The next automatic push leaves
-/// it out before any preview, rather than uploading the whole session again only to meet the same
-/// refusal; once the Hub accepts the branch, automatic pushes carry it again. A refusal the Hub can
-/// also send after its ref transaction still reads as unconfirmed. A client that forgets the
-/// refusal uploads the session on every turn; one that never lets it go keeps a session the Hub now
-/// accepts off it for good; one that reads every named refusal as nothing moved would hide a
-/// receive the Hub may have applied.
+/// A session branch the Hub refused for a reason its later turns do not change stays out of
+/// automatic pushes, and a push the person names asks the Hub again. One refusal is a snapshot
+/// holding more event entries than the Hub reads: the branch stays out while its tip still holds
+/// more than that. The other is a branch built on a session withdrawn on the Hub: it stays out
+/// until a named push is accepted. Each refusal is told in its own words, and as a push that
+/// changed nothing on the Hub: the Hub turned it down before moving any ref. The next automatic
+/// push leaves the branch out before any preview, rather than uploading the whole session again
+/// only to meet the same refusal; once the Hub accepts the branch, automatic pushes carry it again.
+/// A refusal the Hub can also send after its ref transaction still reads as unconfirmed. A client
+/// that forgets the refusal uploads the session on every turn; one that never lets it go keeps a
+/// session the Hub now accepts off it for good; one that reads every named refusal as nothing moved
+/// would hide a receive the Hub may have applied.
 #[test]
-fn a_branch_larger_than_the_hub_accepts_stays_out_of_automatic_pushes() {
+fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -4081,6 +4083,35 @@ fn a_branch_larger_than_the_hub_accepts_stays_out_of_automatic_pushes() {
         text(&unknown).contains("some ref updates are unconfirmed"),
         "{unknown:?}"
     );
+
+    // Built on a withdrawn session: the Hub refuses the receive, and the branch is set aside as a
+    // withdrawn one is until a named push is accepted.
+    turn("big turn 5");
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/big".into(), next.clone(), None)];
+    *hub.refuse_with.lock().unwrap() = Some(
+        "ERR HTTP 422 provenance_rejected: this push puts a withdrawn session on a branch; restore the session before publishing it again\n",
+    );
+    let refused = run(&["--yes", "push", "alice/app@big"], true);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        text(&refused).contains("alice/app@big builds on a session withdrawn on the Hub"),
+        "{refused:?}"
+    );
+    assert!(
+        text(&refused).contains("no branch or tag refs were updated"),
+        "{refused:?}"
+    );
+    turn("big turn 6");
+    let previews = hub.previews.lock().unwrap().len();
+    let left_out = run(&["--yes", "push", "alice/app@big"], true);
+    assert!(!left_out.status.success(), "{left_out:?}");
+    assert_eq!(hub.previews.lock().unwrap().len(), previews);
+    let restored = turn("big turn 7");
+    assert_success(&run(&["--yes", "push", "alice/app@big"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), restored);
+    let after = turn("big turn 8");
+    assert_success(&run(&["--yes", "push", "alice/app@big"], true));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), after);
 }
 
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.

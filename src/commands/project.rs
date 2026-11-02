@@ -802,6 +802,7 @@ pub(crate) enum UploadFailure {
     Hub,
     PrivacyIncomplete,
     TooLarge,
+    BuildsOnWithdrawn,
     Other,
 }
 
@@ -812,6 +813,9 @@ impl UploadFailure {
             .find_map(|cause| cause.downcast_ref::<ChildFailed>());
         if failed.is_some_and(|failed| failed.message.contains(super::push::OVERSIZED)) {
             return Self::TooLarge;
+        }
+        if failed.is_some_and(|failed| failed.message.contains(super::push::BUILDS_ON_WITHDRAWN)) {
+            return Self::BuildsOnWithdrawn;
         }
         match failed.and_then(|failed| failed.exit_code) {
             Some(code) if code == ExitCode::Auth.as_i32() => Self::SignedOut,
@@ -829,6 +833,9 @@ impl UploadFailure {
             Self::PrivacyIncomplete => "its privacy check did not complete",
             Self::TooLarge => {
                 "the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again"
+            }
+            Self::BuildsOnWithdrawn => {
+                "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
             Self::Other => "it could not be completed on this computer",
         }
