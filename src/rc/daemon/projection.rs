@@ -480,32 +480,7 @@ impl Daemon {
         }
         require_same_workspace(caller, session_id, &live.info.workspace_id)?;
         if let Some(source) = &live.info.native_source {
-            let context = crate::rc::runtime_sources::Registry::open()
-                .and_then(|registry| {
-                    crate::rc::runtime_context::RuntimeContext::resolve(
-                        &registry,
-                        &source.source_id,
-                    )
-                })
-                .map_err(source_sessions::unavailable)?;
-            // Resolution refuses a removed or replaced store. A generation bump alone (re-enabling
-            // the same home) leaves this connection's transcripts and their capture intact.
-            let native = live
-                .runtime_thread_id
-                .as_deref()
-                .ok_or_else(|| source_sessions::unavailable("native binding is unavailable"))?;
-            let thread = context
-                .locate_ready(native, &self.mirror.roots(&caller.workspace_id))
-                .map_err(source_sessions::locate_failed)?;
-            if self
-                .roster
-                .get(session_id)
-                .is_some_and(|entry| std::path::Path::new(&entry.cwd) != thread.cwd)
-            {
-                return Err(source_sessions::unavailable(
-                    "native conversation directory changed",
-                ));
-            }
+            let (context, thread) = self.source_thread(session_id, live, source, caller)?;
             if need == Need::Drive && !caller.is_owner() {
                 let current = context.current_mode(&thread).ok().flatten();
                 danger::require_native_mode_held(caller, live.admitted_mode, current)?;
@@ -527,6 +502,79 @@ impl Daemon {
             tx: live.tx.clone(),
             runtime: live.info.runtime.clone(),
         })
+    }
+
+    /// The native thread behind a live session of a native source, located now.
+    fn source_thread(
+        &self,
+        session_id: &str,
+        live: &Live,
+        source: &crate::protocol::NativeSourceRef,
+        caller: &crate::protocol::CallerClaim,
+    ) -> Result<
+        (
+            crate::rc::runtime_context::RuntimeContext,
+            crate::rc::runtime_context::LocatedThread,
+        ),
+        RpcError,
+    > {
+        let context = crate::rc::runtime_sources::Registry::open()
+            .and_then(|registry| {
+                crate::rc::runtime_context::RuntimeContext::resolve(&registry, &source.source_id)
+            })
+            .map_err(source_sessions::unavailable)?;
+        // Resolution refuses a removed or replaced store. A generation bump alone (re-enabling
+        // the same home) leaves this connection's transcripts and their capture intact.
+        let native = live
+            .runtime_thread_id
+            .as_deref()
+            .ok_or_else(|| source_sessions::unavailable("native binding is unavailable"))?;
+        let thread = context
+            .locate_ready(native, &self.mirror.roots(&caller.workspace_id))
+            .map_err(source_sessions::locate_failed)?;
+        if self
+            .roster
+            .get(session_id)
+            .is_some_and(|entry| std::path::Path::new(&entry.cwd) != thread.cwd)
+        {
+            return Err(source_sessions::unavailable(
+                "native conversation directory changed",
+            ));
+        }
+        Ok((context, thread))
+    }
+
+    /// Holds a non-owner's words to a turn that runs in Default or Plan (`rc::turn_mode`), read
+    /// at the RPC: for a steer the running turn's mode, for a start the mode the next turn starts
+    /// in (a queued mode, else the current one). A thread of a native source is read from its
+    /// Codex index now, as #288 reads it; any other session from the mode its driver last
+    /// confirmed. The supervisor asks again against the driver when it delivers. The owner is
+    /// never held.
+    pub(super) fn require_turn_mode(
+        &self,
+        session_id: &str,
+        caller: &crate::protocol::CallerClaim,
+        input: TurnInput,
+    ) -> Result<(), RpcError> {
+        if caller.is_owner() {
+            return Ok(());
+        }
+        let live = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| no_such_session(session_id))?;
+        let current = match &live.info.native_source {
+            Some(source) => {
+                let (context, thread) = self.source_thread(session_id, live, source, caller)?;
+                context.current_mode(&thread).ok().flatten()
+            }
+            None => live.info.permission_mode,
+        };
+        let mode = match input {
+            TurnInput::Start => live.pending_mode.or(current),
+            TurnInput::Steer => current,
+        };
+        crate::rc::turn_mode::require(false, mode).map_err(|refused| refused.rpc_error())
     }
 
     /// A live session **of this workspace**, found by harness thread id or by

@@ -2010,7 +2010,8 @@ impl Session {
             }
             TurnStartOutcome::RetryableNotAccepted { .. }
             | TurnStartOutcome::ConcurrentNotAccepted { .. }
-            | TurnStartOutcome::SharedUnknown { .. } => {}
+            | TurnStartOutcome::SharedUnknown { .. }
+            | TurnStartOutcome::ModeOwnerOnly { .. } => {}
             TurnStartOutcome::FatalNotAccepted { message } => {
                 // Request-id exhaustion is known to precede native I/O, but
                 // this generation can never allocate another unique id. Retire

@@ -1056,6 +1056,23 @@ impl CodexDriver {
         self.mode
     }
 
+    /// The mode a turn runs in, read now: a queued mode for a start, else the thread's. A thread
+    /// of a native source is read from its Codex index, as `RuntimeContext::current_mode` does,
+    /// since a native client may change it without this driver seeing; `None` when it cannot be
+    /// read.
+    pub(super) fn turn_mode(&self, start: bool) -> Option<PermissionMode> {
+        let queued = start.then_some(self.pending_mode).flatten();
+        let Some(source) = &self.source else {
+            return Some(queued.unwrap_or(self.mode));
+        };
+        if queued.is_some() {
+            return queued;
+        }
+        let thread = self.thread_id.as_deref()?;
+        let transcript = self.transcript_path()?;
+        crate::rc::native_settings::current_codex_mode_in(source.home(), &transcript, thread)
+    }
+
     fn outcome_after_turn_response_loss(
         &mut self,
         pending: PendingTurnStart,
@@ -1542,6 +1559,7 @@ impl CodexDriver {
                 | TurnStartOutcome::FatalNotAccepted { .. }
                 | TurnStartOutcome::Unknown { .. }
                 | TurnStartOutcome::SharedUnknown { .. }
+                | TurnStartOutcome::ModeOwnerOnly { .. }
                 | TurnStartOutcome::NativeSubmission { .. } => {}
             }
             return Some(HarnessEvent::TurnStartResolved(outcome));
@@ -2125,6 +2143,11 @@ impl CodexDriver {
     #[cfg(test)]
     pub(crate) fn exhaust_test_request_ids(&mut self) {
         self.next_id = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_mode_unknown(&mut self) {
+        self.native_mode_unknown = true;
     }
 
     #[cfg(test)]

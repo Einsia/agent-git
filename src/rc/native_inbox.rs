@@ -200,6 +200,18 @@ impl Prepared {
                 &self.request.session_id,
                 &self.cwd,
             )?;
+        } else if !self.allow_dangerous {
+            // Read again at delivery: the mode may have changed since the message was prepared.
+            let current = match &self.native {
+                Native::Claude(_) => None,
+                Native::Codex(_) => super::native_settings::current_local_codex_mode(
+                    &self.transcript,
+                    &self.request.session_id,
+                ),
+            };
+            if let Err(refused) = super::turn_mode::require(false, current) {
+                return Err(refused.rpc_error().into());
+            }
         }
         Ok(())
     }
@@ -528,12 +540,13 @@ mod tests {
 
     /// A Claude Code session running in another process receives the message through its own
     /// socket, so that process stays the only transcript writer. This pins the exact frames, one
-    /// delivery per client message id, that a non-owner's message goes out under the peer token
-    /// even while a relay runs, that the owner's goes through the relay under the session's own
-    /// token, that a held lock which no relay acts on falls back to the peer token, and that a
-    /// transcript which ever bypassed permission checks takes messages only from the owner.
-    /// Resending on retry, queueing a non-owner's message where a relay sends it as the session,
-    /// counting a held lock as delivery, or judging only a later mode each fails here.
+    /// delivery per client message id, that the owner's message goes through the relay under the
+    /// session's own token, that a held lock which no relay acts on falls back to the peer token,
+    /// and that a non-owner's message is refused `mode_owner_only` with nothing sent, whatever the
+    /// transcript records: a terminal can change its mode without recording it, so its mode
+    /// can't be read and the conversation is the owner's (`rc::turn_mode`). Resending on retry,
+    /// counting a held lock as delivery, or sending a non-owner's words into a terminal whose mode
+    /// is unknown each fails here.
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_sessions_get_each_message_once_and_bypass_history_needs_the_owner() {
@@ -585,11 +598,27 @@ mod tests {
             ]
         };
 
+        let not_sent = |error: anyhow::Error| {
+            let error = error.downcast::<crate::protocol::RpcError>().unwrap();
+            assert_eq!(error.code, crate::protocol::ErrorCode::Forbidden as i32);
+            assert_eq!(error.data.as_ref().unwrap()["reason"], "mode_owner_only");
+            assert_eq!(error.data.as_ref().unwrap()["outcome"], "not_sent");
+        };
+        // The transcript records Default, but nothing shows the terminal still runs in it.
+        not_sent(
+            send(&uuid::Uuid::new_v4().to_string(), false)
+                .await
+                .unwrap_err(),
+        );
         let first = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&first, false).await.unwrap()["status"], "queued");
-        assert_eq!(next(&mut connections).await, frames(&first, peer));
+        assert_eq!(send(&first, true).await.unwrap()["status"], "queued");
+        assert_eq!(
+            next(&mut connections).await,
+            frames(&first, peer),
+            "the refused message never reached the terminal"
+        );
         // The retry answers from its receipt; the next connection belongs to a later message.
-        assert_eq!(send(&first, false).await.unwrap()["status"], "queued");
+        assert_eq!(send(&first, true).await.unwrap()["status"], "queued");
 
         let child = "0123456789abcdef0123456789abcdef";
         let relay = fixture::relay(&registry, &queue, &session, &socket, child);
@@ -601,12 +630,10 @@ mod tests {
         })
         .await
         .expect("the relay starts");
-        let peers = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&peers, false).await.unwrap()["status"], "queued");
-        assert_eq!(
-            next(&mut connections).await,
-            frames(&peers, peer),
-            "a non-owner's message never passes through the relay"
+        not_sent(
+            send(&uuid::Uuid::new_v4().to_string(), false)
+                .await
+                .unwrap_err(),
         );
         let owners = uuid::Uuid::new_v4().to_string();
         assert_eq!(send(&owners, true).await.unwrap()["status"], "queued");
@@ -645,15 +672,10 @@ mod tests {
             json!({"type":"permission-mode","permissionMode":"default","sessionId":session})
         )
         .unwrap();
-        let refused = send(&uuid::Uuid::new_v4().to_string(), false)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            refused
-                .downcast_ref::<crate::protocol::RpcError>()
-                .unwrap()
-                .code,
-            crate::protocol::ErrorCode::DangerousSessionLocked as i32
+        not_sent(
+            send(&uuid::Uuid::new_v4().to_string(), false)
+                .await
+                .unwrap_err(),
         );
         let owner = uuid::Uuid::new_v4().to_string();
         assert_eq!(send(&owner, true).await.unwrap()["status"], "queued");

@@ -1321,6 +1321,16 @@ fn project_turn_start_outcome(
                 "the harness explicitly rejected the turn; no prompt or queued mode was applied",
             )),
         ),
+        TurnStartOutcome::ModeOwnerOnly { mode } => (
+            SessionRpcCompletion::Turn {
+                guard_attempt,
+                accepted_mode: None,
+                confirmation: None,
+                fail_closed: false,
+                retire_generation: false,
+            },
+            Err(crate::rc::turn_mode::ModeOwnerOnly { mode }.rpc_error()),
+        ),
         TurnStartOutcome::RetryableNotAccepted { message } => (
             SessionRpcCompletion::Turn {
                 guard_attempt,
@@ -1940,6 +1950,12 @@ fn map_receipt<T>(
 ) -> Result<T, RpcError> {
     match got {
         Ok(Ok(value)) => Ok(value),
+        Ok(Err(ref error)) if error.is::<crate::rc::turn_mode::ModeOwnerOnly>() => Err(error
+            .downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>()
+            .map_or_else(
+                || RpcError::new(ErrorCode::Internal, error.to_string()),
+                |refused| refused.rpc_error(),
+            )),
         Ok(Err(error)) if error.is::<crate::rc::harness::TurnNotRunning>() => {
             let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
@@ -2166,6 +2182,15 @@ enum Need {
     Brake,
     /// Send a message, steer, allow an approval. Also passes the danger gate.
     Drive,
+}
+
+/// Which turn a non-owner's words would enter, for `Daemon::require_turn_mode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnInput {
+    /// A new turn, or a message queued for one: it runs in the mode the next turn starts in.
+    Start,
+    /// The running turn: it runs in that turn's mode now.
+    Steer,
 }
 
 /// The hub's `agent` / `branch` → one **validated** lineage.

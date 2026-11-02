@@ -90,14 +90,28 @@ impl<T> Ticket<T> {
         self
     }
 
-    pub(crate) fn check_control(&self, requires_owner: bool) -> crate::Result<()> {
+    /// The request's authority still admits it.
+    pub(crate) fn check_authority(&self) -> crate::Result<()> {
         self.authority
             .check()
-            .map_err(|error| anyhow::anyhow!(error.message))?;
+            .map_err(|error| anyhow::anyhow!(error.message))
+    }
+
+    pub(crate) fn check_control(&self, requires_owner: bool) -> crate::Result<()> {
+        self.check_authority()?;
         anyhow::ensure!(
             !requires_owner || self.owner_control,
             "native permissions changed; this instruction requires workspace owner access"
         );
+        Ok(())
+    }
+
+    /// A non-owner's words enter only a turn that runs in Default or Plan (`rc::turn_mode`).
+    pub(crate) fn check_turn_mode(
+        &self,
+        mode: Option<crate::protocol::PermissionMode>,
+    ) -> crate::Result<()> {
+        super::turn_mode::require(self.owner_control, mode)?;
         Ok(())
     }
 

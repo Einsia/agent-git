@@ -150,6 +150,7 @@ impl Daemon {
                     .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
                 require_same_workspace(&caller, &session_id, &request.workspace_id)?;
                 let d = self.session_channel(&session_id, &caller, Need::Drive)?;
+                self.require_turn_mode(&session_id, &caller, TurnInput::Start)?;
                 let source = live.info.native_source.clone().ok_or_else(|| {
                     RpcError::new(
                         ErrorCode::RuntimeUnavailable,
@@ -268,6 +269,7 @@ impl Daemon {
                 let p: TurnStart = f.params_as()?;
                 // `Drive`: adding model input spends the session's capability.
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                self.require_turn_mode(&p.session_id, &caller, TurnInput::Start)?;
                 // Arm before the command can enter the supervisor queue. From
                 // this point through native write, notification inference, and
                 // a late exact response, every crash restarts as Plan until
@@ -296,6 +298,7 @@ impl Daemon {
             method::TURN_STEER => {
                 let p: TurnSteer = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                self.require_turn_mode(&p.session_id, &caller, TurnInput::Steer)?;
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Steer {

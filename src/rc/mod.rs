@@ -114,6 +114,7 @@ pub mod tail;
 pub mod terminal;
 pub mod ticket;
 pub mod tunnel;
+pub(crate) mod turn_mode;
 #[cfg(windows)]
 pub(crate) mod windows_job;
 pub(crate) mod writer_release;

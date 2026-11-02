@@ -1381,8 +1381,35 @@ impl ClaudeCodeDriver {
 
     #[cfg(test)]
     pub(crate) fn test_driver() -> ClaudeCodeDriver {
+        Self::test_driver_on(
+            Proc::spawn("cat", &[], &PathBuf::from("/"), &[]).expect("test process"),
+        )
+    }
+
+    /// A test driver whose every line written to Claude Code is appended to `path`, and nothing
+    /// comes back, so a supervisor running it cannot consume what it wrote.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_driver_recording(path: &std::path::Path) -> ClaudeCodeDriver {
+        Self::test_driver_on(
+            Proc::spawn(
+                "sh",
+                &["-c".into(), format!("cat >> '{}'", path.display())],
+                &PathBuf::from("/"),
+                &[],
+            )
+            .expect("test process"),
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_test_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
+    #[cfg(test)]
+    fn test_driver_on(proc: Proc) -> ClaudeCodeDriver {
         ClaudeCodeDriver {
-            proc: Proc::spawn("cat", &[], &PathBuf::from("/"), &[]).expect("test process"),
+            proc,
             session_id: "test-session".into(),
             cwd: PathBuf::from("/"),
             current_turn: Some("test-turn".into()),
