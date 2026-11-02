@@ -755,6 +755,16 @@ impl Outcome {
         )
     }
 
+    /// Whether the Hub refused this push because a ref it sets would serve a session withdrawn
+    /// there: built on, or merged with, that session's history. The refusal stands until the
+    /// session is restored on the Hub.
+    pub fn builds_on_withdrawn(&self) -> bool {
+        self.refusal_kind() == Some("provenance_rejected")
+            && self
+                .stderr
+                .contains("this push puts a withdrawn session on a branch")
+    }
+
     /// The most event entries the Hub reads in one session snapshot, when it refused this push
     /// because a snapshot holds more. A session keeps its events as it goes on, so its later
     /// snapshots meet the same refusal until its events shrink or the Hub raises the limit.

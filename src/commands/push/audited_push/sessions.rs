@@ -928,6 +928,52 @@ pub(super) fn run(
                 return Ok(ExitCode::Policy);
             }
         }
+        // The Hub names no ref when it refuses a push for building on a withdrawn session, so the
+        // branch is set aside only when it is the part's one session branch, as an automatic push's
+        // is. Recorded as the Hub's withdrawn refs are, it stays out of automatic pushes until a
+        // push the person names is accepted.
+        let sessions: Vec<&String> = part_branches
+            .iter()
+            .filter(|branch| *branch != "main")
+            .collect();
+        if let [branch] = sessions[..]
+            && [&report.heads, &report.tags]
+                .into_iter()
+                .flatten()
+                .flat_map(|phase| &phase.attempts)
+                .any(|attempt| attempt.outcome.builds_on_withdrawn())
+        {
+            crate::domain::privacy_git::withhold_refs(
+                &repo,
+                &identity,
+                &[format!("refs/heads/{branch}")],
+            )
+            .map_err(|error| {
+                inconsistent(
+                    error,
+                    format!("the Hub refused {target} for building on a withdrawn session, but agit could not record it, so the next automatic push uploads it again"),
+                )
+            })?;
+            if in_parts {
+                ui::error(&format!(
+                    "part {part} of {total} did not complete; {published} parts before it are published"
+                ));
+            }
+            ui::error(&format!(
+                "{repository}@{branch} {}, so the Hub refused it",
+                crate::commands::push::BUILDS_ON_WITHDRAWN
+            ));
+            #[cfg(windows)]
+            use crate::ui::quote_powershell_argument as quote_arg;
+            #[cfg(not(windows))]
+            use crate::ui::session::shell_arg as quote_arg;
+            ui::hint(&format!(
+                "it stays in this checkout and automatic uploads leave it out; once that session is restored on the Hub, `agit push {}` publishes it",
+                quote_arg(&format!("{slug}@{branch}"))
+            ));
+            ui::error(&publication_recovery(&report, &retry_command, &repository));
+            return Ok(ExitCode::Policy);
+        }
         let withdrawn: Vec<String> = [&report.heads, &report.tags]
             .into_iter()
             .flatten()

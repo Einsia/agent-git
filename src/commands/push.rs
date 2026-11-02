@@ -508,6 +508,10 @@ fn acknowledged_unchanged(
 /// in a failed child's message to tell the person why, so it is one fixed phrase.
 pub(crate) const OVERSIZED: &str = "holds more event entries than the Hub accepts";
 
+/// How a push says that a session branch builds on a session withdrawn on the Hub, read by
+/// project capture as [`OVERSIZED`] is.
+pub(crate) const BUILDS_ON_WITHDRAWN: &str = "builds on a session withdrawn on the Hub";
+
 /// Branches one publication carries. A publication's fixed cost (destination checks, the ref
 /// advertisement, snapshot planning) is paid once per publication, so many branches share one.
 /// The plan's head limit also counts `main` and branches a selection carries, so a group stays
