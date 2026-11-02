@@ -560,6 +560,7 @@ struct Projector<'a> {
     /// OpenCode emits parts separately from their parent message.  Keep the native role
     /// association so a reasoning part cannot create a synthetic user turn.
     message_roles: BTreeMap<(String, String, String), String>,
+    codex_agents: BTreeMap<String, Option<String>>,
 }
 
 /// Freeze and project a complete LOG/VIEW pair. VIEW membership is preserved by transforming
@@ -798,6 +799,7 @@ impl<'a> Projector<'a> {
             reporting: true,
             used_aliases: BTreeSet::new(),
             message_roles: BTreeMap::new(),
+            codex_agents: BTreeMap::new(),
         })
     }
 }
@@ -907,6 +909,13 @@ impl Projector<'_> {
 
     fn remember_native_role(&mut self, record: &Envelope) {
         let value = &record.content;
+        if record.source == "codex" && value["type"] == "session_meta" {
+            self.codex_agents
+                .entry(record.session_id.clone())
+                .or_insert_with(|| {
+                    crate::adapter::codex::conversation_agent_path(value).map(str::to_owned)
+                });
+        }
         let (id, role) = match record.source.as_str() {
             "opencode" if value["kind"] == "message" => {
                 (value["id"].as_str(), value["data"]["role"].as_str())
@@ -959,6 +968,14 @@ impl Projector<'_> {
                             blocks,
                         ))
                     }
+                    Some("agent_message") => crate::adapter::codex::classify_response_message_for(
+                        payload,
+                        self.codex_agents
+                            .get(&record.session_id)
+                            .and_then(|path| path.as_deref()),
+                    )
+                    .filter(|(kind, _)| *kind != crate::adapter::EventKind::Other)
+                    .map(|(_, text)| ("user".into(), vec![json!({"type":"text", "text":text})])),
                     Some("reasoning") => Some((
                         "assistant".into(),
                         vec![reasoning_block(&codex_reasoning_text(payload))],
@@ -1174,7 +1191,13 @@ impl Projector<'_> {
                 true,
             ));
         };
-        let codex_internal = record.source == "codex" && codex_user_message_is_internal(value);
+        let codex_internal = record.source == "codex"
+            && codex_message_is_internal(
+                value,
+                self.codex_agents
+                    .get(&record.session_id)
+                    .and_then(|path| path.as_deref()),
+            );
         let mut output = Vec::new();
         for (block_index, block) in blocks.into_iter().enumerate() {
             let projected = match block["type"].as_str() {
@@ -1825,11 +1848,17 @@ fn with_native_classification(mut output: Value, source: &Value, internal: bool)
     output
 }
 
-fn codex_user_message_is_internal(value: &Value) -> bool {
-    if value["type"] != "response_item"
-        || value["payload"]["type"] != "message"
-        || value["payload"]["role"] != "user"
-    {
+fn codex_message_is_internal(value: &Value, agent_path: Option<&str>) -> bool {
+    if value["type"] != "response_item" {
+        return false;
+    }
+    if value["payload"]["type"] == "agent_message" {
+        // Public messages have no interjection marker. Keeping peer context as metadata
+        // preserves its text without opening a turn; the original retains its native kind.
+        return crate::adapter::codex::classify_response_message_for(&value["payload"], agent_path)
+            .is_none_or(|(kind, _)| kind != crate::adapter::EventKind::UserPrompt);
+    }
+    if value["payload"]["type"] != "message" || value["payload"]["role"] != "user" {
         return false;
     }
     let Some(blocks) = value["payload"]["content"].as_array() else {
@@ -2729,8 +2758,8 @@ mod tests {
         );
     }
 
-    /// Environment markup stays intact without claiming file aliases; paths beside markup
-    /// stay private and the environment record does not become a conversational turn.
+    /// Environment markup stays intact without claiming file aliases. Delegated tasks open
+    /// turns, peer updates do not, and opaque task bodies remain only in recoverable originals.
     #[test]
     fn projected_codex_environment_preserves_markup_paths_and_turns() {
         let session = format!("agit-{}", "a".repeat(40));
@@ -2745,8 +2774,18 @@ mod tests {
             "</environment_context>",
         );
         let raw = [
+            json!({"type":"session_meta","payload":{"id":"worker","agent_path":"worker","source":{"subagent":{"thread_spawn":{"agent_path":"worker"}}}}}),
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":context}]}}),
-            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the project"}]}}),
+            json!({"type":"response_item","payload":{"type":"agent_message","author":"parent","recipient":"worker","content":[
+                {"type":"input_text","text":"Message Type: NEW_TASK\nTask name: worker\nSender: parent\nPayload:\ninspect the project"},
+                {"type":"encrypted_content","encrypted_content":"opaque-delegated-task"}
+            ]}}),
+            json!({"type":"response_item","payload":{"type":"agent_message","author":"peer","recipient":"worker","content":[
+                {"type":"input_text","text":"Message Type: MESSAGE\nPayload:\nKeep the public interface"}
+            ]}}),
+            json!({"type":"response_item","payload":{"type":"agent_message","author":"peer","recipient":"worker","content":[
+                {"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload:\nThe dependency is ready"}
+            ]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}),
         ]
         .into_iter()
@@ -2784,7 +2823,7 @@ mod tests {
         let public = transcript::display::parse(projection.log()).unwrap();
         let records = storage::parse_envelopes(projection.log()).unwrap();
         assert_eq!(
-            records[0].content["message"]["content"][0]["text"],
+            records[1].content["message"]["content"][0]["text"],
             context
                 .replace("/private/project", "<private-file-1>")
                 .replace("Paths: /cwd", "Paths: <private-file-2>")
@@ -2803,6 +2842,14 @@ mod tests {
 
         assert_eq!(crate::domain::turn::groups_of(&original).len(), 1);
         assert_eq!(crate::domain::turn::groups_of(&public).len(), 1);
+        assert!(projection.log().contains("inspect the project"));
+        assert!(projection.log().contains("Keep the public interface"));
+        assert!(projection.log().contains("The dependency is ready"));
+        assert!(!projection.log().contains("opaque-delegated-task"));
+        assert_eq!(projection.report.omissions.len(), 1);
+        let (private_log, private_view) = projection.private.session_bytes().unwrap();
+        assert_eq!(private_log.as_str(), log);
+        assert_eq!(private_view.as_str(), log);
         assert_eq!(
             public
                 .events
@@ -2811,7 +2858,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 crate::adapter::EventKind::Other,
+                crate::adapter::EventKind::Other,
                 crate::adapter::EventKind::UserPrompt,
+                crate::adapter::EventKind::Other,
+                crate::adapter::EventKind::Other,
                 crate::adapter::EventKind::AssistantReply,
             ]
         );

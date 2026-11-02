@@ -2,6 +2,189 @@
 
 use serde_json::Value;
 
+/// Native structural names stay addressable; unknown members and tool payload keys are data.
+#[cfg(feature = "secret-vault")]
+pub(crate) const NATIVE_MEMBER_NAMES: &[&str] = &[
+    "type",
+    "kind",
+    "id",
+    "_session_id",
+    "_source",
+    "_object_hash",
+    "session_id",
+    "sessionId",
+    "event_id",
+    "uuid",
+    "parentUuid",
+    "parentId",
+    "parent_id",
+    "parentID",
+    "object_hash",
+    "commit_id",
+    "tree_id",
+    "blob_id",
+    "ref_name",
+    "schema_version",
+    "layout_version",
+    "projection_version",
+    "created_at",
+    "updated_at",
+    "timestamp",
+    "provenance",
+    "message",
+    "payload",
+    "data",
+    "role",
+    "content",
+    "name",
+    "input",
+    "arguments",
+    "output",
+    "result",
+    "tool_calls",
+    "function",
+    "tool_call_id",
+    "call_id",
+    "callId",
+    "tool_use_id",
+    "toolCallId",
+    "callID",
+    "signature",
+    "encrypted_content",
+    "text",
+    "thinking",
+    "summary",
+    "is_error",
+    "isError",
+    "cwd",
+    "model",
+    "usage",
+    "stop_reason",
+    "stop_sequence",
+    "isSidechain",
+    "requestId",
+    "state",
+    "item",
+    "replacement_history",
+    "turn_id",
+    "item_id",
+    "client_id",
+    "history_base",
+    "thread_id",
+    "forked_from_id",
+    "parent_session_id",
+    "parent_thread_id",
+    "thread_source",
+    "source",
+    "subagent",
+    "thread_spawn",
+    "agent_path",
+    "firstKeptEntryId",
+    "fromId",
+    "targetId",
+    "appendParentId",
+    "project_id",
+    "message_id",
+    "messageID",
+    "tail_start_id",
+    "sessionID",
+];
+
+/// Only a schema-owned result container identifies content blocks. A tool's ordinary maps
+/// remain data even when their fields resemble a native record or an attachment.
+#[cfg(feature = "secret-vault")]
+#[derive(Clone, Copy)]
+pub(crate) enum KeyContext {
+    Native,
+    Data,
+    Content,
+    Source,
+}
+
+#[cfg(feature = "secret-vault")]
+impl KeyContext {
+    pub(crate) fn schema_fields(
+        self,
+        object: &serde_json::Map<String, Value>,
+    ) -> &'static [&'static str] {
+        match self {
+            Self::Native => NATIVE_MEMBER_NAMES,
+            Self::Data => &[],
+            Self::Source => &[
+                "type",
+                "encoding",
+                "media_type",
+                "mimeType",
+                "mime_type",
+                "data",
+                "text",
+                "url",
+                "uri",
+                "blob",
+                "format",
+            ],
+            Self::Content => match object.get("type").and_then(Value::as_str) {
+                Some("tool_use" | "server_tool_use" | "toolCall") => {
+                    &["type", "id", "name", "input", "arguments"]
+                }
+                Some("tool_result" | "toolResult") => &[
+                    "type",
+                    "tool_use_id",
+                    "toolCallId",
+                    "content",
+                    "is_error",
+                    "isError",
+                    "structuredContent",
+                ],
+                Some("thinking" | "reasoning" | "redacted_thinking" | "encrypted_content") => &[
+                    "type",
+                    "thinking",
+                    "text",
+                    "signature",
+                    "data",
+                    "encrypted_content",
+                ],
+                Some("text" | "input_text" | "output_text")
+                    if object.get("text").is_some_and(Value::is_string) =>
+                {
+                    &["type", "text", "annotations", "citations"]
+                }
+                Some(
+                    "image" | "input_image" | "output_image" | "document" | "file" | "input_file"
+                    | "audio" | "input_audio" | "output_audio" | "video" | "resource"
+                    | "resource_link" | "blob" | "base64",
+                ) => &[
+                    "type",
+                    "source",
+                    "data",
+                    "mimeType",
+                    "mime_type",
+                    "media_type",
+                    "resource",
+                    "url",
+                    "uri",
+                    "name",
+                    "title",
+                    "description",
+                    "size",
+                    "text",
+                    "blob",
+                    "file",
+                    "file_data",
+                    "file_id",
+                    "image_url",
+                    "video_url",
+                    "file_url",
+                    "audio",
+                    "input_audio",
+                    "annotations",
+                ],
+                _ => &[],
+            },
+        }
+    }
+}
+
 pub(crate) fn identifier_shape(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 256
@@ -79,8 +262,13 @@ pub(crate) struct Field {
 
 #[derive(Default)]
 pub(crate) struct Layout {
+    pub schema: bool,
     pub fields: Vec<Field>,
     pub encoded: Vec<(String, Layout)>,
+    /// Structured payloads own their member names; native schema objects do not.
+    pub data: Vec<String>,
+    /// Tool results can mix ordinary maps with native text and attachment blocks.
+    pub content: Vec<String>,
     /// Runtime-opaque carriers (reasoning signatures and encrypted reasoning). A runtime
     /// verifies them byte for byte on resume and no reader displays them, so privacy
     /// replacement never rewrites them.
@@ -89,6 +277,7 @@ pub(crate) struct Layout {
 
 impl Layout {
     fn field(&mut self, pointer: impl Into<String>, kind: Kind) {
+        self.schema = true;
         self.fields.push(Field {
             pointer: pointer.into(),
             kind,
@@ -96,6 +285,11 @@ impl Layout {
     }
 
     fn codex_item(&mut self, item: &Value, path: &str) {
+        self.schema = true;
+        for field in ["arguments", "input"] {
+            self.data.push(format!("{path}/{field}"));
+        }
+        self.content.push(format!("{path}/output"));
         match item["type"].as_str() {
             Some(
                 "function_call"
@@ -110,6 +304,7 @@ impl Layout {
             }
             Some(
                 "message"
+                | "agent_message"
                 | "reasoning"
                 | "web_search_call"
                 | "computer_call"
@@ -127,6 +322,16 @@ impl Layout {
         if item["encrypted_content"].is_string() {
             self.opaque.push(format!("{path}/encrypted_content"));
         }
+        if item["type"] == "agent_message"
+            && let Some(blocks) = item["content"].as_array()
+        {
+            for (index, block) in blocks.iter().enumerate() {
+                if block["type"] == "encrypted_content" {
+                    self.opaque
+                        .push(format!("{path}/content/{index}/encrypted_content"));
+                }
+            }
+        }
     }
 
     fn claude_message(&mut self, message: &Value) {
@@ -143,9 +348,20 @@ impl Layout {
                     _ => {}
                 }
                 let field = match (message["role"].as_str(), block["type"].as_str()) {
-                    (Some("assistant"), Some("tool_use" | "server_tool_use")) => "id",
-                    (Some("user"), Some("tool_result")) => "tool_use_id",
+                    (Some("assistant"), Some("tool_use" | "server_tool_use")) => {
+                        self.data.push(format!("/message/content/{index}/input"));
+                        "id"
+                    }
+                    (Some("user"), Some("tool_result")) => {
+                        self.content
+                            .push(format!("/message/content/{index}/content"));
+                        self.data
+                            .push(format!("/message/content/{index}/structuredContent"));
+                        "tool_use_id"
+                    }
                     (Some("assistant"), Some(kind)) if kind.ends_with("_tool_result") => {
+                        self.content
+                            .push(format!("/message/content/{index}/content"));
                         "tool_use_id"
                     }
                     _ => continue,
@@ -161,12 +377,14 @@ impl Layout {
     fn openclaw_message(&mut self, message: &Value, path: &str) {
         if message["role"] == "toolResult" {
             self.field(format!("{path}/toolCallId"), Kind::Call);
+            self.content.push(format!("{path}/content"));
         } else if message["role"] == "assistant"
             && let Some(blocks) = message["content"].as_array()
         {
             for (index, block) in blocks.iter().enumerate() {
                 if block["type"] == "toolCall" {
                     self.field(format!("{path}/content/{index}/id"), Kind::Call);
+                    self.data.push(format!("{path}/content/{index}/arguments"));
                 }
             }
         }
@@ -177,6 +395,7 @@ impl Layout {
             for (index, call) in calls.iter().enumerate() {
                 if call["function"].is_object() {
                     self.field(format!("{path}/{index}/id"), Kind::Call);
+                    self.data.push(format!("{path}/{index}/function/arguments"));
                 }
             }
         }
@@ -213,13 +432,18 @@ pub(crate) fn layout(record: &Value) -> Layout {
     let mut ids = Layout::default();
     match record["type"].as_str() {
         Some("session_meta") if record["payload"].is_object() => {
-            for field in ["id", "session_id", "forked_from_id"] {
+            for field in ["id", "session_id", "forked_from_id", "parent_thread_id"] {
                 ids.field(format!("/payload/{field}"), Kind::Identity);
             }
             ids.field("/payload/history_base/thread_id", Kind::Identity);
+            ids.field(
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                Kind::Identity,
+            );
         }
         Some("response_item") => ids.codex_item(&record["payload"], "/payload"),
         Some("compacted") => {
+            ids.schema = true;
             if let Some(items) = record["payload"]["replacement_history"].as_array() {
                 for (index, item) in items.iter().enumerate() {
                     ids.codex_item(item, &format!("/payload/replacement_history/{index}"));
@@ -256,6 +480,7 @@ pub(crate) fn layout(record: &Value) -> Layout {
             ids.field("/data/session_id", Kind::Identity);
             if record["data"]["role"] == "tool" {
                 ids.field("/data/tool_call_id", Kind::Call);
+                ids.content.push("/data/content".into());
             }
             if record["data"]["role"] == "assistant" {
                 let calls = &record["data"]["tool_calls"];
@@ -274,6 +499,10 @@ pub(crate) fn layout(record: &Value) -> Layout {
             ids.field("/callId", Kind::Call);
             ids.field("/id", Kind::Identity);
             ids.field("/parentId", Kind::Identity);
+            ids.data.push("/arguments".into());
+            for field in ["result", "output"] {
+                ids.content.push(format!("/{field}"));
+            }
         }
         Some("system") if record["sessionId"].is_string() => {
             ids.field("/id", Kind::Identity);
@@ -338,6 +567,10 @@ pub(crate) fn layout(record: &Value) -> Layout {
             ids.field("/data/sessionID", Kind::OpenCodeSession);
             if record["data"]["type"] == "tool" {
                 ids.field("/data/callID", Kind::Call);
+                for field in ["input", "metadata"] {
+                    ids.data.push(format!("/data/state/{field}"));
+                }
+                ids.content.push("/data/state/output".into());
             }
         }
         _ => {}

@@ -5,6 +5,7 @@ use super::detector::placeholder;
 use super::dictionary::{Dictionary, Label, Origin, Record, token_id};
 use super::policy::{Batch, Snapshot, Source};
 use super::storage::Store;
+use crate::adapter::protocol_ids::KeyContext;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::ops::Range;
@@ -253,6 +254,7 @@ pub(crate) fn has_wrapped_carrier(value: &Value) -> bool {
 struct EncodedField {
     range: Range<usize>,
     escapes: Vec<Range<usize>>,
+    media: bool,
 }
 
 fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>> {
@@ -260,10 +262,11 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
         raw: &RawValue,
         value: &Value,
         base: usize,
+        source_data: bool,
         fields: &mut Vec<EncodedField>,
     ) -> crate::Result<()> {
         match value {
-            Value::String(_) => {
+            Value::String(text) => {
                 let start = raw.get().as_ptr() as usize - base;
                 let bytes = raw.get().as_bytes();
                 let mut escapes = Vec::new();
@@ -280,19 +283,21 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
                 fields.push(EncodedField {
                     range: start..start + raw.get().len(),
                     escapes,
+                    media: media_payload(source_data, text),
                 });
             }
             Value::Array(values) => {
                 let raw: Vec<&RawValue> = serde_json::from_str(raw.get())?;
                 for (raw, value) in raw.into_iter().zip(values) {
-                    collect(raw, value, base, fields)?;
+                    collect(raw, value, base, false, fields)?;
                 }
             }
             Value::Object(values) => {
                 let raw: std::collections::BTreeMap<String, &RawValue> =
                     serde_json::from_str(raw.get())?;
+                let source = base64_source(values);
                 for (key, value) in values {
-                    collect(raw[key], value, base, fields)?;
+                    collect(raw[key], value, base, source && key == "data", fields)?;
                 }
             }
             _ => {}
@@ -301,7 +306,7 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
     }
     let raw = serde_json::from_str::<&RawValue>(text)?;
     let mut fields = Vec::new();
-    collect(raw, value, text.as_ptr() as usize, &mut fields)?;
+    collect(raw, value, text.as_ptr() as usize, false, &mut fields)?;
     Ok(fields)
 }
 
@@ -563,6 +568,30 @@ impl Projector {
         preserve_protocol_ids: bool,
     ) {
         let mut retained = Vec::new();
+        if !hydrate {
+            for pointer in layout.data.iter().chain(&layout.content) {
+                let Some(text) = value.pointer(pointer).and_then(Value::as_str) else {
+                    continue;
+                };
+                let next = if let Some(batch) = self.encoded_findings(text, false) {
+                    self.protect_batch(text, batch)
+                } else if let Some(protected) = self.protect_encoded_media(text) {
+                    protected
+                } else {
+                    continue;
+                };
+                outcome.replacements += next.replacements;
+                outcome.unresolved += next.unresolved;
+                if next.status != Status::Complete {
+                    outcome.status = Status::Partial;
+                    outcome.reason = outcome.reason.or(next.reason);
+                }
+                if let Some(field) = value.pointer_mut(pointer) {
+                    retained.push((pointer.as_str(), Value::String(next.content)));
+                    *field = Value::Null;
+                }
+            }
+        }
         for (pointer, nested) in &layout.encoded {
             let Some(mut text) = value
                 .pointer(pointer)
@@ -593,7 +622,27 @@ impl Projector {
                 }
                 continue;
             };
-            if !hydrate && let Some(batch) = self.scan_encoded(&text, &decoded) {
+            let key_batch = if hydrate {
+                None
+            } else {
+                self.encoded_findings(&text, true).or_else(|| {
+                    nested
+                        .data
+                        .iter()
+                        .chain(&nested.content)
+                        .find_map(|pointer| {
+                            decoded
+                                .pointer(pointer)
+                                .and_then(Value::as_str)
+                                .and_then(|text| self.encoded_findings(text, false))
+                        })
+                })
+            };
+            if !hydrate && let Some(mut batch) = self.scan_encoded(&text, &decoded).or(key_batch) {
+                for finding in &mut batch.findings {
+                    finding.start = 0;
+                    finding.end = text.len();
+                }
                 let next = self.protect_batch(&text, batch);
                 outcome.replacements += next.replacements;
                 outcome.unresolved += next.unresolved;
@@ -670,6 +719,201 @@ impl Projector {
             if let Some(field) = value.pointer_mut(pointer) {
                 *field = original;
             }
+        }
+        if layout.schema {
+            let mut payloads = Vec::new();
+            for (pointers, context) in [
+                (&layout.data, KeyContext::Data),
+                (&layout.content, KeyContext::Content),
+            ] {
+                for pointer in pointers {
+                    if let Some(data) = value.pointer_mut(pointer) {
+                        self.data_keys(data, hydrate, outcome, context);
+                        payloads.push((pointer, data.take()));
+                    }
+                }
+            }
+            self.data_keys(value, hydrate, outcome, KeyContext::Native);
+            for (pointer, data) in payloads {
+                if let Some(field) = value.pointer_mut(pointer) {
+                    *field = data;
+                }
+            }
+        } else {
+            self.data_keys(value, hydrate, outcome, KeyContext::Data);
+        }
+    }
+
+    /// Escaped JSON payloads retain their exact spelling for native continuation. A decoded
+    /// secret makes the carrier opaque before any value replacement, so quotes, backslashes
+    /// and whitespace restore byte for byte instead of being serialized anew.
+    fn encoded_findings(&self, text: &str, keys_only: bool) -> Option<Batch> {
+        fn find(
+            projector: &Projector,
+            value: &Value,
+            field: Option<&str>,
+            source: bool,
+            keys_only: bool,
+        ) -> Option<Batch> {
+            match value {
+                Value::Object(values) => {
+                    let source = base64_source(values);
+                    for (key, value) in values {
+                        let batch = projector.policy.scan(key, MAX_FINDINGS);
+                        if !batch.complete || !batch.findings.is_empty() {
+                            return Some(batch);
+                        }
+                        if let Some(batch) = find(projector, value, Some(key), source, keys_only) {
+                            return Some(batch);
+                        }
+                    }
+                    None
+                }
+                Value::Array(values) => values
+                    .iter()
+                    .find_map(|value| find(projector, value, None, false, keys_only)),
+                Value::String(text)
+                    if !keys_only && !media_payload(source && field == Some("data"), text) =>
+                {
+                    let batch = projector.field_findings(text, field);
+                    (!batch.complete || !batch.findings.is_empty()).then_some(batch)
+                }
+                _ => None,
+            }
+        }
+        if !text.contains('\\') {
+            return None;
+        }
+        let decoded: Value = serde_json::from_str(text).ok()?;
+        let mut batch = find(self, &decoded, None, false, keys_only)?;
+        if let Some(mut finding) = batch.findings.pop() {
+            finding.start = 0;
+            finding.end = text.len();
+            batch.findings = vec![finding];
+        }
+        Some(batch)
+    }
+
+    /// Binary values inside encoded tool data have the same boundary as decoded source data.
+    /// Discovery masks only their raw spans; projection still uses the original bytes, so a
+    /// replacement elsewhere cannot normalize JSON spelling or store a masked recovery value.
+    fn protect_encoded_media(&mut self, text: &str) -> Option<Outcome> {
+        let decoded: Value = serde_json::from_str(text).ok()?;
+        let media: Vec<_> = encoded_fields(text, &decoded)
+            .ok()?
+            .into_iter()
+            .filter(|field| field.media)
+            .map(|field| field.range.start + 1..field.range.end - 1)
+            .collect();
+        if media.is_empty() {
+            return None;
+        }
+        let mut masked = text.as_bytes().to_vec();
+        for region in &media {
+            masked[region.clone()].fill(b' ');
+        }
+        let masked = String::from_utf8(masked).ok()?;
+        let mut batch = self.field_findings(&masked, None);
+        batch.findings.retain(|finding| {
+            !media
+                .iter()
+                .any(|region| finding.start < region.end && region.start < finding.end)
+        });
+        Some(self.protect_findings(text, batch))
+    }
+
+    /// Payload member names carry data too. Rename only after values have been checked under
+    /// their original field names, and keep the map intact if aliases would merge entries.
+    fn data_keys(
+        &mut self,
+        value: &mut Value,
+        hydrate: bool,
+        outcome: &mut Outcome,
+        context: KeyContext,
+    ) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    self.data_keys(value, hydrate, outcome, context);
+                }
+            }
+            Value::Object(values) => {
+                let schema = context.schema_fields(values);
+                let mut names: std::collections::HashSet<_> = values
+                    .keys()
+                    .filter(|name| schema.contains(&name.as_str()))
+                    .cloned()
+                    .collect();
+                let mut changes = Vec::new();
+                for name in values.keys() {
+                    if schema.contains(&name.as_str()) {
+                        continue;
+                    }
+                    let next = if hydrate {
+                        self.hydrate(name)
+                    } else {
+                        self.protect(name)
+                    };
+                    if !names.insert(next.content.clone()) {
+                        outcome.status = Status::Partial;
+                        outcome.reason = Some(Reason::ProtocolError);
+                        outcome.unresolved += 1;
+                        return;
+                    }
+                    changes.push((name.clone(), next));
+                }
+                let mut renamed = Vec::new();
+                for (name, next) in changes {
+                    outcome.replacements += next.replacements;
+                    outcome.unresolved += next.unresolved;
+                    if next.status != Status::Complete {
+                        outcome.status = Status::Partial;
+                        outcome.reason = outcome.reason.or(next.reason);
+                    }
+                    if name != next.content {
+                        renamed.push((next.content, values.remove(&name).unwrap()));
+                    }
+                }
+                values.extend(renamed);
+                for (name, value) in values {
+                    let nested = match context {
+                        KeyContext::Native
+                            if matches!(
+                                name.as_str(),
+                                "message"
+                                    | "payload"
+                                    | "data"
+                                    | "item"
+                                    | "replacement_history"
+                                    | "tool_calls"
+                                    | "function"
+                                    | "history_base"
+                                    | "state"
+                                    | "source"
+                                    | "subagent"
+                                    | "thread_spawn"
+                            ) =>
+                        {
+                            KeyContext::Native
+                        }
+                        KeyContext::Native if name == "content" => KeyContext::Content,
+                        KeyContext::Content if !schema.is_empty() && name == "content" => {
+                            KeyContext::Content
+                        }
+                        _ if !schema.is_empty()
+                            && matches!(
+                                name.as_str(),
+                                "source" | "resource" | "file" | "audio" | "input_audio"
+                            ) =>
+                        {
+                            KeyContext::Source
+                        }
+                        _ => KeyContext::Data,
+                    };
+                    self.data_keys(value, hydrate, outcome, nested);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -789,6 +1033,11 @@ impl Projector {
     }
 
     fn protect_field(&mut self, text: &str, field: Option<&str>) -> Outcome {
+        let batch = self.field_findings(text, field);
+        self.protect_findings(text, batch)
+    }
+
+    fn field_findings(&self, text: &str, field: Option<&str>) -> Batch {
         // Decoded values keep assignment context without putting JSON escape bytes in a record.
         let prefix = field
             .filter(|field| field.len() <= 128 && field.is_ascii())
@@ -830,7 +1079,7 @@ impl Projector {
                 rule: "credential-assignment",
             }];
         }
-        self.protect_findings(text, batch)
+        batch
     }
 
     /// Protects `text` as the continuation of `context`, text a stream released before it: rules
@@ -1419,6 +1668,129 @@ mod tests {
         );
     }
 
+    /// Schema member names stay addressable without exempting unknown keys on native-shaped
+    /// records. Payload keys and encoded carriers restore exactly, and a colliding rename must
+    /// never silently discard either entry or claim complete protection.
+    #[test]
+    fn payload_keys_restore_without_renaming_schema_or_merging_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let private = "private-test-\u{516c}\u{53f8}-\u{1f9ea}";
+        let escaped = "synthetic-quote-\"slash\\fixture";
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &[
+                    private,
+                    escaped,
+                    "message",
+                    "type",
+                    "source",
+                    "data",
+                    "blockedliteral",
+                ]
+                .map(|value| super::super::policy::Literal {
+                    value,
+                    source: Source::RepositoryUser,
+                }),
+                &[],
+                false,
+            )
+            .unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+        };
+        // Unicode is fixture data exercising decoded JSON member names.
+        let data = json!({private: "first", "message": [{"type":"assistant","message":{private: "second"}}]});
+        let native = json!({"type":"assistant",private:"root","message":{"role":"assistant",private:"message","content":[{"type":"tool_use","id":"call","name":"Inspect",private:"block","input":data}]},"extra":{"type":"message",private:"nested"}});
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":format!("{}blockedliteral{}", "A".repeat(256), "B".repeat(256))}});
+        let result = json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"text","text":"ready"},data,image],"structuredContent":data}]}});
+        let mimic =
+            json!({"type":"message","id":"item",private:"root","message":{private:"nested"}});
+        let encoded = format!(
+            "{{ {} : \"value\", \"ordinary\" : 7 }}",
+            serde_json::to_string(escaped).unwrap()
+        );
+        let arguments = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":encoded}});
+        let value_encoded = format!(
+            "{{ \"ordinary\" : {} }}",
+            serde_json::to_string(escaped).unwrap()
+        );
+        let argument_value = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":value_encoded}});
+        let ordinary_text = format!(
+            "{{ \"ordinary\" : 7, \"note\" : {} }}",
+            json!("quoted \" benign")
+        );
+        let ordinary = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":ordinary_text}});
+        let unescaped = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":"{ \"blockedliteral\" : \"mapping\", \"ordinary\" : 7 }"}});
+        let calls = format!(
+            "[ {{\"id\": \"call\", \"function\": {{\"name\": \"Inspect\", \"arguments\": {} }} }} ]",
+            serde_json::to_string(&encoded).unwrap()
+        );
+        let nested = json!({"type":"hermes_message","data":{"role":"assistant","session_id":"session","tool_calls":calls}});
+        for original in [
+            &data,
+            &native,
+            &result,
+            &mimic,
+            &arguments,
+            &argument_value,
+            &ordinary,
+            &unescaped,
+            &nested,
+        ] {
+            let protected = projector.transform(&original.to_string(), Mode::ProtectJsonl);
+            assert!(protected.status == Status::Complete);
+            assert!(!protected.content.contains(private));
+            let projected: Value = serde_json::from_str(&protected.content).unwrap();
+            if original == &native {
+                assert!(projected["message"]["content"][0]["input"].is_object());
+            }
+            if original == &arguments || original == &argument_value {
+                assert!(whole_token(
+                    projected["payload"]["arguments"].as_str().unwrap()
+                ));
+            }
+            if original == &ordinary {
+                assert_eq!(projected, ordinary);
+            }
+            if original == &unescaped {
+                let data: Value =
+                    serde_json::from_str(projected["payload"]["arguments"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(data["ordinary"], 7);
+                assert!(!data.as_object().unwrap().contains_key("blockedliteral"));
+            }
+            if original == &nested {
+                assert!(whole_token(
+                    projected["data"]["tool_calls"].as_str().unwrap()
+                ));
+            }
+            if original == &result {
+                assert_eq!(projected["message"]["content"][0]["content"][2], image);
+                assert!(projected["message"]["content"][0]["structuredContent"].is_object());
+            }
+            let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+            assert!(restored.status == Status::Complete);
+            assert_eq!(
+                serde_json::from_str::<Value>(&restored.content).unwrap(),
+                *original
+            );
+        }
+        let token = projector.transform(private, Mode::ProtectText).content;
+        let collision = json!({private: "first", token: "second"});
+        for mode in [Mode::ProtectJsonl, Mode::HydrateJsonl] {
+            let output = projector.transform(&collision.to_string(), mode);
+            assert!(output.status == Status::Partial);
+            assert_eq!(output.reason, Some(Reason::ProtocolError));
+            assert_eq!(
+                serde_json::from_str::<Value>(&output.content).unwrap(),
+                collision
+            );
+        }
+    }
+
     /// A value first replaced under a legacy spelling gains a typed token for new content, and
     /// the legacy token keeps restoring. Reusing the legacy record would keep minting long
     /// tokens; dropping it would strand published history.
@@ -1522,6 +1894,46 @@ mod tests {
         let capped = projector.transform(&crowded, Mode::ProtectText);
         assert!(capped.status == Status::Complete);
         assert!(whole_token(&capped.content), "{}", capped.content);
+
+        use base64::Engine as _;
+        let bytes: Vec<_> = (0u8..=255).cycle().take(1024).collect();
+        let binary = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let literal = &binary[16..40];
+        projector.policy = Snapshot::compile(
+            &[super::super::policy::Literal {
+                value: literal,
+                source: Source::GlobalUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap();
+        let payload = json!({"source":{"type":"base64","media_type":"image/png","data":binary},"outside":literal,(literal):"mapping","ordinary":"visible","data":binary});
+        for arguments in [
+            payload.clone(),
+            json!(serde_json::to_string_pretty(&payload).unwrap()),
+        ] {
+            let record = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","arguments":arguments}});
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert!(protected.status == Status::Complete);
+            let projected: Value = serde_json::from_str(&protected.content).unwrap();
+            let data = &projected["payload"]["arguments"];
+            let data = data
+                .as_str()
+                .map(|text| serde_json::from_str::<Value>(text).unwrap())
+                .unwrap_or_else(|| data.clone());
+            assert_eq!(data["source"]["data"], binary);
+            assert_eq!(data["ordinary"], "visible");
+            assert_ne!(data["outside"], literal);
+            assert_ne!(data["data"], binary);
+            assert!(!data.as_object().unwrap().contains_key(literal));
+            let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+            assert!(restored.status == Status::Complete);
+            assert_eq!(
+                serde_json::from_str::<Value>(&restored.content).unwrap(),
+                record
+            );
+        }
     }
 
     /// Native linkage and runtime-opaque carriers survive every projection entry point, even
@@ -1542,6 +1954,12 @@ mod tests {
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let fixtures = [
+            (
+                "codex",
+                json!({"type":"session_meta","payload":{"id":id,"parent_thread_id":id,"source":{"subagent":{"thread_spawn":{"parent_thread_id":id}}},"note":id}}),
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                "/payload/note",
+            ),
             (
                 "codex",
                 json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","client_id":id,"content":[{"type":"text","text":id}]}}}),
@@ -1573,8 +1991,14 @@ mod tests {
                 "/payload/summary",
             ),
             (
+                "codex",
+                json!({"type":"response_item","payload":{"type":"agent_message","id":id,"content":[{"type":"encrypted_content","encrypted_content":id},{"type":"text","text":id}]}}),
+                "/payload/content/0/encrypted_content",
+                "/payload/content/1/text",
+            ),
+            (
                 "claude-code",
-                json!({"type":"assistant","message":{"role":"assistant","id":id,"content":[{"type":"tool_use","id":id,"name":"Read","input":{"id":id}}]}}),
+                json!({"type":"assistant","message":{"role":"assistant","id":id,"content":[{"type":"tool_use","id":id,"name":"Read","input":{"id":id, (id):"mapping"}}]}}),
                 "/message/content/0/id",
                 "/message/content/0/input",
             ),
@@ -1592,7 +2016,7 @@ mod tests {
             ),
             (
                 "opencode",
-                json!({"kind":"part","id":"prt_fixture","session_id":"ses_fixture","message_id":id,"data":{"type":"tool","callID":id,"state":{"input":{"id":id}}}}),
+                json!({"kind":"part","id":"prt_fixture","session_id":"ses_fixture","message_id":id,"data":{"type":"tool","callID":id,"state":{"input":{"id":id, (id):"mapping"}}}}),
                 "/data/callID",
                 "/data/state/input",
             ),
@@ -1616,7 +2040,7 @@ mod tests {
             ),
             (
                 "openclaw",
-                json!({"type":"message","id":"entry","parentId":id,"message":{"role":"assistant","content":[{"type":"toolCall","id":id,"name":"read","arguments":{"id":id}}]}}),
+                json!({"type":"message","id":"entry","parentId":id,"message":{"role":"assistant","content":[{"type":"toolCall","id":id,"name":"read","arguments":{"id":id, (id):"mapping"}}]}}),
                 "/message/content/0/id",
                 "/message/content/0/arguments",
             ),
@@ -1634,7 +2058,7 @@ mod tests {
             ),
             (
                 "workbuddy",
-                json!({"type":"function_call","sessionId":"session","callId":id,"name":"Read","arguments":{"id":id}}),
+                json!({"type":"function_call","sessionId":"session","callId":id,"name":"Read","arguments":{"id":id, (id):"mapping"}}),
                 "/callId",
                 "/arguments",
             ),
@@ -1673,9 +2097,19 @@ mod tests {
                     id,
                     "{runtime}: {identity}"
                 );
+                if original["payload"]["type"] == "agent_message" {
+                    assert_eq!(record["payload"]["id"], id);
+                }
                 let body = record.pointer(data).unwrap().to_string();
                 assert!(!body.contains(id), "{runtime}: {data}");
                 assert!(body.contains("\u{2039}secret:"), "{runtime}: {data}");
+                let restored = projector.transform(&record.to_string(), Mode::HydrateJsonl);
+                assert!(restored.status == Status::Complete, "{runtime}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&restored.content).unwrap(),
+                    original,
+                    "{runtime}: payload keys and values must restore together"
+                );
             }
         }
 

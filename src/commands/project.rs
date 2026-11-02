@@ -647,7 +647,26 @@ fn before_covered(project: &Project, candidate: &Candidate, adopt: bool) -> Resu
     if covered.opener.as_deref() == Some(session_key.as_str()) {
         return Ok(false);
     }
-    // A transcript stored away is restored only when no readable one is in place.
+    // A Codex start is metadata in its first record, including while its history is cold.
+    // Restoring the carrier here would make eligibility inspection rewrite native storage.
+    if candidate.runtime == "codex" {
+        let Ok(path) = crate::adapter::codex::resolve_readonly(&candidate.session_id) else {
+            return Ok(false);
+        };
+        let bytes = crate::adapter::codex_rollout::first_line(
+            &path,
+            crate::adapter::codex_rollout::HEADER_LIMIT,
+        )?;
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        let start = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|record| {
+                chrono::DateTime::parse_from_rfc3339(record["timestamp"].as_str()?).ok()
+            });
+        return Ok(start.is_none_or(|start| start < covered.since));
+    }
     let Some(transcript) = adapter::get(&candidate.runtime).ok().and_then(|adapter| {
         adapter
             .resolve_present(&candidate.session_id, Some(&candidate.cwd))
@@ -1068,6 +1087,8 @@ fn sync(project: &mut Project) -> CmdResult {
     for candidate in candidates(project)? {
         if project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
             || before_covered(project, &candidate, true).unwrap_or(true)
+            || delegation_withheld(&project.repository, &candidate, Some(project), true)
+                .unwrap_or(true)
         {
             continue;
         }
@@ -1715,6 +1736,9 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         session_id: session.into(),
         cwd,
     };
+    if delegation_withheld(&project.repository, &candidate, Some(&project), true).unwrap_or(true) {
+        return Ok(true);
+    }
     // A session claimed elsewhere is left to its source repository.
     let branch = match placement(&project, &candidate) {
         Ok(Placement::Claim(branch)) => Some(branch),
@@ -1736,6 +1760,143 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     Ok(true)
 }
 
+/// A captured header remains local evidence after its native file is removed. Ordinary legacy
+/// claims without a header keep their existing behavior; a known delegate still needs its parent.
+fn delegation_header(session: &str) -> Result<Option<serde_json::Value>> {
+    if let Ok(path) = crate::adapter::codex::resolve_readonly(session) {
+        let bytes = crate::adapter::codex_rollout::first_line(
+            &path,
+            crate::adapter::codex_rollout::HEADER_LIMIT,
+        )?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        return Ok((header["type"] == "session_meta").then_some(header));
+    }
+    let Some(claim) = link::get_checked(&Store::at(config::store_root()?), "codex", session)?
+    else {
+        return Ok(None);
+    };
+    let (Some(owner), Some(agent), Some(branch)) = (claim.owner, claim.agent, claim.branch) else {
+        return Ok(None);
+    };
+    let (owner, agent) = super::parse_slug(&format!("{owner}/{agent}"))?;
+    let Some(repo) = Repo::open(config::repo_dir(&owner, &agent)?) else {
+        return Ok(None);
+    };
+    let Some(line) = crate::domain::storage::materialize_head_at(
+        repo.root(),
+        &format!("refs/heads/{branch}"),
+        "LOG",
+    )?
+    else {
+        return Ok(None);
+    };
+    let header = crate::domain::storage::parse_envelope_line(&line)?.content;
+    Ok((header["type"] == "session_meta" && header["payload"]["id"] == session).then_some(header))
+}
+
+/// A delegated conversation cannot acquire capture authority its ancestors do not have.
+/// Inspect each parent rather than caching a verdict: a later drop must cover existing children.
+fn delegation_withheld(
+    repository: &str,
+    candidate: &Candidate,
+    fallback: Option<&Project>,
+    adopt: bool,
+) -> Result<bool> {
+    if candidate.runtime != "codex" {
+        return Ok(false);
+    }
+    let mut session = candidate.session_id.clone();
+    let mut seen = BTreeSet::new();
+    let records = withheld_records()?;
+    loop {
+        ensure!(
+            seen.len() < 64 && seen.insert(session.clone()),
+            "invalid delegated ancestry"
+        );
+        let Some(header) = delegation_header(&session)? else {
+            ensure!(seen.len() == 1, "delegated ancestry is unavailable");
+            return Ok(false);
+        };
+        let payload = &header["payload"];
+        let spawn = &payload["source"]["subagent"]["thread_spawn"];
+        if !crate::adapter::codex::delegated_header(&header) {
+            return Ok(false);
+        }
+        ensure!(payload["id"] == session, "delegated identity changed");
+        let parents: Vec<_> = [
+            spawn["parent_thread_id"].as_str(),
+            payload["parent_thread_id"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let parent = parents
+            .first()
+            .copied()
+            .or_else(|| payload["forked_from_id"].as_str())
+            .context("delegated parent is missing")?;
+        ensure!(
+            uuid::Uuid::parse_str(parent).is_ok() && parents.iter().all(|id| *id == parent),
+            "ambiguous delegated parent"
+        );
+        let parent_key = key("codex", parent);
+        if records
+            .iter()
+            .any(|record| record.session.as_deref() == Some(&parent_key))
+        {
+            return Ok(true);
+        }
+        let parent_header =
+            delegation_header(parent)?.context("delegated parent is unavailable")?;
+        ensure!(
+            parent_header["payload"]
+                .get("id")
+                .is_none_or(|id| id.as_str() == Some(parent)),
+            "delegated parent identity changed"
+        );
+        link::get_checked(&Store::at(config::store_root()?), "codex", parent)?;
+        let cwd = parent_header["payload"]["cwd"]
+            .as_str()
+            .and_then(|cwd| PathBuf::from(cwd).canonicalize().ok())
+            .context("delegated parent workspace is unavailable")?;
+        let ancestor = Candidate {
+            runtime: "codex".into(),
+            session_id: parent.into(),
+            cwd,
+        };
+        let governing = governing(&ancestor.cwd)?.map(|(project, _)| project);
+        let policy = governing.as_ref().or(fallback);
+        if let Some(policy) = policy {
+            if policy.repository != repository
+                || !policy.enabled
+                || !policy.auto_upload
+                || !includes(policy, &ancestor.cwd)?
+                || policy.leaves_out(&parent_key)
+                || before_covered(policy, &ancestor, adopt)?
+                || !matches!(
+                    placement(policy, &ancestor),
+                    Ok(Placement::New | Placement::Claim(_))
+                )
+            {
+                return Ok(true);
+            }
+        } else if let Some(claim) =
+            link::get_checked(&Store::at(config::store_root()?), "codex", parent)?
+            && claim
+                .owner
+                .as_deref()
+                .zip(claim.agent.as_deref())
+                .is_some_and(|(owner, name)| format!("{owner}/{name}") != repository)
+        {
+            return Ok(true);
+        }
+        session = parent.into();
+    }
+}
+
 /// Whether `project` keeps `candidate`'s turns from being uploaded: the project is paused, it
 /// uploads nothing, it leaves the session out (dropped, or from before the folder was on), or the
 /// session began in one of the folder's git worktrees before the folder covered it. `adopt`
@@ -1745,6 +1906,7 @@ fn withholds(project: &Project, candidate: &Candidate, adopt: bool) -> bool {
         || !project.auto_upload
         || project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
         || before_covered(project, candidate, adopt).unwrap_or(true)
+        || delegation_withheld(&project.repository, candidate, Some(project), adopt).unwrap_or(true)
 }
 
 /// What the project policy of a folder does with one live session. Only team activity reports
@@ -1986,6 +2148,8 @@ fn capture_candidate(mut project: Project, candidate: Candidate, let_in: bool) -
             || !project.auto_upload
             || project.leaves_out(&session_key)
             || (!let_in && before_covered(project, &candidate, true).unwrap_or(true))
+            || delegation_withheld(&project.repository, &candidate, Some(project), true)
+                .unwrap_or(true)
     };
     if held(&project) {
         return Ok(true);
@@ -2103,6 +2267,11 @@ fn bound_apart(project: &Project, candidate: &Candidate) -> Result<Option<String
 /// Uploads one session for a save. `let_in` says the save lets in sessions of the folder's git
 /// worktrees from before they were covered.
 fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Saved> {
+    if delegation_withheld(&project.repository, &candidate, Some(&project), false)? {
+        return Ok(Saved::Failed(
+            "the root conversation's capture policy keeps this delegated session out".into(),
+        ));
+    }
     if let Some(why) = bound_apart(&project, &candidate)? {
         return Ok(Saved::Failed(why));
     }
@@ -2500,6 +2669,22 @@ pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option
             .find(|r| r.repository == slug && &r.branch == branch)
         {
             verdicts.push(Some(record.reason));
+            continue;
+        }
+        let all_links = match &links {
+            Some(links) => links,
+            None => links.insert(link::list(&Store::at(config::store_root()?))),
+        };
+        let branch_claims = recording_into(all_links, &owner, &agent, branch);
+        if branch_claims.iter().any(|claim| {
+            let candidate = Candidate {
+                runtime: claim.source.clone(),
+                session_id: claim.session_id.clone(),
+                cwd: claim.cwd.as_deref().map(PathBuf::from).unwrap_or_default(),
+            };
+            delegation_withheld(slug, &candidate, None, false).unwrap_or(true)
+        }) {
+            verdicts.push(Some(Withholding::Excluded));
             continue;
         }
         if projects.is_empty() {
@@ -4197,6 +4382,221 @@ mod tests {
         assert!(previous.restore(&project.root, "alice/elsewhere").is_err());
         assert_eq!(workspace::read(&project.root).unwrap().repo, "alice/third");
         assert!(read(&project.root).unwrap().is_none());
+    }
+
+    /// Capture inspection must keep both ordinary and delegated histories cold while still
+    /// applying the root's worktree cutoff. Restoring a rollout merely to read its header changes
+    /// storage state and makes metadata work scale with conversation content.
+    #[test]
+    fn capture_inspection_keeps_codex_history_cold() {
+        if !isolated("capture_inspection_keeps_codex_history_cold") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        git_checkout(&main);
+        let tree = worktree(&main, &temp.path().join("tree"));
+        let policy = project(&main);
+        save(&policy).unwrap();
+        let root = "aaaaaaaa-0000-4000-8000-000000000001";
+        let child = "bbbbbbbb-0000-4000-8000-000000000002";
+        let native =
+            PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("sessions/2026/11/01");
+        fs::create_dir_all(&native).unwrap();
+        let mut carriers = Vec::new();
+        for (id, timestamp, parent) in [
+            (root, "2026-01-01T00:00:00Z", None),
+            (child, "2028-01-01T00:00:00Z", Some(root)),
+        ] {
+            let mut header = serde_json::json!({"type":"session_meta","timestamp":timestamp,"payload":{"id":id,"cwd":tree}});
+            if let Some(parent) = parent {
+                header["payload"]["thread_source"] = "subagent".into();
+                header["payload"]["parent_thread_id"] = parent.into();
+            }
+            let body = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"retained history"}]}});
+            let bytes = ruzstd::encoding::compress_to_vec(
+                format!("{header}\n{body}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            );
+            let plain = native.join(format!("rollout-2026-11-01T00-00-00-{id}.jsonl"));
+            let cold = plain.with_extension("jsonl.zst");
+            fs::write(&cold, &bytes).unwrap();
+            carriers.push((plain, cold, bytes));
+        }
+        let cover = |date: &str| {
+            update_covered(&policy.root, |records| {
+                records.insert(
+                    tree.clone(),
+                    Covered {
+                        since: date.parse().unwrap(),
+                        opener: None,
+                    },
+                );
+            })
+            .unwrap()
+        };
+        for (date, withheld) in [
+            ("2025-01-01T00:00:00Z", false),
+            ("2027-01-01T00:00:00Z", true),
+        ] {
+            cover(date);
+            for id in [root, child] {
+                let candidate = Candidate {
+                    runtime: "codex".into(),
+                    session_id: id.into(),
+                    cwd: tree.clone(),
+                };
+                assert_eq!(withholds(&policy, &candidate, false), withheld);
+            }
+            for (plain, cold, bytes) in &carriers {
+                assert!(
+                    !plain.exists(),
+                    "metadata inspection restored a plaintext rollout"
+                );
+                assert_eq!(
+                    &fs::read(cold).expect("compressed carrier must remain"),
+                    bytes
+                );
+            }
+        }
+    }
+
+    /// Siblings and nested delegates share the root's exclusion, history cutoff and repository
+    /// authority. A child's own claim cannot override a later change to the root's policy.
+    #[test]
+    fn delegated_tree_inherits_root_capture_authority() {
+        if !isolated("delegated_tree_inherits_root_capture_authority") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        git_checkout(&main);
+        let tree = worktree(&main, &temp.path().join("tree"));
+        let mut policy = project(&main);
+        save(&policy).unwrap();
+        let root = "aaaaaaaa-0000-4000-8000-000000000001";
+        let child = "bbbbbbbb-0000-4000-8000-000000000002";
+        let sibling = "cccccccc-0000-4000-8000-000000000003";
+        let grandchild = "dddddddd-0000-4000-8000-000000000004";
+        let native =
+            PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("sessions/2026/11/01");
+        fs::create_dir_all(&native).unwrap();
+        for (id, parent) in [
+            (root, None),
+            (child, Some(root)),
+            (sibling, Some(root)),
+            (grandchild, Some(child)),
+        ] {
+            let mut header = serde_json::json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":id,"cwd":tree}});
+            if let Some(parent) = parent {
+                header["payload"]["thread_source"] = "subagent".into();
+                header["payload"]["source"] =
+                    serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+            }
+            fs::write(
+                native.join(format!("rollout-2026-11-01T00-00-00-{id}.jsonl")),
+                format!("{header}\n"),
+            )
+            .unwrap();
+        }
+        let cover = |date: &str| {
+            update_covered(&policy.root, |records| {
+                records.insert(
+                    tree.clone(),
+                    Covered {
+                        since: date.parse().unwrap(),
+                        opener: None,
+                    },
+                );
+            })
+            .unwrap()
+        };
+        cover("2025-01-01T00:00:00Z");
+        let store = Store::at(config::store_root().unwrap());
+        let candidates: Vec<_> = [child, sibling, grandchild]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut claim = link::Link::new("codex", id, Some(&tree));
+                claim.owner = Some("alice".into());
+                claim.agent = Some("app".into());
+                claim.branch = Some(format!("child-{index}"));
+                link::write(&store, &claim).unwrap();
+                Candidate {
+                    runtime: "codex".into(),
+                    session_id: (*id).into(),
+                    cwd: tree.clone(),
+                }
+            })
+            .collect();
+        assert!(candidates.iter().all(|c| !withholds(&policy, c, false)));
+        for earlier in [false, true] {
+            if earlier {
+                policy.earlier.insert(key("codex", root));
+            } else {
+                policy.excluded.insert(key("codex", root));
+            }
+            save(&policy).unwrap();
+            for (index, candidate) in candidates.iter().enumerate() {
+                assert!(withholds(&policy, candidate, false));
+                assert!(capture_candidate(policy.clone(), candidate.clone(), false).unwrap());
+                assert_eq!(
+                    withheld("alice/app", &format!("child-{index}")).unwrap(),
+                    Some(Withholding::Excluded)
+                );
+            }
+            assert!(read(&policy.root).unwrap().unwrap().last_result.is_none());
+            policy.earlier.clear();
+            policy.excluded.clear();
+        }
+        save(&policy).unwrap();
+        cover("2027-01-01T00:00:00Z");
+        assert!(candidates.iter().all(|c| withholds(&policy, c, false)));
+        cover("2025-01-01T00:00:00Z");
+        let mut foreign = link::Link::new("codex", root, Some(&tree));
+        foreign.owner = Some("bob".into());
+        foreign.agent = Some("other".into());
+        foreign.branch = Some("root".into());
+        link::write(&store, &foreign).unwrap();
+        assert!(candidates.iter().all(|c| withholds(&policy, c, false)));
+        // A recorded drop remains authoritative after its native claim is released.
+        fs::remove_file(link::link_path(&store, "codex", root)).unwrap();
+        update_withheld(|records| {
+            records.push(Withheld {
+                repository: "alice/app".into(),
+                branch: "root".into(),
+                session: Some(key("codex", root)),
+                reason: Withholding::Dropped,
+                announced: true,
+            })
+        })
+        .unwrap();
+        assert!(candidates.iter().all(|c| withholds(&policy, c, false)));
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        repo.git(&["config", "user.name", "Synthetic User"])
+            .unwrap();
+        repo.git(&["config", "user.email", "synthetic@example.invalid"])
+            .unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        repo.git(&["checkout", "-b", "child-0"]).unwrap();
+        let child_path = native.join(format!("rollout-2026-11-01T00-00-00-{child}.jsonl"));
+        let raw = fs::read_to_string(&child_path).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let log = crate::domain::transcript::wrap_lines(&raw, "codex", &session);
+        crate::domain::storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(
+            repo.root(),
+            &Meta::new(session, "codex".into(), tree.display().to_string()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Capture delegated header").unwrap();
+        fs::remove_file(child_path).unwrap();
+        fs::remove_file(native.join(format!("rollout-2026-11-01T00-00-00-{root}.jsonl"))).unwrap();
+        assert_eq!(
+            withheld("alice/app", "child-0").unwrap(),
+            Some(Withholding::Excluded)
+        );
     }
 
     /// A foreign claim cannot become a new import or silently change publication authority.

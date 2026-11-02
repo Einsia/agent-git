@@ -38,7 +38,12 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
     ].into_iter().chain(publication_text::records(&workspace)).chain([
         json!({"type":"assistant", "message":{"role":"assistant", "content":"Selected reply"}}),
     ]).map(|v| format!("{v}\n")).collect::<String>();
-    let log = transcript::wrap_lines(&raw, "claude-code", &session);
+    let mut log = transcript::wrap_lines(&raw, "claude-code", &session);
+    let canary = "ghp_7Kq9mZ2vR8xT5nW3pL6cB4dF0hJ1sA9eQ7uY";
+    let peer = json!({"type":"response_item","payload":{"type":"agent_message","author":"/root/worker","recipient":"/root","content":[{"type":"input_text","text":format!("Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\nPeer message canary: {canary}")}]}});
+    let peer = transcript::wrap_lines(&format!("{peer}\n"), "codex", &session);
+    let before_selected_reply = log.len() - log.lines().next_back().unwrap().len() - 1;
+    log.insert_str(before_selected_reply, &peer);
     let dictionary = agit::domain::secret_filter::RepositoryDictionary::open(repo.root()).unwrap();
     dictionary
         .block_add(
@@ -150,6 +155,13 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
     assert!(public_log.contains("<workspace>/src/main.rs"));
     assert!(!public_log.contains("EXCLUDED_FILE_BODY"));
     assert!(!public_log.contains("Selected reply"));
+    // Peer text is visible only after the same secret protection as ordinary messages.
+    let peer = public_log
+        .lines()
+        .find(|line| line.contains("Peer message canary:"))
+        .unwrap();
+    assert!(!peer.contains(canary));
+    assert!(agit::domain::privacy::detector::placeholder::contains_token(peer));
     assert!(!String::from_utf8_lossy(&exported.stdout).contains(workspace.to_str().unwrap()));
     let selected = run(&["export", "alice/app@work", "--privacy", "--view-only"]);
     assert!(
