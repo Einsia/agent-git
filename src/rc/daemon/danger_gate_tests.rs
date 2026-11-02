@@ -245,6 +245,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
                 let info = SessionInfo {
                     interrupt_fenced: None,
+                    lease: None,
                     publication: None,
                     session_id: "session-1".into(),
                     native_source: None,
@@ -308,6 +309,8 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     restart_guard_attempts: Default::default(),
                     restart_guard_mode: None,
                     ended: false,
+                    writer_released: false,
+                    writer_process: None,
                 };
                 let (notes, _notes_rx) = mpsc::channel(1);
                 let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
@@ -343,6 +346,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     watch_generation: 0,
                     session_generation: 3,
                     confinement: HashMap::new(),
+                    leases: Default::default(),
                 };
                 let mut request = Frame::request(
                     method::APPROVAL_DECIDE,

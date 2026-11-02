@@ -219,6 +219,7 @@ impl Daemon {
                 });
             dormant.push(self.stamped(SessionInfo {
                 interrupt_fenced: None,
+                lease: None,
                 publication: None,
                 native_source: None,
                 session_id: id.clone(),
@@ -353,6 +354,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             native_source: None,
             session_id: logical.clone(),
@@ -548,15 +550,16 @@ impl Daemon {
                         "that session's working directory is outside this workspace's bound folders",
                     )
                 })?;
+            if let Some(error) = self.release_failed_refusal(&entry.thread_id) {
+                return Err(error);
+            }
             attach_only_refusal(p.attach_only, &entry.runtime, &entry.thread_id, &cwd)?;
             if transcript_likely_active(&entry.runtime, &entry.thread_id, &cwd)
                 && !shared_claude_available(&entry.runtime, &entry.thread_id, &cwd, caller)
             {
-                return Err(active_writer_error(
-                    &entry.runtime,
+                return Err(self.with_lease(
+                    active_writer_error(&entry.runtime, &entry.thread_id, &cwd, caller),
                     &entry.thread_id,
-                    &cwd,
-                    caller,
                 ));
             }
             // The cell in the roster may hold legacy lineage that does not pass today's test.
@@ -589,6 +592,7 @@ impl Daemon {
             let now = chrono::Utc::now().to_rfc3339();
             let info = SessionInfo {
                 interrupt_fenced: None,
+                lease: None,
                 publication: None,
                 session_id: p.session_id.clone(),
                 native_source: None,
@@ -741,15 +745,16 @@ impl Daemon {
         if p.prompt.is_some() {
             crate::rc::harness::CodexUnconfined::check(&local.runtime, caller.is_owner())?;
         }
+        if let Some(error) = self.release_failed_refusal(&p.session_id) {
+            return Err(error);
+        }
         // An active transcript may be controlled only through its existing native writer.
         if local.likely_active
             && !shared_claude_available(&local.runtime, &p.session_id, &local.cwd, caller)
         {
-            return Err(active_writer_error(
-                &local.runtime,
+            return Err(self.with_lease(
+                active_writer_error(&local.runtime, &p.session_id, &local.cwd, caller),
                 &p.session_id,
-                &local.cwd,
-                caller,
             ));
         }
 
@@ -866,6 +871,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: logical,
             native_source: None,
@@ -1306,6 +1312,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: session_id.clone(),
             native_source: if p.runtime == "codex" {

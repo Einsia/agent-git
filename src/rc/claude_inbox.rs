@@ -320,6 +320,67 @@ pub(crate) fn discover_in(registry: &Path, session_id: &str) -> Option<Live> {
     found
 }
 
+/// Why [`discover_pid_in`] found no process to speak for a session.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// No live, listening registry record names the session for that process.
+    NotListed,
+    /// Another live process names the session, and it was not admitted beside this one.
+    Shared,
+}
+
+/// [`discover_in`] for the process `pid`: found when it names `session_id` and every other live
+/// process naming it is one `handing_over` admits (the daemon's own headless writer, which still
+/// holds the conversation while a terminal takes it over). Any other second process leaves the
+/// session ambiguous, as in [`discover_in`], and is told apart from a process not listed at all.
+#[cfg(unix)]
+pub(crate) fn discover_pid_in(
+    registry: &Path,
+    session_id: &str,
+    pid: u32,
+    handing_over: impl Fn(u32) -> bool,
+) -> Result<Live, Missing> {
+    let mut found = None;
+    for (other, record) in records(registry) {
+        if record.session_id != session_id {
+            continue;
+        }
+        let Some(socket) = listening(other, &record) else {
+            continue;
+        };
+        if other != pid {
+            if handing_over(other) {
+                continue;
+            }
+            return Err(Missing::Shared);
+        }
+        found = Some(Live {
+            pid: other,
+            peer_token: peer_token(registry, other, socket),
+            socket: PathBuf::from(socket),
+            proc_start: record.proc_start,
+            session_id: record.session_id,
+            cwd: record.cwd,
+        });
+    }
+    found.ok_or(Missing::NotListed)
+}
+
+/// Every registered process that names `session_id`, live or not; the caller decides which one
+/// speaks for it.
+#[cfg(unix)]
+pub(crate) fn session_pids(session_id: &str) -> Vec<u32> {
+    let Ok(registry) = crate::adapter::claude_code::sessions_dir() else {
+        return Vec::new();
+    };
+    records(&registry)
+        .into_iter()
+        .filter(|(_, record)| record.session_id == session_id)
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
 pub(crate) fn discover(session_id: &str) -> Option<Live> {
     discover_in(
         &crate::adapter::claude_code::sessions_dir().ok()?,

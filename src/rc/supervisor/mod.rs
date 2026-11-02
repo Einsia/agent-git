@@ -819,6 +819,8 @@ enum TurnGuardBarrier {
 pub struct Session {
     pub info: SessionInfo,
     driver: AnyDriver,
+    /// The session was running a turn when it ended: the writer may have written up to its end.
+    stopped_in_turn: bool,
     background_poll_at: tokio::time::Instant,
     transcript_readable: bool,
     tailer: Option<Tailer>,
@@ -993,6 +995,25 @@ pub enum SessionNote {
         /// answers "no live session". `WatchEnded` carries a generation for the same reason.
         generation: u64,
     },
+    /// The harness process tree of this generation has been reaped: nothing it started can
+    /// still write its conversation `thread`. Sent before settlement and publication, which may
+    /// take long. It names the conversation itself because the daemon may have retired the
+    /// session row before it reads this note; `in_turn` says the writer was stopped mid-turn.
+    WriterReleased {
+        session_id: String,
+        generation: u64,
+        thread: Option<String>,
+        in_turn: bool,
+    },
+    /// This generation's harness cleanup failed: its process may still write `thread`, so the
+    /// conversation stays with it. `process` is that process's pid and start time, read before
+    /// the cleanup, so a daemon restart can tell whether it still runs.
+    WriterNotReleased {
+        session_id: String,
+        generation: u64,
+        thread: Option<String>,
+        process: Option<(u32, i64)>,
+    },
     /// A read-only follow ended on its own (the transcript is gone, or it stayed quiet too
     /// long). The daemon removes it from the table on this note — otherwise `watches` only
     /// grows.
@@ -1072,6 +1093,9 @@ pub enum SessionNote {
         agit_session: Option<String>,
         /// Immutable ID paired with `agit_session`; both or neither.
         expected_agent_id: Option<String>,
+        /// The harness process writing the conversation, by pid and start time, when known: a
+        /// lease waiting on this writer judges by it whether the writer is gone.
+        writer: Option<(u32, i64)>,
     },
 }
 
@@ -1633,6 +1657,7 @@ impl Session {
             cwd,
             info,
             driver,
+            stopped_in_turn: false,
             background_poll_at: tokio::time::Instant::now(),
             transcript_readable: false,
             tailer: None,
@@ -1689,7 +1714,22 @@ impl Session {
             cwd: self.cwd.to_string_lossy().into_owned(),
             agit_session: self.agit_session.as_ref().map(|l| l.to_string()),
             expected_agent_id: self.agit_session.as_ref().map(|l| l.agent_id().to_string()),
+            writer: self.writer_process(),
         })
+    }
+
+    /// The harness process by pid and start time, while it runs.
+    fn writer_process(&self) -> Option<(u32, i64)> {
+        #[cfg(unix)]
+        {
+            self.driver
+                .harness_pid()
+                .and_then(|pid| Some((pid, crate::rc::native_claude::started_ms(pid)?)))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// Tell the daemon the harness's own id. Cheap, idempotent, callable at any time.
@@ -2375,6 +2415,12 @@ impl Session {
         if self.info.status == status {
             return;
         }
+        if status == SessionStatus::Ended {
+            self.stopped_in_turn = matches!(
+                self.info.status,
+                SessionStatus::Running | SessionStatus::AwaitingApproval
+            );
+        }
         self.info.status = status;
         self.info.updated_at = chrono::Utc::now().to_rfc3339();
         self.emit(
@@ -2382,6 +2428,17 @@ impl Session {
             serde_json::json!({"session_id": self.info.session_id, "status": status}),
         )
         .await;
+    }
+
+    /// The writer was inside a turn when it stopped: either the supervisor ended it mid-turn, or
+    /// the harness exited on its own while the session was still running a turn (that exit
+    /// reports `ended` without passing through `set_status`).
+    fn writer_in_turn(&self) -> bool {
+        self.stopped_in_turn
+            || matches!(
+                self.info.status,
+                SessionStatus::Running | SessionStatus::AwaitingApproval
+            )
     }
 
     /// A reaped private harness can no longer write; record the transcript it left behind.
@@ -2414,6 +2471,8 @@ impl Session {
         // Final safety net for EOF/command-channel shutdown paths. The maps are
         // about native requests owned by this process; none survive its exit.
         self.abandon_pending_approvals().await;
+        let thread = self.driver.runtime_thread_id();
+        let process = self.writer_process();
         // **The reason for exiting does not decide whether the process tree is reaped.**
         //
         // An exit path that returns directly — the harness's own EOF/Exited, a closed command
@@ -2422,8 +2481,28 @@ impl Session {
         // cannot miss it either. A failed cleanup leaves a diagnostic behind but must not
         // swallow Ended — the daemon still has to remove a finished session from its table.
         match self.driver.shutdown().await {
-            Ok(()) => self.record_writer_release(&id),
-            Err(e) => tracing_note(&format!("[{id}] harness cleanup failed: {e}")),
+            Ok(()) => {
+                self.record_writer_release(&id);
+                let _ = notes
+                    .send(SessionNote::WriterReleased {
+                        session_id: id.clone(),
+                        generation,
+                        thread,
+                        in_turn: self.writer_in_turn(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                tracing_note(&format!("[{id}] harness cleanup failed: {e}"));
+                let _ = notes
+                    .send(SessionNote::WriterNotReleased {
+                        session_id: id.clone(),
+                        generation,
+                        thread,
+                        process,
+                    })
+                    .await;
+            }
         }
         // **A session ending is a settlement boundary too.** Funnelled into the same single
         // finally point: Shutdown, driver EOF and harness Exited each return on their own, and

@@ -1154,6 +1154,11 @@ impl Proc {
         Ok(())
     }
 
+    /// The direct child's pid while it has not been reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub async fn shutdown(&mut self) -> crate::Result<()> {
         #[cfg(test)]
         if self

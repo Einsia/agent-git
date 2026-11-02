@@ -963,6 +963,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     interrupt_fenced: None,
+                    lease: None,
                     publication: None,
                     session_id: "agit-danger-start".into(),
                     native_source: None,
@@ -1050,6 +1051,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     interrupt_fenced: None,
+                    lease: None,
                     publication: None,
                     session_id: "agit-unjudged".into(),
                     native_source: None,
@@ -1119,6 +1121,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 // owner-only gate.
                 let info = SessionInfo {
                     interrupt_fenced: None,
+                    lease: None,
                     publication: None,
                     session_id: "agit-unauthorized".into(),
                     native_source: None,
@@ -1254,6 +1257,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
         interrupt_fenced: None,
+        lease: None,
         publication: None,
         session_id: "agit-existing".into(),
         native_source: None,
@@ -2253,6 +2257,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         started_process: true,
         info: SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "s-1".into(),
             native_source: None,
@@ -2288,6 +2293,8 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         restart_guard_attempts: Default::default(),
         restart_guard_mode: None,
         ended: false,
+        writer_released: false,
+        writer_process: None,
     };
     let event = |applied| {
         Frame::notification(
@@ -2480,6 +2487,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
     let mk = |last_active: u64| WatchLive {
         info: SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "s".into(),
             native_source: None,
@@ -2585,6 +2593,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         watch_generation: 0,
         session_generation: 0,
         confinement: HashMap::new(),
+        leases: Default::default(),
     };
 
     let rx = daemon.confinement_for("ws-1");
@@ -3042,6 +3051,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         .insert("session-a".into(), 1);
     let info = SessionInfo {
         interrupt_fenced: None,
+        lease: None,
         publication: None,
         session_id: "session-a".into(),
         native_source: None,

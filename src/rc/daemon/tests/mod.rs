@@ -1,4 +1,6 @@
 mod guards;
+#[cfg(unix)]
+mod leases;
 mod metadata;
 #[cfg(unix)]
 mod publication;
@@ -18,6 +20,7 @@ pub(super) fn rpc_test_live(
         generation,
         info: SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: session_id.into(),
             native_source: None,
@@ -55,6 +58,8 @@ pub(super) fn rpc_test_live(
         restart_guard_attempts: Default::default(),
         restart_guard_mode: None,
         ended: false,
+        writer_released: false,
+        writer_process: None,
     }
 }
 
@@ -95,6 +100,7 @@ pub(super) fn rpc_test_daemon(
         watch_generation: 0,
         session_generation: 2,
         confinement: HashMap::new(),
+        leases: Default::default(),
     }))
 }
 

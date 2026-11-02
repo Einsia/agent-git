@@ -793,6 +793,7 @@ mod tests {
 
         let session = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "agit-one".into(),
             native_source: None,

@@ -171,6 +171,7 @@ fn an_immediate_mode_change_waits_through_slow_bound_without_the_daemon_mutex() 
                     cwd: home.path().to_string_lossy().into_owned(),
                     agit_session: None,
                     expected_agent_id: None,
+                    writer: None,
                 });
                 let reply = match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
                     .await
@@ -387,6 +388,7 @@ fn bound_preserves_all_guard_tokens_and_applies_the_shutdown_floor() {
                     cwd: "/tmp/project".into(),
                     agit_session: None,
                     expected_agent_id: None,
+                    writer: None,
                 };
                 let mut state = daemon.lock().await;
                 state.on_session_note(bound(1, "stale-thread"));
@@ -463,6 +465,7 @@ fn a_failed_bound_save_keeps_the_rotated_thread_locked_to_the_owner() {
                     cwd: "/srv/app".into(),
                     agit_session: None,
                     expected_agent_id: None,
+                    writer: None,
                 };
 
                 // `Roster::save` takes the main ledger path and does not touch the fail-closed
