@@ -504,6 +504,10 @@ fn acknowledged_unchanged(
     )
 }
 
+/// How a push says that a session branch is larger than the Hub accepts. Project capture reads it
+/// in a failed child's message to tell the person why, so it is one fixed phrase.
+pub(crate) const OVERSIZED: &str = "holds more event entries than the Hub accepts";
+
 /// Branches one publication carries. A publication's fixed cost (destination checks, the ref
 /// advertisement, snapshot planning) is paid once per publication, so many branches share one.
 /// The plan's head limit also counts `main` and branches a selection carries, so a group stays

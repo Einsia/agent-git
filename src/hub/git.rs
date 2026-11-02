@@ -738,6 +738,36 @@ impl Outcome {
             .and_then(|c| c.get(1))
             .map(|m| m.as_str())
     }
+
+    /// Whether the Hub turned this push down while judging it, before its ref transaction, so no
+    /// ref moved. The Hub raises these kinds only then. A result after the transaction is a
+    /// conflict, an unavailable service or an internal error, and while the Hub reports progress
+    /// it frames those with their kind too, so a named refusal alone does not say nothing moved.
+    pub fn refused_before_refs_moved(&self) -> bool {
+        matches!(
+            self.refusal_kind(),
+            Some(
+                "provenance_rejected"
+                    | "quota_exceeded"
+                    | "agentgit_upgrade_required"
+                    | "publication_refs_moved"
+            )
+        )
+    }
+
+    /// The most event entries the Hub reads in one session snapshot, when it refused this push
+    /// because a snapshot holds more. A session keeps its events as it goes on, so its later
+    /// snapshots meet the same refusal until its events shrink or the Hub raises the limit.
+    pub fn event_entry_limit(&self) -> Option<u64> {
+        if self.refusal_kind() != Some("provenance_rejected") {
+            return None;
+        }
+        let re = regex::Regex::new(
+            r"reserved event topology exceeds the per-push limit of (\d+) entries",
+        )
+        .ok()?;
+        re.captures(&self.stderr)?.get(1)?.as_str().parse().ok()
+    }
 }
 
 /// Run a git command that needs authentication.

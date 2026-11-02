@@ -234,9 +234,15 @@ pub(super) fn run(
     };
     let withheld = crate::domain::privacy_git::withheld_refs(&repo, &identity)
         .map_err(|error| inconsistent(error, unsent_outcome(&target, 0, 0)))?;
+    // A branch the Hub refused for its event entries is left out of automatic publication while
+    // its tip still holds more than the limit: each attempt would upload the whole session only to
+    // meet the same refusal. A push the person runs asks again, as the Hub may accept more by now.
+    let oversized = crate::domain::privacy_git::oversized_refs(&repo, &identity)
+        .map_err(|error| inconsistent(error, unsent_outcome(&target, 0, 0)))?;
     let ask_again = named && !automatic;
     let mut asked_again = Vec::new();
     let mut set_aside = Vec::new();
+    let mut too_large = Vec::new();
     let mut selected_branches = Vec::new();
     for head in original.heads() {
         let branch = head
@@ -253,6 +259,19 @@ pub(super) fn run(
                 continue;
             }
             asked_again.push(head.name().to_owned());
+        }
+        if automatic
+            && let Some(&limit) = oversized.get(head.name())
+            && crate::domain::privacy_git::event_entries_exceed(&repo, head.oid(), limit)?
+        {
+            ui::info(format_args!(
+                "{}",
+                ui::dim(&format!(
+                    "  skipping {branch} (larger than the Hub accepts)"
+                ))
+            ));
+            too_large.push((branch.to_owned(), limit));
+            continue;
         }
         // A session push cannot require reconciling an independently advanced shared-file line.
         // Explicit selections still admit main through the ordinary publication checks.
@@ -289,6 +308,15 @@ pub(super) fn run(
         ui::error(&format!(
             "{repository}@{} is withdrawn on the Hub; it stays in this checkout and was not pushed",
             set_aside.join(", ")
+        ));
+        return Ok(ExitCode::Policy);
+    }
+    if named && let Some((branch, limit)) = too_large.first() {
+        let _ = warmed.join();
+        resolving.finish();
+        ui::error(&format!(
+            "{repository}@{branch} {} (at most {limit} in one session snapshot); it stays in this checkout and was not pushed",
+            crate::commands::push::OVERSIZED
         ));
         return Ok(ExitCode::Policy);
     }
@@ -833,6 +861,72 @@ pub(super) fn run(
                     format!("{target} is published on the Hub, but agit could not record that the Hub accepted the refs it had set aside as withdrawn"),
                 )
             })?;
+        }
+        let acknowledged_heads: Vec<String> = report
+            .heads
+            .iter()
+            .flat_map(|phase| &phase.attempts)
+            .flat_map(|attempt| &attempt.refs)
+            .filter(|published| published.status != PublicationStatus::Unconfirmed)
+            .map(|published| published.reference.name().to_owned())
+            .filter(|name| oversized.contains_key(name))
+            .collect();
+        if !acknowledged_heads.is_empty() {
+            crate::domain::privacy_git::clear_oversized(&repo, &identity, &acknowledged_heads)
+                .map_err(|error| {
+                    inconsistent(
+                        error,
+                        format!("{target} is published on the Hub, but agit could not record that the Hub accepted it, so automatic uploads may still leave it out"),
+                    )
+                })?;
+        }
+        if let Some(limit) = [&report.heads, &report.tags]
+            .into_iter()
+            .flatten()
+            .flat_map(|phase| &phase.attempts)
+            .find_map(|attempt| attempt.outcome.event_entry_limit())
+        {
+            let mut refused = Vec::new();
+            for branch in &part_branches {
+                if let Some(head) = reviewed_heads.get(branch)
+                    && crate::domain::privacy_git::event_entries_exceed(&repo, head, limit)?
+                {
+                    refused.push(branch.clone());
+                }
+            }
+            if let Some(first) = refused.first() {
+                let names: Vec<String> = refused
+                    .iter()
+                    .map(|branch| format!("refs/heads/{branch}"))
+                    .collect();
+                crate::domain::privacy_git::mark_oversized(&repo, &identity, &names, limit)
+                    .map_err(|error| {
+                        inconsistent(
+                            error,
+                            format!("the Hub refused {target} as larger than it accepts, but agit could not record it, so the next automatic push uploads it again"),
+                        )
+                    })?;
+                if in_parts {
+                    ui::error(&format!(
+                        "part {part} of {total} did not complete; {published} parts before it are published"
+                    ));
+                }
+                ui::error(&format!(
+                    "{repository}@{} {} (at most {limit} in one session snapshot), so the Hub refused it",
+                    refused.join(", "),
+                    crate::commands::push::OVERSIZED
+                ));
+                #[cfg(windows)]
+                use crate::ui::quote_powershell_argument as quote_arg;
+                #[cfg(not(windows))]
+                use crate::ui::session::shell_arg as quote_arg;
+                ui::hint(&format!(
+                    "it stays in this checkout and automatic uploads leave it out; `agit push {}` asks the Hub again",
+                    quote_arg(&format!("{slug}@{first}"))
+                ));
+                ui::error(&publication_recovery(&report, &retry_command, &repository));
+                return Ok(ExitCode::Policy);
+            }
         }
         let withdrawn: Vec<String> = [&report.heads, &report.tags]
             .into_iter()
