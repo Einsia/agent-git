@@ -1070,6 +1070,22 @@ impl Daemon {
                         )
                     })?,
             };
+            // A non-owner's message runs in the mode the conversation runs in now, which must be
+            // Default or Plan: a Codex thread's is read from its index now, never its history;
+            // a Claude Code terminal's can change without being recorded, so it cannot be read
+            // and the terminal stays the owner's.
+            if !caller.is_owner() {
+                let current = match &claude {
+                    Some(_) => None,
+                    None => crate::rc::native_settings::current_local_codex_mode(
+                        &transcript,
+                        &request.session_id,
+                    ),
+                };
+                crate::rc::turn_mode::require(false, current)
+                    .map_err(|refused| refused.rpc_error())?;
+                mode_bound = current;
+            }
             let internal =
                 |error: anyhow::Error| RpcError::new(ErrorCode::Internal, error.to_string());
             let native = match claude {

@@ -3931,3 +3931,127 @@ async fn local_session_list_protects_labels_under_their_source_link() {
         Some("repository_unavailable")
     );
 }
+
+/// Pins the non-owner mode rule (`rc::turn_mode`) on a native message to a local Codex
+/// conversation (no source), read from the Codex index when the message is prepared and again
+/// when it is delivered. In Default, an operator's message is prepared; once the index says Auto,
+/// that prepared message is refused at delivery and a new one is refused when prepared, each
+/// `mode_owner_only`; the owner's is not. With the index gone the mode can't be read and the
+/// operator is refused too. A path that read the transcript's history, or checked only when
+/// preparing, put an operator's words into a turn that acts without asking.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn",
+    ) {
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let codex = base.join("codex");
+    let bin = base.join("bin");
+    let day = codex.join("sessions/2026/11/01");
+    for directory in [&project, &day, &bin] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    // A stand-in `codex` on PATH; preparing a message only resolves it.
+    let program = bin.join("codex");
+    std::fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // SAFETY: this case runs alone in its own process.
+    unsafe {
+        std::env::set_var("AGIT_HOME", base.join("agit"));
+        std::env::set_var("CODEX_HOME", &codex);
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    }
+    let native = uuid::Uuid::new_v4().to_string();
+    let transcript = day.join(format!("rollout-2026-11-01T00-00-00-{native}.jsonl"));
+    std::fs::write(
+        &transcript,
+        [
+            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":project}}),
+            serde_json::json!({"type":"turn_context","payload":{
+                "approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"}}}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let index = codex.join("state_1.sqlite");
+    let database = rusqlite::Connection::open(&index).unwrap();
+    database.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, model TEXT, reasoning_effort TEXT, approval_mode TEXT, sandbox_policy TEXT)").unwrap();
+    database
+        .execute(
+            "INSERT INTO threads VALUES (?1,?2,?3,'question','cli',1,0,'fixture','high','on-request','{\"type\":\"workspace-write\"}')",
+            rusqlite::params![native, transcript.to_str(), project.to_str()],
+        )
+        .unwrap();
+    drop(database);
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", &project).unwrap();
+    let local: crate::protocol::LocalSession = serde_json::from_value(serde_json::json!({
+        "runtime_session_id": native,
+        "runtime": "codex",
+        "cwd": project,
+        "modified_at": "2026-11-01T00:00:00Z",
+    }))
+    .unwrap();
+    let message = |state: &Daemon, role: &str| {
+        let mut frame = Frame::request(
+            method::SESSION_ENQUEUE,
+            serde_json::json!({"workspace_id":"ws-a","session_id":native,
+                "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
+        );
+        frame.caller = Some(claim(role, "ws-a"));
+        state.prepare_native_inbox(&frame, Some(local.clone()))
+    };
+    let reason = |error: RpcError| {
+        error
+            .data
+            .and_then(|data| data["reason"].as_str().map(str::to_owned))
+    };
+    let owner_only = Some("mode_owner_only".to_owned());
+    let prepared = message(&state, "operator").unwrap_or_else(|error| panic!("{}", error.message));
+    assert!(prepared.validate_source().is_ok());
+
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE threads SET approval_mode='never', sandbox_policy='{\"type\":\"workspace-write\"}'",
+            [],
+        )
+        .unwrap();
+    let refused = prepared
+        .validate_source()
+        .err()
+        .and_then(|error| error.downcast::<RpcError>().ok())
+        .expect("the operator's message is refused at delivery");
+    assert_eq!(refused.data.as_ref().unwrap()["mode"], "auto");
+    assert_eq!(reason(refused), owner_only);
+    assert_eq!(
+        message(&state, "operator").err().and_then(reason),
+        owner_only
+    );
+    assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
+
+    std::fs::remove_file(&index).unwrap();
+    assert_eq!(
+        message(&state, "operator").err().and_then(reason),
+        owner_only
+    );
+    assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
+}

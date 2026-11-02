@@ -2045,3 +2045,121 @@ async fn pending_input_remains_stoppable_and_approvable_without_losing_its_guard
     assert!(input_task.await.unwrap().response.is_ok());
     assert!(!daemon.lock().await.sessions.contains_key("session-a"));
 }
+
+/// Pins the RPC half of the non-owner mode rule (`rc::turn_mode`), through `prepare_session_rpc`:
+/// an operator's `turn.start`, `turn.steer` and `session.enqueue` into an Auto or AcceptEdits
+/// session, or one whose mode the device cannot read, are refused `mode_owner_only`, `not_sent`,
+/// before anything is queued; into Default or Plan they go on. A start is judged by the mode the
+/// next turn starts in (a queued mode first), a steer by the running turn's. The owner goes on in
+/// every mode. A daemon that judged only Bypass let an operator drive a session the owner set to
+/// act without asking.
+#[test]
+fn a_non_owners_words_enter_only_a_default_or_plan_turn() {
+    use crate::protocol::PermissionMode as M;
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let frames = |role: &str| {
+                    let caller = claim(role, "ws-a");
+                    let mut start = Frame::request(
+                        method::TURN_START,
+                        TurnStart {
+                            session_id: "session-a".into(),
+                            message: "inspect".into(),
+                            by: None,
+                            client_msg_id: Some("message-start".into()),
+                        },
+                    );
+                    start.caller = Some(caller.clone());
+                    let mut steer = Frame::request(
+                        method::TURN_STEER,
+                        TurnSteer {
+                            session_id: "session-a".into(),
+                            message: "inspect".into(),
+                            by: None,
+                            client_msg_id: Some("message-steer".into()),
+                        },
+                    );
+                    steer.caller = Some(caller.clone());
+                    let mut enqueue = Frame::request(
+                        method::SESSION_ENQUEUE,
+                        serde_json::json!({
+                            "workspace_id": "ws-a",
+                            "session_id": "session-a",
+                            "client_msg_id": uuid::Uuid::new_v4().to_string(),
+                            "message": "inspect",
+                        }),
+                    );
+                    enqueue.caller = Some(caller);
+                    [("start", start), ("steer", steer), ("enqueue", enqueue)]
+                };
+                // What each RPC gets for a session in `current` with `pending` queued for the
+                // next turn: `None` when it goes on past the mode rule.
+                let refused = |role: &str, current: Option<M>, pending: Option<M>| {
+                    let (tx, _rx) = mpsc::channel(4);
+                    let mut live = rpc_test_live("session-a", 1, tx, M::Default);
+                    live.info.permission_mode = current;
+                    live.pending_mode = pending;
+                    let daemon = rpc_test_daemon(
+                        HashMap::from([("session-a".to_owned(), live)]),
+                        Roster::default(),
+                    );
+                    let mut state = daemon.try_lock().unwrap();
+                    frames(role).map(|(name, frame)| {
+                        let result = state.prepare_session_rpc(&frame).map(drop);
+                        let refusal = result.err().filter(|error| {
+                            error.data.as_ref().and_then(|data| data.get("reason"))
+                                == Some(&serde_json::json!("mode_owner_only"))
+                        });
+                        if let Some(error) = &refusal {
+                            assert_eq!(error.code, ErrorCode::Forbidden as i32, "{name}");
+                            // The refusal names the mode the turn would run in, as the protocol
+                            // spells it, and only when it can be read.
+                            let judged = if name == "steer" {
+                                current
+                            } else {
+                                pending.or(current)
+                            };
+                            assert_eq!(
+                                error.data.as_ref().unwrap().get("mode"),
+                                judged.map(|mode| serde_json::json!(mode)).as_ref(),
+                                "{name}"
+                            );
+                            assert_eq!(
+                                error.data.as_ref().unwrap()["outcome"],
+                                "not_sent",
+                                "{name}"
+                            );
+                        }
+                        (name, refusal.is_some())
+                    })
+                };
+                let all =
+                    |refused: bool| [("start", refused), ("steer", refused), ("enqueue", refused)];
+                for mode in [M::Default, M::Plan] {
+                    assert_eq!(
+                        refused("operator", Some(mode), None),
+                        all(false),
+                        "{mode:?}"
+                    );
+                }
+                for mode in [Some(M::Auto), Some(M::AcceptEdits), None] {
+                    assert_eq!(refused("operator", mode, None), all(true), "{mode:?}");
+                    assert_eq!(refused("owner", mode, None), all(false), "{mode:?}");
+                }
+                // A start runs in the mode queued for the next turn, a steer in the running one.
+                assert_eq!(
+                    refused("operator", Some(M::Default), Some(M::Auto)),
+                    [("start", true), ("steer", false), ("enqueue", true)]
+                );
+                assert_eq!(
+                    refused("operator", Some(M::Auto), Some(M::Plan))[..2],
+                    [("start", false), ("steer", true)]
+                );
+            });
+    });
+}

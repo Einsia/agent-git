@@ -33,6 +33,14 @@ pub const RPC_FEATURES: &[&str] = &[
     // `session.resume` takes `attach_only` (join a running conversation, never launch one) and
     // replies `launched: true` when it started the runtime.
     "session-resume-attach-only-v1",
+    // A non-owner (any caller the device doesn't see as the owner) may add words to a turn only
+    // when it runs in Default or Plan: turn.start, turn.steer, session.enqueue (live and native),
+    // queued next-turn delivery, approval notes, and the source and inbox paths. Control-ceiling
+    // tokens count as non-owners: the Hub's narrow() forwards them as role operator, and
+    // is_owner() is role == "owner". A mode that can't be read is refused, and a Claude Code
+    // terminal's mode is never read. Checked at the RPC and again at delivery (a non-owner's
+    // approval note is replaced at delivery, in every mode). ExitPlanMode is not covered.
+    "nonowner-turn-mode-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

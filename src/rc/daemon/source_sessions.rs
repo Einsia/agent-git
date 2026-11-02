@@ -888,6 +888,93 @@ mod tests {
         });
     }
 
+    /// Pins the non-owner mode rule (`rc::turn_mode`) on a running session of a native source,
+    /// read from the Codex index now and never from the mode the daemon cached. The owner opened
+    /// it in Auto (admitted Auto) and the daemon's cached mode says Default: an operator's
+    /// `turn.start`, `turn.steer` and `session.enqueue` are refused `mode_owner_only`, the
+    /// owner's are not. Once the index says Default the operator's words go on. A rule that read
+    /// the cached mode, or held a non-owner only to the admitted mode, let the operator drive a
+    /// thread the owner set to act without asking.
+    #[tokio::test]
+    async fn a_non_owner_is_held_to_default_or_plan_on_a_source_session_the_owner_opened_looser() {
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let roots = policy::CanonicalRoots::from_untrusted([project.clone()]);
+            let native = uuid::Uuid::new_v4().to_string();
+            let source = source_conversation(
+                root.path(),
+                &project,
+                &native,
+                &[("on-request", "workspace-write")],
+                ("never", "workspace-write"),
+            );
+            crate::rc::runtime_catalog::Catalog::open()
+                .unwrap()
+                .reconcile(&roots)
+                .unwrap();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut live = super::super::tests::rpc_test_live(
+                &native,
+                1,
+                tx,
+                crate::protocol::PermissionMode::Default,
+            );
+            live.info.runtime = "codex".into();
+            live.info.workspace_id = "ws".into();
+            live.info.native_source = Some(NativeSourceRef {
+                source_id: source.source_id.clone(),
+                generation: source.generation,
+            });
+            live.runtime_thread_id = Some(native.clone());
+            live.admitted_mode = Some(crate::protocol::PermissionMode::Auto);
+            let daemon = super::super::tests::rpc_test_daemon(
+                HashMap::from([(native.clone(), live)]),
+                Roster::default(),
+            );
+            let mut state = daemon.try_lock().unwrap();
+            state.opts.local_owner = true;
+            state.mirror.bind("ws", "project", &project).unwrap();
+            let reasons = |state: &mut Daemon, role: &str| {
+                let caller = crate::protocol::CallerClaim {
+                    account_id: Some("member".into()),
+                    username: None,
+                    role: role.into(),
+                    workspace_id: "ws".into(),
+                };
+                [
+                    (method::TURN_START, serde_json::json!({"session_id":native,"message":"hello","client_msg_id":"start"})),
+                    (method::TURN_STEER, serde_json::json!({"session_id":native,"message":"hello","client_msg_id":"steer"})),
+                    (method::SESSION_ENQUEUE, serde_json::json!({"workspace_id":"ws","session_id":native,"client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"})),
+                ]
+                .map(|(name, params)| {
+                    let mut frame = Frame::request(name, params);
+                    frame.caller = Some(caller.clone());
+                    state
+                        .prepare_session_rpc(&frame)
+                        .map(drop)
+                        .err()
+                        .and_then(|error| {
+                            error.data.and_then(|data| data["reason"].as_str().map(str::to_owned))
+                        })
+                        == Some("mode_owner_only".to_owned())
+                })
+            };
+            assert_eq!(reasons(&mut state, "operator"), [true; 3]);
+            assert_eq!(reasons(&mut state, "owner"), [false; 3]);
+            rusqlite::Connection::open(root.path().join(format!("home-{native}/state_1.sqlite")))
+                .unwrap()
+                .execute(
+                    "UPDATE threads SET approval_mode='on-request', sandbox_policy='{\"type\":\"workspace-write\"}'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(reasons(&mut state, "operator"), [false; 3]);
+        });
+    }
+
     /// Pins that a non-owner is judged only by the mode the Codex index records now, at all four
     /// places a non-owner reaches a source thread: a turn in a running session, a native message,
     /// its delivery, and a resume. The rollout's history says Default throughout. With the index

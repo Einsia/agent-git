@@ -138,6 +138,12 @@ pub(super) fn current_codex_mode_in(
         .and_then(|settings| settings.permission_mode)
 }
 
+/// [`current_codex_mode_in`] for a thread of this machine's default Codex home.
+pub(super) fn current_local_codex_mode(path: &Path, session: &str) -> Option<PermissionMode> {
+    let home = crate::adapter::codex::codex_home().ok()?;
+    current_codex_mode_in(&home, path, session)
+}
+
 /// Whether `caller` may still drive or message a Codex thread of a native source whose current
 /// mode is `current`, bounded by `admitted`. A native client can change the thread's mode at any
 /// time, so a non-owner's turn, steer or message holds only while the current mode, read from
