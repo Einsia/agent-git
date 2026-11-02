@@ -711,9 +711,15 @@ fn run_telemetry_inner(cwd: &Path) -> crate::CmdResultAlias {
         // No candidate means no empty shell: making the user press q at an empty list wastes
         // an interaction.
         println!("no session to continue in this directory.");
-        crate::ui::hint(
-            "adopt one with `agit import`, or start a fresh one with `agit new -b <name>`",
-        );
+        // A directory `agit clone` bound holds no session of its own; its repository's do.
+        match crate::commands::clone::pick_up_command(cwd) {
+            Some(command) => crate::ui::hint(&format!(
+                "pick up its repository's latest session with `{command}`; or adopt one with `agit import`, or start a fresh one with `agit new -b <name>`"
+            )),
+            None => crate::ui::hint(
+                "adopt one with `agit import`, or start a fresh one with `agit new -b <name>`",
+            ),
+        }
         return Ok(crate::ExitCode::Ok);
     }
     widgets::refresh_rc_status();

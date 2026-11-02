@@ -812,6 +812,27 @@ fn default_checkout(repo: &Repo) -> Option<String> {
 }
 
 /// Local branches, most recently committed first.
+/// The command that picks up the latest session of the repository `agit clone` bound `dir` to,
+/// as it runs when copied: `None` when `dir` is not bound or the repository has no session
+/// branch here.
+pub(crate) fn pick_up_command(dir: &Path) -> Option<String> {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    let dir = dir.canonicalize().ok()?;
+    let slug = crate::domain::workspace::read(&dir)?.repo;
+    let (owner, name) = super::parse_slug(&slug).ok()?;
+    let store = Repo::open(config::repo_dir(&owner, &name).ok()?)?;
+    let branch = local_branches(&store)
+        .into_iter()
+        .find(|branch| !meta::is_file_line_at(&store, &format!("refs/heads/{branch}")))?;
+    Some(format!(
+        "agit run {}",
+        quote_arg(&format!("{slug}@{branch}"))
+    ))
+}
+
 fn local_branches(repo: &Repo) -> Vec<String> {
     repo.git_opt(&[
         "for-each-ref",

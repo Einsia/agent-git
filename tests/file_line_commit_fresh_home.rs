@@ -200,6 +200,61 @@ fn new_on_an_empty_checkout_lays_down_the_main_file_line() {
     );
 }
 
+/// `agit new` on a session line suggests a fork that runs as printed: it names the repository and
+/// a free branch name. A suggestion without the repository fails with "no explicit session
+/// target". PowerShell quotes the target, so the exact text is Unix's.
+#[cfg(unix)]
+#[test]
+fn new_on_a_session_line_suggests_a_fork_that_runs_as_printed() {
+    use clap::Parser as _;
+    let lab = Lab::new();
+    let repo = lab.agit_home.join("repos").join("simco").join("lumen");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+    lab.ok(&[
+        "new",
+        "simco/lumen",
+        "-b",
+        "first",
+        "--as",
+        "codex",
+        "--no-launch",
+        "--fresh",
+    ]);
+    let refused = lab.agit(&[
+        "new",
+        "simco/lumen@first",
+        "-b",
+        "second",
+        "--as",
+        "codex",
+        "--no-launch",
+        "--fresh",
+    ]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned()
+        + &String::from_utf8_lossy(&refused.stdout);
+    let suggested = said
+        .split('`')
+        .find(|part| part.starts_with("agit fork "))
+        .unwrap_or_else(|| panic!("no fork suggested: {said}"));
+    assert_eq!(
+        suggested,
+        "agit fork simco/lumen@first -b first-fork-1 --resume"
+    );
+    let words: Vec<&str> = suggested.split_whitespace().collect();
+    agit::commands::Cli::try_parse_from(&words).unwrap();
+    // Without `--resume`, which would launch Codex, the same source and name fork.
+    lab.ok(&words[1..words.len() - 1]);
+    assert_eq!(
+        git(
+            &repo,
+            &["merge-base", "refs/heads/first", "refs/heads/first-fork-1"]
+        ),
+        git(&repo, &["rev-parse", "refs/heads/first"])
+    );
+}
+
 /// File commits preserve code symbols and artifact references in the canonical Git tree.
 #[test]
 fn file_commit_preserves_code_and_artifact_references() {
