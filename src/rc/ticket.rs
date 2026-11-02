@@ -90,6 +90,11 @@ impl<T> Ticket<T> {
         self
     }
 
+    /// Whether the workspace owner sent this instruction (internal tickets count as the owner).
+    pub(crate) fn owner_control(&self) -> bool {
+        self.owner_control
+    }
+
     /// The request's authority still admits it.
     pub(crate) fn check_authority(&self) -> crate::Result<()> {
         self.authority

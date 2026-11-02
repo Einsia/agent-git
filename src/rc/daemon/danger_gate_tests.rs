@@ -488,6 +488,46 @@ fn caller_in(role: &str, workspace: &str) -> CallerClaim {
     }
 }
 
+/// A non-owner's message to a local Codex conversation is refused at the inbox RPC with the typed
+/// `codex_unconfined`; the owner's is not refused for that reason.
+#[tokio::test]
+async fn a_non_owners_inbox_message_to_codex_is_refused() {
+    let cwd = tempfile::tempdir().unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let daemon = super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project-a", cwd.path()).unwrap();
+    let local = || -> crate::protocol::LocalSession {
+        serde_json::from_value(serde_json::json!({"runtime_session_id":session,
+            "runtime":"codex","cwd":cwd.path(),"modified_at":"2026-11-01T00:00:00Z",
+            "likely_active":false}))
+        .unwrap()
+    };
+    let enqueue = |role: &str| {
+        let mut frame = Frame::request(
+            method::SESSION_ENQUEUE,
+            serde_json::json!({"workspace_id":"ws-a","session_id":session,
+                "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
+        );
+        frame.caller = Some(caller_in(role, "ws-a"));
+        frame
+    };
+    let reason = |result: Result<crate::rc::native_inbox::Prepared, RpcError>| {
+        result
+            .err()
+            .and_then(|error| error.data)
+            .and_then(|data| data.get("reason").cloned())
+    };
+    assert_eq!(
+        reason(state.prepare_native_inbox(&enqueue("operator"), Some(local()))),
+        Some(serde_json::json!("codex_unconfined"))
+    );
+    assert_ne!(
+        reason(state.prepare_native_inbox(&enqueue("owner"), Some(local()))),
+        Some(serde_json::json!("codex_unconfined"))
+    );
+}
+
 /// Pins the gate on messages sent to a live terminal Claude Code session (`session.enqueue`)
 /// against the transcript's own mode. The terminal runs in a folder of the workspace and the
 /// ledger has no row for it. While its transcript records `bypassPermissions`, an operator's

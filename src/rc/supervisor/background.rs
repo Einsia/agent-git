@@ -22,6 +22,30 @@ fn instruction(command: &Command) -> bool {
 }
 
 impl Session {
+    /// A non-owner's turn, steer or queued message into a Codex conversation is refused with
+    /// the typed `CodexUnconfined`, in every permission mode; `None` when it was. Codex can't
+    /// confine a turn (reads, environment, MCP tools run outside its sandbox).
+    pub(super) fn refuse_unconfined(&mut self, command: Command) -> Option<Command> {
+        if !matches!(self.driver, AnyDriver::Codex(_)) {
+            return Some(command);
+        }
+        match command {
+            Command::Turn { reply, .. } if !reply.owner_control() => {
+                reply.finish(Ok(TurnStartOutcome::CodexUnconfined));
+                None
+            }
+            Command::Steer { reply, .. } if !reply.owner_control() => {
+                reply.finish(Err(crate::rc::harness::CodexUnconfined.into()));
+                None
+            }
+            Command::Enqueue { reply, .. } if !reply.owner_control() => {
+                reply.finish(Err(crate::rc::harness::CodexUnconfined.into()));
+                None
+            }
+            command => Some(command),
+        }
+    }
+
     pub(super) async fn prepare_fallback_instruction(
         &mut self,
         command: &Command,

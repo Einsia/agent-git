@@ -50,6 +50,48 @@ impl std::fmt::Display for TurnNotRunning {
 
 impl std::error::Error for TurnNotRunning {}
 
+/// What a non-owner is told for any message into a Codex conversation. It names the rule only.
+pub(crate) const CODEX_UNCONFINED: &str =
+    "Until agit on this device is updated, others can't send to Codex conversations.";
+
+/// A non-owner's message into a Codex conversation, refused: Codex can't confine a turn to the
+/// workspace (reads, environment, tools it runs outside its sandbox), in any permission mode.
+/// Nothing was sent.
+#[derive(Debug)]
+pub(crate) struct CodexUnconfined;
+
+impl std::fmt::Display for CodexUnconfined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(CODEX_UNCONFINED)
+    }
+}
+
+impl std::error::Error for CodexUnconfined {}
+
+impl CodexUnconfined {
+    pub(crate) fn rpc_error() -> crate::protocol::RpcError {
+        let mut error =
+            crate::protocol::RpcError::new(crate::protocol::ErrorCode::Forbidden, CODEX_UNCONFINED);
+        error.data = Some(serde_json::json!({
+            "outcome": "not_sent",
+            "retryable": false,
+            "reason": "codex_unconfined"
+        }));
+        error
+    }
+
+    /// Refuse when `caller_is_owner` is false and the conversation is Codex.
+    pub(crate) fn check(
+        runtime: &str,
+        caller_is_owner: bool,
+    ) -> Result<(), crate::protocol::RpcError> {
+        if runtime == "codex" && !caller_is_owner {
+            return Err(Self::rpc_error());
+        }
+        Ok(())
+    }
+}
+
 /// An attach-only opening found no terminal to join when its driver was chosen (it may have
 /// exited after the opening was admitted). Nothing was launched.
 #[derive(Debug)]
@@ -427,6 +469,8 @@ pub enum TurnStartOutcome {
     FatalNotAccepted { message: String },
     /// Shared acceptance is uncertain; keep observing without resending the prompt.
     SharedUnknown { message: String },
+    /// A non-owner's turn into a Codex conversation (`CodexUnconfined`); nothing was written.
+    CodexUnconfined,
     /// A non-owner's prompt, refused before any native bytes were written because the turn
     /// would run in a mode only the owner may use (see `rc::turn_mode`).
     ModeOwnerOnly { mode: Option<PermissionMode> },

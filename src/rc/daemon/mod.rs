@@ -1321,6 +1321,16 @@ fn project_turn_start_outcome(
                 "the harness explicitly rejected the turn; no prompt or queued mode was applied",
             )),
         ),
+        TurnStartOutcome::CodexUnconfined => (
+            SessionRpcCompletion::Turn {
+                guard_attempt,
+                accepted_mode: None,
+                confirmation: None,
+                fail_closed: false,
+                retire_generation: false,
+            },
+            Err(crate::rc::harness::CodexUnconfined::rpc_error()),
+        ),
         TurnStartOutcome::ModeOwnerOnly { mode } => (
             SessionRpcCompletion::Turn {
                 guard_attempt,
@@ -1960,6 +1970,9 @@ fn map_receipt<T>(
             let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
             Err(error)
+        }
+        Ok(Err(error)) if error.is::<crate::rc::harness::CodexUnconfined>() => {
+            Err(crate::rc::harness::CodexUnconfined::rpc_error())
         }
         Ok(Err(error)) => Err(RpcError::new(ErrorCode::Internal, error.to_string())),
         Err(_) => Err(RpcError::new(ErrorCode::Internal, "session went away")),

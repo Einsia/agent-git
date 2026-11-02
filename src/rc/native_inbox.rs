@@ -104,6 +104,8 @@ pub struct Prepared {
     pub(crate) authority: super::authority::Guard,
     pub(crate) confinement: Option<tokio::sync::watch::Receiver<super::Confinement>>,
     pub(crate) allow_dangerous: bool,
+    /// Whether the workspace owner sent the message: a Codex conversation takes only theirs.
+    pub(crate) caller_is_owner: bool,
     /// For a non-owner's message to a source conversation, the loosest mode its thread may be in
     /// when the message is submitted, checked against the index's current mode right before each
     /// submission.
@@ -247,6 +249,9 @@ impl Prepared {
     }
 
     pub async fn deliver(self) -> crate::Result<Value> {
+        if matches!(self.native, Native::Codex(_)) && !self.caller_is_owner {
+            return Err(super::harness::CodexUnconfined::rpc_error().into());
+        }
         self.request.validate()?;
         self.validate_source()?;
         self.validate_native().await?;
@@ -506,6 +511,7 @@ mod tests {
             authority: Default::default(),
             confinement: None,
             allow_dangerous: true,
+            caller_is_owner: true,
             mode_bound: None,
             request: Request {
                 workspace_id: "workspace".into(),
@@ -521,6 +527,33 @@ mod tests {
             username: Some("collaborator".into()),
             receipts: root.join("receipts"),
         }
+    }
+
+    /// A non-owner's message into a Codex conversation is refused at delivery with the typed
+    /// refusal, before anything is validated or written.
+    #[tokio::test]
+    async fn a_non_owners_message_to_codex_is_refused_at_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = prepared(
+            root.path(),
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        value.caller_is_owner = false;
+        let error = value
+            .deliver()
+            .await
+            .unwrap_err()
+            .downcast::<crate::protocol::RpcError>()
+            .unwrap();
+        assert_eq!(
+            error.data.unwrap()["reason"],
+            serde_json::json!("codex_unconfined")
+        );
+        assert!(
+            !root.path().join("receipts").exists(),
+            "nothing was written"
+        );
     }
 
     #[test]
