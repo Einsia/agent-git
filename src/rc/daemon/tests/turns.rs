@@ -1921,6 +1921,20 @@ fn only_a_typed_idle_steer_refusal_authorizes_resubmitting_input() {
     assert!(uncertain.data.is_none());
 }
 
+/// A turn-fenced interrupt a runtime cannot honour answers with a fixed error: the relay logs it
+/// and retries nothing.
+#[test]
+fn an_unsupported_turn_fence_is_a_fixed_error() {
+    let error =
+        super::super::map_receipt::<()>(Ok(Err(crate::rc::harness::FenceUnsupported.into())))
+            .unwrap_err();
+    assert!(error.is(crate::protocol::ErrorCode::SessionBusy));
+    let data = error.data.unwrap();
+    assert_eq!(data["outcome"], "not_sent");
+    assert_eq!(data["reason"], "fence_unsupported");
+    assert_eq!(data["retryable"], false);
+}
+
 // Input can wait for a tool decision. Its receipt must not prevent that decision
 // or a stop, and completing either must not release the input's restart guard.
 #[tokio::test]
