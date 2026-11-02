@@ -694,8 +694,8 @@ fn held_notice(held: &super::project::HeldEarlier, session: &str) -> String {
     )
 }
 
-/// One line for the person when the last automatic upload of this folder's project failed, said
-/// once per failure, with a reason from a fixed set and nothing of the error itself.
+/// One line for the person when the last automatic upload of this conversation failed, said once
+/// per failure, with a reason from a fixed set and nothing of the error itself.
 fn failure_line(runtime: &str, session: &str, origin: &std::path::Path) -> Option<String> {
     let origin = origin
         .canonicalize()
