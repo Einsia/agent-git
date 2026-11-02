@@ -937,13 +937,27 @@ impl ClaudeCodeDriver {
                 .map(|m| m.as_deref())
                 .unwrap_or(self.model_choice.as_deref().or(self.model.as_deref()));
             let selected = super::models::selected(&self.model_catalog, desired);
+            // A model is named only from this session's catalog, whoever asks: an id it doesn't
+            // list is refused here, and the catalog's own id is what Claude Code is sent.
+            let model = match &patch.model {
+                Some(Some(_)) => Some(Some(
+                    selected
+                        .and_then(|entry| entry["id"].as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("This model is absent from the native catalog")
+                        })?
+                        .to_string(),
+                )),
+                Some(None) => Some(None),
+                None => None,
+            };
             let supports_effort = super::models::efforts(selected)
                 .as_array()
                 .is_some_and(|values| !values.is_empty());
             if let Some(Some(effort)) = &patch.effort {
                 super::models::check_effort(selected, effort)?;
             }
-            if let Some(model) = &patch.model {
+            if let Some(model) = &model {
                 self.model_request(json!({"subtype":"set_model","model":model}))
                     .await?;
             }
@@ -1892,6 +1906,73 @@ for line in sys.stdin:
         assert_eq!(state["effort_known"], true);
         driver.current_turn = Some("active".into());
         assert!(driver.model_control(Some(&patch)).await.is_err());
+        driver.shutdown().await.unwrap();
+    }
+
+    /// Pins that a model is named only from the session's catalog, for every caller: an id the
+    /// catalog doesn't list is refused before anything reaches Claude Code, and one it does list
+    /// (by id or by the model it resolves to) is sent as the catalog's own id, never as the
+    /// caller's string.
+    #[tokio::test]
+    async fn a_model_outside_the_catalog_is_refused_before_claude_hears_of_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("requests");
+        let mut driver = probe();
+        driver.proc.shutdown().await.unwrap();
+        let script = r#"import sys,json
+out=open(sys.argv[1],'a')
+for line in sys.stdin:
+    v=json.loads(line)
+    out.write(json.dumps(v['request'])+'\n'); out.flush()
+    print(json.dumps({'type':'control_response','response':{'request_id':v['request_id'],'subtype':'success','response':{}}}),flush=True)
+"#;
+        driver.proc = Proc::spawn(
+            "python3",
+            &[
+                "-u".into(),
+                "-c".into(),
+                script.into(),
+                written.to_string_lossy().into(),
+            ],
+            &PathBuf::from("/"),
+            &[],
+        )
+        .unwrap();
+        driver.model_catalog = vec![json!({
+            "id":"opus","native":{"resolvedModel":"claude-opus-test"},"efforts":[]
+        })];
+        let requests = || {
+            std::fs::read_to_string(&written)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for outside in ["claude-unlisted", "Opus"] {
+            let patch = super::super::models::ModelPatch::parse(&json!({"model":outside})).unwrap();
+            assert!(
+                driver.model_control(Some(&patch)).await.is_err(),
+                "{outside:?}"
+            );
+        }
+        assert_eq!(
+            requests(),
+            Vec::<Value>::new(),
+            "nothing reached Claude Code"
+        );
+        let patch =
+            super::super::models::ModelPatch::parse(&json!({"model":"claude-opus-test"})).unwrap();
+        let state = driver.model_control(Some(&patch)).await.unwrap();
+        assert_eq!(state["model"], "opus");
+        let sent = requests();
+        assert_eq!(sent[0], json!({"subtype":"set_model","model":"opus"}));
+        let patch = super::super::models::ModelPatch::parse(&json!({"model":null})).unwrap();
+        driver.model_control(Some(&patch)).await.unwrap();
+        assert_eq!(
+            requests().last().unwrap(),
+            &json!({"subtype":"set_model","model":null}),
+            "a reset still goes through"
+        );
         driver.shutdown().await.unwrap();
     }
 
