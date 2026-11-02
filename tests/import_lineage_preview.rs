@@ -1114,8 +1114,11 @@ fn choice(lab: &Lab) -> Dialogue {
     dialogue
 }
 
+/// Nothing is highlighted, so Enter alone neither adopts a candidate, even a unique one, nor
+/// imports independently, nor cancels; Esc cancels and says so. A menu with a highlighted
+/// "Cancel" ends on Enter with nothing imported and no word.
 #[test]
-fn interactive_default_cancel_never_adopts_even_a_unique_candidate() {
+fn enter_alone_never_adopts_even_a_unique_candidate_and_a_cancel_is_said() {
     for existing in [false, true] {
         let lab = Lab::new();
         if existing {
@@ -1125,7 +1128,20 @@ fn interactive_default_cancel_never_adopts_even_a_unique_candidate() {
         let mut dialogue = choice(&lab);
         assert_eq!(lab.state(), before);
         dialogue.send(b"\r");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            dialogue.child.try_wait().unwrap().is_none(),
+            "{}",
+            dialogue.text()
+        );
+        assert_eq!(lab.state(), before);
+        dialogue.send(b"q");
         assert_eq!(dialogue.finish(), 0, "{}", dialogue.text());
+        assert!(
+            dialogue.text().contains("nothing was imported"),
+            "{}",
+            dialogue.text()
+        );
         assert_eq!(lab.state(), before);
     }
 }
@@ -1179,7 +1195,7 @@ fn accepted_lineage_rechecks_native_claim_and_destination_before_adoption() {
                     Ok(()) => {}
                     Err(error) if cfg!(windows) && error.raw_os_error() == Some(5) => {
                         assert_eq!(lab.state(), before);
-                        dialogue.send(b"\r");
+                        dialogue.send(b"q");
                         assert_eq!(dialogue.finish(), 0, "{}", dialogue.text());
                         assert_eq!(lab.state(), before);
                         fs::rename(repo.root(), prior).unwrap();
