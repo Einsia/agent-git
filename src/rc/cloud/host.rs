@@ -274,6 +274,58 @@ async fn still_enrolled(hub: String, device: Device) -> bool {
     )
 }
 
+/// Refusals this host makes itself while admitting an offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRefusal {
+    EnrollmentMissing,
+    InboundDisabled,
+    SourceMismatch,
+    IngressFull,
+}
+impl std::fmt::Display for HostRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EnrollmentMissing => "cloud enrollment is missing",
+            Self::InboundDisabled => "inbound cloud connections are disabled",
+            Self::SourceMismatch => "cloud offer source does not match its grant",
+            Self::IngressFull => "executor ingress is full or stopped",
+        })
+    }
+}
+impl std::error::Error for HostRefusal {}
+
+/// The fixed class an offer's rejection is logged under. It names the check that failed, never
+/// an id, a token or a message from the Hub or the operating system.
+fn rejection_reason(error: &anyhow::Error) -> &'static str {
+    if let Some(refusal) = error.downcast_ref::<agit_peer::client::Refusal>() {
+        return refusal.class();
+    }
+    if let Some(refusal) = error.downcast_ref::<HostRefusal>() {
+        return match refusal {
+            HostRefusal::EnrollmentMissing => "enrollment_missing",
+            HostRefusal::InboundDisabled => "inbound_disabled",
+            HostRefusal::SourceMismatch => "source_mismatch",
+            HostRefusal::IngressFull => "ingress_full",
+        };
+    }
+    if error
+        .downcast_ref::<agit_peer::client::HttpFailure>()
+        .is_some()
+    {
+        return "hub_refused";
+    }
+    if error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+    {
+        return "timed_out";
+    }
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        return "local_io";
+    }
+    "other"
+}
+
 async fn run_executor(
     hub: String,
     worker: Worker,
@@ -321,8 +373,8 @@ async fn run_executor(
                     let accepted = async {
                         let origin = hub.clone();
                         let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
-                            .context("cloud enrollment is missing")?;
-                        ensure!(enrollment.inbound_enabled, "inbound cloud connections are disabled");
+                            .ok_or(HostRefusal::EnrollmentMissing)?;
+                        ensure!(enrollment.inbound_enabled, HostRefusal::InboundDisabled);
                         let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
                         phase = "admission";
                         let config = api.data_config(&enrollment.credential)?;
@@ -331,7 +383,7 @@ async fn run_executor(
                         let verification = async {
                             let started = Instant::now();
                             let grant = api.offered_grant(&enrollment.credential, &grant_token, grant.map(|grant| *grant)).await?;
-                            ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
+                            ensure!(grant.source.id == source_id, HostRefusal::SourceMismatch);
                             Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
                         };
                         let transport = |config| async {
@@ -359,10 +411,10 @@ async fn run_executor(
                         let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
                         phase = "ingress";
                         incoming.try_send(Authenticated { connection, grant, stopped, renewal })
-                            .map_err(|_| anyhow::anyhow!("executor ingress is full or stopped"))?;
+                            .map_err(|_| HostRefusal::IngressFull)?;
                         Ok::<_, anyhow::Error>(())
                     }.await;
-                    if accepted.is_err() { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
+                    if let Err(error) = &accepted { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"reason":rejection_reason(error),"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
                 });
             }
             #[allow(unreachable_code)]
@@ -460,6 +512,42 @@ mod presence_tests {
     use agit_tunnel::Packet;
     use futures_util::poll;
     use tokio::sync::oneshot;
+
+    /// #298: a rejected offer is logged under the check that refused it, and only that: a fixed
+    /// class, the same through any context the error picked up on the way, and nothing from the
+    /// error's own text.
+    #[test]
+    fn a_rejected_offer_names_the_check_that_refused_it() {
+        use agit_peer::client::{HttpFailure, Refusal};
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (Refusal::StaleCredential.into(), "stale_credential"),
+            (Refusal::OtherExecutor.into(), "other_executor"),
+            (Refusal::GrantExpired.into(), "grant_expired"),
+            (Refusal::IssuerMismatch.into(), "issuer_mismatch"),
+            (Refusal::InvalidDelegation.into(), "invalid_delegation"),
+            (HostRefusal::EnrollmentMissing.into(), "enrollment_missing"),
+            (HostRefusal::InboundDisabled.into(), "inbound_disabled"),
+            (HostRefusal::SourceMismatch.into(), "source_mismatch"),
+            (HostRefusal::IngressFull.into(), "ingress_full"),
+            (
+                HttpFailure {
+                    status: 403,
+                    reason: None,
+                }
+                .into(),
+                "hub_refused",
+            ),
+            (
+                std::io::Error::other("secret-path /home/someone").into(),
+                "local_io",
+            ),
+            (anyhow::anyhow!("secret text from somewhere"), "other"),
+        ];
+        for (error, class) in cases {
+            let error = error.context("tunnel worker failed");
+            assert_eq!(rejection_reason(&error), class, "{error:#}");
+        }
+    }
 
     /// An enrollment replacement ends the lifetimes held by old Cloud connections and workers;
     /// a first enrollment and a rename keep them. Retiring on the first enrollment would reset
