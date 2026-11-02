@@ -92,6 +92,39 @@ impl CodexUnconfined {
     }
 }
 
+/// What a non-owner is told for a runtime command. It names the rule only.
+pub(crate) const RUNTIME_COMMAND_OWNER_ONLY: &str =
+    "Only the workspace owner can run this command in this conversation.";
+
+/// A non-owner's runtime command, refused on every runtime at delivery. `session.command` is
+/// owner-only at the RPC (`daemon::min_role`); this holds whatever reaches the session anyway.
+/// Nothing was sent.
+#[derive(Debug)]
+pub(crate) struct RuntimeCommandOwnerOnly;
+
+impl std::fmt::Display for RuntimeCommandOwnerOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(RUNTIME_COMMAND_OWNER_ONLY)
+    }
+}
+
+impl std::error::Error for RuntimeCommandOwnerOnly {}
+
+impl RuntimeCommandOwnerOnly {
+    pub(crate) fn rpc_error() -> crate::protocol::RpcError {
+        let mut error = crate::protocol::RpcError::new(
+            crate::protocol::ErrorCode::Forbidden,
+            RUNTIME_COMMAND_OWNER_ONLY,
+        );
+        error.data = Some(serde_json::json!({
+            "outcome": "not_sent",
+            "retryable": false,
+            "reason": "command_owner_only"
+        }));
+        error
+    }
+}
+
 /// An attach-only opening found no terminal to join when its driver was chosen (it may have
 /// exited after the opening was admitted). Nothing was launched.
 #[derive(Debug)]

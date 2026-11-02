@@ -46,6 +46,20 @@ impl Session {
         }
     }
 
+    /// A non-owner's runtime command is refused with the typed `RuntimeCommandOwnerOnly`, on
+    /// every runtime and whatever the session's mode; `None` when it was. `session.command` is
+    /// owner-only at the RPC, so this holds only what reaches the session another way: approving
+    /// a denied action, uploading the thread as feedback or changing memories acts as the owner.
+    pub(super) fn refuse_owner_only_command(&mut self, command: Command) -> Option<Command> {
+        match command {
+            Command::Runtime { reply, .. } if !reply.owner_control() => {
+                reply.finish(Err(crate::rc::harness::RuntimeCommandOwnerOnly.into()));
+                None
+            }
+            command => Some(command),
+        }
+    }
+
     pub(super) async fn prepare_fallback_instruction(
         &mut self,
         command: &Command,

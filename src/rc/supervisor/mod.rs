@@ -2491,7 +2491,10 @@ impl Session {
                     };
                     // Checked at delivery as well as at the RPC: whatever reaches the session.
                     let cmd = match cmd {
-                        Some(command) => match self.refuse_unconfined(command) {
+                        Some(command) => match self
+                            .refuse_unconfined(command)
+                            .and_then(|command| self.refuse_owner_only_command(command))
+                        {
                             Some(command) => Some(command),
                             None => continue,
                         },

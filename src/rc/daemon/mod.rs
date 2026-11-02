@@ -1974,6 +1974,9 @@ fn map_receipt<T>(
         Ok(Err(error)) if error.is::<crate::rc::harness::CodexUnconfined>() => {
             Err(crate::rc::harness::CodexUnconfined::rpc_error())
         }
+        Ok(Err(error)) if error.is::<crate::rc::harness::RuntimeCommandOwnerOnly>() => {
+            Err(crate::rc::harness::RuntimeCommandOwnerOnly::rpc_error())
+        }
         Ok(Err(error)) => Err(RpcError::new(ErrorCode::Internal, error.to_string())),
         Err(_) => Err(RpcError::new(ErrorCode::Internal, "session went away")),
     }
