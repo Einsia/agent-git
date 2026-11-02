@@ -385,29 +385,41 @@ pub(super) fn choose(args: &mut Args, json: bool) -> crate::Result<Decision> {
         return Ok(Decision::Stop(ExitCode::Interactive));
     }
     print_report(&prepared.report);
-    let mut options = vec!["Cancel without importing".to_owned()];
-    options.extend(prepared.report.candidates.iter().map(|candidate| {
-        format!(
-            "Attach at {}: {} completed turns, {} records ({})",
-            candidate.commit, candidate.completed_turns, candidate.records, candidate.evidence
-        )
-    }));
+    let candidates = prepared.report.candidates.len();
+    let mut options: Vec<String> = prepared
+        .report
+        .candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "Attach at {}: {} completed turns, {} records ({})",
+                candidate.commit, candidate.completed_turns, candidate.records, candidate.evidence
+            )
+        })
+        .collect();
     options.push("Import independently without selecting an earlier session history".to_owned());
+    options.push("Cancel without importing".to_owned());
     let labels = options.iter().map(String::as_str).collect::<Vec<_>>();
-    let Some(choice) = ui::prompt::select("Choose the import lineage", &labels)? else {
+    // Which history the session continues, or none, is the person's to pick, so nothing is
+    // highlighted and Enter alone does nothing. A cancel is said: a menu that closed on Enter
+    // without a word read as an import that went wrong.
+    let choice = ui::prompt::select_from(
+        "Choose the import lineage (arrow keys, then Enter; Esc cancels)",
+        &labels,
+        None,
+    )?;
+    let Some(choice) = choice.filter(|choice| *choice <= candidates) else {
+        ui::info("nothing was imported");
         return Ok(Decision::Stop(ExitCode::Ok));
     };
-    if choice == 0 {
-        return Ok(Decision::Stop(ExitCode::Ok));
-    }
-    let candidate = if choice == options.len() - 1 {
+    let candidate = if choice == candidates {
         None
     } else {
         Some(
             prepared
                 .report
                 .candidates
-                .get(choice - 1)
+                .get(choice)
                 .context("the selected candidate is not in the prepared report")?
                 .observed
                 .clone(),

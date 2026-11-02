@@ -46,6 +46,17 @@ pub(crate) fn may_prompt() -> bool {
 }
 
 pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
+    select_from(prompt, options, Some(0))
+}
+
+/// [`select`] starting at `default`. With `None` nothing is highlighted, and Enter does nothing
+/// until the person moves to an option: for a choice where every option has consequences and
+/// none is safe to take unseen.
+pub fn select_from(
+    prompt: &str,
+    options: &[&str],
+    default: Option<usize>,
+) -> Result<Option<usize>> {
     if !can_ask() || options.is_empty() {
         return Ok(None);
     }
@@ -53,7 +64,8 @@ pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
     Ok(Select::new()
         .with_prompt(prompt)
         .items(options)
-        .default(0)
+        // dialoguer's own "nothing selected".
+        .default(default.unwrap_or(!0))
         .interact_opt()?)
 }
 
