@@ -392,12 +392,26 @@ struct OpenCodeEngine {
 }
 
 fn launch_env(spec: &LaunchSpec, agent: &str) -> crate::Result<Vec<(String, String)>> {
-    let mut config = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+    let config = match std::env::var("OPENCODE_CONFIG_CONTENT") {
         Ok(value) => serde_json::from_str::<Value>(&value)
             .map_err(|_| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT is not valid JSON"))?,
         Err(std::env::VarError::NotPresent) => json!({}),
         Err(_) => anyhow::bail!("OPENCODE_CONFIG_CONTENT is not Unicode"),
     };
+    let config = agent_config(config, agent)?;
+    let mut env = super::lineage_env(spec.agit_session.as_ref());
+    env.push(("OPENCODE_CONFIG_CONTENT".into(), config.to_string()));
+    env.push((
+        "OPENCODE_SERVER_PASSWORD".into(),
+        uuid::Uuid::new_v4().to_string(),
+    ));
+    Ok(env)
+}
+
+/// The inline configuration an RC OpenCode session runs under: the person's own, plus a fresh
+/// agent that asks before every tool and denies what this driver can't relay or what would
+/// start work that outlives the turn, for every caller (owner included).
+fn agent_config(mut config: Value, agent: &str) -> crate::Result<Value> {
     let object = config
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("OpenCode inline configuration must be an object"))?;
@@ -411,18 +425,17 @@ fn launch_env(spec: &LaunchSpec, agent: &str) -> crate::Result<Vec<(String, Stri
         agent.into(),
         json!({
             "description":"AgentGit remote workspace", "mode":"primary",
-            "permission":{"*":"ask", "task":"deny", "question":"deny"},
+            // Work that continues after the turn is denied outright: it asks nobody, and an
+            // agent's own rules are merged after any global or project rule, so none re-allows it.
+            "permission":{
+                "*":"ask", "task":"deny", "subagent":"deny", "question":"deny",
+                "schedule_create":"deny", "schedule_resume":"deny",
+            },
             "tools":{"task":false,"question":false}
         }),
     );
     object.insert("default_agent".into(), json!(agent));
-    let mut env = super::lineage_env(spec.agit_session.as_ref());
-    env.push(("OPENCODE_CONFIG_CONTENT".into(), config.to_string()));
-    env.push((
-        "OPENCODE_SERVER_PASSWORD".into(),
-        uuid::Uuid::new_v4().to_string(),
-    ));
-    Ok(env)
+    Ok(config)
 }
 
 impl OpenCodeEngine {

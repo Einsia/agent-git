@@ -721,6 +721,9 @@ pub struct MessageAttribution {
     pub sender: Option<crate::protocol::MessageSender>,
     pub client_msg_id: Option<String>,
     pub native_prompt_id: Option<String>,
+    /// Whether these are the owner's words, as the device sees the caller. False by default, so
+    /// words of unknown origin are never taken for the owner's.
+    pub owner: bool,
 }
 
 impl MessageAttribution {
@@ -754,6 +757,7 @@ impl MessageAttribution {
             sender,
             client_msg_id,
             native_prompt_id: None,
+            owner: caller.is_owner(),
         }
     }
 }
@@ -2108,6 +2112,7 @@ impl Session {
             return;
         }
         pending.attribution.native_prompt_id = self.driver.reserve_prompt_identity();
+        self.driver.note_input_owner(pending.attribution.owner);
         let dispatch = self
             .driver
             .start_turn(
@@ -2617,6 +2622,7 @@ impl Session {
                             }
                             attribution.native_prompt_id = self.driver.reserve_prompt_identity();
                             let pending = PendingSteerCommand { message: report.text, attribution, reply };
+                            self.driver.note_input_owner(pending.attribution.owner);
                             match self.driver.steer(&message).await {
                                 SteerDispatch::Resolved(result) => self.resolve_steer(pending, result).await,
                                 SteerDispatch::Awaiting => self.pending_steer_command = Some(pending),

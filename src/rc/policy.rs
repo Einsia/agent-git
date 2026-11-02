@@ -3191,6 +3191,26 @@ mod tests {
         }
     }
 
+    /// Pins that the rule a non-owner's turn can't start work that outlives it is advertised only
+    /// by a build that also sends a write to OpenCode's project config or to Claude Code's
+    /// instruction file back to the owner: either would let one turn leave work that starts the
+    /// next time the runtime does.
+    #[test]
+    fn the_selfstart_rule_is_advertised_only_with_the_runtimes_config_held_to_the_owner() {
+        let advertised = crate::rc::build_identity::DaemonIdentity::current().unwrap();
+        if !advertised
+            .rpc_features
+            .iter()
+            .any(|feature| feature == "nonowner-selfstart-refused-v1")
+        {
+            return;
+        }
+        for name in ["opencode.json", "claude.md"] {
+            assert!(CONTROL_SURFACES.contains(&name), "{name}");
+        }
+        assert!(is_control_surface_name("CLAUDE.md"));
+    }
+
     /// Pins the project config of the runtimes agit drives as control surfaces: an operator's
     /// write to Claude Code's `.mcp.json`, OpenCode's `opencode.json` / `opencode.jsonc`, anything
     /// under `.opencode/` or a repository plugin marketplace, or a file a runtime loads into later
