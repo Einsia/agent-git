@@ -91,6 +91,14 @@ impl Daemon {
         {
             live.approval_requests.remove(&p.approval_id);
         }
+        self.observe_lease_frame(&stream, &frame);
+        // Viewers learn who writes the conversation with every status change.
+        if frame.method() == method::SESSION_STATUS
+            && let Some(view) = self.lease_view(&stream)
+            && let Some(params) = frame.params.as_mut().and_then(|p| p.as_object_mut())
+        {
+            params.insert("lease".into(), serde_json::json!(view));
+        }
         if frame.method() == method::TURN_COMPLETED
             && let Some(live) = self.sessions.get_mut(&stream)
         {
@@ -200,6 +208,37 @@ impl Daemon {
     /// nothing to revive by logical id after a restart.
     pub(super) fn on_session_note(&mut self, note: SessionNote) {
         match note {
+            // These may arrive after the periodic reconciliation retired the session row; a newer
+            // generation under the same id is not theirs to touch.
+            SessionNote::WriterReleased {
+                session_id,
+                generation,
+                thread,
+                in_turn,
+            } => {
+                self.writer_released(&session_id, generation);
+                // A writer that never reported its conversation is found by the lease it holds.
+                let thread = thread.or_else(|| self.leases.thread_held_by(&session_id));
+                if let Some(thread) = thread
+                    && !self.newer_generation(&session_id, generation)
+                {
+                    self.lease_writer_released(&session_id, &thread, in_turn);
+                }
+            }
+            SessionNote::WriterNotReleased {
+                session_id,
+                generation,
+                thread,
+                process,
+            } => {
+                self.writer_released(&session_id, generation);
+                let thread = thread.or_else(|| self.leases.thread_held_by(&session_id));
+                if let Some(thread) = thread
+                    && !self.newer_generation(&session_id, generation)
+                {
+                    self.lease_release_failed(&session_id, &thread, process);
+                }
+            }
             SessionNote::NativeSettings {
                 session_id,
                 generation,
@@ -336,6 +375,7 @@ impl Daemon {
                 cwd,
                 agit_session,
                 expected_agent_id,
+                writer,
             } => {
                 let Some(live) = self.sessions.get_mut(&session_id) else {
                     return;
@@ -360,6 +400,13 @@ impl Daemon {
                 // note is cheap, idempotent, and also retries a failed first
                 // atomic save instead of making the failure permanent.
                 live.runtime_thread_id = Some(runtime_thread_id.clone());
+                if let Some((pid, started_ms)) = writer {
+                    live.writer_process = Some(crate::rc::lease::Terminal {
+                        pid,
+                        started_ms,
+                        plugin: false,
+                    });
+                }
                 let info = live.info.clone();
                 let prior = self.roster.sessions.get(&session_id);
                 let guard_attempts = prior
@@ -684,6 +731,7 @@ impl Daemon {
             info.native_source = entry.native_source.clone();
         }
         info.runtime_session_id = info.runtime_session_id.filter(|id| !id.is_empty());
+        info.lease = self.lease_view(&info.session_id);
         info
     }
 
@@ -903,6 +951,7 @@ mod bound_lineage_tests {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
                         interrupt_fenced: None,
+                        lease: None,
                         publication: None,
                         session_id: "agit-S".into(),
                         native_source: None,
@@ -945,6 +994,8 @@ mod bound_lineage_tests {
                         restart_guard_attempts: Default::default(),
                         restart_guard_mode: None,
                         ended: false,
+                        writer_released: false,
+                        writer_process: None,
                     };
                     let (notes, _notes_rx) = mpsc::channel(1);
                     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
@@ -983,6 +1034,7 @@ mod bound_lineage_tests {
                         watch_generation: 0,
                         session_generation: 3,
                         confinement: HashMap::new(),
+                        leases: Default::default(),
                     };
 
                     // Resume over a socket that never ACKed the identity
@@ -996,6 +1048,7 @@ mod bound_lineage_tests {
                         cwd: "/tmp".into(),
                         agit_session: None,
                         expected_agent_id: None,
+                        writer: None,
                     });
 
                     // The row that reached disk still claims the original

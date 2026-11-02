@@ -84,6 +84,7 @@ pub mod grants;
 pub mod harness;
 pub mod identity;
 pub mod journal;
+pub(crate) mod lease;
 pub mod lifecycle;
 pub mod lineage;
 pub mod link;
@@ -137,15 +138,23 @@ pub(crate) fn select_plain_authority() {
     LOCAL_AUTHORITY.store(false, std::sync::atomic::Ordering::Release);
 }
 
+const LOCAL_NAMESPACE: &str = "desktop-rc";
+
 /// The selected daemon namespace.
 pub fn rc_dir() -> crate::Result<PathBuf> {
     state_dir(
         if LOCAL_AUTHORITY.load(std::sync::atomic::Ordering::Acquire) {
-            "desktop-rc"
+            LOCAL_NAMESPACE
         } else {
             "rc"
         },
     )
+}
+
+/// The desktop daemon's namespace whichever one this process selected: a hook runs as a plain
+/// command, yet must read what that daemon writes.
+pub(crate) fn local_rc_dir() -> crate::Result<PathBuf> {
+    state_dir(LOCAL_NAMESPACE)
 }
 
 pub(crate) fn state_dir(namespace: &str) -> crate::Result<PathBuf> {

@@ -373,6 +373,11 @@ pub fn begin(argv: &[OsString], restart: Option<&str>) {
         .filter(|value| value.len() <= 512)
         .and_then(|value| serde_json::from_str::<Restart>(value).ok());
     let mut seed = seed(argv);
+    // Before anything reads or writes telemetry state: an unrecorded invocation leaves no `Run`,
+    // so `finish` and every operation report find nothing to emit.
+    if !recorded(&seed) {
+        return;
+    }
     if let Some(restart) = &restart {
         seed.properties
             .insert("invocation_id".into(), json!(restart.invocation_id));
@@ -465,6 +470,14 @@ pub fn activate(onboarding: bool) {
         run.context = Some(context);
         run.started_event = !seed.hook;
     }
+}
+
+/// Whether an invocation is reported at all. A terminal held behind another writer polls
+/// `hooks native-lease` repeatedly for as long as the hold lasts; the registration it follows
+/// (`hooks native-control`) already reports that terminal, and one event per poll would count
+/// the wait instead of the use.
+fn recorded(seed: &Seed) -> bool {
+    seed.properties.get("command_path") != Some(&json!("hooks native-lease"))
 }
 
 /// Only a command a person or their agent ran may stand in for a missing install receipt. An
@@ -919,5 +932,29 @@ fn duration_bucket(ms: u128) -> &'static str {
         10000..=59999 => "10-59s",
         60000..=299999 => "1-4m",
         _ => "5m+",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A held terminal polls its lease repeatedly; the registration that started the hold is the
+    /// one reported invocation.
+    #[test]
+    fn a_lease_poll_is_not_reported_but_the_registration_is() {
+        let argv = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        let poll = seed(&argv(&["agit", "hooks", "native-lease", "--session", "s"]));
+        let registration = seed(&argv(&[
+            "agit",
+            "hooks",
+            "native-control",
+            "--session",
+            "s",
+            "--generation",
+            "g",
+        ]));
+        assert!(!recorded(&poll));
+        assert!(recorded(&registration));
     }
 }

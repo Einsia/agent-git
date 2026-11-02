@@ -136,6 +136,11 @@ impl Daemon {
         ) {
             crate::rc::harness::CodexUnconfined::check(&live.info.runtime, caller_is_owner)?;
         }
+        if matches!(f.method(), method::TURN_START | method::TURN_STEER)
+            && let Some(error) = self.lease_refusal(&session_id)
+        {
+            return Err(error);
+        }
 
         // A policy mutation cannot overtake an approval already accepted under
         // its predecessor. Plain input may wait independently of that approval.

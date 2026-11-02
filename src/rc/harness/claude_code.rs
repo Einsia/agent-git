@@ -630,6 +630,11 @@ impl ClaudeCodeDriver {
         })
     }
 
+    /// The `claude -p` process this driver runs, while it has not been reaped.
+    pub fn harness_pid(&self) -> Option<u32> {
+        self.proc.pid()
+    }
+
     pub fn runtime_thread_id(&self) -> Option<&str> {
         Some(&self.session_id)
     }

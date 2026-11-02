@@ -12,6 +12,20 @@ pub enum Request {
         build_id: String,
     },
     ReloadSecrets,
+    /// A Claude Code terminal loaded this conversation; `pid` is its process, and `loaded` the
+    /// branch its plugin saw it continue, once it has.
+    TerminalOpened {
+        thread_id: String,
+        pid: u32,
+        plugin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loaded: Option<super::lease::Loaded>,
+    },
+    /// The headless writer of this conversation finished a turn on record `leaf`.
+    WriterLeaf {
+        thread_id: String,
+        leaf: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +33,24 @@ pub enum Request {
 pub enum Reply {
     Status(Status),
     Stopping,
-    Busy { blockers: Vec<String> },
+    Busy {
+        blockers: Vec<String>,
+    },
     InstanceChanged,
-    SecretsReloaded { generation: u64, rules: usize },
-    Error { message: String },
+    SecretsReloaded {
+        generation: u64,
+        rules: usize,
+    },
+    /// The terminal's lease state, absent when the daemon does not run this conversation, and
+    /// the line the terminal shows while its own input must wait.
+    TerminalOpened {
+        state: Option<crate::protocol::LeaseState>,
+        notice: Option<String>,
+    },
+    Recorded,
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -77,6 +77,7 @@ pub(super) fn harness_test_session_with_channels(
         publication_incarnation: None,
         info: SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "session-turn-test".into(),
             native_source: None,
@@ -97,6 +98,7 @@ pub(super) fn harness_test_session_with_channels(
             updated_at: "now".into(),
         },
         driver,
+        stopped_in_turn: false,
         background_poll_at: tokio::time::Instant::now(),
         transcript_readable: false,
         tailer: None,
@@ -1377,6 +1379,27 @@ async fn a_protocol_invariant_resolves_the_pending_turn_ticket_before_ending() {
             message,
         } if message.contains("turn-b")
     ));
+}
+
+/// A headless harness that exits on its own reports `ended` without `set_status`; whether it
+/// was inside a turn then comes from the status it was running in.
+#[tokio::test]
+async fn a_writer_that_exits_mid_turn_is_reported_in_turn() {
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let mut session = harness_test_session(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Running,
+    );
+    assert!(session.writer_in_turn(), "exited on its own mid-turn");
+    session.info.status = SessionStatus::Idle;
+    assert!(!session.writer_in_turn());
+    session.set_status(SessionStatus::Running).await;
+    session.set_status(SessionStatus::Ended).await;
+    assert!(
+        session.writer_in_turn(),
+        "stopped by the supervisor mid-turn"
+    );
 }
 
 async fn run_ambiguous_claude_approval(

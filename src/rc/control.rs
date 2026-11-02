@@ -146,7 +146,16 @@ pub(crate) fn ask_with_timeout(
     req: &Request,
     timeout: std::time::Duration,
 ) -> crate::Result<Reply> {
-    let path = socket_path()?;
+    ask_at(&socket_path()?, req, timeout)
+}
+
+/// [`ask_with_timeout`] to the daemon listening at `path`, whichever namespace it serves.
+pub(crate) fn ask_at(
+    path: &std::path::Path,
+    req: &Request,
+    timeout: std::time::Duration,
+) -> crate::Result<Reply> {
+    let path = path.to_path_buf();
     // Connect through the **bounded** path, for the same reason the probe does: against a full
     // backlog a blocking connect waits indefinitely on Linux (observed), and this is the path
     // `agit rc status` / `agit rc stop` send their requests on — bounding the probe but not this

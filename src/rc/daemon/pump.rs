@@ -58,6 +58,7 @@ impl Daemon {
             watch_generation: 0,
             session_generation: 0,
             confinement: HashMap::new(),
+            leases: Daemon::load_leases(),
         }));
 
         tokio::spawn(activity::run(d.clone()));
@@ -147,6 +148,44 @@ impl Daemon {
                                         ],
                                     }
                                 })
+                            }
+                        }
+                        control::Request::TerminalOpened {
+                            thread_id,
+                            pid,
+                            plugin,
+                            loaded,
+                        } => {
+                            // Bounded like Status: the terminal's settings hook waits on this.
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            loop {
+                                if let Ok(mut g) = d.try_lock() {
+                                    break g.terminal_opened(&thread_id, pid, plugin, loaded);
+                                }
+                                if std::time::Instant::now() > deadline {
+                                    break control::Reply::Error {
+                                        message: "the daemon is busy".into(),
+                                    };
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                        }
+                        control::Request::WriterLeaf { thread_id, leaf } => {
+                            // The writer's plugin waits on this at the end of its turn.
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            loop {
+                                if let Ok(mut g) = d.try_lock() {
+                                    g.writer_leaf(&thread_id, &leaf);
+                                    break control::Reply::Recorded;
+                                }
+                                if std::time::Instant::now() > deadline {
+                                    break control::Reply::Error {
+                                        message: "the daemon is busy".into(),
+                                    };
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(20));
                             }
                         }
                         control::Request::ReloadSecrets => {
@@ -751,6 +790,7 @@ impl Daemon {
                     // "add a viewer" — see `reap_idle_watches`.
                     g.reap_idle_watches();
                     g.reconcile_finished_sessions(&frames_tx);
+                    g.enforce_lease_deadlines();
                     g.journal.flush();
                     // Grants are changed by **a person on this machine** with `agit rc grant`,
                     // editing that file on disk; the daemon gets no notification. So reread it on

@@ -425,6 +425,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: watch_id.clone(),
             native_source: enrolled.as_ref().map(|watch| watch.identity()),

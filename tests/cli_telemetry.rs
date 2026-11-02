@@ -567,6 +567,41 @@ fn hooks_aggregate_without_extending_foreground_activity() {
     assert_eq!(summaries[0]["properties"]["integration_count"], 4);
 }
 
+/// A terminal held behind another writer polls `hooks native-lease` for as long as the hold
+/// lasts. Those polls leave telemetry exactly as it was: no event, no queue, no activity, no state
+/// file touched. A hook that is reported still is, in the same home.
+#[cfg(unix)]
+#[test]
+fn lease_polls_leave_telemetry_untouched() {
+    let f = Fixture::new();
+    f.enable();
+    let snapshot = || {
+        let mut files = std::fs::read_dir(f.path(""))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(&path).unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    };
+    let before = snapshot();
+    let session = uuid::Uuid::new_v4().to_string();
+    for _ in 0..3 {
+        let poll = f.run(&["hooks", "native-lease", "--session", &session]);
+        assert!(poll.status.success(), "{poll:?}");
+    }
+    assert_eq!(snapshot(), before);
+    assert!(f.run(&["hooks", "settle"]).status.success());
+    assert!(
+        f.events()
+            .iter()
+            .any(|event| event["event"] == "cli_integration_summary"),
+        "telemetry was live for the polls above"
+    );
+}
+
 #[test]
 fn failed_upload_retries_preserve_uuid_timestamp_and_occurrence_identity() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

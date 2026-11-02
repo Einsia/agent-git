@@ -856,6 +856,8 @@ impl Daemon {
                 restart_guard_attempts,
                 restart_guard_mode,
                 ended: false,
+                writer_released: false,
+                writer_process: None,
                 info: info.clone(),
                 shared_executor,
                 started_process,
@@ -973,6 +975,7 @@ mod tests {
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "agit-opening".into(),
             native_source: None,

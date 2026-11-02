@@ -1386,6 +1386,7 @@ mod tests {
     fn start_info() -> crate::protocol::SessionInfo {
         crate::protocol::SessionInfo {
             interrupt_fenced: None,
+            lease: None,
             publication: None,
             session_id: "agit-started".into(),
             native_source: None,

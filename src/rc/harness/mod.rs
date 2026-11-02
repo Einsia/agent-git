@@ -781,6 +781,15 @@ impl AnyDriver {
         }
     }
 
+    /// The headless harness process, for the one driver whose conversation a terminal can take
+    /// over: only headless Claude Code hands a conversation over through a lease.
+    pub fn harness_pid(&self) -> Option<u32> {
+        match self {
+            AnyDriver::ClaudeCode(d) => d.harness_pid(),
+            _ => None,
+        }
+    }
+
     pub fn runtime_thread_id(&self) -> Option<String> {
         match self {
             AnyDriver::ClaudeCode(d) => d.runtime_thread_id().map(String::from),

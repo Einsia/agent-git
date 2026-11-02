@@ -67,6 +67,7 @@ mod catalog;
 mod danger;
 mod dispatch;
 mod guard;
+mod leases;
 mod observed_capture;
 mod opening;
 mod terminal_input;
@@ -602,6 +603,12 @@ struct Live {
     /// Ended generations remain until every accepted RPC projects its result,
     /// including any rollback of a never-run permission change.
     ended: bool,
+    /// This generation's writer has been reaped (or its cleanup failed) and its lease note
+    /// projected: it writes the conversation no more, although the row stays until the
+    /// supervisor finishes settling.
+    writer_released: bool,
+    /// The harness process writing the conversation, as the supervisor reported it.
+    writer_process: Option<crate::rc::lease::Terminal>,
 }
 
 impl Live {
@@ -1177,6 +1184,8 @@ pub struct Daemon {
     /// effect on **running** sessions immediately. If each session copied the roots at launch and
     /// kept that copy for life, the moment the test flips that stale copy is a long-lived pass.
     confinement: HashMap<String, tokio::sync::watch::Sender<crate::rc::Confinement>>,
+    /// Which process writes each Claude Code conversation this daemon runs or ran headless.
+    leases: crate::rc::lease::Leases,
 }
 
 async fn complete_prepared_session_rpc(

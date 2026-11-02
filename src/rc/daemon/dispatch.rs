@@ -679,6 +679,7 @@ mod tests {
             watch_generation: 0,
             session_generation: 0,
             confinement: HashMap::new(),
+            leases: Default::default(),
         }
     }
 
@@ -737,6 +738,7 @@ mod tests {
         WatchLive {
             info: SessionInfo {
                 interrupt_fenced: None,
+                lease: None,
                 publication: None,
                 session_id: stream.into(),
                 native_source: None,

@@ -95,6 +95,19 @@ pub enum Action {
         session: String,
         #[arg(long)]
         generation: String,
+        /// The newest record the plugin saw this process append to the conversation.
+        #[arg(long)]
+        leaf: Option<String>,
+    },
+    /// The conversation's lease for the registered terminal above this process, without
+    /// registering it again.
+    #[command(hide = true)]
+    NativeLease {
+        #[arg(long)]
+        session: String,
+        /// The newest record the plugin saw this process append to the conversation.
+        #[arg(long)]
+        leaf: Option<String>,
     },
     /// Wait for a shared approval without charging the native hook's execution budget.
     #[command(hide = true)]
@@ -148,16 +161,54 @@ pub fn run(args: Args) -> CmdResult {
         Action::NativeControl {
             session,
             generation,
+            leaf,
         } => {
-            let registration = crate::rc::native_claude::register(&session, &generation)?;
+            let registration = match crate::rc::native_claude::register(&session, &generation) {
+                // Another process still writes the conversation: a definite answer, so the
+                // terminal keeps holding its input instead of taking agit for unreachable.
+                Err(error) if error.is::<crate::rc::native_claude::NotCurrentWriter>() => {
+                    println!("{}", serde_json::json!({ "refused": "not_current_writer" }));
+                    return Ok(ExitCode::Ok);
+                }
+                registration => registration?,
+            };
+            // Registration is also this terminal's request for the conversation's lease.
+            let lease = terminal_lease(&registration, leaf.as_deref()).json();
             println!(
                 "{}",
                 serde_json::json!({
                     "registration": registration,
                     "descriptor": registration.descriptor,
+                    "lease": lease,
                 })
             );
             Ok(ExitCode::Ok)
+        }
+        #[cfg(unix)]
+        Action::NativeLease { session, leaf } => {
+            // The daemon's own headless writer reports the record its turn ended on: a terminal
+            // taking the conversation over must continue from it.
+            if crate::rc::harness::settlement_is_delegated() {
+                if let Some(leaf) = leaf
+                    .as_deref()
+                    .filter(|leaf| crate::rc::native_inbox::valid_id(leaf))
+                {
+                    crate::rc::native_claude::report_writer_leaf(&session, leaf);
+                }
+                let free = crate::rc::native_claude::Announced::Free;
+                println!("{}", serde_json::json!({ "lease": free.json() }));
+                return Ok(ExitCode::Ok);
+            }
+            // Only the registered terminal above this process may ask for its lease.
+            let lease = crate::rc::native_claude::ancestor_registration(&session)
+                .map(|registration| terminal_lease(&registration, leaf.as_deref()))
+                .unwrap_or(crate::rc::native_claude::Announced::Unknown);
+            println!("{}", serde_json::json!({ "lease": lease.json() }));
+            Ok(ExitCode::Ok)
+        }
+        #[cfg(not(unix))]
+        Action::NativeLease { .. } => {
+            anyhow::bail!("Native Claude Code shared control is not supported on this platform")
         }
         #[cfg(not(unix))]
         Action::NativeControl { .. } => {
@@ -475,7 +526,19 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
         return None;
     }
     let restored = restored_title(rt, &ev);
-    let response = session_start(rt, &ev);
+    let mut response = session_start(rt, &ev);
+    if let Some(notice) = announce_terminal(rt, &ev) {
+        let response = response.get_or_insert_with(
+            || serde_json::json!({"hookSpecificOutput": {"hookEventName": "SessionStart"}}),
+        );
+        // Beside, never instead of, what the session start already tells the person (where the
+        // conversation uploads, a sign-in problem).
+        let message = match response["systemMessage"].as_str() {
+            Some(earlier) if !earlier.is_empty() => format!("{earlier}\n{notice}"),
+            _ => notice,
+        };
+        response["systemMessage"] = serde_json::Value::String(message);
+    }
     let Some(title) = restored else {
         return response;
     };
@@ -484,6 +547,55 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     );
     response["hookSpecificOutput"]["sessionTitle"] = serde_json::Value::String(title);
     Some(response)
+}
+
+/// The lease of the registered terminal, continuing the branch whose newest record is `leaf`.
+/// The plugin also runs inside the daemon's own headless writer, which is no terminal and holds
+/// nothing back.
+#[cfg(unix)]
+fn terminal_lease(
+    registration: &crate::rc::native_claude::Registration,
+    leaf: Option<&str>,
+) -> crate::rc::native_claude::Announced {
+    if crate::rc::harness::settlement_is_delegated() {
+        return crate::rc::native_claude::Announced::Free;
+    }
+    let loaded = leaf
+        .filter(|leaf| crate::rc::native_inbox::valid_id(leaf))
+        .and_then(|leaf| {
+            Some(crate::rc::lease::Loaded {
+                leaf: leaf.to_owned(),
+                transcript: registration.transcript_path().ok()?,
+            })
+        });
+    crate::rc::native_claude::announce_terminal(
+        &registration.session,
+        registration.process.pid,
+        true,
+        loaded,
+    )
+}
+
+/// A terminal that loaded a conversation the daemon runs headless takes it over at the headless
+/// turn boundary; this hook announces it whether or not the AgentGit plugin runs there. Returns
+/// the line the terminal shows while its own input must wait.
+fn announce_terminal(rt: &str, ev: &Event) -> Option<String> {
+    #[cfg(unix)]
+    {
+        if rt != "claude-code" || !matches!(ev.source, Source::Startup | Source::Resume) {
+            return None;
+        }
+        let pid = crate::rc::native_claude::terminal_of_hook(&ev.session_id)?;
+        match crate::rc::native_claude::announce_terminal(&ev.session_id, pid, false, None) {
+            crate::rc::native_claude::Announced::Lease(_, notice) => notice,
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (rt, ev);
+        None
+    }
 }
 
 /// Claude Code's own title for a session that an earlier agit renamed with a placeholder: a name
