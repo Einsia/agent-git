@@ -695,3 +695,40 @@ async fn native_opencode_smoke() {
         driver.shutdown().await.unwrap();
     }
 }
+
+/// Pins that an RC OpenCode session can't leave work scheduled after the turn, whoever drives
+/// it: with scheduling switched on in the person's config, and even a rule there allowing it, the
+/// session's agent denies it, and the agent's rules are the ones OpenCode applies last. A launch
+/// that dropped the deny let any turn schedule a prompt that wakes the session later, asking
+/// nobody.
+#[test]
+fn an_rc_opencode_session_cannot_schedule_work_after_the_turn() {
+    let config = agent_config(
+        json!({
+            "experimental": {"schedules": true},
+            "permission": {"schedule_create": "allow", "schedule_resume": "allow", "subagent": "allow"},
+        }),
+        "agit-rc-test",
+    )
+    .unwrap();
+    assert_eq!(config["default_agent"], "agit-rc-test");
+    assert_eq!(
+        config["experimental"]["schedules"], true,
+        "the person's config is kept"
+    );
+    let rules = config["agent"]["agit-rc-test"]["permission"]
+        .as_object()
+        .unwrap();
+    for tool in ["schedule_create", "schedule_resume", "task", "subagent"] {
+        assert_eq!(rules[tool], "deny", "{tool}");
+    }
+    // OpenCode takes the last matching rule; the catch-all must come before the denies.
+    let keys: Vec<_> = rules.keys().map(String::as_str).collect();
+    let ask = keys.iter().position(|key| *key == "*").unwrap();
+    assert!(
+        keys.iter()
+            .skip(ask + 1)
+            .any(|key| *key == "schedule_create")
+    );
+    assert_eq!(rules["*"], "ask");
+}

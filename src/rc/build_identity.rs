@@ -41,6 +41,9 @@ pub const RPC_FEATURES: &[&str] = &[
     // terminal's mode is never read. Checked at the RPC and again at delivery (a non-owner's
     // approval note is replaced at delivery, in every mode). ExitPlanMode is not covered.
     "nonowner-turn-mode-v1",
+    // A non-owner's turn can't start work that outlives it, in any mode, in a Claude Code or
+    // OpenCode session agit drives; a turn the device can't attribute is held to the same rule.
+    "nonowner-selfstart-refused-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

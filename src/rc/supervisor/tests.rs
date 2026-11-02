@@ -969,6 +969,7 @@ async fn an_exact_response_synthesizes_one_remote_head_with_full_attribution() {
                 }),
                 client_msg_id: Some("submitted-message".into()),
                 native_prompt_id: None,
+                owner: false,
             },
             reply: Some(ticket),
             initial: false,
@@ -2866,6 +2867,7 @@ async fn steering_publishes_attributed_redacted_history_only_after_native_accept
                     sender: Some(sender.clone()),
                     client_msg_id: Some("steer-a".into()),
                     native_prompt_id: None,
+                    owner: false,
                 },
                 reply: ticket,
             })
@@ -2948,6 +2950,7 @@ fn authenticated_attribution(account_id: &str, username: &str) -> MessageAttribu
         }),
         client_msg_id: None,
         native_prompt_id: None,
+        owner: false,
     }
 }
 
@@ -3275,6 +3278,78 @@ async fn held_lines_leave_a_marker_when_the_session_stops() {
     assert_eq!(items, [serde_json::json!(redact::GIVEN_UP_TEXT)]);
     assert!(session.held.is_empty());
     session.driver.shutdown().await.unwrap();
+}
+
+/// Pins whose words a turn holds, from the caller through the supervisor to Claude Code: a turn
+/// an operator starts is refused work that outlives it, the owner's is not. The words' owner is
+/// read from the caller the device authenticated (`MessageAttribution::from_caller`), never from
+/// anything the request names.
+#[tokio::test]
+async fn a_turn_is_held_to_the_caller_the_device_sees() {
+    for role in ["operator", "owner"] {
+        let directory = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"delaySeconds": 60, "reason": "later", "prompt": "later"});
+        let (script, written) = crate::rc::harness::claude_code::ClaudeCodeDriver::hook_stand_in(
+            directory.path(),
+            "ScheduleWakeup",
+            &input,
+            false,
+        );
+        let driver =
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_running(&script);
+        let mut session = harness_test_session(
+            AnyDriver::ClaudeCode(Box::new(driver)),
+            "claude-code",
+            SessionStatus::Idle,
+        );
+        let caller = crate::protocol::CallerClaim {
+            account_id: Some(format!("account-{role}")),
+            username: Some(role.into()),
+            role: role.into(),
+            workspace_id: "ws".into(),
+        };
+        let owner = role == "owner";
+        let (ticket, _receipt) = crate::rc::ticket::ticket();
+        let (commands, mut command_rx) = mpsc::channel(1);
+        commands
+            .send(Command::Turn {
+                message: "go".into(),
+                attribution: MessageAttribution::from_caller(&caller, None, None),
+                guard_attempt: None,
+                reply: ticket.with_control_ceiling(owner),
+            })
+            .await
+            .unwrap();
+        let worker = tokio::spawn(async move {
+            session.run_inner(&mut command_rx).await;
+            session
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let answers = loop {
+            let answers =
+                crate::rc::harness::claude_code::ClaudeCodeDriver::hook_responses(&written);
+            if !answers.is_empty() {
+                break answers;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{role}: no hook answer"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let decision = &answers[0]["hookSpecificOutput"]["permissionDecision"];
+        if owner {
+            assert_eq!(answers[0], serde_json::json!({}), "{role}");
+        } else {
+            assert_eq!(decision, "deny", "{role}: {answers:?}");
+        }
+        drop(commands);
+        let mut session = tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = session.driver.shutdown().await;
+    }
 }
 
 /// The supervisor refuses a non-owner's runtime command at delivery, read-only ones included,

@@ -64,8 +64,7 @@ impl std::fmt::Display for FenceUnsupported {
 impl std::error::Error for FenceUnsupported {}
 
 /// What a non-owner is told for any message into a Codex conversation. It names the rule only.
-pub(crate) const CODEX_UNCONFINED: &str =
-    "Until agit on this device is updated, others can't send to Codex conversations.";
+pub(crate) const CODEX_UNCONFINED: &str = "Others can't send to Codex conversations for now.";
 
 /// A non-owner's message into a Codex conversation, refused: Codex can't confine a turn to the
 /// workspace (reads, environment, tools it runs outside its sandbox), in any permission mode.
@@ -975,6 +974,14 @@ impl AnyDriver {
         #[cfg(not(unix))]
         let native = false;
         native
+    }
+
+    /// Whose words the next turn start or steer writes; a runtime that can start work which
+    /// outlives the turn without asking holds a turn to it.
+    pub(crate) fn note_input_owner(&mut self, owner: bool) {
+        if let Self::ClaudeCode(driver) = self {
+            driver.note_input_owner(owner);
+        }
     }
 
     pub fn shared_executor(&self) -> bool {
