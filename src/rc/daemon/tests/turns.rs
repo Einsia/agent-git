@@ -2129,6 +2129,89 @@ async fn a_non_owner_cannot_send_to_a_codex_conversation_in_any_mode() {
     }
 }
 
+/// Every runtime command family, the read-only ones included.
+const RUNTIME_COMMANDS: &[&str] = &[
+    "foreground",
+    "commands",
+    "diff",
+    "prompt.expand",
+    "skill.expand",
+    "approve",
+    "feedback",
+    "memories",
+    "personality",
+    "goal",
+    "fast",
+    "compact",
+    "review",
+    "plan",
+    "init",
+    "status",
+    "mcp",
+    "skills",
+    "apps",
+    "some-native-command",
+];
+
+/// A non-owner's `session.command` is refused at the RPC whatever the command, read-only ones
+/// included, on every runtime and in every mode, before anything is queued; the owner runs
+/// every one. A device that held only a dangerous session's commands to the owner would let an
+/// operator approve, upload feedback or reconfigure as the owner.
+#[tokio::test]
+async fn a_non_owner_runs_no_runtime_command() {
+    use crate::protocol::PermissionMode;
+    for runtime in ["codex", "claude-code", "opencode"] {
+        for mode in [PermissionMode::Default, PermissionMode::Plan] {
+            let (tx, _rx) = mpsc::channel(64);
+            let mut live = rpc_test_live("session", 1, tx, mode);
+            live.info.runtime = runtime.into();
+            let daemon = rpc_test_daemon(
+                HashMap::from([("session".to_owned(), live)]),
+                Roster::default(),
+            );
+            let mut state = daemon.lock().await;
+            let frame = |name: &str, role: &str| {
+                let mut frame = Frame::request(
+                    method::SESSION_COMMAND,
+                    serde_json::json!({"session_id": "session", "name": name,
+                        "arguments": {"value": "x"}}),
+                );
+                frame.caller = Some(claim(role, "ws-a"));
+                frame
+            };
+            for name in RUNTIME_COMMANDS {
+                for role in ["operator", "viewer"] {
+                    let error = state
+                        .prepare_session_rpc(&frame(name, role))
+                        .err()
+                        .unwrap_or_else(|| panic!("{runtime} {mode:?}: {role}'s {name}"));
+                    assert!(
+                        error.is(crate::protocol::ErrorCode::Forbidden),
+                        "{runtime} {role} {name}"
+                    );
+                }
+                assert!(
+                    state.prepare_session_rpc(&frame(name, "owner")).is_ok(),
+                    "{runtime} {mode:?}: the owner's {name}"
+                );
+            }
+        }
+    }
+}
+
+/// The receipt mapping turns the delivery-time refusal into the same typed error as the RPC's.
+#[test]
+fn a_delivery_time_command_refusal_is_the_typed_error() {
+    let error = super::super::map_receipt::<serde_json::Value>(Ok(Err(
+        crate::rc::harness::RuntimeCommandOwnerOnly.into(),
+    )))
+    .unwrap_err();
+    assert_eq!(
+        error,
+        crate::rc::harness::RuntimeCommandOwnerOnly::rpc_error()
+    );
+}
+
 /// Pins the RPC half of the non-owner mode rule (`rc::turn_mode`), through `prepare_session_rpc`:
 /// an operator's `turn.start`, `turn.steer` and `session.enqueue` into an Auto or AcceptEdits
 /// session, or one whose mode the device cannot read, are refused `mode_owner_only`, `not_sent`,

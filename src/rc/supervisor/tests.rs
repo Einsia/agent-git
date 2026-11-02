@@ -3277,6 +3277,93 @@ async fn held_lines_leave_a_marker_when_the_session_stops() {
     session.driver.shutdown().await.unwrap();
 }
 
+/// The supervisor refuses a non-owner's runtime command at delivery, read-only ones included,
+/// with the typed `RuntimeCommandOwnerOnly` and before the driver sees it, on Codex and Claude
+/// Code, whatever passed the RPC. The owner's every command goes on.
+#[tokio::test]
+async fn a_non_owners_runtime_command_is_refused_at_delivery() {
+    let drivers = [
+        (
+            AnyDriver::Codex(Box::new(
+                crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]),
+            )),
+            "codex",
+        ),
+        (
+            AnyDriver::ClaudeCode(Box::new(
+                crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
+            )),
+            "claude-code",
+        ),
+    ];
+    let names = [
+        "foreground",
+        "commands",
+        "diff",
+        "approve",
+        "feedback",
+        "memories",
+        "personality",
+        "goal",
+        "fast",
+        "compact",
+        "review",
+        "status",
+        "mcp",
+        "some-native-command",
+    ];
+    for (driver, runtime) in drivers {
+        let (mut session, _out, _notes) =
+            harness_test_session_with_channels(driver, runtime, SessionStatus::Idle);
+        let (commands, mut command_rx) = mpsc::channel(names.len());
+        let mut receipts = vec![];
+        for name in names {
+            let (ticket, receipt) = crate::rc::ticket::ticket::<serde_json::Value>();
+            commands
+                .send(Command::Runtime {
+                    name: name.into(),
+                    arguments: serde_json::json!({"value": "x"}),
+                    reply: ticket.with_control_ceiling(false),
+                })
+                .await
+                .unwrap();
+            receipts.push((name, receipt));
+        }
+        drop(commands);
+        let worker = tokio::spawn(async move {
+            session.run_inner(&mut command_rx).await;
+            session
+        });
+        for (name, mut receipt) in receipts {
+            let error = receipt
+                .wait(std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.is::<crate::rc::harness::RuntimeCommandOwnerOnly>(),
+                "{runtime} {name}: {error}"
+            );
+        }
+        let mut session = worker.await.unwrap();
+        for name in names {
+            let (ticket, _) = crate::rc::ticket::ticket::<serde_json::Value>();
+            assert!(
+                session
+                    .refuse_owner_only_command(Command::Runtime {
+                        name: name.into(),
+                        arguments: serde_json::json!({}),
+                        reply: ticket,
+                    })
+                    .is_some(),
+                "{runtime}: the owner's {name}"
+            );
+        }
+        session.driver.shutdown().await.unwrap();
+    }
+}
+
 /// The supervisor refuses a non-owner's turn and steer into a Codex conversation at delivery,
 /// with the typed refusal and nothing written, whatever passed the RPC; the owner's steer is
 /// handled as usual.
