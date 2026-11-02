@@ -3932,6 +3932,117 @@ async fn local_session_list_protects_labels_under_their_source_link() {
     );
 }
 
+/// A non-owner's opening that carries a prompt into Codex is refused with `codex_unconfined`
+/// before anything is reserved or launched, on all four opening paths: `session.start` with
+/// runtime codex, `session.resume` of a Codex conversation, a local takeover and a source resume. The initial turn reaches the supervisor with no
+/// owner bit, so this check is the only guard on that path.
+#[tokio::test]
+async fn a_non_owners_opening_prompt_into_codex_launches_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path().canonicalize().unwrap();
+    let roster: Roster = serde_json::from_value(serde_json::json!({
+        "sessions":{"logical":{"runtime":"codex", "thread_id":"native-codex", "cwd":cwd,
+            "workspace_id":"ws-a"}}
+    }))
+    .unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), roster);
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+    let (frames, _frames_rx) = mpsc::channel(1);
+    let reason = |error: RpcError| error.data.and_then(|data| data.get("reason").cloned());
+    let unconfined = Some(serde_json::json!("codex_unconfined"));
+
+    let start = state
+        .prepare_start_session(
+            SessionStart {
+                model: None,
+                start_id: None,
+                workspace_id: "ws-a".into(),
+                project_id: "project-a".into(),
+                runtime: "codex".into(),
+                agent: None,
+                expected_agent_id: None,
+                branch: None,
+                prompt: Some("inspect".into()),
+                by: None,
+                permission_mode: Some(crate::protocol::PermissionMode::Plan),
+            },
+            &claim("operator", "ws-a"),
+            &frames,
+            &Default::default(),
+        )
+        .err()
+        .expect("a non-owner's start with a prompt into Codex is refused");
+    assert_eq!(reason(start), unconfined);
+
+    let resume = state
+        .prepare_resume_session(
+            SessionResume {
+                project_id: None,
+                workspace_id: "ws-a".into(),
+                session_id: "logical".into(),
+                prompt: Some("inspect".into()),
+                by: None,
+                agent: None,
+                expected_agent_id: None,
+                branch: None,
+                attach_only: false,
+            },
+            &claim("operator", "ws-a"),
+            &frames,
+            &Default::default(),
+        )
+        .err()
+        .expect("a non-owner's resume with a prompt into Codex is refused");
+    assert_eq!(reason(resume), unconfined);
+
+    let resume_of = |session: &str| SessionResume {
+        project_id: None,
+        workspace_id: "ws-a".into(),
+        session_id: session.into(),
+        prompt: Some("inspect".into()),
+        by: None,
+        agent: None,
+        expected_agent_id: None,
+        branch: None,
+        attach_only: false,
+    };
+    let takeover = state
+        .prepare_local_takeover(
+            LocatedLocal {
+                title: None,
+                gist: None,
+                labels_withheld: None,
+                runtime: "codex".into(),
+                cwd: cwd.clone(),
+                project_id: Some("project-a".into()),
+                likely_active: false,
+            },
+            resume_of("native-local"),
+            &claim("operator", "ws-a"),
+            &frames,
+        )
+        .err()
+        .expect("a non-owner's takeover with a prompt into Codex is refused");
+    assert_eq!(reason(takeover), unconfined);
+
+    let source = state
+        .prepare_source_resume(
+            resume_of("local-source"),
+            &claim("operator", "ws-a"),
+            &frames,
+            ("source", "native-source"),
+            None,
+            &Default::default(),
+        )
+        .err()
+        .expect("a non-owner's source resume with a prompt into Codex is refused");
+    assert_eq!(reason(source), unconfined);
+
+    assert!(state.opening_sessions.is_empty(), "nothing reserved");
+    assert!(state.sessions.is_empty(), "nothing launched");
+}
+
 /// Pins the non-owner mode rule (`rc::turn_mode`) on a native message to a local Codex
 /// conversation (no source), read from the Codex index when the message is prepared and again
 /// when it is delivered. In Default, an operator's message is prepared; once the index says Auto,
@@ -4025,7 +4136,17 @@ async fn a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn() 
             .and_then(|data| data["reason"].as_str().map(str::to_owned))
     };
     let owner_only = Some("mode_owner_only".to_owned());
-    let prepared = message(&state, "operator").unwrap_or_else(|error| panic!("{}", error.message));
+    let unconfined = Some("codex_unconfined".to_owned());
+    // A non-owner's message into Codex is refused when prepared (codex_unconfined). The
+    // delivery-time re-read of the mode stays pinned with an owner-prepared delivery in a
+    // non-owner's shape.
+    assert_eq!(
+        message(&state, "operator").err().and_then(reason),
+        unconfined
+    );
+    let mut prepared = message(&state, "owner").unwrap_or_else(|error| panic!("{}", error.message));
+    prepared.allow_dangerous = false;
+    prepared.caller_is_owner = false;
     assert!(prepared.validate_source().is_ok());
 
     rusqlite::Connection::open(&index)
@@ -4044,14 +4165,14 @@ async fn a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn() 
     assert_eq!(reason(refused), owner_only);
     assert_eq!(
         message(&state, "operator").err().and_then(reason),
-        owner_only
+        unconfined
     );
     assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
 
     std::fs::remove_file(&index).unwrap();
     assert_eq!(
         message(&state, "operator").err().and_then(reason),
-        owner_only
+        unconfined
     );
     assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
 }

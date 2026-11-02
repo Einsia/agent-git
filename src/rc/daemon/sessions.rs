@@ -497,6 +497,11 @@ impl Daemon {
                 )
                 .with_hint("that session belongs to a different workspace"));
             }
+            // Within the workspace, before any older check: a non-owner's prompt into Codex
+            // always gets this typed refusal.
+            if p.prompt.is_some() {
+                crate::rc::harness::CodexUnconfined::check(&entry.runtime, caller.is_owner())?;
+            }
             // Resuming a session that **ever** ran without approvals is owner-only too: its
             // context may still hold what was read at that time with nobody reviewing it.
             //
@@ -733,6 +738,9 @@ impl Daemon {
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
     ) -> Result<SessionOpening, RpcError> {
+        if p.prompt.is_some() {
+            crate::rc::harness::CodexUnconfined::check(&local.runtime, caller.is_owner())?;
+        }
         // An active transcript may be controlled only through its existing native writer.
         if local.likely_active
             && !shared_claude_available(&local.runtime, &p.session_id, &local.cwd, caller)
@@ -931,6 +939,13 @@ impl Daemon {
         let caller = caller_scope(frame)?;
         require_role(&caller, method::SESSION_ENQUEUE)?;
         let mut request: crate::rc::native_inbox::Request = frame.params_as()?;
+        let codex = enrolled.is_some()
+            || local.as_ref().is_some_and(|local| {
+                local.runtime_session_id == request.session_id && local.runtime == "codex"
+            });
+        if codex {
+            crate::rc::harness::CodexUnconfined::check("codex", caller.is_owner())?;
+        }
         request
             .validate_message()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
@@ -1115,6 +1130,7 @@ impl Daemon {
             authority: frame.authority.clone(),
             confinement: None,
             allow_dangerous: caller.is_owner(),
+            caller_is_owner: caller.is_owner(),
             mode_bound,
             request,
             transcript,
@@ -1150,6 +1166,9 @@ impl Daemon {
         frames: &mpsc::Sender<Frame>,
         authority: &crate::rc::authority::Guard,
     ) -> Result<SessionOpening, RpcError> {
+        if p.prompt.is_some() {
+            crate::rc::harness::CodexUnconfined::check(&p.runtime, caller.is_owner())?;
+        }
         let start_id =
             negotiated_start_id(self.start_idempotency_feature(), p.start_id.as_deref())?;
         let mut p = p;

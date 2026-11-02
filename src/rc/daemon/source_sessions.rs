@@ -71,6 +71,9 @@ impl Daemon {
         authority: &crate::rc::authority::Guard,
     ) -> Result<SessionOpening, RpcError> {
         let (source_id, native) = identity;
+        if p.prompt.is_some() {
+            crate::rc::harness::CodexUnconfined::check("codex", caller.is_owner())?;
+        }
         require_same_workspace(caller, &p.session_id, &p.workspace_id)?;
         if prior
             .as_ref()
@@ -711,9 +714,10 @@ mod tests {
                     .err()
                     .map(|error| error.code)
             };
+            // A non-owner's message to a Codex conversation is refused before the history is read.
             assert_eq!(
                 enqueue(&sources[0], &earlier, "operator"),
-                Some(ErrorCode::DangerousSessionLocked as i32)
+                Some(ErrorCode::Forbidden as i32)
             );
             assert_ne!(
                 enqueue(&sources[0], &earlier, "owner"),
@@ -873,9 +877,10 @@ mod tests {
                     .and_then(|error| error.data)
                     .and_then(|data| data["reason"].as_str().map(str::to_owned))
             };
+            // A non-owner's message to a Codex conversation is refused before its mode is read.
             assert_eq!(
                 reason(&sources[0], &auto, "operator").as_deref(),
-                Some("native_mode_changed")
+                Some("codex_unconfined")
             );
             assert_ne!(
                 reason(&sources[0], &auto, "owner").as_deref(),
@@ -959,11 +964,16 @@ mod tests {
                         .and_then(|error| {
                             error.data.and_then(|data| data["reason"].as_str().map(str::to_owned))
                         })
-                        == Some("mode_owner_only".to_owned())
                 })
             };
-            assert_eq!(reasons(&mut state, "operator"), [true; 3]);
-            assert_eq!(reasons(&mut state, "owner"), [false; 3]);
+            // A native source is Codex: a non-owner gets codex_unconfined before the mode rule,
+            // whatever the index says; the owner is held by neither.
+            let unconfined = Some("codex_unconfined".to_owned());
+            assert_eq!(
+                reasons(&mut state, "operator"),
+                [(); 3].map(|_| unconfined.clone())
+            );
+            assert_eq!(reasons(&mut state, "owner"), [None, None, None]);
             rusqlite::Connection::open(root.path().join(format!("home-{native}/state_1.sqlite")))
                 .unwrap()
                 .execute(
@@ -971,7 +981,10 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            assert_eq!(reasons(&mut state, "operator"), [false; 3]);
+            assert_eq!(
+                reasons(&mut state, "operator"),
+                [(); 3].map(|_| unconfined.clone())
+            );
         });
     }
 
@@ -1111,15 +1124,17 @@ mod tests {
             };
             let changed = Some("native_mode_changed".to_owned());
 
-            // Deliveries prepared while every thread is in Default.
+            // Deliveries prepared while every thread is in Default. A non-owner's is refused at the
+            // RPC (codex_unconfined); the delivery re-check still holds a non-owner-shaped one to
+            // the mode admitted.
             let prepared: Vec<_> = sources
                 .iter()
                 .zip([&locked, &absent, &moved])
                 .map(|(source, native)| {
-                    (
-                        message(&state, source, native, "operator").unwrap(),
-                        message(&state, source, native, "owner").unwrap(),
-                    )
+                    let mut non_owner = message(&state, source, native, "owner").unwrap();
+                    non_owner.allow_dangerous = false;
+                    non_owner.mode_bound = Some(crate::protocol::PermissionMode::Default);
+                    (non_owner, message(&state, source, native, "owner").unwrap())
                 })
                 .collect();
 
@@ -1142,7 +1157,7 @@ mod tests {
                     message(&state, source, native, "operator")
                         .err()
                         .map(reason),
-                    Some(changed.clone()),
+                    Some(Some("codex_unconfined".to_owned())),
                     "{at}"
                 );
                 assert!(message(&state, source, native, "owner").is_ok(), "{at}");

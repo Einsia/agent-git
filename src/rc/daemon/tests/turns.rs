@@ -217,13 +217,11 @@ async fn one_sessions_unanswered_rpc_does_not_block_another_session() {
 #[tokio::test]
 async fn prepared_session_rpc_serializes_declared_turn_results() {
     let (tx, mut rx) = mpsc::channel(2);
+    // An operator's turn: not into Codex, which takes no non-owner input.
+    let mut live = rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+    live.info.runtime = "claude-code".into();
     let daemon = rpc_test_daemon(
-        [(
-            "session-a".into(),
-            rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
-        )]
-        .into_iter()
-        .collect(),
+        [("session-a".into(), live)].into_iter().collect(),
         Roster::default(),
     );
 
@@ -1768,10 +1766,13 @@ async fn message_attribution_comes_from_the_caller_claim_not_request_params() {
     for method_name in [method::TURN_START, method::TURN_STEER] {
         let (tx, _rx) = mpsc::channel(1);
         let daemon = rpc_test_daemon(
-            [(
-                "session-a".into(),
-                rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
-            )]
+            [("session-a".into(), {
+                // Attribution is runtime-independent; Codex takes no non-owner input.
+                let mut live =
+                    rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+                live.info.runtime = "claude-code".into();
+                live
+            })]
             .into_iter()
             .collect(),
             Roster::default(),
@@ -2046,6 +2047,74 @@ async fn pending_input_remains_stoppable_and_approvable_without_losing_its_guard
     assert!(!daemon.lock().await.sessions.contains_key("session-a"));
 }
 
+/// A non-owner's turn, steer or queued message into a Codex conversation is refused with the
+/// typed `codex_unconfined` in every permission mode, Plan included (MCP tools run unasked and
+/// unsandboxed there); the owner's turn goes on.
+#[tokio::test]
+async fn a_non_owner_cannot_send_to_a_codex_conversation_in_any_mode() {
+    use crate::protocol::PermissionMode;
+    for mode in [
+        PermissionMode::Default,
+        PermissionMode::Plan,
+        PermissionMode::Auto,
+    ] {
+        let (tx, _rx) = mpsc::channel(4);
+        let live = rpc_test_live("codex-session", 1, tx, mode);
+        assert_eq!(live.info.runtime, "codex");
+        let daemon = rpc_test_daemon(
+            HashMap::from([("codex-session".to_owned(), live)]),
+            Roster::default(),
+        );
+        let mut state = daemon.lock().await;
+        let frame = |method: &str, role: &str| {
+            let params = match method {
+                method::SESSION_ENQUEUE => serde_json::json!({
+                    "workspace_id": "ws-a", "session_id": "codex-session",
+                    "client_msg_id": uuid::Uuid::new_v4().to_string(), "message": "hello"}),
+                _ => serde_json::json!({"session_id": "codex-session", "message": "hello"}),
+            };
+            let mut frame = Frame::request(method, params);
+            frame.caller = Some(claim(role, "ws-a"));
+            frame
+        };
+        for method in [
+            method::TURN_START,
+            method::TURN_STEER,
+            method::SESSION_ENQUEUE,
+        ] {
+            let error = state
+                .prepare_session_rpc(&frame(method, "operator"))
+                .err()
+                .unwrap_or_else(|| panic!("{method} in {mode:?} was not refused"));
+            assert!(
+                error.is(crate::protocol::ErrorCode::Forbidden),
+                "{method} {mode:?}"
+            );
+            assert_eq!(
+                error.data,
+                Some(
+                    serde_json::json!({"outcome": "not_sent", "retryable": false,
+                    "reason": "codex_unconfined"})
+                ),
+                "{method} {mode:?}"
+            );
+            assert_eq!(error.message, crate::rc::harness::CODEX_UNCONFINED);
+        }
+        assert!(
+            state
+                .prepare_session_rpc(&frame(method::TURN_START, "owner"))
+                .is_ok(),
+            "the owner's turn in {mode:?}"
+        );
+        if let Err(error) = state.prepare_session_rpc(&frame(method::TURN_STEER, "owner")) {
+            assert_ne!(
+                error.data.and_then(|d| d.get("reason").cloned()),
+                Some(serde_json::json!("codex_unconfined"))
+            );
+        }
+    }
+}
+
 /// Pins the RPC half of the non-owner mode rule (`rc::turn_mode`), through `prepare_session_rpc`:
 /// an operator's `turn.start`, `turn.steer` and `session.enqueue` into an Auto or AcceptEdits
 /// session, or one whose mode the device cannot read, are refused `mode_owner_only`, `not_sent`,
@@ -2102,6 +2171,9 @@ fn a_non_owners_words_enter_only_a_default_or_plan_turn() {
                 let refused = |role: &str, current: Option<M>, pending: Option<M>| {
                     let (tx, _rx) = mpsc::channel(4);
                     let mut live = rpc_test_live("session-a", 1, tx, M::Default);
+                    // The mode rule holds for every runtime; Codex takes no non-owner input at
+                    // all (codex_unconfined), so it is pinned here on another runtime.
+                    live.info.runtime = "claude-code".into();
                     live.info.permission_mode = current;
                     live.pending_mode = pending;
                     let daemon = rpc_test_daemon(

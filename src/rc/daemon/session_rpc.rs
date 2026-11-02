@@ -130,6 +130,12 @@ impl Daemon {
         if live.ended || live.generation != generation {
             return Err(no_such_session(&session_id));
         }
+        if matches!(
+            f.method(),
+            method::TURN_START | method::TURN_STEER | method::SESSION_ENQUEUE
+        ) {
+            crate::rc::harness::CodexUnconfined::check(&live.info.runtime, caller_is_owner)?;
+        }
 
         // A policy mutation cannot overtake an approval already accepted under
         // its predecessor. Plain input may wait independently of that approval.

@@ -1559,6 +1559,7 @@ impl CodexDriver {
                 | TurnStartOutcome::FatalNotAccepted { .. }
                 | TurnStartOutcome::Unknown { .. }
                 | TurnStartOutcome::SharedUnknown { .. }
+                | TurnStartOutcome::CodexUnconfined
                 | TurnStartOutcome::ModeOwnerOnly { .. }
                 | TurnStartOutcome::NativeSubmission { .. } => {}
             }

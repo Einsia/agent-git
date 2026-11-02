@@ -3219,3 +3219,71 @@ async fn held_lines_leave_a_marker_when_the_session_stops() {
     assert!(session.held.is_empty());
     session.driver.shutdown().await.unwrap();
 }
+
+/// The supervisor refuses a non-owner's turn and steer into a Codex conversation at delivery,
+/// with the typed refusal and nothing written, whatever passed the RPC; the owner's steer is
+/// handled as usual.
+#[tokio::test]
+async fn a_codex_session_refuses_a_non_owner_turn_at_delivery() {
+    let mut driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+    driver.set_test_current_turn("running");
+    let (mut session, _out, _notes) = harness_test_session_with_channels(
+        AnyDriver::Codex(Box::new(driver)),
+        "codex",
+        SessionStatus::Running,
+    );
+    let (commands, mut command_rx) = mpsc::channel(4);
+    let (turn, mut turn_receipt) = crate::rc::ticket::ticket();
+    let (steer, mut steer_receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Turn {
+            message: "hello".into(),
+            attribution: Default::default(),
+            guard_attempt: None,
+            reply: turn.with_control_ceiling(false),
+        })
+        .await
+        .unwrap();
+    commands
+        .send(Command::Steer {
+            message: "hello".into(),
+            attribution: Default::default(),
+            reply: steer.with_control_ceiling(false),
+        })
+        .await
+        .unwrap();
+    let worker = tokio::spawn(async move {
+        session.run_inner(&mut command_rx).await;
+        session
+    });
+    let outcome = turn_receipt
+        .wait(std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        crate::rc::harness::TurnStartOutcome::CodexUnconfined
+    ));
+    let error = steer_receipt
+        .wait(std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<crate::rc::harness::CodexUnconfined>());
+    drop(commands);
+    let mut session = worker.await.unwrap();
+    let (owner, _) = crate::rc::ticket::ticket::<crate::protocol::Delivery>();
+    assert!(
+        session
+            .refuse_unconfined(Command::Steer {
+                message: "hello".into(),
+                attribution: Default::default(),
+                reply: owner,
+            })
+            .is_some()
+    );
+    session.driver.shutdown().await.unwrap();
+}

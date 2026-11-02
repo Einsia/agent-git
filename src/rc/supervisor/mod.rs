@@ -2011,7 +2011,8 @@ impl Session {
             TurnStartOutcome::RetryableNotAccepted { .. }
             | TurnStartOutcome::ConcurrentNotAccepted { .. }
             | TurnStartOutcome::SharedUnknown { .. }
-            | TurnStartOutcome::ModeOwnerOnly { .. } => {}
+            | TurnStartOutcome::CodexUnconfined => {}
+            TurnStartOutcome::ModeOwnerOnly { .. } => {}
             TurnStartOutcome::FatalNotAccepted { message } => {
                 // Request-id exhaustion is known to precede native I/O, but
                 // this generation can never allocate another unique id. Retire
@@ -2487,6 +2488,14 @@ impl Session {
                             continue;
                         }
                         other => other,
+                    };
+                    // Checked at delivery as well as at the RPC: whatever reaches the session.
+                    let cmd = match cmd {
+                        Some(command) => match self.refuse_unconfined(command) {
+                            Some(command) => Some(command),
+                            None => continue,
+                        },
+                        None => None,
                     };
                     if let Some(command) = &cmd
                         && let Err(error) = self.prepare_fallback_instruction(command).await {
