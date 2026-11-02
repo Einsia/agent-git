@@ -52,6 +52,39 @@ pub struct Args {
     pub fresh: bool,
 }
 
+/// A branch name for a fork of `from_ref` that runs as printed after `-b`: the first free
+/// `<base>-fork-<n>`. The base keeps the ref's ASCII letters, digits and separators; a base that
+/// would start with `-` (read as an option), or is empty or not a name git takes for a branch, is
+/// `session`.
+fn fork_suggestion(repo: &Repo, from_ref: &str) -> String {
+    let base: String = from_ref
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = base.trim_start_matches(['-', '.', '/']);
+    let usable = |name: &str| {
+        crate::domain::repo::valid_branch_name(name).is_ok()
+            && repo
+                .git_opt(&["check-ref-format", "--branch", name])
+                .is_some()
+    };
+    let base = if base.is_empty() || !usable(&format!("{base}-fork-1")) {
+        "session"
+    } else {
+        base
+    };
+    (1..)
+        .map(|n| format!("{base}-fork-{n}"))
+        .find(|b| !repo.has_ref(&format!("refs/heads/{b}")))
+        .expect("the sequence is unbounded")
+}
+
 pub fn run(args: Args) -> CmdResult {
     let mut args = args;
     // With no arguments, and when the test holds, the picker opens first (`docs/07_tui.md`
@@ -233,8 +266,16 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!(
                 "`{from_ref}` is a session line. `new` carries memory only (the inheritance target must point at a file line)."
             ));
+            // The suggestion runs as printed: fork names its source in full and needs a new name.
+            #[cfg(windows)]
+            use crate::ui::quote_powershell_argument as quote_arg;
+            #[cfg(not(windows))]
+            use crate::ui::session::shell_arg as quote_arg;
+            let suggestion = fork_suggestion(&repo, &from_ref);
             ui::hint(&format!(
-                "for context, fork: `agit fork {from_ref} -b <new-name> --resume`"
+                "for context, fork it: `agit fork {} -b {} --resume`",
+                quote_arg(&format!("{slug}@{from_ref}")),
+                quote_arg(&suggestion)
             ));
             return Ok(ExitCode::Precondition);
         }
@@ -433,6 +474,34 @@ mod tests {
     struct W {
         #[command(flatten)]
         args: super::Args,
+    }
+
+    /// The suggested fork name is a valid branch that `-b` takes as its value: a source named in
+    /// another script, or starting with punctuation, does not turn it into an option.
+    #[test]
+    fn a_fork_suggestion_is_a_branch_name_not_an_option() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(temp.path()).unwrap();
+        for (from, expected) in [
+            ("first", "first-fork-1"),
+            ("topic/fix", "topic/fix-fork-1"),
+            ("会话", "session-fork-1"),
+            ("éclair", "clair-fork-1"),
+            ("-x", "x-fork-1"),
+            ("a..b", "session-fork-1"),
+        ] {
+            let suggestion = fork_suggestion(&repo, from);
+            assert_eq!(suggestion, expected, "{from}");
+            crate::domain::repo::valid_branch_name(&suggestion).unwrap();
+            let parsed = crate::commands::Cli::try_parse_from([
+                "agit",
+                "fork",
+                "simco/lumen@first",
+                "-b",
+                &suggestion,
+            ]);
+            assert!(parsed.is_ok(), "{from}: {:?}", parsed.err());
+        }
     }
 
     #[test]

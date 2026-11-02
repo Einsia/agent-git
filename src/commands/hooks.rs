@@ -823,7 +823,7 @@ fn failure_line(runtime: &str, session: &str, origin: &std::path::Path) -> Optio
 const UPLOAD_VISIBILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The person learns that a conversation is uploaded every time it starts: fresh, cleared, forked
-/// (a fork is a new conversation the project uploads on its own) or resumed, `agit continue`
+/// (a fork is a new conversation the project uploads on its own) or resumed, `agit resume`
 /// included. Nothing else tells them, and the agent is told nothing. Both runtimes show a hook's
 /// `systemMessage` to the person rather than to the agent.
 fn announces_upload(runtime: &str, source: Source) -> bool {

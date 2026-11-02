@@ -7,6 +7,14 @@ use crate::{ExitCode, commands::CmdResult, infra::config, ui};
 /// How many of the folder's sessions the overview names.
 const SHOWN: usize = 5;
 
+/// The overview's last line when no step is next: what to do with a session, and the command for
+/// each. Every one must exist as written (a test parses them).
+const FOOTER: [(&str, &str); 3] = [
+    ("Send one", "agit share"),
+    ("Pick one up", "agit resume"),
+    ("Everything", "agit help"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FolderState {
@@ -198,10 +206,10 @@ pub fn run() -> CmdResult {
     match next {
         Some((command, why)) => println!("Next: {} — {why}", ui::accent(command)),
         None => println!(
-            "Send one: {} · Pick one up: {} · Everything: {}",
-            ui::accent("agit share"),
-            ui::accent("agit continue"),
-            ui::accent("agit help")
+            "{}",
+            FOOTER
+                .map(|(what, command)| format!("{what}: {}", ui::accent(command)))
+                .join(" · ")
         ),
     }
     Ok(ExitCode::Ok)
@@ -297,4 +305,47 @@ fn row_json(session: &mut FolderSession) -> serde_json::Value {
         "repository": session.saved.as_ref().map(|(r, _)| r),
         "folder": session.cwd,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    /// Every command the overview suggests runs as printed; a hint naming a command the CLI does
+    /// not define (such as `agit continue`) fails here.
+    #[test]
+    fn every_command_the_overview_suggests_exists() {
+        let mut commands: Vec<&str> = FOOTER.iter().map(|(_, command)| *command).collect();
+        commands.push("agit save --all");
+        for signed_in in [false, true] {
+            for in_folder in [false, true] {
+                for state in [
+                    FolderState::On,
+                    FolderState::LocalOnly,
+                    FolderState::Off,
+                    FolderState::NotSaved,
+                ] {
+                    for sessions in [0, 3] {
+                        commands.extend(
+                            next_step(signed_in, in_folder, state, sessions)
+                                .map(|(command, _)| command),
+                        );
+                    }
+                }
+            }
+        }
+        for command in commands {
+            match crate::commands::Cli::try_parse_from(command.split_whitespace()) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    ) => {}
+                Err(error) => panic!("`{command}` is not a command: {error}"),
+            }
+        }
+    }
 }
