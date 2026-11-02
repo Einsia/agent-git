@@ -663,6 +663,24 @@ impl ClaudeCodeDriver {
         Ok(Delivery::AtToolBoundary)
     }
 
+    /// Interrupt the running turn. A turn-fenced interrupt (one naming the turn to stop) is
+    /// refused and nothing is written: Claude Code starts turns of its own (a background task's
+    /// end, a Monitor event, a scheduled prompt, a steer that opens the next turn), some without
+    /// asking first, and the turn this driver has read may be behind the one running, so an
+    /// interrupt could stop a turn the caller did not name. Without a fence, whatever runs is
+    /// interrupted. `interrupt_fenced()` still reports false for this runtime: the Hub reads true
+    /// there as a terminal-attached conversation.
+    pub async fn interrupt_fenced(
+        &mut self,
+        expected_turn_id: Option<&str>,
+    ) -> crate::Result<super::InterruptOutcome> {
+        if expected_turn_id.is_some() {
+            return Err(super::FenceUnsupported.into());
+        }
+        self.interrupt().await?;
+        Ok(super::InterruptOutcome::Requested)
+    }
+
     pub async fn interrupt(&mut self) -> crate::Result<()> {
         self.proc
             .write_line(&json!({
@@ -1942,6 +1960,110 @@ for line in sys.stdin:
             assert_eq!(matches!(outcome, TurnOutcome::Error), expected.is_some());
             assert!(driver.current_turn.is_none());
         }
+        driver.shutdown().await.unwrap();
+    }
+
+    /// The test driver, writing its stdin into the named pipe `log`, which this creates. The
+    /// writer blocks until `written` opens the pipe for reading.
+    #[cfg(unix)]
+    fn logging_driver(log: &std::path::Path) -> ClaudeCodeDriver {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let mut driver = ClaudeCodeDriver::test_driver();
+        driver.proc = Proc::spawn(
+            "sh",
+            &[
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "log".into(),
+                log.display().to_string(),
+            ],
+            &PathBuf::from("/"),
+            &[],
+        )
+        .unwrap();
+        driver
+    }
+
+    /// The lines `driver` wrote before a sentinel written now: the pipe is read in order, with
+    /// blocking reads, up to that sentinel.
+    #[cfg(unix)]
+    async fn written(driver: &mut ClaudeCodeDriver, log: &std::path::Path) -> Vec<Value> {
+        use std::io::BufRead;
+        driver
+            .proc
+            .write_line(&json!({"type":"sentinel"}))
+            .await
+            .unwrap();
+        let log = log.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let reader = std::io::BufReader::new(std::fs::File::open(&log).unwrap());
+            let mut lines = Vec::new();
+            for line in reader.lines() {
+                let line: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if line["type"] == "sentinel" {
+                    return lines;
+                }
+                lines.push(line);
+            }
+            panic!("the pipe closed before the sentinel");
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn interrupts(lines: &[Value]) -> usize {
+        lines
+            .iter()
+            .filter(|line| line["request"]["subtype"] == "interrupt")
+            .count()
+    }
+
+    /// A fenced interrupt is refused whatever turn it names, the running one included, and
+    /// nothing reaches Claude Code; an unfenced interrupt stops whatever runs, as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fenced_interrupt_is_refused_and_an_unfenced_one_goes_out() {
+        let directory = tempfile::tempdir().unwrap();
+        for (case, current) in [
+            ("running", Some("t1")),
+            ("later", Some("t2")),
+            ("idle", None),
+        ] {
+            let log = directory.path().join(case);
+            let mut driver = logging_driver(&log);
+            match current {
+                Some(turn) => driver.set_test_current_turn(turn),
+                None => driver.clear_test_current_turn(),
+            }
+            let error = driver.interrupt_fenced(Some("t1")).await.unwrap_err();
+            assert!(error.is::<super::super::FenceUnsupported>(), "{case}");
+            assert_eq!(interrupts(&written(&mut driver, &log).await), 0, "{case}");
+            assert_eq!(driver.current_turn(), current, "{case}");
+            driver.shutdown().await.unwrap();
+        }
+
+        let log = directory.path().join("unfenced");
+        let mut driver = logging_driver(&log);
+        driver.set_test_current_turn("t2");
+        assert!(matches!(
+            driver.interrupt_fenced(None).await,
+            Ok(super::super::InterruptOutcome::Requested)
+        ));
+        assert_eq!(interrupts(&written(&mut driver, &log).await), 1);
+        driver.shutdown().await.unwrap();
+    }
+
+    /// The Hub reads `interrupt_fenced == true` on a Claude Code session as a terminal-attached
+    /// conversation, so a headless session keeps reporting false.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_headless_session_still_reports_no_interrupt_fence() {
+        let mut driver =
+            super::super::AnyDriver::ClaudeCode(Box::new(ClaudeCodeDriver::test_driver()));
+        assert!(!driver.interrupt_fenced());
         driver.shutdown().await.unwrap();
     }
 

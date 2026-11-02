@@ -1757,6 +1757,63 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
     session.driver.shutdown().await.unwrap();
 }
 
+/// A headless Claude Code session refuses a turn-fenced stop with a typed error, and the turn
+/// that runs keeps running with its approvals and status.
+#[tokio::test]
+async fn a_fenced_interrupt_leaves_a_claude_turn_running() {
+    let mut driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    driver.set_test_current_turn("next-turn");
+    let (mut session, mut out, _notes) = harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::AwaitingApproval,
+    );
+    session.pending.insert(
+        "current-approval".into(),
+        PendingApproval {
+            tool: "Bash".into(),
+            input: serde_json::json!({}),
+            suggested_permission_mode: None,
+            unseen: false,
+        },
+    );
+    let (commands, mut command_rx) = mpsc::channel(1);
+    let (ticket, mut receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Interrupt {
+            expected_turn_id: Some("selected-turn".into()),
+            reply: ticket,
+        })
+        .await
+        .unwrap();
+    let worker = tokio::spawn(async move {
+        session.run_inner(&mut command_rx).await;
+        session
+    });
+    let error = receipt
+        .wait(std::time::Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<crate::rc::harness::FenceUnsupported>());
+    assert!(
+        out.try_recv().is_err(),
+        "a stale stop cannot resolve a newer approval or change status"
+    );
+    drop(commands);
+    // Closing the command channel ends the session; its driver still has the later turn.
+    let mut session = worker.await.unwrap();
+    assert_eq!(
+        match &session.driver {
+            AnyDriver::ClaudeCode(driver) => driver.current_turn(),
+            _ => unreachable!(),
+        },
+        Some("next-turn")
+    );
+    session.driver.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn exhausted_steer_and_interrupt_each_retire_the_generation() {
     for interrupt in [false, true] {

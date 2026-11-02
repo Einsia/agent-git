@@ -50,6 +50,19 @@ impl std::fmt::Display for TurnNotRunning {
 
 impl std::error::Error for TurnNotRunning {}
 
+/// A turn-fenced interrupt on a runtime that cannot confirm which turn is running. Nothing was
+/// sent.
+#[derive(Debug)]
+pub(crate) struct FenceUnsupported;
+
+impl std::fmt::Display for FenceUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The stop was not sent: this conversation can't confirm which turn is running.")
+    }
+}
+
+impl std::error::Error for FenceUnsupported {}
+
 /// What a non-owner is told for any message into a Codex conversation. It names the rule only.
 pub(crate) const CODEX_UNCONFINED: &str =
     "Until agit on this device is updated, others can't send to Codex conversations.";
@@ -837,14 +850,19 @@ impl AnyDriver {
         if let Self::Codex(driver) = self {
             return driver.interrupt_fenced(expected_turn_id).await;
         }
+        if let Self::ClaudeCode(driver) = self {
+            return driver.interrupt_fenced(expected_turn_id).await;
+        }
         anyhow::ensure!(
             expected_turn_id.is_none(),
             "this runtime does not support turn-fenced interrupts"
         );
         match self {
-            Self::ClaudeCode(driver) => driver.interrupt().await?,
             Self::OpenCode(driver) => driver.interrupt().await?,
             Self::Codex(_) => unreachable!("Codex interrupts use the native turn fence"),
+            Self::ClaudeCode(_) => {
+                unreachable!("Claude Code refuses turn-fenced interrupts itself")
+            }
             #[cfg(unix)]
             Self::ClaudeNative(_) => {
                 unreachable!("native Claude interrupts use the native turn fence")
