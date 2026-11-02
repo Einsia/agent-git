@@ -326,12 +326,15 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
         .flatten()
         .flat_map(|phase| &phase.attempts)
         .collect();
+    // An attempt the Hub turned down before its ref transaction changed nothing, although Git
+    // reports none of its refs.
     let unknown = attempts.iter().any(|attempt| {
-        !attempt.complete
-            || attempt
-                .refs
-                .iter()
-                .any(|reference| reference.status == PublicationStatus::Unconfirmed)
+        !attempt.outcome.refused_before_refs_moved()
+            && (!attempt.complete
+                || attempt
+                    .refs
+                    .iter()
+                    .any(|reference| reference.status == PublicationStatus::Unconfirmed))
     });
     if unknown {
         #[cfg(windows)]

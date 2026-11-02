@@ -3923,6 +3923,166 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
     assert_eq!(git(&remote, &["rev-parse", &version]), tagged);
 }
 
+/// A session branch the Hub refused for holding more event entries in a snapshot than it reads
+/// stays out of automatic pushes while its tip still holds more than that, and a push the person
+/// names asks the Hub again. The refusal is told as the Hub's limit, and as a push that changed
+/// nothing on the Hub: the Hub turned it down before moving any ref. The next automatic push leaves
+/// it out before any preview, rather than uploading the whole session again only to meet the same
+/// refusal; once the Hub accepts the branch, automatic pushes carry it again. A refusal the Hub can
+/// also send after its ref transaction still reads as unconfirmed. A client that forgets the
+/// refusal uploads the session on every turn; one that never lets it go keeps a session the Hub now
+/// accepts off it for good; one that reads every named refusal as nothing moved would hide a
+/// receive the Hub may have applied.
+#[test]
+fn a_branch_larger_than_the_hub_accepts_stays_out_of_automatic_pushes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str], automatic: bool| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        if automatic {
+            command.env("AGIT_AUTO_PUSH", "1");
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"], false));
+    let main = git(&remote, &["rev-parse", "refs/heads/main"]);
+    repo.git(&["branch", "big"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let mut lines = String::new();
+    let mut turn = |content: &str| {
+        repo.git(&["checkout", "-q", "big"]).unwrap();
+        lines.push_str(&format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":content}})
+        ));
+        let log = transcript::wrap_lines(&lines, "claude-code", &session.session);
+        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(content).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let text = |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // The Hub refuses the receive as it refuses a snapshot past its event-entry limit. Its one
+    // event gives the snapshot five entries, over the limit of four the refusal names.
+    turn("big turn 0");
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/main".into(), main.clone(), None)];
+    *hub.refuse_with.lock().unwrap() = Some(
+        "ERR HTTP 422 provenance_rejected: refs/heads/publication: session/meta.json unreadable (reserved event topology exceeds the per-push limit of 4 entries)\n",
+    );
+    let refused = run(&["--yes", "push", "alice/app@big"], true);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        text(&refused).contains(
+            "alice/app@big holds more event entries than the Hub accepts (at most 4 in one session snapshot)"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        text(&refused).contains("no branch or tag refs were updated"),
+        "{refused:?}"
+    );
+    assert!(!text(&refused).contains("unconfirmed"), "{refused:?}");
+    assert!(hub.refuse_moved.lock().unwrap().is_empty());
+    let on_hub = Command::new("git")
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "--verify", "--quiet", "refs/heads/big"])
+        .output()
+        .unwrap();
+    assert!(!on_hub.status.success(), "{on_hub:?}");
+
+    // A turn later the branch is larger still: the automatic push asks the Hub nothing.
+    turn("big turn 1");
+    let previews = hub.previews.lock().unwrap().len();
+    let left_out = run(&["--yes", "push", "alice/app@big"], true);
+    assert!(!left_out.status.success(), "{left_out:?}");
+    assert!(
+        text(&left_out).contains("it stays in this checkout and was not pushed"),
+        "{left_out:?}"
+    );
+    assert_eq!(hub.previews.lock().unwrap().len(), previews);
+
+    // The Hub accepts it now. Naming the branch asks again; the automatic push after the next
+    // turn carries it.
+    let named = turn("big turn 2");
+    assert_success(&run(&["--yes", "push", "alice/app@big"], false));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), named);
+    let next = turn("big turn 3");
+    assert_success(&run(&["--yes", "push", "alice/app@big"], true));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), next);
+
+    // A refusal the Hub can also send after its ref transaction leaves the outcome unknown.
+    turn("big turn 4");
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/big".into(), next.clone(), None)];
+    *hub.refuse_with.lock().unwrap() = Some(
+        "ERR HTTP 503 service_unavailable: repository commit is awaiting durable mutation reconciliation\n",
+    );
+    let unknown = run(&["--yes", "push", "alice/app@big"], false);
+    assert!(!unknown.status.success(), "{unknown:?}");
+    assert!(
+        text(&unknown).contains("some ref updates are unconfirmed"),
+        "{unknown:?}"
+    );
+}
+
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.
 /// Each row names an entry point, the destination's audience, whether `--yes` was given and
 /// whether a terminal is attached. Without a terminal a public switch-on is refused with or without

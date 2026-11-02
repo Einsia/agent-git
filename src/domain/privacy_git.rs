@@ -220,6 +220,52 @@ pub(crate) fn withhold_refs(
     accepted::Ledger::open(source, identity)?.withhold(refs)
 }
 
+/// Destination refs automatic publications to `identity` leave out because the Hub refused a
+/// snapshot of theirs for holding more event entries than it reads, each with the limit the Hub
+/// named (see `accepted::Ledger::oversized`).
+pub(crate) fn oversized_refs(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+) -> Result<BTreeMap<String, u64>> {
+    Ok(accepted::Ledger::open(source, identity)?
+        .oversized()
+        .clone())
+}
+
+/// Record refs the Hub refused for holding more than `limit` event entries in a snapshot.
+pub(crate) fn mark_oversized(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+    refs: &[String],
+    limit: u64,
+) -> Result<()> {
+    accepted::Ledger::open(source, identity)?.mark_oversized(refs, limit)
+}
+
+/// Forget that the Hub refused these refs as oversized, once it has accepted them.
+pub(crate) fn clear_oversized(
+    source: &Repo,
+    identity: &crate::hub::identity::RemoteIdentity,
+    refs: &[String],
+) -> Result<()> {
+    accepted::Ledger::open(source, identity)?.clear_oversized(refs)
+}
+
+/// Whether the snapshot at `commit` holds more than `limit` entries under `events/`, counted as
+/// the Hub counts them: every tree and every blob below it.
+pub(crate) fn event_entries_exceed(repo: &Repo, commit: &str, limit: u64) -> Result<bool> {
+    let events = format!("{commit}:{}", meta::EVENTS_DIR);
+    if repo
+        .git_opt(&["cat-file", "-t", &events])
+        .is_none_or(|kind| kind.trim() != "tree")
+    {
+        return Ok(false);
+    }
+    let listing = repo.git_bytes_result(&["ls-tree", "-r", "-t", "-z", &events])?;
+    let entries = listing.iter().filter(|byte| **byte == 0).count();
+    Ok(u64::try_from(entries).unwrap_or(u64::MAX) > limit)
+}
+
 /// Let publications to `identity` plan these refs again, as when the person names one explicitly.
 pub(crate) fn release_refs(
     source: &Repo,

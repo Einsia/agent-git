@@ -80,6 +80,7 @@ pub(super) struct Ledger {
     scope: String,
     branches: BTreeMap<String, Branch>,
     withheld: BTreeSet<String>,
+    oversized: BTreeMap<String, u64>,
 }
 
 impl Ledger {
@@ -114,11 +115,22 @@ impl Ledger {
                 }
                 None => BTreeSet::new(),
             };
+        let oversized =
+            match super::state::load(&directory.join("oversized"), &scope).context(Inconsistent)? {
+                Some(bytes) => {
+                    let (version, refs): (u32, BTreeMap<String, u64>) =
+                        serde_json::from_slice(&bytes).context(Inconsistent)?;
+                    ensure!(version == 1, Inconsistent);
+                    refs
+                }
+                None => BTreeMap::new(),
+            };
         let ledger = Self {
             directory,
             scope,
             branches,
             withheld,
+            oversized,
         };
         ledger.validate()?;
         Ok(ledger)
@@ -159,9 +171,42 @@ impl Ledger {
         super::state::save(&self.directory.join("withheld"), &self.scope, &bytes)
     }
 
+    /// Branches the Hub refused because a session snapshot held more event entries than it reads,
+    /// with the limit it named. Automatic publication leaves such a branch out while its tip still
+    /// holds more than that, since every attempt would upload it only to meet the same refusal; a
+    /// push the person names asks again. The record is local and never sent.
+    pub fn oversized(&self) -> &BTreeMap<String, u64> {
+        &self.oversized
+    }
+
+    pub fn mark_oversized(&mut self, refs: &[String], limit: u64) -> Result<()> {
+        for name in refs {
+            ensure!(valid_ref_name(name), "invalid oversized publication ref");
+        }
+        self.oversized
+            .extend(refs.iter().map(|name| (name.clone(), limit)));
+        self.save_oversized()
+    }
+
+    pub fn clear_oversized(&mut self, refs: &[String]) -> Result<()> {
+        if !refs.iter().any(|name| self.oversized.contains_key(name)) {
+            return Ok(());
+        }
+        for name in refs {
+            self.oversized.remove(name);
+        }
+        self.save_oversized()
+    }
+
+    fn save_oversized(&self) -> Result<()> {
+        let bytes = Zeroizing::new(serde_json::to_vec(&(1, &self.oversized))?);
+        super::state::save(&self.directory.join("oversized"), &self.scope, &bytes)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.withheld.iter().all(|name| valid_ref_name(name)),
+            self.withheld.iter().all(|name| valid_ref_name(name))
+                && self.oversized.keys().all(|name| valid_ref_name(name)),
             Inconsistent
         );
         for (branch, state) in &self.branches {

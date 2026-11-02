@@ -801,16 +801,19 @@ pub(crate) enum UploadFailure {
     SignedOut,
     Hub,
     PrivacyIncomplete,
+    TooLarge,
     Other,
 }
 
 impl UploadFailure {
     fn of(error: &anyhow::Error, project: &Project) -> Self {
-        let code = error
+        let failed = error
             .chain()
-            .find_map(|cause| cause.downcast_ref::<ChildFailed>())
-            .and_then(|failed| failed.exit_code);
-        match code {
+            .find_map(|cause| cause.downcast_ref::<ChildFailed>());
+        if failed.is_some_and(|failed| failed.message.contains(super::push::OVERSIZED)) {
+            return Self::TooLarge;
+        }
+        match failed.and_then(|failed| failed.exit_code) {
             Some(code) if code == ExitCode::Auth.as_i32() => Self::SignedOut,
             Some(code) if code == ExitCode::Network.as_i32() => Self::Hub,
             Some(code) if code == ExitCode::Policy.as_i32() => Self::PrivacyIncomplete,
@@ -824,6 +827,9 @@ impl UploadFailure {
             Self::SignedOut => "agit is signed out; run `agit login` and the next turn uploads it",
             Self::Hub => "the Hub could not be reached or refused it",
             Self::PrivacyIncomplete => "its privacy check did not complete",
+            Self::TooLarge => {
+                "the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again"
+            }
             Self::Other => "it could not be completed on this computer",
         }
     }
@@ -995,7 +1001,13 @@ fn import_capture(
 }
 
 /// Imports and publishes one session; returns its branch and the head the push started from.
-fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<String>)> {
+/// An `automatic` upload leaves out, once it is imported, a branch the Hub refused for a reason
+/// the next turn does not change, and says so with [`LeftOut`].
+fn sync_one(
+    project: &Project,
+    candidate: &Candidate,
+    automatic: bool,
+) -> Result<(String, Option<String>)> {
     verify(project)?;
     let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
@@ -1017,6 +1029,10 @@ fn sync_one(project: &Project, candidate: &Candidate) -> Result<(String, Option<
         "imported session directory differs from the selected source"
     );
     let repo = verify(project)?;
+    if automatic && (refused_as_withdrawn(&repo, &branch)? || refused_as_oversized(&repo, &branch)?)
+    {
+        return Err(LeftOut.into());
+    }
     // Read before the push: a commit saved while it runs may not be in it, and is not counted as
     // uploaded.
     let head = repo.git_opt(&[
@@ -1081,6 +1097,21 @@ impl std::fmt::Display for NothingSettled {
 
 impl std::error::Error for NothingSettled {}
 
+/// A session automatic upload leaves out on every turn, because the Hub refused its branch for a
+/// reason the next turn does not change: withdrawn, or larger than the Hub accepts. The push that
+/// met the refusal reported it; later turns are imported and left out quietly, or each would
+/// report it again.
+#[derive(Debug)]
+struct LeftOut;
+
+impl std::fmt::Display for LeftOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("automatic upload leaves this session out")
+    }
+}
+
+impl std::error::Error for LeftOut {}
+
 fn sync(project: &mut Project) -> CmdResult {
     let mut rows = Vec::new();
     let mut failed = false;
@@ -1092,7 +1123,7 @@ fn sync(project: &mut Project) -> CmdResult {
         {
             continue;
         }
-        let outcome = match sync_one(project, &candidate) {
+        let outcome = match sync_one(project, &candidate, false) {
             Ok((branch, head)) => {
                 serde_json::json!({"branch": branch, "status": "pushed", "head": head})
             }
@@ -2123,7 +2154,7 @@ fn drain(root: &Path) -> Result<()> {
                 return Ok(());
             };
             // A failure is recorded in the project's last result; the remaining sessions go on.
-            let _ = capture_candidate(project, candidate, false);
+            let _ = capture_candidate(project, candidate, false, true);
         }
         drop(worker);
         if markers(root)?.is_empty() && !catch_up_requested(root)? {
@@ -2133,8 +2164,14 @@ fn drain(root: &Path) -> Result<()> {
 }
 
 /// Uploads a queued or saved session. `let_in` says a save lets in the sessions of the folder's
-/// git worktrees from before the folder covered them; automatic capture never does.
-fn capture_candidate(mut project: Project, candidate: Candidate, let_in: bool) -> Result<bool> {
+/// git worktrees from before the folder covered them; automatic capture never does. `automatic`
+/// says no person asked for this upload.
+fn capture_candidate(
+    mut project: Project,
+    candidate: Candidate,
+    let_in: bool,
+    automatic: bool,
+) -> Result<bool> {
     // Automatic capture leaves foreign claims to their source repository's settlement.
     if !matches!(
         placement(&project, &candidate),
@@ -2165,8 +2202,11 @@ fn capture_candidate(mut project: Project, candidate: Candidate, let_in: bool) -
         return Ok(false);
     }
     let modified = transcript_modified(&candidate);
-    let result = sync_one(&project, &candidate);
-    if result.as_ref().is_err_and(|e| e.is::<NothingSettled>()) {
+    let result = sync_one(&project, &candidate, automatic);
+    if result
+        .as_ref()
+        .is_err_and(|e| e.is::<NothingSettled>() || e.is::<LeftOut>())
+    {
         return Ok(true);
     }
     if result.is_ok()
@@ -2302,7 +2342,7 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
         return Ok(Saved::Failed(format!("it is saved in {source}")));
     }
-    if !capture_candidate(project.clone(), candidate.clone(), let_in)? {
+    if !capture_candidate(project.clone(), candidate.clone(), let_in, false)? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
         return Ok(Saved::Failed(
@@ -3289,7 +3329,10 @@ pub(crate) fn registration_scope(cwd: &Path) -> bool {
 }
 
 pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<bool> {
-    if withheld(slug, branch)?.is_some() || refused_as_withdrawn(repo, branch)? {
+    if withheld(slug, branch)?.is_some()
+        || refused_as_withdrawn(repo, branch)?
+        || refused_as_oversized(repo, branch)?
+    {
         return Ok(true);
     }
     let meta = crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))?
@@ -3327,6 +3370,28 @@ fn refused_as_withdrawn(repo: &Repo, branch: &str) -> Result<bool> {
     };
     Ok(crate::domain::privacy_git::withheld_refs(repo, &identity)?
         .contains(&format!("refs/heads/{branch}")))
+}
+
+/// Whether the Hub this checkout publishes to refused `branch` for holding more event entries
+/// than it reads, and its tip still holds more than the limit the Hub named.
+fn refused_as_oversized(repo: &Repo, branch: &str) -> Result<bool> {
+    let Some(identity) = crate::hub::identity::read(repo)? else {
+        return Ok(false);
+    };
+    let Some(&limit) = crate::domain::privacy_git::oversized_refs(repo, &identity)?
+        .get(&format!("refs/heads/{branch}"))
+    else {
+        return Ok(false);
+    };
+    let Some(tip) = repo.git_opt(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ]) else {
+        return Ok(false);
+    };
+    crate::domain::privacy_git::event_entries_exceed(repo, tip.trim(), limit)
 }
 
 /// How many of a folder's newest conversations `project list` describes.
@@ -4143,7 +4208,7 @@ mod tests {
         assert!(before_covered(&policy, &candidate(BEFORE, &tree), true).unwrap());
         assert!(!before_covered(&policy, &candidate(AFTER, &tree), true).unwrap());
         assert!(withholds(&policy, &candidate(BEFORE, &tree), false));
-        assert!(capture_candidate(policy.clone(), candidate(BEFORE, &tree), false).unwrap());
+        assert!(capture_candidate(policy.clone(), candidate(BEFORE, &tree), false, true).unwrap());
         assert!(read(&policy.root).unwrap().unwrap().last_result.is_none());
         let mut kept = link::Link::new("claude-code", BEFORE, Some(&tree));
         kept.owner = Some("alice".into());
@@ -4539,7 +4604,7 @@ mod tests {
             save(&policy).unwrap();
             for (index, candidate) in candidates.iter().enumerate() {
                 assert!(withholds(&policy, candidate, false));
-                assert!(capture_candidate(policy.clone(), candidate.clone(), false).unwrap());
+                assert!(capture_candidate(policy.clone(), candidate.clone(), false, true).unwrap());
                 assert_eq!(
                     withheld("alice/app", &format!("child-{index}")).unwrap(),
                     Some(Withholding::Excluded)
@@ -4979,7 +5044,7 @@ mod tests {
             .insert(key(&candidate.runtime, &candidate.session_id));
         let guard = lock(&latest.root).unwrap();
         save(&latest).unwrap();
-        let worker = std::thread::spawn(move || capture_candidate(stale, candidate, false));
+        let worker = std::thread::spawn(move || capture_candidate(stale, candidate, false, true));
         drop(guard);
         assert!(worker.join().unwrap().unwrap());
         assert!(read(&latest.root).unwrap().unwrap().last_result.is_none());
@@ -5394,8 +5459,11 @@ mod tests {
     }
 
     /// A branch the checkout's Hub refused as withdrawn is not pushed after a turn, until a named
-    /// push releases it. Checking only the project policy would start an automatic push on every
-    /// turn and warn each time that it failed, after the refusal was already reported once.
+    /// push releases it; nor is one it refused for holding more event entries than it reads, while
+    /// its tip still holds more than the limit it named. Checking only the project policy would
+    /// start an automatic push on every turn and warn each time that it failed, after the refusal
+    /// was already reported once; holding back a branch whose tip is within the limit would keep a
+    /// session the Hub now accepts off it for good.
     #[test]
     fn a_branch_the_hub_refused_is_not_pushed_automatically() {
         if !isolated("a_branch_the_hub_refused_is_not_pushed_automatically") {
@@ -5414,6 +5482,32 @@ mod tests {
         crate::domain::privacy_git::withhold_refs(&repo, &identity, &refused).unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", "work").unwrap());
         crate::domain::privacy_git::release_refs(&repo, &identity, &refused).unwrap();
+        assert!(!blocks_auto_push(&repo, "alice/app", "work").unwrap());
+
+        // One event: `events/` then holds its four fan-out directories and the event itself.
+        let session = Meta::new(
+            format!("agit-{}", "b".repeat(40)),
+            "claude-code".into(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        let log = crate::domain::transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                serde_json::json!({"type":"user","message":{"role":"user","content":"one turn"}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        crate::domain::storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("One turn").unwrap();
+        crate::domain::privacy_git::mark_oversized(&repo, &identity, &refused, 4).unwrap();
+        assert!(blocks_auto_push(&repo, "alice/app", "work").unwrap());
+        crate::domain::privacy_git::mark_oversized(&repo, &identity, &refused, 5).unwrap();
+        assert!(!blocks_auto_push(&repo, "alice/app", "work").unwrap());
+        crate::domain::privacy_git::mark_oversized(&repo, &identity, &refused, 4).unwrap();
+        crate::domain::privacy_git::clear_oversized(&repo, &identity, &refused).unwrap();
         assert!(!blocks_auto_push(&repo, "alice/app", "work").unwrap());
     }
 
