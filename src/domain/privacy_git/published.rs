@@ -179,7 +179,7 @@ fn logical_path(alias: &str) -> Result<&str> {
             && root
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            && !path.contains(['\\', ':', '<', '>'])
+            && logical_path_spelling(path)
             && !path.chars().any(char::is_control)
             && path
                 .split('/')
@@ -187,6 +187,22 @@ fn logical_path(alias: &str) -> Result<&str> {
         "invalid public logical path"
     );
     Ok(path)
+}
+
+fn logical_path_spelling(path: &str) -> bool {
+    use crate::domain::privacy::detector::placeholder;
+    let invalid = |text: &str| text.contains(['\\', ':', '<', '>']);
+    let mut cursor = 0;
+    // Only validated placeholders own colons; literal drive prefixes remain invalid.
+    for (start, end, token) in placeholder::token_segments(path) {
+        if placeholder::typed_parts(token).is_some() {
+            if invalid(&path[cursor..start]) {
+                return false;
+            }
+            cursor = end;
+        }
+    }
+    !invalid(&path[cursor..])
 }
 
 fn fields(value: &Value, names: &[&str]) -> Result<()> {
@@ -257,7 +273,10 @@ fn validate_message(value: &Value) -> Result<()> {
                         .flatten()
                         .collect::<Vec<_>>();
                     ensure!(paths.len() == 1, "ambiguous public tool path");
-                    logical_path(paths[0].as_str().context("invalid public tool path")?)?;
+                    let path = paths[0].as_str().context("invalid public tool path")?;
+                    if !super::super::privacy_paths::is_private_alias(path) {
+                        logical_path(path)?;
+                    }
                 }
             }
             Some("tool_result") => {
@@ -315,6 +334,32 @@ fn validate_classification(value: &Value) -> Result<()> {
 mod tests {
     use super::validate_message;
     use serde_json::json;
+
+    #[test]
+    fn file_tool_paths_accept_opaque_aliases_without_accepting_local_paths() {
+        for (path, accepted) in [
+            ("<workspace>/src/main.rs", true),
+            ("<private-file-1>", true),
+            ("/private/project/config.json", false),
+            ("<private-file-0>", false),
+            ("<private-file-01>", false),
+            ("<private-file-1>/../secret", false),
+            ("<private-file-name>", false),
+            ("<workspace>/src/‹secret:blocked:abcdefghijkl›.rs", true),
+            ("<workspace>/src/‹secret:blocked:abcdefghijk0›.rs", false),
+            ("<workspace>/src/‹unknown:blocked:abcdefghijkl›.rs", false),
+            ("<workspace>/‹secret:blocked:abcdefghijkl›/../secret", false),
+            ("<workspace>/C:/secret", false),
+        ] {
+            let value = json!({
+                "type": "assistant", "message": {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "call-file", "name": "Read",
+                    "input": {"file_path": path}
+                }]}
+            });
+            assert_eq!(validate_message(&value).is_ok(), accepted, "{path}");
+        }
+    }
 
     fn message(role: &str, marker: serde_json::Value) -> serde_json::Value {
         let mut value = json!({

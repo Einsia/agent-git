@@ -3888,3 +3888,188 @@ fn a_folder_never_uploads_a_conversation_with_no_finished_turn() {
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
     assert!(state["last_result"].is_null(), "{state}");
 }
+
+/// A delegated task must finish before publication, and dropping its root also fences children
+/// that already have claims, their siblings, and descendants queued by later hooks.
+#[test]
+fn delegated_capture_keeps_unfinished_tasks_and_a_dropped_roots_tree_unpublished() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    assert!(
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    repo.set_auto_push(Some(true)).unwrap();
+    agit::hub::identity::pin(
+        &repo,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let policy = serde_json::json!({
+        "root":lab.work,"repository":"einsia/qa","identity":{"hub":lab.hub,"agent_id":QA_AGENT_ID},
+        "account":"me","account_id":null,"enabled":true,"auto_upload":true,"history":"none",
+        "excluded":[format!("claude-code:{SID}")],"last_result":null,
+    });
+    fs::write(state.with_extension("json"), policy.to_string()).unwrap();
+    let root = "aaaaaaaa-0000-4000-8000-000000000001";
+    let child = "bbbbbbbb-0000-4000-8000-000000000002";
+    let sibling = "dddddddd-0000-4000-8000-000000000004";
+    let grandchild = "eeeeeeee-0000-4000-8000-000000000005";
+    let directory = lab.home.join(".codex/sessions/2026/11/01");
+    fs::create_dir_all(&directory).unwrap();
+    let path = |id: &str| directory.join(format!("rollout-2026-11-01T00-00-00-{id}.jsonl"));
+    fs::write(
+        path(root),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":root,"cwd":lab.work}})
+        ),
+    )
+    .unwrap();
+    let write_child = |id: &str, parent: &str, complete: bool| {
+        let mut rows: Vec<serde_json::Value> = include_str!("fixtures/codex-delegated-task.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["payload"]["id"] = id.into();
+        rows[0]["payload"]["cwd"] = serde_json::json!(lab.work);
+        for field in ["parent_thread_id", "forked_from_id"] {
+            rows[0]["payload"][field] = parent.into();
+        }
+        rows[0]["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] =
+            parent.into();
+        let task = if id == child {
+            "/root/child"
+        } else if id == sibling {
+            "/root/sibling"
+        } else {
+            "/root/child/grandchild"
+        };
+        let sender = if parent == root {
+            "/root"
+        } else {
+            "/root/child"
+        };
+        rows[0]["payload"]["source"]["subagent"]["thread_spawn"]["agent_path"] = task.into();
+        rows[0]["payload"]["source"]["subagent"]["thread_spawn"]["depth"] =
+            serde_json::json!(if parent == root { 1 } else { 2 });
+        rows[2]["payload"]["recipient"] = task.into();
+        rows[2]["payload"]["author"] = sender.into();
+        rows[2]["payload"]["content"][0]["text"] =
+            format!("Message Type: NEW_TASK\nTask name: {task}\nSender: {sender}\nPayload:\n")
+                .into();
+        if !complete {
+            rows.pop();
+        }
+        fs::write(
+            path(id),
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    };
+    let hold = || {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state.with_extension("capture"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        lock
+    };
+    let hook = |id: &str| {
+        let mut process = lab
+            .agit(&["hooks", "settle", "--runtime", "codex"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = serde_json::json!({"session_id":id,"cwd":lab.work,"transcript_path":path(id),"hook_event_name":"Stop","source":"startup"});
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let result = process.wait_with_output().unwrap();
+        assert!(result.status.success(), "{result:?}");
+    };
+    let drain = || {
+        let result = lab
+            .agit(&["--quiet", "project", "capture"])
+            .arg(&lab.work)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        let current: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.with_extension("json")).unwrap()).unwrap();
+        assert!(
+            current["last_result"].is_null(),
+            "an upload was attempted: {current}"
+        );
+    };
+    write_child(child, root, false);
+    let lock = hold();
+    hook(child);
+    drop(lock);
+    drain();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claim =
+        agit::domain::link::get(&store, "codex", child).expect("unfinished child is claimed");
+    let branch = claim.branch.unwrap();
+    assert_eq!(
+        repo.git(&["cat-file", "-s", &format!("{branch}:LOG")])
+            .unwrap()
+            .trim(),
+        "0"
+    );
+
+    let dropped = lab
+        .agit(&["project", "drop"])
+        .env("CODEX_THREAD_ID", root)
+        .output()
+        .unwrap();
+    assert!(dropped.status.success(), "{dropped:?}");
+    let policy: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.with_extension("json")).unwrap()).unwrap();
+    assert!(
+        policy["excluded"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("codex:{root}")))
+    );
+    write_child(child, root, true);
+    write_child(sibling, root, true);
+    write_child(grandchild, child, true);
+    let lock = hold();
+    for id in [child, sibling, grandchild] {
+        hook(id);
+    }
+    drop(lock);
+    drain();
+    assert_eq!(
+        repo.git(&["cat-file", "-s", &format!("{branch}:LOG")])
+            .unwrap()
+            .trim(),
+        "0"
+    );
+    for id in [sibling, grandchild] {
+        assert!(
+            agit::domain::link::get(&store, "codex", id).is_none_or(|claim| claim.branch.is_none())
+        );
+    }
+}

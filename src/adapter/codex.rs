@@ -1319,6 +1319,8 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
     // record's replacement_history is "a duplicate" or "the only carrier" (see the
     // compacted arm).
     let mut saw_message = false;
+    let mut agent_path = None;
+    let mut saw_header = false;
 
     // The line number goes into every event ([`Event::line`]); the web transcript uses it to
     // go back to the source for tool arguments and reasoning. Blank and malformed lines take
@@ -1361,12 +1363,9 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
                 // opening prompt.
                 if !saw_message && let Some(rh) = rh {
                     for m in rh {
-                        if m.get("type").and_then(|x| x.as_str()) != Some("message") {
-                            continue;
-                        }
-                        let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("");
-                        if let Some(t) = extract_content_text(m.get("content")) {
-                            let (kind, text) = classify_message(role, t);
+                        if let Some((kind, text)) =
+                            classify_response_message_for(m, agent_path.as_deref())
+                        {
                             events.push(Event::text(kind, text, ts.clone()).at_line(lineno));
                         }
                     }
@@ -1374,6 +1373,10 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
                 }
             }
             "session_meta" => {
+                if !saw_header {
+                    agent_path = conversation_agent_path(v).map(str::to_owned);
+                    saw_header = true;
+                }
                 if let Some(p) = payload {
                     if id.is_empty()
                         && let Some(s) = p.get("id").and_then(|x| x.as_str())
@@ -1393,12 +1396,14 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
             "response_item" => {
                 let Some(p) = payload else { continue };
                 match p.get("type").and_then(|x| x.as_str()).unwrap_or("") {
-                    "message" => {
+                    "message" | "agent_message" => {
                         saw_message = true;
-                        let role = p.get("role").and_then(|x| x.as_str()).unwrap_or("");
-                        if let Some(t) = extract_content_text(p.get("content")) {
-                            let (kind, text) = classify_message(role, t);
+                        if let Some((kind, text)) =
+                            classify_response_message_for(p, agent_path.as_deref())
+                        {
                             events.push(Event::text(kind, text, ts).at_line(lineno));
+                        } else if p["type"] == "agent_message" {
+                            events.push(other_event(ts).at_line(lineno));
                         }
                     }
                     "function_call" | "local_shell_call" | "custom_tool_call" => {
@@ -1492,6 +1497,79 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
         runtime: "codex".into(),
         cwd,
         events,
+    }
+}
+
+pub(crate) fn delegated_header(record: &serde_json::Value) -> bool {
+    record["type"] == "session_meta"
+        && (record["payload"]["thread_source"] == "subagent"
+            || record["payload"]["source"] == "subagent"
+            || record["payload"]["source"]["subagent"].is_object())
+}
+
+/// The first native header identifies which recipient owns this conversation.
+pub(crate) fn conversation_agent_path(record: &serde_json::Value) -> Option<&str> {
+    if record["type"] != "session_meta" {
+        return None;
+    }
+    if !delegated_header(record) {
+        return Some("/root");
+    }
+    record["payload"]["source"]["subagent"]["thread_spawn"]["agent_path"]
+        .as_str()
+        .or_else(|| record["payload"]["agent_path"].as_str())
+}
+
+/// A delegated task is its recipient's request; a copy in the parent is only context.
+/// Opaque bodies stay in the native transcript, and readable prompts omit routing headers.
+pub(crate) fn classify_response_message_for(
+    message: &serde_json::Value,
+    agent_path: Option<&str>,
+) -> Option<(EventKind, String)> {
+    match message["type"].as_str()? {
+        "message" => Some(classify_message(
+            message["role"].as_str().unwrap_or(""),
+            extract_content_text(message.get("content"))?,
+        )),
+        "agent_message" => {
+            let text = extract_content_text(message.get("content"))?;
+            let body = text.split_once("\nPayload:\n").map(|(_, body)| body.trim());
+            match text.lines().next() {
+                Some("Message Type: NEW_TASK") => {
+                    let task = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Task name: "))?;
+                    let recipient = message["recipient"].as_str()?;
+                    let owns_task =
+                        task == recipient && recipient != "/root" && agent_path == Some(recipient);
+                    let prompt = body
+                        .filter(|body| !body.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Delegated task: {}",
+                                task.rsplit('/').next().unwrap_or(task)
+                            )
+                        });
+                    Some((
+                        if owns_task {
+                            EventKind::UserPrompt
+                        } else {
+                            EventKind::UserInterjection
+                        },
+                        prompt,
+                    ))
+                }
+                Some("Message Type: MESSAGE" | "Message Type: FINAL_ANSWER") => Some((
+                    EventKind::UserInterjection,
+                    body.filter(|body| !body.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "Agent message".into()),
+                )),
+                _ => Some((EventKind::Other, text)),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -3305,6 +3383,59 @@ mod tests {
         ] {
             assert!(!is_synthetic_user_text(s), "must not be an injection: {s}");
         }
+    }
+
+    /// Delegated tasks open turns even when their bodies are opaque; peer updates stay inside
+    /// the active turn. Treating every agent message as a prompt fragments tool executions.
+    #[test]
+    fn delegated_tasks_open_turns_without_peer_messages_opening_more() {
+        // Captured Codex 0.166.0 record shape; account, workspace, IDs and opaque body are fixture data.
+        let fixture = include_str!("../../tests/fixtures/codex-delegated-task.jsonl");
+        let captured: Vec<serde_json::Value> = fixture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let task = captured[2]["payload"].clone();
+        let mut records = vec![captured[0].clone(), captured[2].clone()];
+        for kind in ["MESSAGE", "FINAL_ANSWER", "NEW_TASK_EXTRA"] {
+            records.push(serde_json::json!({"type":"response_item", "payload":{
+                "type":"agent_message", "author":"/root/peer", "recipient":"/root/worker",
+                "content":[{"type":"input_text", "text":format!("Message Type: {kind}\nPayload:\nprogress") }]
+            }}));
+        }
+        records.push(serde_json::json!({"type":"event_msg", "payload":{"type":"task_complete"}}));
+        let session = parse_records(records.iter().enumerate());
+        assert_eq!(session.counts().prompts, 1);
+        assert_eq!(session.counts().interjections, 2);
+        assert_eq!(crate::domain::turn::completed_count(&session), 1);
+        assert_eq!(crate::domain::turn::chain_of(&session).len(), 1);
+        assert_eq!(session.events[0].line, Some(1));
+        assert!(
+            !session.events[0]
+                .text
+                .as_deref()
+                .unwrap()
+                .contains("opaque-task-body")
+        );
+
+        assert_eq!(
+            session.gist(200).as_deref(),
+            Some("Delegated task: conversation_corpus")
+        );
+        let open = parse_records(captured[..captured.len() - 1].iter().enumerate());
+        assert_eq!(crate::domain::turn::completed_count(&open), 0);
+        let mut parent = captured.clone();
+        parent[0]["payload"] = serde_json::json!({"id":captured[0]["payload"]["parent_thread_id"],"cwd":"/workspace","source":"cli","agent_path":"/root/conversation_corpus"});
+        assert_eq!(parse_records(parent.iter().enumerate()).counts().prompts, 0);
+
+        let fragment = parse_records([(0, &captured[2])]);
+        assert_eq!(fragment.counts().prompts, 0);
+
+        let compacted = serde_json::json!({"type":"compacted", "payload":{
+            "window_number":1, "replacement_history":[task]
+        }});
+        let retained = parse_records([(0, &captured[0]), (1, &compacted)]);
+        assert_eq!(retained.counts().prompts, 1);
     }
 
     /// `task_complete` is recognized as a `TurnEnd`.

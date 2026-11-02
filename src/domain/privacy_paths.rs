@@ -369,6 +369,11 @@ fn alias_path(repo: &Repo) -> Result<std::path::PathBuf> {
     Ok(repo.common_dir()?.join(ALIAS_DIRECTORY).join(ALIAS_FILE))
 }
 
+/// An opaque file alias carries no local path and can appear in captured file-tool inputs.
+pub fn is_private_alias(alias: &str) -> bool {
+    private_id(alias).is_some()
+}
+
 fn private_id(alias: &str) -> Option<u64> {
     let digits = alias.strip_prefix("<private-file-")?.strip_suffix('>')?;
     if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {

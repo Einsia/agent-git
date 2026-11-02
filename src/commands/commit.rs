@@ -5062,7 +5062,15 @@ mod tests {
     #[test]
     fn native_archive_waits_for_turn_end_after_tool_results_and_commentary() {
         let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
-        let first = format!("{META}\n{}{}", codex_user("first"), codex_asst("ready"));
+        let task = serde_json::json!({"type":"response_item", "payload":{
+            "type":"agent_message", "author":"/root", "recipient":"/root/worker",
+            "content":[
+                {"type":"input_text", "text":"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+                {"type":"encrypted_content", "encrypted_content":"opaque-delegated-task"}
+            ]
+        }});
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":"n","cwd":"/tmp","thread_source":"subagent","agent_path":"/root/worker"}});
+        let first = format!("{header}\n{task}\n{}", codex_asst("ready"));
         assert_eq!(completed_native_boundary("codex", &first).unwrap(), None);
         let settled = format!("{first}{end}");
         let mut active = format!(

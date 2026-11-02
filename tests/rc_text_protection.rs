@@ -103,7 +103,9 @@ fn assert_one_placeholder(protected: &str, before: &str, after: &str) {
 }
 
 /// A key inside one text, as a prompt or an error carries it, becomes exactly one placeholder
-/// and the text around it is unchanged. A pass over single lines replaces only the BEGIN line.
+/// and the text around it is unchanged, including when that text is a JSON member name. A pass
+/// over single lines exposes the body; a colliding member rename must withhold the JSON rather
+/// than expose the original key or silently discard an entry.
 fn a_key_in_one_text_is_one_placeholder(_home: &Path) {
     let redactor = Redactor::new(Persona::default());
     let before = "deploy with this key:\n";
@@ -112,6 +114,17 @@ fn a_key_in_one_text_is_one_placeholder(_home: &Path) {
     let report = redactor.scrub(&prompt);
     assert_one_placeholder(&report.text, before, after);
     assert_eq!(redactor.try_scrub(&prompt).unwrap().text, report.text);
+    let structured = serde_json::json!({"type":"message", prompt.clone(): "payload"});
+    let protected = redactor.try_scrub_json(&structured).unwrap().value;
+    assert_eq!(
+        protected,
+        serde_json::json!({"type":"message", report.text.clone(): "payload"})
+    );
+    let collision = serde_json::json!({prompt: "first", report.text: "second"});
+    assert!(redactor.try_scrub_json(&collision).is_err());
+    let withheld = redactor.scrub_json(&collision).value;
+    assert!(withheld.get("protection_error").is_some());
+    assert!(!withheld.to_string().contains(BODY[0]));
 }
 
 /// A key at the end of a streamed item waits in the stream's held tail and becomes one placeholder
