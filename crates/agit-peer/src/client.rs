@@ -34,6 +34,45 @@ impl std::fmt::Display for HttpFailure {
 }
 impl std::error::Error for HttpFailure {}
 
+/// Why an offered connection was refused before relay admission. Each names a check, never a
+/// value from the grant or the device, so the reason can be logged as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The grant, its caller or a device names another issuer than this Hub.
+    IssuerMismatch,
+    /// The grant addresses a different executor than this device.
+    OtherExecutor,
+    /// The grant addresses this device under another credential epoch than the one stored here.
+    StaleCredential,
+    /// The grant's lease ended before admission, by this device's clock.
+    GrantExpired,
+    /// The grant's controller delegation is malformed.
+    InvalidDelegation,
+}
+impl Refusal {
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::IssuerMismatch => "issuer_mismatch",
+            Self::OtherExecutor => "other_executor",
+            Self::StaleCredential => "stale_credential",
+            Self::GrantExpired => "grant_expired",
+            Self::InvalidDelegation => "invalid_delegation",
+        }
+    }
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IssuerMismatch => "cloud grant caller or issuer mismatch",
+            Self::OtherExecutor => "cloud grant addresses another executor",
+            Self::StaleCredential => "cloud grant addresses another credential of this executor",
+            Self::GrantExpired => "cloud grant expired before endpoint admission",
+            Self::InvalidDelegation => "invalid cloud controller delegation",
+        })
+    }
+}
+impl std::error::Error for Refusal {}
+
 fn error_reason(status: u16, bytes: &[u8]) -> Option<&'static str> {
     let body = serde_json::from_slice::<serde_json::Value>(bytes).ok();
     match (
@@ -421,8 +460,12 @@ impl Client {
     ) -> anyhow::Result<()> {
         self.validate_grant(grant)?;
         ensure!(
-            same_device(&grant.target, &executor.device),
-            "cloud grant addresses another executor"
+            same_endpoint(&grant.target, &executor.device),
+            Refusal::OtherExecutor
+        );
+        ensure!(
+            grant.target.credential_epoch == executor.device.credential_epoch,
+            Refusal::StaleCredential
         );
         Ok(())
     }
@@ -462,7 +505,7 @@ impl Client {
                 && grant.source.owner.issuer == self.origin
                 && grant.target.owner.issuer == self.origin
                 && grant.source.owner.account_id == grant.caller.account_id,
-            "cloud grant caller or issuer mismatch"
+            Refusal::IssuerMismatch
         );
         if let Some(scope) = &grant.session_controller {
             ensure!(
@@ -476,7 +519,7 @@ impl Client {
                     && !scope.runtime.chars().any(char::is_control)
                     && scope.generation > 0
                     && scope.access != crate::access::Access::Deny,
-                "invalid session controller delegation"
+                Refusal::InvalidDelegation
             );
         }
         if let Some(scope) = &grant.project_controller {
@@ -490,21 +533,18 @@ impl Client {
                     && !scope.local_path.chars().any(char::is_control)
                     && scope.generation > 0
                     && scope.access != crate::access::Access::Deny,
-                "invalid project controller delegation"
+                Refusal::InvalidDelegation
             );
         }
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-        ensure!(
-            grant.expires_at_ms > now,
-            "cloud grant expired before endpoint admission"
-        );
+        ensure!(grant.expires_at_ms > now, Refusal::GrantExpired);
         Ok(())
     }
 
     fn socket_config(&self, device: &DeviceCredential, path: &str) -> anyhow::Result<Config> {
         ensure!(
             device.device.owner.issuer == self.origin,
-            "cloud device issuer mismatch"
+            Refusal::IssuerMismatch
         );
         let mut url = url::Url::parse(&self.transport_origin)?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
@@ -925,19 +965,45 @@ mod tests {
         assert!(client.validate_grant(&project).is_ok());
         project.session_controller = delegated.session_controller;
         assert!(client.validate_grant(&project).is_err());
-        let mut stale = grant;
+        let refusal = |error: anyhow::Error| *error.downcast_ref::<Refusal>().unwrap();
+        let mut stale = grant.clone();
         stale.target.credential_epoch += 1;
-        assert!(
-            client
-                .admitted_data_config(&executor, &stale, &token)
-                .is_err()
+        assert_eq!(
+            refusal(
+                client
+                    .admitted_data_config(&executor, &stale, &token)
+                    .err()
+                    .unwrap()
+            ),
+            Refusal::StaleCredential
         );
-        assert!(
-            client
-                .offered_grant(&executor, &token, Some(stale))
+        assert_eq!(
+            refusal(
+                client
+                    .offered_grant(&executor, &token, Some(stale))
+                    .await
+                    .unwrap_err()
+            ),
+            Refusal::StaleCredential
+        );
+        let mut elsewhere = grant.clone();
+        elsewhere.target.id = "another-device".into();
+        let mut expired = grant.clone();
+        expired.expires_at_ms = 0;
+        let mut foreign = grant;
+        foreign.caller.issuer = "https://another-hub.example".into();
+        for (offered, expected) in [
+            (elsewhere, Refusal::OtherExecutor),
+            (expired, Refusal::GrantExpired),
+            (foreign, Refusal::IssuerMismatch),
+            (project, Refusal::InvalidDelegation),
+        ] {
+            let error = client
+                .offered_grant(&executor, &token, Some(offered))
                 .await
-                .is_err()
-        );
+                .unwrap_err();
+            assert_eq!(refusal(error), expected);
+        }
     }
 
     #[tokio::test]
