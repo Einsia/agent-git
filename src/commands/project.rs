@@ -837,7 +837,7 @@ impl UploadFailure {
             Self::BuildsOnWithdrawn => {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
-            Self::Other => "it could not be completed on this computer",
+            Self::Other => "it could not be completed on this computer; the next turn tries again",
         }
     }
 }
@@ -3234,9 +3234,9 @@ pub(crate) fn automatic_upload(
 }
 
 /// The repository and reason of the last automatic upload by the project that saves this
-/// conversation, when it failed and no conversation has been told yet. Each failure is told once:
-/// the upload runs detached after its turn, so only a later turn can tell it, and repeating it on
-/// every turn would bury the next one.
+/// conversation, when that upload was this conversation's, it failed, and it has not been told
+/// yet. Each failure is told once: the upload runs detached after its turn, so only a later turn
+/// can tell it, and repeating it on every turn would bury the next one.
 pub(crate) fn unreported_failure(
     runtime: &str,
     session: &str,
@@ -3244,7 +3244,9 @@ pub(crate) fn unreported_failure(
 ) -> Option<(String, UploadFailure)> {
     let (project, _) = capturing(runtime, session, origin)?;
     let last = project.last_result.as_ref()?;
-    if last["ok"] != false {
+    // The project keeps one last result for every conversation it uploads; another
+    // conversation's failure is not this turn's.
+    if last["ok"] != false || last["session_id"] != session {
         return None;
     }
     let reason = serde_json::from_value::<UploadFailure>(last["reason"].clone()).ok()?;
@@ -5943,5 +5945,31 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(format!("{other:#}"), "the Hub did not answer");
+    }
+
+    /// #293: the project keeps one last result for every conversation it uploads, and a turn of
+    /// one conversation is never told another's failure; that conversation's own turn is, once.
+    #[test]
+    fn another_conversations_upload_failure_is_not_told_on_this_turn() {
+        if !isolated("another_conversations_upload_failure_is_not_told_on_this_turn") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        let mut policy = project(&root);
+        policy.last_result = Some(serde_json::json!({
+            "at": "2026-01-01T00:00:00Z", "ok": false, "session_id": "failed-session",
+            "error": "x", "reason": "other",
+        }));
+        save(&policy).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(unreported_failure("claude-code", "this-session", &root).is_none());
+        let (repository, failure) =
+            unreported_failure("claude-code", "failed-session", &root).expect("its own turn");
+        assert_eq!(repository, "alice/app");
+        assert_eq!(failure, UploadFailure::Other);
+        assert!(failure.describe().ends_with("the next turn tries again"));
+        assert!(unreported_failure("claude-code", "failed-session", &root).is_none());
     }
 }
