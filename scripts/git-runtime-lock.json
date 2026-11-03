@@ -69,11 +69,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.9.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.9.0-r0.apk",
-        "sha256": "32b127f31e0a919110a18a7f0bb3780d8fb66ba4d8d61b2d301d633f0e319d0e",
+        "version": "2.10.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.10.0-r0.apk",
+        "sha256": "e7e7408ea787ed06d00159b0ff1f9b65a63cf634f36d9e0fa7512ce2c489a503",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c10df79ce35862cf273f98f6eb78d52e4f064ac7/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/af0fa42036cd6e626768c0d65fddaa1d1b30cf21/main/expat"
       },
       {
         "name": "libidn2",
@@ -199,11 +199,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.9.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.9.0-r0.apk",
-        "sha256": "7128bfe18b8a315b9cf90ddf0beffeee454648ae72ff7898ff7d7b09803a559d",
+        "version": "2.10.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.10.0-r0.apk",
+        "sha256": "99144fe0b1bb9316a3bc30c38707996767806661f4a0456fcf4565ac92e79b0f",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/c10df79ce35862cf273f98f6eb78d52e4f064ac7/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/af0fa42036cd6e626768c0d65fddaa1d1b30cf21/main/expat"
       },
       {
         "name": "libidn2",

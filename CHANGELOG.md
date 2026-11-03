@@ -8,6 +8,95 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.35] - 2026-11-03
+
+### Added
+
+- `agit month draft <org> <YYYY-MM>` gathers what you asked and what came back in the sessions the
+  Hub lists for your month in an organization into a private, protected bundle for your own agent
+  to write a summary from. `agit month publish` puts the sections you wrote on the Hub as your own
+  text after a secret scan and your confirmation at a terminal; it stays yours alone until you
+  share the month on the website. `agit month clean` deletes the bundle. Against a Hub that doesn't
+  name the days it keeps of each session, `agit month draft` says so and exits without reading
+  anything.
+- `agit remote` lists the Hubs that hold a repository (`-v` adds its address there, the account
+  signed in, and the upstream), for the folder's repository by default.
+- An agit that was never set up, for example because npm 12 blocked its install script, says so
+  when you start or save a session. A terminal you answer lists what setup writes and asks once,
+  default No; agents and scripts get one line a day telling them to ask you first. `agit doctor`
+  reports the setup state and Claude Code's capture hooks.
+- Remote Control can stop a live session from the web, and its owner can close it, which also stops
+  this machine collecting its transcript.
+- A page can follow a conversation on a device without starting it there, and a resume says
+  whether it started the conversation's runtime.
+
+### Changed
+
+- Someone other than a conversation's owner can send to it again from the Hub once the device the
+  conversation runs on has this version. Claude Code and OpenCode conversations accept their
+  messages again, and the device refuses only work that would outlast their turn.
+- Others can no longer send messages into a Codex conversation on this device; only the workspace
+  owner can, until a later update.
+- Only the workspace owner can run a conversation's runtime commands on the device.
+- Importing a session starts one Git process per turn instead of about four.
+
+### Fixed
+
+- A Claude Code conversation shared between a terminal and the web has a single writer: reopening
+  it in a terminal stops the web's headless process at its turn boundary instead of forking the
+  conversation, and the web is told who holds it. A terminal opened while a web turn still runs
+  takes the conversation over when that turn ends, and keeps holding what is typed there until
+  then.
+- `agit push` no longer fails when someone else pushes to the same repository while a publication
+  is being checked. It previews the publication again once, and asks again if what it would
+  publish changed.
+- A conversation you drop or exclude while a long `agit push` is still running is no longer
+  uploaded by a later group of branches or by `--keep-going` publishing branches one at a time.
+- A conversation larger than the Hub accepts is no longer uploaded again after every turn.
+  Automatic uploads leave it out until it shrinks or you push it yourself, and a push the Hub
+  turned down before changing anything no longer says that some ref updates are unconfirmed.
+- A conversation that builds on a session withdrawn on the Hub is no longer uploaded again after
+  every turn; automatic uploads leave it out and say why once, and pushing it yourself publishes it
+  once that session is restored.
+- When the Hub refuses an upload, `agit save` and `agit` show the Hub's reason instead of Git's
+  "failed to push some refs", and no longer suggest saving again when the same refusal would come
+  back.
+- `agit import` no longer imports nothing when you press Enter at its history choice: no option is
+  preselected, Esc or q cancels, and a cancel says that nothing was imported.
+- Every command `agit`, `agit new` and `agit resume` suggest runs as printed: the overview names
+  `agit resume` instead of a command that doesn't exist, and a fork suggestion names the
+  repository and a free branch name.
+- `agit status` now says when a conversation's completed turns stay on this computer because
+  automatic publication is off for them, and which setting keeps them there.
+- The "last automatic upload failed" line after a turn is about that conversation only, and says
+  when the next turn will try again.
+- Resuming a conversation from before the folder was on, or from before agit covered its git
+  worktree, now tells you it is not uploaded, where it would go and who can read it there, and how
+  to upload it.
+- Memory a conversation writes in a folder that uploads automatically is collected onto its
+  branch; its memory baseline is recorded when the conversation starts, so its own edits are no
+  longer counted as personal memory that was already there.
+- Upgrading removes the old agit section that told agents to run `agit status` at every session
+  start from your home folder's instruction files, also where an early setup doubled its markers;
+  `agit doctor` and `agit` name any project that still has it, with
+  `agit setup --remove-agents-md DIR`, which removes only that section.
+- Signing out now also clears live sessions from Team activity for a device started with
+  `agit rc start`, and says so when it can't.
+- Team activity no longer keeps showing a terminal Claude Code session as "Needs approval" after
+  you answer the approval in the terminal.
+- Stopping a headless Claude Code turn with a turn-specific stop is now refused with a clear reason
+  (fence_unsupported) instead of an unexplained error; a plain stop still stops the turn.
+- When the device refuses a Cloud connection, its log now says which check refused it.
+- A privacy publication no longer leaves the next push or status check reporting "privacy
+  publication cache is being updated; retry" when another agit thread was starting a process at
+  the moment the publication finished.
+- After `agit memory distill`, the hint to publish main now names the repository
+  (`agit push <owner/repo>@main`), so it works from any folder.
+- `npx create-agit` no longer exits silently with status 13 when its check of the registry for a
+  newer installer cannot finish; it installs its own version instead.
+- Native task identities and binary content are kept when a session is captured, and delegated
+  sessions get meaningful titles.
+
 ## [0.2.34] - 2026-11-01
 
 ### Added
