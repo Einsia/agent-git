@@ -295,7 +295,10 @@ pub fn execute(
         let mut summaries: Vec<_> = projector.dictionary.records().filter_map(|record| {
             let rule = decisions.iter().find(|rule| rule.scope == scope && rule.token == record.token);
             if command.action == "list" && rule.is_none_or(|rule| rule.block != Some(true)) { return None; }
-            Some(json!({"id":token_id(&record.token),"token":record.token,
+            // What kind of value it is comes from its placeholder, never from the value.
+            let kind = crate::domain::privacy::detector::placeholder::typed_parts(&record.token)
+                .map(|(_, kind, _)| kind);
+            Some(json!({"id":token_id(&record.token),"token":record.token,"kind":kind,
                 "name":rule.map(|rule|rule.name.as_str()).unwrap_or("detected secret"),
                 "origins":record.origins,"explicit_block":rule.is_some_and(|rule|rule.block == Some(true)),
                 "allowed":rule.is_some_and(|rule|rule.allow == Some(true))}))

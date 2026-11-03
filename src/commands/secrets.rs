@@ -236,12 +236,28 @@ pub fn run(args: Args) -> CmdResult {
                 println!("no matching privacy records");
             }
             for record in records {
+                // Context without the value: what kind of value it is, and
+                // whether a detector found it or the person added it.
+                let from: Vec<&str> = record["origins"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|origin| origin.as_str())
+                    .map(|origin| match origin {
+                        "heuristic" => "detector",
+                        "global_user" => "added-for-all",
+                        "repository_user" => "added-in-repo",
+                        other => other,
+                    })
+                    .collect();
                 println!(
-                    "{}\t{}\tblocked={}\tallowed={}",
+                    "{}\t{}\tblocked={}\tallowed={}\tkind={}\tfrom={}",
                     record["id"].as_str().unwrap_or(""),
                     record["name"].as_str().unwrap_or(""),
                     record["explicit_block"],
-                    record["allowed"]
+                    record["allowed"],
+                    record["kind"].as_str().unwrap_or("unknown"),
+                    from.join(",")
                 );
             }
         }
