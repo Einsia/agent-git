@@ -1471,6 +1471,21 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     repo.add_all().unwrap();
     repo.commit("Protected repeated events").unwrap();
     assert_success(&run(&["--yes", "push", "alice/app@hydrated"], false));
+    // A branch new to the Hub whose name holds that request's protected value, spelled as a branch
+    // name, is refused: the stored request shows only a placeholder, so the name is compared with
+    // the request as publication restores it.
+    let spelled = format!("ship-{}", secret.to_ascii_lowercase());
+    repo.git(&["branch", &spelled, "hydrated"]).unwrap();
+    let before = hub.posts.load(Ordering::Acquire);
+    let refused = run(&["--yes", "push", &format!("alice/app@{spelled}")], false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("rename the branch with `agit branch rename"),
+        "{refused:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), before);
+    repo.git(&["branch", "-D", &spelled]).unwrap();
     let restored = envelope(&git(&remote, &["rev-parse", "refs/heads/hydrated"]))
         .open_layer(&rotated)
         .unwrap();
@@ -1551,7 +1566,8 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let refused = run(&["--yes", "push", &format!("alice/app@{named}")], false);
     assert!(!refused.status.success(), "{refused:?}");
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("requires privacy rewriting"),
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("rename the branch with `agit branch rename"),
         "{refused:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
