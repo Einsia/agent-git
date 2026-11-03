@@ -739,6 +739,19 @@ impl Outcome {
             .map(|m| m.as_str())
     }
 
+    /// The Hub's refusal as git printed it, `HTTP <status> <kind>: <message>`, without git's own
+    /// prefix. Git follows it with "failed to push some refs", which says nothing of why.
+    pub fn refusal(&self) -> Option<&str> {
+        let re = regex::Regex::new(r"\bHTTP [45]\d\d [a-z][a-z0-9_]*: [^\r\n]*").ok()?;
+        re.find(&self.stderr).map(|m| m.as_str().trim_end())
+    }
+
+    /// Whether the Hub would refuse the same push again: it judged the push and turned it down
+    /// for what it carries or for this agit, not because the repository moved meanwhile.
+    pub fn refused_for_good(&self) -> bool {
+        self.refused_before_refs_moved() && self.refusal_kind() != Some("publication_refs_moved")
+    }
+
     /// Whether the Hub turned this push down while judging it, before its ref transaction, so no
     /// ref moved. The Hub raises these kinds only then. A result after the transaction is a
     /// conflict, an unavailable service or an internal error, and while the Hub reports progress
@@ -1730,6 +1743,37 @@ mod tests {
             outcome("! [rejected] main -> main (fetch first)").refusal_kind(),
             None
         );
+    }
+
+    /// Git ends a refused push with "failed to push some refs", which says nothing of why; the
+    /// Hub's line before it does. This stderr is what a Sim run printed for an encrypted push.
+    #[test]
+    fn the_hubs_refusal_is_read_whole_and_told_apart_from_a_moved_repository() {
+        let refused = outcome(
+            "fatal: remote error: HTTP 422 provenance_rejected: privacy public session contains an unsupported message block\nfatal: the remote end hung up unexpectedly\nerror: failed to push some refs to 'http://h/a/proj.git'\n",
+        );
+        assert_eq!(
+            refused.refusal(),
+            Some(
+                "HTTP 422 provenance_rejected: privacy public session contains an unsupported message block"
+            )
+        );
+        assert!(refused.refused_for_good());
+        // A repository that moved meanwhile takes a new preview, not a change to the content.
+        let moved = outcome(
+            "fatal: remote error: HTTP 409 publication_refs_moved: the repository changed after this publication was previewed; preview it again",
+        );
+        assert!(moved.refusal().is_some());
+        assert!(!moved.refused_for_good());
+        // A result after the ref transaction may have moved refs; it is not a refusal to rerun.
+        assert!(
+            !outcome("fatal: remote error: HTTP 503 service_unavailable: try later")
+                .refused_for_good()
+        );
+        let bare =
+            outcome("error: RPC failed; HTTP 422 curl 22 The requested URL returned error: 422");
+        assert_eq!(bare.refusal(), None);
+        assert!(!bare.refused_for_good());
     }
 
     #[test]

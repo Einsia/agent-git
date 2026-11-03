@@ -512,6 +512,38 @@ pub(crate) const OVERSIZED: &str = "holds more event entries than the Hub accept
 /// project capture as [`OVERSIZED`] is.
 pub(crate) const BUILDS_ON_WITHDRAWN: &str = "builds on a session withdrawn on the Hub";
 
+/// How a push says that the Hub refused it for what it carries, so the same push meets the same
+/// refusal. Project capture reads it as [`OVERSIZED`] is, and offers no retry for it.
+pub(crate) const REFUSED_AGAIN: &str = "the Hub refuses it again until that changes";
+
+/// How a push the Hub refused for this agit's version says what to do, read as [`REFUSED_AGAIN`]
+/// is.
+pub(crate) const UPGRADE_FIRST: &str = "run `agit upgrade`, then";
+
+/// What the Hub says when an encrypted publication carries a Claude Code record its public
+/// projection does not support yet.
+pub(crate) const UNSUPPORTED_BLOCK: &str =
+    "privacy public session contains an unsupported message block";
+
+/// How a push says the Hub refused an encrypted publication for [`UNSUPPORTED_BLOCK`], in
+/// privacy's words. A newer agit publishes it; pushing again does not.
+pub(crate) const ENCRYPTED_REFUSED: &str = "This session's encrypted publication was refused by the Hub (unsupported Claude Code record); it will publish once agit is updated.";
+
+/// Whether a failed push's message says that the same push meets the same refusal.
+pub(crate) fn refused_for_good(message: &str) -> bool {
+    [
+        REFUSED_AGAIN,
+        UPGRADE_FIRST,
+        OVERSIZED,
+        BUILDS_ON_WITHDRAWN,
+        ENCRYPTED_REFUSED,
+        // A branch name the privacy check would change stays refused until it is renamed.
+        "rename the branch with `agit branch rename",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
 /// Branches one publication carries. A publication's fixed cost (destination checks, the ref
 /// advertisement, snapshot planning) is paid once per publication, so many branches share one.
 /// The plan's head limit also counts `main` and branches a selection carries, so a group stays

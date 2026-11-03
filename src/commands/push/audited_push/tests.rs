@@ -671,3 +671,115 @@ fn audit_and_new_destinations_require_full_inspection() {
             .is_none()
     );
 }
+
+/// A refused attempt as Git reports it when the Hub turns the push down: no ref line, and the
+/// Hub's reason above Git's own "failed to push some refs".
+fn refused_report(hub_line: &str) -> PublicationReport {
+    PublicationReport {
+        lfs: None,
+        heads: Some(crate::hub::git::PublicationPhase {
+            attempts: vec![PublicationAttempt {
+                batch: 0,
+                outcome: crate::hub::git::Outcome {
+                    code: 128,
+                    stderr: format!(
+                        "fatal: remote error: {hub_line}\nfatal: the remote end hung up unexpectedly\nerror: failed to push some refs to 'http://h/me/qa.git'\n"
+                    ),
+                },
+                refs: vec![],
+                complete: false,
+                error: None,
+            }],
+            unattempted: vec![],
+            error: None,
+            withdrawn: vec![],
+        }),
+        tags: None,
+        error: None,
+    }
+}
+
+/// A refusal the same push meets again is told by the Hub's reason, never by Git's last line,
+/// and is not offered as something to rerun.
+#[test]
+fn a_refusal_for_good_is_told_by_its_reason_and_not_offered_again() {
+    let retry = "agit push me/qa --branch=work";
+    let recovery = publication_recovery(
+        &refused_report(
+            "HTTP 422 provenance_rejected: refs/heads/work: session/meta.json unreadable",
+        ),
+        retry,
+        "me/qa",
+    );
+    assert!(
+        recovery.contains(
+            "(HTTP 422 provenance_rejected: refs/heads/work: session/meta.json unreadable)"
+        ),
+        "{recovery}"
+    );
+    assert!(!recovery.contains("failed to push some refs"), "{recovery}");
+    assert!(
+        !recovery.contains(retry) && !recovery.contains("unconfirmed"),
+        "{recovery}"
+    );
+    assert!(
+        recovery.contains("no branch or tag refs were updated"),
+        "{recovery}"
+    );
+    assert!(
+        crate::commands::push::refused_for_good(&recovery),
+        "{recovery}"
+    );
+
+    // An agit too old for the Hub is told how to get past it.
+    let recovery = publication_recovery(
+        &refused_report("HTTP 428 agentgit_upgrade_required: this agit is too old"),
+        retry,
+        "me/qa",
+    );
+    assert!(
+        recovery.ends_with(&format!("run `agit upgrade`, then `{retry}`")),
+        "{recovery}"
+    );
+    assert!(
+        crate::commands::push::refused_for_good(&recovery),
+        "{recovery}"
+    );
+
+    // The encrypted record the Hub cannot project yet is told in privacy's words alone.
+    let recovery = publication_recovery(
+        &refused_report(
+            "HTTP 422 provenance_rejected: privacy public session contains an unsupported message block",
+        ),
+        retry,
+        "me/qa",
+    );
+    assert_eq!(recovery, crate::commands::push::ENCRYPTED_REFUSED);
+    assert!(crate::commands::push::refused_for_good(&recovery));
+
+    // Whatever Hub sent it, the line reaches the terminal without control characters.
+    let recovery = publication_recovery(
+        &refused_report("HTTP 422 provenance_rejected: plain\u{1b}[2J\u{7}text"),
+        retry,
+        "me/qa",
+    );
+    assert!(
+        recovery.contains("(HTTP 422 provenance_rejected: plain[2Jtext)"),
+        "{recovery}"
+    );
+    assert!(!recovery.chars().any(char::is_control), "{recovery:?}");
+
+    // A repository that moved meanwhile is still worth another try.
+    let recovery = publication_recovery(
+        &refused_report(
+            "HTTP 409 publication_refs_moved: the repository changed after this publication was previewed; preview it again",
+        ),
+        retry,
+        "me/qa",
+    );
+    assert!(recovery.contains(retry), "{recovery}");
+    assert!(
+        !crate::commands::push::refused_for_good(&recovery),
+        "{recovery}"
+    );
+}
