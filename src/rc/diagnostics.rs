@@ -23,6 +23,98 @@ const WRITE_RETRY: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub(super) struct Log(Arc<Inner>);
 
+/// The daemon's log once it is open, for the parts of the daemon that run apart from the
+/// endpoint: session supervisors, runtime drivers, the session RPC waits and the frame loop.
+static DAEMON_LOG: std::sync::OnceLock<Log> = std::sync::OnceLock::new();
+
+/// Makes `log` the one [`event`] writes to. The first log opened in a process stays.
+pub(super) fn install(log: &Log) {
+    let _ = DAEMON_LOG.set(log.clone());
+}
+
+/// Records `event` in the daemon's log when one is open. `metadata` holds ids (every one capped,
+/// see [`id`] and [`rpc_id`]), fixed classes, exit codes and timings only: never a prompt,
+/// message, tool output, path or error text.
+pub(crate) fn event(event: &str, metadata: Value) {
+    if let Some(log) = DAEMON_LOG.get() {
+        log.record(event, metadata);
+    }
+}
+
+/// The newest daemon log in each daemon namespace (the desktop daemon's first), for `agit
+/// doctor`. Nothing is created: a namespace without a log has none to name.
+pub(super) fn newest_logs() -> Vec<PathBuf> {
+    let Ok(home) = crate::infra::config::agit_home() else {
+        return Vec::new();
+    };
+    [super::LOCAL_NAMESPACE, "rc"]
+        .iter()
+        .filter_map(|namespace| {
+            std::fs::read_dir(home.join(namespace))
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with("diagnostics-") && name.ends_with(".jsonl")
+                })
+                .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+                .max_by_key(|(modified, _)| *modified)
+                .map(|(_, path)| path)
+        })
+        .collect()
+}
+
+/// The events the daemon-wide log holds whose metadata names `id`, for tests: a log in a
+/// private temporary folder is installed first when none is. Waits up to five seconds for
+/// `expected` such events, since lines are written on their own thread.
+#[cfg(test)]
+pub(crate) fn test_events(id: &str, expected: usize) -> Vec<Value> {
+    let log = DAEMON_LOG.get_or_init(|| {
+        let directory =
+            std::env::temp_dir().join(format!("agit-daemon-log-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        Log::open_in(&directory, "test", FILE_BYTES, WRITE_RETRY).unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["metadata"].to_string().contains(id))
+            .collect();
+        if events.len() >= expected || Instant::now() >= deadline {
+            return events;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// An id as the log keeps it: at most 256 characters. Every id an event carries is capped so.
+pub(crate) fn id(value: &str) -> String {
+    short(value)
+}
+
+/// A request id as the log keeps it: a string capped as [`id`], a number as it is.
+pub(crate) fn rpc_id(value: Option<&crate::protocol::RequestId>) -> Value {
+    request_id(value)
+}
+
+/// Milliseconds since `start`, for a timing field.
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The name of an enum value's variant (`Accepted` for `Accepted { .. }`): a fixed class, never
+/// the text a variant carries.
+pub(crate) fn variant<T: std::fmt::Debug>(value: &T) -> String {
+    format!("{value:?}")
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .take(64)
+        .collect()
+}
+
 struct Inner {
     sender: Option<mpsc::SyncSender<Vec<u8>>>,
     _worker: Option<std::thread::JoinHandle<()>>,
@@ -238,6 +330,33 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// The daemon-wide events keep ids, fixed classes and timings: a typed outcome is logged as
+    /// its variant's name, never the text it carries, and an id is capped.
+    #[test]
+    fn daemon_events_keep_ids_classes_and_timings_only() {
+        let outcome = crate::rc::harness::TurnStartOutcome::Unknown {
+            message: "SYNTHETIC-PRIVATE-CONTENT".into(),
+            attempted_mode: None,
+        };
+        assert_eq!(variant(&outcome), "Unknown");
+        assert_eq!(id(&"x".repeat(300)).len(), 256);
+        // Opens the daemon-wide log when no other test did; each test reads only its own ids.
+        test_events("session-diagnostics-canary", 0);
+        event(
+            "turn.start_resolved",
+            json!({
+                "session_id": id("session-diagnostics-canary"),
+                "outcome": variant(&outcome),
+                "elapsed_ms": 7,
+            }),
+        );
+        let events = test_events("session-diagnostics-canary", 1);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "turn.start_resolved");
+        assert_eq!(events[0]["metadata"]["outcome"], "Unknown");
+        assert!(!events[0].to_string().contains("SYNTHETIC-PRIVATE-CONTENT"));
+    }
 
     #[test]
     fn rotation_retains_private_metadata_without_request_content() {

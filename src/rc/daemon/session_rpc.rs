@@ -1142,8 +1142,29 @@ impl PreparedSessionRpc {
                 mut reply,
                 guard_attempt,
             } => {
+                let started = std::time::Instant::now();
+                let turn = |event: &str, extra: serde_json::Value| {
+                    let mut metadata = serde_json::json!({
+                        "session_id": crate::rc::diagnostics::id(&session_id),
+                        "generation": generation,
+                        "elapsed_ms": crate::rc::diagnostics::elapsed_ms(started),
+                    });
+                    if let (Some(metadata), serde_json::Value::Object(extra)) =
+                        (metadata.as_object_mut(), extra)
+                    {
+                        metadata.extend(extra);
+                    }
+                    crate::rc::diagnostics::event(event, metadata);
+                };
+                // Every start is logged with its outcome, however soon that comes; a start still
+                // in flight after the first window also gets the slow-wait events below.
+                turn("turn.start_received", serde_json::json!({}));
                 if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
                 {
+                    turn(
+                        "turn.start_resolved",
+                        serde_json::json!({"outcome": "not_queued"}),
+                    );
                     return finish_prepared_session_rpc(
                         daemon,
                         session_id,
@@ -1174,10 +1195,20 @@ impl PreparedSessionRpc {
                                     eprintln!(
                                         "agitd: a taken turn/start lost its typed supervisor outcome; retaining its RPC gate until hard-stop persistence"
                                     );
+                                    turn(
+                                        "turn.start_parked",
+                                        serde_json::json!({"reason": "outcome_lost"}),
+                                    );
                                     std::future::pending::<TurnStartOutcome>().await
                                 }
                             },
                         };
+                        turn(
+                            "turn.start_resolved",
+                            serde_json::json!({
+                                "outcome": crate::rc::diagnostics::variant(&outcome),
+                            }),
+                        );
                         let (completion, response) =
                             project_turn_start_outcome(outcome, guard_attempt.clone());
                         finish_prepared_session_rpc(
@@ -1189,7 +1220,20 @@ impl PreparedSessionRpc {
                         // A taken turn may carry a sticky permission override. Retain its
                         // gate until a typed native outcome or proven shutdown; elapsed
                         // time alone cannot prove refusal or authorize another write.
-                        let outcome = match reply.wait_until_closed().await {
+                        // The wait has no deadline, so the log notes each window it spans.
+                        turn("turn.start_taken", serde_json::json!({}));
+                        let closed = {
+                            let mut wait = std::pin::pin!(reply.wait_until_closed());
+                            loop {
+                                match tokio::time::timeout(2 * SESSION_REPLY_TIMEOUT, &mut wait)
+                                    .await
+                                {
+                                    Ok(closed) => break closed,
+                                    Err(_) => turn("turn.start_waiting", serde_json::json!({})),
+                                }
+                            }
+                        };
+                        let outcome = match closed {
                             Ok(Ok(outcome)) => outcome,
                             Ok(Err(error)) => TurnStartOutcome::Unknown {
                                 message: format!(
@@ -1201,9 +1245,19 @@ impl PreparedSessionRpc {
                                 eprintln!(
                                     "agitd: a taken turn/start receipt closed without termination proof; retaining its RPC gate until hard-stop persistence"
                                 );
+                                turn(
+                                    "turn.start_parked",
+                                    serde_json::json!({"reason": "receipt_closed"}),
+                                );
                                 std::future::pending::<TurnStartOutcome>().await
                             }
                         };
+                        turn(
+                            "turn.start_resolved",
+                            serde_json::json!({
+                                "outcome": crate::rc::diagnostics::variant(&outcome),
+                            }),
+                        );
                         let (completion, response) =
                             project_turn_start_outcome(outcome, guard_attempt);
                         finish_prepared_session_rpc(

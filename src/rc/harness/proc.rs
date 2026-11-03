@@ -818,6 +818,19 @@ fn stdout_failure(strict: bool, message: String) -> Line {
     }
 }
 
+/// How long a stdin write may block before the daemon's log notes it, and how often after.
+const STDIN_WAIT_NOTE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The runtime's program as the log names it: its file name, never the directory it is in.
+fn program_name(program: &str) -> String {
+    crate::rc::diagnostics::id(
+        &std::path::Path::new(program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    )
+}
+
 impl Proc {
     /// Start a harness child process.
     ///
@@ -915,6 +928,10 @@ impl Proc {
         if let Some(pgid) = pgid {
             let _ = LAUNCH_GROUPS.try_with(|groups| groups.record(pgid));
         }
+        crate::rc::diagnostics::event(
+            "runtime.spawned",
+            serde_json::json!({"program": program_name(program), "pid": child.id()}),
+        );
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -1041,12 +1058,42 @@ impl Proc {
 
     /// Write one NDJSON line to the child.
     pub async fn write_line(&mut self, v: &serde_json::Value) -> crate::Result<()> {
+        let pid = self.child.id();
         let Some(stdin) = self.stdin.as_mut() else {
             anyhow::bail!("the harness process is no longer accepting input (it exited)");
         };
         let mut s = serde_json::to_string(v)?;
         s.push('\n');
-        pipe_input::write(stdin, s.as_bytes()).await?;
+        // A pipe the child stops reading blocks this write with no deadline; the log notes each
+        // interval it stays blocked, and the total once it completes late.
+        let started = std::time::Instant::now();
+        let written = {
+            let mut write = std::pin::pin!(pipe_input::write(stdin, s.as_bytes()));
+            loop {
+                match tokio::time::timeout(STDIN_WAIT_NOTE, &mut write).await {
+                    Ok(written) => break written,
+                    Err(_) => crate::rc::diagnostics::event(
+                        "runtime.stdin_waiting",
+                        serde_json::json!({
+                            "pid": pid,
+                            "bytes": s.len(),
+                            "elapsed_ms": crate::rc::diagnostics::elapsed_ms(started),
+                        }),
+                    ),
+                }
+            }
+        };
+        if started.elapsed() >= STDIN_WAIT_NOTE {
+            crate::rc::diagnostics::event(
+                "runtime.stdin_written",
+                serde_json::json!({
+                    "pid": pid,
+                    "ok": written.is_ok(),
+                    "elapsed_ms": crate::rc::diagnostics::elapsed_ms(started),
+                }),
+            );
+        }
+        written?;
         #[cfg(test)]
         if self
             .write_outcome_failures
@@ -1209,6 +1256,16 @@ fn process_group_exists(pgid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon's log names a runtime by its program's file name, never the folder it is in.
+    #[test]
+    fn a_runtime_is_logged_by_its_program_name_only() {
+        assert_eq!(
+            super::program_name("/Users/canary/private/bin/claude"),
+            "claude"
+        );
+        assert_eq!(super::program_name("codex"), "codex");
+    }
+
     #[cfg(unix)]
     #[test]
     fn closed_runtime_input_preserves_default_output_pipe_signals() {

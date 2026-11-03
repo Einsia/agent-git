@@ -477,7 +477,7 @@ impl Daemon {
                                 continue;
                             }
                             let prepared = {
-                                let mut g = d.lock().await;
+                                let mut g = frame_lock(&d).await;
                                 if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
                                 g.prepare_opening(&frame, &frames_tx)
                             };
@@ -523,7 +523,7 @@ impl Daemon {
                                 continue;
                             }
                             let prepared = {
-                                let state = d.lock().await;
+                                let state = frame_lock(&d).await;
                                 state.prepare_catalog(&frame)
                             };
                             match prepared {
@@ -552,7 +552,7 @@ impl Daemon {
                                 continue;
                             }
                             let prepared = {
-                                let g = d.lock().await;
+                                let g = frame_lock(&d).await;
                                 if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
                                 g.prepare_session_list(&frame)
                             };
@@ -567,7 +567,7 @@ impl Daemon {
                                         let scanned = tokio::task::spawn_blocking(move || {
                                             if include_local { snapshot.scan(LocalSessionScan::Listing) } else { vec![] }
                                         }).await;
-                                        let mut g = d.lock().await;
+                                        let mut g = frame_lock(&d).await;
                                         if !connection_epoch_is_current(&g.settlement, epoch) { return; }
                                         let result = scanned.map_err(|_| RpcError::new(ErrorCode::Internal, "session discovery worker failed"))
                                             .and_then(|local| g.finish_session_list(&frame, &roots, local));
@@ -591,7 +591,7 @@ impl Daemon {
                                 continue;
                             }
                             let prepared = {
-                                let state = d.lock().await;
+                                let state = frame_lock(&d).await;
                                 if !connection_epoch_is_current(&state.settlement, epoch) { continue; }
                                 state.prepare_session_metadata(&frame)
                             };
@@ -631,7 +631,7 @@ impl Daemon {
                         }
                         link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_ENQUEUE && {
-                                let state = d.lock().await;
+                                let state = frame_lock(&d).await;
                                 frame.params.as_ref().and_then(|params| params["session_id"].as_str())
                                     .and_then(|id| state.sessions.get(id))
                                     .is_none_or(|live| live.info.native_source.is_none())
@@ -645,7 +645,7 @@ impl Daemon {
                                 continue;
                             }
                             let snapshot = {
-                                let state = d.lock().await;
+                                let state = frame_lock(&d).await;
                                 state.prepare_session_list(&frame)
                             };
                             match snapshot {
@@ -709,7 +709,7 @@ impl Daemon {
                             let frame = *frame;
                             let Some(id) = frame.id.clone() else { continue };
                             let prepared = {
-                                let mut g = d.lock().await;
+                                let mut g = frame_lock(&d).await;
                                 // The socket can turn over while this task was
                                 // waiting briefly for the state lock. An old
                                 // request must never borrow the new socket's
@@ -758,10 +758,19 @@ impl Daemon {
                             }
                         }
                         ev => {
-                            let mut g = d.lock().await;
+                            let mut g = frame_lock(&d).await;
                             g.on_link_event(ev, &frames_tx).await;
                         }
-                    } }
+                    } } else {
+                        let link::LinkEvent::Frame { frame, .. } = &ev;
+                        crate::rc::diagnostics::event(
+                            "daemon.frame_dropped_stopping",
+                            serde_json::json!({
+                                "method": crate::rc::diagnostics::id(frame.method()),
+                                "request_id": crate::rc::diagnostics::rpc_id(frame.id.as_ref()),
+                            }),
+                        );
+                    }
                 }
                 Some(note) = notes_rx.recv(), if shutdown_projection_tail.is_none_or(|tail| tail.notes > 0) => {
                     if let Some(tail) = shutdown_projection_tail.as_mut() {
@@ -1042,4 +1051,31 @@ async fn unless_departed(
                 ErrorCode::SessionBusy, "the requester left before this read finished")));
         }
     }
+}
+
+/// How long a frame may wait for the daemon's lock before the daemon's log notes it, and how
+/// often after.
+const LOCK_WAIT_NOTE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The daemon's lock for a frame from the Hub. The wait has no deadline; the log notes each
+/// interval it lasts, and the total once the lock is taken late.
+async fn frame_lock(d: &Arc<Mutex<Daemon>>) -> tokio::sync::MutexGuard<'_, Daemon> {
+    let started = std::time::Instant::now();
+    let mut lock = std::pin::pin!(d.lock());
+    let guard = loop {
+        match tokio::time::timeout(LOCK_WAIT_NOTE, &mut lock).await {
+            Ok(guard) => break guard,
+            Err(_) => crate::rc::diagnostics::event(
+                "daemon.lock_waiting",
+                serde_json::json!({"elapsed_ms": crate::rc::diagnostics::elapsed_ms(started)}),
+            ),
+        }
+    };
+    if started.elapsed() >= LOCK_WAIT_NOTE {
+        crate::rc::diagnostics::event(
+            "daemon.lock_taken",
+            serde_json::json!({"elapsed_ms": crate::rc::diagnostics::elapsed_ms(started)}),
+        );
+    }
+    guard
 }

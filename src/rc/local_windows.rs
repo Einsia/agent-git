@@ -140,7 +140,7 @@ async fn wait_ready() -> crate::Result<NamedPipeClient> {
                 });
                 if !retryable || Instant::now() >= deadline {
                     return Err(error.context(format!(
-                        "agitd did not become ready; inspect agitd-*.log in {}",
+                        "agitd did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
                         super::super::rc_dir()?.display()
                     )));
                 }

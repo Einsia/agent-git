@@ -22,6 +22,28 @@ use std::{
 struct PendingPrompt {
     id: String,
     steering: bool,
+    /// When the prompt went to the terminal, and whether the log already noted that its
+    /// receipt is overdue.
+    submitted: std::time::Instant,
+    overdue_noted: bool,
+}
+
+/// How long a terminal-held prompt may wait for its receipt before the daemon's log notes it.
+const RECEIPT_OVERDUE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl PendingPrompt {
+    fn new(id: String, steering: bool) -> Self {
+        crate::rc::diagnostics::event(
+            "native.prompt_submitted",
+            serde_json::json!({"operation_id": crate::rc::diagnostics::id(&id), "steering": steering}),
+        );
+        Self {
+            id,
+            steering,
+            submitted: std::time::Instant::now(),
+            overdue_noted: false,
+        }
+    }
 }
 
 pub struct ClaudeNativeDriver {
@@ -136,10 +158,7 @@ impl ClaudeNativeDriver {
             .and_then(|client| client.submit(&id, "prompt", json!({"text":message})))
         {
             Ok(()) => {
-                self.pending_prompt = Some(PendingPrompt {
-                    id,
-                    steering: false,
-                });
+                self.pending_prompt = Some(PendingPrompt::new(id, false));
                 TurnStartDispatch::Awaiting
             }
             Err(error) => TurnStartDispatch::Resolved(TurnStartOutcome::RetryableNotAccepted {
@@ -157,7 +176,7 @@ impl ClaudeNativeDriver {
             let id = uuid::Uuid::new_v4().to_string();
             self.client()?
                 .submit(&id, "prompt", json!({"text":message}))?;
-            self.pending_prompt = Some(PendingPrompt { id, steering: true });
+            self.pending_prompt = Some(PendingPrompt::new(id, true));
             Ok(())
         })();
         match submitted {
@@ -361,7 +380,13 @@ impl ClaudeNativeDriver {
                     .push_back(HarnessEvent::InterruptResolved(outcome));
             }
         }
-        if let Some(PendingPrompt { id, steering }) = &self.pending_prompt {
+        if let Some(PendingPrompt {
+            id,
+            steering,
+            submitted,
+            ..
+        }) = &self.pending_prompt
+        {
             let outcome = match self
                 .client()
                 .ok()
@@ -389,6 +414,14 @@ impl ClaudeNativeDriver {
                 None => None,
             };
             if let Some(outcome) = outcome {
+                crate::rc::diagnostics::event(
+                    "native.receipt",
+                    serde_json::json!({
+                        "operation_id": crate::rc::diagnostics::id(id),
+                        "outcome": crate::rc::diagnostics::variant(&outcome),
+                        "elapsed_ms": crate::rc::diagnostics::elapsed_ms(*submitted),
+                    }),
+                );
                 let event = if *steering {
                     HarnessEvent::SteerResolved(match outcome {
                         TurnStartOutcome::NativeSubmission { delivery, .. } => Ok(delivery),
@@ -400,6 +433,20 @@ impl ClaudeNativeDriver {
                 self.pending_prompt = None;
                 self.events.push_front(event);
             }
+        }
+        // The receipt has no deadline; a terminal that never answers is noted once.
+        if let Some(prompt) = self.pending_prompt.as_mut()
+            && !prompt.overdue_noted
+            && prompt.submitted.elapsed() >= RECEIPT_OVERDUE
+        {
+            prompt.overdue_noted = true;
+            crate::rc::diagnostics::event(
+                "native.receipt_overdue",
+                serde_json::json!({
+                    "operation_id": crate::rc::diagnostics::id(&prompt.id),
+                    "elapsed_ms": crate::rc::diagnostics::elapsed_ms(prompt.submitted),
+                }),
+            );
         }
     }
 

@@ -381,6 +381,7 @@ pub async fn serve(
                 "daemon.started",
                 serde_json::json!({"version":env!("CARGO_PKG_VERSION")}),
             );
+            super::diagnostics::install(&log);
             Some(log)
         }
         Err(error) => {

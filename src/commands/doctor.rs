@@ -436,6 +436,17 @@ pub fn run(args: Args) -> CmdResult {
         },
     ));
 
+    // ── Background service log ──
+    // What the agit background service did, by ids, classes and timings, never content. The
+    // first place to look when a session stopped answering.
+    checks.push((
+        "service log".into(),
+        match crate::rc::daemon_logs().first() {
+            Some(path) => Check::Ok(ui::tilde(path)),
+            None => Check::Ok("none yet; written once the agit background service starts".into()),
+        },
+    ));
+
     // ── Secret keystore ──
     // Probed the way a commit uses it. A store that opens but refuses writes, or a vault whose
     // key the configured store does not hold, fails the first commit that finds a secret — on

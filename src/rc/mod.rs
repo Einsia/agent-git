@@ -151,6 +151,11 @@ pub fn rc_dir() -> crate::Result<PathBuf> {
     )
 }
 
+/// The newest log of each daemon namespace: ids, classes and timings of what the daemon did.
+pub(crate) fn daemon_logs() -> Vec<PathBuf> {
+    diagnostics::newest_logs()
+}
+
 /// The desktop daemon's namespace whichever one this process selected: a hook runs as a plain
 /// command, yet must read what that daemon writes.
 pub(crate) fn local_rc_dir() -> crate::Result<PathBuf> {

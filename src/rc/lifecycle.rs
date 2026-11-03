@@ -206,7 +206,7 @@ fn ready(requirements: &Requirements<'_>) -> crate::Result<()> {
         }
         ensure!(
             Instant::now() < deadline,
-            "local daemon did not become ready; inspect agitd-*.log in {}",
+            "local daemon did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
             super::rc_dir()?.display()
         );
         std::thread::sleep(POLL);
