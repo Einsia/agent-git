@@ -8,6 +8,27 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.36] - 2026-11-03
+
+### Changed
+
+- Published Codex sessions show their token usage and model.
+- Published sessions carry the conversation itself; the runtime's setup and context records stay on this computer.
+- OpenCode, Hermes and OpenClaw sessions show no user prompts until those runtimes mark typed messages.
+- Cursor and WorkBuddy sessions show only the typed request.
+- A caption typed with a pasted image in Claude Code isn't published.
+- Published sessions show a tool result's text and images only.
+- Repositories published by this version show as diverged in agit 0.2.35 and older; update agit to see their real
+  status.
+
+### Fixed
+
+- A new session's branch name is made from the published request.
+- A Codex conversation is saved by itself only after Codex has run AgentGit's hooks for it, as `agit on` says; until
+  then `agit save SESSION-ID` uploads it.
+- Watching a conversation from the Hub never saves or uploads a conversation you left out or a folder you turned off.
+- `agit secrets review` says what kind each secret is and whether a detector found it or you added it.
+
 ## [0.2.35] - 2026-11-03
 
 ### Added
