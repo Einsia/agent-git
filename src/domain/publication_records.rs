@@ -429,7 +429,9 @@ fn typed_content(content: &Value) -> Option<Value> {
 
 /// A tool result without the elements the runtime appended to it. The output itself stays,
 /// empty when nothing else was there, so the call keeps its result. Of a result made of parts,
-/// text parts and images stay; any other part, such as one nesting further parts, is left out.
+/// text parts (`text`, and Codex's `input_text` and `output_text`) and images stay; any other
+/// part, such as one nesting further parts or an `input_image` that can name a local file, is
+/// left out.
 fn tool_result(block: &Value) -> Value {
     let mut block = block.clone();
     match &block["content"] {
@@ -438,7 +440,12 @@ fn tool_result(block: &Value) -> Value {
             let parts = parts
                 .iter()
                 .filter_map(|part| match part["text"].as_str() {
-                    Some(text) if part["type"] == "text" => {
+                    Some(text)
+                        if matches!(
+                            part["type"].as_str(),
+                            Some("text" | "input_text" | "output_text")
+                        ) =>
+                    {
                         let text = without_injected(text);
                         (!text.trim().is_empty()).then(|| {
                             let mut part = part.clone();
@@ -710,6 +717,8 @@ fn codex(record: &Map<String, Value>) -> Option<Value> {
             record["payload"]["message"] = Value::String(message);
             return Some(record);
         }
+        "event_msg" if kind == Some("token_count") => return codex_usage(record, payload),
+        "turn_context" => return codex_model(record, payload),
         "event_msg" => matches!(
             kind?,
             "agent_message"
@@ -730,6 +739,81 @@ fn codex(record: &Map<String, Value>) -> Option<Value> {
         _ => false,
     };
     kept.then(|| Value::Object(record.clone()))
+}
+
+/// A turn's token counts as numbers only. The account's rate limits, and anything else the event
+/// carries, are left out; an event with no counts publishes nothing.
+fn codex_usage(record: &Map<String, Value>, payload: &Map<String, Value>) -> Option<Value> {
+    const COUNTS: &[&str] = &[
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ];
+    let info = payload.get("info")?.as_object()?;
+    let numbers = |usage: &Value, keys: &[&str]| -> Map<String, Value> {
+        keys.iter()
+            .filter_map(|key| {
+                let value = usage.get(*key).filter(|value| value.is_u64())?;
+                Some(((*key).to_owned(), value.clone()))
+            })
+            .collect()
+    };
+    let mut counted = Map::new();
+    for key in ["total_token_usage", "last_token_usage"] {
+        let usage = info.get(key).map(|usage| numbers(usage, COUNTS));
+        if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+            counted.insert(key.into(), Value::Object(usage));
+        }
+    }
+    counted.extend(numbers(
+        &Value::Object(info.clone()),
+        &["model_context_window"],
+    ));
+    if counted.is_empty() {
+        return None;
+    }
+    Some(codex_stub(
+        record,
+        "event_msg",
+        serde_json::json!({"type": "token_count", "info": counted}),
+    ))
+}
+
+/// The model a turn ran on, and nothing else from its context: no working directory,
+/// instructions, approval or sandbox policy. A value that is not a short model id publishes
+/// nothing.
+fn codex_model(record: &Map<String, Value>, payload: &Map<String, Value>) -> Option<Value> {
+    let model = payload.get("model")?.as_str().filter(|model| {
+        // A model the person serves from disk would name its path, a home directory included.
+        !model.is_empty()
+            && model.len() <= 100
+            && !model.starts_with(['/', '~', '.'])
+            && !model.contains("..")
+            && !model.contains('\\')
+            // A drive letter's path (C:/...) or a URL.
+            && !model.contains(":/")
+            && model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+    })?;
+    Some(codex_stub(
+        record,
+        "turn_context",
+        serde_json::json!({ "model": model }),
+    ))
+}
+
+/// A Codex record of `kind` holding only `payload`, and the record's own time for ordering.
+fn codex_stub(record: &Map<String, Value>, kind: &str, payload: Value) -> Value {
+    let mut stub = Map::new();
+    if let Some(timestamp) = record.get("timestamp").filter(|time| time.is_string()) {
+        stub.insert("timestamp".into(), timestamp.clone());
+    }
+    stub.insert("type".into(), Value::String(kind.into()));
+    stub.insert("payload".into(), payload);
+    Value::Object(stub)
 }
 
 /// Whether every content item of a Codex user-role message is marked as the person's own input.
