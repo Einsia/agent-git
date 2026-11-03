@@ -26,7 +26,8 @@ pub(super) fn publication(
     let raw = format!(
         "{}\n",
         json!({"type":"response_item", "payload":{
-            "type":"message", "role":"user", "content":[{"type":"input_text", "text":private_text}]
+            "type":"message", "role":"user", "content":[{"type":"input_text", "text":private_text}],
+            "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}
         }})
     );
     let session = format!("agit-{}", "a".repeat(40));

@@ -581,8 +581,31 @@ pub fn project_session(
     storage::snapshot_files(log, view)?;
     aliases.reserve_aliases(log)?;
     let records = storage::parse_envelopes(log)?;
+    // The public projection carries conversation records only; the private layer keeps them all.
+    // A quote is projected as the record it quotes, so it carries no more than that record does.
+    let public_records: Vec<Option<Envelope>> =
+        crate::domain::publication_records::published_sequence(
+            records
+                .iter()
+                .map(|record| (record.source.as_str(), &record.content)),
+        )
+        .into_iter()
+        .zip(&records)
+        .map(|(kept, record)| {
+            // A quote of an earlier record is replaced below by that record's own projection.
+            if evidence_reference(record).is_some() {
+                return Some(record.clone());
+            }
+            kept.map(|content| Envelope {
+                source: record.source.clone(),
+                session_id: record.session_id.clone(),
+                object_hash: transcript::object_hash(&content),
+                content,
+            })
+        })
+        .collect();
     let mut projector = Projector::new(policy, aliases, branch, redactor, records.len())?;
-    for record in &records {
+    for record in public_records.iter().flatten() {
         projector.remember_native_role(record);
     }
     // Native IDs are scoped by runtime and source session. Ambiguous reuse cannot authorize
@@ -597,6 +620,10 @@ pub fn project_session(
             contexts.insert(group.clone(), cwd.to_owned());
         }
         let cwd = contexts.get(&group).cloned();
+        let Some(record) = &public_records[index] else {
+            cwd_at.push(cwd);
+            continue;
+        };
         let calls_in_record = projector
             .native_message(record)
             .filter(|(role, _)| role == "assistant")
@@ -633,23 +660,31 @@ pub fn project_session(
     let mut mapped = BTreeMap::new();
     let mut projected_evidence = BTreeMap::new();
     let mut public_log = String::new();
-    for (index, record) in records.iter().enumerate() {
+    for (index, (source_record, record)) in records.iter().zip(&public_records).enumerate() {
         projector.record = Some(index);
-        let content = match evidence_reference(record) {
-            Some(reference) => {
-                if let Some(source) = reference
-                    .filter(|reference| reference.version == 1)
-                    .and_then(|reference| projected_evidence.get(&reference.key()))
-                {
-                    json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("Recovered historical session evidence (policy-projected).\n{source}")}]}})
-                } else {
-                    json!({"type":"user","message":{"role":"user","content":[projector.omit(Omission::HistoricalSource)]}})
+        let content = match record {
+            // A record publication leaves out keeps its place as an omission, without its text.
+            None => with_native_classification(
+                json!({"type":"user", "message":{"role":"user", "content":[projector.omit(Omission::NativeRecord)]}}),
+                &source_record.content,
+                true,
+            ),
+            Some(record) => match evidence_reference(record) {
+                Some(reference) => {
+                    if let Some(source) = reference
+                        .filter(|reference| reference.version == 1)
+                        .and_then(|reference| projected_evidence.get(&reference.key()))
+                    {
+                        json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("Recovered historical session evidence (policy-projected).\n{source}")}]}})
+                    } else {
+                        json!({"type":"user","message":{"role":"user","content":[projector.omit(Omission::HistoricalSource)]}})
+                    }
                 }
-            }
-            None => projector.record(record, cwd_at[index].as_deref(), &calls)?,
+                None => projector.record(record, cwd_at[index].as_deref(), &calls)?,
+            },
         };
         projected_evidence.insert(
-            EvidenceReference::from_record(record).key(),
+            EvidenceReference::from_record(source_record).key(),
             content.clone(),
         );
         let envelope = Envelope {
@@ -659,7 +694,7 @@ pub fn project_session(
             content,
         };
         let line = storage::envelope_line(&envelope);
-        let original = storage::envelope_line(record);
+        let original = storage::envelope_line(source_record);
         if let Some(previous) = mapped.insert(original, line.clone()) {
             ensure!(
                 previous == line,
@@ -896,7 +931,7 @@ impl Projector<'_> {
         if self.policy.tools.omits(source, name) {
             return Ok(Some(Omission::ToolCall));
         }
-        for field in ["file_path", "path"] {
+        for field in TOOL_PATH_KEYS {
             if let Some(path) = input.get(field).and_then(Value::as_str)
                 && let Some(rule) = self.policy.captured_file_exclusion(path, cwd, self.branch)
             {
@@ -938,6 +973,18 @@ impl Projector<'_> {
     fn native_message(&self, record: &Envelope) -> Option<(String, Vec<Value>)> {
         let value = &record.content;
         match record.source.as_str() {
+            // Words absorbed into a running turn, as publication reduced the record: only an
+            // absorbed prompt reaches here, its content already through the block rule.
+            "claude-code" | "claude-desktop"
+                if value["type"] == "queue-operation"
+                    && value["operation"] == "remove"
+                    && value["reason"] == "absorbed_mid_turn" =>
+            {
+                Some((
+                    "user".into(),
+                    vec![json!({"type":"text", "text":value["content"].as_str()?})],
+                ))
+            }
             "claude-code" | "cursor" if message_role(record).is_some() => {
                 let blocks = native_content_blocks(&value["message"]["content"]);
                 let role = assistant_for_reasoning(message_role(record)?.into(), &blocks);
@@ -1030,8 +1077,22 @@ impl Projector<'_> {
                             json!({"type":"text", "text":data["text"].as_str().unwrap_or_default()}),
                         ],
                     )),
+                    Some("tool") => Some(("assistant".into(), opencode_tool_blocks(data))),
                     _ => None,
                 }
+            }
+            "opencode" if value["kind"] == "session_message" && value["type"] == "assistant" => {
+                let blocks: Vec<Value> = value["data"]["content"]
+                    .as_array()?
+                    .iter()
+                    .flat_map(|item| match item["type"].as_str() {
+                        Some("text") => vec![json!({"type":"text", "text":item["text"].as_str().unwrap_or_default()})],
+                        Some("reasoning") => vec![reasoning_block(&reasoning_block_text(item))],
+                        Some("tool") => opencode_tool_blocks(item),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                (!blocks.is_empty()).then_some(("assistant".into(), blocks))
             }
             "opencode" if value["kind"] == "message" => {
                 let role = value["data"]["role"].as_str()?.to_owned();
@@ -1246,14 +1307,22 @@ impl Projector<'_> {
                             json!({"type":"tool_use", "id":public_id, "name":"omitted", "input":{"notice":self.notice(reason)}})
                         } else {
                             let mut input = block["input"].clone();
-                            for field in ["path", "file_path"] {
+                            for field in TOOL_PATH_KEYS {
                                 if let Some(path) = input[field].as_str() {
                                     let path = if absolute_path(path) {
                                         path.to_owned()
                                     } else if let Some(cwd) = cwd {
                                         format!("{cwd}/{path}")
                                     } else {
-                                        path.to_owned()
+                                        // A relative path with no known working directory
+                                        // cannot be placed, so it is not published.
+                                        self.note(
+                                            "path.normalization".into(),
+                                            ProjectionAction::ExcludeSource,
+                                            1,
+                                        );
+                                        input[field] = json!("<private-path>");
+                                        continue;
                                     };
                                     input[field] = json!(self.path_alias(&path)?);
                                 }
@@ -1616,11 +1685,57 @@ fn native_message_text(value: &Value) -> String {
     }
 }
 
+/// The tool input keys that name a file, as Claude Code, Codex and OpenCode write them.
+const TOOL_PATH_KEYS: [&str; 4] = ["file_path", "path", "filePath", "notebook_path"];
+
 fn native_tool_input(value: &Value) -> Value {
     value
         .as_str()
         .and_then(|text| serde_json::from_str(text).ok())
         .unwrap_or_else(|| value.clone())
+}
+
+/// An OpenCode tool item, a part of a message or an item of a one-row message, as the call and,
+/// once it has one, its result.
+fn opencode_tool_blocks(item: &Value) -> Vec<Value> {
+    let id = item["callID"]
+        .as_str()
+        .or_else(|| item["id"].as_str())
+        .unwrap_or_default();
+    let name = item["tool"]
+        .as_str()
+        .or_else(|| item["name"].as_str())
+        .unwrap_or("tool");
+    let state = &item["state"];
+    let input = native_tool_input(state.get("input").unwrap_or(&Value::Null));
+    let mut blocks = vec![json!({
+        "type":"tool_use", "id":id, "name":name, "input":input
+    })];
+    // A classic part carries its result as `output` or `error`; a one-row item as the text parts
+    // of its `content`, of which nothing else is read.
+    let output = state
+        .get("output")
+        .or_else(|| state.get("error"))
+        .cloned()
+        .or_else(|| {
+            state["content"].as_array().map(|parts| {
+                Value::Array(
+                    parts
+                        .iter()
+                        .filter(|part| part["type"] == "text")
+                        .filter_map(|part| part["text"].as_str())
+                        .map(|text| json!({"type":"text", "text":text}))
+                        .collect(),
+                )
+            })
+        });
+    if let Some(output) = output {
+        blocks.push(json!({
+            "type":"tool_result", "tool_use_id":id, "content":output,
+            "is_error":state["status"] == "error"
+        }));
+    }
+    blocks
 }
 
 fn native_content_blocks(value: &Value) -> Vec<Value> {
@@ -2545,6 +2660,374 @@ mod tests {
         assert!(!projected.to_string().contains("signature"));
     }
 
+    fn projected(runtime: &str, records: &[Value]) -> Vec<Envelope> {
+        let session = format!("agit-{}", "a".repeat(40));
+        let raw = records
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>();
+        let log = transcript::wrap_lines(&raw, runtime, &session);
+        let projection = project_session(
+            &PrivacyPolicy::default(),
+            &mut PathAliasStore::default(),
+            None,
+            &log,
+            &log,
+            &Meta::new(session, runtime.into(), String::new()),
+            &Redactor::new(Default::default()),
+        )
+        .unwrap();
+        storage::parse_envelopes(projection.log()).unwrap()
+    }
+
+    /// Words absorbed into a running turn are the person's own and are projected as theirs; a
+    /// notice the runtime queued the same way keeps its place without its text.
+    #[test]
+    fn an_absorbed_follow_up_is_projected_as_the_persons_words() {
+        let records = projected(
+            "claude-code",
+            &[
+                json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","sessionId":"s","content":"also update the README"}),
+                json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","sessionId":"s","content":"<task-notification>\n<task-id>PRIVATE_TASK</task-id>\n</task-notification>"}),
+                json!({"type":"queue-operation","operation":"enqueue","sessionId":"s","content":"also update the README"}),
+            ],
+        );
+        assert_eq!(records[0].content["message"]["role"], "user");
+        assert_eq!(
+            records[0].content["message"]["content"][0]["text"],
+            "also update the README"
+        );
+        assert!(records[0].content.get("isMeta").is_none());
+        for record in &records[1..] {
+            assert_eq!(record.content["isMeta"], true);
+            assert!(!record.content.to_string().contains("PRIVATE_TASK"));
+            assert!(!record.content.to_string().contains("README"));
+        }
+    }
+
+    /// An OpenCode tool part is projected from its input and its output only, through the tool
+    /// policy and path aliases; its metadata, title and timing never reach the projection.
+    #[test]
+    fn an_opencode_tool_part_projects_only_its_input_and_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let raw = [
+            json!({"id":"msg_1","kind":"message","session_id":"ses","time_created":1,"data":{"role":"assistant"}}),
+            json!({"id":"prt_1","kind":"part","message_id":"msg_1","data":{"type":"tool","callID":"call-1","tool":"read",
+                "state":{"status":"completed","input":{"filePath":file},"output":"TOOL_OUTPUT",
+                         "title":"CANARY-TOOL-TITLE-77a1","metadata":{"preview":"CANARY-TOOL-METADATA-3b9e"},
+                         "time":{"start":1,"end":2}}}}),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        let log = transcript::wrap_lines(&raw, "opencode", &session);
+        let policy = PrivacyPolicy {
+            workspace: Some(temp.path().into()),
+            include: vec!["src/**".into()],
+            ..Default::default()
+        };
+        let projection = project_session(
+            &policy,
+            &mut PathAliasStore::default(),
+            None,
+            &log,
+            &log,
+            &Meta::new(
+                session,
+                "opencode".into(),
+                temp.path().display().to_string(),
+            ),
+            &Redactor::new(Default::default()),
+        )
+        .unwrap();
+        let public = projection.log();
+        assert!(!public.contains("CANARY-TOOL-TITLE-77a1"));
+        assert!(!public.contains("CANARY-TOOL-METADATA-3b9e"));
+        assert!(public.contains("TOOL_OUTPUT"), "{public}");
+        assert!(public.contains("<workspace>/src/main.rs"), "{public}");
+        assert!(!public.contains(temp.path().to_str().unwrap()), "{public}");
+    }
+
+    /// An OpenCode file tool on an excluded file publishes neither its input nor its result, in
+    /// either storage shape; a relative path is decided as the same absolute path.
+    #[test]
+    fn an_opencode_file_tool_follows_the_file_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let tools = [
+            json!({"type":"tool","callID":"call-1","tool":"read",
+                "state":{"status":"completed","input":{"filePath":"private.txt"},"output":"EXCLUDED_BODY"}}),
+            json!({"type":"tool","callID":"call-2","tool":"write",
+                "state":{"status":"completed","input":{"filePath":"private.txt","content":"EXCLUDED_WRITE"},"output":"ok"}}),
+            json!({"type":"tool","callID":"call-3","tool":"edit",
+                "state":{"status":"completed","input":{"filePath":"private.txt","oldString":"EXCLUDED_OLD","newString":"EXCLUDED_NEW"},"output":"ok"}}),
+            json!({"type":"tool","callID":"call-4","tool":"read",
+                "state":{"status":"completed","input":{"filePath":temp.path().join("src/main.rs")},"output":"ALLOWED_BODY"}}),
+            json!({"type":"tool","id":"call-5","name":"write","state":{"status":"completed",
+                "input":{"path":"private.txt","content":"EXCLUDED_V2_INPUT"},
+                "content":[{"type":"text","text":"EXCLUDED_V2_RESULT","metadata":{"preview":"CANARY_V2_PART"}}],
+                "structured":{"preview":"CANARY_V2_STRUCTURED"},"metadata":{"preview":"CANARY_V2_METADATA"},
+                "title":"CANARY_V2_TITLE"},"time":{"created":1}}),
+            json!({"type":"tool","callID":"call-6","tool":"read",
+                "state":{"status":"completed","input":{"filePath":temp.path().join("notes/secret.md")},"output":"NOTES_ABSOLUTE_BODY"}}),
+            json!({"type":"tool","callID":"call-7","tool":"read",
+                "state":{"status":"completed","input":{"filePath":"notes/secret.md"},"output":"NOTES_RELATIVE_BODY"}}),
+        ];
+        let parts = std::iter::once(
+            json!({"id":"msg_1","kind":"message","session_id":"ses","time_created":1,"data":{"role":"assistant"}}),
+        )
+        .chain(tools.iter().enumerate().map(|(index, tool)| {
+            json!({"id":format!("prt_{index}"),"kind":"part","message_id":"msg_1","data":tool})
+        }))
+        .collect::<Vec<_>>();
+        let one_row = [
+            json!({"id":"msg_2","kind":"session_message","session_id":"ses","type":"assistant","seq":2,
+                "time_created":2,"data":{"content":tools}}),
+        ];
+        let policy = PrivacyPolicy {
+            workspace: Some(temp.path().into()),
+            include: vec!["src/**".into()],
+            exclude: vec!["private.txt".into()],
+            ..Default::default()
+        };
+        for records in [&parts[..], &one_row[..]] {
+            let session = format!("agit-{}", "a".repeat(40));
+            let raw = records
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>();
+            let log = transcript::wrap_lines(&raw, "opencode", &session);
+            let projection = project_session(
+                &policy,
+                &mut PathAliasStore::default(),
+                None,
+                &log,
+                &log,
+                &Meta::new(
+                    session,
+                    "opencode".into(),
+                    temp.path().display().to_string(),
+                ),
+                &Redactor::new(Default::default()),
+            )
+            .unwrap();
+            let public = projection.log();
+            for hidden in [
+                "EXCLUDED_BODY",
+                "EXCLUDED_WRITE",
+                "EXCLUDED_OLD",
+                "EXCLUDED_NEW",
+                "EXCLUDED_V2_INPUT",
+                "EXCLUDED_V2_RESULT",
+                "CANARY_V2",
+                "private.txt",
+            ] {
+                assert!(!public.contains(hidden), "{hidden}: {public}");
+            }
+            assert!(public.contains("\"omitted\""), "{public}");
+            assert!(public.contains("ALLOWED_BODY"), "{public}");
+            assert!(public.contains("<workspace>/src/main.rs"), "{public}");
+            // A relative path outside the includes gets the decision of the same absolute path;
+            // only its path text is masked.
+            assert_eq!(
+                public.contains("NOTES_RELATIVE_BODY"),
+                public.contains("NOTES_ABSOLUTE_BODY"),
+                "{public}"
+            );
+            assert!(public.contains("<private-path>"), "{public}");
+        }
+    }
+
+    /// A notebook edit on an excluded notebook publishes neither its input nor its result.
+    #[test]
+    fn a_notebook_edit_follows_the_file_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let raw = [
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"NotebookEdit",
+                "input":{"notebook_path":temp.path().join("private.ipynb"),"new_source":"EXCLUDED_CELL"}}]}}),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"EXCLUDED_RESULT"}]}}),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        let log = transcript::wrap_lines(&raw, "claude-code", &session);
+        let policy = PrivacyPolicy {
+            workspace: Some(temp.path().into()),
+            include: vec!["src/**".into()],
+            exclude: vec!["private.ipynb".into()],
+            ..Default::default()
+        };
+        let projection = project_session(
+            &policy,
+            &mut PathAliasStore::default(),
+            None,
+            &log,
+            &log,
+            &Meta::new(
+                session,
+                "claude-code".into(),
+                temp.path().display().to_string(),
+            ),
+            &Redactor::new(Default::default()),
+        )
+        .unwrap();
+        let public = projection.log();
+        for hidden in ["EXCLUDED_CELL", "EXCLUDED_RESULT", "private.ipynb"] {
+            assert!(!public.contains(hidden), "{hidden}: {public}");
+        }
+        assert!(public.contains("\"omitted\""), "{public}");
+    }
+
+    /// OpenCode's one-row tool item, as the v2 sample stores it, projects its call and the result
+    /// held in its `content`.
+    #[test]
+    fn an_opencode_one_row_tool_projects_its_content_result() {
+        let records = projected(
+            "opencode",
+            &[
+                json!({"id":"msg_v2","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":3,
+                "time_created":520,"data":{"time":{"created":520,"completed":528},"content":[
+                {"type":"reasoning","id":"r-0","text":"thinking"},
+                {"type":"tool","id":"call_1","name":"write","state":{"status":"completed",
+                 "input":{"path":"hello.txt","content":"hi\n"},
+                 "content":[{"type":"text","text":"Created file successfully: hello.txt","metadata":{"preview":"CANARY_V2_PART"}},
+                            {"type":"file","url":"CANARY_V2_FILE"}],
+                 "structured":{"preview":"CANARY_V2_STRUCTURED"},"metadata":{"preview":"CANARY_V2_METADATA"},"title":"CANARY_V2_TITLE"},
+                 "time":{"created":521,"ran":522,"completed":523}}]}}),
+            ],
+        );
+        let blocks = records
+            .iter()
+            .flat_map(|record| {
+                record.content["message"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let call = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("call");
+        assert_eq!(call["name"], "write");
+        // OpenCode records carry no working directory, so a relative path cannot be placed.
+        assert_eq!(call["input"]["path"], "<private-path>");
+        let result = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_result")
+            .expect("result");
+        assert_eq!(result["tool_use_id"], call["id"]);
+        assert_eq!(result["is_error"], false);
+        assert!(
+            result["content"]
+                .to_string()
+                .contains("Created file successfully"),
+            "{result}"
+        );
+        let public = serde_json::to_string(
+            &records
+                .iter()
+                .map(|record| &record.content)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!public.contains("CANARY_V2"), "{public}");
+    }
+
+    /// A one-row OpenCode reply with tool items projects the same calls and results as the same
+    /// reply stored as a header and parts.
+    #[test]
+    fn an_opencode_reply_projects_its_tools_in_either_storage_shape() {
+        let tool = json!({"type":"tool","callID":"call-1","tool":"read",
+            "state":{"status":"completed","input":{"path":"/work/a.rs"},"output":"TOOL_OUTPUT"}});
+        let one_row = projected(
+            "opencode",
+            &[
+                json!({"id":"msg_v4","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":9,
+                "time_created":530,"data":{"time":{"created":530,"completed":538},
+                "content":[{"type":"text","id":"text-0","text":"Done."},tool]}}),
+            ],
+        );
+        let parts = projected(
+            "opencode",
+            &[
+                json!({"id":"msg_v4","kind":"message","session_id":"ses_v2","time_created":530,"data":{"role":"assistant"}}),
+                json!({"id":"prt_1","kind":"part","message_id":"msg_v4","data":{"type":"text","text":"Done."}}),
+                json!({"id":"prt_2","kind":"part","message_id":"msg_v4","data":tool}),
+            ],
+        );
+        let blocks = |records: &[Envelope]| -> Vec<Value> {
+            records
+                .iter()
+                .filter(|record| record.content.get("isMeta").is_none())
+                .flat_map(|record| {
+                    record.content["message"]["content"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .map(|mut block| {
+                    for id in ["id", "tool_use_id"] {
+                        if block.get(id).is_some() {
+                            block[id] = json!("call");
+                        }
+                    }
+                    block
+                })
+                .collect()
+        };
+        let projected_one_row = blocks(&one_row);
+        assert_eq!(projected_one_row, blocks(&parts));
+        assert!(
+            projected_one_row
+                .iter()
+                .any(|block| block["type"] == "tool_use" && block["name"] == "read")
+        );
+        assert!(
+            projected_one_row
+                .iter()
+                .any(|block| block["type"] == "tool_result")
+        );
+    }
+
+    /// OpenCode's one-row messages: a reply is projected as the assistant's text, a user row
+    /// keeps its place without its text.
+    #[test]
+    fn opencode_single_row_messages_project_replies_and_omit_user_rows() {
+        let session = format!("agit-{}", "a".repeat(40));
+        let raw = [
+            json!({"id":"msg_v3","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,"time_created":520,"data":{"text":"PRIVATE_USER_ROW"}}),
+            json!({"id":"msg_v4","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":9,"time_created":530,
+                "data":{"time":{"created":530,"completed":538},"system":"PRIVATE_SYSTEM","content":[{"type":"text","id":"text-0","text":"Done."}]}}),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        let log = transcript::wrap_lines(&raw, "opencode", &session);
+        let projection = project_session(
+            &PrivacyPolicy::default(),
+            &mut PathAliasStore::default(),
+            None,
+            &log,
+            &log,
+            &Meta::new(session, "opencode".into(), String::new()),
+            &Redactor::new(Default::default()),
+        )
+        .unwrap();
+        let records = storage::parse_envelopes(projection.log()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].content["isMeta"], true);
+        assert_eq!(records[1].content["message"]["role"], "assistant");
+        assert!(projection.log().contains("Done."));
+        assert!(!projection.log().contains("PRIVATE_USER_ROW"));
+        assert!(!projection.log().contains("PRIVATE_SYSTEM"));
+    }
+
     #[test]
     fn hermes_and_opencode_native_markers_do_not_open_turns() {
         let cases = [
@@ -2554,7 +3037,8 @@ mod tests {
                     json!({"type":"hermes_message","data":{"session_id":"session","role":"user","content":"stale","active":0}}),
                     json!({"type":"hermes_message","data":{"session_id":"session","role":"user","content":"summary","active":1,"_compressed_summary":1}}),
                 ],
-                vec!["isMeta", "isCompactSummary"],
+                // Hermes user-role records carry no mark of who wrote them, so both are omitted.
+                vec!["isMeta"],
             ),
             (
                 "opencode",
@@ -2567,6 +3051,7 @@ mod tests {
         ];
         for (runtime, values, markers) in cases {
             let session = format!("agit-{}", "a".repeat(40));
+            let count = values.len();
             let raw = values
                 .into_iter()
                 .map(|value| format!("{value}\n"))
@@ -2583,10 +3068,7 @@ mod tests {
             )
             .unwrap();
             let records = storage::parse_envelopes(projection.log()).unwrap();
-            assert_eq!(
-                records.len(),
-                markers.len() + usize::from(runtime == "opencode")
-            );
+            assert_eq!(records.len(), count);
             for marker in markers {
                 assert!(
                     records.iter().any(|record| record.content[marker] == true),
@@ -2758,10 +3240,11 @@ mod tests {
         );
     }
 
-    /// Environment markup stays intact without claiming file aliases. Delegated tasks open
-    /// turns, peer updates do not, and opaque task bodies remain only in recoverable originals.
+    /// The environment Codex supplies and the messages its agents send each other are not the
+    /// person's input: each keeps its place without its text, and only the owner's encrypted
+    /// original holds it.
     #[test]
-    fn projected_codex_environment_preserves_markup_paths_and_turns() {
+    fn projected_codex_environment_and_agent_messages_keep_only_their_place() {
         let session = format!("agit-{}", "a".repeat(40));
         let context = concat!(
             "<environment_context>\n",
@@ -2793,7 +3276,6 @@ mod tests {
         .collect::<String>();
         let log = transcript::wrap_lines(&raw, "codex", &session);
         let metadata = Meta::new(session, "codex".into(), String::new());
-        let original = transcript::display::parse(&log).unwrap();
         let policy = PrivacyPolicy {
             external_roots: vec![super::super::privacy::ExternalRoot {
                 label: "docs".into(),
@@ -2820,51 +3302,30 @@ mod tests {
             &Redactor::new(Default::default()),
         )
         .unwrap();
-        let public = transcript::display::parse(projection.log()).unwrap();
         let records = storage::parse_envelopes(projection.log()).unwrap();
-        assert_eq!(
-            records[1].content["message"]["content"][0]["text"],
-            context
-                .replace("/private/project", "<private-file-1>")
-                .replace("Paths: /cwd", "Paths: <private-file-2>")
-                .replace("</private/report.txt>", "<<private-file-3>>")
-                .replace("</unfinished\n", "<<private-file-4>\n")
-        );
-        assert_eq!(
-            projection.private.path_aliases,
-            BTreeMap::from([
-                ("<private-file-1>".into(), "/private/project".into()),
-                ("<private-file-2>".into(), "/cwd".into()),
-                ("<private-file-3>".into(), "/private/report.txt".into()),
-                ("<private-file-4>".into(), "/unfinished".into()),
-            ])
-        );
-
-        assert_eq!(crate::domain::turn::groups_of(&original).len(), 1);
-        assert_eq!(crate::domain::turn::groups_of(&public).len(), 1);
-        assert!(projection.log().contains("inspect the project"));
-        assert!(projection.log().contains("Keep the public interface"));
-        assert!(projection.log().contains("The dependency is ready"));
-        assert!(!projection.log().contains("opaque-delegated-task"));
-        assert_eq!(projection.report.omissions.len(), 1);
+        assert_eq!(records.len(), 6, "every record keeps its place");
+        for record in &records[..5] {
+            assert_eq!(
+                record.content["message"]["content"][0]["text"],
+                Omission::NativeRecord.text()
+            );
+            assert_eq!(record.content["isMeta"], true);
+        }
+        assert!(projection.log().contains("Done"));
+        for private in [
+            "/private/project",
+            "environment_context",
+            "inspect the project",
+            "Keep the public interface",
+            "The dependency is ready",
+            "opaque-delegated-task",
+        ] {
+            assert!(!projection.log().contains(private), "{private}");
+        }
+        assert!(projection.private.path_aliases.is_empty());
         let (private_log, private_view) = projection.private.session_bytes().unwrap();
         assert_eq!(private_log.as_str(), log);
         assert_eq!(private_view.as_str(), log);
-        assert_eq!(
-            public
-                .events
-                .iter()
-                .map(|event| event.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                crate::adapter::EventKind::Other,
-                crate::adapter::EventKind::Other,
-                crate::adapter::EventKind::UserPrompt,
-                crate::adapter::EventKind::Other,
-                crate::adapter::EventKind::Other,
-                crate::adapter::EventKind::AssistantReply,
-            ]
-        );
     }
 
     #[test]
@@ -2931,13 +3392,8 @@ mod tests {
                     .is_some_and(|text| text.contains(Omission::NativeRecord.text()))
         }));
         assert!(!projection.log().contains("internal progress"));
-        assert!(public.events.iter().any(|event| {
-            event.kind == crate::adapter::EventKind::Other
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("internal note"))
-        }));
+        // A record the runtime generated keeps its place without its text.
+        assert!(!projection.log().contains("internal note"));
         assert!(projection.log().contains("MASKED"));
         assert!(projection.log().contains("<workspace>/src/main.rs"));
         assert!(!projection.log().contains(secret));
@@ -2965,7 +3421,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let session = format!("agit-{}", "a".repeat(40));
         let raw = [
-            json!({"role":"user","message":{"content":[{"type":"text","text":format!("MARKER Read {}", path.display())}]}}),
+            json!({"role":"user","message":{"content":[{"type":"text","text":format!("<user_query>\nMARKER Read {}\n</user_query>", path.display())}]}}),
             json!({"role":"assistant","message":{"content":[{"type":"text","text":"Checked reply"},{"type":"tool_use","name":"Read","input":{"path":path}}]}}),
             json!({"role":"assistant","message":{"content":[{"type":"tool_use","id":"shell-call","name":"Bash","input":{"command":format!("cat {}", path.display())}}]}}),
             json!({"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"shell-call","content":"BASH_RESULT MARKER"}]}}),
@@ -3237,13 +3693,12 @@ mod tests {
             json!([]),
         ];
         let (projection, _) = project_tool_results(&results, temp.path(), AttachmentMode::Original);
+        // A result made of parts keeps its text parts only: a listing's entries and scalar rows
+        // publish nothing.
         let expected = [
             json!({"status":200,"mime_type":"application/json","body":{"message":"RETAIN_ME","secret":"MASKED","path":"<workspace>/src/main.rs"},"metadata":{"mimeType":"text/plain","media_type":"application/json","data":"RETAIN_DATA"}}),
-            json!([
-                {"type":"file","name":"main.rs","path":"<workspace>/src/main.rs","secret":"MASKED"},
-                {"type":"directory","name":"src"}
-            ]),
-            json!(["MASKED",7,true,null,{"type":"text","text":"RETAIN_ROW","row":1},["<workspace>/src/main.rs","MASKED"]]),
+            json!([]),
+            json!([{"type":"text","text":"RETAIN_ROW","row":1}]),
             json!([]),
         ];
         let records = storage::parse_envelopes(projection.log()).unwrap();
@@ -3267,51 +3722,73 @@ mod tests {
             {"mimeType":"image/png","name":"SECRET_VALUE.png","size":12,"data":"SECRET_VALUE/PRIVATE_IMAGE_BODY","url":"https://private.invalid/private-image","file_id":"PRIVATE_ID"},
             {"type":"output_text","text":"AFTER"}
         ])];
-        let (projection, log) = project_tool_results(&results, temp.path(), AttachmentMode::Omit);
-        let records = storage::parse_envelopes(projection.log()).unwrap();
-        assert_eq!(
-            records[1].content["message"]["content"][0]["content"],
-            format!(
-                "BEFORE MASKED\n{}\n{}\n{}\nAFTER",
-                Omission::Document.text(),
-                Omission::Document.text(),
-                Omission::Image.text()
-            )
-        );
-        assert_eq!(projection.report.omissions.len(), 3);
-        for notice in &projection.report.omissions {
-            assert_eq!(notice.record, 1);
-            assert_eq!(
-                notice.reason,
-                "attachment body is excluded from public content"
-            );
-        }
-        let private = &projection.private;
-        let (private_log, private_view) = private.session_bytes().unwrap();
-        assert_eq!(private_log.as_str(), log);
-        assert_eq!(private_view.as_str(), log);
-
-        let (original, _) = project_tool_results(&results, temp.path(), AttachmentMode::Original);
-        assert!(original.log().contains("SECRET_VALUE/PRIVATE_IMAGE_BODY"));
-        assert!(original.log().contains("PRIVATE_FILE_BODY"));
-        assert!(original.log().contains("MASKED.png"));
-        assert!(original.report.omissions.is_empty());
-        let (metadata, _) = project_tool_results(&results, temp.path(), AttachmentMode::Metadata);
-        assert!(metadata.log().contains("MASKED.png"));
-        assert!(metadata.log().contains("BEFORE MASKED"));
-        for hidden in [
-            "PRIVATE_IMAGE_BODY",
-            "PRIVATE_FILE_BODY",
-            "PRIVATE_DOCUMENT_BODY",
-            "private.invalid",
-            "PRIVATE_ID",
+        // A tool result's text parts (output_text included) publish in every attachment mode;
+        // its other parts publish nothing, and the owner's encrypted original keeps them.
+        for mode in [
+            AttachmentMode::Omit,
+            AttachmentMode::Original,
+            AttachmentMode::Metadata,
         ] {
-            assert!(
-                !metadata.log().contains(hidden),
-                "metadata exposes {hidden}"
+            let (projection, log) = project_tool_results(&results, temp.path(), mode);
+            let records = storage::parse_envelopes(projection.log()).unwrap();
+            assert_eq!(
+                records[1].content["message"]["content"][0]["content"],
+                "BEFORE MASKED\nAFTER"
             );
+            assert!(projection.report.omissions.is_empty());
+            for hidden in [
+                "PRIVATE_IMAGE_BODY",
+                "PRIVATE_FILE_BODY",
+                "PRIVATE_DOCUMENT_BODY",
+                "private.invalid",
+                "PRIVATE_ID",
+                "SECRET_VALUE",
+            ] {
+                assert!(!projection.log().contains(hidden), "{hidden}");
+            }
+            let (private_log, private_view) = projection.private.session_bytes().unwrap();
+            assert_eq!(private_log.as_str(), log);
+            assert_eq!(private_view.as_str(), log);
         }
-        assert_ne!(metadata.policy_digest, original.policy_digest);
+    }
+
+    #[test]
+    fn kept_image_parts_follow_the_attachment_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = json!({"type":"image","name":"SECRET_VALUE.png","mimeType":"image/png","size":12,
+             "source":{"type":"base64","media_type":"image/png","data":"PRIVATE_IMAGE_BODY"},
+             "url":"https://private.invalid/private-image","file_id":"PRIVATE_ID"});
+        let text = json!({"type":"text","text":"BEFORE SECRET_VALUE"});
+        let results = [json!([text.clone(), image.clone()])];
+        let message = [json!({"type":"user","message":{"role":"user","content":[text, image]}})];
+        // A kept image reaches the attachment mode both inside a tool result and as a
+        // user message block.
+        let entry_points: [&dyn Fn(&Path, AttachmentMode) -> (SessionProjection, String); 2] = [
+            &|workspace, mode| project_tool_results(&results, workspace, mode),
+            &|workspace, mode| project_records(&message, workspace, mode),
+        ];
+        for project in entry_points {
+            let (original, _) = project(temp.path(), AttachmentMode::Original);
+            assert!(original.log().contains("PRIVATE_IMAGE_BODY"));
+            assert!(original.log().contains("MASKED.png"));
+            let (metadata, log) = project(temp.path(), AttachmentMode::Metadata);
+            assert!(metadata.log().contains("BEFORE MASKED"));
+            assert!(metadata.log().contains("MASKED.png"));
+            for hidden in [
+                "PRIVATE_IMAGE_BODY",
+                "private.invalid",
+                "PRIVATE_ID",
+                "SECRET_VALUE",
+            ] {
+                assert!(
+                    !metadata.log().contains(hidden),
+                    "metadata exposes {hidden}"
+                );
+            }
+            let (private_log, _) = metadata.private.session_bytes().unwrap();
+            assert_eq!(private_log.as_str(), log);
+            assert_ne!(metadata.policy_digest, original.policy_digest);
+        }
         let mut old = serde_json::to_value(PrivacyPolicy::default()).unwrap();
         old.as_object_mut().unwrap().remove("attachments");
         assert_eq!(
@@ -3327,12 +3804,24 @@ mod tests {
         workspace: &Path,
         attachments: AttachmentMode,
     ) -> (SessionProjection, String) {
+        let call = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"file","name":"Read","input":{"file_path":workspace.join("src/main.rs")}}]}});
+        let records = std::iter::once(call).chain(results.iter().map(|result| {
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"file","content":result}]}})
+        })).collect::<Vec<_>>();
+        project_records(&records, workspace, attachments)
+    }
+
+    fn project_records(
+        records: &[Value],
+        workspace: &Path,
+        attachments: AttachmentMode,
+    ) -> (SessionProjection, String) {
         let session = format!("agit-{}", "c".repeat(40));
         std::fs::create_dir_all(workspace.join("src")).unwrap();
-        let call = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"file","name":"Read","input":{"file_path":workspace.join("src/main.rs")}}]}});
-        let raw = std::iter::once(call).chain(results.iter().map(|result| {
-            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"file","content":result}]}})
-        })).map(|record| format!("{record}\n")).collect::<String>();
+        let raw = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
         let log = transcript::wrap_lines(&raw, "claude-code", &session);
         let policy = PrivacyPolicy {
             attachments,
@@ -3379,7 +3868,8 @@ mod tests {
             }}),
             json!({"type":"turn_context","payload":{"cwd":temp.path(),"developer_instructions":private[3]}}),
             json!({"type":"future_control","payload":{"nested":{"value":private[4]}}}),
-            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Public question"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Public question"}],
+                "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Public answer"}]}}),
         ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
         let log = transcript::wrap_lines(&raw, "codex", &session);

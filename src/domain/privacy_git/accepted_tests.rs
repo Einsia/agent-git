@@ -333,6 +333,8 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
                 &metadata.session,
             );
         }
+        // A snapshot holds the events its LOG names, as one agit commits does.
+        let _ = fs::remove_dir_all(source.root().join(meta::EVENTS_DIR));
         storage::write_snapshot(source.root(), &text, &text).unwrap();
         meta::write(source.root(), metadata).unwrap();
         source.add_all().unwrap();

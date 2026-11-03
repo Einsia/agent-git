@@ -1044,6 +1044,16 @@ impl ProjectedHistory {
                             "encrypted or obsolete ciphertext cannot be admitted as plaintext"
                         );
                         imports.add(oid, &parents[oid]);
+                        // A session snapshot publishes its conversation records only.
+                        let conversation = match config {
+                            Some(_) if selected.delivery.is_none() => {
+                                conversation_commit(&source, oid, &parents[oid])?
+                            }
+                            _ => None,
+                        };
+                        if let Some(conversation) = &conversation {
+                            imports.add(conversation, &parents[oid]);
+                        }
                         let public = if let Some(delivery) = &selected.delivery {
                             let delivered = Meta {
                                 milestone: metadata.milestone.clone(),
@@ -1097,13 +1107,14 @@ impl ProjectedHistory {
                                 && metadata.fork_origin == original_metadata.fork_origin
                                 && neutral.is_none()
                                 && public_parents == parents[oid]
+                                && conversation.is_none()
                             {
                                 oid.clone()
                             } else {
                                 plain_commit(
                                     &source,
                                     &repo,
-                                    (oid, neutral.as_deref()),
+                                    (conversation.as_deref().unwrap_or(oid), neutral.as_deref()),
                                     &public_parents,
                                     Some(&published),
                                 )?
@@ -1542,6 +1553,137 @@ fn readable_fork_sources(
 }
 
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
+/// `oid` as plain publication carries it: `None` when every record it holds is published as it
+/// is, otherwise a commit written to `source` with the same message and parents whose LOG, VIEW
+/// and events hold only what [`publication_records`] keeps. The local commit is left as it is, so
+/// local history and resume keep the complete native transcript.
+///
+/// [`publication_records`]: crate::domain::publication_records
+fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<Option<String>> {
+    use crate::domain::{publication_records, storage, transcript::Envelope};
+    let limit = storage::MAX_MATERIALIZED_BYTES;
+    let (log, view) = storage::materialize_pair_local(source.root(), oid, limit, limit)?;
+    let lines = |text: &str| -> Vec<String> {
+        text.split_inclusive('\n')
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut line = line.to_owned();
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                line
+            })
+            .collect()
+    };
+    let log = lines(&log);
+    let envelopes = log
+        .iter()
+        .map(|line| storage::parse_legacy_envelope_line(line))
+        .collect::<Result<Vec<_>>>()?;
+    let kept = publication_records::published_sequence(
+        envelopes
+            .iter()
+            .map(|envelope| (envelope.source.as_str(), &envelope.content)),
+    );
+    let mut published = BTreeMap::<&str, Option<String>>::new();
+    let mut public_log = String::new();
+    let mut changed = false;
+    for ((line, envelope), kept) in log.iter().zip(&envelopes).zip(kept) {
+        let public = kept.map(|content| {
+            storage::envelope_line(&Envelope {
+                source: envelope.source.clone(),
+                session_id: envelope.session_id.clone(),
+                object_hash: crate::domain::transcript::object_hash(&content),
+                content,
+            })
+        });
+        changed |= public.as_deref() != Some(line.as_str());
+        if let Some(public) = &public {
+            public_log.push_str(public);
+        }
+        published.entry(line).or_insert(public);
+    }
+    let text = read(
+        source,
+        &["cat-file", "blob", &format!("{oid}:{}", meta::FILE)],
+        meta::MAX_BYTES,
+    )?;
+    let mut metadata: Meta = serde_json::from_slice(&text)?;
+    // Every event object a v1 tree holds, named by its LOG or not: one that is not published
+    // must leave the tree, so a tree holding one is never published as it is. A v0 tree has no
+    // such objects; an `events/` there is the repository's own content.
+    let held = if metadata.layout == meta::LayoutVersion::V1 {
+        source
+            .git_bytes_result(&[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                oid,
+                "--",
+                meta::EVENTS_DIR,
+            ])?
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).context("event path is not UTF-8"))
+            .collect::<Result<BTreeSet<_>>>()?
+    } else {
+        BTreeSet::new()
+    };
+    let named = published
+        .values()
+        .flatten()
+        .map(|line| meta::event_path(&storage::event_id(line)?))
+        .collect::<Result<BTreeSet<_>>>()?;
+    changed |= held.iter().any(|path| !named.contains(path));
+    if !changed {
+        return Ok(None);
+    }
+    let mut public_view = String::new();
+    for line in lines(&view) {
+        let public = published
+            .get(line.as_str())
+            .context("a session VIEW holds an event its LOG does not")?;
+        if let Some(public) = public {
+            public_view.push_str(public);
+        }
+    }
+
+    let tree = if metadata.layout == meta::LayoutVersion::V1 {
+        // Only what changes is written: every event object the tree holds that is not published
+        // is removed, events that changed are added, and LOG and VIEW are replaced. Every other
+        // event keeps its object.
+        let files = storage::snapshot_files(&public_log, &public_view)?;
+        let original = held;
+        let mut edits: Vec<(String, Option<Vec<u8>>)> = original
+            .iter()
+            .filter(|path| !files.contains_key(*path))
+            .map(|path| (path.clone(), None))
+            .collect();
+        edits.extend(
+            files
+                .into_iter()
+                .filter(|(path, _)| {
+                    path == meta::LOG_FILE || path == meta::VIEW_FILE || !original.contains(path)
+                })
+                .map(|(path, bytes)| (path, Some(bytes))),
+        );
+        crate::commands::plumbing::tree_apply_owned(source, oid, edits)?
+    } else {
+        // A v0 snapshot is published in the v1 layout its rebuilt tree has.
+        metadata.layout = meta::LayoutVersion::V1;
+        crate::commands::plumbing::session_snapshot_tree(
+            source,
+            oid,
+            &public_log,
+            &public_view,
+            &meta::to_text(&metadata)?,
+        )?
+    };
+    let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+    write_object(source, "commit", &commit_body(&tree, parents, &original)?).map(Some)
+}
+
 fn plain_commit(
     source: &Repo,
     destination: &Repo,
@@ -2354,6 +2496,48 @@ impl ProjectedHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v0 snapshot keeps its session in the three root files, and an `events/` directory beside
+    /// them is the repository's own content: a snapshot whose records are all published needs no
+    /// projection, and the push publishes it as it is.
+    #[test]
+    fn a_v0_snapshot_with_a_repository_events_directory_is_published_as_it_is() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let mut session = Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            "claude-code".into(),
+            String::new(),
+        );
+        session.layout = meta::LayoutVersion::V0;
+        let log = crate::domain::transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":"hello"}})
+            ),
+            "claude-code",
+            &session.session,
+        );
+        std::fs::create_dir_all(temp.path().join("session")).unwrap();
+        std::fs::write(temp.path().join(meta::LEGACY_LOG_FILE), &log).unwrap();
+        std::fs::write(temp.path().join(meta::LEGACY_VIEW_FILE), &log).unwrap();
+        std::fs::write(
+            temp.path().join(meta::FILE),
+            serde_json::to_vec(&session).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join(meta::EVENTS_DIR)).unwrap();
+        std::fs::write(
+            temp.path().join("events/notes.md"),
+            "the team's event notes\n",
+        )
+        .unwrap();
+        git(temp.path(), &["add", "-A"]);
+        git(temp.path(), &["commit", "-q", "-m", "v0 snapshot"]);
+        let head = git(temp.path(), &["rev-parse", "HEAD"]);
+        let repo = Repo::at(temp.path());
+        assert_eq!(conversation_commit(&repo, head.trim(), &[]).unwrap(), None);
+    }
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")

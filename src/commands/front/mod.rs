@@ -770,29 +770,23 @@ impl FolderSession {
         let (repository, branch) = self.saved.as_ref()?;
         let (owner, name) = super::parse_slug(repository).ok()?;
         let repo = Repo::open(config::repo_dir(&owner, &name).ok()?)?;
-        let local = repo.git_opt(&[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ]);
         let remote = repo.git_opt(&[
             "rev-parse",
             "--verify",
             "--quiet",
             &format!("refs/remotes/origin/{branch}"),
         ]);
-        Some(match (local, remote) {
-            (_, None) => Upload::NotUploaded,
+        Some(match remote {
+            None => Upload::NotUploaded,
             // A Stop hook that did not run leaves the branch as it was pushed while the
             // conversation goes on, so the transcript is compared with its last upload too.
-            (local, remote)
-                if local == remote
+            Some(_)
+                if crate::domain::privacy_git::hub_holds_head(&repo, branch)
                     && !super::project::changed_since_upload(self.runtime, &self.id, &self.cwd) =>
             {
                 Upload::Uploaded
             }
-            _ => Upload::Waiting,
+            Some(_) => Upload::Waiting,
         })
     }
 

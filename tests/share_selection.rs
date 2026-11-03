@@ -494,7 +494,7 @@ fn native_ids_remain_live_and_local_ref_ambiguities_are_rejected() {
         &cursor,
         format!(
             "{}\n",
-            json!({"role":"user","message":{"content":[{"type":"text","text":"LIVE-CURSOR"}]}})
+            json!({"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nLIVE-CURSOR\n</user_query>"}]}})
         ),
     )
     .unwrap();

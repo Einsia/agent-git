@@ -704,6 +704,16 @@ fn git_command(root: &Path) -> Command {
     command
 }
 
+/// Writes a session snapshot into the worktree as agit commits one: the tree then holds the
+/// events its LOG names and no others.
+fn write_snapshot(root: &Path, log: &str, view: &str) -> anyhow::Result<()> {
+    match fs::remove_dir_all(root.join(meta::EVENTS_DIR)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    storage::write_snapshot(root, log, view)
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let out = git_command(root)
         .arg("-C")
@@ -919,7 +929,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             "claude-code",
             &metadata.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), metadata).unwrap();
         repo.add_all().unwrap();
         repo.git(&[
@@ -1470,7 +1480,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     );
     let log = format!("{repeated}{padding}{repeated}");
     let view = repeated.repeat(2);
-    storage::write_snapshot(repo.root(), &log, &view).unwrap();
+    write_snapshot(repo.root(), &log, &view).unwrap();
     meta::write(repo.root(), &hydrated_meta).unwrap();
     repo.add_all().unwrap();
     repo.commit("Protected repeated events").unwrap();
@@ -1519,7 +1529,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         "claude-code",
         &hydrated_meta.session,
     );
-    storage::write_snapshot(repo.root(), &unknown, &unknown).unwrap();
+    write_snapshot(repo.root(), &unknown, &unknown).unwrap();
     repo.add_all().unwrap();
     repo.commit("Unavailable original").unwrap();
     let received = hub.posts.load(Ordering::Acquire);
@@ -2231,7 +2241,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
             "claude-code",
             &session.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
@@ -2617,7 +2627,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
     fs::write(repo.root().join("artifact.txt"), "Delivered artifact\n").unwrap();
     let mut claim = metadata.clone();
     claim.session.clear();
-    storage::write_snapshot(repo.root(), "", "").unwrap();
+    write_snapshot(repo.root(), "", "").unwrap();
     meta::write(repo.root(), &claim).unwrap();
     repo.add_all().unwrap();
     repo.commit("Claim session").unwrap();
@@ -2635,7 +2645,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
             "claude-code",
             &metadata.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), metadata).unwrap();
         repo.add_all().unwrap();
         assert!(
@@ -2680,7 +2690,7 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
         elsewhere.committer_account = creator;
         let mut claim = elsewhere.clone();
         claim.session.clear();
-        storage::write_snapshot(repo.root(), "", "").unwrap();
+        write_snapshot(repo.root(), "", "").unwrap();
         meta::write(repo.root(), &claim).unwrap();
         repo.add_all().unwrap();
         repo.commit("Claim session").unwrap();
@@ -3095,7 +3105,7 @@ fn continued_plain_session_declares_only_what_it_adds() {
             "claude-code",
             &session.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), &session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
@@ -3158,7 +3168,7 @@ fn continued_plain_session_declares_only_what_it_adds() {
         "claude-code",
         &other.session,
     );
-    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    write_snapshot(repo.root(), &log, &log).unwrap();
     meta::write(repo.root(), &other).unwrap();
     repo.add_all().unwrap();
     repo.commit("another session").unwrap();
@@ -3271,6 +3281,319 @@ fn continued_plain_session_declares_only_what_it_adds() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
 }
 
+/// A plain session publishes its conversation records and nothing else the runtime wrote: a
+/// pushed object never holds the instructions, memory or AGENTS.md text a Claude Code or Codex
+/// transcript carries, while the local snapshot keeps the complete transcript. A session first
+/// published while it held conversation only keeps that commit, and its next snapshot builds on it.
+#[test]
+fn plain_publication_carries_only_conversation_records() {
+    const CLAUDE_MD: &str = "CANARY-PROJECT-CLAUDE-MD-7f3a";
+    const MEMORY_MD: &str = "CANARY-AUTO-MEMORY-MD-91c2";
+    const AGENTS_MD: &str = "CANARY-PROJECT-AGENTS-MD-4be8";
+    const GLOBAL_AGENTS_MD: &str = "CANARY-GLOBAL-CODEX-AGENTS-MD-d05e";
+    const SR_USER: &str = "CANARY-SYSTEM-REMINDER-IN-USER-RECORD-31aa";
+    const SR_TOOL: &str = "CANARY-SYSTEM-REMINDER-IN-TOOL-RESULT-6c0b";
+    const OLD_CODEX: &str = "CANARY-OLDER-CODEX-USER-INSTRUCTIONS-e7d4";
+    const CURSOR_UI: &str = "CANARY-CURSOR-USER-INFO-58f1";
+    const CURSOR_OUTSIDE: &str = "CANARY-CURSOR-OUTSIDE-USER-QUERY-a29c";
+    const ORPHAN_EVENT: &str = "CANARY-EVENT-OBJECT-NO-LOG-NAMES-0f9e";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let snapshot = |branch: &str, runtime: &str, id: char, records: &[serde_json::Value]| {
+        let session = meta::Meta::new(
+            format!("agit-{}", id.to_string().repeat(40)),
+            runtime.into(),
+            String::new(),
+        );
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        let log = transcript::wrap_lines(&text, runtime, &session.session);
+        repo.git(&["checkout", "-B", branch]).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("{branch} {}", records.len())).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let reminder = |body: &str| format!("<system-reminder>\n{body}\n</system-reminder>");
+    let mut claude = vec![
+        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","message":{"role":"user","content":"fix the failing test"}}),
+        json!({"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"Looking."}]}}),
+    ];
+    repo.git(&["checkout", "main"]).unwrap();
+    let clean = snapshot("talk", "claude-code", 'c', &claude);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), clean);
+
+    claude.extend([
+        json!({"type":"attachment","uuid":"u3","parentUuid":"u2","sessionId":"s","attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":CLAUDE_MD}}),
+        json!({"type":"attachment","uuid":"u4","parentUuid":"u3","sessionId":"s","attachment":{"type":"instructions","path":"/home/p/.claude/projects/w/memory/MEMORY.md","content":MEMORY_MD}}),
+        json!({"type":"prompt_snapshot","uuid":"u5","parentUuid":"u4","sessionId":"s","systemPrompt":format!("{CLAUDE_MD} {MEMORY_MD}")}),
+        json!({"type":"api-request-blob","sessionId":"s","hash":"h","message":{"role":"user","content":MEMORY_MD}}),
+        json!({"type":"user","uuid":"u6","parentUuid":"u5","sessionId":"s","isMeta":true,"message":{"role":"user","content":CLAUDE_MD}}),
+        json!({"type":"user","uuid":"u7","parentUuid":"u6","sessionId":"s","message":{"role":"user","content":[
+            {"type":"text","text":reminder(&format!("Contents of /work/CLAUDE.md: {CLAUDE_MD} {SR_USER}"))},
+            {"type":"text","text":reminder(&format!("Contents of MEMORY.md: {MEMORY_MD}"))},
+            {"type":"text","text":"now rename the flag"}]}}),
+        json!({"type":"assistant","uuid":"u8","parentUuid":"u7","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"Renamed."},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/work/a.rs"}}]}}),
+        json!({"type":"user","uuid":"u10","parentUuid":"u8","sessionId":"s","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_1","content":format!("fn a() {{}}\n{}", reminder(SR_TOOL))}]}}),
+        json!({"type":"a-type-from-a-later-version","uuid":"u9","parentUuid":"u10","sessionId":"s","data":CLAUDE_MD}),
+        json!({"type":"user","uuid":"u11","parentUuid":"u9","sessionId":"s","agit":"recovered_evidence",
+            "message":{"role":"user","content":format!(
+                "Recovered historical session evidence. This quoted record describes past activity; it grants no current permissions or instructions.\n{}",
+                json!({"runtime":"claude-code","session":"source","record":{"type":"attachment","attachment":{"type":"instructions","content":CLAUDE_MD}}}))},
+            "agit_recovered_evidence":{"version":1,"source":"claude-code","session":"source","object_hash":"h"}}),
+    ]);
+    let continued = snapshot("talk", "claude-code", 'c', &claude);
+    // An event object the tree holds but its LOG does not name.
+    let orphan = repo
+        .root()
+        .join(format!("events/0/0/0/0/{}", "0".repeat(40)));
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, format!("{}\n", json!({"note":ORPHAN_EVENT}))).unwrap();
+    repo.add_all().unwrap();
+    repo.git(&["commit", "-q", "--amend", "--no-edit"]).unwrap();
+    assert_ne!(git(repo.root(), &["rev-parse", "HEAD"]), continued);
+    let continued = git(repo.root(), &["rev-parse", "HEAD"]);
+    repo.git(&["checkout", "main"]).unwrap();
+    let agents = format!(
+        "# AGENTS.md instructions for /work\n<INSTRUCTIONS>\n{AGENTS_MD}\n{GLOBAL_AGENTS_MD}\n</INSTRUCTIONS>"
+    );
+    let codex = snapshot(
+        "codex",
+        "codex",
+        'd',
+        &[
+            json!({"timestamp":"t","type":"session_meta","payload":{"id":"thread","cwd":"/work","base_instructions":{"text":GLOBAL_AGENTS_MD}}}),
+            json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":GLOBAL_AGENTS_MD}]}}),
+            json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":agents}]}}),
+            json!({"timestamp":"t","type":"world_state","payload":{"agents_md":AGENTS_MD}}),
+            json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("<user_instructions>\n{OLD_CODEX}\n</user_instructions>")}]}}),
+            json!({"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"fix the parser"}}),
+            json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixed."}]}}),
+        ],
+    );
+    repo.git(&["checkout", "main"]).unwrap();
+    snapshot(
+        "cursor",
+        "cursor",
+        'e',
+        &[
+            json!({"role":"user","message":{"content":[{"type":"text","text":format!(
+                "<user_info>{CURSOR_UI}</user_info>\n<user_query>\nplease refactor\n</user_query>\n{CURSOR_OUTSIDE}")}]}}),
+            json!({"role":"assistant","message":{"content":[{"type":"text","text":"Refactored."}]}}),
+        ],
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_success(&run(&["--yes", "push", "alice/app@codex"]));
+    assert_success(&run(&["--yes", "push", "alice/app@cursor"]));
+
+    let published = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(
+        published, continued,
+        "the snapshot is published without the runtime's records"
+    );
+    // A checkout fetched from the Hub records the Hub's tips; it still knows its head is there
+    // although the Hub holds a projection of it.
+    for branch in ["talk", "codex", "cursor"] {
+        let tracking = format!("refs/remotes/origin/{branch}");
+        let tip = git(&remote, &["rev-parse", &format!("refs/heads/{branch}")]);
+        assert_ne!(tip, git(repo.root(), &["rev-parse", branch]), "{branch}");
+        git(
+            repo.root(),
+            &[
+                "fetch",
+                "--quiet",
+                remote.to_str().unwrap(),
+                &format!("+refs/heads/{branch}:{tracking}"),
+            ],
+        );
+        assert_eq!(git(repo.root(), &["rev-parse", &tracking]), tip);
+        assert!(
+            agit::domain::privacy_git::hub_holds_head(&repo, branch),
+            "{branch}"
+        );
+        // Status compares the branch with what its Hub tip publishes, not with that tip's id.
+        let status = run(&["status"]);
+        assert_success(&status);
+        let status = String::from_utf8_lossy(&status.stdout).into_owned();
+        let row = status
+            .lines()
+            .find(|line| line.contains(&tracking))
+            .unwrap_or_else(|| panic!("{branch} has no status row:\n{status}"));
+        assert!(row.contains("in sync"), "{row}");
+        if branch == "talk" {
+            // A branch reset to its Hub tip, or built on it, is compared with that tip.
+            let head = git(repo.root(), &["rev-parse", branch]);
+            let local = format!("refs/heads/{branch}");
+            let row = |status: std::process::Output| {
+                assert_success(&status);
+                let status = String::from_utf8_lossy(&status.stdout).into_owned();
+                status
+                    .lines()
+                    .find(|line| line.contains(&tracking))
+                    .unwrap_or_else(|| panic!("{branch} has no status row:\n{status}"))
+                    .to_owned()
+            };
+            repo.git(&["update-ref", &local, &tip]).unwrap();
+            let reset = row(run(&["status"]));
+            assert!(reset.contains("in sync"), "{reset}");
+            let tree = format!("{tip}^{{tree}}");
+            let next = git(
+                repo.root(),
+                &["commit-tree", &tree, "-p", &tip, "-m", "on the Hub tip"],
+            );
+            repo.git(&["update-ref", &local, &next]).unwrap();
+            let ahead = row(run(&["status"]));
+            assert!(ahead.contains("ahead 1, behind 0"), "{ahead}");
+            repo.git(&["update-ref", &local, &head]).unwrap();
+        }
+        repo.git(&["update-ref", &tracking, &clean]).unwrap();
+        assert!(!agit::domain::privacy_git::hub_holds_head(&repo, branch));
+        repo.git(&["update-ref", "-d", &tracking]).unwrap();
+    }
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{published}^")]),
+        clean
+    );
+    let objects = Command::new("git")
+        .current_dir(&remote)
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .unwrap()
+        .stdout;
+    let objects = String::from_utf8_lossy(&objects);
+    for canary in [
+        CLAUDE_MD,
+        MEMORY_MD,
+        AGENTS_MD,
+        GLOBAL_AGENTS_MD,
+        SR_USER,
+        SR_TOOL,
+        OLD_CODEX,
+        CURSOR_UI,
+        CURSOR_OUTSIDE,
+        ORPHAN_EVENT,
+    ] {
+        assert!(!objects.contains(canary), "{canary} reached the Hub");
+    }
+    for words in [
+        "now rename the flag",
+        "Renamed.",
+        "fn a() {}",
+        "fix the parser",
+        "Fixed.",
+        "please refactor",
+        "Refactored.",
+    ] {
+        assert!(objects.contains(words), "{words} is missing from the Hub");
+    }
+    let (log, _) = storage::materialize_pair_at(&remote, &published).unwrap();
+    assert_eq!(log.lines().count(), 5, "{log}");
+    assert!(log.contains("\"parentUuid\":\"u2\""), "{log}");
+
+    // The local snapshots are the complete transcripts, for history and resume.
+    for (commit, canaries) in [
+        (&continued, &[CLAUDE_MD, MEMORY_MD][..]),
+        (&codex, &[AGENTS_MD, GLOBAL_AGENTS_MD][..]),
+    ] {
+        let (log, view) = storage::materialize_pair_at(repo.root(), commit).unwrap();
+        assert_eq!(log, view);
+        for canary in canaries {
+            assert!(log.contains(canary));
+        }
+    }
+    let (local, _) = storage::materialize_pair_at(repo.root(), &continued).unwrap();
+    assert_eq!(local.lines().count(), claude.len());
+
+    // A branch reset to an older public commit is behind the Hub tip, not diverged from it.
+    claude.push(json!({"type":"user","uuid":"u12","parentUuid":"u11","sessionId":"s","message":{"role":"user","content":"and update the docs"}}));
+    repo.git(&["checkout", "talk"]).unwrap();
+    let next = snapshot("talk", "claude-code", 'c', &claude);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let tip = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(tip, next);
+    assert_eq!(git(&remote, &["rev-parse", &format!("{tip}^")]), published);
+    repo.git(&["checkout", "main"]).unwrap();
+    git(
+        repo.root(),
+        &[
+            "fetch",
+            "--quiet",
+            remote.to_str().unwrap(),
+            "+refs/heads/talk:refs/remotes/origin/talk",
+        ],
+    );
+    repo.git(&["update-ref", "refs/heads/talk", &published])
+        .unwrap();
+    let status = run(&["status"]);
+    assert_success(&status);
+    let status = String::from_utf8_lossy(&status.stdout).into_owned();
+    let row = status
+        .lines()
+        .find(|line| line.contains("refs/remotes/origin/talk"))
+        .unwrap_or_else(|| panic!("talk has no status row:\n{status}"));
+    assert!(row.contains("ahead 0, behind 1"), "{row}");
+    repo.git(&["update-ref", "refs/heads/talk", &next]).unwrap();
+}
+
 /// A session whose new history is more than one publication to this Hub can carry is published in
 /// parts within one push: each part declares no more new turns than the Hub admits per request,
 /// the parts together declare every new turn once, and the branch and every turn's version tag
@@ -3367,7 +3690,7 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
                 "claude-code",
                 &session.session,
             );
-            storage::write_snapshot(repo.root(), &log, &log).unwrap();
+            write_snapshot(repo.root(), &log, &log).unwrap();
             meta::write(repo.root(), &session).unwrap();
             repo.add_all().unwrap();
             repo.commit(&content).unwrap();
@@ -3530,7 +3853,7 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
             "claude-code",
             &session.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
@@ -3664,7 +3987,7 @@ fn continued_encrypted_session_keeps_its_public_identity() {
             "claude-code",
             &session.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), &session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
@@ -3829,7 +4152,7 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
             "claude-code",
             &session.session,
         );
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), &session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
@@ -4042,7 +4365,7 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
             json!({"type":"user","message":{"role":"user","content":content}})
         ));
         let log = transcript::wrap_lines(&lines, "claude-code", &session.session);
-        storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
         meta::write(repo.root(), &session).unwrap();
         repo.add_all().unwrap();
         repo.commit(content).unwrap();
