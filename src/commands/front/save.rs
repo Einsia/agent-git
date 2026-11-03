@@ -389,8 +389,10 @@ fn report(
 ) -> CmdResult {
     let failed = rows
         .iter()
-        .filter(|r| matches!(r.outcome, Saved::Failed(_)))
+        .filter(|r| matches!(r.outcome, Saved::Failed(_) | Saved::Refused(_)))
         .count();
+    // A refusal says its own way forward; saving again only meets it again.
+    let retry = rows.iter().any(|r| matches!(r.outcome, Saved::Failed(_)));
     if crate::commands::json::is_capturing() {
         let sessions: Vec<serde_json::Value> = rows
             .iter()
@@ -398,7 +400,7 @@ fn report(
                 let (status, branch, error) = match &r.outcome {
                     Saved::Uploaded(b) => ("uploaded", Some(b), None),
                     Saved::Pending(b) => ("pending", Some(b), None),
-                    Saved::Failed(e) => ("failed", None, Some(e)),
+                    Saved::Failed(e) | Saved::Refused(e) => ("failed", None, Some(e)),
                 };
                 serde_json::json!({
                     "title": r.title,
@@ -410,7 +412,7 @@ fn report(
                     "link": match &r.outcome {
                         Saved::Uploaded(b) => Some(link(&r.repository, b)),
                         Saved::Pending(_) => Some(super::repository_link(&r.repository)),
-                        Saved::Failed(_) => None,
+                        Saved::Failed(_) | Saved::Refused(_) => None,
                     },
                     "branch": branch,
                     "error": error,
@@ -441,11 +443,13 @@ fn report(
                         ),
                         "if_no": "for each folder the user says no to, run its `if_no` in folders_turned_on",
                     }))
-                } else if failed > 0 {
+                } else if retry {
                     Some(serde_json::json!({
                         "command": "agit save",
                         "why": "retry what did not upload; what is already on the Hub is not sent again",
                     }))
+                } else if failed > 0 {
+                    None
                 } else {
                     this_conversation.then(|| serde_json::json!({
                         "command": "agit share",
@@ -478,11 +482,11 @@ fn report(
                         row.repository
                     );
                 }
-                Saved::Failed(error) => {
+                Saved::Failed(error) | Saved::Refused(error) => {
                     ui::error(&format!(
                         "could not upload \"{}\": {}",
                         ui::truncate(&row.title, 60),
-                        ui::truncate(error, 200)
+                        ui::truncate(error, 400)
                     ));
                 }
             }
@@ -497,9 +501,9 @@ fn report(
             ui::warning(&format!("skipped {}: {why}", ui::tilde(folder)));
         }
         report_dropped(dropped);
-        if failed > 0 {
+        if retry {
             ui::hint("run `agit save` again to retry; `agit` shows what is still waiting");
-        } else if this_conversation {
+        } else if this_conversation && failed == 0 {
             println!("To send it to someone: {}", ui::accent("agit share"));
         }
     }

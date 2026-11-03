@@ -7,7 +7,7 @@ use crate::domain::privacy_git::ProjectedHistory;
 use crate::domain::privacy_receipt::{PublicationReceipt, SupervisorReply};
 use crate::hub::git::{
     CapturedPublication, ContentInspection, FrozenPublication, InspectionFailure,
-    PublicationReport, PublicationStatus,
+    PublicationAttempt, PublicationReport, PublicationStatus,
 };
 use crate::hub::identity::RemoteIdentity;
 use crate::hub::{Client, RemoteAgent};
@@ -268,9 +268,9 @@ fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
     command
 }
 
-/// What stopped a publication, in the transport's words: the step's own error, a ref the Hub
-/// rejected with its reason, or the last line Git printed. A caller that runs push as a child
-/// reads only the final error line, so the reason has to be in it.
+/// What stopped a publication, in the transport's words: the Hub's refusal, the step's own error,
+/// a ref the Hub rejected with its reason, or the last line Git printed. A caller that runs push
+/// as a child reads only the final error line, so the reason has to be in it.
 fn publication_failure(report: &PublicationReport) -> Option<String> {
     let from_git = |code: i32, stderr: &str| {
         stderr
@@ -279,6 +279,13 @@ fn publication_failure(report: &PublicationReport) -> Option<String> {
             .rfind(|line| !line.is_empty())
             .map_or_else(|| format!("Git exit {code}"), str::to_owned)
     };
+    // Git's last line after a refusal is "failed to push some refs"; the Hub's own line says why,
+    // and often what to do, so it is kept whole up to a longer bound. It is printed as the Hub
+    // wrote it, and any Hub can write it, so control characters never reach the terminal.
+    if let Some(refusal) = refused(report).find_map(|attempt| attempt.outcome.refusal()) {
+        let printable: String = refusal.chars().filter(|c| !c.is_control()).collect();
+        return Some(crate::ui::truncate(&printable, 400));
+    }
     let lfs = report.lfs.as_ref().and_then(|lfs| {
         lfs.error.clone().or_else(|| {
             lfs.attempts
@@ -316,6 +323,15 @@ fn publication_failure(report: &PublicationReport) -> Option<String> {
     Some(crate::ui::truncate(&reason, 200))
 }
 
+/// The ref attempts that failed, in order.
+fn refused(report: &PublicationReport) -> impl Iterator<Item = &PublicationAttempt> {
+    [&report.heads, &report.tags]
+        .into_iter()
+        .flatten()
+        .flat_map(|phase| &phase.attempts)
+        .filter(|attempt| !attempt.ok())
+}
+
 fn publication_recovery(report: &PublicationReport, retry: &str, repository: &str) -> String {
     let stopped = publication_failure(report).map_or_else(
         || "publication did not complete".to_owned(),
@@ -326,6 +342,42 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
         .flatten()
         .flat_map(|phase| &phase.attempts)
         .collect();
+    if refused(report).any(|attempt| {
+        attempt.outcome.refusal_kind() == Some("provenance_rejected")
+            && attempt
+                .outcome
+                .stderr
+                .contains(crate::commands::push::UNSUPPORTED_BLOCK)
+    }) {
+        return crate::commands::push::ENCRYPTED_REFUSED.to_owned();
+    }
+    // The same push meets the same refusal, so rerunning it is no way forward.
+    if report.error.is_none()
+        && refused(report).next().is_some()
+        && refused(report).all(|attempt| attempt.outcome.refused_for_good())
+    {
+        let done = if attempts
+            .iter()
+            .flat_map(|attempt| &attempt.refs)
+            .any(|reference| reference.status == PublicationStatus::Updated)
+        {
+            "some ref updates were acknowledged"
+        } else {
+            "no branch or tag refs were updated"
+        };
+        if refused(report)
+            .any(|attempt| attempt.outcome.refusal_kind() == Some("agentgit_upgrade_required"))
+        {
+            return format!(
+                "{stopped}; {done}; {} `{retry}`",
+                crate::commands::push::UPGRADE_FIRST
+            );
+        }
+        return format!(
+            "{stopped}; {done}; {}",
+            crate::commands::push::REFUSED_AGAIN
+        );
+    }
     // An attempt the Hub turned down before its ref transaction changed nothing, although Git
     // reports none of its refs.
     let unknown = attempts.iter().any(|attempt| {

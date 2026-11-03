@@ -759,6 +759,8 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
             .flatten()
             .filter(|d| d["level"] == "error")
             .filter_map(|d| d["message"].as_str())
+            // Git's own summary of a refused push names only the URL; agit's line says why.
+            .filter(|message| !message.starts_with("failed to push some refs"))
             .collect();
         let said = if messages.is_empty() {
             format!(
@@ -803,6 +805,7 @@ pub(crate) enum UploadFailure {
     PrivacyIncomplete,
     TooLarge,
     BuildsOnWithdrawn,
+    Refused,
     Other,
 }
 
@@ -816,6 +819,11 @@ impl UploadFailure {
         }
         if failed.is_some_and(|failed| failed.message.contains(super::push::BUILDS_ON_WITHDRAWN)) {
             return Self::BuildsOnWithdrawn;
+        }
+        // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
+        // name to rename is refused before the Hub is asked.
+        if failed.is_some_and(|failed| super::push::refused_for_good(&failed.message)) {
+            return Self::Refused;
         }
         match failed.and_then(|failed| failed.exit_code) {
             Some(code) if code == ExitCode::Auth.as_i32() => Self::SignedOut,
@@ -837,6 +845,7 @@ impl UploadFailure {
             Self::BuildsOnWithdrawn => {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
+            Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
             Self::Other => "it could not be completed on this computer; the next turn tries again",
         }
     }
@@ -2243,8 +2252,21 @@ pub(crate) enum Saved {
     /// Claimed on this branch; its first turn has not finished, and the Stop that finishes it
     /// uploads it.
     Pending(String),
-    /// Left where it was, with the reason.
+    /// Left where it was, with the reason; saving again may get it through.
     Failed(String),
+    /// Left where it was for a reason saving again does not change; the reason says what does.
+    Refused(String),
+}
+
+impl Saved {
+    /// A failed upload, told apart by whether the same upload meets the same refusal.
+    fn upload_failed(message: String) -> Self {
+        if super::push::refused_for_good(&message) {
+            Self::Refused(message)
+        } else {
+            Self::Failed(message)
+        }
+    }
 }
 
 /// Uploads these sessions of the project deciding for the folder at `root` now, after any
@@ -2281,14 +2303,14 @@ pub(crate) fn save_now(
         let project = read(root)?.context("folder is not set up")?;
         // `--all` and `--today` ask for earlier sessions, never for one the person dropped.
         if project.excluded.contains(&session_key) {
-            saved.push(Saved::Failed(format!(
+            saved.push(Saved::Refused(format!(
                 "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`"
             )));
             continue;
         }
         saved.push(match save_one(project, candidate, earlier || named) {
             Ok(outcome) => outcome,
-            Err(error) => Saved::Failed(format!("{error:#}")),
+            Err(error) => Saved::upload_failed(format!("{error:#}")),
         });
     }
     // A Stop that arrived meanwhile queued its session and left it to the lock holder.
@@ -2315,12 +2337,12 @@ fn bound_apart(project: &Project, candidate: &Candidate) -> Result<Option<String
 /// worktrees from before they were covered.
 fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Saved> {
     if delegation_withheld(&project.repository, &candidate, Some(&project), false)? {
-        return Ok(Saved::Failed(
+        return Ok(Saved::Refused(
             "the root conversation's capture policy keeps this delegated session out".into(),
         ));
     }
     if let Some(why) = bound_apart(&project, &candidate)? {
-        return Ok(Saved::Failed(why));
+        return Ok(Saved::Refused(why));
     }
     let finished = adapter::get(&candidate.runtime)
         .ok()
@@ -2330,7 +2352,7 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         })
         .is_some_and(|session| crate::domain::turn::completed_count(&session) > 0);
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
-        return Ok(Saved::Failed(format!("it is saved in {source}")));
+        return Ok(Saved::Refused(format!("it is saved in {source}")));
     }
     if !finished {
         let _guard = lock(&project.root)?;
@@ -2338,7 +2360,7 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         // claim must not take a session that binding now keeps.
         let project = read(&project.root)?.context("folder is not set up")?;
         if let Some(why) = bound_apart(&project, &candidate)? {
-            return Ok(Saved::Failed(why));
+            return Ok(Saved::Refused(why));
         }
         verify(&project)?;
         let (branch, opens) = publication(&project, &candidate)?;
@@ -2347,12 +2369,12 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
     }
     let store = Store::at(config::store_root()?);
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
-        return Ok(Saved::Failed(format!("it is saved in {source}")));
+        return Ok(Saved::Refused(format!("it is saved in {source}")));
     }
     if !capture_candidate(project.clone(), candidate.clone(), let_in, false)? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
-        return Ok(Saved::Failed(
+        return Ok(Saved::Refused(
             why.unwrap_or_else(|| "it is saved in another repository".into()),
         ));
     }
@@ -2367,7 +2389,7 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         && last["session_id"] == candidate.session_id.as_str()
         && last["ok"] == false
     {
-        return Ok(Saved::Failed(
+        return Ok(Saved::upload_failed(
             last["error"].as_str().unwrap_or("unknown error").to_owned(),
         ));
     }
@@ -4287,7 +4309,7 @@ mod tests {
         let session = |id: &str| ("claude-code".to_string(), id.to_string(), tree.clone());
         let saved = save_now(&tree, &[session(AFTER)], true, false).unwrap();
         assert!(
-            matches!(&saved[..], [Saved::Failed(why)] if why.contains("agit project drop")),
+            matches!(&saved[..], [Saved::Refused(why)] if why.contains("agit project drop")),
             "a dropped session was let in"
         );
         let _ = save_now(&tree, &[session(AFTER)], false, true).unwrap();
@@ -4399,7 +4421,7 @@ mod tests {
         };
         let saved = save_now(&policy.root, &[session()], true, false).unwrap();
         assert!(
-            matches!(&saved[..], [Saved::Failed(why)] if why.contains("agit project drop")),
+            matches!(&saved[..], [Saved::Refused(why)] if why.contains("agit project drop")),
             "a dropped session was let in after the move"
         );
         let _ = save_now(&policy.root, &[session()], false, true).unwrap();
@@ -5287,7 +5309,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let [Saved::Failed(why)] = saved.as_slice() else {
+        let [Saved::Refused(why)] = saved.as_slice() else {
             panic!("the nested session was not refused");
         };
         assert!(why.contains("set up on its own"), "{why}");
@@ -5330,7 +5352,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let Saved::Failed(why) = &saved[0] else {
+        let Saved::Refused(why) = &saved[0] else {
             panic!("a dropped session was saved");
         };
         assert!(why.contains("agit project drop"), "{why}");
@@ -5945,6 +5967,42 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(format!("{other:#}"), "the Hub did not answer");
+    }
+
+    /// A Hub refusal comes back from the child as a policy exit, as a privacy check that did not
+    /// complete does. It is told as a refusal, and a save offers no retry for it; a failure the
+    /// next try may get past still gets one.
+    #[test]
+    fn a_hub_refusal_is_told_as_one_and_not_offered_again() {
+        let work = tempfile::tempdir().unwrap();
+        let policy = project(work.path());
+        let refused = format!(
+            "publication did not complete (HTTP 422 provenance_rejected: x); no branch or tag refs were updated; {}",
+            super::super::push::REFUSED_AGAIN
+        );
+        let child = |message: &str| {
+            anyhow::Error::new(ChildFailed {
+                exit_code: Some(ExitCode::Policy.as_i32()),
+                message: message.into(),
+            })
+        };
+        assert_eq!(
+            UploadFailure::of(&child(&refused), &policy),
+            UploadFailure::Refused
+        );
+        assert_eq!(
+            UploadFailure::of(&child("the privacy review did not finish"), &policy),
+            UploadFailure::PrivacyIncomplete
+        );
+        assert!(matches!(Saved::upload_failed(refused), Saved::Refused(_)));
+        assert!(matches!(
+            Saved::upload_failed(super::super::push::ENCRYPTED_REFUSED.into()),
+            Saved::Refused(_)
+        ));
+        assert!(matches!(
+            Saved::upload_failed("the Hub did not answer".into()),
+            Saved::Failed(_)
+        ));
     }
 
     /// #293: the project keeps one last result for every conversation it uploads, and a turn of

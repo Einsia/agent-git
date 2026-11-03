@@ -4042,6 +4042,17 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
         "{refused:?}"
     );
     assert!(!text(&refused).contains("unconfirmed"), "{refused:?}");
+    // The Hub's reason, not Git's "failed to push some refs", and no rerun of the same push.
+    assert!(
+        text(&refused).contains(
+            "publication did not complete (HTTP 422 provenance_rejected: refs/heads/publication: session/meta.json unreadable"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !text(&refused).contains("is safe after resolving it"),
+        "{refused:?}"
+    );
     assert!(hub.refuse_moved.lock().unwrap().is_empty());
     let on_hub = Command::new("git")
         .arg("--git-dir")
