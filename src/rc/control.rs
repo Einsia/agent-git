@@ -16,7 +16,7 @@ use std::path::PathBuf;
 mod ownership;
 use ownership::Ownership;
 
-pub use super::control_protocol::{Reply, Request, SessionLine, Status};
+pub use super::control_protocol::{CloudLine, CloudPresence, Reply, Request, SessionLine, Status};
 
 /// Length cap for a unix socket path.
 ///

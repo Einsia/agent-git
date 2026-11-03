@@ -5,6 +5,7 @@
 //! renders. Every error ends in a command the user can run — an error without a
 //! next step is a bug (see the CLI conventions in `commands/mod.rs`).
 
+mod here;
 mod sources;
 
 use super::CmdResult;
@@ -204,6 +205,10 @@ pub struct StartArgs {
     /// Name shown in the web UI (default: this machine's hostname).
     #[arg(long, value_name = "name")]
     pub name: Option<String>,
+    /// Make this computer reachable through Cloud on the Hub you signed in to, wait until it is
+    /// online there, and say what to do next. Publishes nothing.
+    #[arg(long)]
+    pub here: bool,
 }
 
 #[derive(ClapArgs)]
@@ -666,6 +671,26 @@ fn landed_link(
 
 fn start(args: StartArgs) -> CmdResult {
     crate::rc::select_local_authority();
+    if args.here {
+        let choice = here::choose_hub(
+            &config::configured_hub_url(),
+            config::hub_url_env_override().as_deref(),
+            |hub| {
+                crate::infra::credentials::load_checked(hub)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            },
+        );
+        if let here::HubChoice::Mismatch {
+            signed_in,
+            environment,
+        } = choice
+        {
+            ui::error(&here::mismatch_line(&signed_in, &environment));
+            return Ok(ExitCode::Precondition);
+        }
+    }
     let hub = config::hub_url();
     crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(&hub))?;
     if let Err(error) = crate::rc::roster::Roster::try_load() {
@@ -683,6 +708,11 @@ fn start(args: StartArgs) -> CmdResult {
             );
         }
     }
+    // `--here` turns Cloud access on only for a Hub the person is signed in to.
+    if args.here && crate::infra::credentials::load_checked(&hub)?.is_none() {
+        ui::error(&here::not_signed_in_line(&hub));
+        return Ok(ExitCode::Precondition);
+    }
     crate::rc::cloud::store::request_inbound(&hub)?;
     ui::section("agit rc");
     println!("  machine   {}", identity::identity()?.display_name);
@@ -695,6 +725,31 @@ fn start(args: StartArgs) -> CmdResult {
         crate::rc::navigation::workspaces_url(&hub)
     );
     ui::hint("`agit rc cloud inbound --hub <hub> --enabled false` disables Cloud inbound access.");
+    if args.here {
+        crate::rc::local::ensure_daemon()?;
+        let deadline = std::time::Instant::now() + here::PRESENCE_WAIT;
+        let origin = here::origin(&hub);
+        let outcome = here::wait(
+            &origin,
+            || match control::ask(&control::Request::Status) {
+                Ok(control::Reply::Status(status)) => Some(status.cloud),
+                _ => None,
+            },
+            || crate::rc::cloud::store::inbound_pending(&origin).unwrap_or(true),
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::time::Instant::now() < deadline
+            },
+        );
+        let line = here::outcome_line(&origin, &outcome);
+        return Ok(if outcome == here::Outcome::Online {
+            ui::success(&line);
+            ExitCode::Ok
+        } else {
+            ui::error(&line);
+            ExitCode::Precondition
+        });
+    }
     if control::running_pid().is_some() || args.detach {
         crate::rc::local::ensure_daemon()?;
         ui::success("agitd is ready; Cloud connection status is recorded in the daemon log.");
@@ -721,6 +776,25 @@ fn status() -> CmdResult {
             );
             println!("  uptime     {}", human_secs(s.uptime_secs));
             println!("  version    {}", s.agit_version);
+            for line in &s.cloud {
+                let state = match (line.presence, line.error.as_deref()) {
+                    (control::CloudPresence::Connected, _) => ui::ok("online").to_string(),
+                    (control::CloudPresence::Connecting, _) => "connecting".to_owned(),
+                    (control::CloudPresence::Failed, class) => ui::warn_text(&format!(
+                        "not online ({})",
+                        class.unwrap_or("connection_failed")
+                    ))
+                    .to_string(),
+                };
+                let enrolled = if line.enrolled {
+                    ""
+                } else if line.pending {
+                    ", enrolling"
+                } else {
+                    ", not enrolled"
+                };
+                println!("  cloud      {} {state}{enrolled}", line.hub);
+            }
             println!();
             if s.sessions.is_empty() {
                 println!("  {}", ui::dim("no live sessions"));

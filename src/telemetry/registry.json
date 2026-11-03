@@ -141,7 +141,7 @@
     "rc sources connect": {"aliases":[],"args":{"source_id":{"action":"Set","policy":"presence"},"thread_id":{"action":"Set","policy":"presence"}}},
     "rc sources sessions": {"aliases":[],"args":{"source_id":{"action":"Set","policy":"presence"},"project":{"action":"Set","policy":"presence"},"after":{"action":"Set","policy":"presence"},"limit":{"action":"Set","policy":"bucket"}}},
     "rc sources settings": {"aliases":[],"args":{"source_id":{"action":"Set","policy":"presence"},"thread_id":{"action":"Set","policy":"presence"},"project":{"action":"Set","policy":"presence"}}},
-    "rc start": {"aliases":[],"args":{"detach":{"action":"SetTrue","policy":"boolean"},"name":{"action":"Set","policy":"presence"}}},
+    "rc start": {"aliases":[],"args":{"detach":{"action":"SetTrue","policy":"boolean"},"here":{"action":"SetTrue","policy":"boolean"},"name":{"action":"Set","policy":"presence"}}},
     "rc status": {"aliases":[],"args":{}},
     "rc stop": {"aliases":[],"args":{}},
     "rc ungrant": {"aliases":[],"args":{"command":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},

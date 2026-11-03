@@ -462,6 +462,19 @@ pub(crate) fn hub_url_at(home: Option<&std::path::Path>) -> String {
     DEFAULT_HUB_URL.to_string()
 }
 
+/// The Hub the config file names (what `agit login --hub` records), ignoring `AGIT_HUB_URL`.
+#[cfg(feature = "cli")]
+pub(crate) fn configured_hub_url() -> String {
+    agit_home()
+        .ok()
+        .and_then(|home| {
+            get_global_file_at(&home.join("config.json"), "hub.url")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| DEFAULT_HUB_URL.to_string())
+}
+
 /// The non-empty, normalized `AGIT_HUB_URL` override, when one is active.
 ///
 /// Configuration UIs need the source as well as the effective value: a stored value hidden by

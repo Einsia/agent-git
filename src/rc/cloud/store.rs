@@ -261,7 +261,7 @@ pub fn request_inbound(hub: &str) -> crate::Result<()> {
     write(&intent_path(api.origin())?, &api.origin())
 }
 
-pub(super) fn inbound_pending(hub: &str) -> crate::Result<bool> {
+pub(crate) fn inbound_pending(hub: &str) -> crate::Result<bool> {
     Ok(read::<String>(&intent_path(hub)?, MAX_RECORD)?.is_some())
 }
 

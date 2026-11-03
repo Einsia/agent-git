@@ -63,6 +63,31 @@ pub struct Status {
     pub uptime_secs: u64,
     pub agit_version: String,
     pub sessions: Vec<SessionLine>,
+    /// Each Hub's Cloud connection as this daemon sees it. A daemon that predates the field sends
+    /// none, which a reader takes as "can't tell", never as offline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cloud: Vec<CloudLine>,
+}
+
+/// One Hub's Cloud connection: whether this device is enrolled there with inbound on, and
+/// whether its presence socket is connected. `error` is a fixed class, never a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudLine {
+    pub hub: String,
+    pub enrolled: bool,
+    pub pending: bool,
+    pub presence: CloudPresence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudPresence {
+    #[default]
+    Connecting,
+    Connected,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

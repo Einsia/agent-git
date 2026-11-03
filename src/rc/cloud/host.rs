@@ -97,6 +97,18 @@ impl Service {
                     }
                 };
                 retire_changed_enrollments(&mut tasks, &origins);
+                super::state::observe(
+                    &origins
+                        .iter()
+                        .map(|(hub, pending, device)| {
+                            (
+                                hub.clone(),
+                                *pending,
+                                device.as_ref().map(|device| device.id.clone()),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 for (hub, pending, device) in origins {
                     let task = tasks.entry(hub.clone()).or_insert_with(|| {
                         let (changed, receiver) = watch::channel(());
@@ -147,11 +159,17 @@ impl Service {
                                         changed.send_replace(());
                                     }
                                 }
-                                Err(error) => record(
-                                    &log,
-                                    "cloud.enrollment_failed",
-                                    serde_json::json!({"hub":hub,"http_status":error.downcast_ref::<agit_peer::client::HttpFailure>().map(|error| error.status)}),
-                                ),
+                                Err(error) => {
+                                    super::state::enrollment_failed(
+                                        &hub,
+                                        super::state::failure_class(&error),
+                                    );
+                                    record(
+                                        &log,
+                                        "cloud.enrollment_failed",
+                                        serde_json::json!({"hub":hub,"http_status":error.downcast_ref::<agit_peer::client::HttpFailure>().map(|error| error.status)}),
+                                    );
+                                }
                             }
                         }));
                     }
@@ -347,6 +365,7 @@ async fn run_executor(
             let raw = worker.open(api.presence_config(&enrollment.credential)?).await?;
             let transport_timing = raw.connect_timing;
             let mut presence = Presence::open(raw).await?;
+            super::state::connected(&hub, &enrollment.credential.device.id);
             record(&log, "cloud.presence_connected", serde_json::json!({"hub":hub,"device_id":enrollment.credential.device.id,"epoch":presence.epoch,"worker_pid":presence.worker_pid,"transport_timing":transport_timing}));
             backoff = Duration::from_millis(250);
             loop {
@@ -421,6 +440,7 @@ async fn run_executor(
             Ok::<_, anyhow::Error>(())
         }.await;
         let error = attempt.as_ref().err();
+        super::state::disconnected(&hub, error.map(super::state::failure_class));
         record(
             &log,
             "cloud.presence_disconnected",
