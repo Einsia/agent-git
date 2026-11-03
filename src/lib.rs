@@ -147,6 +147,9 @@ pub mod domain {
     /// Device-local private snapshots bound to encrypted publication objects.
     #[cfg(feature = "cli")]
     pub mod privacy_recovery;
+    /// Which native records a published session carries: the conversation, never runtime
+    /// context (the Hub applies the same rule).
+    pub mod publication_records;
     /// Search query syntax (`in:` / `owner:` / `-excluded` / `"phrase"`). Shared by the backend
     /// and the CLI.
     pub mod query;

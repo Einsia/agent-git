@@ -718,7 +718,7 @@ fn to_rfc3339(s: &str) -> Option<String> {
 /// `Start multitasking` (5 occurrences) is undecidable: it comes from the user clicking a UI
 /// button, reads like a command, and counts as user intent by origin. It is not added — missing
 /// it only makes the count high, while misjudging it wipes out human input.
-fn is_synthetic_user_text(text: &str) -> bool {
+pub(crate) fn is_synthetic_user_text(text: &str) -> bool {
     const INJECTED: &[&str] = &[
         "Perform any necessary follow-up actions in response to the subagent completion",
         "Briefly inform the user about the task result and perform any follow-up action",
