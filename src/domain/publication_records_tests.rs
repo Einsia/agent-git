@@ -1150,3 +1150,84 @@ fn a_look_alike_tag_does_not_hide_a_runtime_element() {
             .contains(MEMORY_MD)
     );
 }
+
+/// Codex's usage: a turn's token counts as numbers and the model it ran on are published; the
+/// account's rate limits, the turn's working directory, instructions and policies never are.
+#[test]
+fn codex_usage_publishes_counts_and_the_model_only() {
+    let usage = codex(
+        "event_msg",
+        json!({"type":"token_count",
+            "info":{
+                "total_token_usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":90,
+                    "reasoning_output_tokens":40,"total_tokens":1290,"note":CLAUDE_MD},
+                "last_token_usage":{"input_tokens":"CANARY-NOT-A-NUMBER-7c1d","output_tokens":10},
+                "model_context_window":272000,
+                "extra":{"text":MEMORY_MD}},
+            "rate_limits":{"primary":{"used_percent":12.5,"resets_at":"CANARY-RATE-LIMIT-9e04"}}}),
+    );
+    let kept = published("codex", &usage).unwrap();
+    assert_eq!(
+        kept,
+        json!({"timestamp":"2026-11-03T03:00:00.000Z","type":"event_msg","payload":{"type":"token_count",
+            "info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":90,
+                "reasoning_output_tokens":40,"total_tokens":1290},
+                "last_token_usage":{"output_tokens":10},"model_context_window":272000}}})
+    );
+    assert_stable("codex", &usage);
+    let empty = codex(
+        "event_msg",
+        json!({"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":1}}}),
+    );
+    assert_eq!(published("codex", &empty), None);
+
+    let context = codex(
+        "turn_context",
+        json!({"cwd":"/home/person/CANARY-TURN-CWD-41aa","model":"gpt-5.5-codex",
+            "user_instructions":AGENTS_MD,"approval_policy":"never","sandbox_policy":{"mode":"workspace-write"}}),
+    );
+    assert_eq!(
+        published("codex", &context).unwrap(),
+        json!({"timestamp":"2026-11-03T03:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5.5-codex"}})
+    );
+    assert_stable("codex", &context);
+    for model in [
+        json!(format!("Follow {AGENTS_MD} first")),
+        json!("/Users/canary/m"),
+        json!("~/models/m"),
+        json!("./m"),
+        json!("models/../m"),
+        json!("C:/Users/canary/private-model"),
+        json!("c:\\Users\\canary\\m"),
+        json!("//host/share/m"),
+        json!("\\\\host\\share\\m"),
+        json!("file:///Users/canary/m"),
+        json!("a model with spaces"),
+        json!(7),
+        json!("x".repeat(101)),
+    ] {
+        let context = codex("turn_context", json!({"cwd":"/work","model":model}));
+        assert_eq!(published("codex", &context), None, "{model}");
+    }
+}
+
+/// A tool output a Codex-shaped result writes as `input_text` or `output_text` parts is text:
+/// published through the same block rule, so an environment block inside it is stripped. An
+/// `input_image` part, which can name a local file, is not.
+#[test]
+fn codex_text_parts_of_a_tool_result_are_published_as_text() {
+    let record = json!({"type":"user","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"toolu_1","content":[
+            {"type":"output_text","text":format!(
+                "build passed\n<environment_context>\n<cwd>/home/person/{AGENTS_MD}</cwd>\n</environment_context>")},
+            {"type":"input_text","text":"see log"},
+            {"type":"input_image","image_url":"file:///Users/canary/screen.png"}]}]}});
+    let kept = published("claude-code", &record).unwrap();
+    assert_eq!(
+        kept["message"]["content"][0]["content"],
+        json!([{"type":"output_text","text":"build passed"},{"type":"input_text","text":"see log"}])
+    );
+    assert!(!kept.to_string().contains(AGENTS_MD));
+    assert!(!kept.to_string().contains("canary"));
+    assert_stable("claude-code", &record);
+}
