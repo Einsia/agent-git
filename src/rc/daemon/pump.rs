@@ -891,6 +891,7 @@ impl Daemon {
                     last_seq: self.journal.last_seq(&l.info.session_id),
                 })
                 .collect(),
+            cloud: crate::rc::cloud::state::lines(),
         }
     }
 

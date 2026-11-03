@@ -33,7 +33,13 @@ of tunnel transport.
 
 Use `agit rc start --detach` to run in the background. Local and SSH access stay available
 while Cloud registration or networking retries. Inspect `agit rc status` and the printed
-private daemon log when a device is not online. `agit rc stop` stops that daemon and its sessions.
+private daemon log when a device is not online.
+
+`agit rc start --here` does the same against the Hub you signed in to, then waits up to 30 s
+until this computer is online there. It prints one line: "Online on <hub>" with the next step,
+or which Hub it is online on instead ("online on <other>, not on <hub>"). It refuses an
+`AGIT_HUB_URL` that names another Hub than the signed-in one, and it publishes nothing.
+`agit rc status` shows each Hub's Cloud state. `agit rc stop` stops that daemon and its sessions.
 
 `agit rc local start --detach` is the outgoing controller startup used by Desktop. It does
 not enable inbound Cloud access. `agit rc cloud inbound --hub <origin> --enabled false`

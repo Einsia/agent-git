@@ -8,6 +8,7 @@ pub mod ingress;
 mod publication;
 pub(crate) mod refusal;
 pub mod resources;
+pub(crate) mod state;
 pub mod store;
 pub use commands::{Args, run};
 
