@@ -105,6 +105,13 @@ pub fn check_audit_environment() -> crate::Result<()> {
     audited_push::check_environment(std::env::vars_os())
 }
 
+/// The entry point of `agit __push-automatic`, which background spawners run through
+/// [`super::auto_push::automatic_push`]: the one place that marks a publication automatic.
+pub fn run_automatic(args: Args) -> CmdResult {
+    super::auto_push::mark_automatic();
+    run(args)
+}
+
 pub fn run(mut args: Args) -> CmdResult {
     if args.audit && !ui::prompt::can_ask() {
         ui::error(
@@ -122,7 +129,7 @@ pub fn run(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Precondition);
     }
     if args.to_hub.is_some()
-        && (std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some()
+        && (crate::commands::auto_push::is_automatic()
             || std::env::var_os(identity::EXPECTED_AGENT_ID_ENV).is_some()
             || std::env::var_os(crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV).is_some())
     {
@@ -334,6 +341,21 @@ pub fn run(mut args: Args) -> CmdResult {
             }
         }
     }
+    // A session its folder left out goes only where a push names its branch.
+    if !asked_explicitly {
+        publishable.retain(|branch| {
+            let left_out =
+                super::project::folder_refuses_upload(&repo, &checkout.slug(), branch, false)
+                    .unwrap_or(true);
+            if left_out {
+                ui::info(format_args!(
+                    "{}",
+                    ui::dim(&format!("  skipping {branch} (its folder left it out)"))
+                ));
+            }
+            !left_out
+        });
+    }
     let mut branches = publishable;
     if let Some(unchanged) =
         acknowledged_unchanged(&args, &repo, &client, &branches, asked_explicitly)
@@ -450,7 +472,7 @@ fn acknowledged_unchanged(
         return None;
     }
     if named
-        && std::env::var_os(super::auto_push::AUTOMATIC_ENV).is_none()
+        && !super::auto_push::is_automatic()
         && !crate::domain::privacy_git::withheld_refs(repo, &identity)
             .ok()?
             .is_empty()

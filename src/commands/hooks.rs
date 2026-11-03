@@ -641,6 +641,11 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     let bound = origin
         .map(|d| workspace::read(d).is_some() || super::project::registration_scope(d))
         .unwrap_or(false);
+    // Codex running this conversation's hook is what `agit on` waits for before anything else
+    // saves it.
+    if rt == "codex" && bound {
+        super::project::codex_hooks_seen(&ev.session_id);
+    }
     if rt == "codex" && ev.source != Source::Compact {
         let _ = crate::rc::runtime_sources::Registry::open()
             .and_then(|registry| registry.enroll_default());

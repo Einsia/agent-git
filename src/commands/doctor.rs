@@ -136,6 +136,22 @@ pub fn run(args: Args) -> CmdResult {
         checks.push(runtime_row(ad.as_ref()));
     }
     checks.push(setup_row());
+    checks.push((
+        "kept-back uploads".into(),
+        match super::project::kept_back_uploads() {
+            Ok(uploads) if uploads.is_empty() => {
+                Check::Ok("no session on the Hub that its folder keeps back".into())
+            }
+            Ok(uploads) => Check::Ok(
+                uploads
+                    .iter()
+                    .map(super::project::KeptBackUpload::describe)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            Err(error) => Check::Warn(format!("cannot read local session records: {error:#}")),
+        },
+    ));
 
     // ── Skill installation ──
     // The Skill is not part of the session store; it has its own per-runtime home and version. A

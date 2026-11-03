@@ -3770,6 +3770,16 @@ impl Session {
         let Some(thread_id) = self.driver.runtime_thread_id() else {
             return deferred_command;
         };
+        // A conversation the folder it runs in keeps back gets no branch, commit or upload from
+        // RC, whoever drives it.
+        if !crate::rc::capture::consented(
+            &self.cwd,
+            &self.info.runtime,
+            &thread_id,
+            self.info.project_id.is_some(),
+        ) {
+            return deferred_command;
+        }
         if self.landed_thread.as_deref() != Some(thread_id.as_str()) {
             self.announce_binding().await;
         }
@@ -3887,8 +3897,8 @@ impl Session {
             result_file,
             prepared_file,
         };
-        let mut push = command(&["push", &agit_session_env]);
-        crate::commands::auto_push::configure(push.as_std_mut());
+        let mut push = command(&[]);
+        crate::commands::auto_push::automatic_push(push.as_std_mut(), &agit_session_env);
         let context = settlement_io::LocalSettlementContext {
             lease,
             receipt_path,

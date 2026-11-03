@@ -89,6 +89,12 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(notice) = super::project::worktree_notice(&cwd) {
         println!("  {notice}");
     }
+    // Told once: branches already on the Hub that the folder they ran in keeps back.
+    if let Ok(uploads) = super::project::kept_back_uploads_to_tell() {
+        for upload in uploads {
+            println!("  {}", upload.describe());
+        }
+    }
     if let Some(count) = worktree_left_out(&cwd).filter(|count| *count > 0) {
         println!(
             "  {count} earlier session{} here {} not uploaded; to upload {} too: `agit save --all`",

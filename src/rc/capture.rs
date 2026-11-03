@@ -59,6 +59,25 @@ impl RepositoryKind {
     }
 }
 
+/// Whether RC may save and upload the conversation `native` of `runtime`, running or watched at
+/// `cwd`, without the person asking. The agit folder governing `cwd` decides (see
+/// [`crate::commands::project::folder_decision`]). With no such folder, the RC workspace project
+/// the conversation runs in is the consent: `bound` when the caller knows it was started in one,
+/// otherwise a project this computer's workspaces bind around `cwd`. Anywhere else, nothing is
+/// saved.
+pub(crate) fn consented(cwd: &std::path::Path, runtime: &str, native: &str, bound: bool) -> bool {
+    match crate::commands::project::folder_decision(cwd, runtime, native) {
+        Some(decided) => decided,
+        None => {
+            bound
+                || crate::rc::mirror::Mirror::load()
+                    .all_roots()
+                    .iter()
+                    .any(|root| cwd.starts_with(root))
+        }
+    }
+}
+
 pub(crate) fn require(lineage: &AgitSession) -> Result<Repo> {
     require_by(lineage, Authority::Process)
 }
@@ -551,5 +570,71 @@ mod tests {
             local.capture,
             Some(RepositoryKind::DeviceLocal { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    /// Pins that the drop rule is advertised only by a build whose every background save checks
+    /// it: watching (take-in and each collection), a turn RC drives (its archive and its landing),
+    /// and recovery of a queued turn. The rule itself: the folder decides, a project an RC
+    /// workspace binds is the consent where no folder speaks, and nothing else is.
+    #[test]
+    fn the_drop_rule_is_advertised_only_with_every_gate_checking_it() {
+        if crate::rc::in_isolated_test(
+            "rc::capture::consent_tests::the_drop_rule_is_advertised_only_with_every_gate_checking_it",
+        ) {
+            return;
+        }
+        let advertised = crate::rc::build_identity::DaemonIdentity::current().unwrap();
+        assert!(
+            advertised
+                .rpc_features
+                .iter()
+                .any(|feature| feature == "observed-capture-consent-v1")
+        );
+        let source = |file: &str| {
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+                .unwrap()
+        };
+        for (file, check, gates) in [
+            ("src/rc/daemon/observed_capture.rs", "!capture_allowed(", 2),
+            (
+                "src/rc/supervisor/mod.rs",
+                "!crate::rc::capture::consented(",
+                1,
+            ),
+            (
+                "src/rc/supervisor/archive_recovery.rs",
+                "!crate::rc::capture::consented(",
+                2,
+            ),
+        ] {
+            assert_eq!(source(file).matches(check).count(), gates, "{file}");
+        }
+        assert!(
+            source("src/rc/daemon/observed_capture.rs")
+                .contains("crate::commands::project::folder_decision(root, runtime, native)")
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        let folder = home.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let elsewhere = elsewhere.canonicalize().unwrap();
+        crate::commands::project::policy_for_test(&folder, true, true, &[("codex", "dropped")]);
+        assert!(super::consented(&folder, "codex", "kept", false));
+        assert!(!super::consented(&folder, "codex", "dropped", true));
+        crate::commands::project::policy_for_test(&folder, true, false, &[]);
+        assert!(!super::consented(&folder, "codex", "kept", true));
+        crate::commands::project::policy_for_test(&folder, false, true, &[]);
+        assert!(!super::consented(&folder, "codex", "kept", true));
+        assert!(!super::consented(&elsewhere, "codex", "kept", false));
+        assert!(super::consented(&elsewhere, "codex", "kept", true));
     }
 }

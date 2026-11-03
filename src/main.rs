@@ -553,6 +553,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Revert(a) => commands::revert::run(a),
 
         Commands::Push(a) => commands::push::run(a),
+        Commands::PushAutomatic(a) => commands::push::run_automatic(a),
         Commands::Fetch(a) => commands::fetch::run(a),
         Commands::Pull(a) => commands::pull::run(a),
         Commands::Remote(a) => commands::remote::run(a),

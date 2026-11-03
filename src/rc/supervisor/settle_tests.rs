@@ -463,6 +463,121 @@ fn archived_turns_end_where_the_completed_only_cut_ends() {
     });
 }
 
+/// A turn RC drives in a conversation the folder it runs in left out (an attach_only join of a
+/// dropped terminal conversation, a resume, a takeover) is neither queued for saving nor landed,
+/// committed or pushed. The same turn, once the folder keeps the conversation, is queued.
+#[cfg(unix)]
+#[test]
+fn a_turn_in_a_conversation_its_folder_left_out_is_not_saved() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::settle_tests::a_turn_in_a_conversation_its_folder_left_out_is_not_saved",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path());
+    }
+    crate::rc::select_local_authority();
+    let folder = home.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    let line = |value: serde_json::Value| format!("{value}\n");
+    let finished =
+        line(serde_json::json!({"type": "user", "message": {"role": "user", "content": "first"}}))
+            + &line(serde_json::json!({"type": "assistant", "message": {
+                "model": "claude-haiku-5-5", "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            }}));
+    let transcript = home.path().join("native.jsonl");
+    std::fs::write(&transcript, &finished).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _context = runtime.enter();
+    let (mut session, _out, _notes) = super::tests::harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
+        )),
+        "claude-code",
+        SessionStatus::Idle,
+    );
+    let (_lease, settlement) = tokio::sync::watch::channel(SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    });
+    session.settlement = settlement;
+    session.agit_session = Some(
+        crate::rc::lineage::AgitSession::new(
+            "alice/photo",
+            "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+            "s/settlement",
+        )
+        .unwrap(),
+    );
+    session.settlement_child = Some(SettlementChild {
+        exe: "/usr/bin/true".into(),
+        repo_dir: home.path().into(),
+    });
+    session.cwd = folder.clone();
+    session.tailer = Some(Tailer::new(&transcript, false));
+    let thread = session.driver.runtime_thread_id().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        // The RC workspace binds the folder too; the folder's own word decides.
+        let mut mirror = crate::rc::mirror::Mirror::load();
+        mirror.bind("workspace", "project", &folder).unwrap();
+        mirror.save().unwrap();
+        crate::commands::project::policy_for_test(
+            &folder,
+            true,
+            true,
+            &[("claude-code", thread.as_str())],
+        );
+        session
+            .retain_completed_archive(
+                &uuid::Uuid::new_v4().to_string(),
+                super::archive_recovery::TurnEnding::Completed,
+            )
+            .unwrap();
+        assert!(
+            crate::rc::archive_jobs::pending().unwrap().is_empty(),
+            "nothing is queued"
+        );
+        runtime.block_on(session.settle_and_push(SettlementBoundary::Turn));
+        assert!(session.landed_thread.is_none(), "nothing is landed");
+
+        crate::commands::project::policy_for_test(&folder, true, true, &[]);
+        session
+            .retain_completed_archive(
+                &uuid::Uuid::new_v4().to_string(),
+                super::archive_recovery::TurnEnding::Completed,
+            )
+            .unwrap();
+        assert_eq!(crate::rc::archive_jobs::pending().unwrap().len(), 1);
+
+        // Where neither a folder nor an RC workspace speaks for the conversation, nothing is
+        // queued.
+        let unbound = home.path().join("unbound");
+        std::fs::create_dir(&unbound).unwrap();
+        session.cwd = unbound.canonicalize().unwrap();
+        session.info.project_id = None;
+        std::fs::write(&transcript, finished.repeat(2)).unwrap();
+        session.tailer = Some(Tailer::new(&transcript, false));
+        session
+            .retain_completed_archive(
+                &uuid::Uuid::new_v4().to_string(),
+                super::archive_recovery::TurnEnding::Completed,
+            )
+            .unwrap();
+        let jobs = crate::rc::archive_jobs::pending().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].cwd, folder, "the unbound turn queued nothing");
+    });
+}
+
 /// The other half of what `settle_on_exit` owes: lines written into the transcript after the
 /// last turn boundary still become `item.completed` at session end, rather than being lost
 /// forever because no further `turn.completed` arrives.
@@ -886,7 +1001,7 @@ impl SettlementFixture {
                 "#!/bin/sh\nset -e\nexport GIT_CONFIG_NOSYSTEM=1\n\
                      export GIT_CONFIG_GLOBAL=/dev/null\nexport GIT_TERMINAL_PROMPT=0\n\
                      case \"$1\" in\ncommit)\n{commit_body}  ;;\n\
-                     push)\n{push_body}  ;;\n\
+                     __push-automatic|push)\n{push_body}  ;;\n\
                      esac\nexit 0\n",
             ),
         )
@@ -1303,7 +1418,7 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 .find(|entry| entry.publication.is_none())
                 .unwrap();
             let commit_start = script.find("commit)\n").unwrap();
-            let push_start = script.find("push)\n").unwrap();
+            let push_start = script.find("__push-automatic|push)\n").unwrap();
             let retry_script = format!(
                 "{}commit)\n :\n ;;\n{}",
                 &script[..commit_start],
@@ -1550,7 +1665,7 @@ async fn unconfirmed_publication_keeps_the_source_pending_without_notification()
         let script = std::fs::read_to_string(&fixture.exe).unwrap();
         let modified = match refusal {
             "missing-result" => script.replace("push)\n", "push)\n    exit 0\n"),
-            "failed-process" => script.replace("esac\nexit 0", "esac\nif [ \"$1\" = push ]; then exit 7; fi\nexit 0"),
+            "failed-process" => script.replace("esac\nexit 0", "esac\nif [ \"$1\" = __push-automatic ]; then exit 7; fi\nexit 0"),
             "wrong-source" => script.replace("\"source\":\"__SOURCE__\"", &format!("\"source\":\"{}\"", "f".repeat(40))),
             "stale-request" => script.replace("    printf '{\"request\":%s", "    request=$(printf '%s' \"$request\" | sed 's/\"request_id\":\"[^\"]*\"/\"request_id\":\"00000000-0000-0000-0000-000000000000\"/')\n    printf '{\"request\":%s"),
             _ => unreachable!(),

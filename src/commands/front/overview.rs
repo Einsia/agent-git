@@ -159,7 +159,7 @@ pub fn run() -> CmdResult {
             }
             if codex_untrusted {
                 println!(
-                    "  {} in Codex, open /hooks and trust both AgentGit hooks; until then its turns upload when you run `agit` or `agit save`",
+                    "  {} in Codex, open /hooks and trust both AgentGit hooks; until then nothing from Codex is saved here; to upload one session: `agit save SESSION-ID`",
                     ui::warn_text("Codex has not run AgentGit's save hook:")
                 );
             }

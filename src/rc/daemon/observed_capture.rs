@@ -385,6 +385,16 @@ fn capture_boundary(
     }))
 }
 
+/// Whether the conversation `native` of `runtime`, running in `root` inside a project an RC
+/// workspace binds, may be saved and uploaded without the person asking: as the agit folder
+/// governing `root` decides,
+/// else by that binding (see [`crate::rc::capture::consented`]), and for Codex only once AgentGit
+/// saw a hook of that very conversation.
+fn capture_allowed(runtime: &str, root: &std::path::Path, native: &str) -> bool {
+    crate::commands::project::folder_decision(root, runtime, native).unwrap_or(true)
+        && (runtime != "codex" || crate::commands::project::codex_capture_allowed(root, native))
+}
+
 impl Daemon {
     fn reserve_observed_capture(
         &mut self,
@@ -397,7 +407,7 @@ impl Daemon {
         let project_id = entry.project_id.as_ref()?;
         let project = self.mirror.project_path(&entry.workspace_id, project_id)?;
         let cwd = PathBuf::from(&entry.cwd);
-        if !cwd.starts_with(&project) {
+        if !cwd.starts_with(&project) || !capture_allowed(&entry.runtime, &cwd, &entry.thread_id) {
             return None;
         }
         let conflicts = |runtime: &str,
@@ -474,13 +484,19 @@ impl Daemon {
             .project_path(&info.workspace_id, project)
             .context("Observed project is no longer bound")?;
         ensure!(
-            cwd.starts_with(root),
+            cwd.starts_with(&root),
             "Observed session is outside its project"
         );
         let native = info
             .runtime_session_id
             .as_deref()
             .context("Observed native identity is missing")?;
+        // A conversation the folder leaves out, or a Codex one whose own hooks never ran, is not
+        // saved in the background: watching it doesn't change that, and it stays on this
+        // computer until the person saves it.
+        if !capture_allowed(&info.runtime, cwd, native) {
+            return Ok(None);
+        }
         let logical = self
             .roster
             .logical_for_thread_in(
@@ -705,6 +721,217 @@ mod tests {
         Guard(Some(run))
     }
 
+    /// A Codex conversation watched from the Hub is taken in and collected only when AgentGit saw a
+    /// hook of that very conversation. Hooks that ran for one conversation in the folder, then
+    /// stopped being trusted, don't let a later one in: it stays on this computer.
+    #[test]
+    fn a_codex_conversation_is_taken_in_only_once_its_own_hooks_ran() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::observed_capture::tests::a_codex_conversation_is_taken_in_only_once_its_own_hooks_ran",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let project = root.path().canonicalize().unwrap();
+            let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.lock().await;
+            state.opts.local_owner = true;
+            state
+                .settlement
+                .send_modify(|authority| authority.local_owner = true);
+            state
+                .mirror
+                .bind(crate::rc::endpoint::WORKSPACE, "project", &project)
+                .unwrap();
+            let watched = |name: &str, native: &str| {
+                let (tx, _rx) = mpsc::channel(1);
+                let mut live = super::super::tests::rpc_test_live(
+                    name,
+                    1,
+                    tx,
+                    crate::protocol::PermissionMode::Default,
+                );
+                assert_eq!(live.info.runtime, "codex");
+                live.info.workspace_id = crate::rc::endpoint::WORKSPACE.into();
+                live.info.project_id = Some("project".into());
+                live.info.runtime_session_id = Some(native.into());
+                live.runtime_thread_id = Some(native.into());
+                live
+            };
+            let hooked = watched("hooked", "hooked-native");
+            let unhooked = watched("unhooked", "unhooked-native");
+            for live in [&hooked, &unhooked] {
+                assert!(
+                    state
+                        .retain_observed_capture(&live.info, &project)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(state.roster.observed.is_empty(), "nothing is taken in");
+
+            // The first conversation's hooks run; then the person untrusts them, and the second
+            // runs without.
+            crate::commands::project::codex_hooks_seen("hooked-native");
+            assert!(
+                state
+                    .retain_observed_capture(&unhooked.info, &project)
+                    .unwrap()
+                    .is_none(),
+                "a conversation whose own hooks never ran stays out"
+            );
+            let taken = state
+                .retain_observed_capture(&hooked.info, &project)
+                .unwrap()
+                .expect("taken in once its own hooks ran");
+            assert_eq!(state.roster.observed.len(), 1);
+            assert!(state.roster.observed.contains(&taken.session_id));
+            assert!(state.reserve_observed_capture(&taken.session_id).is_some());
+            state.opening_sessions.remove(&taken.session_id);
+
+            // Without the record of its hooks, a conversation already taken in is not collected.
+            std::fs::remove_file(
+                root.path()
+                    .join("agit/hooks-seen/codex-sessions/hooked-native"),
+            )
+            .unwrap();
+            assert!(
+                state.reserve_observed_capture(&taken.session_id).is_none(),
+                "not collected without its own hooks"
+            );
+        });
+    }
+
+    /// A watched conversation the folder's policy leaves out is neither taken in nor collected:
+    /// one the person dropped, and any while the folder doesn't upload by itself or is off.
+    /// Watching it from the Hub never lifts that.
+    #[test]
+    fn a_watched_conversation_the_folder_leaves_out_is_not_taken_in() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::observed_capture::tests::a_watched_conversation_the_folder_leaves_out_is_not_taken_in",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let project = root.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.lock().await;
+            state.opts.local_owner = true;
+            state
+                .settlement
+                .send_modify(|authority| authority.local_owner = true);
+            state
+                .mirror
+                .bind(crate::rc::endpoint::WORKSPACE, "project", &project)
+                .unwrap();
+            let watched = |name: &str, native: &str| {
+                let (tx, _rx) = mpsc::channel(1);
+                let mut live = super::super::tests::rpc_test_live(
+                    name,
+                    1,
+                    tx,
+                    crate::protocol::PermissionMode::Default,
+                );
+                live.info.workspace_id = crate::rc::endpoint::WORKSPACE.into();
+                live.info.project_id = Some("project".into());
+                live.info.runtime_session_id = Some(native.into());
+                live.runtime_thread_id = Some(native.into());
+                crate::commands::project::codex_hooks_seen(native);
+                live
+            };
+            let runtime = watched("probe", "probe-native").info.runtime;
+            let kept = watched("kept", "kept-native");
+            let dropped = watched("dropped", "dropped-native");
+            crate::commands::project::policy_for_test(
+                &project,
+                true,
+                true,
+                &[(runtime.as_str(), "dropped-native")],
+            );
+            assert!(
+                state
+                    .retain_observed_capture(&dropped.info, &project)
+                    .unwrap()
+                    .is_none(),
+                "a dropped conversation is not taken in"
+            );
+            let taken = state
+                .retain_observed_capture(&kept.info, &project)
+                .unwrap()
+                .expect("a conversation the folder keeps is taken in");
+            assert_eq!(state.roster.observed.len(), 1);
+            assert!(state.reserve_observed_capture(&taken.session_id).is_some());
+            state.opening_sessions.remove(&taken.session_id);
+
+            // Dropped after it was taken in, it is not collected.
+            crate::commands::project::policy_for_test(
+                &project,
+                true,
+                true,
+                &[
+                    (runtime.as_str(), "dropped-native"),
+                    (runtime.as_str(), "kept-native"),
+                ],
+            );
+            assert!(
+                state.reserve_observed_capture(&taken.session_id).is_none(),
+                "a conversation dropped after it was taken in is not collected"
+            );
+
+            // A subfolder with its own setting decides for the conversations that run in it.
+            let sub = project.join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            crate::commands::project::policy_for_test(
+                &sub,
+                true,
+                true,
+                &[(runtime.as_str(), "sub-native")],
+            );
+            let in_sub = watched("in-sub", "sub-native");
+            assert!(
+                state
+                    .retain_observed_capture(&in_sub.info, &sub)
+                    .unwrap()
+                    .is_none(),
+                "the subfolder's own setting keeps it out"
+            );
+
+            // A folder that doesn't upload by itself, or is off, keeps every conversation out.
+            for (enabled, auto_upload) in [(true, false), (false, true)] {
+                crate::commands::project::policy_for_test(&project, enabled, auto_upload, &[]);
+                let later = watched("later", "later-native");
+                assert!(
+                    state
+                        .retain_observed_capture(&later.info, &project)
+                        .unwrap()
+                        .is_none(),
+                    "taken in from a folder with enabled {enabled}, auto_upload {auto_upload}"
+                );
+                assert!(state.reserve_observed_capture(&taken.session_id).is_none());
+            }
+        });
+    }
+
     #[test]
     fn observed_identity_survives_viewers_and_respects_native_writer_and_project_fences() {
         if crate::rc::in_isolated_test(
@@ -722,6 +949,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
+            crate::commands::project::codex_hooks_seen("native");
             let project = root.path().canonicalize().unwrap();
             let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
             let mut state = daemon.lock().await;
