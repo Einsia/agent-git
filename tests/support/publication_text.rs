@@ -77,10 +77,6 @@ pub fn assert_public(public: &Value, workspace: &Path) {
         "PRIVATE_MCP_RESULT",
         "PUBLIC_MESSAGE",
         "MIXED_IMAGE_BODY",
-        "PRIVATE_FILE_BODY",
-        "PRIVATE_DOCUMENT_BODY",
-        "PRIVATE_AUDIO_BODY",
-        "ATTACHMENT_SKILL_BODY",
         "MIXED_TEXT_BEFORE",
         "MIXED_TEXT_AFTER",
         "NESTED_TEXT",
@@ -96,8 +92,15 @@ pub fn assert_public(public: &Value, workspace: &Path) {
         "RAW_BLOCK",
         "UNKNOWN_BLOCK",
         "ATTACHMENT_SIBLING_TEXT",
+        "ATTACHMENT_SKILL_BODY",
         "NESTED_IMAGE_BODY",
         "UNTYPED_ATTACHMENT_BODY",
+        // A tool result's parts are published only as text or images.
+        "PRIVATE_FILE_BODY",
+        "PRIVATE_DOCUMENT_BODY",
+        "PRIVATE_AUDIO_BODY",
+        "FILE_LIST",
+        "SCALAR_ARRAY",
         workspace.to_str().unwrap(),
     ] {
         assert!(!text.contains(marker), "private content escaped: {marker}");
@@ -127,17 +130,6 @@ pub fn assert_public(public: &Value, workspace: &Path) {
             "status":200,"mime_type":"application/json","body":{"message":"HTTP_JSON_METADATA","nested":nested},
             "headers":{"mimeType":"application/json","media_type":"text/plain"}
         })
-    );
-    assert_eq!(
-        result("FILE_LIST"),
-        json!([
-            {"type":"file","name":"FILE_LIST","path":"<workspace>/src/main.rs","secret":"MASKED_VALUE"},
-            {"type":"directory","name":"src","size":0}
-        ])
-    );
-    assert_eq!(
-        result("SCALAR_ARRAY"),
-        json!(["SCALAR_ARRAY", 7, true, null, nested, ["MASKED_VALUE"]])
     );
     if let Some(report) = public.get("report") {
         let omissions = report["omissions"].as_array().unwrap();

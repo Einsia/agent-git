@@ -85,27 +85,56 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
     }
     let omitted = selected.len().saturating_sub(limit);
     selected.truncate(limit);
+    // A session published as a projection has a Hub tip of its own id. A branch on that public
+    // history (the tip, an ancestor or a descendant of it) is compared with the tip; any other
+    // branch with the local commit the tip publishes.
+    let candidates: Vec<Option<(String, Option<String>)>> = selected
+        .iter()
+        .map(|(name, _, tracking, fixed_state)| {
+            let remote = before.get(tracking).filter(|_| fixed_state.is_none())?;
+            let source = (*tracking == format!("refs/remotes/origin/{name}"))
+                .then(|| crate::domain::privacy_git::projected_source(&repo, name, &remote.sha))
+                .flatten();
+            Some((remote.sha.clone(), source))
+        })
+        .collect();
     let mut tips = BTreeSet::new();
-    for (_, head, tracking, fixed_state) in &selected {
-        if fixed_state.is_none()
-            && let Some(remote) = before.get(tracking)
-            && remote.sha != *head
+    for ((_, head, _, _), candidate) in selected.iter().zip(&candidates) {
+        if let Some((remote, source)) = candidate
+            && remote != head
         {
             tips.insert(head.clone());
-            tips.insert(remote.sha.clone());
+            tips.insert(remote.clone());
+            tips.extend(source.clone());
         }
     }
     let graph = ancestry(&repo, &tips);
+    let compared: Vec<Option<String>> = selected
+        .iter()
+        .zip(candidates)
+        .map(|((_, head, _, _), candidate)| {
+            let (remote, source) = candidate?;
+            let on_public_history = *head == remote
+                || graph.as_ref().is_ok_and(|graph| {
+                    reachable(graph, head).contains(remote.as_str())
+                        || reachable(graph, &remote).contains(head.as_str())
+                });
+            Some(match source {
+                Some(source) if !on_public_history => source,
+                _ => remote,
+            })
+        })
+        .collect();
     let mut rows = Vec::new();
-    for (name, head, tracking, fixed_state) in selected {
+    for ((name, head, tracking, fixed_state), remote) in selected.into_iter().zip(compared) {
         let mut ahead_count = None;
         let mut behind_count = None;
         let state = if let Some(state) = fixed_state {
             state
         } else if tracking.is_empty() {
             "no known tracking ref".to_owned()
-        } else if let Some(remote) = before.get(&tracking) {
-            if head == remote.sha {
+        } else if let Some(remote) = remote {
+            if head == remote {
                 ahead_count = Some(0);
                 behind_count = Some(0);
                 "in sync (ahead 0, behind 0)".to_owned()
@@ -113,7 +142,7 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
                 match &graph {
                     Ok(graph) => {
                         let local = reachable(graph, &head);
-                        let upstream = reachable(graph, &remote.sha);
+                        let upstream = reachable(graph, &remote);
                         let ahead = local.difference(&upstream).count();
                         let behind = upstream.difference(&local).count();
                         ahead_count = Some(ahead);

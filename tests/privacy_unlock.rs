@@ -1099,7 +1099,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         .unwrap();
     let new_turn = if runtime == "codex" {
         vec![
-            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new private turn"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new private turn"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new private reply"}]}}),
         ]
     } else {

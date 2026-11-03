@@ -202,6 +202,43 @@ impl ProjectedHistory {
     }
 }
 
+/// Whether the Hub's copy of `branch`, as this checkout last fetched it, is this checkout's head:
+/// the same commit, or the public commit the Hub accepted for it when publication carried a
+/// projection of it.
+pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
+    let tip = |reference: String| repo.git_opt(&["rev-parse", "--verify", "--quiet", &reference]);
+    let local = tip(format!("refs/heads/{branch}"));
+    let remote = tip(format!("refs/remotes/origin/{branch}"));
+    if local == remote {
+        return true;
+    }
+    let (Some(local), Some(remote)) = (local, remote) else {
+        return false;
+    };
+    let Ok(Some(identity)) = crate::hub::identity::read(repo) else {
+        return false;
+    };
+    accepted::Ledger::open(repo, &identity)
+        .ok()
+        .and_then(|ledger| {
+            ledger
+                .get(branch, &local)
+                .map(|entry| entry.public == remote)
+        })
+        .unwrap_or(false)
+}
+
+/// The local commit that the Hub's `public` commit on `branch` is the published projection of,
+/// from the accepted publication record. `None` when `public` is no projection of a local commit.
+pub fn projected_source(repo: &Repo, branch: &str, public: &str) -> Option<String> {
+    let identity = crate::hub::identity::read(repo).ok()??;
+    accepted::Ledger::open(repo, &identity)
+        .ok()?
+        .accepted(branch)
+        .find(|entry| entry.public == public && entry.source != entry.public)
+        .map(|entry| entry.source.clone())
+}
+
 /// Destination refs publications to `identity` leave out because the Hub refused them as
 /// withdrawn (see `accepted::Ledger::withheld`).
 pub(crate) fn withheld_refs(

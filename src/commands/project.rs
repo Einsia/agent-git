@@ -1920,12 +1920,49 @@ pub(crate) fn changed_since_upload(runtime: &str, session_id: &str, cwd: &Path) 
     let Some(&uploaded) = caught(&project.root).get(&key(runtime, session_id)) else {
         return false;
     };
-    let modified = adapter::get(runtime)
+    let length = caught_lengths(&project.root)
+        .get(&key(runtime, session_id))
+        .copied();
+    adapter::get(runtime)
         .ok()
         .and_then(|adapter| adapter.resolve_present(session_id, Some(cwd)))
-        .and_then(|path| fs::metadata(path).ok()?.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok());
-    modified.is_some_and(|modified| modified.as_secs() != uploaded)
+        .is_some_and(|path| changed_after(runtime, &path, uploaded, length))
+}
+
+/// Whether the transcript at `path` gained more than the runtime's own bookkeeping after the
+/// upload that saw it at `modified` and `length` bytes. A runtime writes such records after a
+/// turn's Stop hook has uploaded it (hook and duration summaries), and they are not a turn.
+fn changed_after(runtime: &str, path: &Path, modified: u64, length: Option<u64>) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let now = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_secs());
+    if now == Some(modified) {
+        return false;
+    }
+    let Some(length) = length.filter(|length| *length <= metadata.len()) else {
+        return true;
+    };
+    let (Ok(adapter), Ok(mut file)) = (adapter::get(runtime), fs::File::open(path)) else {
+        return true;
+    };
+    let mut added = String::new();
+    if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(length)).is_err()
+        || std::io::Read::read_to_string(&mut file, &mut added).is_err()
+    {
+        return true;
+    }
+    !added
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| adapter.is_runtime_bookkeeping(&record))
+        })
 }
 
 /// Whether the project policy deciding for the folder at `root` was turned off (`agit off`,
@@ -2483,6 +2520,7 @@ fn capture_candidate(
         return Ok(false);
     }
     let modified = transcript_modified(&candidate);
+    let length = transcript_length(&candidate);
     let result = sync_one(&project, &candidate, automatic);
     if result
         .as_ref()
@@ -2494,6 +2532,9 @@ fn capture_candidate(
         && let Some(modified) = modified
     {
         let _ = record_caught(&project.root, &candidate, modified);
+        if let Some(length) = length {
+            let _ = record_caught_length(&project.root, &candidate, length);
+        }
     }
     let reason = result
         .as_ref()
@@ -3562,6 +3603,25 @@ fn caught(root: &Path) -> std::collections::BTreeMap<String, u64> {
         .unwrap_or_default()
 }
 
+/// The transcript's length in bytes at the same upload, so what was added after it can be read.
+fn caught_lengths(root: &Path) -> std::collections::BTreeMap<String, u64> {
+    caught_path(root)
+        .ok()
+        .and_then(|path| fs::read(path.with_extension("caught-length")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn record_caught_length(root: &Path, candidate: &Candidate, length: u64) -> Result<()> {
+    let mut map = caught_lengths(root);
+    map.insert(key(&candidate.runtime, &candidate.session_id), length);
+    let mut file = tempfile::NamedTempFile::new_in(home()?)?;
+    file.write_all(&serde_json::to_vec(&map)?)?;
+    file.persist(caught_path(root)?.with_extension("caught-length"))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
 fn record_caught(root: &Path, candidate: &Candidate, modified: u64) -> Result<()> {
     let mut map = caught(root);
     map.insert(key(&candidate.runtime, &candidate.session_id), modified);
@@ -3569,6 +3629,12 @@ fn record_caught(root: &Path, candidate: &Candidate, modified: u64) -> Result<()
     file.write_all(&serde_json::to_vec(&map)?)?;
     file.persist(caught_path(root)?).map_err(|e| e.error)?;
     Ok(())
+}
+
+fn transcript_length(candidate: &Candidate) -> Option<u64> {
+    let adapter = adapter::get(&candidate.runtime).ok()?;
+    let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
+    Some(fs::metadata(path).ok()?.len())
 }
 
 fn transcript_modified(candidate: &Candidate) -> Option<u64> {
@@ -3608,10 +3674,23 @@ fn behind(
             let Ok(repo) = checkout(project) else {
                 return false;
             };
-            let tip =
-                |reference: String| repo.git_opt(&["rev-parse", "--verify", "--quiet", &reference]);
-            tip(format!("refs/heads/{branch}")) != tip(format!("refs/remotes/origin/{branch}"))
-                || transcript_modified(candidate) != caught.get(&session_key).copied()
+            !crate::domain::privacy_git::hub_holds_head(&repo, &branch)
+                || match caught.get(&session_key) {
+                    None => transcript_modified(candidate).is_some(),
+                    Some(&modified) => adapter::get(&candidate.runtime)
+                        .ok()
+                        .and_then(|adapter| {
+                            adapter.resolve(&candidate.session_id, Some(&candidate.cwd))
+                        })
+                        .is_some_and(|path| {
+                            changed_after(
+                                &candidate.runtime,
+                                &path,
+                                modified,
+                                caught_lengths(&project.root).get(&session_key).copied(),
+                            )
+                        }),
+                }
         }
         _ => false,
     }
@@ -4081,7 +4160,11 @@ fn standing(
     let saved_at = local.and_then(|(_, at)| *at);
     let head = local.map(|(commit, _)| commit);
     let pushed = last.is_some_and(|last| head.is_some() && last.uploaded.get(&session.id) == head);
-    let status = if pushed || (remote.is_some() && remote == head) {
+    let projected = remote.is_some()
+        && checkout
+            .as_ref()
+            .is_some_and(|(repo, _)| crate::domain::privacy_git::hub_holds_head(repo, branch));
+    let status = if pushed || (remote.is_some() && remote == head) || projected {
         "uploaded"
     } else if remote.is_some() {
         "waiting"
@@ -5755,7 +5838,8 @@ mod tests {
     /// A session uploaded and then continued while its Stop hook did not run (an untrusted hook,
     /// a crash) still has the branch it pushed, so a check of the branch alone calls it uploaded
     /// and a folder's `agit save` skips the new turns. Its transcript changed after the recorded
-    /// upload, so it is waiting. A session uploaded before any record counts by its branch.
+    /// upload, so it is waiting. A session uploaded before any record counts by its branch, and
+    /// the summary the runtime writes after its Stop hook uploaded the turn changes nothing.
     #[test]
     fn a_turn_the_hook_missed_is_still_waiting() {
         if !isolated("a_turn_the_hook_missed_is_still_waiting") {
@@ -5798,12 +5882,26 @@ mod tests {
             transcript_modified(&candidate).unwrap(),
         )
         .unwrap();
+        record_caught_length(
+            &project.root,
+            &candidate,
+            transcript_length(&candidate).unwrap(),
+        )
+        .unwrap();
         assert_eq!(session.upload(), Some(Upload::Uploaded));
 
+        // The runtime writes its own summary after the Stop hook uploaded the turn.
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(&transcript)
             .unwrap();
+        file.write_all(b"{\"type\":\"system\",\"subtype\":\"stop_hook_summary\"}\n")
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!changed_since_upload("claude-code", id, &project.root));
+        assert_eq!(session.upload(), Some(Upload::Uploaded));
+
         file.write_all(b"{}\n").unwrap();
         file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
             .unwrap();
