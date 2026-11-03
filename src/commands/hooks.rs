@@ -542,11 +542,18 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     let Some(title) = restored else {
         return response;
     };
-    let mut response = response.unwrap_or_else(
-        || serde_json::json!({"hookSpecificOutput": {"hookEventName": "SessionStart"}}),
-    );
+    Some(with_session_title(response, title))
+}
+
+/// `response` with Claude Code's session title set to `title`. Claude Code rejects a
+/// `hookSpecificOutput` without its `hookEventName` and drops the whole response with it, the
+/// `systemMessage` beside it included, so the event name is set whatever the response held.
+fn with_session_title(response: Option<serde_json::Value>, title: String) -> serde_json::Value {
+    let mut response = response.unwrap_or_else(|| serde_json::json!({}));
+    response["hookSpecificOutput"]["hookEventName"] =
+        serde_json::Value::String("SessionStart".into());
     response["hookSpecificOutput"]["sessionTitle"] = serde_json::Value::String(title);
-    Some(response)
+    response
 }
 
 /// The lease of the registered terminal, continuing the branch whose newest record is `leaf`.
@@ -1225,8 +1232,35 @@ fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::R
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, SignIn, Source, decide};
+    use super::{Decision, SignIn, Source, decide, with_session_title};
     use clap::Parser as _;
+
+    /// A restored title rides beside a system message. Claude Code drops a hook response whose
+    /// `hookSpecificOutput` lacks `hookEventName`, title and message together, so a session
+    /// start that already said something (a session from before the folder was on) kept its
+    /// placeholder title and lost its notice.
+    #[test]
+    fn a_restored_title_always_names_its_hook_event() {
+        for response in [
+            None,
+            Some(serde_json::json!({"systemMessage": "agit: this conversation is from before"})),
+            Some(serde_json::json!({"hookSpecificOutput": {"hookEventName": "SessionStart"}})),
+        ] {
+            let said = response.clone();
+            let out = with_session_title(response, "Add a short note".into());
+            assert_eq!(
+                out["hookSpecificOutput"]["hookEventName"], "SessionStart",
+                "{out}"
+            );
+            assert_eq!(
+                out["hookSpecificOutput"]["sessionTitle"], "Add a short note",
+                "{out}"
+            );
+            if let Some(message) = said.as_ref().and_then(|r| r["systemMessage"].as_str()) {
+                assert_eq!(out["systemMessage"], message, "{out}");
+            }
+        }
+    }
 
     /// The Stop hook reads only the transcript's end, so an unanswered record longer than that
     /// window (a pasted image, a large tool result) is cut where the read starts. A check that
