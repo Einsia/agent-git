@@ -1081,6 +1081,20 @@ fn quiet_secret_creation_preserves_identifiers_and_followup_behavior() {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0]["id"], id);
             assert_eq!(records[0]["name"], "quiet-created");
+            // Each record says what kind of value it is and who added it, never the value.
+            assert!(records[0]["kind"].is_string(), "{records:?}");
+            if repository_rule {
+                let mut text = listing.clone();
+                text.retain(|argument| *argument != "--json");
+                let shown = success(lab.run(&text));
+                let shown = String::from_utf8_lossy(&shown.stdout);
+                assert!(shown.contains("\tkind="), "{shown}");
+                assert!(shown.contains("\tfrom=added-in-repo"), "{shown}");
+                assert!(
+                    !shown.contains("SYNTHETIC-QUIET-SECRET-FOR-TESTING"),
+                    "{shown}"
+                );
+            }
             let remove = if repository_rule {
                 vec!["secrets", "block", "remove", id, "--repo", repo_path]
             } else {
