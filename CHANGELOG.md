@@ -16,7 +16,6 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - Published sessions carry the conversation itself; the runtime's setup and context records stay on this computer.
 - OpenCode, Hermes and OpenClaw sessions show no user prompts until those runtimes mark typed messages.
 - Cursor and WorkBuddy sessions show only the typed request.
-- A caption typed with a pasted image in Claude Code isn't published.
 - Published sessions show a tool result's text and images only.
 - Repositories published by this version show as diverged in agit 0.2.35 and older; update agit to see their real
   status.
