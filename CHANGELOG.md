@@ -8,6 +8,22 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.37] - 2026-11-04
+
+### Added
+
+- `agit rc start --here` waits until this computer is online on the Hub you signed in to and says which Hub it is online
+  on if not; `agit rc status` shows each Hub's Cloud connection.
+- `agit doctor` names the background service's log, which now records each turn's start and outcome, session shutdowns
+  and the runtime's start and exit, by ids and timings only.
+
+### Fixed
+
+- An old conversation larger than 32 MiB uploads again; since 0.2.36 its first upload failed.
+- A Claude Code conversation an older agit renamed "agit: unnamed" gets its own title back when you reopen it.
+- A remote-control message sent while a Claude Code conversation in a terminal is busy is confirmed at once and starts
+  the next turn, instead of waiting for the running turn to end and being reported as not sent.
+
 ## [0.2.36] - 2026-11-03
 
 ### Changed
