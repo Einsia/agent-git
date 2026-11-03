@@ -21,6 +21,9 @@ async function request($, path, body) {
 const MAX_OPERATIONS = 4096;
 const MAX_EVENTS = 1024;
 const MAX_PROMPT_CHARS = 128 * 1024;
+// How long a prompt submitted during a turn is given to be refused before the receipt says
+// Claude Code holds it: a refusal comes from checking the submission, not from the turn.
+const QUEUE_REFUSAL_MS = 250;
 
 // Receipts contain operation metadata only. The native transcript remains the message record.
 const randomId = () => crypto.randomUUID();
@@ -383,8 +386,23 @@ async function execute($, command, target) {
         result(record, { outcome: "command_completed" });
       } else {
         invoked = true;
-        const accepted = await $.prompt.submit({ text: command.text, asUser: true });
-        result(record, { outcome: accepted?.drop === undefined ? "accepted" : "not_sent" });
+        const submitted = $.prompt.submit({ text: command.text, asUser: true });
+        // While a turn runs, Claude Code holds a submitted prompt for that turn's end, and the
+        // submission settles only then, which can be hours. A submission that has not failed by
+        // the time the queue has had to refuse it is in that queue, so the receipt says so at
+        // once and the daemon tells the sender it starts the next turn. Waiting for the turn's
+        // end instead leaves the sender with no answer for as long as the turn runs.
+        const queued = turn !== null && await Promise.race([
+          submitted.then(() => false, () => false),
+          new Promise(resolve => setTimeout(resolve, QUEUE_REFUSAL_MS, true)),
+        ]);
+        if (queued) {
+          submitted.catch(() => {});
+          result(record, { outcome: "accepted" });
+        } else {
+          const accepted = await submitted;
+          result(record, { outcome: accepted?.drop === undefined ? "accepted" : "not_sent" });
+        }
       }
     }
   } catch {

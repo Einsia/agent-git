@@ -327,6 +327,52 @@ test("native tool and compaction activity stays visible until completion without
 });
 
 
+// Claude Code holds a prompt submitted during a turn until that turn ends, and only then settles
+// the submission. A receipt that waited for it would leave the sender of a message to a terminal
+// running a long command with no answer for the whole turn, and then told it was not sent while
+// it arrives later. With no turn running, the prompt enters at once and its own checks decide,
+// so the receipt still waits for them: a receipt sent early there would report a prompt the
+// terminal holds back as accepted.
+test("a prompt for a running turn is acknowledged as queued at once, and an idle one only once it enters", async () => {
+  const f = await fixture();
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const entered = deferred();
+  f.api.prompt.submit = value => { f.calls.push(["prompt", value]); return entered.promise; };
+  await f.fire("session.start");
+  await f.fire("turn.start", { turnId: "long-turn" });
+  await f.poll();
+  const target = f.latest();
+  const command = { ...target, id: "while-running", method: "prompt", text: "a note for the running turn" };
+  f.replies.push(body => ({ generation: body.generation, commands: [command] }));
+  await f.poll();
+  await wait(400);
+  await f.poll();
+  assert.deepEqual(f.latest().results, [{ id: "while-running", outcome: "accepted" }]);
+  assert.deepEqual(f.calls.filter(call => call[0] === "prompt").length, 1);
+
+  f.api.prompt.submit = async () => { throw new Error("the submission was refused"); };
+  f.replies.push(body => ({ generation: body.generation, ack_results: ["while-running"],
+    commands: [{ ...command, id: "refused" }] }));
+  await f.poll();
+  await wait(50);
+  await f.poll();
+  assert.deepEqual(f.latest().results, [{ id: "refused", outcome: "unknown" }],
+    "a submission that fails at once is not reported as queued");
+
+  await f.fire("turn.complete", { turnId: "long-turn", reason: "completed", durationMs: 1 });
+  entered.resolve({ text: command.text });
+  f.api.prompt.submit = () => wait(400).then(() => ({ drop: "held back at this terminal" }));
+  f.replies.push(body => ({ generation: body.generation, ack_results: ["refused"],
+    commands: [{ ...command, id: "idle" }] }));
+  await f.poll();
+  await wait(300);
+  await f.poll();
+  assert.deepEqual(f.latest().results, [], "an idle prompt's receipt waits for it to enter");
+  await wait(200);
+  await f.poll();
+  assert.deepEqual(f.latest().results, [{ id: "idle", outcome: "not_sent" }]);
+});
+
 test("native slash commands keep their receipt and activity without creating a model prompt", async () => {
   const f = await fixture();
   const completed = deferred();
