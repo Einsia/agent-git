@@ -179,6 +179,12 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
     std::fs::create_dir_all(&jobs).unwrap();
     let job_path = jobs.join(filename);
     std::fs::write(&job_path, job.to_string()).unwrap();
+    // The conversation runs in a project the device's RC workspace binds, as a Hub-started one does.
+    std::fs::write(
+        rc.join("workspaces.json"),
+        serde_json::json!({"workspaces":{"local-owner":{"project":cwd}}}).to_string(),
+    )
+    .unwrap();
     std::fs::write(rc.join("sessions.json"), serde_json::json!({
         "captures":{"logical-fixture":capture},"sessions":{"logical-fixture":{
             "runtime":"claude-code","thread_id":native,"cwd":cwd,"workspace_id":"local-owner",

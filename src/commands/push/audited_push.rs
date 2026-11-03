@@ -554,8 +554,7 @@ impl Intent {
         } else {
             lookup(client, &checkout.owner, &checkout.name)?
         };
-        let accept_secret_findings = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV)
-            .is_none()
+        let accept_secret_findings = !crate::commands::auto_push::is_automatic()
             && (args.allow_secrets || config::allow_secrets());
         // The checkout's upstream says nothing about another repository's write access.
         let upstream = if explicit_repository {

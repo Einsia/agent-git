@@ -32,9 +32,15 @@ pub(super) fn run(
                 );
             }
             ensure!(
-                std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_none()
+                !crate::commands::auto_push::is_automatic()
                     || !crate::commands::project::blocks_auto_push(repo, slug, branch)?,
                 "automatic publication of `{slug}@{branch}` was turned off"
+            );
+            ensure!(
+                !crate::commands::auto_push::is_automatic()
+                    || !crate::commands::project::folder_refuses_upload(repo, slug, branch, true)?,
+                "{}",
+                folder_refusal(slug, branch)
             );
         }
         Ok(())
@@ -45,7 +51,7 @@ pub(super) fn run(
     } = destination;
     let repository = format!("{}/{}", intent.owner, intent.name);
     let reading = ui::publication::stage("Checking destination and publication history");
-    let automatic = std::env::var_os(crate::commands::auto_push::AUTOMATIC_ENV).is_some();
+    let automatic = crate::commands::auto_push::is_automatic();
     ensure!(
         !automatic || !args.audit,
         "automatic publication cannot replace an interactive audit decision"
@@ -55,6 +61,17 @@ pub(super) fn run(
         "{}",
         crate::commands::auto_push::DISABLED_FOR_REPOSITORY
     );
+    // The folder a conversation ran in decides whether it uploads without the person asking,
+    // whichever path recorded its branch.
+    if automatic {
+        for branch in branches {
+            ensure!(
+                !crate::commands::project::folder_refuses_upload(&repo, slug, branch, true)?,
+                "{}",
+                folder_refusal(slug, branch)
+            );
+        }
+    }
     if automatic && intent.visibility == "public" {
         let enrolled = match &intent.action {
             Action::Existing(remote) => super::super::consent::confirms_public(
@@ -1244,4 +1261,11 @@ mod answer_tests {
             assert_eq!(unattended.without_asking(), Some(true));
         }
     }
+}
+
+/// Why an automatic upload of `slug@branch` was refused by the folder its conversation ran in.
+fn folder_refusal(slug: &str, branch: &str) -> String {
+    format!(
+        "`{slug}@{branch}` is not uploaded automatically: the folder it ran in left it out, or doesn't upload by itself; `agit push {slug}@{branch}` uploads it if you want it there"
+    )
 }

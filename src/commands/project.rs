@@ -579,6 +579,237 @@ fn update_covered<T>(
     Ok(result)
 }
 
+/// Where AgentGit records that Codex ran its hooks for `session`, `None` for an id that is not a
+/// plain file name.
+fn codex_hooked_path(session: &str) -> Option<PathBuf> {
+    let plain = !session.is_empty()
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    plain
+        .then(|| config::agit_home().ok())?
+        .map(|home| home.join("hooks-seen").join("codex-sessions").join(session))
+}
+
+/// Records, as a Codex hook (SessionStart or Stop) runs for `session`, that Codex runs AgentGit's
+/// hooks for that conversation.
+pub(crate) fn codex_hooks_seen(session: &str) {
+    if let Some(path) = codex_hooked_path(session)
+        && path
+            .parent()
+            .is_some_and(|dir| config::create_state_dir(dir).is_ok())
+    {
+        let _ = fs::write(path, b"");
+    }
+}
+
+/// Whether Codex's `session` may be saved without the person naming it and without its own hook
+/// running: AgentGit has seen a hook of that very conversation. `agit on` tells the person nothing
+/// from Codex is saved until Codex runs the hooks, and a person who stops trusting them makes that
+/// true again, so a folder where they once ran is not enough. A catch-up
+/// then only completes an upload the hooks already started. `root`, the bound folder, is kept for
+/// callers that judge per folder; the answer depends on the conversation alone.
+pub(crate) fn codex_capture_allowed(_root: &Path, session: &str) -> bool {
+    codex_hooked_path(session).is_some_and(|path| path.exists())
+}
+
+/// Why the folder whose policy decides for `path` keeps `session` of `runtime` from being saved or
+/// uploaded without the person asking, if it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeptBack {
+    /// The person dropped it, or it ran before the folder was on.
+    LeftOut,
+    /// The folder doesn't upload by itself.
+    NoAutomaticUpload,
+    /// The folder is off.
+    Off,
+    /// The folder's policy can't be read.
+    Unreadable,
+}
+
+/// Whether, and why, the folder whose policy decides for `path` keeps `session` of `runtime` back.
+/// `Err` holds the reason; `Ok(None)` when no folder covers `path`.
+fn folder_judgement(path: &Path, runtime: &str, session: &str) -> Result<Option<()>, KeptBack> {
+    match governing(path) {
+        Ok(Some((project, _))) if !project.enabled => Err(KeptBack::Off),
+        Ok(Some((project, _)))
+            if project.leaves_out(&key(runtime, session))
+                || before_covered(
+                    &project,
+                    &Candidate {
+                        runtime: runtime.into(),
+                        session_id: session.into(),
+                        cwd: path.to_path_buf(),
+                    },
+                    false,
+                )
+                .unwrap_or(true) =>
+        {
+            Err(KeptBack::LeftOut)
+        }
+        Ok(Some((project, _))) if !project.auto_upload => Err(KeptBack::NoAutomaticUpload),
+        Ok(Some(_)) => Ok(Some(())),
+        Ok(None) => Ok(None),
+        Err(_) => Err(KeptBack::Unreadable),
+    }
+}
+
+/// What the folder whose policy decides for `path` says about saving and uploading `session` of
+/// `runtime`, running in `path`, without the person asking: no while the folder is off or doesn't
+/// upload by itself, or for a session it leaves out (dropped, from before the folder was on, or
+/// from before the folder covered its git worktree, or of unknown start there); yes otherwise. `None`
+/// when no folder covers `path`; a policy that can't be read says no.
+pub(crate) fn folder_decision(path: &Path, runtime: &str, session: &str) -> Option<bool> {
+    match folder_judgement(path, runtime, session) {
+        Ok(decided) => decided.map(|()| true),
+        Err(_) => Some(false),
+    }
+}
+
+/// A session branch this computer saw accepted on the Hub although the folder its conversation ran
+/// in keeps it from uploading by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeptBackUpload {
+    pub repository: String,
+    pub branch: String,
+    /// The session's page on the Hub, or the repository's when the session can't be named.
+    pub url: String,
+}
+
+impl KeptBackUpload {
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "Also on the Hub from this folder: {}@{}. You can review it at {}.",
+            self.repository, self.branch, self.url
+        )
+    }
+}
+
+/// The Hub page of the session `branch` of `repo` holds, by the checkout's pinned Hub.
+fn session_page(repo: &Repo, owner: &str, agent: &str, branch: &str) -> String {
+    let hub = crate::hub::identity::read(repo)
+        .ok()
+        .flatten()
+        .map(|identity| identity.hub)
+        .unwrap_or_else(config::hub_url);
+    let repository = format!("{}/@{owner}/{agent}", hub.trim_end_matches('/'));
+    match crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}")) {
+        Ok(Some(meta)) if meta::is_bare_id(&meta.session) => {
+            format!("{repository}/s/{}", meta.session)
+        }
+        _ => repository,
+    }
+}
+
+/// Every session branch on this computer that was accepted on the Hub although its folder keeps
+/// the conversation back, judged from local records only: claims, folder policies, publication
+/// receipts and remote-tracking refs. Nothing is sent.
+pub(crate) fn kept_back_uploads() -> Result<Vec<KeptBackUpload>> {
+    let mut found = BTreeMap::new();
+    for claim in link::list(&Store::at(config::store_root()?)) {
+        let (Some(owner), Some(agent), Some(branch), Some(cwd)) = (
+            claim.owner.as_deref(),
+            claim.agent.as_deref(),
+            claim.branch.as_deref(),
+            claim.cwd.as_deref(),
+        ) else {
+            continue;
+        };
+        if folder_judgement(Path::new(cwd), &claim.source, &claim.session_id).is_ok() {
+            continue;
+        }
+        let Some(repo) = Repo::open(config::repo_dir(owner, agent)?) else {
+            continue;
+        };
+        let accepted = crate::domain::privacy_receipt::PublicationReceipt::load(&repo, branch)
+            .ok()
+            .flatten()
+            .is_some()
+            || repo
+                .git_opt(&[
+                    "for-each-ref",
+                    "--count=1",
+                    "--format=%(refname)",
+                    &format!("refs/remotes/*/{branch}"),
+                ])
+                .is_some_and(|refs| !refs.trim().is_empty());
+        if accepted {
+            let repository = format!("{owner}/{agent}");
+            found
+                .entry((repository.clone(), branch.to_owned()))
+                .or_insert_with(|| KeptBackUpload {
+                    repository,
+                    branch: branch.to_owned(),
+                    url: session_page(&repo, owner, agent, branch),
+                });
+        }
+    }
+    Ok(found.into_values().collect())
+}
+
+/// The kept-back uploads `agit status` has not shown yet, recorded as shown: each is told once.
+pub(crate) fn kept_back_uploads_to_tell() -> Result<Vec<KeptBackUpload>> {
+    let path = config::agit_home()?.join("kept-back-uploads-told.json");
+    let mut told: BTreeSet<String> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let fresh: Vec<_> = kept_back_uploads()?
+        .into_iter()
+        .filter(|upload| !told.contains(&format!("{}@{}", upload.repository, upload.branch)))
+        .collect();
+    if !fresh.is_empty() {
+        told.extend(
+            fresh
+                .iter()
+                .map(|upload| format!("{}@{}", upload.repository, upload.branch)),
+        );
+        config::create_state_dir(&config::agit_home()?)?;
+        fs::write(&path, serde_json::to_vec(&told)?)?;
+    }
+    Ok(fresh)
+}
+
+/// Writes the policy of the folder `root` as `agit on` would, with `dropped` sessions left out as
+/// `agit project drop` would leave them.
+#[cfg(test)]
+pub(crate) fn policy_for_test(
+    root: &Path,
+    enabled: bool,
+    auto_upload: bool,
+    dropped: &[(&str, &str)],
+) {
+    save(&Project {
+        root: root.canonicalize().unwrap(),
+        repository: "alice/app".into(),
+        identity: RemoteIdentity::new(
+            "https://example.test",
+            "bbbbbbbb-0000-4000-8000-000000000002",
+        )
+        .unwrap(),
+        account: "alice".into(),
+        account_id: None,
+        enabled,
+        auto_upload,
+        history: History::All,
+        excluded: dropped
+            .iter()
+            .map(|(runtime, session)| key(runtime, session))
+            .collect(),
+        earlier: BTreeSet::new(),
+        last_result: None,
+        push_auto_before: None,
+    })
+    .unwrap();
+}
+
+/// Whether the project keeps `candidate` because it is a Codex session that did not run with
+/// AgentGit's hooks in the folder (see [`codex_capture_allowed`]).
+fn codex_unhooked(project: &Project, candidate: &Candidate) -> bool {
+    candidate.runtime == "codex" && !codex_capture_allowed(&project.root, &candidate.session_id)
+}
+
 /// Records that the project at `root` covers `worktree` from now on, unless it already does.
 /// `opener` is the conversation whose start is the first sight of the worktree: a runtime may
 /// write a new conversation's first record before it runs the hook, so that conversation counts
@@ -739,16 +970,31 @@ fn verify(project: &Project) -> Result<Repo> {
 
 fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json::Value> {
     let mut command = crate::infra::background::command(std::env::current_exe()?);
+    command.args(["--quiet", "--json"]).args(arguments);
+    if automatic {
+        super::auto_push::configure(&mut command);
+    }
+    run_child(command, arguments, cwd)
+}
+
+/// The folder's own automatic upload of `target`.
+fn automatic_push(target: &str, cwd: &Path) -> Result<serde_json::Value> {
+    let mut command = crate::infra::background::command(std::env::current_exe()?);
+    command.args(["--quiet", "--json"]);
+    super::auto_push::automatic_push(&mut command, target);
+    run_child(command, &["push".into(), target.into()], cwd)
+}
+
+fn run_child(
+    mut command: std::process::Command,
+    arguments: &[String],
+    cwd: &Path,
+) -> Result<serde_json::Value> {
     command
-        .args(["--quiet", "--json"])
-        .args(arguments)
         .current_dir(cwd)
         .env_remove("AGIT_SESSION")
         .env_remove("AGIT_YES")
         .stdin(Stdio::null());
-    if automatic {
-        super::auto_push::configure(&mut command);
-    }
     let output = command.output()?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("child command did not return a CLI result")?;
@@ -1072,11 +1318,13 @@ fn sync_one(
         "--quiet",
         &format!("refs/heads/{branch}^{{commit}}"),
     ]);
-    let mut args = vec!["push".into(), target];
-    if !project.auto_upload {
-        args.push("--yes".into());
+    if project.auto_upload {
+        retry_stale(|| automatic_push(&target, &candidate.cwd))?;
+    } else {
+        // The person asked for this save: their push.
+        let args = vec!["push".into(), target, "--yes".into()];
+        retry_stale(|| child(&args, &candidate.cwd, false))?;
     }
-    retry_stale(|| child(&args, &candidate.cwd, project.auto_upload))?;
     // A publication does not move the local view of the Hub's branches; fetching does, so local
     // status and links can tell that this branch is on the Hub.
     let _ = child(
@@ -1149,6 +1397,7 @@ fn sync(project: &mut Project) -> CmdResult {
     for candidate in candidates(project)? {
         if project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
             || before_covered(project, &candidate, true).unwrap_or(true)
+            || codex_unhooked(project, &candidate)
             || delegation_withheld(&project.repository, &candidate, Some(project), true)
                 .unwrap_or(true)
         {
@@ -1695,17 +1944,14 @@ pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Pat
     let Some(project) = read(&policy_root(folder)).ok().flatten() else {
         return false;
     };
+    let candidate = Candidate {
+        runtime: runtime.into(),
+        session_id: session_id.into(),
+        cwd: cwd.to_path_buf(),
+    };
     project.earlier.contains(&key(runtime, session_id))
-        || before_covered(
-            &project,
-            &Candidate {
-                runtime: runtime.into(),
-                session_id: session_id.into(),
-                cwd: cwd.to_path_buf(),
-            },
-            false,
-        )
-        .unwrap_or(true)
+        || before_covered(&project, &candidate, false).unwrap_or(true)
+        || codex_unhooked(&project, &candidate)
 }
 
 /// Whether the person stopped uploading this session from the folder at `root`, or from the main
@@ -1793,6 +2039,9 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     let Some((project, _)) = governing(&cwd)? else {
         return Ok(false);
     };
+    if runtime == "codex" {
+        codex_hooks_seen(session);
+    }
     let candidate = Candidate {
         runtime: runtime.into(),
         session_id: session.into(),
@@ -2174,6 +2423,7 @@ fn drain(root: &Path) -> Result<()> {
             let caught = caught(root);
             for candidate in candidates(&project)? {
                 if !before_covered(&project, &candidate, true).unwrap_or(true)
+                    && !codex_unhooked(&project, &candidate)
                     && behind(&project, &candidate, &caught)
                 {
                     enqueue(root, &candidate)?;
@@ -3407,6 +3657,89 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
     Ok(project.repository == slug && (!project.enabled || !project.auto_upload))
 }
 
+/// Whether the folder the conversation of `slug@branch` ran in keeps it from this upload: it leaves
+/// the conversation out (dropped, or from before the folder was on), or, for an `automatic`
+/// upload, the folder is off or doesn't upload by itself. The folder's word holds whatever
+/// repository the branch publishes to, and however the branch was recorded. A branch whose
+/// directory or folder policy can't be read is refused with an error.
+pub(crate) fn folder_refuses_upload(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    automatic: bool,
+) -> Result<bool> {
+    // A branch without session metadata holds no conversation.
+    let Some(meta) =
+        crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))?
+    else {
+        return Ok(false);
+    };
+    // A conversation that recorded no directory ran in no folder whose policy could object.
+    if meta.is_file_line() || meta.cwd.is_empty() {
+        return Ok(false);
+    }
+    let hydrated = crate::domain::privacy::service::transform(
+        Some(repo.root()),
+        &meta.cwd,
+        crate::domain::privacy::projector::Mode::HydrateText,
+    );
+    ensure!(
+        crate::domain::privacy::projector::tokens(&hydrated.content)
+            .next()
+            .is_none(),
+        "cannot resolve the session directory to verify the folder's policy"
+    );
+    // A folder's policy is kept by its path, so a directory removed since still finds it.
+    let recorded = Path::new(&hydrated.content);
+    let cwd = recorded
+        .canonicalize()
+        .unwrap_or_else(|_| recorded.to_path_buf());
+    let Some((project, _)) = governing(&cwd)? else {
+        return Ok(false);
+    };
+    if automatic && (!project.enabled || !project.auto_upload) {
+        return Ok(true);
+    }
+    let mut sessions: Vec<String> = meta
+        .runtime_instances
+        .iter()
+        .map(|id| key(&meta.runtime, id))
+        .collect();
+    sessions.extend(
+        meta.capture
+            .iter()
+            .chain(capture_origin(slug, branch)?.iter())
+            .map(|origin| key(&origin.runtime, &origin.session)),
+    );
+    let (owner, agent) = super::parse_slug(slug)?;
+    sessions.extend(
+        recording_into(
+            &link::list(&Store::at(config::store_root()?)),
+            &owner,
+            &agent,
+            branch,
+        )
+        .iter()
+        .map(|claim| key(&claim.source, &claim.session_id)),
+    );
+    // A session of a git worktree from before the folder covered it is left out too.
+    Ok(sessions.iter().any(|session| {
+        project.leaves_out(session)
+            || session.split_once(':').is_some_and(|(runtime, id)| {
+                before_covered(
+                    &project,
+                    &Candidate {
+                        runtime: runtime.into(),
+                        session_id: id.into(),
+                        cwd: cwd.clone(),
+                    },
+                    false,
+                )
+                .unwrap_or(true)
+            })
+    }))
+}
+
 /// Whether the Hub this checkout publishes to refused `branch` as withdrawn. The push that met
 /// the refusal said so once; later turns leave the branch out quietly, as an excluded session is
 /// left out, until a push that names it asks the Hub again.
@@ -4239,6 +4572,14 @@ mod tests {
             Some((tree.clone(), policy.root.clone()))
         );
         assert!(!left_out(&tree, "claude-code", AFTER, &tree));
+        // Saving in the background (RC, watching from the Hub) holds the worktree to the same
+        // start: earlier history and an unknown start are kept back; a later one is the folder's.
+        assert_eq!(folder_decision(&tree, "claude-code", BEFORE), Some(false));
+        assert_eq!(
+            folder_decision(&tree, "claude-code", UNSTAMPED),
+            Some(false)
+        );
+        assert_eq!(folder_decision(&tree, "claude-code", AFTER), Some(true));
         assert!(claude(STARTING, &tree).is_some());
         let candidate = |id: &str, cwd: &Path| Candidate {
             runtime: "claude-code".into(),
@@ -5470,6 +5811,81 @@ mod tests {
         assert_eq!(session.upload(), Some(Upload::Waiting));
     }
 
+    /// An automatic upload of a branch is refused when the folder its conversation ran in leaves
+    /// that conversation out, however the branch names it, and while the folder is off or doesn't
+    /// upload by itself, whatever repository the folder is bound to. A branch that recorded no
+    /// directory has no folder to ask.
+    #[test]
+    fn the_folder_decides_whether_its_conversation_uploads_automatically() {
+        if !isolated("the_folder_decides_whether_its_conversation_uploads_automatically") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("folder");
+        fs::create_dir(&work).unwrap();
+        let mut policy = project(&work);
+        policy.repository = "carol/elsewhere".into();
+        save(&policy).unwrap();
+        let repo = Repo::init(&temp.path().join("repo")).unwrap();
+        repo.git(&["checkout", "-b", "work"]).unwrap();
+        const SESSION: &str = "019a0000-0000-7000-8000-0000000000e1";
+        let commit = |metadata: &Meta| {
+            meta::write(repo.root(), metadata).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("snapshot").unwrap();
+        };
+        let mut metadata = Meta::new(
+            format!("agit-{}", "e".repeat(40)),
+            "codex".into(),
+            policy.root.to_string_lossy().into_owned(),
+        );
+        metadata.runtime_instances = vec![SESSION.into()];
+        commit(&metadata);
+        let refused = || folder_refuses_upload(&repo, "alice/app", "work", true).unwrap();
+        assert!(!refused());
+
+        policy.excluded.insert(key("codex", SESSION));
+        save(&policy).unwrap();
+        assert!(refused(), "named by its runtime instance");
+        metadata.runtime_instances.clear();
+        commit(&metadata);
+        assert!(!refused());
+        metadata.capture = Some(meta::CaptureOrigin {
+            runtime: "codex".into(),
+            session: SESSION.into(),
+        });
+        commit(&metadata);
+        assert!(refused(), "named by its capture origin");
+        assert!(
+            folder_refuses_upload(&repo, "alice/app", "work", false).unwrap(),
+            "a left-out conversation is held back from a push that doesn't name it"
+        );
+        policy.excluded.clear();
+        policy.earlier.insert(key("codex", SESSION));
+        save(&policy).unwrap();
+        assert!(refused(), "from before the folder was on");
+
+        policy.earlier.clear();
+        policy.auto_upload = false;
+        save(&policy).unwrap();
+        assert!(refused(), "the folder doesn't upload by itself");
+        assert!(
+            !folder_refuses_upload(&repo, "alice/app", "work", false).unwrap(),
+            "the person's own push isn't held back by the folder's upload setting"
+        );
+        policy.auto_upload = true;
+        policy.enabled = false;
+        save(&policy).unwrap();
+        assert!(refused(), "the folder is off");
+        policy.enabled = true;
+        save(&policy).unwrap();
+        assert!(!refused());
+
+        metadata.cwd = String::new();
+        commit(&metadata);
+        assert!(!refused(), "no directory, no folder");
+    }
+
     #[test]
     fn paused_project_blocks_its_registered_session_directory() {
         if !isolated("paused_project_blocks_its_registered_session_directory") {
@@ -5849,6 +6265,80 @@ mod tests {
         assert_eq!(
             withheld("alice/app", "rename-the-tabs-7a8b").unwrap(),
             Some(Withholding::Excluded)
+        );
+    }
+
+    /// `agit on` says nothing from Codex is saved until Codex runs AgentGit's hooks, and a person who
+    /// stops trusting them makes that true again. A catch-up, a sync and a folder's `agit save`
+    /// take a Codex session only when AgentGit saw a hook of that very session: hooks run for A,
+    /// then are untrusted, and B runs; A is taken and B stays out until the person names it.
+    /// `--all` and `--today` never let in a session the person dropped, hooks or not. A gate on
+    /// the folder having seen hooks once takes B.
+    #[test]
+    fn a_codex_session_is_taken_only_when_its_own_hooks_ran() {
+        if !isolated("a_codex_session_is_taken_only_when_its_own_hooks_ran") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        save(&policy).unwrap();
+        let root = policy.root.clone();
+        const A: &str = "aaaaaaaa-0000-4000-8000-0000000000a1";
+        const B: &str = "aaaaaaaa-0000-4000-8000-0000000000b2";
+        const DROPPED: &str = "aaaaaaaa-0000-4000-8000-0000000000c3";
+        let candidate = |id: &str| Candidate {
+            runtime: "codex".into(),
+            session_id: id.into(),
+            cwd: root.clone(),
+        };
+        for id in [A, B] {
+            assert!(!codex_capture_allowed(&root, id));
+            assert!(codex_unhooked(&policy, &candidate(id)));
+            assert!(left_out(&root, "codex", id, &root));
+        }
+        // A's hooks run; then the person untrusts them, and B runs without.
+        codex_hooks_seen(A);
+        assert!(codex_capture_allowed(&root, A));
+        assert!(!codex_unhooked(&policy, &candidate(A)));
+        assert!(!left_out(&root, "codex", A, &root));
+        assert!(!codex_capture_allowed(&root, B));
+        assert!(left_out(&root, "codex", B, &root));
+        // A conversation's own hook saves it; that check is not this one.
+        assert!(!withholds(&policy, &candidate(B), false));
+        // An id that is not a plain name is never recorded, and never allowed.
+        codex_hooks_seen("../escape");
+        assert!(!codex_capture_allowed(&root, "../escape"));
+        // Claude Code is not held back by Codex's hooks.
+        assert!(!codex_unhooked(
+            &policy,
+            &Candidate {
+                runtime: "claude-code".into(),
+                session_id: B.into(),
+                cwd: root.clone(),
+            }
+        ));
+
+        // A dropped session stays out under `--all`, its hooks having run or not.
+        codex_hooks_seen(DROPPED);
+        policy.excluded.insert(key("codex", DROPPED));
+        save(&policy).unwrap();
+        let saved = save_now(
+            &root,
+            &[("codex".into(), DROPPED.into(), root.clone())],
+            true,
+            false,
+        )
+        .unwrap();
+        let [Saved::Refused(why)] = saved.as_slice() else {
+            panic!("a dropped Codex session was saved");
+        };
+        assert!(why.contains("agit project drop"), "{why}");
+        assert!(
+            read(&root)
+                .unwrap()
+                .unwrap()
+                .excluded
+                .contains(&key("codex", DROPPED))
         );
     }
 

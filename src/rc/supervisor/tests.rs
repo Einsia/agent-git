@@ -83,7 +83,8 @@ pub(super) fn harness_test_session_with_channels(
             native_source: None,
             runtime_session_id: None,
             workspace_id: "workspace-test".into(),
-            project_id: None,
+            // Started in a project its RC workspace binds, as a Hub-started session is.
+            project_id: Some("project-test".into()),
             runtime: runtime.into(),
             agent: None,
             branch: None,

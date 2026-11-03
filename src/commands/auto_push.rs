@@ -5,7 +5,25 @@ use crate::ui;
 use std::path::Path;
 use std::process::Stdio;
 
+/// Set on background children so a commit an automatic push started doesn't start another. It
+/// only ever holds a push back: no push reads it to decide that it is automatic.
 pub(super) const AUTOMATIC_ENV: &str = "AGIT_AUTO_PUSH";
+
+/// The internal entry point background spawners publish through; [`automatic_push`] is the only
+/// code that names it. It is not a flag of `agit push`, whose pushes are always the person's own.
+pub(crate) const AUTOMATIC_ENTRY: &str = "__push-automatic";
+
+static AUTOMATIC: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Marks this process as an automatic publication. Only [`AUTOMATIC_ENTRY`]'s entry point calls it.
+pub(crate) fn mark_automatic() {
+    let _ = AUTOMATIC.set(());
+}
+
+/// Whether this process publishes automatically, as [`AUTOMATIC_ENTRY`] marked it.
+pub(crate) fn is_automatic() -> bool {
+    AUTOMATIC.get().is_some()
+}
 
 /// Whether the person turned automatic publication off for `repository` on this computer: in its
 /// own checkout here, or for every repository when there is none. A repository that publishes to
@@ -84,6 +102,13 @@ pub(crate) fn configure(command: &mut std::process::Command) {
     command.env(AUTOMATIC_ENV, "1").env_remove("AGIT_YES");
 }
 
+/// Makes `command`, an agit executable with its global options set, an automatic publication of
+/// `target`. Every background push is spawned through here.
+pub(crate) fn automatic_push(command: &mut std::process::Command, target: &str) {
+    configure(command);
+    command.args([AUTOMATIC_ENTRY, target]);
+}
+
 #[cfg(all(test, unix))]
 #[test]
 fn unattended_children_cannot_inherit_interactive_consent() {
@@ -116,6 +141,7 @@ pub(super) fn after_settlement(
 ) {
     if std::env::var_os(super::commit::SUPERVISOR_RESULT_ENV).is_some()
         || crate::rc::harness::settlement_is_delegated()
+        || is_automatic()
         || std::env::var_os(AUTOMATIC_ENV).is_some()
     {
         return;
@@ -152,9 +178,9 @@ pub(super) fn after_settlement(
     // settlement caller. It uses the ordinary identity, access, visibility and secret gates.
     let outcome = std::env::current_exe().and_then(|executable| {
         let mut command = crate::infra::background::command(executable);
-        configure(&mut command);
+        command.arg("--json");
+        automatic_push(&mut command, &target);
         command
-            .args(["--json", "push", &target])
             .current_dir(directory)
             .env("AGIT_SESSION", &target)
             .env("AGIT_TUI", "0")
@@ -237,4 +263,104 @@ fn a_failed_child_relays_its_error_and_hints() {
         ))
     );
     assert_eq!(failure_reason(b"not an envelope"), None);
+}
+
+/// Every background push is spawned through [`automatic_push`], which marks it automatic: a push
+/// spawned another way would run as the person's own and skip what an automatic one is held to.
+/// Each argument list in the source that starts with `push` is listed here with why it is not a
+/// background `agit push`; a new one fails until it is spawned through [`automatic_push`] or added
+/// with its reason.
+#[cfg(test)]
+#[test]
+fn every_background_push_is_spawned_as_automatic() {
+    const KNOWN: &[(&str, &str, &str)] = &[
+        (
+            "src/commands/push.rs",
+            r#"let mut args = vec!["push", "--no-follow-tags", "--recurse-submodules=no"];"#,
+            "git transport",
+        ),
+        (
+            "src/domain/lfs/local.rs",
+            r#"let mut args = vec!["push", "--object-id", "origin"];"#,
+            "git lfs transport",
+        ),
+        (
+            "src/hub/git.rs",
+            r#"vec!["push", "--", "--progress", "refs/heads/fetch"],"#,
+            "git transport",
+        ),
+        (
+            "src/commands/project.rs",
+            r#"let args = vec!["push".into(), target, "--yes".into()];"#,
+            "the person's own save",
+        ),
+        (
+            "src/commands/project.rs",
+            r#"run_child(command, &["push".into(), target.into()], cwd)"#,
+            "names the automatic push in its errors",
+        ),
+        (
+            "src/commands/front/on.rs",
+            r#"&["push", &destination.slug(), "-b", "main", "--private"],"#,
+            "the person's own `agit on` creating their repository",
+        ),
+        (
+            "src/hub/identity.rs",
+            r#"&["push", slug, "--all", "--to-hub", current],"#,
+            "a command suggested to the person",
+        ),
+    ];
+    const TESTS: &[&str] = &[
+        "src/commands/auto_push.rs",
+        "src/commands/clone.rs",
+        "src/commands/scan.rs",
+        "src/commands/push/publication_tests.rs",
+        "src/domain/refs.rs",
+        "src/domain/secrets/mod.rs",
+        "src/domain/repo/mod.rs",
+        "src/hub/git.rs",
+    ];
+    fn files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = Vec::new();
+    files(&root.join("src"), &mut found);
+    let shape = regex::Regex::new(r#"\[\s*"push"|"push"\.into\(\)|\.arg\(\s*"push"\s*\)"#).unwrap();
+    let mut unknown = Vec::new();
+    for path in found {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap();
+        // A test module's pushes run git in a fixture, never in the background.
+        let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| shape.is_match(line))
+        {
+            let in_tests = TESTS.contains(&relative.as_str())
+                && (relative.ends_with("tests.rs") || !production.contains(line));
+            let known = KNOWN
+                .iter()
+                .any(|(file, known, _)| *file == relative && *known == line);
+            if !in_tests && !known {
+                unknown.push(format!("{relative}: {line}"));
+            }
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "spawn background pushes through auto_push::automatic_push: {unknown:#?}"
+    );
 }

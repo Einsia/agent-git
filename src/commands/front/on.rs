@@ -487,7 +487,7 @@ impl RuntimeState {
                 "nothing is saved yet: Codex lists none of AgentGit's hooks; to add them: `agit setup --runtime codex --hooks`".into()
             }
             Self::CatchUp => {
-                "this Codex has no hooks; its sessions here upload when you run `agit save`".into()
+                "this Codex has no hooks, so nothing from it is saved by itself; to upload its sessions here: `agit save SESSION-ID`, or all of them: `agit save --all`".into()
             }
         }
     }

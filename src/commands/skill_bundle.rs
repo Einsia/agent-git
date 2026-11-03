@@ -244,9 +244,12 @@ mod tests {
         // Use clap's generated command definition as the source of truth.  Comparing
         // both complete sets catches both a stale resource entry and a newly added
         // top-level command that forgot to ship a sub-skill.
+        // The internal automatic-publication entry is spawned by agit itself, never offered to
+        // an agent.
         let commands = crate::commands::cli_def()
             .get_subcommands()
             .map(|command| command.get_name().to_owned())
+            .filter(|name| name != crate::commands::auto_push::AUTOMATIC_ENTRY)
             .collect::<std::collections::BTreeSet<_>>();
         let subskills = SUBSKILLS
             .iter()

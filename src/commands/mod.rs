@@ -1369,6 +1369,9 @@ pub enum Commands {
     Doctor(doctor::Args),
 
     // ── Hidden: runtime and MCP, not shown in help ───
+    /// (hidden) an automatic publication, as background spawners run it (`auto_push::automatic_push`)
+    #[command(name = "__push-automatic", hide = true)]
+    PushAutomatic(push::Args),
     /// (hidden) runtime hook entry point
     #[command(hide = true)]
     Hooks(hooks::Args),
@@ -1414,7 +1417,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Merge(_) => "merge",
         Commands::CherryPick(_) => "cherry-pick",
         Commands::Revert(_) => "revert",
-        Commands::Push(_) => "push",
+        Commands::Push(_) | Commands::PushAutomatic(_) => "push",
         Commands::Fetch(_) => "fetch",
         Commands::Pull(_) => "pull",
         Commands::Remote(_) => "remote",

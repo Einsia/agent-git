@@ -44,6 +44,12 @@ pub const RPC_FEATURES: &[&str] = &[
     // A non-owner's turn can't start work that outlives it, in any mode, in a Claude Code or
     // OpenCode session agit drives; a turn the device can't attribute is held to the same rule.
     "nonowner-selfstart-refused-v1",
+    // Watching a conversation, joining it (attach_only), and taking over or resuming it save and
+    // upload it only as the folder it runs in allows: never one the person dropped or that ran
+    // before the folder was on, nothing while the folder is off or doesn't upload by itself, and
+    // with no folder only inside a project an RC workspace binds. Queued turns are judged again
+    // before they are saved, and every automatic push is held to the same rule.
+    "observed-capture-consent-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -777,10 +777,14 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
                 if cfg!(unix) { "file" } else { "os" },
             )
             .stdin(Stdio::null())
-            .args(args);
-        if automatic {
-            command.env("AGIT_AUTO_PUSH", "1");
-        }
+            .args(args.iter().map(|arg| {
+                // An automatic push is the internal entry background spawners run.
+                if automatic && *arg == "push" {
+                    "__push-automatic"
+                } else {
+                    *arg
+                }
+            }));
         command.output().unwrap()
     };
     let run = |args: &[&str], automatic: bool| run_home(args, automatic, &home);
@@ -3775,9 +3779,6 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
                 command.env(name, value);
             }
         }
-        if automatic {
-            command.env("AGIT_AUTO_PUSH", "1");
-        }
         command
             .current_dir(temp.path())
             .env("AGIT_HOME", &home)
@@ -3790,7 +3791,14 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
                 if cfg!(unix) { "file" } else { "os" },
             )
             .stdin(Stdio::null())
-            .args(args)
+            .args(args.iter().map(|arg| {
+                // An automatic push is the internal entry background spawners run.
+                if automatic && *arg == "push" {
+                    "__push-automatic"
+                } else {
+                    *arg
+                }
+            }))
             .output()
             .unwrap()
     };
@@ -3984,9 +3992,6 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
                 command.env(name, value);
             }
         }
-        if automatic {
-            command.env("AGIT_AUTO_PUSH", "1");
-        }
         command
             .current_dir(temp.path())
             .env("AGIT_HOME", &home)
@@ -3999,7 +4004,14 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
                 if cfg!(unix) { "file" } else { "os" },
             )
             .stdin(Stdio::null())
-            .args(args)
+            .args(args.iter().map(|arg| {
+                // An automatic push is the internal entry background spawners run.
+                if automatic && *arg == "push" {
+                    "__push-automatic"
+                } else {
+                    *arg
+                }
+            }))
             .output()
             .unwrap()
     };
@@ -4141,6 +4153,200 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), after);
 }
 
+/// A conversation from a folder that doesn't upload by itself is not uploaded by an automatic
+/// push, whichever path recorded its branch and whatever the checkout's own setting says; the
+/// person's own push still uploads it. A client that judged only the checkout's setting would
+/// upload what the folder keeps back.
+#[test]
+fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run_env = |args: &[&str], automatic: bool, vars: &[(&str, &str)]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .envs(vars.iter().copied())
+            .stdin(Stdio::null())
+            .args(args.iter().map(|arg| {
+                // An automatic push is the internal entry background spawners run.
+                if automatic && *arg == "push" {
+                    "__push-automatic"
+                } else {
+                    *arg
+                }
+            }))
+            .output()
+            .unwrap()
+    };
+    let run = |args: &[&str], automatic: bool| run_env(args, automatic, &[]);
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"], false));
+
+    // The folder is bound without automatic upload; the checkout's own setting is on.
+    let folder = temp.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    assert_success(&run(
+        &[
+            "--yes",
+            "project",
+            "bind",
+            folder.to_str().unwrap(),
+            "--repo",
+            "alice/app",
+            "--history",
+            "none",
+        ],
+        false,
+    ));
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    repo.git(&["checkout", "-q", "-b", "kept"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "d".repeat(40)),
+        "codex".into(),
+        folder.to_string_lossy().into_owned(),
+    );
+    session.runtime_instances = vec!["019a0000-0000-7000-8000-00000000d0d0".into()];
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"kept back"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("kept back").unwrap();
+
+    // The internal entry, run by hand, is an automatic push: held to the folder, and nothing more.
+    let posts = hub.posts.load(Ordering::Acquire);
+    let automatic = run(&["__push-automatic", "alice/app@kept"], false);
+    assert!(!automatic.status.success(), "{automatic:?}");
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr).contains(
+            "`alice/app@kept` is not uploaded automatically: the folder it ran in left it out, or doesn't upload by itself"
+        ),
+        "{automatic:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+    assert!(
+        git(&remote, &["show-ref"])
+            .lines()
+            .all(|line| !line.ends_with("refs/heads/kept"))
+    );
+
+    // The variable background children carry doesn't make a push automatic: the person's push of
+    // the branch goes through.
+    assert_success(&run_env(
+        &["--yes", "push", "alice/app@kept"],
+        false,
+        &[("AGIT_AUTO_PUSH", "1")],
+    ));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/kept"]),
+        git(repo.root(), &["rev-parse", "kept"])
+    );
+
+    // A session the person dropped from the folder goes only where a push names its branch.
+    const DROPPED: &str = "019a0000-0000-7000-8000-00000000d0d1";
+    repo.git(&["checkout", "-q", "-b", "dropped", "main"])
+        .unwrap();
+    session.session = format!("agit-{}", "f".repeat(40));
+    session.runtime_instances = vec![DROPPED.into()];
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"dropped"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("dropped").unwrap();
+    for entry in fs::read_dir(home.join("projects")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let mut policy: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            policy["auto_upload"] = json!(true);
+            policy["excluded"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!("codex:{DROPPED}")));
+            fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        }
+    }
+    let unnamed = run(&["--yes", "push", "alice/app", "--all"], false);
+    assert_success(&unnamed);
+    assert!(
+        String::from_utf8_lossy(&unnamed.stdout)
+            .contains("skipping dropped (its folder left it out)"),
+        "{unnamed:?}"
+    );
+    assert!(
+        git(&remote, &["show-ref"])
+            .lines()
+            .all(|line| !line.ends_with("refs/heads/dropped"))
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@dropped"], false));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/dropped"]),
+        git(repo.root(), &["rev-parse", "dropped"])
+    );
+}
+
 /// Automatic upload into a public repository is switched on only by the person, at a terminal.
 /// Each row names an entry point, the destination's audience, whether `--yes` was given and
 /// whether a terminal is attached. Without a terminal a public switch-on is refused with or without
@@ -4204,10 +4410,14 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
                 if cfg!(unix) { "file" } else { "os" },
             )
             .stdin(Stdio::null())
-            .args(args);
-        if automatic {
-            command.env("AGIT_AUTO_PUSH", "1");
-        }
+            .args(args.iter().map(|arg| {
+                // An automatic push is the internal entry background spawners run.
+                if automatic && *arg == "push" {
+                    "__push-automatic"
+                } else {
+                    *arg
+                }
+            }));
         command.output().unwrap()
     };
     let run = |args: &[&str], automatic: bool| run_in(&home, args, automatic);

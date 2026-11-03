@@ -67,6 +67,15 @@ impl Session {
             boundary <= tailer.consumed(),
             "native completion has not reached the transcript reader"
         );
+        // A conversation the folder it runs in keeps back is not queued for saving.
+        if !crate::rc::capture::consented(
+            &self.cwd,
+            &self.info.runtime,
+            &native,
+            self.info.project_id.is_some(),
+        ) {
+            return Ok(());
+        }
         Job::capture(
             &self.info.session_id,
             &native,
@@ -165,6 +174,11 @@ pub(crate) async fn prepare(
         lease.local_owner,
         "archive recovery requires local capture authority"
     );
+    // A job queued before its folder kept the conversation back is dropped unsaved.
+    if !crate::rc::capture::consented(&job.cwd, &job.runtime, &job.native, false) {
+        job.remove()?;
+        return Err(KeptBack.into());
+    }
     let lineage = job.session()?;
     let repo = crate::rc::capture::require(&lineage)?;
     let exe = std::env::current_exe()?;
@@ -422,8 +436,8 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
     if saved.publication.is_none() {
         let mut result = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
         result.write_all(&serde_json::to_vec(&request)?)?;
-        let mut push = command(&exe, &job, &lineage, &["push".into(), job.lineage.clone()]);
-        crate::commands::auto_push::configure(push.as_std_mut());
+        let mut push = command(&exe, &job, &lineage, &[]);
+        crate::commands::auto_push::automatic_push(push.as_std_mut(), &job.lineage);
         push.env(
             crate::hub::identity::EXPECTED_AGENT_ID_ENV,
             &request.destination.agent_id,
@@ -535,6 +549,77 @@ mod tests {
         domain::repo::Repo,
         rc::{lineage::AgitSession, local_repository::publication::Selection},
     };
+
+    /// Recovery drops a queued turn whose folder keeps its conversation back, without landing or
+    /// committing it. Settling an already queued turn without rechecking would save a conversation
+    /// the person dropped.
+    #[test]
+    fn a_queued_turn_of_a_conversation_its_folder_left_out_is_dropped_unsaved() {
+        if crate::rc::in_isolated_test(
+            "rc::supervisor::archive_recovery::tests::a_queued_turn_of_a_conversation_its_folder_left_out_is_dropped_unsaved",
+        ) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        crate::rc::select_local_authority();
+        let folder = home.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let lineage = AgitSession::new(
+            "alice/photo",
+            "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+            "s/dropped",
+        )
+        .unwrap();
+        let transcript = home.path().join("native.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let job = Job::capture(
+            "logical",
+            "dropped-native",
+            "claude-code",
+            None,
+            &folder,
+            &lineage,
+            "turn",
+            &transcript,
+            3,
+            None,
+        )
+        .unwrap();
+        job.record().unwrap();
+        crate::commands::project::policy_for_test(
+            &folder,
+            true,
+            true,
+            &[("claude-code", "dropped-native")],
+        );
+        let (_lease, state) = tokio::sync::watch::channel(SettlementState {
+            local_owner: true,
+            epoch: 1,
+            agent_identity_v1: true,
+            session_start_idempotency_v1: false,
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let Err(refused) = runtime.block_on(prepare(
+            job,
+            state,
+            std::sync::Arc::new(Preemption::default()),
+        )) else {
+            panic!("a left-out conversation is not settled");
+        };
+        assert!(refused.downcast_ref::<KeptBack>().is_some(), "{refused:#}");
+        assert!(crate::rc::archive_jobs::pending().unwrap().is_empty());
+        assert!(
+            !lineage.repo_dir().unwrap().exists(),
+            "nothing was landed or committed"
+        );
+    }
 
     /// A device-local capture publishes on the person's behalf, so automatic publication turned
     /// off in its destination's checkout makes recovery wait even while the capture repository's
@@ -654,3 +739,15 @@ mod tests {
         assert_eq!(publication_waits().unwrap(), wait(Off::UserDefault, None));
     }
 }
+
+/// Recovery dropped a queued turn of a conversation its folder keeps back, without saving it.
+#[derive(Debug)]
+pub(crate) struct KeptBack;
+
+impl std::fmt::Display for KeptBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the folder this conversation ran in keeps it from being saved automatically")
+    }
+}
+
+impl std::error::Error for KeptBack {}
