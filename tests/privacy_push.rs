@@ -3757,6 +3757,109 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
     );
 }
 
+/// A session larger than one privacy envelope may hold, but within what capture records, makes its
+/// first publication to a new branch. The new branch is named from the session's opening request,
+/// which publication reads from the whole saved LOG; a read capped below what capture admits
+/// refuses the first publication of every session that grew past that cap while it was recorded,
+/// which is how an old long conversation fails to catch up.
+#[test]
+fn a_session_larger_than_an_envelope_makes_its_first_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [28; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    repo.git(&["checkout", "-b", "long-talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    // Records of plain prose, each well under the privacy check's unit, together past one
+    // envelope's input.
+    let paragraph =
+        "The build reads the manifest, resolves each dependency and writes the lockfile. "
+            .repeat(10_000);
+    let mut records =
+        vec![json!({"type":"user","message":{"role":"user","content":"tidy the build"}})];
+    while records
+        .iter()
+        .map(|record| record.to_string().len())
+        .sum::<usize>()
+        <= agit::domain::privacy_publication::MAX_INPUT_BYTES
+    {
+        records.push(
+            json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"text","text":paragraph},
+            ]}}),
+        );
+    }
+    let native: String = records.iter().map(|record| format!("{record}\n")).collect();
+    let log = transcript::wrap_lines(&native, "claude-code", &session.session);
+    assert!(log.len() > agit::domain::privacy_publication::MAX_INPUT_BYTES);
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("tidy the build").unwrap();
+    let pushed = run(&["--yes", "push", "alice/app@long-talk"]);
+    assert_success(&pushed);
+    git(&remote, &["rev-parse", "refs/heads/long-talk"]);
+}
+
 /// Every part of a push in parts goes out under a confirmation that covers it. When the repository
 /// turns public after a part lands, the parts not yet sent stay unsent, since the yes was given
 /// for a private audience. Without a terminal, plain parts publish to a private repository on
