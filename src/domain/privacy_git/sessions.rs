@@ -662,7 +662,9 @@ fn opening_request(
     if !metadata.is_session_line() {
         return Ok(None);
     }
-    let limit = super::super::privacy_publication::MAX_INPUT_BYTES;
+    // Every committed session fits the storage cap, as capture enforces it. A smaller cap here
+    // would refuse the first publication of a session that grew past it while recorded.
+    let limit = super::super::storage::MAX_MATERIALIZED_BYTES;
     let (log, _) =
         super::super::storage::materialize_pair_local(source.root(), head, limit, limit)?;
     // The stored request has its protected values replaced already; the name may have been made
