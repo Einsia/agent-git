@@ -12,7 +12,9 @@
 //! kept record can lose the blocks the runtime injected into it. [`Classifier::class`] is derived
 //! from it, so the CLI that omits a record and the Hub that refuses or hides it apply the same
 //! rule. A session's records are judged in their LOG order, by one classifier: an OpenCode part
-//! takes its role from the message header before it.
+//! takes its role from the message header before it. [`record_kind`] reads what a record
+//! contributes to that judgement once, and [`Classifier::class_of`] folds the kinds in order;
+//! [`Classifier::class`] is that fold over one record.
 //!
 //! Local history and resume keep the complete native transcript; only publication applies this.
 
@@ -66,6 +68,89 @@ pub const USER_QUERY_ONLY: &[&str] = &["cursor", "workbuddy"];
 pub struct Classifier {
     /// OpenCode message ids and their roles, from the message headers seen so far.
     opencode_roles: HashMap<String, String>,
+    /// The same for the ordered judgement of kinds: each message id's hash, and whether its role
+    /// is the assistant's.
+    assistant_messages: HashMap<u64, bool>,
+}
+
+/// What one record contributes to the ordered judgement of a session, read from the record
+/// alone. It holds no text and no id, only hashes of ids, flags and classes, so a reader can keep
+/// one per record and judge a session's LOG again without reading its records again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordKind(Kind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A class that does not depend on the records around it.
+    Fixed(RecordClass),
+    /// An OpenCode message header: its id's hash, whether its role is the assistant's, and its
+    /// own class.
+    OpencodeHeader {
+        message: Option<u64>,
+        assistant: bool,
+        class: RecordClass,
+    },
+    /// An OpenCode part: its message id's hash, and its class under an assistant message and
+    /// under any other.
+    OpencodePart {
+        message: Option<u64>,
+        under_assistant: RecordClass,
+        otherwise: RecordClass,
+    },
+}
+
+/// The kind of `content`, a native record of runtime `source`.
+pub fn record_kind(source: &str, content: &Value) -> RecordKind {
+    let fixed = |source: &str| {
+        RecordKind(Kind::Fixed(class_from(
+            Classifier::default().published(source, content),
+            content,
+        )))
+    };
+    let Some(record) = content
+        .as_object()
+        .filter(|record| source == "opencode" && !is_agit_marker(record))
+        .filter(|record| recovered_evidence(record).is_none())
+    else {
+        return fixed(source);
+    };
+    let message = |key: &str| record.get(key).and_then(Value::as_str).map(id_hash);
+    match record.get("kind").and_then(Value::as_str) {
+        Some("message") => match record["data"]["role"].as_str() {
+            Some(role) => RecordKind(Kind::OpencodeHeader {
+                message: message("id"),
+                assistant: role == "assistant",
+                class: class_from(opencode_header(record), content),
+            }),
+            None => fixed(source),
+        },
+        Some("part") => RecordKind(Kind::OpencodePart {
+            message: message("message_id"),
+            under_assistant: class_from(opencode_part(record, true), content),
+            otherwise: class_from(opencode_part(record, false), content),
+        }),
+        _ => fixed(source),
+    }
+}
+
+/// A 64-bit hash of an id: the first 8 bytes of its SHA-256.
+fn id_hash(id: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("a SHA-256 digest has 8 bytes"),
+    )
+}
+
+/// The class of a record that publication keeps as `published`.
+fn class_from(published: Option<Value>, content: &Value) -> RecordClass {
+    match published {
+        Some(kept) if kept == *content => RecordClass::Conversation,
+        _ if is_request_snapshot(content) => RecordClass::RequestSnapshot,
+        _ => RecordClass::RuntimeContext,
+    }
 }
 
 impl Classifier {
@@ -73,10 +158,38 @@ impl Classifier {
     /// that [`Classifier::published`] keeps unchanged is [`RecordClass::Conversation`]; a record
     /// that would lose injected blocks is not, so the Hub refuses what the CLI would have trimmed.
     pub fn class(&mut self, source: &str, content: &Value) -> RecordClass {
-        match self.published(source, content) {
-            Some(kept) if kept == *content => RecordClass::Conversation,
-            _ if is_request_snapshot(content) => RecordClass::RequestSnapshot,
-            _ => RecordClass::RuntimeContext,
+        self.class_of(record_kind(source, content))
+    }
+
+    /// [`Classifier::class`] of the next record, from its [`RecordKind`].
+    pub fn class_of(&mut self, kind: RecordKind) -> RecordClass {
+        match kind.0 {
+            Kind::Fixed(class) => class,
+            Kind::OpencodeHeader {
+                message,
+                assistant,
+                class,
+            } => {
+                if let Some(message) = message {
+                    self.assistant_messages.insert(message, assistant);
+                }
+                class
+            }
+            Kind::OpencodePart {
+                message,
+                under_assistant,
+                otherwise,
+            } => {
+                let assistant = message
+                    .and_then(|message| self.assistant_messages.get(&message))
+                    .copied()
+                    .unwrap_or(false);
+                if assistant {
+                    under_assistant
+                } else {
+                    otherwise
+                }
+            }
         }
     }
 
@@ -191,13 +304,15 @@ fn is_request_snapshot(content: &Value) -> bool {
         .is_some_and(|kind| kind.starts_with("api-request") || kind == "prompt_snapshot")
 }
 
-/// agit's own merge, cherry-pick and revert markers and its merge summary. They carry no
-/// runtime context; a merge summary's text goes through the detector like any other.
+/// agit's own merge, cherry-pick and revert markers, with or without the source they name, and its
+/// merge summary. They carry no runtime context; a merge summary's text goes through the detector
+/// like any other.
 fn is_agit_marker(record: &Map<String, Value>) -> bool {
     let kind = record.get("type").and_then(Value::as_str);
     if kind == Some("system") {
-        return record.len() == 3
-            && record.get("source").is_some_and(Value::is_string)
+        // Older markers may name no source; they carry no other field either.
+        let sourced = record.len() == 3 && record.get("source").is_some_and(Value::is_string);
+        return (sourced || record.len() == 2)
             && matches!(
                 record.get("subtype").and_then(Value::as_str),
                 Some(
@@ -313,7 +428,8 @@ fn typed_content(content: &Value) -> Option<Value> {
 }
 
 /// A tool result without the elements the runtime appended to it. The output itself stays,
-/// empty when nothing else was there, so the call keeps its result.
+/// empty when nothing else was there, so the call keeps its result. Of a result made of parts,
+/// text parts and images stay; any other part, such as one nesting further parts, is left out.
 fn tool_result(block: &Value) -> Value {
     let mut block = block.clone();
     match &block["content"] {
@@ -330,7 +446,8 @@ fn tool_result(block: &Value) -> Value {
                             part
                         })
                     }
-                    _ => Some(part.clone()),
+                    _ if part["type"] == "image" => Some(part.clone()),
+                    _ => None,
                 })
                 .collect();
             block["content"] = Value::Array(parts);
@@ -644,40 +761,19 @@ impl Classifier {
     fn opencode(&mut self, record: &Map<String, Value>) -> Option<Value> {
         match record.get("kind").and_then(Value::as_str)? {
             "message" => {
-                let data = record.get("data")?.as_object()?;
-                let role = data.get("role").and_then(Value::as_str)?;
+                let role = record.get("data")?.get("role")?.as_str()?;
                 if let Some(id) = record.get("id").and_then(Value::as_str) {
                     self.opencode_roles.insert(id.to_owned(), role.to_owned());
                 }
-                let mut header = Map::new();
-                for key in ["role", "mode"] {
-                    if let Some(value) = data.get(key) {
-                        header.insert(key.into(), value.clone());
-                    }
-                }
-                let mut kept = Map::new();
-                for key in ["id", "kind", "session_id", "time_created"] {
-                    if let Some(value) = record.get(key) {
-                        kept.insert(key.into(), value.clone());
-                    }
-                }
-                kept.insert("data".into(), Value::Object(header));
-                Some(Value::Object(kept))
+                opencode_header(record)
             }
             "part" => {
-                let data = record.get("data")?;
-                let role = record
+                let assistant = record
                     .get("message_id")
                     .and_then(Value::as_str)
-                    .and_then(|id| self.opencode_roles.get(id));
-                let kept = match data["type"].as_str()? {
-                    "text" => {
-                        role.is_some_and(|role| role == "assistant") && data["synthetic"] != true
-                    }
-                    "reasoning" | "tool" | "compaction" => true,
-                    _ => false,
-                };
-                kept.then(|| Value::Object(record.clone()))
+                    .and_then(|id| self.opencode_roles.get(id))
+                    .is_some_and(|role| role == "assistant");
+                opencode_part(record, assistant)
             }
             // The other storage shape: one row per message, its parts inside. Assistant rows
             // keep their timing and their text, reasoning and tool items; a compaction keeps its
@@ -718,6 +814,37 @@ impl Classifier {
             _ => None,
         }
     }
+}
+
+/// An OpenCode message header as it is published: its role and mode only.
+fn opencode_header(record: &Map<String, Value>) -> Option<Value> {
+    let data = record.get("data")?.as_object()?;
+    data.get("role")?.as_str()?;
+    let mut header = Map::new();
+    for key in ["role", "mode"] {
+        if let Some(value) = data.get(key) {
+            header.insert(key.into(), value.clone());
+        }
+    }
+    let mut kept = Map::new();
+    for key in ["id", "kind", "session_id", "time_created"] {
+        if let Some(value) = record.get(key) {
+            kept.insert(key.into(), value.clone());
+        }
+    }
+    kept.insert("data".into(), Value::Object(header));
+    Some(Value::Object(kept))
+}
+
+/// An OpenCode part as it is published under an assistant message or under any other.
+fn opencode_part(record: &Map<String, Value>, under_assistant: bool) -> Option<Value> {
+    let data = record.get("data")?;
+    let kept = match data["type"].as_str()? {
+        "text" => under_assistant && data["synthetic"] != true,
+        "reasoning" | "tool" | "compaction" => true,
+        _ => false,
+    };
+    kept.then(|| Value::Object(record.clone()))
 }
 
 // ---- Hermes, OpenClaw, WorkBuddy ------------------------------------------------------------
