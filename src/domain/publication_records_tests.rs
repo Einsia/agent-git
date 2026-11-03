@@ -6,8 +6,16 @@ const MEMORY_MD: &str = "CANARY-AUTO-MEMORY-MD-91c2";
 const AGENTS_MD: &str = "CANARY-PROJECT-AGENTS-MD-4be8";
 const GLOBAL_AGENTS_MD: &str = "CANARY-GLOBAL-CODEX-AGENTS-MD-d05e";
 
+/// The class of `record` on its own, checked to be the same by the kind of the record and by
+/// what publication keeps of it.
 fn class(source: &str, record: &Value) -> RecordClass {
-    record_class(source, record)
+    let by_kind = record_class(source, record);
+    assert_eq!(
+        by_kind,
+        class_from(published(source, record), record),
+        "{source}: {record}"
+    );
+    by_kind
 }
 
 /// Every kept record is published in a form the Hub accepts as it is, and publishing it again
@@ -901,6 +909,125 @@ fn opencode_single_row_messages_follow_the_same_rule() {
     assert_eq!(published("opencode", &user), None);
     let other = json!({"id":"msg_v5","kind":"session_message","type":"agent-switch","data":{"agent":AGENTS_MD}});
     assert_eq!(published("opencode", &other), None);
+}
+
+/// The ordered judgement of kinds is the judgement of the records: a session's records give the
+/// same classes whether each is read in full in order or reduced to its kind first. An OpenCode
+/// part takes its role from the header before it in both.
+#[test]
+fn the_ordered_judgement_of_kinds_matches_what_publication_keeps() {
+    let header = |id: &str, role: &str| json!({"id":id,"kind":"message","session_id":"ses","time_created":1,"data":{"role":role}});
+    let text = |id: &str, message: &str| json!({"id":id,"kind":"part","message_id":message,"data":{"type":"text","text":"words"}});
+    let mut sessions: Vec<Vec<(&str, Value)>> = vec![
+        vec![
+            ("opencode", header("m1", "user")),
+            ("opencode", text("p1", "m1")),
+            ("opencode", header("m2", "assistant")),
+            ("opencode", text("p2", "m2")),
+            ("opencode", text("p3", "m3")),
+            ("opencode", header("m3", "assistant")),
+            ("opencode", text("p4", "m3")),
+            ("opencode", header("m2", "user")),
+            ("opencode", text("p5", "m2")),
+            (
+                "opencode",
+                json!({"id":"m4","kind":"message","data":{"role":"assistant","system":AGENTS_MD}}),
+            ),
+            ("opencode", text("p6", "m4")),
+            (
+                "opencode",
+                json!({"id":"p7","kind":"part","message_id":"m2","data":{"type":"tool","tool":"read"}}),
+            ),
+        ],
+        claude_transcript()
+            .into_iter()
+            .map(|(record, _)| ("claude-code", record))
+            .collect(),
+    ];
+    sessions.push(
+        sessions[0]
+            .iter()
+            .chain(&sessions[1])
+            .map(|(source, record)| (*source, record.clone()))
+            .collect(),
+    );
+    for records in sessions {
+        let mut by_kind = Classifier::default();
+        let mut by_content = Classifier::default();
+        for (source, record) in &records {
+            let kind = record_kind(source, record);
+            assert_eq!(
+                by_kind.class_of(kind),
+                class_from(by_content.published(source, record), record),
+                "{source}: {record}"
+            );
+        }
+    }
+    // What a reader keeps per record is small and holds nothing of the record's text.
+    fn copy<T: Copy>(_: T) {}
+    let kind = record_kind("opencode", &header("m1", "assistant"));
+    copy(kind);
+    assert!(std::mem::size_of::<RecordKind>() <= 32);
+    assert!(!format!("{kind:?}").contains("m1"));
+}
+
+/// A tool result's parts are kept only as text, stripped of injected elements, or as images; a
+/// part of any other shape, such as one nesting further parts, publishes nothing, and the parts
+/// beside it stay.
+#[test]
+fn a_nested_tool_result_part_publishes_nothing() {
+    let reminder = format!("<system-reminder>{MEMORY_MD}</system-reminder>");
+    let record = json!({"type":"user","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"toolu_1","content":[
+            {"type":"text","text":"listing"},
+            {"type":"container","content":[{"type":"text","text":reminder.clone()}]},
+            [{"type":"text","text":reminder.clone()}],
+            {"type":"document","source":{"type":"text","data":CLAUDE_MD}},
+            {"type":"image","source":{"type":"base64","data":"IMAGE"}}]}]}});
+    let kept = published("claude-code", &record).unwrap();
+    assert_eq!(
+        kept["message"]["content"][0]["content"],
+        json!([{"type":"text","text":"listing"},
+               {"type":"image","source":{"type":"base64","data":"IMAGE"}}])
+    );
+    assert!(!kept.to_string().contains(MEMORY_MD) && !kept.to_string().contains(CLAUDE_MD));
+    assert_stable("claude-code", &record);
+}
+
+/// A merge marker that names no source is kept when it is exactly an agit marker, and withheld
+/// with any other field.
+#[test]
+fn a_sourceless_agit_marker_is_kept_only_as_it_is() {
+    for subtype in [
+        "agit:__merge_start__",
+        "agit:__merge_end__",
+        "agit:__cherry_pick_start__",
+        "agit:__cherry_pick_end__",
+        "agit:__revert__",
+    ] {
+        let marker = json!({"type":"system","subtype":subtype});
+        for source in RUNTIMES {
+            assert_eq!(
+                class(source, &marker),
+                RecordClass::Conversation,
+                "{subtype}"
+            );
+        }
+        let mut extra = marker.clone();
+        extra["note"] = json!(CLAUDE_MD);
+        assert_eq!(class("claude-code", &extra), RecordClass::RuntimeContext);
+    }
+    for marker in [
+        json!({"type":"system","subtype":"agit:__other__"}),
+        json!({"type":"user","subtype":"agit:__merge_start__"}),
+        json!({"type":"system","subtype":"agit:__merge_start__","source":7}),
+    ] {
+        assert_eq!(
+            class("claude-code", &marker),
+            RecordClass::RuntimeContext,
+            "{marker}"
+        );
+    }
 }
 
 /// Where Claude Code puts its reminders in a person's text, as observed: ahead of the words, after
