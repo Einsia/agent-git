@@ -311,6 +311,75 @@ async fn prepared_session_rpc_serializes_declared_turn_results() {
         serde_json::from_value(interrupt_result).expect("declared interrupt result decodes");
 }
 
+/// A turn start whose outcome comes back at once is logged as received and resolved with its
+/// outcome class, without waiting for any window to pass.
+#[tokio::test]
+async fn a_turn_start_answered_at_once_is_logged_with_its_outcome() {
+    // Opens the daemon-wide log before the start, so its events land there.
+    crate::rc::diagnostics::test_events("session-log-315", 0);
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut live = rpc_test_live(
+        "session-log-315",
+        1,
+        tx,
+        crate::protocol::PermissionMode::Default,
+    );
+    live.info.runtime = "claude-code".into();
+    let daemon = rpc_test_daemon(
+        [("session-log-315".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    let mut turn = Frame::request(
+        method::TURN_START,
+        TurnStart {
+            session_id: "session-log-315".into(),
+            message: "SYNTHETIC-PRIVATE-PROMPT".into(),
+            by: Some("operator".into()),
+            client_msg_id: Some("message-1".into()),
+        },
+    );
+    turn.caller = Some(claim("operator", "ws-a"));
+    let prepared = daemon
+        .lock()
+        .await
+        .prepare_session_rpc(&turn)
+        .expect("turn is admitted");
+    let worker_daemon = daemon.clone();
+    let worker = tokio::spawn(async move {
+        let (_stop_tx, mut stop) = tokio::sync::watch::channel(false);
+        prepared.execute(worker_daemon, &mut stop).await
+    });
+    match rx.recv().await.expect("turn command is queued") {
+        Command::Turn { reply, .. } => {
+            assert!(reply.accept());
+            reply.finish(Ok(TurnStartOutcome::Accepted {
+                turn_id: "turn-315".into(),
+                still_running: true,
+                consumed_mode: None,
+                confirmation: TurnStartConfirmation::Exact,
+            }));
+        }
+        _ => panic!("wrong queued command"),
+    }
+    worker.await.unwrap().response.expect("turn succeeds");
+    let events = crate::rc::diagnostics::test_events("session-log-315", 2);
+    let names: Vec<_> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        ["turn.start_received", "turn.start_resolved"],
+        "{events:?}"
+    );
+    assert_eq!(events[1]["metadata"]["outcome"], "Accepted");
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("SYNTHETIC-PRIVATE-PROMPT")
+    );
+}
+
 #[test]
 fn a_taken_turn_with_a_lost_typed_outcome_never_releases_its_gate() {
     let home = tempfile::tempdir().unwrap();

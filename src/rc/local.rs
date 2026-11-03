@@ -215,7 +215,7 @@ pub(super) fn wait_ready() -> crate::Result<()> {
         }
         ensure!(
             std::time::Instant::now() < deadline,
-            "agitd did not become ready; inspect agitd-*.log in {}",
+            "agitd did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
             super::rc_dir()?.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));

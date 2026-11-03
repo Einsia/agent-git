@@ -2468,6 +2468,24 @@ impl Session {
         let generation = self.generation;
         let notes = self.notes.clone();
         self.run_inner(&mut commands).await;
+        let exiting = std::time::Instant::now();
+        let log = |event: &str, extra: serde_json::Value| {
+            let mut metadata = serde_json::json!({
+                "session_id": crate::rc::diagnostics::id(&id),
+                "generation": generation,
+                "elapsed_ms": crate::rc::diagnostics::elapsed_ms(exiting),
+            });
+            if let (Some(metadata), serde_json::Value::Object(extra)) =
+                (metadata.as_object_mut(), extra)
+            {
+                metadata.extend(extra);
+            }
+            crate::rc::diagnostics::event(event, metadata);
+        };
+        log(
+            "supervisor.exiting",
+            serde_json::json!({"in_turn": self.writer_in_turn()}),
+        );
         // Final safety net for EOF/command-channel shutdown paths. The maps are
         // about native requests owned by this process; none survive its exit.
         self.abandon_pending_approvals().await;
@@ -2480,7 +2498,12 @@ impl Session {
         // machine. Funnelling into the single finally point means a newly added exit branch
         // cannot miss it either. A failed cleanup leaves a diagnostic behind but must not
         // swallow Ended — the daemon still has to remove a finished session from its table.
-        match self.driver.shutdown().await {
+        let shutdown = self.driver.shutdown().await;
+        log(
+            "supervisor.harness_shutdown",
+            serde_json::json!({"ok": shutdown.is_ok()}),
+        );
+        match shutdown {
             Ok(()) => {
                 self.record_writer_release(&id);
                 let _ = notes
@@ -2507,10 +2530,13 @@ impl Session {
         // **A session ending is a settlement boundary too.** Funnelled into the same single
         // finally point: Shutdown, driver EOF and harness Exited each return on their own, and
         // adding the call to them one by one always misses one.
+        log("supervisor.settle_started", serde_json::json!({}));
         self.settle_on_exit().await;
+        log("supervisor.settle_finished", serde_json::json!({}));
         // **Every exit path announces.** Here rather than one line before each `return`,
         // because forgetting to announce on a newly added exit path has no symptom at all —
         // that row stays silently in `sessions` while its channel is dead.
+        log("supervisor.ended", serde_json::json!({}));
         let _ = notes
             .send(SessionNote::Ended {
                 session_id: id,
@@ -3001,6 +3027,14 @@ impl Session {
                             return;
                         }
                         Some(HarnessEvent::Exited { code }) => {
+                            crate::rc::diagnostics::event(
+                                "runtime.exited",
+                                serde_json::json!({
+                                    "session_id": crate::rc::diagnostics::id(&self.info.session_id),
+                                    "generation": self.generation,
+                                    "exit_code": code,
+                                }),
+                            );
                             self.abandon_pending_approvals().await;
                             // Drain whatever the harness wrote on its way out.
                             // The held-back delta tails go first, ahead of the
