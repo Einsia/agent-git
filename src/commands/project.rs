@@ -907,7 +907,7 @@ fn new_branch(project: &Project, candidate: &Candidate) -> String {
     });
     let words = gist
         .as_deref()
-        .map(|gist| super::front::slug(&without_markup(gist), 40))
+        .and_then(|gist| branch_words(project, gist))
         .unwrap_or_default();
     let runtime = match candidate.runtime.as_str() {
         "claude-code" => "claude",
@@ -929,6 +929,21 @@ fn new_branch(project: &Project, candidate: &Candidate) -> String {
     } else {
         short
     }
+}
+
+/// The words of a new branch's name: the opening request as it is published, with every value
+/// publication replaces left out, so nothing replaced in the conversation reaches the name.
+/// `None` when that can't be checked.
+fn branch_words(project: &Project, request: &str) -> Option<String> {
+    let redactor = match checkout(project) {
+        Ok(repo) => crate::domain::redact::Redactor::try_this_machine()
+            .ok()?
+            .with_repository(repo.root())
+            .ok()?,
+        Err(_) => crate::domain::redact::Redactor::try_this_machine().ok()?,
+    };
+    let published = redactor.branch_name_source(&without_markup(request))?;
+    Some(super::front::slug(&published, 40))
 }
 
 /// A request's text without the markup a runtime or a paste wraps around it, such as

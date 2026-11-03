@@ -44,6 +44,8 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+#[cfg(feature = "cli")]
+use zeroize::Zeroizing;
 
 /// What a reader sees in place of text whose privacy check did not complete.
 pub const WITHHELD: &str = "[privacy check pending: text withheld]";
@@ -710,6 +712,65 @@ impl Redactor {
         )
     }
 
+    /// The text a session branch is named from: the first prompt as it is published, with every
+    /// replaced value left out. `None` when the privacy check cannot run, so the caller names the
+    /// branch without the prompt's words.
+    #[cfg(feature = "cli")]
+    pub(crate) fn branch_name_source(&self, prompt: &str) -> Option<String> {
+        branch_text(prompt, |text| {
+            let protected = crate::domain::privacy::service::transform(
+                self.repo.as_deref(),
+                text,
+                crate::domain::privacy::projector::Mode::ProtectText,
+            );
+            crate::domain::privacy::service::passed(&protected).then_some(protected.content)
+        })
+    }
+
+    /// Whether a branch name carries any part of `prompt` that publication replaces: a
+    /// high-confidence finding or a value the person registered.
+    #[cfg(feature = "cli")]
+    pub(crate) fn name_carries_replaced(&self, name: &str, prompt: &str) -> crate::Result<bool> {
+        let scan = crate::domain::privacy::detector::scan_high_confidence(prompt, 64);
+        anyhow::ensure!(
+            scan.complete,
+            "the privacy check for `{name}` could not complete; retrying the push usually works"
+        );
+        let mut replaced: Vec<Zeroizing<String>> = scan
+            .findings
+            .iter()
+            .map(|span| Zeroizing::new(prompt[span.start..span.end].to_owned()))
+            .collect();
+        let protected = crate::domain::privacy::service::transform(
+            self.repo.as_deref(),
+            prompt,
+            crate::domain::privacy::projector::Mode::ProtectText,
+        );
+        anyhow::ensure!(
+            crate::domain::privacy::service::passed(&protected),
+            "the privacy check for `{name}` could not run; retrying the push usually works (`agit doctor` if it keeps failing)"
+        );
+        let pieces = replaced_values(prompt, &protected.content, |tokens| {
+            restore_all(tokens, |text| {
+                let restored = crate::domain::privacy::service::transform(
+                    self.repo.as_deref(),
+                    text,
+                    crate::domain::privacy::projector::Mode::HydrateText,
+                );
+                (crate::domain::privacy::service::passed(&restored)
+                    && restored.replacements == tokens.len())
+                .then(|| Zeroizing::new(restored.content))
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the privacy check for `{name}` could not complete; retrying the push usually works"
+            )
+        })?;
+        replaced.extend(pieces);
+        Ok(carries(name, &replaced))
+    }
+
     #[cfg(feature = "cli")]
     pub(crate) fn scrub_persona(&self, text: &str) -> Report {
         self.persona_only(text)
@@ -1208,6 +1269,165 @@ fn empty_report() -> Report {
     }
 }
 
+/// A prompt with every high-confidence finding removed here, then protected by `protect` (the
+/// privacy worker, which also replaces the values the person registered), with its placeholders
+/// dropped. `None` when `protect` cannot run.
+#[cfg(feature = "cli")]
+fn branch_text(prompt: &str, protect: impl FnOnce(&str) -> Option<String>) -> Option<String> {
+    let scan = crate::domain::privacy::detector::scan_high_confidence(prompt, 64);
+    if !scan.complete {
+        return None;
+    }
+    let mut kept = String::new();
+    let mut at = 0;
+    for span in &scan.findings {
+        if span.start >= at {
+            kept.push_str(&prompt[at..span.start]);
+            kept.push(' ');
+            at = span.end;
+        }
+    }
+    kept.push_str(&prompt[at..]);
+    let protected = protect(&kept)?;
+    let mut words = String::new();
+    let mut at = 0;
+    for (start, end, _) in crate::domain::privacy::projector::tokens(&protected) {
+        words.push_str(&protected[at..start]);
+        words.push(' ');
+        at = end;
+    }
+    words.push_str(&protected[at..]);
+    Some(words)
+}
+
+/// Whether `name` carries any of `values`, compared case-insensitively with every run of other
+/// characters read as one `-`, since that is how a prompt becomes a branch name. A long word of
+/// the name inside one long word of a value counts too: a name cut to length may hold only part
+/// of a token.
+#[cfg(feature = "cli")]
+fn carries(name: &str, values: &[impl AsRef<str>]) -> bool {
+    let name = name_words(name);
+    values.iter().any(|value| {
+        let value = Zeroizing::new(name_words(value.as_ref()));
+        !value.is_empty()
+            && (name.contains(value.as_str())
+                || value
+                    .split('-')
+                    .filter(|part| part.len() >= 16)
+                    .any(|part| {
+                        name.split('-')
+                            .any(|word| word.len() >= 8 && part.contains(word))
+                    }))
+    })
+}
+
+/// Lowercase ASCII words joined by single `-`s: how a branch name is spelled from text.
+#[cfg(feature = "cli")]
+fn name_words(text: &str) -> String {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Every value `protected` replaced in `original`: each placeholder's own value, and the text
+/// each run of adjacent placeholders stands for. `restore` is asked once, for the distinct
+/// placeholders in order, and its answers are reused for repeats: each ask reloads the whole
+/// dictionary. `None` when a value can't be restored or the two texts can't be aligned, so
+/// nothing is guessed.
+#[cfg(feature = "cli")]
+fn replaced_values(
+    original: &str,
+    protected: &str,
+    restore: impl FnOnce(&[&str]) -> Option<Vec<Zeroizing<String>>>,
+) -> Option<Vec<Zeroizing<String>>> {
+    let mut values: Vec<Zeroizing<String>> = replaced_pieces(original, protected)?
+        .into_iter()
+        .map(Zeroizing::new)
+        .collect();
+    let mut distinct: Vec<&str> = Vec::new();
+    for (_, _, token) in crate::domain::privacy::projector::tokens(protected) {
+        if !distinct.contains(&token) {
+            distinct.push(token);
+        }
+    }
+    if distinct.is_empty() {
+        return Some(values);
+    }
+    let restored = restore(&distinct)?;
+    if restored.len() != distinct.len() {
+        return None;
+    }
+    for value in restored {
+        if value.is_empty()
+            || crate::domain::privacy::projector::tokens(&value)
+                .next()
+                .is_some()
+            || !original.contains(value.as_str())
+        {
+            return None;
+        }
+        values.push(value);
+    }
+    Some(values)
+}
+
+/// `tokens` restored by one call of `hydrate` on them all, each kept apart by a separator no
+/// value holds. `None` when the answer doesn't split back into one value per token.
+#[cfg(feature = "cli")]
+fn restore_all(
+    tokens: &[&str],
+    hydrate: impl FnOnce(&str) -> Option<Zeroizing<String>>,
+) -> Option<Vec<Zeroizing<String>>> {
+    let separator = format!("\u{1f}{}\u{1f}", uuid::Uuid::new_v4().simple());
+    let restored = hydrate(&tokens.join(&separator))?;
+    let values: Vec<Zeroizing<String>> = restored
+        .split(separator.as_str())
+        .map(|value| Zeroizing::new(value.to_owned()))
+        .collect();
+    (values.len() == tokens.len()).then_some(values)
+}
+
+/// The pieces of `original` that `protected` (its protected form) shows as placeholders. A run of
+/// adjacent placeholders is one piece: the text it stands for in `original`. `None` when the two
+/// can't be aligned without guessing.
+#[cfg(feature = "cli")]
+fn replaced_pieces(original: &str, protected: &str) -> Option<Vec<String>> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (start, end, _) in crate::domain::privacy::projector::tokens(protected) {
+        match runs.last_mut() {
+            Some(run) if run.1 == start => run.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    let mut kept_until = 0;
+    for (index, &(start, end)) in runs.iter().enumerate() {
+        let before = &protected[kept_until..start];
+        at += original.get(at..)?.find(before)? + before.len();
+        let next_start = runs.get(index + 1).map_or(protected.len(), |next| next.0);
+        let after = &protected[end..next_start];
+        let hidden_end = if after.is_empty() {
+            // Only the last run can end the text; any other is followed by kept text.
+            if index + 1 != runs.len() {
+                return None;
+            }
+            original.len()
+        } else {
+            at + original.get(at..)?.find(after)?
+        };
+        if hidden_end == at {
+            return None;
+        }
+        pieces.push(original[at..hidden_end].to_owned());
+        at = hidden_end;
+        kept_until = end;
+    }
+    Some(pieces)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,6 +1520,153 @@ mod tests {
         let a = scrub(persona(), &text);
         let b = scrub(persona(), &text);
         assert_eq!(a.text, b.text);
+    }
+
+    const KEY_ID: &str = "AKIA2E7YQXK4NMZ5VJ3T";
+    const TOKEN: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    const REGISTERED: &str = "Larkspur-Overture";
+
+    fn placeholder() -> String {
+        format!(
+            "{{{{AGIT_SECRET_V2:{}:{}}}}}",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        )
+    }
+
+    fn values() -> Vec<String> {
+        [KEY_ID, TOKEN, REGISTERED].map(str::to_owned).to_vec()
+    }
+
+    /// A new session's branch is named from its opening request as published: the request's
+    /// words stay, and nothing publication replaces reaches the name, in any spelling.
+    #[test]
+    fn a_new_branch_is_named_from_the_published_request() {
+        let request = format!("deploy with {KEY_ID} and {TOKEN} using {REGISTERED} please");
+        let text = branch_text(&request, |text| {
+            Some(text.replace(REGISTERED, &placeholder()))
+        })
+        .unwrap();
+        let name = crate::commands::front::slug(&text, 200);
+        assert!(name.starts_with("deploy-with"), "{name}");
+        assert!(name.ends_with("please"), "{name}");
+        assert!(!carries(&name, &values()), "{name}");
+        assert!(
+            branch_text(&request, |_| None).is_none(),
+            "a check that can't run"
+        );
+    }
+
+    /// Before a branch new to the Hub is published, a name carrying anything publication replaces
+    /// in its session's request is found, whatever its case and separators.
+    #[test]
+    fn a_branch_name_carrying_a_replaced_value_is_found_in_any_spelling() {
+        for name in [
+            "deploy-akia2e7yqxk4nmz5vj3t",
+            "deploy_AKIA2E7YQXK4NMZ5VJ3T",
+            "use-ghp-r7kq2mxv9lpz4tnc8wjf3bhy6svd1age5ukr",
+            "with-larkspur-overture",
+            "with larkspur overture",
+            "ghp-r7kq2mxv9lpz4tnc8wjf3bhy6",
+        ] {
+            assert!(carries(name, &values()), "{name}");
+        }
+        for name in ["deploy-with-please", "overture-notes", "akia-rotation"] {
+            assert!(!carries(name, &values()), "{name}");
+        }
+        // Two values side by side are one replaced span, and a name holding both is found.
+        let joined = replaced_pieces(
+            "use LarkspurOverture now",
+            &format!("use {}{} now", placeholder(), placeholder()),
+        )
+        .expect("adjacent placeholders align");
+        assert_eq!(joined, vec!["LarkspurOverture".to_owned()]);
+        assert!(carries("use-larkspuroverture-abcd", &joined));
+        // Each of two adjacent values is found on its own too.
+        let (first, second) = (placeholder(), placeholder());
+        let restore = |tokens: &[&str]| {
+            tokens
+                .iter()
+                .map(|token| {
+                    (*token == first)
+                        .then(|| Zeroizing::new("Larkspur".to_owned()))
+                        .or_else(|| (*token == second).then(|| Zeroizing::new("Nova".to_owned())))
+                })
+                .collect()
+        };
+        let values = replaced_values(
+            "use LarkspurNova now",
+            &format!("use {first}{second} now"),
+            restore,
+        )
+        .expect("each value restored");
+        for name in [
+            "use-larkspur-abcd",
+            "use-nova-abcd",
+            "use-larkspurnova-abcd",
+        ] {
+            assert!(carries(name, &values), "{name}");
+        }
+        assert!(!carries("use-abcd", &values));
+        // A value that can't be restored is no answer.
+        assert!(
+            replaced_values(
+                "use LarkspurNova now",
+                &format!("use {first}{second} now"),
+                |_| None
+            )
+            .is_none()
+        );
+        // Text that can't be aligned without guessing is no answer at all.
+        assert_eq!(
+            replaced_pieces("use something else", &format!("use {} now", placeholder())),
+            None
+        );
+        let token = placeholder();
+        let original = format!("use {REGISTERED} now");
+        assert_eq!(
+            replaced_pieces(&original, &format!("use {token} now")),
+            Some(vec![REGISTERED.to_owned()])
+        );
+    }
+
+    /// A request repeating its placeholders many times asks the privacy log once, for each
+    /// distinct placeholder, and the repeats reuse those answers.
+    #[test]
+    fn repeated_placeholders_are_restored_in_one_ask() {
+        let (first, second) = (placeholder(), placeholder());
+        let original = format!("use {REGISTERED} and Nova ").repeat(1024);
+        let protected = format!("use {first} and {second} ").repeat(1024);
+        let dictionary = [(first.as_str(), REGISTERED), (second.as_str(), "Nova")];
+        let hydrate = |text: &str| {
+            let mut text = text.to_owned();
+            for (token, value) in dictionary {
+                text = text.replace(token, value);
+            }
+            Some(Zeroizing::new(text))
+        };
+        let asks = std::cell::Cell::new(0);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let values = replaced_values(&original, &protected, |tokens| {
+            asks.set(asks.get() + 1);
+            asked
+                .borrow_mut()
+                .extend(tokens.iter().map(|token| token.to_string()));
+            restore_all(tokens, hydrate)
+        })
+        .expect("each value restored");
+        assert_eq!(asks.get(), 1, "one ask for 2,048 placeholders");
+        assert_eq!(*asked.borrow(), [first.clone(), second.clone()]);
+        assert!(carries("with-larkspur-overture", &values));
+        assert!(carries("use-nova", &values));
+        // An answer that doesn't split back into one value per placeholder is no answer.
+        assert!(
+            restore_all(&[first.as_str(), second.as_str()], |_| Some(
+                Zeroizing::new("Larkspur".to_owned())
+            ))
+            .is_none()
+        );
+        assert!(restore_all(&[first.as_str()], |_| None).is_none());
     }
 
     /// A credential-shaped branch name is refused by the detector in this process, before the

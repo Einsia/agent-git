@@ -645,6 +645,49 @@ fn remote_movement(
     }
 }
 
+/// The opening request of the session a branch head belongs to, or `None` for a head that is
+/// not a session line.
+fn opening_request(
+    source: &Repo,
+    sessions: &sources::History,
+    head: &str,
+) -> Result<Option<String>> {
+    let metadata = match sessions.stored(head) {
+        Some(metadata) => metadata.clone(),
+        None => match super::super::storage::metadata_local(source.root(), head) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        },
+    };
+    if !metadata.is_session_line() {
+        return Ok(None);
+    }
+    let limit = super::super::privacy_publication::MAX_INPUT_BYTES;
+    let (log, _) =
+        super::super::storage::materialize_pair_local(source.root(), head, limit, limit)?;
+    // The stored request has its protected values replaced already; the name may have been made
+    // from the original, so it is compared with the request as publication restores it.
+    let native = zeroize::Zeroizing::new(crate::domain::transcript::unwrap_strict(&log)?);
+    let native = if crate::domain::privacy::projector::tokens(&native)
+        .next()
+        .is_some()
+    {
+        let preserve = super::super::storage::parse_envelopes(&log)?
+            .iter()
+            .any(|record| crate::domain::privacy::projector::has_wrapped_carrier(&record.content));
+        crate::domain::privacy::service::PublicationHydrator::new(source.root(), preserve)?
+            .jsonl(&native)?
+    } else {
+        native
+    };
+    let session = crate::adapter::get(&metadata.runtime)?.parse(&native)?;
+    Ok(session
+        .events
+        .iter()
+        .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
+        .and_then(|event| event.text.clone()))
+}
+
 impl ProjectedHistory {
     pub fn prepare_sessions(
         source: &Repo,
@@ -809,8 +852,18 @@ impl ProjectedHistory {
                     .context("invalid publication branch")?;
                 ensure!(
                     redactor.publishes_unchanged(branch)?,
-                    "publication branch name requires privacy rewriting; rename it before publishing"
+                    "a branch name contains text the privacy check would change, so it can't be published as it is; rename the branch with `agit branch rename OLD NEW` (`agit branch` lists them), then push again"
                 );
+                // A branch new to the Hub is named from its session's opening request: it must
+                // carry nothing publication replaces in that request, in any spelling.
+                if !selected.remote.refs.contains_key(head.name())
+                    && let Some(request) = opening_request(&source, source_sessions, head.oid())?
+                {
+                    ensure!(
+                        !redactor.name_carries_replaced(branch, &request)?,
+                        "a branch name contains text the privacy check would change, so it can't be published as it is; rename the branch with `agit branch rename OLD NEW` (`agit branch` lists them), then push again"
+                    );
+                }
                 let reachable = ancestors(head.oid(), walk)?;
                 // Below a boundary the remote head may be held history the walk did not reach;
                 // whether the publication fast-forwards it is checked against the Hub before
