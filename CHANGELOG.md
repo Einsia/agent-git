@@ -8,6 +8,35 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.40] - 2026-11-05
+
+### Added
+
+- `agit repair placeholders` puts back values an older agit replaced in a repository's files; real credentials stay
+  replaced, and nothing is published until you push.
+- `agit setup --remove-skill --runtime <tool>` turns agit's Skill off for one tool and keeps it off through later setups
+  and upgrades.
+
+### Changed
+
+- `agit setup` now sets up only the AI tools installed on this computer; run it again after installing another, or use
+  `agit setup --all` for every tool agit supports.
+- `agit upgrade` now sets up an AI tool installed since the last setup (agit's Skill, capture hooks and MCP) and says
+  which; that tool's conversations are then saved on this computer, and uploaded only in folders set to upload.
+- Refusals to edit or merge an encrypted publication now point only to continuing the session natively, and a fork of
+  an encrypted snapshot can be continued on this computer but isn't published.
+
+### Fixed
+
+- A session that includes another session published encrypted is no longer published as a plain session; such a push is
+  refused and nothing is uploaded.
+- A push that is refused or fails its destination checks no longer contacts the Hub to sync the privacy dictionary.
+- A long session with many records no longer fails its first upload with "local Git inspection exceeds its output limit".
+- When a repository `agit push` meant to create already exists by the time it asks, the push stops and asks again instead
+  of continuing into it.
+- The background service no longer rewrites its session catalog every few seconds while idle, which wore the disk and
+  used CPU on computers with many sessions.
+
 ## [0.2.39] - 2026-11-04
 
 ### Changed
