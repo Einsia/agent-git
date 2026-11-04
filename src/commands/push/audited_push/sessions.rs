@@ -197,12 +197,27 @@ pub(super) fn run(
             selection.verify(&repo)?;
         }
         let creating = ui::publication::stage("Creating publication destination");
-        let created = super::super::super::remote_request(client.publish(&PublishRequest {
+        let created = match client.publish(&PublishRequest {
             name: intent.name.clone(),
             owner: (intent.owner != intent.account).then(|| intent.owner.clone()),
             public: intent.visibility == "public",
             repo_origins: Vec::new(),
-        }))?;
+            expect_new: true,
+        }) {
+            // The confirmed creation is of a new repository; one that exists by now was not
+            // what the person answered for.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::hub::client::ApiError>()
+                    .is_some_and(|api| api.status == 409) =>
+            {
+                return Err(super::RepositoryExists {
+                    repository: repository.clone(),
+                }
+                .into());
+            }
+            result => super::super::super::remote_request(result)?,
+        };
         ensure!(
             created.owner == intent.owner
                 && created.name == intent.name

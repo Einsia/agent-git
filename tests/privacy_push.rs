@@ -82,6 +82,9 @@ struct Hub {
     /// The refusal line the next refusal carries instead of `publication_refs_moved`, such as one
     /// the client does not retry.
     refuse_with: Arc<Mutex<Option<&'static str>>>,
+    /// The next repository creation finds the name taken: the repository appears, as one made
+    /// by someone else between the push's lookup and its creation, and the Hub answers 409.
+    taken_on_create: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -146,6 +149,8 @@ impl Hub {
         let writing = Arc::clone(&write_on_refusal);
         let refuse_with = Arc::new(Mutex::new(None::<&'static str>));
         let refusing_with = Arc::clone(&refuse_with);
+        let taken_on_create = Arc::new(AtomicBool::new(false));
+        let taking = Arc::clone(&taken_on_create);
         let publicize_when = Arc::new(Mutex::new(None::<String>));
         let publicizing = Arc::clone(&publicize_when);
         let resolver_hub = base.clone();
@@ -421,11 +426,19 @@ impl Hub {
                         assert_eq!(request["public"], false);
                         assert_eq!(request["repo_origins"], json!([]));
                         assert!(request["owner"].is_null());
+                        // A push creates only a repository that is new.
+                        assert_eq!(request["expect_new"], true);
                         let destination = root.join("alice/app.git");
                         assert!(!destination.exists());
                         fs::create_dir_all(&destination).unwrap();
                         git(&destination, &["init", "--bare", "--initial-branch=main"]);
                         git(&destination, &["config", "http.receivepack", "true"]);
+                        if taking.swap(false, Ordering::AcqRel) {
+                            let body =
+                                r#"{"kind":"conflict","error":"this name is taken","fix":[]}"#;
+                            write!(stream, "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            continue;
+                        }
                         created.fetch_add(1, Ordering::Release);
                         Some(
                             json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","push_url":url,"web_url":format!("{resolver_hub}/alice/app")}),
@@ -676,6 +689,7 @@ impl Hub {
             refuse_moved_from,
             write_on_refusal,
             refuse_with,
+            taken_on_create,
             stop,
             worker: Some(worker),
         }
@@ -5655,5 +5669,110 @@ fn an_upload_says_once_which_records_keep_parts_left_out() {
     assert!(
         said.contains("2 records in this upload have parts the privacy check left out"),
         "{said}"
+    );
+}
+
+/// A push that decided to create its repository creates only a new one. When the name is taken
+/// by the time it asks the Hub, nothing is created or published, the push says so by name, and
+/// only the person decides whether to publish into the repository that exists: the `--yes` given
+/// for creating it does not answer that, and with nobody to ask the whole push ends, also with
+/// `--keep-going` over several branches. A push that took the existing repository in place of the
+/// new one would publish where nobody chose to; one that went on to publish the branches one at a
+/// time would find it there and do the same.
+#[test]
+fn a_repository_that_appears_before_its_creation_is_asked_about_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"hello"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn 1").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+
+    hub.taken_on_create.store(true, Ordering::Release);
+    let refused = run(&["--yes", "push", "alice/app", "--all", "--keep-going"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        said.contains("alice/app already exists on the Hub, so this push did not create it and published nothing")
+            && said.contains("run `agit push` again at a terminal"),
+        "{refused:?}"
+    );
+    assert!(git(&remote, &["for-each-ref"]).is_empty(), "{refused:?}");
+
+    // A new push sees the repository that exists, and a `--yes` given for it publishes there.
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/main"]),
+        git(repo.root(), &["rev-parse", "HEAD"])
     );
 }

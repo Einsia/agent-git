@@ -690,6 +690,10 @@ fn publish_in_groups(
     // first publication. Every later one reads it again: its retry, a branch of a failed group
     // published on its own, and a later group.
     let first = std::cell::Cell::new(true);
+    // A repository that appeared where this push meant to create one ends the whole push when
+    // nobody can be asked about it: a later group, or a branch published on its own, would find
+    // the repository there and could publish into it on answers given for creating it.
+    let stopped = std::cell::Cell::new(false);
     let publish = |group: &[String]| {
         let attempt = |attempt| {
             audited_push::run(
@@ -712,7 +716,25 @@ fn publish_in_groups(
                     ui::info(format_args!("{moved}; previewing it again"));
                     attempt(moved.retry())
                 }
-                Err(error) => Err(error),
+                Err(error) => match error.downcast::<audited_push::RepositoryExists>() {
+                    // Only a person answers for publishing into a repository they did not
+                    // create: neither a `--yes` given for the creation nor automatic upload does.
+                    Ok(exists)
+                        if !crate::commands::auto_push::is_automatic() && ui::prompt::can_ask() =>
+                    {
+                        ui::info(format_args!("{exists}; asking again"));
+                        yes.withdraw();
+                        attempt(audited_push::Attempt::First)
+                    }
+                    Ok(exists) => {
+                        stopped.set(true);
+                        Err(crate::commands::InteractionRequired(format!(
+                            "{exists}; run `agit push` again at a terminal to decide whether to publish into it"
+                        ))
+                        .into())
+                    }
+                    Err(error) => Err(error),
+                },
             },
             outcome => outcome,
         }
@@ -728,6 +750,9 @@ fn publish_in_groups(
     );
     for group in groups {
         let outcome = publish(group);
+        if stopped.get() {
+            return outcome;
+        }
         let failure = match &outcome {
             Ok(ExitCode::Ok) => continue,
             Ok(code) => (format!("exit {}", code.as_i32()), *code),
@@ -746,7 +771,11 @@ fn publish_in_groups(
             failure.0
         ));
         for branch in group {
-            match publish(std::slice::from_ref(branch)) {
+            let outcome = publish(std::slice::from_ref(branch));
+            if stopped.get() {
+                return outcome;
+            }
+            match outcome {
                 Ok(ExitCode::Ok) => {}
                 Ok(code) => failed.push((branch.clone(), format!("exit {}", code.as_i32()), code)),
                 Err(error) => {

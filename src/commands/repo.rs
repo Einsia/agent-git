@@ -206,6 +206,7 @@ fn create(target: &str, private: bool, public: bool) -> CmdResult {
         owner: in_org.then(|| owner.clone()),
         public: !private,
         repo_origins: vec![],
+        expect_new: false,
     }) {
         Ok(resp) => {
             // A hub row without a pinned local repo is a trap: the natural

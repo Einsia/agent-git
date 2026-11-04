@@ -652,7 +652,8 @@ fn a_member_first_push_creates_only_where_the_organization_lets_it() {
                 Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                 Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                 Step::new("POST /api/agents", Reply::Status(503)).with_body(json!({
-                    "name":"qa", "owner":"team", "public":false, "repo_origins":[]
+                    "name":"qa", "owner":"team", "public":false, "repo_origins":[],
+                    "expect_new":true
                 })),
             ]);
         }
@@ -692,7 +693,7 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
                         Step::new("GET /api/agents/team/qa", Reply::Status(404)),
                         Step::new("POST /api/agents", Reply::Status(rejection)).with_body(json!({
                             "name":"qa", "owner":"team", "public":public,
-                            "repo_origins":[]
+                            "repo_origins":[], "expect_new":true
                         })),
                     ],
                 );
@@ -760,7 +761,7 @@ fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_
             )
             .with_body(json!({
                 "name":"qa", "owner":"team", "public":false,
-                "repo_origins":[]
+                "repo_origins":[], "expect_new":true
             })),
         ];
         if case != "post-owner" {

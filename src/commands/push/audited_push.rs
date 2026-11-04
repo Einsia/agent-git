@@ -90,10 +90,30 @@ impl Yes {
         self.given && !self.withdrawn.get()
     }
 
-    fn withdraw(&self) {
+    pub(super) fn withdraw(&self) {
         self.withdrawn.set(true);
     }
 }
+
+/// A first publication that set out to create its repository found one by that name on the Hub.
+/// Nothing was created or published; publishing into the existing repository is a decision of its
+/// own, asked again by name.
+#[derive(Debug)]
+pub(super) struct RepositoryExists {
+    pub(super) repository: String,
+}
+
+impl std::fmt::Display for RepositoryExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} already exists on the Hub, so this push did not create it and published nothing",
+            self.repository
+        )
+    }
+}
+
+impl std::error::Error for RepositoryExists {}
 
 /// What a publication preview puts before the person: where it goes, and the sessions and policy
 /// its receipt binds. Equal values are the same publication; any difference is one nobody
