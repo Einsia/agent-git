@@ -1633,6 +1633,43 @@ struct Conversation {
     left_out: BTreeSet<String>,
 }
 
+/// The longest path under `events/` a session tree may list. The reader refuses a longer one
+/// before holding all of it, so with the most events a session may hold it bounds what
+/// [`held_events`] keeps in memory; a bound checked only on the finished path leaves a tree with
+/// one huge name free to fill memory first.
+const MAX_EVENT_PATH_BYTES: usize = 4096;
+
+/// Every event object `oid`'s tree holds under `events/`, named by its LOG or not.
+///
+/// The listing grows with the session, so it is streamed and bounded by what a session may hold.
+/// Read whole through one local inspection, whose output bound is sized for a single object, it
+/// refuses the snapshot of every session that recorded enough events.
+fn held_events(source: &Repo, oid: &str) -> Result<BTreeSet<String>> {
+    let mut held = BTreeSet::new();
+    source.git_stream_split_local_bounded(
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            oid,
+            "--",
+            meta::EVENTS_DIR,
+        ],
+        0,
+        MAX_EVENT_PATH_BYTES,
+        |path| {
+            ensure!(
+                held.len() < crate::domain::storage::MAX_SEQUENCE_EVENTS,
+                "a session tree holds more event objects than a session may"
+            );
+            held.insert(String::from_utf8(path.to_vec()).context("event path is not UTF-8")?);
+            Ok(())
+        },
+    )?;
+    Ok(held)
+}
+
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
 /// The local commit is left as it is, so local history and resume keep the complete native
 /// transcript.
@@ -1690,20 +1727,7 @@ fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<C
     // must leave the tree, so a tree holding one is never published as it is. A v0 tree has no
     // such objects; an `events/` there is the repository's own content.
     let held = if metadata.layout == meta::LayoutVersion::V1 {
-        source
-            .git_bytes_result(&[
-                "ls-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                oid,
-                "--",
-                meta::EVENTS_DIR,
-            ])?
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8(path.to_vec()).context("event path is not UTF-8"))
-            .collect::<Result<BTreeSet<_>>>()?
+        held_events(source, oid)?
     } else {
         BTreeSet::new()
     };
@@ -2639,6 +2663,53 @@ mod tests {
                 left_out: BTreeSet::new(),
             }
         );
+    }
+
+    /// A long session's snapshot lists every event object it holds, where its listing is longer
+    /// than one local inspection may print. Each object is one line of the listing, so a listing
+    /// read whole through that inspection refuses the first publication of every session that
+    /// recorded enough events.
+    #[test]
+    fn a_snapshot_lists_every_event_object_past_one_inspections_output() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let line = meta::event_path(&"0".repeat(meta::EVENT_ID_HEX_LEN))
+            .unwrap()
+            .len()
+            + 1;
+        let count = crate::domain::repo::MAX_INSPECTION_OUTPUT_BYTES / line + 1;
+        let blob = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(b"{}\n")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        let mut index = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["update-index", "--add", "--index-info"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = index.stdin.take().unwrap();
+        for id in 0..count {
+            let path = meta::event_path(&format!("{id:040x}")).unwrap();
+            writeln!(input, "100644 {}\t{path}", blob.trim()).unwrap();
+        }
+        drop(input);
+        assert!(index.wait().unwrap().success());
+        let tree = git(temp.path(), &["write-tree"]);
+        let commit = git(temp.path(), &["commit-tree", &tree, "-m", "long session"]);
+        let source = Repo::at(temp.path()).local_objects_only();
+        assert_eq!(held_events(&source, &commit).unwrap().len(), count);
     }
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
