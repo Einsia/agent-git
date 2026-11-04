@@ -9,6 +9,32 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const SCAN_PAGE: usize = 100;
+/// How soon a source is swept again after a sweep that found a change, and the longest it waits
+/// once its sweeps keep finding none: each unchanged sweep doubles the wait up to this.
+const SWEEP_AGAIN_MS: (i64, i64) = (2000, 30_000);
+/// What this process knows of each source's sweeps, by catalog and source: the sweep in
+/// progress, and how long the next one waits.
+static SWEEPS: std::sync::Mutex<std::collections::BTreeMap<(PathBuf, String), SweepState>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[derive(Default)]
+struct SweepState {
+    sweep: Option<Sweep>,
+    /// The wait after the last complete sweep; `0` before this process completed one.
+    idle_ms: i64,
+}
+
+/// One pass over a source's conversations, page by page: the conversations it has seen so far.
+/// Only a pass this process saw from its first page knows every conversation the source still
+/// has, so only such a pass removes the rest. A pass found half done (the daemon restarted during
+/// it) completes without removing anything, and the next one starts from the first page.
+struct Sweep {
+    epoch: i64,
+    seen: std::collections::HashSet<String>,
+    whole: bool,
+    /// Whether any page of this pass changed the catalog.
+    changed: bool,
+}
 /// A catalog moved aside because it could not be opened is kept this long for inspection, then
 /// removed the next time one is moved aside.
 const UNREADABLE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
@@ -349,10 +375,31 @@ impl Catalog {
             Ok::<_, anyhow::Error>(page)
         })();
         let transaction = connection.transaction()?;
+        let mut sweeps = SWEEPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = sweeps
+            .entry((self.database.clone(), source_id.clone()))
+            .or_default();
         match page {
             Ok(page) => {
+                if cursor.is_none()
+                    || state
+                        .sweep
+                        .as_ref()
+                        .is_none_or(|sweep| sweep.epoch != epoch)
+                {
+                    state.sweep = Some(Sweep {
+                        epoch,
+                        seen: Default::default(),
+                        whole: cursor.is_none(),
+                        changed: false,
+                    });
+                }
+                let sweep = state.sweep.as_mut().expect("a sweep was just started");
                 let mut changed = false;
                 for row in page.rows {
+                    sweep.seen.insert(row.session_ref.clone());
                     let serialized = serde_json::to_string(&row)?;
                     let previous: Option<String> = transaction
                         .query_row(
@@ -361,7 +408,12 @@ impl Catalog {
                             |r| r.get(0),
                         )
                         .optional()?;
-                    changed |= previous.as_deref() != Some(&serialized);
+                    // A conversation as it was is not written again: rewriting every row on every
+                    // pass is most of what a daemon writes while nothing happens.
+                    if previous.as_deref() == Some(&serialized) {
+                        continue;
+                    }
+                    changed = true;
                     transaction.execute(
                         "INSERT INTO sessions VALUES (?1,?2,?3,?4,?5) ON CONFLICT(session_ref)
                          DO UPDATE SET cwd=excluded.cwd,epoch=excluded.epoch,row=excluded.row",
@@ -375,25 +427,52 @@ impl Catalog {
                     )?;
                 }
                 let complete = page.next_cursor.is_none();
-                if complete && page.reliable {
-                    changed |= transaction.execute(
-                        "DELETE FROM sessions WHERE source_id=?1 AND epoch!=?2",
-                        params![source_id, epoch],
-                    )? > 0;
+                if complete && page.reliable && sweep.whole {
+                    let held: Vec<String> = transaction
+                        .prepare("SELECT session_ref FROM sessions WHERE source_id=?1")?
+                        .query_map([&source_id], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    for gone in held.iter().filter(|held| !sweep.seen.contains(*held)) {
+                        changed |= transaction
+                            .execute("DELETE FROM sessions WHERE session_ref=?1", [gone])?
+                            > 0;
+                    }
                 }
-                let status = if !complete {
-                    "scanning"
-                } else if page.reliable {
-                    "ready"
-                } else {
-                    "unavailable"
-                };
                 let old_status: String = transaction.query_row(
                     "SELECT status FROM sources WHERE source_id=?1",
                     [&source_id],
                     |r| r.get(0),
                 )?;
+                // A source that is ready stays ready while it is swept again: what the catalog
+                // holds for it is still complete, and flipping it to scanning and back would make
+                // every idle sweep a change to report.
+                let status = if !complete {
+                    if old_status == "ready" {
+                        "ready"
+                    } else {
+                        "scanning"
+                    }
+                } else if page.reliable {
+                    "ready"
+                } else {
+                    "unavailable"
+                };
                 changed |= old_status != status;
+                let sweep_changed = state.sweep.as_mut().is_some_and(|sweep| {
+                    sweep.changed |= changed;
+                    sweep.changed
+                });
+                let wait = if !complete {
+                    1
+                } else if sweep_changed || state.idle_ms == 0 {
+                    SWEEP_AGAIN_MS.0
+                } else {
+                    (state.idle_ms * 2).min(SWEEP_AGAIN_MS.1)
+                };
+                if complete {
+                    state.sweep = None;
+                    state.idle_ms = wait;
+                }
                 transaction.execute(
                     "UPDATE sources SET cursor=?2,epoch=?3,status=?4,due=?5 WHERE source_id=?1",
                     params![
@@ -401,7 +480,7 @@ impl Catalog {
                         page.next_cursor,
                         epoch + i64::from(complete),
                         status,
-                        now + if complete { 2000 } else { 1 }
+                        now + wait
                     ],
                 )?;
                 if changed {
@@ -409,6 +488,7 @@ impl Catalog {
                 }
             }
             Err(_) => {
+                state.sweep = None;
                 let changed = transaction.execute("UPDATE sources SET status='unavailable',due=?2 WHERE source_id=?1 AND status!='unavailable'", params![source_id, now + 5000])?;
                 transaction.execute(
                     "UPDATE sources SET cursor=NULL,epoch=epoch+1,due=?2 WHERE source_id=?1",
@@ -1053,6 +1133,113 @@ mod tests {
             125,
             "removal takes effect before the next background scan"
         );
+    }
+
+    /// An idle catalog writes no conversation: once a sweep has seen them all, sweeping again
+    /// rewrites none, bumps no revision and logs no change, and the sweeps of a source where
+    /// nothing changes come further apart. A change is written at the next sweep, and sweeps
+    /// come quickly again after it. A sweep found half done after a restart removes nothing; the
+    /// next whole sweep removes what is gone.
+    #[test]
+    fn an_idle_catalog_rewrites_no_conversation_and_sweeps_less_often() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        let roots = CanonicalRoots::from_untrusted([project.clone()]);
+        let registry = Registry::at(directory.path().join("registry")).unwrap();
+        let native = native_store(&directory.path().join("alpha"), &project, "model-alpha");
+        registry
+            .register(&directory.path().join("alpha"), None, None, None)
+            .unwrap();
+        let path = directory.path().join("cache");
+        let cache = Catalog::at(registry.clone(), path.clone()).unwrap();
+        for now in 0..3 {
+            cache.reconcile_at(&roots, now).unwrap();
+        }
+        let connection = cache.connection().unwrap();
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM sessions"), 125);
+        connection
+            .execute_batch(
+                "CREATE TABLE writes(kind TEXT NOT NULL);
+                 CREATE TRIGGER count_updates AFTER UPDATE ON sessions BEGIN
+                     INSERT INTO writes VALUES('row'); END;
+                 CREATE TRIGGER count_inserts AFTER INSERT ON sessions BEGIN
+                     INSERT INTO writes VALUES('row'); END;
+                 CREATE TRIGGER count_sources AFTER UPDATE ON sources BEGIN
+                     INSERT INTO writes VALUES('source'); END;",
+            )
+            .unwrap();
+        let revision = count("SELECT revision FROM metadata");
+        let changes = count("SELECT count(*) FROM changes");
+
+        // Five idle minutes of the worker's 250 ms ticks.
+        let mut now = 3;
+        let mut commits = 0;
+        for _ in 0..(5 * 60 * 4) {
+            now += 250;
+            let before = count("PRAGMA data_version");
+            cache.reconcile_at(&roots, now).unwrap();
+            commits += i64::from(count("PRAGMA data_version") != before);
+        }
+        assert!(commits <= 40, "{commits} commits in five idle minutes");
+        assert_eq!(
+            count("SELECT count(*) FROM writes WHERE kind='row'"),
+            0,
+            "an unchanged conversation is never written again"
+        );
+        assert_eq!(count("SELECT revision FROM metadata"), revision);
+        assert_eq!(count("SELECT count(*) FROM changes"), changes);
+        // Two pages per sweep; a sweep every 2 s would update the source 300 times.
+        let sources = count("SELECT count(*) FROM writes WHERE kind='source'");
+        assert!(
+            sources <= 40,
+            "{sources} source updates in five idle minutes"
+        );
+
+        // A change is written once, at the next sweep, and the sweep after it comes quickly.
+        native
+            .execute(
+                "UPDATE threads SET first_user_message='another question' WHERE id='thread-000'",
+                [],
+            )
+            .unwrap();
+        let due = count("SELECT due FROM sources");
+        assert!(due - now <= SWEEP_AGAIN_MS.1);
+        while count("SELECT count(*) FROM writes WHERE kind='row'") == 0 {
+            now += 250;
+            cache.reconcile_at(&roots, now).unwrap();
+        }
+        // It was on the sweep's first page; the last page changes nothing, and the next sweep
+        // still comes quickly.
+        assert_eq!(count("SELECT cursor IS NOT NULL FROM sources"), 1);
+        now += 250;
+        cache.reconcile_at(&roots, now).unwrap();
+        assert_eq!(count("SELECT cursor IS NULL FROM sources"), 1);
+        assert!(count("SELECT due FROM sources") - now <= SWEEP_AGAIN_MS.0);
+        assert_eq!(count("SELECT count(*) FROM writes WHERE kind='row'"), 1);
+        assert_eq!(count("SELECT revision FROM metadata"), revision + 1);
+
+        // The daemon restarts in the middle of a sweep while a conversation goes away.
+        let due = count("SELECT due FROM sources");
+        cache.reconcile_at(&roots, due).unwrap();
+        SWEEPS
+            .lock()
+            .unwrap()
+            .retain(|(database, _), _| *database != cache.database);
+        native
+            .execute("UPDATE threads SET archived=1 WHERE id='thread-124'", [])
+            .unwrap();
+        cache.reconcile_at(&roots, due + 1).unwrap();
+        assert_eq!(
+            count("SELECT count(*) FROM sessions"),
+            125,
+            "a sweep found half done removes nothing"
+        );
+        for later in [due + 10_000, due + 10_001] {
+            cache.reconcile_at(&roots, later).unwrap();
+        }
+        assert_eq!(count("SELECT count(*) FROM sessions"), 124);
     }
 
     #[test]
