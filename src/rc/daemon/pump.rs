@@ -74,6 +74,10 @@ impl Daemon {
         {
             eprintln!("agitd: native Claude integration is unavailable: {error:#}");
         }
+        #[cfg(unix)]
+        if let Err(error) = crate::rc::lifecycle::watch_installation(identity.executable.clone()) {
+            eprintln!("agitd: installed build replacement is not watched: {error}");
+        }
         if let Err(error) = crate::rc::runtime_sources::Registry::open()
             .and_then(|registry| registry.enroll_default())
         {
