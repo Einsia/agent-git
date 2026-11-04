@@ -769,6 +769,25 @@ fn a_refusal_for_good_is_told_by_its_reason_and_not_offered_again() {
     );
     assert!(!recovery.chars().any(char::is_control), "{recovery:?}");
 
+    // A receipt refused for itself is told in plain words, nothing having moved, and is worth
+    // another try.
+    let recovery = publication_recovery(
+        &refused_report("HTTP 409 publication_receipt_invalid: policy"),
+        retry,
+        "me/qa",
+    );
+    assert!(
+        recovery.contains(
+            "(the repository's privacy policy changed on the Hub after this was previewed)"
+        ) && recovery.contains("no branch or tag refs were updated")
+            && recovery.contains(retry),
+        "{recovery}"
+    );
+    assert!(
+        !crate::commands::push::refused_for_good(&recovery),
+        "{recovery}"
+    );
+
     // A repository that moved meanwhile is still worth another try.
     let recovery = publication_recovery(
         &refused_report(

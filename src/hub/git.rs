@@ -747,9 +747,34 @@ impl Outcome {
     }
 
     /// Whether the Hub would refuse the same push again: it judged the push and turned it down
-    /// for what it carries or for this agit, not because the repository moved meanwhile.
+    /// for what it carries or for this agit, not because the repository moved meanwhile or its
+    /// receipt no longer held, which a new push previews again.
     pub fn refused_for_good(&self) -> bool {
-        self.refused_before_refs_moved() && self.refusal_kind() != Some("publication_refs_moved")
+        self.refused_before_refs_moved()
+            && !matches!(
+                self.refusal_kind(),
+                Some("publication_refs_moved" | "publication_receipt_invalid")
+            )
+    }
+
+    /// Why the Hub refused this push's publication receipt for itself, as the one word it sends:
+    /// `expired`, `binding`, `policy`, `snapshot` or `unavailable`. `None` when it refused no
+    /// receipt.
+    pub fn receipt_refusal(&self) -> Option<&str> {
+        if self.refusal_kind() != Some("publication_receipt_invalid") {
+            return None;
+        }
+        let re = regex::Regex::new(r"\bHTTP 409 publication_receipt_invalid: ([a-z_]+)").ok()?;
+        Some(re.captures(&self.stderr)?.get(1)?.as_str())
+    }
+
+    /// Whether a new preview of the same publication can pass where this push was refused: the
+    /// repository's refs moved, its receipt had expired when the push arrived, or the
+    /// repository's visibility or publication settings changed, which a new preview asks about
+    /// again.
+    pub fn previews_again(&self) -> bool {
+        self.refusal_kind() == Some("publication_refs_moved")
+            || matches!(self.receipt_refusal(), Some("expired" | "binding"))
     }
 
     /// Whether the Hub turned this push down while judging it, before its ref transaction, so no
@@ -764,6 +789,7 @@ impl Outcome {
                     | "quota_exceeded"
                     | "agentgit_upgrade_required"
                     | "publication_refs_moved"
+                    | "publication_receipt_invalid"
             )
         )
     }
@@ -1746,7 +1772,10 @@ mod tests {
     }
 
     /// Git ends a refused push with "failed to push some refs", which says nothing of why; the
-    /// Hub's line before it does. This stderr is what a Sim run printed for an encrypted push.
+    /// Hub's line before it does. This stderr is what a Sim run printed for an encrypted push. A
+    /// receipt refused for itself is read by its word: taken for a refusal for good, a push would
+    /// stop where a new preview passes; taken for one worth a new preview whatever the word, it
+    /// would preview the same publication again for a change no new preview undoes.
     #[test]
     fn the_hubs_refusal_is_read_whole_and_told_apart_from_a_moved_repository() {
         let refused = outcome(
@@ -1765,6 +1794,27 @@ mod tests {
         );
         assert!(moved.refusal().is_some());
         assert!(!moved.refused_for_good());
+        assert!(moved.previews_again());
+        // A receipt refused for itself names why in one word. It is no refusal for good, since
+        // any new push previews again; only an expired receipt or changed settings are worth a
+        // new preview of the same publication within this push.
+        for (category, again) in [
+            ("expired", true),
+            ("binding", true),
+            ("policy", false),
+            ("snapshot", false),
+            ("unavailable", false),
+        ] {
+            let receipt = outcome(&format!(
+                "fatal: remote error: HTTP 409 publication_receipt_invalid: {category}\nfatal: the remote end hung up unexpectedly\n"
+            ));
+            assert_eq!(receipt.receipt_refusal(), Some(category));
+            assert!(receipt.refused_before_refs_moved(), "{category}");
+            assert!(!receipt.refused_for_good(), "{category}");
+            assert_eq!(receipt.previews_again(), again, "{category}");
+        }
+        assert_eq!(refused.receipt_refusal(), None);
+        assert!(!refused.previews_again());
         // A result after the ref transaction may have moved refs; it is not a refusal to rerun.
         assert!(
             !outcome("fatal: remote error: HTTP 503 service_unavailable: try later")
