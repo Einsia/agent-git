@@ -90,6 +90,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var lastRefresh: Date?
     /// Folder path → what the app is running there right now.
     @Published private(set) var busy: [String: String] = [:]
+    /// Why the last action on a folder failed, shown on that folder's row until an action there
+    /// succeeds: a refusal shown only at the top of the menu is easy to miss.
+    @Published private(set) var failed: [String: String] = [:]
+    /// The exit code of the last command run for each folder, nil when it gave no answer.
+    private var lastExit: [String: Int] = [:]
     @Published private(set) var history: [UploadEvent] = []
     /// Folders this app paused, with their destinations, so resuming restores exactly them.
     @Published private(set) var paused: [String: String] = [:]
@@ -439,23 +444,70 @@ final class AppModel: ObservableObject {
         } done: { _ in "Retry finished." }
     }
 
-    /// Turning uploads on publishes this folder's new conversations, so it always asks first.
+    /// Turning uploads on publishes this folder's new conversations, so it always asks first, in
+    /// one dialog, and one yes is enough: the folder's uploads and the repository's automatic
+    /// upload turn on together.
     func turnOn(_ folder: Folder) {
-        if folder.blocked { return allowAutoUpload(folder.folder) }
-        guard confirmUpload(folders: [(folder.folder, folder.repository)], includeHistory: false) else { return }
-        bind(folder.folder, repository: folder.repository, history: false)
+        let path = folder.folder
+        let repository = folder.repository
+        ask(path, repository, includeHistory: false) { [weak self] consent in
+            self?.bind(path, repository: repository, history: false, publicConsent: consent)
+        }
+    }
+
+    /// Asks the person, in one dialog, to turn uploads on in `path`, and on yes calls `next` with
+    /// whether that yes was given in the public words. Whether `repository` is public is read
+    /// first, so the dialog for a public one says so; its yes is passed to agit as the person's
+    /// consent for exactly that repository. A check that fails asks nothing: the bind would refuse
+    /// the same way, and the reason shows on the folder's row.
+    private func ask(
+        _ path: String, _ repository: String, includeHistory: Bool,
+        _ next: @escaping (Bool) -> Void
+    ) {
+        failed[path] = nil
+        probe(path, repository) { [weak self] audience in
+            guard let self, let audience else { return }
+            if audience == "public" {
+                if self.confirmPublic(path: path, repository: repository, includeHistory: includeHistory) {
+                    next(true)
+                }
+            } else if self.confirmUpload(folders: [(path, repository)], includeHistory: includeHistory) {
+                next(false)
+            }
+        }
+    }
+
+    /// Reads `repository`'s audience the way a dry-run bind of `path` reports it, in that folder's
+    /// queue, and hands `next` "public", "private", "" when agit could not read it, or nil when the
+    /// check itself failed.
+    private func probe(_ path: String, _ repository: String, _ next: @escaping (String?) -> Void) {
+        var audience = ""
+        perform(path, "Checking \(repository)…") { cli in
+            try await cli.run(
+                ["project", "bind", path, "--repo", repository, "--history", "none",
+                 "--auto-upload", "--dry-run"],
+                timeout: 120)
+        } done: { result in
+            audience = Self.audience(result)
+            return ""
+        } then: { ok in
+            next(ok ? audience : nil)
+        }
+    }
+
+    /// `repository_visibility` from a dry-run bind's answer, or "" when agit could not read it.
+    private static func audience(_ result: CLIResult) -> String {
+        guard let value = result.value,
+              let object = try? JSONSerialization.jsonObject(with: value) as? [String: Any]
+        else { return "" }
+        return object["repository_visibility"] as? String ?? ""
     }
 
     /// A blocked folder's policy already uploads; only its repository's `push.auto` holds it
-    /// back, and turning that on is the change the confirmation names.
+    /// back. It is turned on the same way as the toggle, which turns both on.
     func allowAutoUpload(_ path: String) {
-        guard let folder = folders.first(where: { $0.folder == path }),
-              confirmUpload(folders: [(folder.folder, folder.repository)], includeHistory: false)
-        else { return }
-        perform(
-            path, "Turning on automatic upload for \(folder.repository)…",
-            { cli in try await cli.run(["config", "--repo", folder.repository, "push.auto", "true"]) },
-            done: { _ in "\(folder.repository) uploads automatically on this Mac again." })
+        guard let folder = folders.first(where: { $0.folder == path }) else { return }
+        turnOn(folder)
     }
 
     func turnOff(_ folder: Folder, then: ((Bool) -> Void)? = nil) {
@@ -492,37 +544,70 @@ final class AppModel: ObservableObject {
 
     /// Enrolls a folder the user picked. A missing repository is created private, never public.
     func enroll(path: String, repository: String, includeHistory: Bool, createPrivate: Bool) {
-        guard confirmUpload(folders: [(path, repository)], includeHistory: includeHistory) else { return }
         let parts = repository.split(separator: "/", maxSplits: 1).map(String.init)
         let ownName = parts.count == 2 && parts[0] == whoami?.account
-        let off = autoPushOff(repository)
-        perform(path, "Turning on uploads in \((path as NSString).lastPathComponent)…") { cli in
+        let name = (path as NSString).lastPathComponent
+        ask(path, repository, includeHistory: includeHistory) { [weak self] consent in
+            guard let self else { return }
             if createPrivate && ownName {
-                // An existing repository refuses creation; the bind below reports any real problem.
-                _ = try? await cli.run(["--yes", "repo", "create", parts[1], "--private"], timeout: 120)
+                self.perform(path, "Creating \(repository)…") { cli in
+                    // An existing repository refuses creation; the bind after it reports any real
+                    // problem.
+                    _ = try? await cli.run(["--yes", "repo", "create", parts[1], "--private"], timeout: 120)
+                    return CLIResult(ok: true, exitCode: 0, kind: nil, value: nil, errors: [])
+                } done: { _ in "" }
             }
-            if off, let refused = try await Self.allowAutoPush(cli, repository) { return refused }
-            return try await cli.run(
-                ["--yes", "project", "bind", path, "--repo", repository,
-                 "--history", includeHistory ? "all" : "none", "--auto-upload"],
-                timeout: includeHistory ? 3600 : 600)
-        } done: { _ in "\((path as NSString).lastPathComponent) now uploads its new conversations to \(repository)." }
+            self.bind(
+                path, repository: repository, history: includeHistory, publicConsent: consent,
+                said: "\(name) now uploads its new conversations to \(repository).")
+        }
     }
 
-    private func bind(_ path: String, repository: String, history: Bool, then: ((Bool) -> Void)? = nil) {
+    /// Turns uploads on in `path`. A bind made without the public consent that agit refuses as
+    /// needing a person's answer is checked again: if the repository is public now (it turned
+    /// public after the question, or one question covered several folders), the person is asked
+    /// in the public words, and nothing uploads before that yes.
+    private func bind(
+        _ path: String, repository: String, history: Bool, publicConsent: Bool = false,
+        said: String? = nil, then: ((Bool) -> Void)? = nil
+    ) {
         let name = (path as NSString).lastPathComponent
         let off = autoPushOff(repository)
+        let consent = publicConsent ? ["--public-consent", repository] : []
         perform(
             path, "Turning on uploads in \(name)…",
             { cli in
-                if off, let refused = try await Self.allowAutoPush(cli, repository) { return refused }
+                if off, let refused = try await Self.allowAutoPush(cli, repository, consent) {
+                    return refused
+                }
                 return try await cli.run(
                     ["--yes", "project", "bind", path, "--repo", repository,
-                     "--history", history ? "all" : "none", "--auto-upload"],
-                    timeout: 600)
+                     "--history", history ? "all" : "none", "--auto-upload"] + consent,
+                    timeout: history ? 3600 : 600)
             },
-            done: { _ in "\(name) uploads automatically again." },
-            then: then)
+            done: { _ in said ?? "\(name) uploads automatically again." },
+            then: { [weak self] ok in
+                guard let self, !ok, !publicConsent, self.lastExit[path] == AgitCLI.needsAnswer else {
+                    then?(ok)
+                    return
+                }
+                let refusal = self.failed[path]
+                self.probe(path, repository) { [weak self] audience in
+                    guard let self else { return }
+                    guard audience == "public" else {
+                        self.failed[path] = refusal
+                        then?(false)
+                        return
+                    }
+                    guard self.confirmPublic(path: path, repository: repository, includeHistory: history) else {
+                        then?(false)
+                        return
+                    }
+                    self.bind(
+                        path, repository: repository, history: history, publicConsent: true,
+                        said: said, then: then)
+                }
+            })
     }
 
     func signIn() {
@@ -601,12 +686,22 @@ final class AppModel: ObservableObject {
         notice = nil
         Task {
             var ok = false
+            lastExit[key] = nil
             do {
                 let result = try await job.work(cli)
                 ok = result.ok
-                notice = result.ok ? job.done(result) : result.reason
+                lastExit[key] = result.exitCode
+                if result.ok {
+                    let said = job.done(result)
+                    if !said.isEmpty { notice = said }
+                    failed[key] = nil
+                } else {
+                    notice = result.reason
+                    failed[key] = result.reason
+                }
             } catch {
                 notice = error.localizedDescription
+                failed[key] = error.localizedDescription
             }
             job.then?(ok)
             if let next = waiting[key]?.first {
@@ -628,9 +723,51 @@ final class AppModel: ObservableObject {
     /// Lifts a repository's automatic upload by name, once the person has agreed to exactly that:
     /// agit's bind never lifts an explicit off by itself. The refusal, when there is one, is what
     /// the action reports.
-    private static func allowAutoPush(_ cli: AgitCLI, _ repository: String) async throws -> CLIResult? {
-        let result = try await cli.run(["config", "--repo", repository, "push.auto", "true"])
+    private static func allowAutoPush(
+        _ cli: AgitCLI, _ repository: String, _ consent: [String] = []
+    ) async throws -> CLIResult? {
+        let result = try await cli.run(["config", "--repo", repository, "push.auto", "true"] + consent)
         return result.ok ? nil : result
+    }
+
+    /// The question for a public destination. Cancel stays the default; only "Upload publicly"
+    /// says yes, and that yes is the person's consent agit is given for exactly `repository`.
+    private func confirmPublic(path: String, repository: String, includeHistory: Bool) -> Bool {
+        let alert = NSAlert()
+        let hub = Words.host(whoami?.hub ?? "the Hub")
+        let account = whoami?.account ?? "your account"
+        let name = (path as NSString).lastPathComponent
+        let waiting = folders.first { $0.folder == path }?.awaitingUpload ?? 0
+        let held = waiting == 0
+            ? ""
+            : waiting == 1
+                ? ", and 1 conversation already saved here that has not been uploaded"
+                : ", and \(waiting) conversations already saved here that have not been uploaded"
+        let what = includeHistory
+            ? """
+            The Claude Code and Codex conversations that already ran in \(Words.tilde(path)) upload \
+            now. From then on every new one there uploads after each turn, and so does every \
+            conversation this Mac saves in \(repository).
+            """
+            : """
+            From now on, new Claude Code and Codex conversations in \(Words.tilde(path)) upload after \
+            each turn\(held), and so does every conversation this Mac saves in \(repository).
+            """
+        alert.messageText = "Upload conversations from \(name) to a public repository?"
+        alert.informativeText = """
+        Where: \(repository) on \(hub) as \(account).
+
+        \(repository) is public: anyone can read these conversations, without signing in.
+
+        \(what) agit checks each upload for secrets first.
+
+        To stop, turn it off here in the menu bar at any time (or run `agit project unbind \(Words.tilde(path))`).
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Upload publicly")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
     }
 
     /// Publication needs a yes from the user every time it is turned on; nothing here uploads

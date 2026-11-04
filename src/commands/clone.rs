@@ -490,6 +490,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                 &store,
                 &format!("{owner}/{name}"),
                 &format!("agit config --repo {owner}/{name} push.auto true"),
+                None,
             )?;
         }
         store.set_auto_push(Some(value))?;

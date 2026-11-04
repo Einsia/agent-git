@@ -58,6 +58,10 @@ pub struct Args {
     /// Configure user preferences, inherited by repositories without an override.
     #[arg(long)]
     pub global: bool,
+    /// The person's consent, given in agit's menu bar, to upload automatically into this public
+    /// repository. It must name the `--repo` repository and counts only outside an agent session.
+    #[arg(long, value_name = "OWNER/REPO", requires = "repo", hide = true)]
+    pub public_consent: Option<String>,
 }
 
 /// Where the effective value shown by the editor comes from.
@@ -234,6 +238,7 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
             &repo,
             &format!("{owner}/{name}"),
             &format!("agit config --repo {owner}/{name} push.auto true"),
+            args.public_consent.as_deref(),
         )?;
     }
     let operation = if args.unset {
@@ -322,6 +327,7 @@ impl RepoAutoPush {
                 repo,
                 slug,
                 &format!("agit config --repo {slug} push.auto true"),
+                None,
             )?;
         }
         if let Some(value) = self.value {

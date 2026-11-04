@@ -109,6 +109,7 @@ struct MenuView: View {
             }
             Spacer()
             Menu {
+                Text("AgentGit menu bar \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
                 if let version = model.version { Text(version) }
                 if let path = model.cli?.executable.path { Text(Words.tilde(path)) }
                 Button("Choose the agit program…") { model.chooseCLI() }
@@ -295,6 +296,22 @@ private struct FolderRow: View {
                 }
                 .padding(.leading, 18)
             }
+            if let reason = model.failed[folder.folder], model.busy[folder.folder] == nil {
+                // A refusal is shown where the person clicked, with its reason and next step.
+                Text(Words.reasonFirst(reason))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.leading, 18)
+            } else if !folder.isOn && !folder.blocked && folder.sessionsHere > 0
+                        && model.busy[folder.folder] == nil {
+                Text("Uploads are off here. Claude Code and Codex keep these conversations; turn this on and agit saves and uploads the new ones after each turn.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18)
+            }
             if let running = model.busy[folder.folder] {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
@@ -352,10 +369,13 @@ private struct ConversationRow: View {
                     .font(.system(size: 12))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                Text(subtitle)
-                    .font(.system(size: 10))
-                    .foregroundStyle(failed ? Color.orange : Color.secondary)
-                    .lineLimit(1)
+                // Redrawn every minute: a menu open for days must not keep saying "3 minutes ago".
+                TimelineView(.everyMinute) { _ in
+                    Text(subtitle)
+                        .font(.system(size: 10))
+                        .foregroundStyle(failed ? Color.orange : Color.secondary)
+                        .lineLimit(1)
+                }
             }
             .help(conversation.displayTitle)
             Spacer(minLength: 4)
@@ -373,7 +393,11 @@ private struct ConversationRow: View {
     }
 
     private var subtitle: String {
-        let status = failed ? "Upload failed" : Words.status(conversation.status)
+        let status = failed
+            ? "Upload failed"
+            : folder.isOn || folder.blocked
+                ? Words.status(conversation.status)
+                : Words.statusWhileOff(conversation.status)
         return "\(Words.ago(conversation.lastActiveDate)) · \(status)"
     }
 }
@@ -389,14 +413,17 @@ private struct UploadRow: View {
                 Text(event.ok ? "Uploaded \(event.conversation.map { "\"\($0)\"" } ?? "conversations")" : "Upload failed")
                     .font(.system(size: 12))
                     .lineLimit(1)
-                Text("\((event.folder as NSString).lastPathComponent) · \(Words.ago(event.at))")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                if let reason = event.reason, !event.ok {
-                    Text(reason)
+                TimelineView(.everyMinute) { _ in
+                    Text("\((event.folder as NSString).lastPathComponent) · \(Words.ago(event.at))")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                }
+                if let reason = event.reason, !event.ok {
+                    Text(Words.reasonFirst(reason))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
             }

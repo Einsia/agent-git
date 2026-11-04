@@ -128,6 +128,25 @@ enum Words {
         }
     }
 
+    /// A conversation's status in a folder whose uploads are off: nothing is missing yet, the
+    /// conversation is only not saved by agit until uploads are on.
+    static func statusWhileOff(_ status: String) -> String {
+        switch status {
+        case "uploaded": return "Uploaded"
+        case "waiting", "not_uploaded": return "Saved on this Mac, not uploaded"
+        default: return "Kept by Claude Code; not saved by agit while off"
+        }
+    }
+
+    /// An error with git's own summary of a refused push left out, so the reason comes first:
+    /// that summary names only the URL, and cut to a few lines it hides why.
+    static func reasonFirst(_ text: String) -> String {
+        let prefix = text.range(of: ": ").map { String(text[..<$0.upperBound]) } ?? ""
+        let parts = String(text.dropFirst(prefix.count)).components(separatedBy: "; ")
+            .filter { !$0.hasPrefix("failed to push some refs") }
+        return parts.isEmpty ? text : prefix + parts.joined(separator: "; ")
+    }
+
     static func folderState(_ state: String) -> String {
         switch state {
         case "on": return "Uploads automatically"

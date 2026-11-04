@@ -209,13 +209,26 @@ struct AgitCLI {
         )
     }
 
+    /// agit's exit code for a refusal that needs a person's answer (`ExitCode::Interactive`).
+    static let needsAnswer = 8
+
+    /// The variables by which agit tells it runs inside an agent session (`AGIT_SESSION` and the
+    /// runtimes' own, as `infra::runtime_session::ENV_SESSIONS` lists them).
+    static let sessionVariables = [
+        "AGIT_SESSION", "AGIT_RUNTIME_SESSION",
+        "CODEBUDDY_SESSION_ID", "HERMES_SESSION_ID", "OPENCLAW_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+        "OPENCODE_SESSION_ID",
+    ]
+
     private func launch(_ arguments: [String], timeout: TimeInterval) async throws -> (Data, Int32) {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
-        // A session variable inherited from a terminal would make agit act on that session.
-        environment.removeValue(forKey: "AGIT_SESSION")
+        // A session variable inherited from a terminal or an agent would make agit act on that
+        // session, and would make a click here count as an agent's rather than the person's.
+        for name in Self.sessionVariables { environment.removeValue(forKey: name) }
         environment["AGIT_TUI"] = "0"
         process.environment = environment
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser

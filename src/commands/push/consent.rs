@@ -82,21 +82,45 @@ pub(crate) fn confirms_public(repo: &Repo, destination: &RemoteIdentity) -> Resu
     }))
 }
 
-/// Only the person switches on automatic upload into a public repository, at a terminal. Unlike
-/// a one-off push, no `--yes`, `--json` or `AGIT_YES` answers it: an agent that relays a yes would
-/// otherwise enable every later turn's upload on one sentence.
-pub(crate) fn require_terminal_for_public(repository: &str, command: &str) -> crate::Result<()> {
-    if crate::ui::prompt::can_ask() {
+/// Only a person switches on automatic upload into a public repository: at a terminal, or with a
+/// click in agit's own menu bar, which passes `--public-consent` naming the repository its dialog
+/// showed. No `--yes`, `--json` or `AGIT_YES` answers it, and neither does the flag inside an agent
+/// session: an agent that relays a yes would otherwise enable every later turn's upload on one
+/// sentence.
+pub(crate) fn require_person_for_public(
+    repository: &str,
+    command: &str,
+    public_consent: Option<&str>,
+) -> crate::Result<()> {
+    let in_agent_session = crate::tui::Signals::from_process().agent_session.is_some();
+    if person_consents(
+        repository,
+        public_consent,
+        crate::ui::prompt::can_ask(),
+        in_agent_session,
+    ) {
         return Ok(());
     }
     Err(crate::commands::InteractionRequired(format!(
-        "automatic upload into the public repository {repository} is switched on only by the person: ask them to run `{command}` themselves in a terminal"
+        "Automatic upload into the public repository {repository} is turned on from the AgentGit menu bar, or by running `{command}` in a terminal."
     ))
     .into())
 }
 
+/// Whether a person stands behind switching on automatic upload into the public `repository`:
+/// a terminal outside an agent session, or the menu bar's consent for exactly that repository,
+/// also outside one.
+fn person_consents(
+    repository: &str,
+    public_consent: Option<&str>,
+    at_terminal: bool,
+    in_agent_session: bool,
+) -> bool {
+    at_terminal || (!in_agent_session && public_consent == Some(repository))
+}
+
 /// Records the person's enrollment when switching automatic upload on for a checkout pinned to a
-/// public repository, and refuses the switch away from a terminal.
+/// public repository, and refuses the switch when no person stands behind it.
 ///
 /// A checkout whose destination or audience cannot be read records nothing; automatic
 /// publication then refuses a public destination by itself.
@@ -104,6 +128,7 @@ pub(crate) fn enroll_public_destination(
     repo: &Repo,
     repository: &str,
     command: &str,
+    public_consent: Option<&str>,
 ) -> crate::Result<()> {
     let Some(identity) = crate::hub::identity::read(repo)? else {
         return Ok(());
@@ -114,7 +139,7 @@ pub(crate) fn enroll_public_destination(
     if consent.visibility != "public" {
         return Ok(());
     }
-    require_terminal_for_public(repository, command)?;
+    require_person_for_public(repository, command, public_consent)?;
     consent.save(repo)?;
     Ok(())
 }
@@ -122,6 +147,36 @@ pub(crate) fn enroll_public_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The menu bar's consent counts only for the repository it names and only outside an agent
+    /// session; `--yes` alone is no consent. A gate that took any repository named, or the flag
+    /// from an agent's own session, would let an agent switch a public upload on by passing it.
+    #[test]
+    fn a_public_switch_on_needs_a_terminal_or_the_menu_bars_consent_for_that_repository() {
+        assert!(person_consents("alice/app", None, true, false));
+        assert!(person_consents(
+            "alice/app",
+            Some("alice/app"),
+            false,
+            false
+        ));
+        assert!(
+            !person_consents("alice/app", None, false, false),
+            "--yes alone"
+        );
+        assert!(!person_consents(
+            "alice/app",
+            Some("alice/other"),
+            false,
+            false
+        ));
+        assert!(!person_consents(
+            "alice/app",
+            Some("alice/app"),
+            false,
+            true
+        ));
+    }
 
     /// A saved enrollment cannot authorize another account, repository or audience.
     #[test]
