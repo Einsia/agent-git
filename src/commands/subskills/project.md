@@ -66,7 +66,7 @@ project branch that breaks it whatever its claim says; agit drops such conversat
 own and says once which. `drop` stops uploading a conversation from this computer: the named
 one, or without a target the conversation it runs in. It stops recording into its branch and
 the project no longer captures it; its local history stays. A copy already on the Hub stays
-there. Run `drop` only when the user asks for it.
+there. Run `drop` only when the user asks for it. A conversation the user dropped is uploaded again only when the user asks for it. Don't run the `agit save` a push names for a dropped conversation on your own.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is
 complete. `unbind` pauses project hook capture and automatic publication for the selected
