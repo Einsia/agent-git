@@ -156,6 +156,45 @@ pub(super) fn mismatch_line(signed_in: &str, environment: &str) -> String {
     )
 }
 
+/// What plain `agit rc start` does about the Hub (#306). It keeps following `AGIT_HUB_URL`, which
+/// self-hosted setups and scripts rely on, but says so when that names another Hub than the one
+/// the person signed in to. It turns Cloud access on only for a Hub with a stored sign-in.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PlainStart {
+    pub(super) warning: Option<String>,
+    pub(super) enable_inbound: bool,
+}
+
+pub(super) fn plain_start(
+    configured: &str,
+    environment: Option<&str>,
+    hub: &str,
+    signed_in: impl Fn(&str) -> bool,
+) -> PlainStart {
+    let warning = match choose_hub(configured, environment, &signed_in) {
+        HubChoice::Mismatch {
+            signed_in,
+            environment,
+        } => Some(format!(
+            "AGIT_HUB_URL points to {environment}, so Cloud access goes there, not to {signed_in} \
+             where you signed in. To use {signed_in}, unset AGIT_HUB_URL and run `agit rc start` \
+             again."
+        )),
+        HubChoice::Use(_) => None,
+    };
+    PlainStart {
+        warning,
+        enable_inbound: signed_in(hub),
+    }
+}
+
+pub(super) fn inbound_off_line(hub: &str) -> String {
+    format!(
+        "Cloud access stays off for {hub} until you sign in there with `agit login --hub {hub}`; \
+         local and SSH access work now."
+    )
+}
+
 pub(super) fn not_signed_in_line(hub: &str) -> String {
     format!("Not signed in to {hub}: run `agit login --hub {hub}`, then `agit rc start --here`.")
 }
@@ -340,5 +379,48 @@ mod tests {
         assert_eq!((outcome, looks), (Outcome::Online, 3));
         let (outcome, _) = waited_requesting(vec![Some(vec![old]), None], vec![true, false]);
         assert!(matches!(outcome, Outcome::NotOnline { .. }), "{outcome:?}");
+    }
+
+    /// Plain `rc start` (#306): an `AGIT_HUB_URL` that names another Hub than the signed-in one
+    /// is warned about, not refused; Cloud access is turned on only for a Hub with a sign-in;
+    /// a person signed in to the Hub they use sees nothing new.
+    #[test]
+    fn plain_start_warns_about_another_hub_and_needs_a_sign_in_for_cloud_access() {
+        let only_dev = |hub: &str| hub == DEV;
+        let mismatch = plain_start(DEV, Some(PROD), PROD, only_dev);
+        let warning = mismatch
+            .warning
+            .as_deref()
+            .expect("a warning, not a refusal");
+        assert!(warning.contains(PROD) && warning.contains(DEV), "{warning}");
+        assert!(
+            !mismatch.enable_inbound,
+            "no sign-in on prod: Cloud access stays off"
+        );
+        let both = |_: &str| true;
+        let signed_both = plain_start(DEV, Some(PROD), PROD, both);
+        assert!(signed_both.warning.is_some() && signed_both.enable_inbound);
+        assert_eq!(
+            plain_start(DEV, None, DEV, only_dev),
+            PlainStart {
+                warning: None,
+                enable_inbound: true
+            },
+            "the usual case is unchanged"
+        );
+        assert_eq!(
+            plain_start(DEV, Some("https://dev.example/"), DEV, only_dev).warning,
+            None,
+            "the same Hub spelled differently is not another Hub"
+        );
+        let nobody = |_: &str| false;
+        assert_eq!(
+            plain_start(DEV, Some(PROD), PROD, nobody),
+            PlainStart {
+                warning: None,
+                enable_inbound: false
+            },
+            "AGIT_HUB_URL alone, no sign-in anywhere: nothing to warn about, no Cloud access"
+        );
     }
 }
