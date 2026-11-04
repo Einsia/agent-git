@@ -418,6 +418,15 @@ pub fn run(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    // Files an older agit filled with placeholders publish as they are; say how to repair them.
+    for branch in branches
+        .iter()
+        .filter(|branch| crate::domain::meta::is_file_line_at(&repo, branch))
+    {
+        if let Some(hint) = super::repair::hint(&repo, &checkout.slug(), branch) {
+            ui::warning(&hint);
+        }
+    }
     let (publication_client, publication_account) = if let Some(destination) = &args.to_hub {
         let hub = identity::normalize_hub(destination)?;
         ensure!(

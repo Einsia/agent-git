@@ -146,6 +146,8 @@
     "rc stop": {"aliases":[],"args":{}},
     "rc ungrant": {"aliases":[],"args":{"command":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},
     "remote": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"verbose":{"action":"SetTrue","policy":"boolean"}}},
+    "repair": {"aliases":[],"args":{}},
+    "repair placeholders": {"aliases":[],"args":{"dry_run":{"action":"SetTrue","policy":"boolean"},"target":{"action":"Set","policy":"presence"}}},
     "repo": {"aliases":[],"args":{}},
     "repo collab": {"aliases":[],"args":{}},
     "repo collab add": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"role":{"action":"Set","policy":"enum","values":["read","write","admin"]},"user":{"action":"Set","policy":"presence"}}},

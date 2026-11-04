@@ -276,3 +276,32 @@ agit privacy unlock alice/project@work --workspace ./project
 
 Recovery obtains the exact snapshot's content key and decrypts locally. Existing
 recovered files remain local user data after cloud access is revoked.
+
+## Repair files an older agit filled with placeholders
+
+Older agit versions replaced some values that are not credentials, such as checksums,
+base64 data URIs, links and whole script lines, with `{{AGIT_SECRET_V1:…}}` or
+`{{AGIT_SECRET_V2:…}}` placeholders in the files they published. Those files then broke
+for everyone who downloaded or cloned them. `agit push` names such files on the branches it
+publishes. To repair them:
+
+```sh
+agit repair placeholders alice/project            # every file line
+agit repair placeholders alice/project@main --dry-run
+```
+
+The command reads each affected text file at the branch tip and puts back the values from
+this device's dictionary. It then protects the file again under the current policy, so a
+real credential stays a placeholder, written in the current short form
+(`‹secret:kind:id›`); a file that held only credentials changes only in that spelling, and
+`agit push` stops naming it. Changed files land as one ordinary commit,
+"agit: restore values an earlier agit replaced". History is not rewritten: older
+commits keep their placeholders, and the current files, which downloads and clones see,
+are repaired. Nothing is published until you push: look through the listed files first,
+since everything the current check doesn't treat as a credential is back in them. Push to
+publish the commit.
+
+Some placeholders may have originals that this device's dictionary does not hold. These
+are listed by file and line, and the command exits with a precondition error. Sign in on
+this device so its dictionary syncs, or run the repair on the device that published the
+files.

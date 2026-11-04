@@ -568,6 +568,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Export(a) => commands::export::run(a),
         Commands::Scan(a) => commands::scan::run(a),
         Commands::Secrets(a) => commands::secret_vault::run(a),
+        Commands::Repair(a) => commands::repair::run(a),
         Commands::Setup(a) => commands::setup::run(a),
         Commands::Upgrade(a) => commands::upgrade::run(a),
         Commands::Doctor(a) => commands::doctor::run(a),
