@@ -8,6 +8,26 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.39] - 2026-11-04
+
+### Changed
+
+- `agit rc start` warns when AGIT_HUB_URL names another Hub than the one you signed in to, and turns Cloud access on only
+  for a Hub you're signed in to.
+
+### Fixed
+
+- `agit merge`, `agit resume` and switching runtimes no longer refuse Claude Code 2.1.311 to 2.1.314 sessions over the
+  records it writes after a turn and at /exit. A record of a type agit does not know yet is refused by its type, with
+  `agit upgrade` as the fix.
+- The menu bar turns on uploads for a folder with one confirmation, including into a public repository after a question
+  that says it is public; a refusal shows on the folder you clicked, and times in the menu stay current.
+- A computer with many Claude Code commands or Skills no longer shows offline in remote control; the command list it
+  reports is shortened instead.
+- Pushing many large sessions at once no longer fails because too many of them go to the Hub in one publication.
+- Remote viewers no longer see a replay gap when nothing was missed. The background service now records each session
+  subscription's sequence numbers in its local diagnostics log (no content, nothing uploaded).
+
 ## [0.2.38] - 2026-11-04
 
 ### Added
