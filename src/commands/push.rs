@@ -572,6 +572,69 @@ pub(crate) fn refused_for_good(message: &str) -> bool {
 /// well below it.
 const BRANCHES_PER_PUBLICATION: usize = 48;
 
+/// Event bytes one publication may make the Hub read. Its view check reads each event object the
+/// push carries once, within a budget of two of the largest sessions agit records (the Hub's
+/// `materialize::DEFAULT_PAIR_BUDGET_BYTES`); a group of large sessions past it is refused whole.
+const VIEW_BYTES_PER_PUBLICATION: u64 = 2 * crate::domain::storage::MAX_MATERIALIZED_BYTES as u64;
+
+/// What `branch`'s head makes the Hub read in a publication's view check, at most: its event
+/// objects, and its LOG and VIEW, which hold the whole transcript in the older layout. A branch
+/// that cannot be read counts nothing; its publication says why.
+fn view_bytes(repo: &Repo, branch: &str) -> u64 {
+    use crate::domain::meta;
+    let Ok(listing) = repo.git_bytes_result(&[
+        "ls-tree",
+        "-r",
+        "-l",
+        "-z",
+        &format!("refs/heads/{branch}"),
+        "--",
+        meta::EVENTS_DIR,
+        meta::LOG_FILE,
+        meta::VIEW_FILE,
+        meta::LEGACY_LOG_FILE,
+        meta::LEGACY_VIEW_FILE,
+    ]) else {
+        return 0;
+    };
+    listing
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            // `<mode> blob <oid> <size>\t<path>`; the size is right-aligned after the oid.
+            let header = std::str::from_utf8(entry.split(|byte| *byte == b'\t').next()?).ok()?;
+            let mut fields = header.split_whitespace();
+            (fields.nth(1)? == "blob").then_some(())?;
+            fields.nth(1)?.parse::<u64>().ok()
+        })
+        .sum()
+}
+
+/// `branches` cut into publications in order: each takes at most [`BRANCHES_PER_PUBLICATION`]
+/// branches, and as many as fit together within `budget` by `bytes`. A branch over the budget on
+/// its own goes alone.
+fn publication_groups(
+    branches: &[String],
+    bytes: impl Fn(&str) -> u64,
+    budget: u64,
+) -> Vec<&[String]> {
+    let mut groups = Vec::new();
+    let (mut start, mut used) = (0, 0u64);
+    for (index, branch) in branches.iter().enumerate() {
+        let size = bytes(branch);
+        if index > start
+            && (index - start == BRANCHES_PER_PUBLICATION || used.saturating_add(size) > budget)
+        {
+            groups.push(&branches[start..index]);
+            (start, used) = (index, 0);
+        }
+        used = used.saturating_add(size);
+    }
+    if start < branches.len() {
+        groups.push(&branches[start..]);
+    }
+    groups
+}
+
 /// Publish `branches` in as few publications as the head limit allows.
 ///
 /// Without `--keep-going` the first failing group ends the push, as one publication of the whole
@@ -626,7 +689,12 @@ fn publish_in_groups(
         return publish(branches);
     }
     let mut failed: Vec<(String, String, ExitCode)> = Vec::new();
-    for group in branches.chunks(BRANCHES_PER_PUBLICATION) {
+    let groups = publication_groups(
+        branches,
+        |branch| view_bytes(repo, branch),
+        VIEW_BYTES_PER_PUBLICATION,
+    );
+    for group in groups {
         let outcome = publish(group);
         let failure = match &outcome {
             Ok(ExitCode::Ok) => continue,
@@ -1412,5 +1480,74 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Branches go out in publications of at most [`BRANCHES_PER_PUBLICATION`], and large sessions
+    /// are kept apart so that each publication stays within the event bytes the Hub reads for one.
+    /// Grouping by count alone puts large sessions together past that budget, and the Hub refuses
+    /// the whole group; a branch over the budget on its own still goes, alone.
+    #[test]
+    fn publications_group_branches_by_count_and_by_event_bytes() {
+        const MIB: u64 = 1 << 20;
+        let names = |count: usize| -> Vec<String> { (0..count).map(|i| format!("b{i}")).collect() };
+        let small = names(50);
+        let groups = publication_groups(&small, |_| MIB, 1024 * MIB);
+        assert_eq!(
+            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+            [BRANCHES_PER_PUBLICATION, 2]
+        );
+
+        let large = names(6);
+        let sizes = [600, 600, 100, 900, 2048, 10];
+        let size = |branch: &str| sizes[branch[1..].parse::<usize>().unwrap()] * MIB;
+        let groups = publication_groups(&large, size, 1024 * MIB);
+        let named: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|group| group.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                vec!["b0"],
+                vec!["b1", "b2"],
+                vec!["b3"],
+                vec!["b4"],
+                vec!["b5"]
+            ]
+        );
+    }
+
+    /// A branch weighs what its head makes the Hub read: every event object, LOG and VIEW. One
+    /// that weighed only the files at the top of the snapshot would see a few bytes of event ids
+    /// where the Hub reads the whole transcript.
+    #[test]
+    fn a_branch_weighs_its_event_objects() {
+        let (_dir, repo) = fixture("view-bytes");
+        repo.git(&["checkout", "--quiet", "-b", "session", "main"])
+            .unwrap();
+        let text: String = (0..20)
+            .map(|turn| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"user","message":{"role":"user","content":format!("turn {turn} {}", "x".repeat(500))}})
+                )
+            })
+            .collect();
+        let log = crate::domain::transcript::wrap_lines(
+            &text,
+            "claude-code",
+            &format!("agit-{}", "a".repeat(40)),
+        );
+        crate::domain::storage::write_snapshot(repo.root(), &log, &log).unwrap();
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-m", "session"]).unwrap();
+        let written: u64 = crate::domain::storage::snapshot_files(&log, &log)
+            .unwrap()
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
+        assert_eq!(view_bytes(&repo, "session"), written);
+        assert!(written > text.len() as u64);
+        assert_eq!(view_bytes(&repo, "no-such-branch"), 0);
     }
 }
