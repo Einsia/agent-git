@@ -967,6 +967,10 @@ impl PendingSessionRpc {
                 let _ = reply.wait_until_closed().await;
                 SessionRpcCompletion::None
             }
+            PendingSessionRpcOperation::Turn(mut reply) => {
+                let outcome = taken_turn_outcome(reply.wait_until_closed().await).await;
+                project_turn_start_outcome(outcome, None).0
+            }
             PendingSessionRpcOperation::Interrupt(mut reply) => {
                 let _ = reply.wait_until_closed().await;
                 SessionRpcCompletion::None
@@ -1122,11 +1126,156 @@ impl SessionRpcLease {
     }
 }
 
+/// Where to tell the asker that a session has taken its turn or steer. The instruction's own
+/// answer can come only once the runtime has dealt with it, which for a terminal-held or
+/// first turn can be long after the take; without this the asker cannot tell a turn on its
+/// way from one that never arrived.
+pub(super) struct TakenNotice {
+    pub(super) outbound: crate::rc::outbound::OutboundTx,
+    pub(super) request: crate::protocol::RequestId,
+}
+
+impl TakenNotice {
+    fn send(&self, session_id: &str, client_msg_id: Option<&str>) {
+        let mut params = serde_json::json!({
+            "request_id": self.request, "session_id": session_id,
+        });
+        if let Some(client_msg_id) = client_msg_id {
+            params["client_msg_id"] = client_msg_id.into();
+        }
+        let _ = self
+            .outbound
+            .send(Frame::notification(method::TURN_ACCEPTED, params));
+    }
+}
+
+/// Waits on `wait`, and sends `notice` the moment the session takes the instruction, if that
+/// comes first. The notice carries no outcome; the instruction's answer still comes from `wait`.
+/// Also answers when the take happened, if it came before the answer.
+async fn acknowledging_take<T>(
+    wait: impl std::future::Future<Output = ReplyWait<T>>,
+    taken: crate::rc::ticket::Taken,
+    notice: Option<&TakenNotice>,
+    session_id: &str,
+    client_msg_id: Option<&str>,
+) -> (ReplyWait<T>, Option<tokio::time::Instant>) {
+    tokio::pin!(wait);
+    tokio::select! {
+        biased;
+        done = &mut wait => (done, None),
+        () = taken.wait() => {
+            let at = tokio::time::Instant::now();
+            if let Some(notice) = notice {
+                notice.send(session_id, client_msg_id);
+            }
+            (wait.await, Some(at))
+        }
+    }
+}
+
+/// How long a taken turn with no permission override may go without its runtime showing that it
+/// took the turn before its asker is told it is not confirmed. The Hub gives up on an answer
+/// sooner than a runtime can take to settle a turn it is still running, so a turn that waited
+/// for its outcome alone would leave its asker with no answer at all.
+const TURN_ACCEPTANCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const TURN_ACCEPTANCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+enum Acceptance<T> {
+    /// The receipt answered.
+    Closed(Result<crate::Result<T>, tokio::sync::oneshot::error::RecvError>),
+    /// The session runs a turn or asks for approval, so its runtime took the turn; the outcome
+    /// comes when the runtime gives it.
+    Running,
+    /// Neither came by the deadline.
+    Expired,
+}
+
+/// Waits for `reply`, or for the session to show a running turn, until `deadline`.
+async fn await_acceptance<T>(
+    daemon: &Arc<Mutex<Daemon>>,
+    session_id: &str,
+    generation: u64,
+    reply: &mut crate::rc::ticket::Receipt<T>,
+    deadline: tokio::time::Instant,
+) -> Acceptance<T> {
+    let closed = reply.wait_until_closed();
+    tokio::pin!(closed);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut closed => return Acceptance::Closed(result),
+            () = tokio::time::sleep(TURN_ACCEPTANCE_POLL) => {}
+        }
+        let running = daemon
+            .lock()
+            .await
+            .sessions
+            .get(session_id)
+            .is_some_and(|live| {
+                live.generation == generation
+                    && matches!(
+                        live.info.status,
+                        SessionStatus::Running | SessionStatus::AwaitingApproval
+                    )
+            });
+        if running {
+            return Acceptance::Running;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Acceptance::Expired;
+        }
+    }
+}
+
+fn turn_unconfirmed_error() -> RpcError {
+    instruction_unknown(
+        RpcError::new(
+            ErrorCode::Internal,
+            "the session took this message but its agent has not confirmed it yet",
+        )
+        .with_hint("it may still start a turn; check the conversation before sending it again"),
+    )
+}
+
+/// The typed outcome a taken turn's receipt closed with. A receipt that closed with none keeps
+/// the session's gate for good, as only a hard stop proves nothing was applied.
+async fn taken_turn_outcome(
+    closed: Result<crate::Result<TurnStartOutcome>, tokio::sync::oneshot::error::RecvError>,
+) -> TurnStartOutcome {
+    match closed {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => TurnStartOutcome::Unknown {
+            message: format!(
+                "the session failed after taking turn/start without a classified outcome: {error}"
+            ),
+            attempted_mode: None,
+        },
+        Err(_) => {
+            eprintln!(
+                "agitd: a taken turn/start receipt closed without termination proof; retaining its RPC gate until hard-stop persistence"
+            );
+            std::future::pending::<TurnStartOutcome>().await
+        }
+    }
+}
+
 impl PreparedSessionRpc {
+    /// Runs the request with no asker to tell of the take; the daemon serves requests through
+    /// [`Self::serve`], which does.
+    #[cfg(test)]
     pub(super) async fn execute(
         self,
         daemon: Arc<Mutex<Daemon>>,
         stop: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> ExecutedSessionRpc {
+        self.execute_with_notice(daemon, stop, None).await
+    }
+
+    pub(super) async fn execute_with_notice(
+        self,
+        daemon: Arc<Mutex<Daemon>>,
+        stop: &mut tokio::sync::watch::Receiver<bool>,
+        notice: Option<TakenNotice>,
     ) -> ExecutedSessionRpc {
         let PreparedSessionRpc {
             session_id,
@@ -1159,6 +1308,8 @@ impl PreparedSessionRpc {
                 // Every start is logged with its outcome, however soon that comes; a start still
                 // in flight after the first window also gets the slow-wait events below.
                 turn("turn.start_received", serde_json::json!({}));
+                let client_msg_id = command.client_msg_id().map(str::to_owned);
+                let taken = reply.get_mut().taken();
                 if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
                 {
                     turn(
@@ -1181,8 +1332,16 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
-                match reply_within_state(reply.get_mut(), stop).await {
-                    ReplyWait::Done(result) => {
+                match acknowledging_take(
+                    reply_within_state(reply.get_mut(), stop),
+                    taken,
+                    notice.as_ref(),
+                    &session_id,
+                    client_msg_id.as_deref(),
+                )
+                .await
+                {
+                    (ReplyWait::Done(result), _) => {
                         let outcome = match result {
                             Ok(outcome) => outcome,
                             Err(error) => match reply.abandon() {
@@ -1216,20 +1375,51 @@ impl PreparedSessionRpc {
                         )
                         .await
                     }
-                    ReplyWait::InFlight(_error) => {
+                    (ReplyWait::InFlight(_error), taken_at) => {
                         // A taken turn may carry a sticky permission override. Retain its
                         // gate until a typed native outcome or proven shutdown; elapsed
                         // time alone cannot prove refusal or authorize another write.
                         // The wait has no deadline, so the log notes each window it spans.
                         turn("turn.start_taken", serde_json::json!({}));
-                        let closed = {
-                            let mut wait = std::pin::pin!(reply.wait_until_closed());
-                            loop {
-                                match tokio::time::timeout(2 * SESSION_REPLY_TIMEOUT, &mut wait)
-                                    .await
-                                {
-                                    Ok(closed) => break closed,
-                                    Err(_) => turn("turn.start_waiting", serde_json::json!({})),
+                        // One without an override is answered once its runtime has shown no
+                        // sign of taking it for a while, and keeps the gate until the outcome.
+                        let early = match guard_attempt {
+                            None => Some(
+                                await_acceptance(
+                                    &daemon,
+                                    &session_id,
+                                    generation,
+                                    reply.get_mut(),
+                                    taken_at.unwrap_or_else(tokio::time::Instant::now)
+                                        + TURN_ACCEPTANCE_WINDOW,
+                                )
+                                .await,
+                            ),
+                            Some(_) => None,
+                        };
+                        let closed = match early {
+                            Some(Acceptance::Closed(closed)) => closed,
+                            Some(Acceptance::Expired) => {
+                                turn("turn.start_unconfirmed", serde_json::json!({}));
+                                return ExecutedSessionRpc {
+                                    response: Err(turn_unconfirmed_error()),
+                                    pending: Some(PendingSessionRpc {
+                                        session_id,
+                                        generation,
+                                        serial,
+                                        operation: PendingSessionRpcOperation::Turn(reply),
+                                    }),
+                                };
+                            }
+                            Some(Acceptance::Running) | None => {
+                                let mut wait = std::pin::pin!(reply.wait_until_closed());
+                                loop {
+                                    match tokio::time::timeout(2 * SESSION_REPLY_TIMEOUT, &mut wait)
+                                        .await
+                                    {
+                                        Ok(closed) => break closed,
+                                        Err(_) => turn("turn.start_waiting", serde_json::json!({})),
+                                    }
                                 }
                             }
                         };
@@ -1313,6 +1503,8 @@ impl PreparedSessionRpc {
                 command,
                 mut reply,
             } => {
+                let client_msg_id = command.client_msg_id().map(str::to_owned);
+                let taken = reply.get_mut().taken();
                 if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
                 {
                     return finish_prepared_session_rpc(
@@ -1325,8 +1517,16 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
-                match reply_within_state(reply.get_mut(), stop).await {
-                    ReplyWait::Done(result) => {
+                match acknowledging_take(
+                    reply_within_state(reply.get_mut(), stop),
+                    taken,
+                    notice.as_ref(),
+                    &session_id,
+                    client_msg_id.as_deref(),
+                )
+                .await
+                {
+                    (ReplyWait::Done(result), _) => {
                         let response = result.map(|delivery| {
                             serde_json::to_value(TurnSteerResult { delivery }).unwrap()
                         });
@@ -1340,7 +1540,7 @@ impl PreparedSessionRpc {
                         )
                         .await
                     }
-                    ReplyWait::InFlight(error) => ExecutedSessionRpc {
+                    (ReplyWait::InFlight(error), _) => ExecutedSessionRpc {
                         response: Err(error),
                         pending: Some(PendingSessionRpc {
                             session_id,
@@ -1598,8 +1798,13 @@ impl PreparedSessionRpc {
         id: crate::protocol::RequestId,
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) {
-        let ExecutedSessionRpc { response, pending } =
-            self.execute(daemon.clone(), &mut stop).await;
+        let notice = TakenNotice {
+            outbound: outbound.clone(),
+            request: id.clone(),
+        };
+        let ExecutedSessionRpc { response, pending } = self
+            .execute_with_notice(daemon.clone(), &mut stop, Some(notice))
+            .await;
         // Replies are request-id fenced and the outbound reply lane deliberately
         // survives reconnects. Enqueue exactly once even if the asking socket
         // turned over while the side effect ran; losing this receipt would

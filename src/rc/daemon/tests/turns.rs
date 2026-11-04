@@ -210,6 +210,191 @@ async fn one_sessions_unanswered_rpc_does_not_block_another_session() {
     assert!(!daemon.lock().await.sessions.contains_key("session-a"));
 }
 
+/// The asker of a turn hears that the session took it as soon as it does, before the outcome,
+/// which a runtime can give only much later (a terminal-held turn waits for the turn it runs
+/// behind). A turn still waiting in the session's queue is not announced as taken: an asker told
+/// so would wait for an outcome that a withdrawn request never gets.
+#[tokio::test]
+async fn a_taken_turn_is_announced_to_its_asker_before_its_outcome() {
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut live = rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+    live.info.runtime = "claude-code".into();
+    let daemon = rpc_test_daemon(
+        [("session-a".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    let mut turn = Frame::request(
+        method::TURN_START,
+        TurnStart {
+            session_id: "session-a".into(),
+            message: "hello".into(),
+            by: Some("operator".into()),
+            client_msg_id: Some("message-1".into()),
+        },
+    );
+    turn.caller = Some(claim("operator", "ws-a"));
+    let request = turn.id.clone().expect("a request has an id");
+    let prepared = daemon
+        .lock()
+        .await
+        .prepare_session_rpc(&turn)
+        .expect("turn is admitted");
+    let (outbound, mut outbound_rx) = crate::rc::outbound::channel();
+    let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(prepared.serve(daemon.clone(), outbound, request.clone(), stop));
+    let Some(Command::Turn { reply, .. }) = rx.recv().await else {
+        panic!("the turn is queued");
+    };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            outbound_rx.next_write()
+        )
+        .await
+        .is_err(),
+        "a queued turn is not announced"
+    );
+    assert!(reply.accept());
+    let write = tokio::time::timeout(std::time::Duration::from_secs(1), outbound_rx.next_write())
+        .await
+        .expect("the take is announced at once")
+        .expect("the outbound lane is open");
+    let notice = write.frame().clone();
+    write.commit();
+    assert_eq!(notice.method.as_deref(), Some(method::TURN_ACCEPTED));
+    assert_eq!(notice.id, None, "the notice is not the request's answer");
+    assert_eq!(
+        notice.params,
+        Some(serde_json::json!({
+            "request_id": request, "session_id": "session-a", "client_msg_id": "message-1",
+        }))
+    );
+    reply.finish(Ok(TurnStartOutcome::Accepted {
+        turn_id: "turn-42".into(),
+        still_running: true,
+        consumed_mode: None,
+        confirmation: TurnStartConfirmation::Exact,
+    }));
+    let write = tokio::time::timeout(std::time::Duration::from_secs(1), outbound_rx.next_write())
+        .await
+        .expect("the outcome follows")
+        .expect("the outbound lane is open");
+    let answer = write.frame().clone();
+    write.commit();
+    assert_eq!(answer.id, Some(request));
+    assert!(answer.result.is_some(), "{answer:?}");
+    worker.await.expect("the turn worker joins");
+}
+
+/// A taken turn with no permission override whose runtime shows no sign of taking it is answered
+/// "not confirmed" once its window passes, instead of leaving its asker with no answer: the Hub
+/// gives up on its own, and a turn held behind one a terminal runs could wait for hours. Its gate
+/// stays closed until the outcome comes, so nothing else is sent into that session meanwhile. A
+/// session that shows the turn running is not cut off, however long the turn's outcome takes,
+/// since a headless runtime answers a first turn only when it ends.
+#[tokio::test(start_paused = true)]
+async fn a_taken_turn_with_no_sign_of_its_runtime_is_answered_unconfirmed() {
+    for runs in [false, true] {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut live = rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+        live.info.runtime = "claude-code".into();
+        live.info.status = if runs {
+            SessionStatus::Running
+        } else {
+            SessionStatus::Idle
+        };
+        let daemon = rpc_test_daemon(
+            [("session-a".into(), live)].into_iter().collect(),
+            Roster::default(),
+        );
+        let turn_frame = || {
+            let mut turn = Frame::request(
+                method::TURN_START,
+                TurnStart {
+                    session_id: "session-a".into(),
+                    message: "hello".into(),
+                    by: Some("operator".into()),
+                    client_msg_id: Some("message-1".into()),
+                },
+            );
+            turn.caller = Some(claim("operator", "ws-a"));
+            turn
+        };
+        let turn = turn_frame();
+        let request = turn.id.clone().expect("a request has an id");
+        let prepared = daemon
+            .lock()
+            .await
+            .prepare_session_rpc(&turn)
+            .expect("turn is admitted");
+        let (outbound, mut outbound_rx) = crate::rc::outbound::channel();
+        let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(prepared.serve(daemon.clone(), outbound, request.clone(), stop));
+        let Some(Command::Turn { reply, .. }) = rx.recv().await else {
+            panic!("the turn is queued");
+        };
+        assert!(reply.accept());
+        let write = outbound_rx
+            .next_write()
+            .await
+            .expect("the take is announced");
+        assert_eq!(write.frame().method.as_deref(), Some(method::TURN_ACCEPTED));
+        write.commit();
+
+        let answer =
+            tokio::time::timeout(std::time::Duration::from_secs(90), outbound_rx.next_write())
+                .await;
+        if runs {
+            assert!(answer.is_err(), "a running turn is not cut off");
+        } else {
+            let write = answer
+                .expect("the asker is answered within the window")
+                .expect("the outbound lane is open");
+            let error = write
+                .frame()
+                .error
+                .clone()
+                .expect("an error answers the turn");
+            assert_eq!(write.frame().id, Some(request.clone()));
+            assert_eq!(
+                error.data.as_ref().map(|data| &data["outcome"]),
+                Some(&serde_json::json!("unknown")),
+                "{error:?}"
+            );
+            write.commit();
+            let busy = daemon.lock().await.prepare_session_rpc(&turn_frame());
+            assert!(
+                busy.is_err(),
+                "the session's gate stays closed until the outcome"
+            );
+        }
+        reply.finish(Ok(TurnStartOutcome::Accepted {
+            turn_id: "turn-42".into(),
+            still_running: true,
+            consumed_mode: None,
+            confirmation: TurnStartConfirmation::Exact,
+        }));
+        if runs {
+            let write =
+                tokio::time::timeout(std::time::Duration::from_secs(1), outbound_rx.next_write())
+                    .await
+                    .expect("the outcome follows")
+                    .expect("the outbound lane is open");
+            assert!(write.frame().result.is_some());
+            write.commit();
+        }
+        worker.await.expect("the turn worker joins");
+        assert!(
+            daemon
+                .lock()
+                .await
+                .prepare_session_rpc(&turn_frame())
+                .is_ok(),
+            "the outcome releases the gate"
+        );
+    }
+}
+
 /// The lock-free execution path must serialize the protocol's declared
 /// result DTOs, rather than maintaining a second handwritten wire shape.
 /// This catches drift in the two queued RPC results that moved out of

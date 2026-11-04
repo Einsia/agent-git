@@ -796,6 +796,8 @@ struct PendingSessionRpc {
 
 enum PendingSessionRpcOperation {
     Value(SessionReceipt<serde_json::Value>),
+    /// A turn with no permission override whose asker was told it is not confirmed yet.
+    Turn(SessionReceipt<TurnStartOutcome>),
     Steer(SessionReceipt<crate::protocol::Delivery>),
     Interrupt(SessionReceipt<()>),
     Approve {

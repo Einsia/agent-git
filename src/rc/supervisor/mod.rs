@@ -1231,6 +1231,18 @@ fn accept(c: &Command) -> bool {
     }
 }
 
+impl Command {
+    /// The sender's own id for the words this command carries, when it carries words.
+    pub(crate) fn client_msg_id(&self) -> Option<&str> {
+        match self {
+            Command::Turn { attribution, .. } | Command::Steer { attribution, .. } => {
+                attribution.client_msg_id.as_deref()
+            }
+            _ => None,
+        }
+    }
+}
+
 fn command_danger_arm(command: &Command) -> Option<u64> {
     match command {
         Command::Approve { danger, .. } => danger.arm(),

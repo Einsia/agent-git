@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 const QUEUED: u8 = 0;
 const TAKEN: u8 = 1;
@@ -46,13 +46,37 @@ pub struct Ticket<T> {
     authority: super::authority::Guard,
     owner_control: bool,
     state: Arc<AtomicU8>,
+    taken: Arc<Notify>,
     done: oneshot::Sender<crate::Result<T>>,
 }
 
 /// The caller's half of the receipt.
 pub struct Receipt<T> {
     state: Arc<AtomicU8>,
+    taken: Arc<Notify>,
     done: oneshot::Receiver<crate::Result<T>>,
+}
+
+/// Resolves once the executor has taken the instruction, and never if it is abandoned. It is a
+/// separate handle so the caller can watch for the take while it waits on the receipt itself.
+#[derive(Clone)]
+pub struct Taken {
+    state: Arc<AtomicU8>,
+    taken: Arc<Notify>,
+}
+
+impl Taken {
+    pub async fn wait(&self) {
+        loop {
+            // Registered before the state is read, so a take between the two still wakes it.
+            let notified = self.taken.notified();
+            match self.state.load(Ordering::Acquire) {
+                TAKEN => return,
+                ABANDONED => std::future::pending::<()>().await,
+                _ => notified.await,
+            }
+        }
+    }
 }
 
 /// The outcome of abandoning.
@@ -72,15 +96,21 @@ pub fn ticket<T>() -> (Ticket<T>, Receipt<T>) {
 
 pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticket<T>, Receipt<T>) {
     let state = Arc::new(AtomicU8::new(QUEUED));
+    let taken = Arc::new(Notify::new());
     let (tx, rx) = oneshot::channel();
     (
         Ticket {
             authority,
             owner_control: true,
             state: state.clone(),
+            taken: taken.clone(),
             done: tx,
         },
-        Receipt { state, done: rx },
+        Receipt {
+            state,
+            taken,
+            done: rx,
+        },
     )
 }
 
@@ -128,6 +158,7 @@ impl<T> Ticket<T> {
                 .compare_exchange(QUEUED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         }) {
+            self.taken.notify_waiters();
             true
         } else {
             let _ =
@@ -146,6 +177,14 @@ impl<T> Ticket<T> {
 }
 
 impl<T> Receipt<T> {
+    /// A handle that resolves when the executor takes this instruction.
+    pub fn taken(&self) -> Taken {
+        Taken {
+            state: self.state.clone(),
+            taken: self.taken.clone(),
+        }
+    }
+
     /// Try to abandon. See [`Abandon`].
     ///
     /// **Asking a second time gives the same answer.** Two parties ask along this path:
