@@ -1989,7 +1989,8 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
 }
 
 /// A receipt the Hub refuses because the repository's refs moved after the preview (another
-/// member's push to any branch) is previewed again, once, from the start. The second attempt reads
+/// member's push to any branch), or because it had expired when the upload arrived, is previewed
+/// again, once, from the start. The second attempt reads
 /// the destination and the project again and passes every gate again: a conversation dropped
 /// meanwhile is not sent, by the retry or by any later publication of the push, a branch of a
 /// failed group published again on its own included. A `--yes` given for the first attempt answers
@@ -2096,8 +2097,41 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
         git(&remote, &["rev-parse", "refs/heads/work"]),
         git(repo.root(), &["rev-parse", "refs/heads/work"])
     );
-    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
     *hub.visibility.lock().unwrap() = "private";
+
+    // A receipt that had expired when its upload reached the Hub is previewed again the same way.
+    // One refused for a reason a new preview of the same publication does not undo is told in
+    // plain words, with nothing updated, and not previewed again.
+    fs::write(work.join("README.md"), "Shared file, receipt expired").unwrap();
+    git(&work, &["commit", "-am", "Receipt expired"]);
+    let before = previews();
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/other".into(), tip.clone(), None)];
+    *hub.refuse_with.lock().unwrap() = Some("ERR HTTP 409 publication_receipt_invalid: expired\n");
+    let pushed = run(&["--yes", "push", "alice/app@work"]);
+    assert_success(&pushed);
+    assert!(
+        text(&pushed).contains(
+            "this publication's receipt ran out before the upload reached the Hub; previewing it again"
+        ),
+        "{pushed:?}"
+    );
+    assert_eq!(previews(), before + 2);
+    fs::write(work.join("README.md"), "Shared file, policy changed").unwrap();
+    git(&work, &["commit", "-am", "Policy changed"]);
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/other".into(), tip.clone(), None)];
+    *hub.refuse_with.lock().unwrap() = Some("ERR HTTP 409 publication_receipt_invalid: policy\n");
+    let refused = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        !text(&refused).contains("previewing it again")
+            && text(&refused).contains(
+                "the repository's privacy policy changed on the Hub after this was previewed"
+            )
+            && text(&refused).contains("no branch or tag refs were updated"),
+        "{refused:?}"
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@work"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
 
     // A push in three parts, refused at its second part while the repository turned public. The
     // retry plans from what the Hub holds, so its parts are numbered from one again: its first part

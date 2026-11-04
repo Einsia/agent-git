@@ -117,16 +117,13 @@ impl Previewed {
     }
 }
 
-/// The kind the Hub gives a publication receipt it refuses because the repository's refs changed
-/// after the publication was previewed, as another member's push to any branch does. A new
-/// preview of the same publication can pass; no other receipt refusal promises that.
-const REFS_MOVED: &str = "publication_refs_moved";
-
-/// A first attempt the Hub refused as [`REFS_MOVED`]. Its caller runs the publication once more
-/// from the start: destination, preview, every gate and confirmation, receipt and pack.
+/// A first attempt the Hub refused in a way a new preview of the same publication can pass (see
+/// [`crate::hub::git::Outcome::previews_again`]). Its caller runs the publication once more from
+/// the start: destination, preview, every gate and confirmation, receipt and pack.
 #[derive(Debug)]
 pub(super) struct RefsMoved {
     refused: Previewed,
+    why: &'static str,
 }
 
 impl RefsMoved {
@@ -137,18 +134,38 @@ impl RefsMoved {
 
 impl std::fmt::Display for RefsMoved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the repository changed on the Hub while this publication was being checked")
+        f.write_str(self.why)
     }
 }
 
 impl std::error::Error for RefsMoved {}
 
-fn refs_moved(report: &PublicationReport) -> bool {
-    [&report.heads, &report.tags]
+/// Why the Hub refused an attempt of `report` in a way a new preview can pass, or `None`.
+fn previews_again(report: &PublicationReport) -> Option<&'static str> {
+    let outcome = &[&report.heads, &report.tags]
         .into_iter()
         .flatten()
         .flat_map(|phase| &phase.attempts)
-        .any(|attempt| !attempt.ok() && attempt.outcome.refusal_kind() == Some(REFS_MOVED))
+        .find(|attempt| !attempt.ok() && attempt.outcome.previews_again())?
+        .outcome;
+    Some(match outcome.receipt_refusal() {
+        Some(category) => receipt_refusal_words(category),
+        None => "the repository changed on the Hub while this publication was being checked",
+    })
+}
+
+/// A receipt refusal's category, as the Hub sends it, in words for the person.
+fn receipt_refusal_words(category: &str) -> &'static str {
+    match category {
+        "expired" => "this publication's receipt ran out before the upload reached the Hub",
+        "binding" => {
+            "the repository's visibility or publication settings changed on the Hub after this was previewed"
+        }
+        "policy" => "the repository's privacy policy changed on the Hub after this was previewed",
+        "snapshot" => "the Hub received a publication other than the one confirmed",
+        "unavailable" => "the Hub no longer holds this publication's receipt",
+        _ => "the Hub refused this publication's receipt",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -282,6 +299,9 @@ fn publication_failure(report: &PublicationReport) -> Option<String> {
     // Git's last line after a refusal is "failed to push some refs"; the Hub's own line says why,
     // and often what to do, so it is kept whole up to a longer bound. It is printed as the Hub
     // wrote it, and any Hub can write it, so control characters never reach the terminal.
+    if let Some(category) = refused(report).find_map(|attempt| attempt.outcome.receipt_refusal()) {
+        return Some(receipt_refusal_words(category).to_owned());
+    }
     if let Some(refusal) = refused(report).find_map(|attempt| attempt.outcome.refusal()) {
         let printable: String = refusal.chars().filter(|c| !c.is_control()).collect();
         return Some(crate::ui::truncate(&printable, 400));

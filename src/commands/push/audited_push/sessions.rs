@@ -1045,8 +1045,14 @@ pub(super) fn run(
         }
         if !report.ok() {
             // What reached the Hub stays acknowledged above; the next attempt plans only the rest.
-            if matches!(attempt, super::Attempt::First) && super::refs_moved(&report) {
-                return Err(super::RefsMoved { refused: previewed }.into());
+            if matches!(attempt, super::Attempt::First)
+                && let Some(why) = super::previews_again(&report)
+            {
+                return Err(super::RefsMoved {
+                    refused: previewed,
+                    why,
+                }
+                .into());
             }
             if in_parts {
                 ui::error(&format!(
