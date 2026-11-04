@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -18,6 +18,8 @@ assert.equal(process.platform, 'win32', 'Windows smoke tests require a native Wi
 const home = mkdtempSync(join(tmpdir(), 'agit-windows-smoke-'))
 try {
   protectWindowsSmokeHome(home)
+  // Setup writes for the runtimes installed here; Claude Code has run in this home.
+  mkdirSync(join(home, '.claude'), { recursive: true })
   const env = { ...process.env, USERPROFILE: home, CI: '1' }
   for (const key of Object.keys(env)) {
     if (['HOME', 'AGIT_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME'].includes(key.toUpperCase())) delete env[key]
