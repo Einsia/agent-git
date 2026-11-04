@@ -184,6 +184,30 @@ impl Journal {
         f
     }
 
+    /// The seq of the oldest frame `stream`'s ring holds (`None` when it holds
+    /// none), and the last seq it numbered.
+    pub fn window(&self, stream: &str) -> (Option<u64>, u64) {
+        self.streams
+            .get(stream)
+            .map(|s| (s.ring.front().and_then(|f| f.seq), s.next))
+            .unwrap_or((None, 0))
+    }
+
+    /// The first seq a viewer that has every frame through `after` gets from
+    /// `stream` when `first_sent` is the first frame sent to it: that frame, or
+    /// with none to send, `after + 1` when the viewer lacks nothing, and
+    /// `next + 1` when frames after `after` were numbered but are no longer held.
+    /// Anything above `after + 1` tells the viewer those frames are gone, so it
+    /// is answered only when they are.
+    pub fn from_seq(&self, stream: &str, after: u64, first_sent: Option<u64>) -> u64 {
+        let next = self.last_seq(stream);
+        match first_sent {
+            Some(first) => first,
+            None if after >= next => after.saturating_add(1),
+            None => next.saturating_add(1),
+        }
+    }
+
     pub fn last_seq(&self, stream: &str) -> u64 {
         self.streams.get(stream).map(|s| s.next).unwrap_or(0)
     }
@@ -298,6 +322,36 @@ fn write_watermark(w: &Watermark) -> crate::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stream that stopped keeping frames reports the frames it numbered since
+    /// as gone, and only those: a viewer that has them all lacks nothing.
+    #[test]
+    fn a_replay_claims_a_gap_only_for_frames_no_longer_held() {
+        let mut j = Journal::default();
+        let frame = || Frame::notification("item.completed", serde_json::json!({}));
+        for _ in 0..3 {
+            j.record("s", frame());
+        }
+        let from = |j: &Journal, after: u64| {
+            let (sent, _) = j.replay("s", after);
+            j.from_seq("s", after, sent.first().and_then(|f| f.seq))
+        };
+        assert_eq!(from(&j, 0), 1, "a fresh stream, whole");
+        assert_eq!(from(&j, 2), 3);
+        assert_eq!(from(&j, 3), 4, "nothing new: from after_seq + 1");
+        j.forget("s");
+        for _ in 0..2 {
+            j.record("s", frame());
+        }
+        assert_eq!(j.window("s"), (None, 5));
+        assert_eq!(from(&j, 3), 6, "frames 4 and 5 were dropped: an honest gap");
+        assert_eq!(from(&j, 5), 6, "a viewer that has them lacks nothing");
+        assert_eq!(
+            from(&j, u64::MAX),
+            u64::MAX,
+            "a cursor at the end of the range neither panics nor wraps to 0"
+        );
+    }
 
     /// Terminal frames are **numbered as usual** but never enter the ring.
     ///

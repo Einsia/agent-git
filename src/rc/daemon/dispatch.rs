@@ -481,7 +481,8 @@ impl Daemon {
                     )
                     .with_hint("nothing was sent for this request — resubscribing is safe"));
                 };
-                let (mut replay, lowest) = self.journal.replay(&p.session_id, p.after_seq);
+                let (mut replay, _) = self.journal.replay(&p.session_id, p.after_seq);
+                let (ring_front, ring_next) = self.journal.window(&p.session_id);
                 // **One subscription replays at most this many frames.**
                 //
                 // The ring holds 8192 slots, and these frames go into the outbound queue
@@ -499,7 +500,25 @@ impl Daemon {
                 // here" — reporting the `lowest` the ring holds after cutting a stretch off makes
                 // the front end believe everything from `lowest` on is contiguous, and that hole
                 // is never filled again.
-                let lowest = replay.first().and_then(|f| f.seq).unwrap_or(lowest);
+                let lowest = self.journal.from_seq(
+                    &p.session_id,
+                    p.after_seq,
+                    replay.first().and_then(|f| f.seq),
+                );
+                // Numbers only: what the viewer asked from, what it gets from, and why.
+                crate::rc::diagnostics::event(
+                    "session.subscribe_replay",
+                    serde_json::json!({
+                        "stream": crate::rc::diagnostics::id(&p.session_id),
+                        "request_id": crate::rc::diagnostics::rpc_id(f.id.as_ref()),
+                        "after_seq": p.after_seq,
+                        "from_seq": lowest,
+                        "ring_front": ring_front,
+                        "ring_next": ring_next,
+                        "frames": replay.len(),
+                        "replay_capped": dropped > 0,
+                    }),
+                );
                 // **`try_send` is wrong here.**
                 //
                 // The only consumer of `frames_rx` is the main select loop, and it is blocked in
@@ -848,6 +867,89 @@ mod tests {
         assert_eq!(
             reply.from_seq, 2,
             "`from_seq` names the oldest frame still held; jumping to the next unsent seq tells the viewer all history below it is gone"
+        );
+    }
+
+    /// `from_seq` is `after_seq + 1` whenever the viewer lacks nothing this machine dropped: from
+    /// the start of a fresh stream, from the middle, and with nothing new to send. Each subscribe
+    /// is logged with the numbers that decided it, and nothing else.
+    #[tokio::test]
+    async fn a_subscribe_claims_a_gap_only_for_frames_it_no_longer_holds() {
+        let id = watch_stream_id("ws-a", "thread-316");
+        // The daemon-wide log is open before anything is recorded.
+        crate::rc::diagnostics::test_events(&id, 0);
+        let mut d = watching_daemon();
+        let (frames, _frames_rx) = mpsc::channel(8);
+        install_watch(
+            &mut d.journal,
+            &mut d.watches,
+            id.clone(),
+            watching_tail(&id),
+        );
+        for _ in 0..3 {
+            d.journal.record(&id, watched_item());
+        }
+        let mut subscribe = async |after_seq: u64| {
+            let reply = d
+                .dispatch(&viewer_subscribe(&id, after_seq), &frames)
+                .await
+                .unwrap();
+            let reply: SessionSubscribeResult = serde_json::from_value(reply).unwrap();
+            let sent: Vec<u64> = std::mem::take(&mut d.deferred)
+                .iter()
+                .filter_map(|f| f.seq)
+                .collect();
+            d.deferred_slot = None;
+            (reply.from_seq, sent)
+        };
+        assert_eq!(
+            subscribe(0).await,
+            (1, vec![1, 2, 3]),
+            "a fresh stream, whole"
+        );
+        assert_eq!(subscribe(2).await, (3, vec![3]));
+        assert_eq!(subscribe(3).await, (4, vec![]), "nothing lacked, no gap");
+
+        let events = crate::rc::diagnostics::test_events(&id, 3);
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "session.subscribe_replay")
+            .map(|event| &event["metadata"])
+            .collect();
+        assert_eq!(logged.len(), 3, "{events:?}");
+        let last = logged[2].as_object().unwrap();
+        let mut keys: Vec<_> = last.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "after_seq",
+                "frames",
+                "from_seq",
+                "replay_capped",
+                "request_id",
+                "ring_front",
+                "ring_next",
+                "stream"
+            ]
+        );
+        assert_eq!(
+            (
+                &last["after_seq"],
+                &last["from_seq"],
+                &last["ring_front"],
+                &last["ring_next"],
+                &last["frames"],
+                &last["replay_capped"]
+            ),
+            (
+                &serde_json::json!(3),
+                &serde_json::json!(4),
+                &serde_json::json!(1),
+                &serde_json::json!(3),
+                &serde_json::json!(0),
+                &serde_json::json!(false)
+            )
         );
     }
 }
