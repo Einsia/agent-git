@@ -510,11 +510,10 @@ pub fn watch_upgrade(mut target: UpgradeTarget) -> crate::Result<()> {
     }
 }
 
-pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Result<()> {
+/// A reconciliation helper outlives the daemon it replaces, so it leads its own session.
+fn detached_reconciler(exe: &Path) -> crate::Result<std::process::Command> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
-    let mut watched = target.clone();
-    watched.watch_id = Some(uuid::Uuid::new_v4().to_string());
     let mut log_options = std::fs::OpenOptions::new();
     log_options.create(true).append(true);
     #[cfg(unix)]
@@ -525,8 +524,6 @@ pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Resu
     let log = log_options.open(super::rc_dir()?.join("upgrade-watch.log"))?;
     let mut command = crate::infra::background::command(exe);
     command
-        .args(["rc", "local", "watch-upgrade", "--target"])
-        .arg(serde_json::to_string(&watched)?)
         .env("AGIT_TELEMETRY_DEFER", "1")
         .env(crate::commands::upgrade::RESTART_ENV, "1")
         .stdin(std::process::Stdio::null())
@@ -541,6 +538,16 @@ pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Resu
             Ok(())
         });
     }
+    Ok(command)
+}
+
+pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Result<()> {
+    let mut watched = target.clone();
+    watched.watch_id = Some(uuid::Uuid::new_v4().to_string());
+    let mut command = detached_reconciler(exe)?;
+    command
+        .args(["rc", "local", "watch-upgrade", "--target"])
+        .arg(serde_json::to_string(&watched)?);
     let mut child = command
         .spawn()
         .context("cannot start background daemon upgrade watcher")?;
@@ -552,6 +559,178 @@ pub fn schedule_upgrade_watch(exe: &Path, target: &UpgradeTarget) -> crate::Resu
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+const INSTALLATION_POLL: Duration = Duration::from_secs(10);
+
+/// The file at a daemon's launch path, as far as a replacement can tell it apart.
+#[cfg(unix)]
+type InstalledFile = Option<(u64, u64, u64, i64, i64)>;
+
+#[cfg(unix)]
+fn installed_file(path: &Path) -> InstalledFile {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    })
+}
+
+/// Decides when a replaced installation is ready to take over the running daemon.
+#[cfg(unix)]
+struct InstallationWatch {
+    handled: InstalledFile,
+    seen: InstalledFile,
+    failures: u32,
+    wait: u32,
+}
+
+#[cfg(unix)]
+impl InstallationWatch {
+    fn new(running: InstalledFile) -> Self {
+        Self {
+            handled: running,
+            seen: running,
+            failures: 0,
+            wait: 0,
+        }
+    }
+
+    /// Whether `current` is a settled replacement that has not yet been handed off. An
+    /// installer still writing the file shows a different file at every poll, and starting its
+    /// build before the write finishes would run a truncated executable. An `urgent` look, made
+    /// because a helper could not start from the running image, does not wait out a backoff.
+    fn replaced(&mut self, current: InstalledFile, urgent: bool) -> bool {
+        let settled = current.is_some() && current == self.seen;
+        self.seen = current;
+        if !settled {
+            self.failures = 0;
+            self.wait = 0;
+            return false;
+        }
+        if current == self.handled {
+            return false;
+        }
+        if self.wait > 0 && !urgent {
+            self.wait -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Records the outcome of handing off the replacement `replaced` last reported. Only a
+    /// reconciliation that completed (restarted, deferred to its own watcher, or found nothing
+    /// to do) settles it. A failed one is retried after 1, 2, 4, … up to 32 polls, since its
+    /// cause (a missing execute bit, a busy lock) can clear without the file changing again.
+    fn finished(&mut self, succeeded: bool) {
+        if succeeded {
+            self.handled = self.seen;
+            self.failures = 0;
+            self.wait = 0;
+        } else {
+            self.wait = 1 << self.failures.min(5);
+            self.failures += 1;
+        }
+    }
+}
+
+/// Why the installation watch looks at the launch path now.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// The regular poll.
+    Poll,
+    /// A helper could not be started from the running image.
+    Suspect,
+}
+
+#[cfg(unix)]
+static INSTALLATION_LOOKS: std::sync::OnceLock<std::sync::mpsc::Sender<Look>> =
+    std::sync::OnceLock::new();
+
+/// A helper the daemon starts from its own image failed to start in a way a replaced
+/// installation explains (the file gone, stale, unreadable or no longer an executable): the
+/// installation watch looks at once instead of at its next poll.
+pub(crate) fn helper_failed_to_start(error: &anyhow::Error) {
+    #[cfg(unix)]
+    if let Some(looks) = INSTALLATION_LOOKS.get() {
+        suspect_installation(error, looks);
+    }
+    #[cfg(not(unix))]
+    let _ = error;
+}
+
+#[cfg(unix)]
+fn suspect_installation(error: &anyhow::Error, looks: &std::sync::mpsc::Sender<Look>) -> bool {
+    let replaced = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .filter_map(std::io::Error::raw_os_error)
+        .any(|code| [libc::ESTALE, libc::ENOENT, libc::EACCES, libc::ENOEXEC].contains(&code));
+    replaced && looks.send(Look::Suspect).is_ok()
+}
+
+/// A daemon whose executable is replaced keeps running only the image it loaded: every helper
+/// it starts by path then fails or runs another build, so new controller links, settlement and
+/// privacy checks stop while the conversations it holds still look attached. The installed
+/// build takes over through the same guarded reconciliation an installer runs; a deferred
+/// handoff keeps retrying in that reconciliation's own watcher.
+#[cfg(unix)]
+pub(crate) fn watch_installation(executable: PathBuf) -> std::io::Result<()> {
+    let (looks, looked) = std::sync::mpsc::channel();
+    if INSTALLATION_LOOKS.set(looks).is_err() {
+        return Ok(());
+    }
+    let watch = InstallationWatch::new(installed_file(&executable));
+    std::thread::Builder::new()
+        .name("installation-watch".into())
+        .spawn(move || {
+            let reconcile = || {
+                let reconciled = detached_reconciler(&executable).and_then(|mut command| {
+                    command.args(["rc", "local", "reconcile-installed"]);
+                    Ok(command.spawn()?.wait()?)
+                });
+                let failure = match reconciled {
+                    Ok(status) if status.success() => return Ok(()),
+                    Ok(status) => format!("its reconciliation exited with {status}"),
+                    Err(error) => format!("{error:#}"),
+                };
+                eprintln!(
+                    "agitd: {} was replaced, but its build could not take over yet: {failure}",
+                    executable.display()
+                );
+                Err(())
+            };
+            let next = || match looked.recv_timeout(INSTALLATION_POLL) {
+                Ok(look) => Some(look),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Look::Poll),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            };
+            run_installation_watch(watch, next, || installed_file(&executable), reconcile);
+        })?;
+    Ok(())
+}
+
+/// Hands the installation over each time a look finds a settled replacement, until `next`
+/// ends.
+#[cfg(unix)]
+fn run_installation_watch(
+    mut watch: InstallationWatch,
+    mut next: impl FnMut() -> Option<Look>,
+    probe: impl Fn() -> InstalledFile,
+    mut reconcile: impl FnMut() -> Result<(), ()>,
+) {
+    while let Some(look) = next() {
+        if watch.replaced(probe(), look == Look::Suspect) {
+            watch.finished(reconcile().is_ok());
+        }
+    }
 }
 
 pub fn report(outcome: &Outcome) -> crate::Result<()> {
@@ -588,6 +767,149 @@ mod tests {
                 "restart",
                 "--if-idle"
             ]
+        );
+    }
+
+    /// A replaced installation hands off once it settles and until a handoff completes. Firing
+    /// on the first changed poll would start a build an installer is still writing; firing on
+    /// every poll after a completed handoff would stack reconciliations while a busy daemon
+    /// defers its restart; never retrying a failed one would leave the daemon on the old build.
+    #[cfg(unix)]
+    #[test]
+    fn installation_watch_retries_a_settled_replacement_until_its_handoff_completes() {
+        let file = |ino, len| Some((1, ino, len, 0, 0));
+        let mut watch = InstallationWatch::new(file(1, 10));
+        assert!(
+            !watch.replaced(file(1, 10), false),
+            "the running build is not a replacement"
+        );
+        assert!(
+            !watch.replaced(file(2, 4), false),
+            "a file still being written must settle first"
+        );
+        assert!(!watch.replaced(file(2, 8), false));
+        assert!(watch.replaced(file(2, 8), false));
+        watch.finished(false);
+        assert!(
+            !watch.replaced(file(2, 8), false),
+            "a failed handoff backs off"
+        );
+        assert!(
+            watch.replaced(file(2, 8), false),
+            "a failed handoff is retried without a new installation"
+        );
+        watch.finished(false);
+        assert!(!watch.replaced(file(2, 8), false));
+        assert!(!watch.replaced(file(2, 8), false));
+        assert!(
+            watch.replaced(file(2, 8), false),
+            "each failure doubles the wait"
+        );
+        watch.finished(true);
+        assert!(
+            !watch.replaced(file(2, 8), false),
+            "a completed handoff is not repeated"
+        );
+        assert!(
+            !watch.replaced(None, false),
+            "a missing installation has nothing to run"
+        );
+        assert!(!watch.replaced(None, false));
+        assert!(!watch.replaced(file(3, 8), false));
+        assert!(
+            watch.replaced(file(3, 8), false),
+            "a later installation hands off again"
+        );
+    }
+
+    /// Runs the installation watch over a script of looks, each made while the launch path
+    /// holds the given file, with reconciliations answering in turn; returns how many ran.
+    #[cfg(unix)]
+    fn watched(
+        running: InstalledFile,
+        looks: &[(InstalledFile, Look)],
+        answers: &[Result<(), ()>],
+    ) -> usize {
+        let current = std::cell::Cell::new(running);
+        let mut looks = looks.iter();
+        let mut answers = answers.iter();
+        let mut ran = 0;
+        run_installation_watch(
+            InstallationWatch::new(running),
+            || {
+                let (file, look) = looks.next()?;
+                current.set(*file);
+                Some(*look)
+            },
+            || current.get(),
+            || {
+                ran += 1;
+                *answers.next().unwrap_or(&Ok(()))
+            },
+        );
+        ran
+    }
+
+    /// The regular poll alone hands a replaced installation over once it settles, and once only.
+    /// Without it a daemon whose executable was renamed over keeps every helper it starts
+    /// failing until someone restarts it (#298).
+    #[cfg(unix)]
+    #[test]
+    fn the_poll_hands_a_replaced_installation_over() {
+        let file = |ino, len| Some((1, ino, len, 0, 0));
+        let poll = |file| (file, Look::Poll);
+        assert_eq!(
+            watched(
+                file(1, 10),
+                &[
+                    poll(file(1, 10)),
+                    poll(file(2, 8)),
+                    poll(file(2, 8)),
+                    poll(file(2, 8))
+                ],
+                &[]
+            ),
+            1
+        );
+        assert_eq!(watched(file(1, 10), &[poll(file(1, 10)); 4], &[]), 0);
+    }
+
+    /// A helper that cannot start from the running image because its file is gone, stale,
+    /// unreadable or no longer an executable makes the watch look at once, past any backoff:
+    /// on the Sim's read-only share every Cloud offer failed until a restart (#298). Any other
+    /// failure to start is no sign of a replacement.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_cannot_start_hands_the_installation_over_at_once() {
+        let (looks, looked) = std::sync::mpsc::channel();
+        for code in [libc::ESTALE, libc::ENOENT, libc::EACCES, libc::ENOEXEC] {
+            let error = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("cannot start the tunnel worker");
+            assert!(suspect_installation(&error, &looks), "errno {code}");
+            assert_eq!(looked.try_recv(), Ok(Look::Suspect));
+        }
+        let refused = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
+        assert!(!suspect_installation(&refused, &looks));
+        assert!(!suspect_installation(
+            &anyhow::anyhow!("tunnel worker closed"),
+            &looks
+        ));
+        assert!(looked.try_recv().is_err());
+
+        let file = |ino, len| Some((1, ino, len, 0, 0));
+        let suspect = |file| (file, Look::Suspect);
+        assert_eq!(
+            watched(
+                file(1, 10),
+                &[
+                    suspect(file(2, 8)),
+                    suspect(file(2, 8)),
+                    suspect(file(2, 8))
+                ],
+                &[Err(())]
+            ),
+            2,
+            "a failed handoff is retried at the next failed start, not after its backoff"
         );
     }
 

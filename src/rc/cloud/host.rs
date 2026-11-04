@@ -407,7 +407,7 @@ async fn run_executor(
                         };
                         let transport = |config| async {
                             let started = Instant::now();
-                            let raw = worker.open(config).await?;
+                            let raw = worker.open(config).await.inspect_err(super::super::lifecycle::helper_failed_to_start)?;
                             Ok::<_, anyhow::Error>((raw, started.elapsed().as_secs_f64() * 1000.0))
                         };
                         // A join-bearing upgrade must follow admission; speculative sockets carry no ticket.

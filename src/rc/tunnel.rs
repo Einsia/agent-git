@@ -64,7 +64,7 @@ pub async fn connect(
         started.elapsed(),
         None,
     );
-    let connection: Connection = result?;
+    let connection: Connection = result.inspect_err(super::lifecycle::helper_failed_to_start)?;
     let (sink, source) = connection.split();
     let sink = sink.with(|message| async move {
         Ok::<_, anyhow::Error>(match message {
