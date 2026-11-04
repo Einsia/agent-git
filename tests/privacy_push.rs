@@ -46,6 +46,8 @@ struct Hub {
     refuse_tags: Arc<AtomicBool>,
     unsupported_policy: Arc<AtomicBool>,
     corrupt_receipt: Arc<AtomicBool>,
+    /// The repository's location answers 404, as it does for a reader who lost access to it.
+    location_gone: Arc<AtomicBool>,
     creations: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
     visibility: Arc<Mutex<&'static str>>,
@@ -114,6 +116,8 @@ impl Hub {
         let unsupported = Arc::clone(&unsupported_policy);
         let corrupt_receipt = Arc::new(AtomicBool::new(false));
         let corrupting = Arc::clone(&corrupt_receipt);
+        let location_gone = Arc::new(AtomicBool::new(false));
+        let gone = Arc::clone(&location_gone);
         let confirmations = Arc::new(AtomicUsize::new(0));
         let confirmed = Arc::clone(&confirmations);
         let creations = Arc::new(AtomicUsize::new(0));
@@ -246,6 +250,19 @@ impl Hub {
                     || target == "/api/agents/alice/notes"
                 {
                     let body = r#"{"error":"repository is unavailable"}"#;
+                    write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                // The Hub keeps no publication status for a version it never received.
+                if target == format!("/api/repositories/{AGENT_ID}/location")
+                    && gone.load(Ordering::Acquire)
+                {
+                    let body = r#"{"kind":"not_found","error":"source unavailable"}"#;
+                    write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                if target.contains("/privacy?ref=") {
+                    let body = r#"{"kind":"not_found","error":"version not found"}"#;
                     write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     continue;
                 }
@@ -497,6 +514,12 @@ impl Hub {
                     ("GET", "/api/agents/alice/app") => Some(
                         json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url,"visibility":*served_visibility.lock().unwrap()}),
                     ),
+                    // Where the repository lives now, asked before a session's privacy status.
+                    ("GET", path) if path == format!("/api/repositories/{AGENT_ID}/location") => {
+                        Some(
+                            json!({"agent_id":AGENT_ID,"owner":"alice","name":"app","clone_url":url}),
+                        )
+                    }
                     // A publication plans against the limits the Hub publishes.
                     ("GET", "/api/hub/config") => Some(json!({
                         "mode":"live",
@@ -636,6 +659,7 @@ impl Hub {
             refuse_tags,
             unsupported_policy,
             corrupt_receipt,
+            location_gone,
             creations,
             viewing_public,
             visibility,
@@ -898,6 +922,28 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     }
     assert_eq!(hub.creations.load(Ordering::Acquire), 1);
     assert!(hub.posts.load(Ordering::Acquire) > 0);
+    // A branch never pushed is told as not published yet, not as a repository the reader cannot
+    // see.
+    let unpublished = run(&["privacy", "status", "alice/app@unencrypted"], false);
+    assert!(!unpublished.status.success(), "{unpublished:?}");
+    let said = String::from_utf8_lossy(&unpublished.stderr);
+    assert!(
+        said.contains("this version of alice/app@unencrypted isn't published yet"),
+        "{said}"
+    );
+    // A status names no upload: the person asked for a status.
+    assert!(said.contains("once it's published"), "{said}");
+    assert!(!said.contains("agit push"), "{said}");
+    assert!(!said.contains("private agent you cannot access"), "{said}");
+    // A reader who lost access to the repository is not told the version isn't published: with
+    // no receipt here either, only the repository's own answer can say which it is.
+    hub.location_gone.store(true, Ordering::Release);
+    let lost = run(&["privacy", "status", "alice/app@unencrypted"], false);
+    hub.location_gone.store(false, Ordering::Release);
+    assert!(!lost.status.success(), "{lost:?}");
+    let said = String::from_utf8_lossy(&lost.stderr);
+    assert!(!said.contains("isn't published yet"), "{said}");
+    assert!(!said.contains("once it's published"), "{said}");
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), base);
     assert_eq!(git(&remote, &["rev-parse", "refs/tags/file-release"]), base);
     assert_eq!(

@@ -65,13 +65,33 @@ pub(super) fn run(target: &str) -> CmdResult {
     } else {
         (client, repository, identity)
     };
-    let status = client.session_publication_status(
+    let status = match client.session_publication_status(
         &repository,
         &identity,
         &session,
         &commit,
         expected.as_ref(),
-    )?;
+    ) {
+        Ok(status) => status,
+        // The Hub answers a version it has no copy of as it answers a repository the reader
+        // cannot see. A version this machine never published is simply not there yet, unless
+        // the repository itself is out of reach, which only its own answer says.
+        Err(error)
+            if !error.is::<crate::hub::privacy::location::SourceUnavailable>()
+                && not_found(&error)
+                && let Some(branch) = resolved.branch.as_deref()
+                && !published_here(&repo, branch, &resolved.sha)? =>
+        {
+            let target = format!("{slug}@{branch}");
+            crate::ui::error(&format!(
+                "this version of {target} isn't published yet, so the Hub has no privacy status for it"
+            ));
+            // A fact, not a command: the person asked for a status, not an upload.
+            crate::ui::hint("it gets a Hub privacy status once it's published");
+            return Ok(ExitCode::Ref);
+        }
+        Err(error) => return Err(error),
+    };
     if crate::commands::json::requested() {
         println!(
             "{}",
@@ -130,4 +150,25 @@ pub(super) fn run(target: &str) -> CmdResult {
         }
     }
     Ok(ExitCode::Ok)
+}
+
+fn not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::hub::client::ApiError>()
+            .is_some_and(|api| api.status == 404)
+    })
+}
+
+/// Whether this machine published exactly this version of `branch`, so the Hub's "not found"
+/// cannot mean that it was never sent.
+fn published_here(
+    repo: &crate::domain::repo::Repo,
+    branch: &str,
+    sha: &str,
+) -> crate::Result<bool> {
+    Ok(
+        crate::domain::privacy_receipt::PublicationReceipt::load(repo, branch)?
+            .is_some_and(|receipt| receipt.source == sha),
+    )
 }
