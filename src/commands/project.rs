@@ -45,6 +45,11 @@ pub enum Action {
         /// Move a directory routed to another repository, replacing its binding and project policy.
         #[arg(long)]
         rebind: bool,
+        /// The person's consent, given in agit's menu bar, to upload automatically into this
+        /// public repository. It must name the `--repo` repository and counts only outside an
+        /// agent session.
+        #[arg(long, value_name = "OWNER/REPO", requires = "auto_upload", hide = true)]
+        public_consent: Option<String>,
     },
     /// Import and publish eligible sessions again; existing claims are reused.
     Sync {
@@ -1471,7 +1476,16 @@ pub fn run(args: Args) -> CmdResult {
             auto_upload,
             dry_run,
             rebind,
-        } => bind(&path, &repo, history, auto_upload, dry_run, rebind),
+            public_consent,
+        } => bind(
+            &path,
+            &repo,
+            history,
+            auto_upload,
+            dry_run,
+            rebind,
+            public_consent.as_deref(),
+        ),
         Action::List => list(),
         Action::Status { path } => {
             let root = root(&path)?;
@@ -1580,6 +1594,7 @@ fn bind(
     automatic: bool,
     dry_run: bool,
     rebind: bool,
+    public_consent: Option<&str>,
 ) -> CmdResult {
     let root = root(path)?;
     let (owner, name) = super::parse_slug(repository)?;
@@ -1612,12 +1627,22 @@ fn bind(
     // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
     assignable(&root, repository, rebind)?;
     if dry_run {
+        // Whoever asks the person first (agit's menu bar) learns here whether the destination is
+        // public, so it can say so in its question. It is read, never changed; an unreadable
+        // audience is null, and the bind itself checks it again.
+        let visibility = super::require_login().ok().and_then(|client| {
+            let (owner, name) = super::parse_slug(repository).ok()?;
+            super::remote_request(client.get_agent(&owner, &name))
+                .ok()
+                .map(|remote| remote.visibility)
+        });
         println!(
             "{}",
             serde_json::json!({
                 "directory": root, "repository": repository, "history": history,
                 "repository_auto_upload": automatic, "repository_auto_push": automatic,
                 "repository_auto_push_scope": automatic.then(|| auto_push_scope(repository)),
+                "repository_visibility": visibility,
                 "candidates": rows, "candidates_in_worktrees": in_worktrees,
             })
         );
@@ -1675,7 +1700,7 @@ fn bind(
     project.account = me.username;
     project.account_id = me.account_id;
     if automatic && remote.visibility == "public" {
-        super::push::require_terminal_for_public(
+        super::push::require_person_for_public(
             repository,
             &format!(
                 "agit project bind {} --repo {repository} --history {} --auto-upload",
@@ -1686,6 +1711,7 @@ fn bind(
                     "none"
                 }
             ),
+            public_consent,
         )?;
     }
     let org = owner_is_org(&client, &owner, &project.account);
@@ -4184,11 +4210,38 @@ fn readable(error: &str) -> String {
             .filter(|row| row["level"] == "error")
             .filter_map(|row| row["message"].as_str())
             .collect();
+        let reasons: Vec<_> = errors
+            .iter()
+            .copied()
+            .filter(|message| !is_git_summary(message))
+            .collect();
+        // git's summary alone is still all there is to say.
+        let errors = if reasons.is_empty() { errors } else { reasons };
         if !errors.is_empty() {
             return format!("{command}: {}", errors.join("; "));
         }
     }
-    error.to_owned()
+    without_git_summary(error)
+}
+
+/// Whether `part` is git's own summary of a refused push, which names only the URL. A result saved
+/// before the push child left that line out still leads with it, as text or as diagnostics, and a
+/// reader shown the first line or two would see the URL and not why.
+fn is_git_summary(part: &str) -> bool {
+    part.starts_with("failed to push some refs")
+}
+
+/// `error` without git's summary of a refused push (`is_git_summary`).
+fn without_git_summary(error: &str) -> String {
+    let (command, rest) = error.split_once(": ").unwrap_or(("", error));
+    let kept: Vec<_> = rest
+        .split("; ")
+        .filter(|part| !is_git_summary(part))
+        .collect();
+    if kept.is_empty() || command.is_empty() {
+        return error.to_owned();
+    }
+    format!("{command}: {}", kept.join("; "))
 }
 
 /// A capture result and a sync result in one shape. `uploaded` maps each session the attempt
@@ -5408,12 +5461,32 @@ mod tests {
         }
         let bound = tempfile::tempdir().unwrap();
         workspace::bind(bound.path(), "alice/other", false).unwrap();
-        let error = bind(bound.path(), "alice/app", History::None, false, true, false).unwrap_err();
+        let error = bind(
+            bound.path(),
+            "alice/app",
+            History::None,
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("add `--rebind` to this command to move it to alice/app"),
             "{error:#}"
         );
-        assert!(bind(bound.path(), "alice/app", History::None, false, true, true).is_ok());
+        assert!(
+            bind(
+                bound.path(),
+                "alice/app",
+                History::None,
+                false,
+                true,
+                true,
+                None
+            )
+            .is_ok()
+        );
 
         let enrolled = tempfile::tempdir().unwrap();
         save(&project(enrolled.path())).unwrap();
@@ -5424,6 +5497,7 @@ mod tests {
             false,
             true,
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5437,7 +5511,8 @@ mod tests {
                 History::None,
                 false,
                 true,
-                false
+                false,
+                None
             )
             .is_ok()
         );
@@ -5448,7 +5523,8 @@ mod tests {
                 History::None,
                 false,
                 true,
-                true
+                true,
+                None
             )
             .is_ok()
         );
@@ -6854,6 +6930,29 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(format!("{other:#}"), "the Hub did not answer");
+    }
+
+    /// A failure saved while git's own summary of a refused push still led the message is read
+    /// with the reason first, whether it was saved as text or as the child's diagnostics; that
+    /// summary names only the URL.
+    #[test]
+    fn a_saved_failure_reads_with_its_reason_first() {
+        assert_eq!(
+            readable(
+                r#"push failed: [{"level":"error","message":"failed to push some refs to 'https://hub/x.git'"},{"level":"error","message":"publication did not complete (HTTP 422 too many entries)"}]"#
+            ),
+            "push failed: publication did not complete (HTTP 422 too many entries)"
+        );
+        assert_eq!(
+            readable(
+                "push failed: failed to push some refs to 'https://hub/x.git'; publication did not complete (HTTP 422 too many entries); retry later"
+            ),
+            "push failed: publication did not complete (HTTP 422 too many entries); retry later"
+        );
+        assert_eq!(
+            without_git_summary("push failed: timeout"),
+            "push failed: timeout"
+        );
     }
 
     /// A Hub refusal comes back from the child as a policy exit, as a privacy check that did not

@@ -4891,14 +4891,16 @@ fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
     );
 }
 
-/// Automatic upload into a public repository is switched on only by the person, at a terminal.
-/// Each row names an entry point, the destination's audience, whether `--yes` was given and
-/// whether a terminal is attached. Without a terminal a public switch-on is refused with or without
-/// `--yes` and leaves automatic upload off; private, and user-wide or destination-less switches,
-/// stay allowed, but an automatic push into a public repository that nobody enrolled is refused
-/// before upload. A gate that accepted `--yes` would let an agent enroll a public repository on
-/// a relayed sentence; a gate only at the entry points would let an inherited user preference
-/// publish publicly. Choosing "On", or inheriting an enabled preference, in a first checkout's
+/// Automatic upload into a public repository is switched on only by the person: at a terminal, or
+/// with the menu bar's consent naming that repository, outside any agent session. Each row names an
+/// entry point, the destination's audience, whether `--yes` was given and whether a terminal is
+/// attached. Without either, a public switch-on is refused with or without `--yes` and leaves
+/// automatic upload off; private, and user-wide or destination-less switches, stay allowed, but an
+/// automatic push into a public repository that nobody enrolled is refused before upload. A gate
+/// that accepted `--yes`, or the consent for another repository or from inside an agent session,
+/// would let an agent enroll a public repository on a relayed sentence; a gate only at the entry
+/// points would let an inherited user preference publish publicly. The dry run the menu bar asks
+/// first names the audience, so its question can say the repository is public. Choosing "On", or inheriting an enabled preference, in a first checkout's
 /// menu at a terminal records the same enrollment as `--auto-push=true` there; a menu that only
 /// stored the switch would leave every later automatic upload refused.
 #[cfg(unix)]
@@ -4931,6 +4933,21 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
     sign_in(&home);
     let project = temp.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    // A folder's automatic upload needs a runtime whose hooks capture its turns; a stand-in
+    // `claude` first on the search path keeps the rows from depending on what the machine running
+    // them has installed.
+    let runtimes = temp.path().join("runtimes");
+    fs::create_dir_all(&runtimes).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = runtimes.join("claude");
+        fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let search_path = std::env::join_paths(std::iter::once(runtimes.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
     let run_in = |home: &Path, args: &[&str], automatic: bool| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
@@ -4941,6 +4958,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
             }
         }
         command
+            .env("PATH", &search_path)
             .current_dir(temp.path())
             .env("AGIT_HOME", home)
             .env("CODEX_HOME", home.join("codex"))
@@ -5065,6 +5083,36 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         "none",
         "--auto-upload",
     ];
+    let repo_consent: &[&str] = &[
+        "config",
+        "--repo",
+        "alice/app",
+        "push.auto",
+        "true",
+        "--public-consent",
+        "alice/app",
+    ];
+    let repo_consent_other: &[&str] = &[
+        "config",
+        "--repo",
+        "alice/app",
+        "push.auto",
+        "true",
+        "--public-consent",
+        "alice/other",
+    ];
+    let bind_consent: &[&str] = &[
+        "project",
+        "bind",
+        project_dir,
+        "--repo",
+        "alice/app",
+        "--history",
+        "none",
+        "--auto-upload",
+        "--public-consent",
+        "alice/app",
+    ];
     let user_switch: &[&str] = &["config", "push.auto", "true"];
     let init_switch: &[&str] = &["init", "fresh", "--no-bind", "--auto-push=true"];
     let menu_clone: &[&str] = &["clone", "alice/app"];
@@ -5118,6 +5166,12 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         row(clone_switch, "public", true, false, false, None),
         row(clone_switch, "private", false, false, true, None),
         row(bind_switch, "public", true, false, false, None),
+        // The menu bar's click, outside any agent session, consents for the repository it names
+        // and enrolls it as a terminal answer does; consent for another repository is none.
+        row(repo_consent, "public", false, false, true, Some(true)),
+        row(repo_consent_other, "public", true, false, false, None),
+        // The menu bar passes --yes for the bind's own question; the consent answers the public one.
+        row(bind_consent, "public", true, false, true, None),
         row(user_switch, "public", true, false, true, Some(false)),
         row(init_switch, "public", false, false, true, None),
         menu(ON, "public", false, true, Some(true)),
@@ -5233,7 +5287,8 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
             assert_eq!(out.status.success(), switched_on, "{case}: {out:?}");
             if !switched_on {
                 assert!(
-                    String::from_utf8_lossy(&out.stderr).contains("themselves in a terminal"),
+                    String::from_utf8_lossy(&out.stderr)
+                        .contains("is turned on from the AgentGit menu bar, or by running"),
                     "{case}: {out:?}"
                 );
             }
@@ -5267,6 +5322,49 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
             }
         }
     }
+
+    // The same consent from inside an agent's own session is none: an agent that runs the menu
+    // bar's command line would otherwise switch a public upload on for itself.
+    repo.git(&["config", "--local", "--unset-all", "agit.autoPush"])
+        .ok();
+    let _ = fs::remove_file(&enrollment);
+    *hub.visibility.lock().unwrap() = "public";
+    let mut inside = Command::new(env!("CARGO_BIN_EXE_agit"));
+    inside.env_clear_local();
+    for (name, value) in git_command(temp.path()).get_envs() {
+        if let Some(value) = value {
+            inside.env(name, value);
+        }
+    }
+    let inside = inside
+        .current_dir(temp.path())
+        .env("AGIT_HOME", &home)
+        .env("CODEX_HOME", home.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+        .env("AGIT_HUB_URL", &hub.base)
+        .env("CI", "1")
+        .env("AGIT_TUI", "0")
+        .env("AGIT_USE_SYSTEM_GIT", "1")
+        .env("AGIT_SECRETS_KEYSTORE", "file")
+        .env("AGIT_SESSION", "alice/app@work")
+        .stdin(Stdio::null())
+        .args(repo_consent)
+        .output()
+        .unwrap();
+    assert!(!inside.status.success(), "{inside:?}");
+    assert!(!effective(&home));
+    assert!(!enrollment.exists());
+
+    let mut probe = vec!["--json"];
+    probe.extend_from_slice(bind_switch);
+    probe.push("--dry-run");
+    let probe = run(&probe, false);
+    assert_success(&probe);
+    let probe: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+    assert_eq!(
+        probe["result"]["value"]["repository_visibility"], "public",
+        "{probe}"
+    );
 }
 
 /// A session branch that moved on the Hub while this checkout settled its own turn is refused
