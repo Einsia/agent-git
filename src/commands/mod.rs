@@ -96,6 +96,7 @@ pub mod hooks;
 /// stdio MCP server (hidden).
 pub mod mcp;
 pub mod migration;
+pub mod repair;
 pub mod scan;
 #[path = "secrets.rs"]
 pub mod secret_vault;
@@ -1362,6 +1363,8 @@ pub enum Commands {
     Scan(scan::Args),
     /// Register low-entropy literal secrets in the device-local encrypted vault
     Secrets(secret_vault::Args),
+    /// Put back values an earlier agit replaced with placeholders: `agit repair placeholders <owner/repo>`
+    Repair(repair::Args),
     /// Install all integrations at once: hooks + skill + mcp + AGENTS.md (idempotent)
     Setup(setup::Args),
     /// Upgrade to the latest version the hub announces (--check only reports)
@@ -1431,6 +1434,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Export(_) => "export",
         Commands::Scan(_) => "scan",
         Commands::Secrets(_) => "secrets",
+        Commands::Repair(_) => "repair",
         Commands::Setup(_) => "setup",
         Commands::Upgrade(_) => "upgrade",
         Commands::Doctor(_) => "doctor",
