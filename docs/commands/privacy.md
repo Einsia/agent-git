@@ -2,8 +2,9 @@
 
 ## Choose an initial publication mode
 
-New sessions default to `plain` publication. This applies to new sessions, first imports,
-independent forks and offline creation. Before the session's first remote registration, its
+New sessions default to `plain` publication. This applies to new sessions, first imports, forks
+and offline creation. A session whose history includes an encrypted snapshot (a fork or merge of
+one) is not published: its push is refused, and nothing is uploaded. Before the session's first remote registration, its
 creator can explicitly enable encryption:
 
 ```sh
@@ -227,9 +228,9 @@ membership and the membership epoch still apply: departure invalidates grants an
 rejoining does not restore them. Owner departure does not revoke other eligible
 readers' access.
 
-An independent fork has its own session policy and recipients. Resume, repeat
-import, clone, branch rename, and repository copies preserve source authority.
-Inherited originals remain governed by their source repository and session.
+A fork of an encrypted snapshot stays on this computer: it can be resumed and continued, and its
+push is refused. Resume, repeat import, clone, branch rename, and repository copies preserve
+source authority. Inherited originals remain governed by their source repository and session.
 
 Changes require confirmation. Use the global `--yes` flag for an explicitly
 authorized unattended operation and `--json` for structured results.

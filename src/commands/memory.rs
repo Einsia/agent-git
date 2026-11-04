@@ -1892,7 +1892,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("native continuation or an independent fork")
+                .contains("requires a settled native continuation")
         );
         assert_eq!(
             primary.git(&["rev-parse", "refs/heads/s1"]).unwrap(),

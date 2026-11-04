@@ -885,6 +885,7 @@ impl ProjectedHistory {
                 }
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
                 let mut plain_rewrites = BTreeSet::new();
+                let mut encrypted_reach = EncryptedReach::new(&ledger);
                 for oid in order.iter().filter(|oid| reachable.contains(*oid)) {
                     // The plan leaves a boundary commit's ancestry out, so its public parents come
                     // from its accepted mapping instead of from this walk.
@@ -1034,6 +1035,23 @@ impl ProjectedHistory {
                     if config.is_none_or(|response| {
                         response.config.privacy.scheme == SessionScheme::Plain
                     }) {
+                        // A plain snapshot never carries an encrypted session's turns: readers
+                        // were shown only their projection, and nothing here can publish them in
+                        // that form. One whose history reaches an encrypted snapshot, through any
+                        // parent, is refused before anything is sent.
+                        if config.is_some()
+                            && let Some(encrypted) = encrypted_reach.of(
+                                &source,
+                                oid,
+                                &parents[oid],
+                                enveloped.contains(oid),
+                            )?
+                        {
+                            anyhow::bail!(
+                                "{encrypted} was published encrypted, and the history of {} includes it, so its turns can't be published as a plain session; nothing was uploaded",
+                                metadata.session
+                            );
+                        }
                         ensure!(
                             parents[oid]
                                 .iter()
@@ -1631,6 +1649,109 @@ struct Conversation {
     /// The event path of each published record holding a placeholder the privacy check put where
     /// it left something out.
     left_out: BTreeSet<String>,
+}
+
+/// Which encrypted session, if any, a commit's history reaches through any parent: a commit
+/// carrying an envelope, or one this device published encrypted. Answers are kept per commit, so a
+/// snapshot whose parents were already answered costs no walk of their shared history.
+struct EncryptedReach {
+    /// This device's encrypted publications: each source commit and its session.
+    published: Vec<(String, String)>,
+    answers: BTreeMap<String, Option<String>>,
+}
+
+impl EncryptedReach {
+    fn new(ledger: &accepted::Ledger) -> Self {
+        Self {
+            published: ledger
+                .every_accepted()
+                .filter(|entry| !entry.plain && !entry.delivered && entry.source != entry.public)
+                .map(|entry| (entry.source.clone(), entry.source_session.clone()))
+                .collect(),
+            answers: BTreeMap::new(),
+        }
+    }
+
+    fn of(
+        &mut self,
+        source: &Repo,
+        oid: &str,
+        parents: &[String],
+        enveloped: bool,
+    ) -> Result<Option<String>> {
+        if let Some(answer) = self.answers.get(oid) {
+            return Ok(answer.clone());
+        }
+        let known: Option<Vec<&Option<String>>> = parents
+            .iter()
+            .map(|parent| self.answers.get(parent))
+            .collect();
+        let answer = match known {
+            Some(known)
+                if !enveloped && !self.published.iter().any(|(commit, _)| commit == oid) =>
+            {
+                known.into_iter().flatten().next().cloned()
+            }
+            _ => self.walk(source, oid)?,
+        };
+        self.answers.insert(oid.to_owned(), answer.clone());
+        Ok(answer)
+    }
+
+    /// Asked of Git with bounded output: one ancestry test per encrypted publication, and at
+    /// most a few commits that touched an envelope.
+    fn walk(&self, source: &Repo, oid: &str) -> Result<Option<String>> {
+        for (commit, session) in &self.published {
+            if commit == oid {
+                return Ok(Some(session.clone()));
+            }
+            // A publication whose commit this checkout doesn't hold can't be in its history.
+            if source
+                .git_status_local(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?
+                .0
+                != Some(0)
+            {
+                continue;
+            }
+            match source
+                .git_status_local(&["merge-base", "--is-ancestor", commit, oid])?
+                .0
+            {
+                Some(0) => return Ok(Some(session.clone())),
+                Some(1) => {}
+                // Git couldn't answer, so the history can't be shown to be free of it.
+                _ => anyhow::bail!(
+                    "this checkout can't tell whether {session}, which was published encrypted, is in the history being pushed; nothing was uploaded"
+                ),
+            }
+        }
+        // Full history: by default a path query skips a parent the merge's tree doesn't take.
+        let touched: Vec<String> = source
+            .git(&[
+                "rev-list",
+                "--max-count=32",
+                "--full-history",
+                oid,
+                "--",
+                "privacy/envelope.json",
+            ])?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if touched.is_empty() {
+            return Ok(None);
+        }
+        let held = enveloped_commits(source, &touched)?;
+        let commit = touched
+            .iter()
+            .find(|commit| held.contains(*commit))
+            .unwrap_or(&touched[0]);
+        Ok(Some(
+            crate::domain::storage::metadata_local(source.root(), commit)
+                .map(|metadata| metadata.session)
+                .unwrap_or_else(|_| commit.clone()),
+        ))
+    }
 }
 
 /// The longest path under `events/` a session tree may list. The reader refuses a longer one
@@ -3137,6 +3258,119 @@ mod tests {
                 (side.as_str(), "b.txt"),
                 (merge.as_str(), "c.txt"),
             ]
+        );
+    }
+
+    /// A long plain history is asked about with bounded output, and an encrypted publication on
+    /// an unrelated branch doesn't make it reach one; one on its own history does.
+    #[test]
+    fn a_long_plain_history_is_asked_about_with_bounded_output() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let commits = 30_000;
+        let mut script = String::new();
+        for index in 0..commits {
+            script.push_str(&format!(
+                "commit refs/heads/main\nmark :{}\ncommitter t <t@example.com> 1600000000 +0000\ndata 1\n.\n{}\n",
+                index + 1,
+                if index == 0 { String::new() } else { format!("from :{index}\n") }
+            ));
+        }
+        script.push_str(
+            "commit refs/heads/other\nmark :999999\ncommitter t <t@example.com> 1600000000 +0000\ndata 5\nother\n\n",
+        );
+        let mut import = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["fast-import", "--quiet"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        import
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(import.wait().unwrap().success());
+        let tip = git(temp.path(), &["rev-parse", "main"]).trim().to_owned();
+        let parent = git(temp.path(), &["rev-parse", "main^"]).trim().to_owned();
+        let other = git(temp.path(), &["rev-parse", "other"]).trim().to_owned();
+        let source = Repo::at(temp.path()).local_objects_only();
+        let mut reach = EncryptedReach {
+            published: vec![(other.clone(), "agit-encrypted".into())],
+            answers: BTreeMap::new(),
+        };
+        assert_eq!(
+            reach
+                .of(&source, &tip, std::slice::from_ref(&parent), false)
+                .unwrap(),
+            None
+        );
+        let first = git(temp.path(), &["rev-list", "--max-parents=0", "main"])
+            .trim()
+            .to_owned();
+        let mut reach = EncryptedReach {
+            published: vec![(first, "agit-encrypted".into())],
+            answers: BTreeMap::new(),
+        };
+        assert_eq!(
+            reach
+                .of(&source, &tip, &[parent], false)
+                .unwrap()
+                .as_deref(),
+            Some("agit-encrypted")
+        );
+    }
+
+    /// A publication whose commit this checkout doesn't hold is skipped; one Git can't place in
+    /// the history refuses the push rather than count as absent.
+    #[test]
+    fn an_encrypted_publication_git_cannot_place_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(
+            temp.path(),
+            &["commit", "-q", "--allow-empty", "-m", "first"],
+        );
+        let first = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        git(
+            temp.path(),
+            &["commit", "-q", "--allow-empty", "-m", "second"],
+        );
+        let tip = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        git(temp.path(), &["checkout", "-q", "--orphan", "other"]);
+        git(
+            temp.path(),
+            &["commit", "-q", "--allow-empty", "-m", "other"],
+        );
+        let other = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let source = Repo::at(temp.path()).local_objects_only();
+        let reach = |published: Vec<(String, String)>| EncryptedReach {
+            published,
+            answers: BTreeMap::new(),
+        };
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_owned();
+        assert_eq!(
+            reach(vec![(absent, "agit-absent".into())])
+                .walk(&source, &tip)
+                .unwrap(),
+            None
+        );
+        // The tip's parent is gone: Git can't walk its history to answer.
+        std::fs::remove_file(
+            temp.path()
+                .join(".git/objects")
+                .join(&first[..2])
+                .join(&first[2..]),
+        )
+        .unwrap();
+        // Whichever probe fails first, the ancestry test or the envelope query, the push stops.
+        assert!(
+            reach(vec![(other, "agit-elsewhere".into())])
+                .walk(&source, &tip)
+                .is_err()
         );
     }
 }

@@ -2460,7 +2460,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("native continuation or an independent fork")
+                    .contains("requires a settled native continuation")
             );
             assert_eq!(
                 target

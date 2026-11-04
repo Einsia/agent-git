@@ -718,7 +718,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             assert!(!refused.status.success(), "{args:?}: {refused:?}");
             assert!(
                 String::from_utf8_lossy(&refused.stderr)
-                    .contains("native continuation or an independent fork"),
+                    .contains("requires a settled native continuation"),
                 "{args:?}: {refused:?}"
             );
             assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
@@ -1074,8 +1074,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     let files = run(&file_args);
     assert!(!files.status.success(), "{files:?}");
     assert!(
-        String::from_utf8_lossy(&files.stderr)
-            .contains("native continuation or an independent fork"),
+        String::from_utf8_lossy(&files.stderr).contains("requires a settled native continuation"),
         "{files:?}"
     );
     assert_eq!(repo.git(&["write-tree"]).unwrap(), staged);
