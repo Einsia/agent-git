@@ -404,8 +404,9 @@ fn native_peer_executor_starts_without_cloud_and_stops() {
     let status = command(&home, hub, &["rc", "status"]);
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("local RPC ready"));
+    // Without a sign-in for the Hub, Cloud access stays off (#306): no inbound request.
     assert!(
-        std::fs::read_dir(home.join("desktop-rc"))
+        !std::fs::read_dir(home.join("desktop-rc"))
             .unwrap()
             .any(|entry| {
                 entry
@@ -413,7 +414,13 @@ fn native_peer_executor_starts_without_cloud_and_stops() {
                     .file_name()
                     .to_string_lossy()
                     .starts_with("cloud-inbound-")
-            })
+            }),
+        "a start without a sign-in must not request Cloud inbound access"
+    );
+    assert!(
+        String::from_utf8_lossy(&started.stdout).contains("inbound   off"),
+        "{}",
+        String::from_utf8_lossy(&started.stdout)
     );
     assert!(command(&home, hub, &["rc", "stop"]).status.success());
     let deadline = Instant::now() + Duration::from_secs(10);

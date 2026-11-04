@@ -336,6 +336,41 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
             })
     };
     assert!(!pending(), "outbound-only startup must not enable inbound");
+    // Without a sign-in for the Hub, Cloud access stays off (#306): the service still runs.
+    let unsigned = command(home)
+        .args(["rc", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        unsigned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unsigned.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unsigned.stdout).contains("inbound   off"),
+        "{}",
+        String::from_utf8_lossy(&unsigned.stdout)
+    );
+    assert!(!pending(), "no sign-in: no Cloud inbound request");
+    // Signed in to that Hub, start turns Cloud access on as before.
+    let hub = "http://127.0.0.1:9";
+    agit::infra::credentials::save_at(
+        &home.join("credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(hub).unwrap()
+        )),
+        &agit::infra::credentials::HubCredential {
+            account_id: Some("account-owner".into()),
+            username: "owner".into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
     let start = command(home)
         .args(["rc", "start", "--detach"])
         .output()

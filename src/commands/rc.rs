@@ -693,6 +693,23 @@ fn start(args: StartArgs) -> CmdResult {
     }
     let hub = config::hub_url();
     crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(&hub))?;
+    let signed_in = |hub: &str| {
+        crate::infra::credentials::load_checked(hub)
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    let plan = here::plain_start(
+        &config::configured_hub_url(),
+        config::hub_url_env_override().as_deref(),
+        &hub,
+        signed_in,
+    );
+    if !args.here
+        && let Some(warning) = &plan.warning
+    {
+        ui::warning(warning);
+    }
     if let Err(error) = crate::rc::roster::Roster::try_load() {
         ui::error(&format!("{error:#}"));
         return Ok(ExitCode::Precondition);
@@ -713,18 +730,41 @@ fn start(args: StartArgs) -> CmdResult {
         ui::error(&here::not_signed_in_line(&hub));
         return Ok(ExitCode::Precondition);
     }
-    crate::rc::cloud::store::request_inbound(&hub)?;
+    // Cloud access is turned on only for a Hub this computer holds a sign-in for (#306). The
+    // sign-in above may have just stored one, so the plan is asked again.
+    let inbound = here::plain_start(
+        &config::configured_hub_url(),
+        config::hub_url_env_override().as_deref(),
+        &hub,
+        signed_in,
+    )
+    .enable_inbound;
+    if inbound {
+        crate::rc::cloud::store::request_inbound(&hub)?;
+    }
     ui::section("agit rc");
     println!("  machine   {}", identity::identity()?.display_name);
     println!("  hub       {hub}");
     println!("  runtimes  {}", runtimes_line());
-    println!("  inbound   enabled for your account; other users require explicit access grants");
-    println!("  cloud     registration and connection retry independently in the background");
+    if inbound {
+        println!(
+            "  inbound   enabled for your account; other users require explicit access grants"
+        );
+        println!("  cloud     registration and connection retry independently in the background");
+    } else {
+        println!("  inbound   off: not signed in to this Hub");
+    }
     println!(
         "  workspace {}",
         crate::rc::navigation::workspaces_url(&hub)
     );
-    ui::hint("`agit rc cloud inbound --hub <hub> --enabled false` disables Cloud inbound access.");
+    if inbound {
+        ui::hint(
+            "`agit rc cloud inbound --hub <hub> --enabled false` disables Cloud inbound access.",
+        );
+    } else {
+        ui::hint(&here::inbound_off_line(&hub));
+    }
     if args.here {
         crate::rc::local::ensure_daemon()?;
         let deadline = std::time::Instant::now() + here::PRESENCE_WAIT;
