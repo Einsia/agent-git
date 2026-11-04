@@ -730,6 +730,7 @@ pub(crate) fn ensure_on_hub(
             .then(|| destination.owner.clone()),
         public: false,
         repo_origins: origin.into_iter().map(str::to_string).collect(),
+        expect_new: false,
     };
     let response = match (&existing, client.publish(&request)) {
         (_, Ok(response)) => response,

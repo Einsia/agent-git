@@ -263,6 +263,11 @@ pub struct PublishRequest {
     /// index on.
     #[serde(default)]
     pub repo_origins: Vec<String>,
+    /// Refuse a repository that already has this name instead of answering with it (409): sent
+    /// when the caller decided to create the repository, so that decision never publishes into
+    /// one that exists by the time it is carried out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub expect_new: bool,
 }
 
 #[derive(Debug, Deserialize)]
