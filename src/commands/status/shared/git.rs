@@ -36,8 +36,23 @@ impl Git {
         repo.inspection_common_dir_using(&mut |command, limit| self.run(command, limit))
     }
 
-    pub(super) fn checkout_paths(&self, repo: &Repo) -> Result<(PathBuf, PathBuf)> {
-        repo.inspection_checkout_paths_using(&mut |command, limit| self.run(command, limit))
+    /// Three queries run at once and answered in the order given; any that failed fails the
+    /// call. Each has the time a query run alone has.
+    pub(super) fn outputs(&self, [a, b, c]: [(Command, usize); 3]) -> Result<[Output; 3]> {
+        let timeout = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .context("shared-file query deadline expired")?
+            .min(QUERY_TIMEOUT);
+        let limit = |limit: usize| limit.min(super::MAX_OUTPUT);
+        let (a, b, c) = self.runtime.block_on(async {
+            tokio::join!(
+                execute(a.0, limit(a.1), timeout),
+                execute(b.0, limit(b.1), timeout),
+                execute(c.0, limit(c.1), timeout),
+            )
+        });
+        Ok([a?, b?, c?])
     }
 
     pub(super) fn worktrees(&self, repo: &Repo) -> Result<Vec<Worktree>> {

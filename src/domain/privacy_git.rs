@@ -228,15 +228,31 @@ pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The local commit that the Hub's `public` commit on `branch` is the published projection of,
-/// from the accepted publication record. `None` when `public` is no projection of a local commit.
-pub fn projected_source(repo: &Repo, branch: &str, public: &str) -> Option<String> {
-    let identity = crate::hub::identity::read(repo).ok()??;
-    accepted::Ledger::open(repo, &identity)
-        .ok()?
-        .accepted(branch)
-        .find(|entry| entry.public == public && entry.source != entry.public)
-        .map(|entry| entry.source.clone())
+/// A checkout's accepted publication record, read once to answer for each of its branches. Read
+/// per branch instead, a repository with many published sessions costs a Hub identity lookup and a
+/// record read for every one of them.
+pub struct Projections(Option<accepted::Ledger>);
+
+impl Projections {
+    pub fn open(repo: &Repo) -> Self {
+        Self(
+            crate::hub::identity::read(repo)
+                .ok()
+                .flatten()
+                .and_then(|identity| accepted::Ledger::open(repo, &identity).ok()),
+        )
+    }
+
+    /// The local commit that the Hub's `public` commit on `branch` is the published projection
+    /// of, from the accepted publication record. `None` when `public` is no projection of a local
+    /// commit.
+    pub fn source(&self, branch: &str, public: &str) -> Option<String> {
+        self.0
+            .as_ref()?
+            .accepted(branch)
+            .find(|entry| entry.public == public && entry.source != entry.public)
+            .map(|entry| entry.source.clone())
+    }
 }
 
 /// Destination refs publications to `identity` leave out because the Hub refused them as
