@@ -104,15 +104,21 @@ fn run(test: impl FnOnce(&mut Daemon, &mut mpsc::Receiver<Command>), status: Ses
 }
 
 /// An idle headless writer stops as soon as a terminal opens its conversation, and the
-/// terminal holds it afterwards; the web sees the terminal as the holder.
+/// terminal holds it afterwards; the web sees the terminal as the holder. No web turn is running,
+/// so the terminal is told nothing about one, for a terminal with the plugin or without.
 #[test]
 fn an_idle_headless_writer_hands_over_at_once() {
     run(
         |state, commands| {
-            let crate::rc::control::Reply::TerminalOpened { state: lease, .. } = open(state) else {
+            let crate::rc::control::Reply::TerminalOpened {
+                state: lease,
+                notice,
+            } = open(state)
+            else {
                 panic!("a terminal announcement is answered with its lease");
             };
             assert_eq!(lease, Some(State::Releasing));
+            assert_eq!(notice, None, "an idle writer runs no turn to wait for");
             assert!(stopped(commands), "idle: the headless writer stops at once");
             let releasing = state.lease_view("agit-h").unwrap();
             assert_eq!(
@@ -134,6 +140,20 @@ fn an_idle_headless_writer_hands_over_at_once() {
             assert!(
                 view.takeable,
                 "the web may send through the terminal's plugin"
+            );
+        },
+        SessionStatus::Idle,
+    );
+    run(
+        |state, _| {
+            let crate::rc::control::Reply::TerminalOpened { notice, .. } =
+                state.terminal_opened(THREAD, std::process::id(), false, None)
+            else {
+                panic!("a terminal announcement is answered with its lease");
+            };
+            assert_eq!(
+                notice, None,
+                "a terminal without the plugin is not sent away either"
             );
         },
         SessionStatus::Idle,

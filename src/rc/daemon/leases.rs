@@ -118,6 +118,12 @@ impl Daemon {
             started_ms,
             plugin,
         };
+        // A writer between turns stops at once and has written everything this terminal loaded,
+        // so nothing runs that the terminal has to wait for or resume again after.
+        let idle_writer = headless
+            .as_deref()
+            .and_then(|session_id| self.sessions.get(session_id))
+            .is_some_and(|live| live.info.status == SessionStatus::Idle);
         let opened = self.leases.opened(
             thread,
             terminal,
@@ -128,6 +134,7 @@ impl Daemon {
             &descends,
             now_ms(),
         );
+        let quiet = idle_writer && matches!(opened, Opened::Release { .. });
         if let Opened::Release { session_id } = &opened {
             if let Some(writer) = self
                 .sessions
@@ -142,7 +149,9 @@ impl Daemon {
         let lease = self.leases.get(thread);
         control::Reply::TerminalOpened {
             state: lease.map(|lease| lease.state),
-            notice: lease.and_then(|lease| lease.notice_for(thread, &terminal)),
+            notice: lease
+                .filter(|_| !quiet)
+                .and_then(|lease| lease.notice_for(thread, &terminal)),
         }
     }
 
