@@ -129,6 +129,20 @@ impl PushAccess {
     }
 }
 
+/// The push-access probe refused writing to a destination: [`PushAccess::ReadOnly`] (403) or
+/// [`PushAccess::Missing`] (404). The refusal stays a value, so a caller can still tell the two
+/// apart once the status is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRefused(pub PushAccess);
+
+impl std::fmt::Display for WriteRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("publication write authority is unavailable")
+    }
+}
+
+impl std::error::Error for WriteRefused {}
+
 /// One agent on the hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAgent {
