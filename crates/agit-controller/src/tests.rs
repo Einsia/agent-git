@@ -122,6 +122,59 @@ async fn discovery_recovers_a_missing_reply_and_accepts_a_delayed_original() {
     }
 }
 
+/// A peer's machine description is admitted up to [`MAX_DESCRIPTION_BYTES`], large catalogs
+/// included, and refused above it. The route's error then starts with [`DESCRIPTION_TOO_LARGE`] and
+/// names the size, so a host can tell the person to update agit on the device instead of saying
+/// the device is offline. A cap that a large slash-command catalog outgrows, or a refusal whose
+/// text a host cannot recognise, fails here.
+#[tokio::test]
+async fn a_large_description_is_admitted_and_one_over_the_cap_is_refused_by_name() {
+    for (padding, admitted) in [(200 * 1024, true), (MAX_DESCRIPTION_BYTES, false)] {
+        let controller = controller();
+        let mut events = controller.subscribe();
+        let (config, mut incoming, server) = endpoint().await;
+        controller.connect("peer".into(), config, None).unwrap();
+        let mut socket = tokio::time::timeout(WAIT, incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read(&mut socket).await;
+        assert_eq!(request["method"], "machine.describe");
+        response(
+            &mut socket,
+            &request["id"],
+            json!({
+                "protocol_version":1,"authority":"local-owner","instance_id":"instance",
+                "machine":{"machine_fingerprint":"host"},"catalog":"x".repeat(padding),
+            }),
+        )
+        .await;
+        if admitted {
+            let ready = controller.ready("peer", WAIT).await.unwrap();
+            assert!(matches!(ready.state, State::Online));
+        } else {
+            let error = tokio::time::timeout(WAIT, async {
+                loop {
+                    if let Ok(Event::State { status }) = events.recv().await
+                        && let Some(error) = status.error
+                        && error.starts_with(DESCRIPTION_TOO_LARGE)
+                    {
+                        return error;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                error.contains(&format!("at most {MAX_DESCRIPTION_BYTES}")),
+                "{error}"
+            );
+        }
+        controller.disconnect("peer");
+        server.abort();
+    }
+}
+
 #[tokio::test]
 async fn responses_correlate_out_of_order_and_events_keep_peer_namespaces() {
     let controller = controller();
