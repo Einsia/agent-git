@@ -932,14 +932,53 @@ impl Repo {
         self.inspection_path_using(&["rev-parse", "--git-common-dir"], run)
     }
 
+    /// The one query [`Self::inspection_identity`] reads: the checkout's top level, its Git
+    /// directory, the common directory and the object format, a line each.
     #[cfg(feature = "cli")]
-    pub(crate) fn inspection_checkout_paths_using(
+    pub(crate) fn inspection_identity_command(&self) -> Command {
+        self.inspection_command(&[
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--show-object-format",
+        ])
+    }
+
+    /// What [`Self::inspection_identity_command`] printed: the top level, the Git directory and
+    /// the common directory, then the object format. Exactly four lines are read; a path with a
+    /// line break in it is refused rather than taken for the next answer.
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_identity(
         &self,
-        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
-    ) -> Result<(PathBuf, PathBuf)> {
+        output: &std::process::Output,
+    ) -> Result<(PathBuf, PathBuf, PathBuf, String)> {
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "local Git inspection could not identify its storage path"
+        );
+        let text = output
+            .stdout
+            .strip_suffix(b"\n")
+            .context("local Git inspection path is incomplete")?;
+        let lines: Vec<&[u8]> = text.split(|byte| *byte == b'\n').collect();
+        let [toplevel, git_dir, common, format] = lines[..] else {
+            anyhow::bail!("local Git inspection paths are ambiguous");
+        };
+        let path = |bytes: &[u8]| -> Result<PathBuf> {
+            anyhow::ensure!(!bytes.is_empty(), "local Git inspection path is empty");
+            let path = inspection_native_path(bytes)?;
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                self.root.join(path)
+            })
+        };
         Ok((
-            self.inspection_path_using(&["rev-parse", "--show-toplevel"], run)?,
-            self.inspection_path_using(&["rev-parse", "--absolute-git-dir"], run)?,
+            path(toplevel)?,
+            path(git_dir)?,
+            path(common)?,
+            std::str::from_utf8(format)?.trim().to_owned(),
         ))
     }
 

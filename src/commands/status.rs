@@ -22,13 +22,104 @@ use crate::domain::store::Store;
 use crate::infra::config;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 mod branches;
 mod merges;
 mod project;
 mod sessions;
 mod shared;
+
+/// How many branch rows the repositories of one status page show in all.
+const BRANCH_ROWS: usize = 128;
+
+/// Threads a status page keeps busy at once. Its reads are short Git queries whose time is
+/// mostly process start-up, so a few in flight hide that latency without loading the machine.
+const PAGE_WORKERS: usize = 8;
+
+/// Runs `work` for each of `items` on up to [`PAGE_WORKERS`] threads and hands every result to
+/// `take` in item order. An item starts only while it is fewer than that many places ahead of the
+/// next one `take` is due, so once `take` answers false at most that many items past it have run.
+/// Without the bound, threads that finish quick items race through the rest of the list while one
+/// slow item holds `take` back, and a page that stops early has inspected everything anyway.
+fn in_order<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+    mut take: impl FnMut(usize, R) -> bool,
+) {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(PAGE_WORKERS)
+        .min(items.len());
+    if workers <= 1 {
+        for (index, item) in items.iter().enumerate() {
+            if !take(index, work(item)) {
+                return;
+            }
+        }
+        return;
+    }
+    // How many items `take` has received, and whether it stopped.
+    let gate = Mutex::new((0usize, false));
+    let moved = Condvar::new();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (sender, results) = std::sync::mpsc::channel();
+        for _ in 0..workers {
+            let (sender, next, gate, moved, work) = (sender.clone(), &next, &gate, &moved, &work);
+            scope.spawn(move || {
+                // A thread whose item panics stops the others, so none waits for a turn that the
+                // missing result keeps from coming, and the panic reaches the caller.
+                struct Stopping<'a>(&'a Mutex<(usize, bool)>, &'a Condvar);
+                impl Drop for Stopping<'_> {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            self.0.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+                            self.1.notify_all();
+                        }
+                    }
+                }
+                let _stopping = Stopping(gate, moved);
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let mut state = gate.lock().unwrap_or_else(PoisonError::into_inner);
+                    while !state.1 && index >= state.0 + workers {
+                        state = moved.wait(state).unwrap_or_else(PoisonError::into_inner);
+                    }
+                    if state.1 {
+                        break;
+                    }
+                    drop(state);
+                    if sender.send((index, work(item))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut waiting = BTreeMap::new();
+        let mut due = 0;
+        for (index, result) in results {
+            waiting.insert(index, result);
+            while let Some(result) = waiting.remove(&due) {
+                let more = take(due, result);
+                due += 1;
+                let mut state = gate.lock().unwrap_or_else(PoisonError::into_inner);
+                *state = (due, !more);
+                drop(state);
+                moved.notify_all();
+                if !more {
+                    return;
+                }
+            }
+        }
+    });
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -177,17 +268,19 @@ pub fn run(args: Args) -> CmdResult {
         let mut omitted = 0;
         let mut aside_example = None;
         let mut aside_unreadable = false;
-        for (index, (owner, name, path)) in agents.iter().enumerate() {
-            if rows.len() >= 128 {
+        in_order(&agents, ahead, |index, (inspected, aside)| {
+            if rows.len() >= BRANCH_ROWS {
                 omitted += agents.len() - index;
-                break;
+                return false;
             }
+            let (owner, name, path) = &agents[index];
             let slug = format!("{owner}/{name}");
-            let aside = set_aside(&Repo::at(path)).unwrap_or_else(|_| {
+            let aside = aside.unwrap_or_else(|_| {
                 aside_unreadable = true;
                 BTreeSet::new()
             });
-            match branches::inspect(&Repo::at(path), 128 - rows.len()) {
+            let limit = BRANCH_ROWS - rows.len();
+            match branches::settle(&Repo::at(path), inspected, BRANCH_ROWS, limit) {
                 Ok(page) if page.branches.is_empty() => rows.push(vec![
                     slug,
                     "—".into(),
@@ -225,7 +318,8 @@ pub fn run(args: Args) -> CmdResult {
                     format!("unavailable: {error:#}"),
                 ]),
             }
-        }
+            true
+        });
         println!(
             "{}",
             ui::table::render(
@@ -506,14 +600,16 @@ fn structured(args: &Args) -> CmdResult {
     let next = args.offset.saturating_add(items.len());
     let agents = super::clone::list_local()?;
     let mut repositories = Vec::new();
-    let mut remaining = 128;
+    let mut remaining = BRANCH_ROWS;
     let mut repositories_omitted = 0;
-    for (index, (owner, name, path)) in agents.iter().enumerate() {
+    in_order(&agents, ahead, |index, (inspected, set_aside)| {
         if remaining == 0 {
             repositories_omitted = agents.len() - index;
-            break;
+            return false;
         }
-        let branch_sync = match branches::inspect(&Repo::at(path), remaining) {
+        let (owner, name, path) = &agents[index];
+        let branch_sync = match branches::settle(&Repo::at(path), inspected, BRANCH_ROWS, remaining)
+        {
             Ok(page) => {
                 remaining -= page.branches.len().max(1);
                 serde_json::json!({
@@ -525,7 +621,7 @@ fn structured(args: &Args) -> CmdResult {
                 serde_json::json!({"items": null, "omitted": null, "error": format!("{error:#}")})
             }
         };
-        let set_aside = match set_aside(&Repo::at(path)) {
+        let set_aside = match set_aside {
             Ok(branches) => serde_json::json!({"branches": branches, "error": null}),
             Err(error) => serde_json::json!({"branches": null, "error": format!("{error:#}")}),
         };
@@ -533,7 +629,8 @@ fn structured(args: &Args) -> CmdResult {
             "repo": format!("{owner}/{name}"), "path": path, "branches": branch_sync,
             "set_aside": set_aside,
         }));
-    }
+        true
+    });
     let shared_files = shared::inspect(&agents);
     let merge_transactions = merges::page(&agents);
     let runtime_sessions = super::context::runtime_sessions();
@@ -581,6 +678,19 @@ fn structured(args: &Args) -> CmdResult {
     });
     println!("{}", serde_json::to_string(&result)?);
     Ok(ExitCode::Ok)
+}
+
+/// A repository's branches and set-aside record, read before its turn on the page comes. The
+/// branches are read with the most rows any repository may show; [`branches::settle`] judges
+/// whether that reading stands for the rows left when its turn comes.
+fn ahead(
+    (_, _, path): &(String, String, std::path::PathBuf),
+) -> (
+    crate::Result<branches::Page>,
+    crate::Result<BTreeSet<String>>,
+) {
+    let repo = Repo::at(path);
+    (branches::inspect(&repo, BRANCH_ROWS), set_aside(&repo))
 }
 
 /// Branches the checkout's Hub refused as withdrawn, which pushes leave out until the person names
@@ -824,6 +934,51 @@ mod tests {
                 offset: 0,
             }
             .check_missing
+        );
+    }
+
+    /// A page reads its repositories on several threads but must take them in order and stop
+    /// where its budget runs out. Results arrive in item order whatever order they finish in,
+    /// and after a stop only a bounded number of items beyond it have run: a pool that let quick
+    /// items race ahead of a slow one would read every repository of a page that shows a few.
+    #[test]
+    fn a_page_takes_results_in_order_and_runs_little_past_where_it_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..200).collect();
+        let mut seen = Vec::new();
+        super::in_order(
+            &items,
+            |&item| {
+                if item % 7 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                item * 2
+            },
+            |index, doubled| {
+                seen.push((index, doubled));
+                true
+            },
+        );
+        assert_eq!(
+            seen,
+            (0..200).map(|item| (item, item * 2)).collect::<Vec<_>>()
+        );
+
+        let started = AtomicUsize::new(0);
+        super::in_order(
+            &items,
+            |&item| {
+                started.fetch_add(1, Ordering::SeqCst);
+                if item == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            },
+            |_, ()| false,
+        );
+        assert!(
+            started.load(Ordering::SeqCst) <= 1 + super::PAGE_WORKERS,
+            "{} items ran for a page that stopped at the first",
+            started.load(Ordering::SeqCst)
         );
     }
 }

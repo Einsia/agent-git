@@ -131,39 +131,46 @@ pub(super) fn page(agents: &[(String, String, PathBuf)]) -> Page {
         repositories_omitted: omitted,
         incomplete: omitted > 0,
     };
-    for (owner, name, path) in agents.iter().take(128) {
-        let repo = format!("{owner}/{name}");
-        let item = match inspect(&Repo::at(path)) {
-            Ok(None) => continue,
-            Ok(Some(tx)) => {
-                let picked_count = tx.picked_count();
-                let summary_ready = tx.has_summary();
-                Transaction {
-                    repo,
-                    target: Some(tx.target),
-                    source: Some(tx.source),
-                    target_head: Some(tx.target_head),
-                    source_head: Some(tx.source_head),
-                    picked_count: Some(picked_count),
-                    summary_ready: Some(summary_ready),
-                    error: None,
+    let shown = &agents[..agents.len().min(128)];
+    super::in_order(
+        shown,
+        |(_, _, path)| inspect(&Repo::at(path)),
+        |index, inspected| {
+            let (owner, name, _) = &shown[index];
+            let repo = format!("{owner}/{name}");
+            let item = match inspected {
+                Ok(None) => return true,
+                Ok(Some(tx)) => {
+                    let picked_count = tx.picked_count();
+                    let summary_ready = tx.has_summary();
+                    Transaction {
+                        repo,
+                        target: Some(tx.target),
+                        source: Some(tx.source),
+                        target_head: Some(tx.target_head),
+                        source_head: Some(tx.source_head),
+                        picked_count: Some(picked_count),
+                        summary_ready: Some(summary_ready),
+                        error: None,
+                    }
                 }
-            }
-            Err(_) => {
-                page.incomplete = true;
-                Transaction {
-                    repo,
-                    target: None,
-                    source: None,
-                    target_head: None,
-                    source_head: None,
-                    picked_count: None,
-                    summary_ready: None,
-                    error: Some("unavailable: transaction missing, changed, or unreadable"),
+                Err(_) => {
+                    page.incomplete = true;
+                    Transaction {
+                        repo,
+                        target: None,
+                        source: None,
+                        target_head: None,
+                        source_head: None,
+                        picked_count: None,
+                        summary_ready: None,
+                        error: Some("unavailable: transaction missing, changed, or unreadable"),
+                    }
                 }
-            }
-        };
-        page.items.push(item);
-    }
+            };
+            page.items.push(item);
+            true
+        },
+    );
     page
 }

@@ -6,6 +6,7 @@ use anyhow::{Context, ensure};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 mod git;
 
@@ -215,8 +216,13 @@ fn cell(value: &str) -> String {
     output
 }
 
-fn output(git: &git::Git, repo: &Repo, args: &[&str]) -> crate::Result<Vec<u8>> {
-    let output = git.output(repo, args, MAX_OUTPUT)?;
+fn paths_command(repo: &Repo, args: &[&str]) -> Command {
+    let mut command = repo.inspection_command(args);
+    command.arg("--").args(PATHS);
+    command
+}
+
+fn succeeded(output: Output) -> crate::Result<Vec<u8>> {
     ensure!(
         output.status.success() && output.stderr.is_empty(),
         "shared-file metadata is unavailable"
@@ -224,19 +230,25 @@ fn output(git: &git::Git, repo: &Repo, args: &[&str]) -> crate::Result<Vec<u8>> 
     Ok(output.stdout)
 }
 
-fn paths_output(git: &git::Git, repo: &Repo, args: &[&str]) -> crate::Result<Vec<u8>> {
-    let mut command = args.to_vec();
-    command.push("--");
-    command.extend(PATHS);
-    output(git, repo, &command)
-}
-
 fn snapshot(git: &git::Git, repo: &Repo, checkout: &Worktree) -> crate::Result<Snapshot> {
-    let (toplevel, git_dir) = git.checkout_paths(repo)?;
+    // Which checkout Git chose, its branch and its head are asked at once, since no answer decides
+    // whether another is asked. The working tree is read only once they show it is this checkout.
+    let [identity, symbolic, head] = git.outputs([
+        (repo.inspection_identity_command(), MAX_OUTPUT),
+        (
+            repo.inspection_command(&["symbolic-ref", "--quiet", "HEAD"]),
+            4096,
+        ),
+        (
+            repo.inspection_command(&["rev-parse", "--verify", "--quiet", "HEAD"]),
+            MAX_OUTPUT,
+        ),
+    ])?;
+    let (toplevel, git_dir, common, format) = repo.inspection_identity(&identity)?;
     let toplevel = toplevel.canonicalize()?;
     let git_dir = git_dir.canonicalize()?;
     ensure!(toplevel == repo.root(), "Git selected a different checkout");
-    let common = git.common_dir(repo)?.canonicalize()?;
+    let common = common.canonicalize()?;
     if checkout.primary {
         ensure!(
             git_dir == common,
@@ -274,7 +286,6 @@ fn snapshot(git: &git::Git, repo: &Repo, checkout: &Worktree) -> crate::Result<S
             "checkout backlink names another registration"
         );
     }
-    let symbolic = git.output(repo, &["symbolic-ref", "--quiet", "HEAD"], 4096)?;
     let reference = match symbolic.status.code() {
         Some(0) if symbolic.stderr.is_empty() => Some(
             std::str::from_utf8(&symbolic.stdout)?
@@ -296,8 +307,7 @@ fn snapshot(git: &git::Git, repo: &Repo, checkout: &Worktree) -> crate::Result<S
         branch == checkout.branch.as_deref(),
         "checkout branch differs from its registration"
     );
-    let head = output(git, repo, &["rev-parse", "--verify", "--quiet", "HEAD"]);
-    let head = match head {
+    let head = match succeeded(head) {
         Ok(bytes) => bytes,
         Err(_) => {
             let reference = reference.context("unborn HEAD is not a branch")?;
@@ -310,9 +320,6 @@ fn snapshot(git: &git::Git, repo: &Repo, checkout: &Worktree) -> crate::Result<S
             Vec::new()
         }
     };
-    let format = String::from_utf8(output(git, repo, &["rev-parse", "--show-object-format"])?)?
-        .trim()
-        .to_owned();
     ensure!(
         matches!(format.as_str(), "sha1" | "sha256"),
         "unsupported object format"
@@ -345,20 +352,26 @@ fn snapshot(git: &git::Git, repo: &Repo, checkout: &Worktree) -> crate::Result<S
     if !head.is_empty() {
         staged_args.push(std::str::from_utf8(&head)?.trim_end_matches('\n'));
     }
-    let staged = paths_output(git, repo, &staged_args)?;
+    let [staged, index, untracked] = git.outputs([
+        (paths_command(repo, &staged_args), MAX_OUTPUT),
+        (
+            paths_command(repo, &["ls-files", "--stage", "-z"]),
+            MAX_OUTPUT,
+        ),
+        (
+            paths_command(repo, &["ls-files", "--others", "--exclude-standard", "-z"]),
+            MAX_OUTPUT,
+        ),
+    ])?;
     Ok(Snapshot {
         head,
-        staged,
+        staged: succeeded(staged)?,
         common,
         toplevel,
         git_dir,
         format,
-        index: paths_output(git, repo, &["ls-files", "--stage", "-z"])?,
-        untracked: paths_output(
-            git,
-            repo,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
-        )?,
+        index: succeeded(index)?,
+        untracked: succeeded(untracked)?,
     })
 }
 

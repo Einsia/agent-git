@@ -32,6 +32,24 @@ pub(super) struct Page {
     pub omitted: usize,
 }
 
+/// What [`inspect`] with `limit` answers, given `read`: what it answered with the larger `most`.
+/// A reading that showed every row it found, and no more of them than `limit`, is that answer,
+/// since below that count nothing depends on the limit: the rows read and compared are the same
+/// ones. Any other reading, a failed one included, is taken again with `limit`, because what a
+/// smaller limit cuts can change what remains.
+pub(super) fn settle(
+    repo: &Repo,
+    read: crate::Result<Page>,
+    most: usize,
+    limit: usize,
+) -> crate::Result<Page> {
+    match read {
+        Ok(page) if page.omitted == 0 && page.branches.len() <= limit => Ok(page),
+        read if limit == most => read,
+        _ => inspect(repo, limit),
+    }
+}
+
 pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
     let repo = repo.clone().exact_root_inspection();
     let before = refs(&repo, limit)?;
@@ -88,12 +106,17 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
     // A session published as a projection has a Hub tip of its own id. A branch on that public
     // history (the tip, an ancestor or a descendant of it) is compared with the tip; any other
     // branch with the local commit the tip publishes.
+    let mut projections = None;
     let candidates: Vec<Option<(String, Option<String>)>> = selected
         .iter()
         .map(|(name, _, tracking, fixed_state)| {
             let remote = before.get(tracking).filter(|_| fixed_state.is_none())?;
             let source = (*tracking == format!("refs/remotes/origin/{name}"))
-                .then(|| crate::domain::privacy_git::projected_source(&repo, name, &remote.sha))
+                .then(|| {
+                    projections
+                        .get_or_insert_with(|| crate::domain::privacy_git::Projections::open(&repo))
+                        .source(name, &remote.sha)
+                })
                 .flatten();
             Some((remote.sha.clone(), source))
         })
@@ -422,4 +445,45 @@ fn tracking_configuration(repo: &Repo) -> crate::Result<TrackingConfig> {
             .push((field.to_owned(), value.to_owned()));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A page reads each repository's branches ahead of its turn, with the most rows any
+    /// repository may show, and keeps that reading only if it holds for the rows left when the
+    /// turn comes. Kept when it has more rows than are left, the page would show more branches
+    /// than its budget allows, and the warning that rows were left out would never come.
+    #[test]
+    fn a_reading_taken_ahead_stands_only_for_the_rows_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        for args in [
+            vec!["config", "user.name", "Branch status fixture"],
+            vec!["config", "user.email", "branch-status@example.invalid"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "--quiet", "-m", "root"],
+            vec!["branch", "second"],
+            vec!["branch", "third"],
+        ] {
+            repo.git(&args).unwrap();
+        }
+        let repo = Repo::at(directory.path().canonicalize().unwrap());
+        let ahead = || inspect(&repo, 128);
+        let names = |page: &Page| {
+            page.branches
+                .iter()
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let kept = settle(&repo, ahead(), 128, 3).unwrap();
+        assert_eq!(names(&kept), names(&inspect(&repo, 3).unwrap()));
+        assert_eq!(kept.omitted, 0);
+
+        let cut = settle(&repo, ahead(), 128, 2).unwrap();
+        assert_eq!(cut.branches.len(), 2, "two rows were left");
+        assert_eq!(cut.omitted, 1, "the left-out branch is counted");
+    }
 }
