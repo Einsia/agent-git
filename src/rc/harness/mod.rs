@@ -152,7 +152,7 @@ impl std::error::Error for AttachOnlyNotRunning {}
 
 use crate::protocol::{
     ApprovalRequest, ApprovalResponse, Delivery, ItemKind, PermissionApply, PermissionMode,
-    RuntimeCapability,
+    RuntimeCapability, SlashCommand,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -1060,6 +1060,70 @@ impl AnyDriver {
     }
 }
 
+/// Serialized bytes the slash-command catalog of one runtime may take in the machine's description.
+/// The description travels as one frame a controller bounds, and a catalog holding every command
+/// and Skill a person installed, each with its description, can outgrow it.
+const COMMANDS_BUDGET: usize = 24 * 1024;
+/// The longest description a catalog keeps, then the shorter ones tried until it fits. Zero keeps
+/// the names alone.
+const COMMAND_DESCRIPTION_CHARS: [usize; 5] = [200, 120, 80, 40, 0];
+const COMMAND_HINT_CHARS: usize = 80;
+
+/// `commands` as a machine's description carries them, within [`COMMANDS_BUDGET`]. Descriptions and
+/// argument hints are shortened as far as the catalog needs, every command at one length, down to
+/// the names alone: a command's name is what autocomplete needs, and the runtime's built-in
+/// commands sit among the person's own in no useful order, so shortening keeps them all where
+/// cutting the list would lose some. Only when the names alone do not fit are commands kept in
+/// order while they fit. Returns the commands kept and how many were left out.
+pub(crate) fn bounded_commands(commands: Vec<SlashCommand>) -> (Vec<SlashCommand>, usize) {
+    fn cut(text: &str, chars: usize) -> Option<String> {
+        if chars == 0 {
+            return None;
+        }
+        if text.chars().count() <= chars {
+            return Some(text.to_owned());
+        }
+        let mut cut: String = text.chars().take(chars - 1).collect();
+        cut.push('…');
+        Some(cut)
+    }
+    // Its encoding and the comma before the next one.
+    let bytes = |command: &SlashCommand| {
+        serde_json::to_string(command).map_or(usize::MAX, |text| text.len() + 1)
+    };
+    let total = commands.len();
+    let mut shortened = Vec::new();
+    for chars in COMMAND_DESCRIPTION_CHARS {
+        shortened = commands
+            .iter()
+            .map(|command| SlashCommand {
+                name: command.name.clone(),
+                description: command
+                    .description
+                    .as_deref()
+                    .and_then(|text| cut(text, chars)),
+                argument_hint: command
+                    .argument_hint
+                    .as_deref()
+                    .and_then(|text| cut(text, chars.min(COMMAND_HINT_CHARS))),
+            })
+            .collect();
+        let size = shortened
+            .iter()
+            .fold(0usize, |size, command| size.saturating_add(bytes(command)));
+        if size <= COMMANDS_BUDGET {
+            return (shortened, 0);
+        }
+    }
+    let mut used = 0usize;
+    shortened.retain(|command| {
+        used = used.saturating_add(bytes(command));
+        used <= COMMANDS_BUDGET
+    });
+    let omitted = total - shortened.len();
+    (shortened, omitted)
+}
+
 /// Static capability description for a runtime, reported at register time.
 pub fn capability_of(runtime: &str) -> RuntimeCapability {
     match runtime {
@@ -1076,6 +1140,7 @@ pub fn capability_of(runtime: &str) -> RuntimeCapability {
             partial_messages: false,
             resume: false,
             commands: vec![],
+            commands_omitted: 0,
             permission_modes: vec![],
             permission_switch: None,
         },
@@ -1156,6 +1221,70 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command(index: usize, description_chars: usize) -> SlashCommand {
+        SlashCommand {
+            name: format!("/skill-{index}"),
+            description: Some("d".repeat(description_chars)),
+            argument_hint: Some("h".repeat(120)),
+        }
+    }
+
+    /// The command catalog a machine describes stays within its byte budget however many commands
+    /// and Skills a person installed. A catalog that fits keeps its descriptions, cut to the
+    /// longest length; a larger one shortens them as far as it needs and keeps every command, so a
+    /// built-in listed late is not lost to Skills listed early; only when the names alone do not
+    /// fit are commands left out, in order, and counted. Sent unbounded, a large catalog grows the
+    /// description past what a controller accepts and the machine shows offline; cut by position
+    /// alone, it loses whichever commands come last.
+    #[test]
+    fn a_runtimes_command_catalog_stays_within_its_budget() {
+        let size = |kept: &[SlashCommand]| serde_json::to_string(kept).unwrap().len();
+        let longest = COMMAND_DESCRIPTION_CHARS[0];
+
+        // Fits at the longest length: descriptions are cut there, hints at theirs, and all stay.
+        let (kept, omitted) = bounded_commands((0..10).map(|i| command(i, 500)).collect());
+        assert_eq!((kept.len(), omitted), (10, 0));
+        let description = kept[0].description.as_deref().unwrap();
+        assert_eq!(description.chars().count(), longest);
+        assert!(description.ends_with('…'));
+        assert_eq!(
+            kept[0].argument_hint.as_deref().unwrap().chars().count(),
+            COMMAND_HINT_CHARS
+        );
+
+        // Over the budget at the longest length: shorter descriptions, every command kept, the
+        // last one included.
+        let (kept, omitted) = bounded_commands((0..150).map(|i| command(i, 500)).collect());
+        assert_eq!((kept.len(), omitted), (150, 0));
+        assert!(size(&kept) <= COMMANDS_BUDGET);
+        assert_eq!(kept[149].name, "/skill-149");
+        assert!(kept[0].description.as_deref().unwrap().chars().count() < longest);
+
+        // The names alone do not fit: kept in order while they fit, the rest counted.
+        let (kept, omitted) = bounded_commands((0..2000).map(|i| command(i, 500)).collect());
+        assert!(!kept.is_empty() && omitted > 0);
+        assert_eq!(kept.len() + omitted, 2000);
+        assert!(size(&kept) <= COMMANDS_BUDGET);
+        assert_eq!(kept[0].name, "/skill-0");
+        assert!(kept[0].description.is_none() && kept[0].argument_hint.is_none());
+
+        // At the budget: the commands that fit are all kept, and one more is left out.
+        let each = serde_json::to_string(&SlashCommand {
+            name: "/skill-0".into(),
+            description: None,
+            argument_hint: None,
+        })
+        .unwrap()
+        .len()
+            + 1;
+        let fit = COMMANDS_BUDGET / each;
+        let named = |count: usize| -> Vec<SlashCommand> {
+            (0..count).map(|i| command(i % 10, 500)).collect()
+        };
+        assert_eq!(bounded_commands(named(fit)).1, 0);
+        assert_eq!(bounded_commands(named(fit + 1)).1, 1);
+    }
 
     #[test]
     fn bounded_turn_ids_fail_stop_without_evicting_or_rejecting_duplicates() {

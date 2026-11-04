@@ -77,6 +77,7 @@ pub fn capability() -> RuntimeCapability {
         partial_messages: true,
         resume: true,
         commands: vec![],
+        commands_omitted: 0,
         // No `acceptEdits`: codex's approval policy does not separate edits
         // from commands (that split is a claude-code concept), and offering a
         // mode we would have to approximate is worse than not offering it —

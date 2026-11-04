@@ -138,6 +138,7 @@ pub(crate) fn version_of(program: &program::Program) -> Option<String> {
 
 pub fn capability() -> RuntimeCapability {
     let program = program::resolve();
+    let (commands, commands_omitted) = super::bounded_commands(cached_machine_commands());
     RuntimeCapability {
         runtime: "claude-code".into(),
         available: program.is_some(),
@@ -149,7 +150,8 @@ pub fn capability() -> RuntimeCapability {
         resume: true,
         // Discovery reads cached commands because the harness provides its catalog only
         // after session initialization. Project commands must stay out of this shared view.
-        commands: cached_machine_commands(),
+        commands,
+        commands_omitted,
         // All five map onto native `--permission-mode` values, and the switch
         // is live: a `set_permission_mode` control request is answered
         // `{"mode":"auto"}` and the very next `system/init` reports the new
