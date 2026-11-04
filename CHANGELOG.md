@@ -8,6 +8,39 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-11-04
+
+### Added
+
+- After you push by hand in a folder that doesn't upload by itself, your agent may ask once whether new conversations
+  there should upload automatically, naming where they would go and who can read them; `agit off` declines, and agit
+  won't suggest it there again.
+- The upload summary says how many records in the upload have parts the privacy check left out.
+
+### Changed
+
+- `agit scan` mentions low-confidence values only with `--low-confidence`, which now lists just those in what push would
+  publish, grouped by shape, and `--json` carries `low_confidence` only then.
+- `agit status` reads repositories and session checkouts several at a time, so it finishes several times faster on a
+  computer with many sessions.
+- When the website can't bind a project to a folder on this computer, it can now say why (signed in to another Hub or
+  account, a repository that isn't private or isn't yours, no write access, or a timeout).
+
+### Fixed
+
+- A conversation with a record too large for the privacy check to divide keeps saving; that record's largest parts are
+  left out of what agit saves and uploads, and agit says so.
+- Reopening a conversation in the terminal after the page's reply has ended no longer says a web turn is still running.
+- When the Hub turns a publication down because its preview ran out or the repository's settings changed, agit says so
+  plainly, says nothing was updated, and previews again once where that helps.
+- `agit privacy status` on a version of a branch that isn't published yet says so and names `agit push`, instead of
+  suggesting you may lack access.
+- The daemon recovers by itself when its installed agit is replaced while it runs.
+- A remote-control message that your computer has taken is confirmed at once, and one its agent never confirms is
+  reported as unconfirmed after a minute instead of leaving the sender with no answer.
+- When `agit push` won't upload a conversation the folder keeps out, it says why (it ran before agit was on, you dropped
+  it, or it's a delegated session) and, where one exists, names the `agit save` command that uploads it.
+
 ## [0.2.37] - 2026-11-04
 
 ### Added
