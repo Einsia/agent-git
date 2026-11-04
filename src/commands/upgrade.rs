@@ -201,6 +201,34 @@ fn refresh_installed_skills(exe: &Path) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     }
+    // A runtime installed since the last setup carries no agit yet; the refresh above touches only
+    // what is there, so it is set up as a bare setup would have.
+    let output = std::process::Command::new(exe)
+        .args(["--no-tui", "--quiet", "setup", "--new-runtimes"])
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let set_up = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !set_up.is_empty() {
+                ui::info(format_args!(
+                    "AgentGit is now set up for {set_up}, installed since the last setup."
+                ));
+            }
+        }
+        result => {
+            let detail = match result {
+                Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                Err(error) => error.to_string(),
+            };
+            ui::warning(&format!(
+                "CLI is installed, but setting up runtimes installed since the last setup failed: {detail}"
+            ));
+            ui::hint("run `agit setup` to retry.");
+            return Ok(ExitCode::Precondition);
+        }
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -663,12 +691,13 @@ mod tests {
         let exe = root.path().join("new agit");
         write_executable(
             &exe,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s' \"$AGIT_TELEMETRY_DEFER\" > \"$0.telemetry\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.args\"\nprintf '%s' \"$AGIT_TELEMETRY_DEFER\" > \"$0.telemetry\"\n",
         );
         assert_eq!(refresh_installed_skills(&exe).unwrap(), ExitCode::Ok);
+        // The refresh of what is there, then the setup of runtimes installed since.
         assert_eq!(
             std::fs::read_to_string(root.path().join("new agit.args")).unwrap(),
-            "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n"
+            "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n--no-tui\n--quiet\nsetup\n--new-runtimes\n"
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join("new agit.telemetry")).unwrap(),

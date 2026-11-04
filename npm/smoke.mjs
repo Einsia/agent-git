@@ -119,6 +119,8 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
   const postinstall = spawnSync('node', [join(mainPkg, 'npm', 'postinstall.js')], { encoding: 'utf8', env: { ...env, npm_command: 'exec' }, cwd: home })
   check('dependency postinstall defers usage-statistics onboarding', postinstall.status === 0 && !existsSync(preferences), postinstall.stderr)
   const acquisitionId = 'f2ec57cb-12f0-4387-bd56-7739bde158bf'
+  // Setup writes for the runtimes installed here; Claude Code has run in this home.
+  mkdirSync(join(home, '.claude'), { recursive: true })
   const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs'), '--acquisition-id', acquisitionId, '--campaign-url', 'https://example.test/?utm_source=docs&utm_campaign=launch&utm_creative_format=video&gclid=click&token=private-campaign-canary'], {
     encoding: 'utf8',
     env: { ...env, AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic' },

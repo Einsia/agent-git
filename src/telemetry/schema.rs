@@ -89,6 +89,8 @@ fn fields(matches: &ArgMatches, policy: &BTreeMap<String, Field>, out: &mut Map<
             }
             "count" => json!(bucket(values.len() as u64)),
             "presence" => json!(provided),
+            // A reviewed argument whose use is a choice the person keeps on this computer.
+            "omitted" => continue,
             _ => continue,
         };
         out.insert(format!("arg_{id}"), value);
@@ -239,7 +241,7 @@ fn validate_command(command: &Command, path: &str, seen: &mut Vec<String>) -> Re
         }
         if !matches!(
             field.policy.as_str(),
-            "boolean" | "enum" | "presence" | "count" | "bucket"
+            "boolean" | "enum" | "presence" | "count" | "bucket" | "omitted"
         ) {
             return Err(format!("invalid policy: {path} {id}"));
         }
@@ -589,6 +591,11 @@ mod tests {
             assert_eq!(value["arg_remove_agents_md"], true, "{value}");
             assert!(!value.to_string().contains("private-canary"));
         }
+        // Turning a Skill off is the person's choice and stays on the device: not even that it
+        // was asked for is recorded.
+        let value = capture(&["agit", "setup", "--remove-skill", "--runtime", "codex"]);
+        assert_eq!(value["command_path"], "setup");
+        assert!(value.get("arg_remove_skill").is_none(), "{value}");
     }
 
     #[test]

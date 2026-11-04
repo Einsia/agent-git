@@ -424,7 +424,7 @@ mod terminal {
             return;
         }
         let lab = Lab::new();
-        let replacement = "#!/bin/sh\nif [ \"$1\" = --no-tui ]; then\n  printf '%s\\n' \"$@\" > \"$AGIT_HOME/refreshed\"\nelse\n  printf '%s\\n' \"$@\" > \"$AGIT_HOME/continued\"\n  pwd > \"$AGIT_HOME/continued-cwd\"\n  printf '%s\\n' \"$AGIT_HUB_URL\"\nfi\n";
+        let replacement = "#!/bin/sh\nif [ \"$1\" = --no-tui ]; then\n  printf '%s\\n' \"$@\" >> \"$AGIT_HOME/refreshed\"\nelse\n  printf '%s\\n' \"$@\" > \"$AGIT_HOME/continued\"\n  pwd > \"$AGIT_HOME/continued-cwd\"\n  printf '%s\\n' \"$AGIT_HUB_URL\"\nfi\n";
         let (hub, executable) = upgrade_fixture(&lab, replacement.as_bytes());
         fs::create_dir(lab.root.path().join("nested directory")).unwrap();
         let args = ["-C", "nested directory", "config", "hub.url"];
@@ -452,7 +452,7 @@ mod terminal {
         assert_eq!(fs::read_to_string(&executable).unwrap(), replacement);
         assert_eq!(
             fs::read_to_string(lab.store.join("refreshed")).unwrap(),
-            "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n"
+            "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n--no-tui\n--quiet\nsetup\n--new-runtimes\n"
         );
         assert_eq!(
             fs::read_to_string(lab.store.join("continued")).unwrap(),

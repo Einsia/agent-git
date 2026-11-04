@@ -403,3 +403,236 @@ fn the_old_session_start_section_goes_at_home_and_is_named_in_projects() {
     );
     assert_eq!(overview(&app), serde_json::json!([]));
 }
+
+/// Runs agit with the isolated home of [`agit_in`] and a PATH that holds no runtime's program, so a
+/// runtime counts as installed only by the folder it keeps on this computer.
+fn without_runtimes(root: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+    command.env_clear_local();
+    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    command
+        .args(["--no-tui"])
+        .args(args)
+        .env("PATH", &bin)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("CODEX_HOME", root.join("custom-codex"))
+        .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+        .env("AGIT_HOME", root.join("agit"))
+        .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+        .env("AGIT_TELEMETRY_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn said(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Bare `agit setup` writes only for the runtimes installed on this computer, so it creates no
+/// configuration folder for a tool the person does not have, and a runtime installed later is set
+/// up by the next bare setup. With none installed it writes nothing and names the two ways on;
+/// `--all` still writes for every runtime. A setup that wrote for every supported runtime would
+/// create `~/.cursor` or `$CODEX_HOME` here; one that judged once and remembered would never set
+/// up the runtime installed afterwards.
+#[test]
+fn bare_setup_writes_for_the_runtimes_installed_here() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let skill = |folder: &str| root.join(folder).join("skills/agit/SKILL.md");
+
+    let none = without_runtimes(root, &["setup", "--yes"]);
+    assert!(none.status.success(), "{none:?}");
+    assert!(
+        said(&none).contains("`agit setup --runtime <runtime>`")
+            && said(&none).contains("`agit setup --all`"),
+        "{none:?}"
+    );
+    for folder in [".claude", "custom-codex", ".cursor", ".config/opencode"] {
+        assert!(!root.join(folder).exists(), "{folder}");
+    }
+    // What the same request asks for outside the runtimes still happens.
+    let completions = without_runtimes(root, &["setup", "--skill", "--completions", "bash"]);
+    assert!(completions.status.success(), "{completions:?}");
+    assert!(
+        String::from_utf8_lossy(&completions.stdout).contains("complete -F"),
+        "{completions:?}"
+    );
+    assert!(!root.join(".claude").exists() && !root.join(".cursor").exists());
+
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    let claude = without_runtimes(root, &["setup", "--yes"]);
+    assert!(claude.status.success(), "{claude:?}");
+    assert!(skill(".claude").exists(), "{claude:?}");
+    for folder in ["custom-codex", ".cursor", ".config/opencode"] {
+        assert!(!root.join(folder).exists(), "{folder}: {claude:?}");
+    }
+
+    std::fs::create_dir_all(root.join(".config/opencode")).unwrap();
+    let later = without_runtimes(root, &["setup", "--yes"]);
+    assert!(later.status.success(), "{later:?}");
+    assert!(
+        skill(".config/opencode").exists() && skill(".claude").exists(),
+        "{later:?}"
+    );
+    assert!(
+        !root.join("custom-codex").exists() && !root.join(".cursor").exists(),
+        "{later:?}"
+    );
+
+    // A program on PATH counts too, for a runtime that has not run yet, also Cursor, whose
+    // adapter says it cannot resume sessions whatever is installed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let program = root.join("bin/cursor");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let on_path = without_runtimes(root, &["setup", "--yes"]);
+        assert!(on_path.status.success(), "{on_path:?}");
+        assert!(skill(".cursor").exists(), "{on_path:?}");
+        assert!(!root.join("custom-codex").exists(), "{on_path:?}");
+    }
+
+    let every = without_runtimes(root, &["setup", "--yes", "--all"]);
+    assert!(every.status.success(), "{every:?}");
+    assert!(skill("custom-codex").exists(), "{every:?}");
+}
+
+/// A Skill the person turned off for a runtime stays off: bare setup and the refresh `agit
+/// upgrade` runs leave it out, and doctor says it is off by choice, until setup names that runtime
+/// again. Turning it off removes only agit's bundle, never a file the person keeps beside it. A
+/// refresh that reinstalled every Skill it found missing would undo the choice on the next
+/// upgrade, and a removal of the whole folder would take the person's notes with it.
+#[test]
+fn a_skill_turned_off_stays_off_until_setup_names_its_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    let skill = root.join(".claude/skills/agit");
+    assert!(without_runtimes(root, &["setup", "--yes"]).status.success());
+    let notes = skill.join("references/commands/notes.txt");
+    std::fs::write(&notes, "my notes").unwrap();
+
+    let off = without_runtimes(
+        root,
+        &["setup", "--remove-skill", "--runtime", "claude-code"],
+    );
+    assert!(off.status.success(), "{off:?}");
+    assert!(!skill.join("SKILL.md").exists(), "{off:?}");
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "my notes");
+
+    for args in [
+        &["setup", "--yes"][..],
+        &["setup", "--skill", "--installed-only"],
+    ] {
+        let again = without_runtimes(root, args);
+        assert!(again.status.success(), "{args:?}: {again:?}");
+        assert!(!skill.join("SKILL.md").exists(), "{args:?}: {again:?}");
+        assert!(
+            said(&again).contains("agit's Skill is off for claude-code"),
+            "{args:?}: {again:?}"
+        );
+    }
+    let doctor = without_runtimes(root, &["doctor"]);
+    assert!(
+        said(&doctor).contains("off, as the person chose"),
+        "{doctor:?}"
+    );
+
+    let on = without_runtimes(root, &["setup", "--skill", "--runtime", "claude-code"]);
+    assert!(on.status.success(), "{on:?}");
+    assert!(skill.join("SKILL.md").exists(), "{on:?}");
+    assert!(!root.join("agit/skill-off.json").exists());
+}
+
+/// A runtime installed after the last setup is set up by the next upgrade, as the bare setup that
+/// once wrote for every runtime ahead of time did: with Codex set up first, Claude Code installed
+/// later is named by doctor, and the setup `agit upgrade` runs after refreshing Skills
+/// (`setup --new-runtimes`) gives it its Skill and capture hooks and names it. It follows only a
+/// setup that happened: before any setup, and while the person's "no" at the setup notice stands,
+/// it writes nothing. With nothing new it says nothing; a runtime whose Skill was turned off is not
+/// new, and neither is one that kept agit's hooks without its Skill. An upgrade that only refreshed
+/// what was there would leave Claude Code uncaptured for good, since a runtime already set up
+/// silences the notice; one that set up whatever carries no Skill would overrule the person's
+/// "no" and every Skill they removed while keeping capture.
+#[test]
+fn a_runtime_installed_after_setup_is_set_up_by_the_next_upgrade() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    std::fs::create_dir_all(root.join("custom-codex")).unwrap();
+    let before = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(
+        before.status.success() && before.stdout.is_empty(),
+        "{before:?}"
+    );
+    assert!(!root.join("custom-codex/skills").exists());
+    assert!(without_runtimes(root, &["setup", "--yes"]).status.success());
+    assert!(root.join("custom-codex/skills/agit/SKILL.md").exists());
+    assert!(!root.join(".claude").exists());
+
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    let doctor = without_runtimes(root, &["doctor"]);
+    assert!(
+        said(&doctor).contains("not set up for Claude Code"),
+        "{doctor:?}"
+    );
+    let declined = root.join("agit/setup-notice.json");
+    std::fs::write(&declined, r#"{"declined_at":"2026-11-04T00:00:00Z"}"#).unwrap();
+    let refused = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(
+        refused.status.success() && refused.stdout.is_empty(),
+        "{refused:?}"
+    );
+    assert!(!root.join(".claude/skills").exists());
+    assert!(declined.exists());
+    std::fs::remove_file(&declined).unwrap();
+    let upgrade = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(upgrade.status.success(), "{upgrade:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&upgrade.stdout).trim(),
+        "Claude Code"
+    );
+    assert!(root.join(".claude/skills/agit/SKILL.md").exists());
+    let settings = std::fs::read_to_string(root.join(".claude/settings.json")).unwrap();
+    assert!(settings.contains("hooks settle"), "{settings}");
+    let doctor = without_runtimes(root, &["doctor"]);
+    assert!(!said(&doctor).contains("not set up for"), "{doctor:?}");
+
+    let again = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(again.status.success(), "{again:?}");
+    assert!(again.stdout.is_empty(), "{again:?}");
+
+    std::fs::create_dir_all(root.join(".cursor")).unwrap();
+    assert!(
+        without_runtimes(root, &["setup", "--remove-skill", "--runtime", "cursor"])
+            .status
+            .success()
+    );
+    let off = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(off.status.success() && off.stdout.is_empty(), "{off:?}");
+    assert!(!root.join(".cursor/skills/agit/SKILL.md").exists());
+
+    std::fs::remove_dir_all(root.join(".claude/skills/agit")).unwrap();
+    let doctor = without_runtimes(root, &["doctor"]);
+    assert!(!said(&doctor).contains("not set up for"), "{doctor:?}");
+    let hooked = without_runtimes(root, &["--quiet", "setup", "--new-runtimes"]);
+    assert!(
+        hooked.status.success() && hooked.stdout.is_empty(),
+        "{hooked:?}"
+    );
+    assert!(!root.join(".claude/skills/agit").exists());
+}

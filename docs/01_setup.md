@@ -17,7 +17,8 @@ The global package wires skills, hooks and MCP from its install script. npm 12 a
 skip an install script that has not been allowed, which is what `--allow-scripts` above is for;
 an organization policy (`strict-allow-scripts`, `ignore-scripts`) can block or skip it too. Under
 pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If the install
-script did not run, run `agit setup` once yourself. What the npm package itself does is in
+script did not run, run `agit setup` once yourself. It sets up the runtimes installed at the time,
+so run it again after installing another. What the npm package itself does is in
 [`../npm/README.md`](../npm/README.md).
 
 Do not install `@einsia/agentgit` (no hyphen) — that is a different CLI from

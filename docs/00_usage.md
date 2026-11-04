@@ -122,7 +122,11 @@ To mark a session offline first, use the `--link-only` of 3.1 below.
 agit setup
 ```
 
-It configures the following integrations. Repeating setup updates existing managed entries:
+It configures the following integrations for the runtimes installed on this computer: a program
+on PATH, or the configuration folder a runtime makes when it first runs. Run it again after
+installing another runtime, or use `agit setup --all` to prepare every runtime agit supports.
+Repeating setup updates existing managed entries. `agit setup --remove-skill --runtime <runtime>`
+turns agit's Skill off for one runtime and keeps it off through later setups and upgrades:
 
 | What        | Where                                              | Effect                                                       |
 | ----------- | -------------------------------------------------- | ------------------------------------------------------------ |
