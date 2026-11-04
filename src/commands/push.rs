@@ -416,7 +416,7 @@ pub fn run(mut args: Args) -> CmdResult {
     };
 
     reading.finish();
-    publish_in_groups(
+    let code = publish_in_groups(
         &args,
         &publication_client,
         &publication_account,
@@ -424,7 +424,18 @@ pub fn run(mut args: Args) -> CmdResult {
         &repo,
         &branches,
         asked_explicitly,
-    )
+    )?;
+    // A push the person made is where their agent may learn the folder could upload by itself.
+    if code == ExitCode::Ok
+        && !args.dry_run
+        && args.to_hub.is_none()
+        && !crate::rc::local_repository::publication::is_device_local(&repo).unwrap_or(true)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let destination = args.to.clone().unwrap_or_else(|| checkout.slug());
+        super::front::offer_automatic_upload(&publication_client, &cwd, &destination);
+    }
+    Ok(code)
 }
 
 /// Selected branches whose local tip is the source of the publication the Hub last acknowledged

@@ -208,10 +208,12 @@ async function main() {
     dim('`agit setup` did not fully succeed — re-run it later; the CLI itself is installed.')
   }
 
+  // The same lines `agit setup` prints when it runs on its own (next_steps in src/commands/setup.rs).
   say('')
   say('Next:')
-  say('  agit login        # sign in to the hub')
-  say('  then ask your agent to follow https://agent-git.com/docs/quickstart/')
+  say('  agit login   sign in to the Hub')
+  say('  agit on      in a project folder: each new conversation there uploads after each turn to a Hub repository it names first, and asks you before it starts; `agit off` stops it')
+  say('  Quickstart:  https://agent-git.com/docs/quickstart/')
   say('')
   dim('docs: https://agent-git.com/docs')
 }

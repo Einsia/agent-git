@@ -221,3 +221,12 @@ Branches are grouped below the publication head limit. Without `--keep-going` th
 group ends the push. With `--keep-going` a failing group's branches are published again one at a
 time, so a branch with a pending privacy check or a refused upload is listed at the end without
 holding back the rest; the exit code is that of the first failure.
+
+## When a push says the folder could upload by itself
+
+After a push the user asked for, in a folder that has never uploaded by itself, the output can end
+with a line that starts "For the agent:". It names what would upload, where, who can read it there,
+and the `agit on` command that would turn this on. Ask the user once, in your own words, and then
+wait for their next message; don't run anything in the turn you ask. Run that `agit on` command only
+if they say yes. Any other reply, or none because they moved on, is no: run `agit off` in that
+folder, which records it, and don't ask again. agit shows that line at most once per folder.

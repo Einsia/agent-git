@@ -22,6 +22,94 @@ use crate::{
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+/// What a push the person made says to their agent about the folder `root` it ran in: that each
+/// new conversation there and in its subfolders, and in the git `worktrees` it would also cover,
+/// could upload to `repository` by itself, who can read it there, how to stop it, and that the
+/// agent asks the person and waits for a yes. The person's no is
+/// `agit off`, after which nothing suggests it there again.
+pub(crate) fn automatic_upload_offer(
+    root: &Path,
+    worktrees: &[PathBuf],
+    repository: &str,
+    public: bool,
+) -> String {
+    let folder = ui::tilde(root);
+    // The person hears every place it would cover before they answer.
+    let also = match worktrees {
+        [] => String::new(),
+        [only] => format!(", and also {} (git worktree),", ui::tilde(only)),
+        many => format!(
+            ", and also {} (git worktrees),",
+            many.iter()
+                .map(|w| ui::tilde(w))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let command = if public {
+        format!("agit on --repo {repository} --public")
+    } else {
+        format!("agit on --repo {repository}")
+    };
+    let audience = if public {
+        "public: anyone can read it"
+    } else {
+        "private: only its members can read it"
+    };
+    format!(
+        "For the agent: {folder} doesn't upload its conversations by itself. With `{command}`, each new conversation in this folder and its subfolders{also} would upload to {repository} ({audience}) automatically after each turn; `agit off` turns that off again. Ask the person whether they want this, then wait for their reply. Run `{command}` only if they say yes. Any other reply, or none, counts as no: then run `agit off` here, and don't ask again."
+    )
+}
+
+/// Says [`automatic_upload_offer`] after a push the person made from `cwd` to `repository`, once
+/// per folder, and records that it did: only where no project has ever governed the folder and
+/// nobody was asked yet, never for agit's own automatic push or under `--quiet`, and not when the
+/// Hub doesn't describe the repository.
+pub(crate) fn offer_automatic_upload(client: &crate::hub::Client, cwd: &Path, repository: &str) {
+    let Ok(root) = folder(cwd) else {
+        return;
+    };
+    if !offer_due(
+        &root,
+        crate::commands::auto_push::is_automatic(),
+        ui::quiet(),
+    ) {
+        return;
+    }
+    let Some((owner, name)) = repository.split_once('/') else {
+        return;
+    };
+    let Ok(remote) = client.get_agent(owner, name) else {
+        return;
+    };
+    if !matches!(
+        super::project::claim_automatic_upload_offer(&root),
+        Ok(true)
+    ) {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        automatic_upload_offer(
+            &root,
+            &super::project::worktrees_covered_from(&root),
+            repository,
+            remote.visibility == "public",
+        )
+    );
+}
+
+/// Whether a push may suggest turning `root` on: one the person made (`automatic` is agit's own
+/// background push), not under `--quiet`, in a folder no project has ever governed, and only if
+/// nobody was asked about it before.
+pub(crate) fn offer_due(root: &Path, automatic: bool, quiet: bool) -> bool {
+    !automatic
+        && !quiet
+        && super::project::never_bound(root)
+        && !super::project::automatic_upload_offered(root)
+}
+
 /// A refusal that names the next step. The message and the step are plain words: the front door
 /// never asks a person to know how sessions are stored.
 #[derive(Debug)]
@@ -987,6 +1075,50 @@ fn push_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line a push says names what would upload, where, who can read it there and how to stop
+    /// it, and has the agent wait for a yes. A public destination is said to be public, and its
+    /// command carries --public, which `agit on` needs for one.
+    #[test]
+    fn the_automatic_upload_offer_says_what_where_who_and_how_to_stop() {
+        let root = Path::new("/work/app");
+        let private = automatic_upload_offer(root, &[], "alice/app", false);
+        for said in [
+            "For the agent: /work/app doesn't upload",
+            "`agit on --repo alice/app`",
+            "each new conversation in this folder and its subfolders would upload to alice/app (private: only its members can read it) automatically after each turn",
+            "`agit off` turns that off again",
+            "then wait for their reply",
+            "Any other reply, or none, counts as no",
+        ] {
+            assert!(private.contains(said), "{said}: {private}");
+        }
+        assert!(!private.contains("--public"), "{private}");
+        assert!(!private.contains("git worktree"), "{private}");
+        let public = automatic_upload_offer(root, &[], "alice/site", true);
+        assert!(
+            public.contains("`agit on --repo alice/site --public`"),
+            "{public}"
+        );
+        assert!(public.contains("(public: anyone can read it)"), "{public}");
+        // Every git worktree it would also cover is named in the question itself.
+        let one =
+            automatic_upload_offer(root, &[PathBuf::from("/work/app-fix")], "alice/app", false);
+        assert!(
+            one.contains("in this folder and its subfolders, and also /work/app-fix (git worktree), would upload to alice/app"),
+            "{one}"
+        );
+        let two = automatic_upload_offer(
+            root,
+            &[PathBuf::from("/work/a"), PathBuf::from("/work/b")],
+            "alice/app",
+            false,
+        );
+        assert!(
+            two.contains("and also /work/a, /work/b (git worktrees), would upload"),
+            "{two}"
+        );
+    }
 
     /// The origin is sent to the Hub to find the team's destination. A token a person put into an
     /// HTTPS remote must not travel with it; an SSH user is part of the address and stays.

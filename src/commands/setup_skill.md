@@ -33,6 +33,10 @@ the conversation, its folder's destination and the account by itself, so do not 
 
 - `agit save` run inside a conversation saves that conversation and turns its folder on, so later
   turns upload after each turn without any command. Send the user `result.value.sessions[].link`.
+- When a push's output ends with a line that starts "For the agent:", ask the user once whether
+  the folder should upload by itself as it describes, then wait for their next message. Run the
+  `agit on` command it names only on a yes; anything else, or no answer, is no: run `agit off` in
+  that folder, and don't ask again.
 - When a save turned a folder on (`result.value.folders_turned_on[]`, each with `folder` and
   `repository`), tell the user, with the link, that new sessions in that folder now upload to
   that repository by themselves, and ask once whether they should keep doing so, naming each

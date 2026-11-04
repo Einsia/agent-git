@@ -284,7 +284,34 @@ fn run_setup(mut args: Args) -> CmdResult {
     } else {
         ui::info(format_args!("Nothing to install."));
     }
+    // The installer that ran this setup says the next steps itself, last.
+    if all
+        && !args.installed_only
+        && !super::json::requested()
+        && !ui::quiet()
+        && std::env::var("AGIT_INSTALL_CHANNEL").as_deref() != Ok("create_agit")
+    {
+        println!();
+        for line in next_steps(crate::infra::credentials::current_user().is_some()) {
+            println!("{line}");
+        }
+    }
     Ok(ExitCode::Ok)
+}
+
+/// What a person does after setup: sign in, turn a project folder on, and the quickstart. The
+/// create-agit installer prints the same lines (npm/create-agit/bin.mjs); `agit on` is described
+/// by what it uploads, where, and how to stop it.
+pub(crate) fn next_steps(signed_in: bool) -> Vec<&'static str> {
+    let mut lines = vec!["Next:"];
+    if !signed_in {
+        lines.push("  agit login   sign in to the Hub");
+    }
+    lines.push(
+        "  agit on      in a project folder: each new conversation there uploads after each turn to a Hub repository it names first, and asks you before it starts; `agit off` stops it",
+    );
+    lines.push("  Quickstart:  https://agent-git.com/docs/quickstart/");
+    lines
 }
 
 // ── hooks ─────────────────────────────────────────────────────────────
