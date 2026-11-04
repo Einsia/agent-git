@@ -85,6 +85,10 @@ pub struct Outcome {
     /// unchanged. Only the service sets it, for the text and record protection modes.
     #[serde(skip)]
     pub unprocessed: usize,
+    /// How many records in `content` lost parts too large for the privacy check to divide, a
+    /// placeholder standing in their place. Only the service sets it.
+    #[serde(skip)]
+    pub omitted: usize,
     /// Why the outcome is not Complete. On a Complete outcome, [`Reason::FindingsCap`] says the
     /// input held more findings than one scan finishes: a text was replaced whole, or a stream
     /// released nothing.
@@ -101,6 +105,7 @@ impl Outcome {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         }
     }
@@ -376,6 +381,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         for line in text.split_inclusive('\n') {
@@ -390,6 +396,7 @@ impl Projector {
                     unresolved: 0,
                     consumed: None,
                     unprocessed: 0,
+                    omitted: 0,
                     reason: None,
                 };
                 self.record(&mut value, hydrate, &mut next, preserve_protocol_ids);
@@ -432,6 +439,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         for (value, pointers) in batch.records.iter_mut().zip(batch.pointers) {
@@ -525,6 +533,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         self.record(
@@ -1179,6 +1188,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         let mut cursor = 0;
@@ -1217,6 +1227,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         let mut seen = std::collections::HashSet::new();
@@ -1250,6 +1261,7 @@ impl Projector {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
         let mut cursor = 0;

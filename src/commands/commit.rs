@@ -1401,6 +1401,19 @@ fn privacy_pending(
     Ok(ExitCode::Ok)
 }
 
+/// What settlement says of records the privacy check could not divide, whose largest parts it
+/// left out of what agit keeps.
+fn omitted_records_warning(records: usize) -> String {
+    let (count, its) = if records == 1 {
+        ("a record".to_owned(), "its")
+    } else {
+        (format!("{records} records"), "their")
+    };
+    format!(
+        "{count} larger than the privacy check can divide had {its} largest parts left out of what agit saves and uploads; the conversation file on this computer still has them"
+    )
+}
+
 fn warn_refused_record(target: Option<&str>, bytes: u64, turns: usize) {
     ui::warning(&format!(
         "privacy check refused a record of {}: it is larger than the check can divide, so {turns} turn{} stay unsettled, and settling again does not change that",
@@ -3560,7 +3573,11 @@ fn settle_bytes(
                 protected_increment.replacements
             ));
         }
-        if unsettled > 0 {
+        if protected_increment.omitted > 0 {
+            ui::warning(&omitted_records_warning(protected_increment.omitted));
+        }
+        // A refused record was named above, and settling again meets it again.
+        if unsettled > 0 && refused_record.is_none() {
             ui::warning(&format!(
                 "privacy check pending ({}): {unsettled} later turn{} stay unsettled; the next settlement tries again",
                 privacy::reason_name(protected_increment.reason),

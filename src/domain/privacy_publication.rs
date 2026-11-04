@@ -210,6 +210,7 @@ pub(crate) fn project_worker(
         unresolved: 0,
         consumed: None,
         unprocessed: 0,
+        omitted: 0,
         reason: None,
     })
 }

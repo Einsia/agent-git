@@ -609,6 +609,7 @@ fn transform_inner(
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         };
     }
@@ -684,6 +685,7 @@ fn transform_inner(
         unresolved: 0,
         consumed: None,
         unprocessed: 0,
+        omitted: 0,
         reason: None,
     };
     let mut stopped = None;
@@ -760,6 +762,7 @@ fn transform_inner(
                 outcome.content.push_str(&batch.content);
                 outcome.replacements += batch.replacements;
                 outcome.unresolved += batch.unresolved;
+                outcome.omitted += batch.omitted;
                 if batch.status != Status::Complete {
                     outcome.status = Status::Partial;
                     outcome.reason = outcome
@@ -822,7 +825,11 @@ pub(crate) const CROWDED_TEXT: &str = "[content omitted: too many findings for t
 /// One JSONL line too large for a request, protected in parts. Its base64 media payloads stay
 /// here, since media is never scanned, and every other string too large to travel with the record
 /// is protected on its own, window by window, each window with the text before it as context. The
-/// line keeps its bytes unless something in it was replaced.
+/// line keeps its bytes unless something in it was replaced or left out.
+///
+/// When the record is still too large without those strings, its largest arrays and objects are
+/// left out, largest first, each replaced by [`OMITTED_TEXT`], until the rest fits one request;
+/// the rest, keys included, is then checked as one record. Nothing left out is sent or kept.
 fn protect_oversized_line(
     process: &mut Process,
     repo: Option<&Path>,
@@ -861,8 +868,18 @@ fn protect_oversized_line(
         size = size - part.bytes + encoded(&stub);
         parts.push((part, stub, original));
     }
+    // From here the record is measured as it is sent, re-encoded: a number written as `1e9` in
+    // the line encodes longer, so the line's own length can fall far short of the request.
+    let mut encoded = record.to_string().len() + newline.len();
+    let mut omitted = Vec::new();
+    if size > MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES
+        || encoded > MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES
+    {
+        omitted = omit_containers(&mut record, body, &mut encoded);
+        parts.retain(|(part, _, _)| !omitted.iter().any(|at| within(&part.pointer, at)));
+    }
     let stubbed = format!("{record}{newline}");
-    if size > MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES || stubbed.len() > MAX_UNIT_BYTES {
+    if encoded > MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES || stubbed.len() > MAX_UNIT_BYTES {
         return Ok(skipped(line, Reason::Oversize));
     }
     let batch = process.request(repo, "", &stubbed, Mode::ProtectJsonl, remaining())?;
@@ -900,7 +917,7 @@ fn protect_oversized_line(
             if windows.reason == Some(Reason::Oversize) {
                 // No cut in any window that fits a request leaves a finding whole: the string
                 // is omitted rather than holding the session back for good.
-                replacements += 1;
+                omitted.push(part.pointer.clone());
                 serde_json::Value::from(OMITTED_TEXT)
             } else if !passed(&windows) {
                 return Ok(skipped(
@@ -914,7 +931,7 @@ fn protect_oversized_line(
         };
     }
     Ok(Outcome {
-        content: if replacements == 0 {
+        content: if replacements == 0 && omitted.is_empty() {
             line.to_owned()
         } else {
             format!("{protected}{newline}")
@@ -924,8 +941,134 @@ fn protect_oversized_line(
         unresolved: 0,
         consumed: None,
         unprocessed: 0,
+        omitted: usize::from(!omitted.is_empty()),
         reason: None,
     })
+}
+
+/// How many containers one record may try to leave out. Each try judges the whole record under
+/// every runtime, so a record whose large parts all decide what it is stops here and stays
+/// refused instead of holding its settlement for long.
+const MAX_OMISSION_TRIALS: usize = 64;
+
+/// Whether the JSON pointer `pointer` is `container` or lies inside it.
+fn within(pointer: &str, container: &str) -> bool {
+    pointer
+        .strip_prefix(container)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Leave out the largest arrays and objects of `record`, largest first, until it fits one request
+/// with the room [`WINDOW_CONTEXT_BYTES`] keeps, and return where each was. `size` is the
+/// record's length as serde encodes it, the measure each container is taken at, and follows every
+/// change; a size taken from the line as written would not shrink by what a container encodes to.
+///
+/// Only containers [`collect_containers`] offers are left out, and one only if the record's
+/// [`record_kind`] under every runtime, judged on `original`, the record as the runtime wrote it,
+/// stays the same; otherwise the parts inside it are tried in turn.
+fn omit_containers(
+    record: &mut serde_json::Value,
+    original: &str,
+    size: &mut usize,
+) -> Vec<String> {
+    use crate::domain::publication_records::{RUNTIMES, record_kind};
+    let Ok(mut judged) = serde_json::from_str::<serde_json::Value>(original) else {
+        return Vec::new();
+    };
+    let kinds = |value: &serde_json::Value| {
+        RUNTIMES
+            .iter()
+            .map(|runtime| record_kind(runtime, value))
+            .collect::<Vec<_>>()
+    };
+    let before = kinds(&judged);
+    let mut containers = Vec::new();
+    collect_containers(record, &mut String::new(), 0, &mut containers);
+    // An ancestor encodes larger than anything inside it, so it is always tried first.
+    containers.sort_by_key(|(pointer, bytes)| (std::cmp::Reverse(*bytes), pointer.clone()));
+    let placeholder = serde_json::Value::from(OMITTED_TEXT);
+    let placeholder_bytes = placeholder.to_string().len();
+    let mut omitted: Vec<String> = Vec::new();
+    let mut trials = 0;
+    for (pointer, bytes) in containers {
+        if *size <= MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES || trials == MAX_OMISSION_TRIALS {
+            break;
+        }
+        if omitted.iter().any(|at| within(&pointer, at)) {
+            continue;
+        }
+        trials += 1;
+        let Some(slot) = judged.pointer_mut(&pointer) else {
+            continue;
+        };
+        let kept = std::mem::replace(slot, placeholder.clone());
+        if kinds(&judged) != before {
+            *judged
+                .pointer_mut(&pointer)
+                .expect("the pointer was just replaced") = kept;
+            continue;
+        }
+        *record
+            .pointer_mut(&pointer)
+            .expect("the pointer was collected from this record") = placeholder.clone();
+        *size = *size - bytes + placeholder_bytes;
+        omitted.push(pointer);
+    }
+    omitted
+}
+
+/// How many levels of typed objects (ones with a string `type`, `role` or `kind`) the publication
+/// classifiers read to tell what a record is: the record, its message or payload, and the
+/// message's content parts.
+const CLASSIFIED_LEVELS: usize = 3;
+
+/// The arrays and objects below the top of `value` that may be left out, each with its pointer
+/// and encoded size. A typed object within [`CLASSIFIED_LEVELS`], and every container holding
+/// one, stays: a content-part list replaced by a string would publish a tool result as words the
+/// person typed. Returns whether `value` itself stays for that reason; `typed_above` counts the
+/// typed objects that hold it.
+fn collect_containers(
+    value: &serde_json::Value,
+    pointer: &mut String,
+    typed_above: usize,
+    out: &mut Vec<(String, usize)>,
+) -> bool {
+    let typed = value.as_object().is_some_and(|object| {
+        ["type", "role", "kind"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(serde_json::Value::is_string))
+    });
+    let levels = typed_above + usize::from(typed);
+    let mut stays = typed && levels <= CLASSIFIED_LEVELS;
+    let children: Box<dyn Iterator<Item = (String, &serde_json::Value)>> = match value {
+        serde_json::Value::Array(values) => Box::new(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index.to_string(), value)),
+        ),
+        serde_json::Value::Object(values) => Box::new(
+            values
+                .iter()
+                .map(|(key, value)| (key.replace('~', "~0").replace('/', "~1"), value)),
+        ),
+        _ => return stays,
+    };
+    for (step, child) in children {
+        if !(child.is_array() || child.is_object()) {
+            continue;
+        }
+        let at = pointer.len();
+        pointer.push('/');
+        pointer.push_str(&step);
+        if collect_containers(child, pointer, levels, out) {
+            stays = true;
+        } else {
+            out.push((pointer.clone(), child.to_string().len()));
+        }
+        pointer.truncate(at);
+    }
+    stays
 }
 
 /// A string inside an oversized record: where it is, the field that holds it, its size as
@@ -1000,6 +1143,7 @@ fn protect_windows(
         unresolved: 0,
         consumed: None,
         unprocessed: 0,
+        omitted: 0,
         reason: None,
     };
     let keys = crate::domain::redact::PrivateKeys::new(text);
@@ -1389,5 +1533,95 @@ mod tests {
         process.close();
         assert!(started.elapsed() < worker::WATCHDOG_FLOOR + Duration::from_secs(2));
         assert!(matches!(process.child.try_wait(), Ok(Some(_))));
+    }
+
+    /// A record too large for the privacy check loses its largest parts without changing what it
+    /// is to publication: a Claude tool result, a Claude tool call and a Codex function output each
+    /// keep their kind under every runtime, their typed parts and the list holding them. One that
+    /// left out the largest container a classifier reads, such as the content-part list, would
+    /// publish the tool result as words the person typed while its kind stayed `Conversation`; one
+    /// that judged only the containers' places would turn a withheld tool result into a published
+    /// one.
+    #[test]
+    fn leaving_out_parts_keeps_what_a_record_is_to_publication() {
+        use crate::domain::publication_records::{RUNTIMES, record_kind};
+        let lines = |count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("line {index}")).collect()
+        };
+        let texts = |count: usize| -> Vec<serde_json::Value> {
+            (0..count)
+                .map(|index| serde_json::json!({"type": "text", "text": format!("part {index}")}))
+                .collect()
+        };
+        let cases = [
+            (
+                "a tool result whose own body is largest",
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": texts(400)}
+                ]}}),
+                "/message/content/0/content",
+            ),
+            (
+                "a tool result with a large structured result beside it",
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+                ]}, "toolUseResult": {"type": "update", "structuredPatch": [{"lines": lines(400)}]}}),
+                "/toolUseResult/structuredPatch",
+            ),
+            (
+                "a tool call with large input",
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "MultiEdit",
+                     "input": {"file_path": "a.rs", "edits": lines(400)}}
+                ]}}),
+                "/message/content/0/input",
+            ),
+            (
+                // A part the classifier does not know keeps this record from publication; the
+                // body as a string would publish it, so only that part goes.
+                "a withheld tool result",
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "done"},
+                        {"type": "tool_reference", "names": lines(400)}
+                    ]}
+                ]}}),
+                "/message/content/0/content/1",
+            ),
+            (
+                "a Codex function output",
+                serde_json::json!({"type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "call_1",
+                    "output": {"rows": lines(400)}
+                }}),
+                "/payload/output",
+            ),
+        ];
+        let kinds = |value: &serde_json::Value| {
+            RUNTIMES
+                .iter()
+                .map(|runtime| record_kind(runtime, value))
+                .collect::<Vec<_>>()
+        };
+        for (case, original, left_out) in cases {
+            let line = original.to_string();
+            let mut record = original.clone();
+            // Just over the bound, so the largest part that may go is the one that goes.
+            let mut size = MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES + 1;
+            let omitted = omit_containers(&mut record, &line, &mut size);
+            assert_eq!(omitted, [left_out], "{case}");
+            assert_eq!(record.pointer(left_out).unwrap(), OMITTED_TEXT, "{case}");
+            assert!(size <= MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES, "{case}");
+            assert_eq!(kinds(&record), kinds(&original), "{case}");
+            for typed in ["/message/content/0", "/payload"] {
+                if let Some(part) = original.pointer(typed) {
+                    assert_eq!(
+                        record.pointer(typed).unwrap()["type"],
+                        part["type"],
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 }

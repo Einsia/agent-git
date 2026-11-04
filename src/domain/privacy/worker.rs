@@ -528,6 +528,7 @@ fn frozen_hydration(request: &Request) -> crate::Result<Outcome> {
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         })
     })
@@ -579,6 +580,7 @@ fn status() -> crate::Result<Outcome> {
         unresolved: 0,
         consumed: None,
         unprocessed: 0,
+        omitted: 0,
         reason: None,
     })
 }
@@ -627,6 +629,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         });
     }
@@ -815,6 +818,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         });
     }
@@ -847,6 +851,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unresolved: 0,
             consumed: None,
             unprocessed: 0,
+            omitted: 0,
             reason: None,
         });
     }
