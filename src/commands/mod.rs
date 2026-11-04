@@ -377,7 +377,8 @@ pub fn secret_remedies(sources: impl IntoIterator<Item = secrets::Source>) -> Ve
             secrets::Source::File => file = true,
             secrets::Source::BlobObject
             | secrets::Source::CommitObject
-            | secrets::Source::TagObject => object = true,
+            | secrets::Source::TagObject
+            | secrets::Source::Record => object = true,
         }
     }
     let mut out = Vec::new();

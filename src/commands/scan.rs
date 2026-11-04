@@ -3,9 +3,10 @@
 //! * `--secrets` (default): an advisory scan of the publish surface; `push` neither scans nor
 //!   blocks. It lists the high-confidence findings (provider signatures, private keys, credential
 //!   assignments, registered values), each with file / line / redacted snippet and the record id
-//!   `agit secrets allow` accepts, and states how many there are. Entropy-only findings are only
-//!   counted unless `--low-confidence` is given: runtime ids, hashes and encrypted carriers are
-//!   opaque too, and listing them buries the credentials.
+//!   `agit secrets allow` accepts, and states how many there are. Entropy-only values are not
+//!   reported by default: runtime ids, hashes and encrypted carriers are opaque too, and listing
+//!   them buries the credentials. `--low-confidence` lists those in what push publishes, grouped
+//!   by shape ([`secrets::published_low_confidence`]).
 //!
 //!   The scan surface is [`secrets::scan_agent_repo_allowing`]: workspace + reachable blob /
 //!   commit / tag, repo-wide, run **once**. A surface that skips the workspace misses the most
@@ -56,7 +57,7 @@ pub struct Args {
     /// Bring up a local review agent to vet sensitive content.
     #[arg(long)]
     pub sensitive: bool,
-    /// Also list entropy-only findings (runtime ids, hashes, encrypted carriers).
+    /// Also list entropy-only values in what push publishes, grouped by shape.
     #[arg(long)]
     pub low_confidence: bool,
     /// Machine-readable report.
@@ -210,15 +211,21 @@ pub fn run(args: Args) -> CmdResult {
     }
     let allowed = privacy_records(&repo, "allowed_values", None)
         .and_then(|values| Ok(serde_json::from_value::<HashSet<String>>(values)?));
-    let found = collect(&repo, &n, allowed.as_ref().unwrap_or(&HashSet::new()))?;
+    let privacy_store = allowed.is_ok();
+    let allowed = allowed.unwrap_or_default();
+    let found = collect(&repo, &n, &allowed)?;
+    let low = args
+        .low_confidence
+        .then(|| secrets::published_low_confidence(&repo, &allowed))
+        .transpose()?;
     super::report_binary_carriers(found.binary_carriers);
     echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
-    let records = if allowed.is_ok() && !found.hits.is_empty() {
+    let records = if privacy_store && !found.hits.is_empty() {
         record_ids(&repo, &found.hits)
     } else {
         None
     };
-    let listed: Vec<(&(String, secrets::Hit), &str, Option<&str>)> = found
+    let listed: Vec<(&(String, secrets::Hit), Option<&str>)> = found
         .hits
         .iter()
         .enumerate()
@@ -227,60 +234,33 @@ pub fn run(args: Args) -> CmdResult {
                 .as_ref()
                 .and_then(|ids| ids.get(index))
                 .and_then(Option::as_deref);
-            (hit, "high", record)
+            (hit, record)
         })
-        .chain(
-            found
-                .low_confidence
-                .iter()
-                .filter(|_| args.low_confidence)
-                .map(|hit| (hit, "low", None)),
-        )
         .collect();
     let at_least = if found.counted_all { "" } else { "at least " };
     if args.json {
-        // `source` is the **structured** carrier, so a consumer never parses the prefix of `at`:
-        // a user can create a directory genuinely called `commit object ab12cd34/...`.
-        let entries = |confidence: &str| -> Vec<serde_json::Value> {
-            listed
-                .iter()
-                .filter(|(_, tier, _)| *tier == confidence)
-                .map(|((at, h), tier, record)| {
-                    serde_json::json!({
-                        "rule": h.rule,
-                        "at": at,
-                        "line": h.line,
-                        "preview": h.redacted,
-                        "source": h.source.as_str(),
-                        "confidence": tier,
-                        "record_id": record,
-                    })
-                })
-                .collect()
-        };
-        let mut low = serde_json::json!({ "count": found.low_confidence_count });
-        if args.low_confidence {
-            low["findings"] = entries("low").into();
+        let findings: Vec<serde_json::Value> = listed
+            .iter()
+            .map(|((at, h), record)| finding_json(at, h, "high", *record))
+            .collect();
+        let mut report = serde_json::json!({
+            "check": "secrets",
+            "advisory": true,
+            "count": found.count,
+            "count_exact": found.counted_all,
+            "findings": findings,
+        });
+        // Absent unless asked for: low-confidence values are not counted without the flag.
+        if let Some(low) = &low {
+            report["low_confidence"] = low_confidence_json(low);
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "check": "secrets",
-                "advisory": true,
-                "count": found.count,
-                "count_exact": found.counted_all,
-                "findings": entries("high"),
-                "low_confidence": low,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for ((at, h), tier, record) in &listed {
+        for ((at, h), record) in &listed {
             // Print only the redacted snippet: this output goes into CI logs.
-            let suffix = match (tier, record) {
-                (_, Some(id)) => format!("  record {id}"),
-                (&"low", None) => "  (low confidence)".to_string(),
-                _ => String::new(),
-            };
+            let suffix = record
+                .map(|id| format!("  record {id}"))
+                .unwrap_or_default();
             println!(
                 "  {}  {at}:{}  {}{suffix}",
                 h.rule,
@@ -288,14 +268,11 @@ pub fn run(args: Args) -> CmdResult {
                 ui::dim(&h.redacted)
             );
         }
+        if let Some(low) = &low {
+            print_low_confidence(low);
+        }
     }
 
-    let low_confidence_hint = (found.low_confidence_count > 0 && !args.low_confidence).then(|| {
-        format!(
-            "· {at_least}{} low-confidence values are not listed: entropy alone also matches runtime ids, hashes and encrypted carriers, and capture does not replace them by default; `--low-confidence` lists them",
-            found.low_confidence_count
-        )
-    });
     if !found.hits.is_empty() {
         if !found.unscanned.is_empty() {
             super::report_unscanned(&found.unscanned);
@@ -325,9 +302,6 @@ pub fn run(args: Args) -> CmdResult {
             ),
         }
         super::hint_secret_hit_remedies(found.hits.iter().map(|(_, hit)| hit));
-        if let Some(hint) = low_confidence_hint {
-            ui::hint(&hint);
-        }
         // Findings exit 7, not the generic failure 1: CI has to tell "a secret was found" from
         // "the command broke".
         Ok(ExitCode::Policy)
@@ -341,9 +315,6 @@ pub fn run(args: Args) -> CmdResult {
                 found.low_confidence_count
             ));
         }
-        if let Some(hint) = low_confidence_hint {
-            ui::hint(&hint);
-        }
         Ok(ExitCode::Policy)
     } else {
         if !args.json {
@@ -355,11 +326,114 @@ pub fn run(args: Args) -> CmdResult {
             } else {
                 "no high-confidence text findings; binary artifacts were not text-scanned"
             });
-            if let Some(hint) = low_confidence_hint {
-                ui::hint(&hint);
-            }
         }
         Ok(ExitCode::Ok)
+    }
+}
+
+/// One finding as `--json` reports it.
+fn finding_json(
+    at: &str,
+    hit: &secrets::Hit,
+    confidence: &str,
+    record: Option<&str>,
+) -> serde_json::Value {
+    // `source` is the **structured** carrier, so a consumer never parses the prefix of `at`: a
+    // user can create a directory genuinely called `commit object ab12cd34/...`.
+    serde_json::json!({
+        "rule": hit.rule,
+        "at": at,
+        "line": hit.line,
+        "preview": hit.redacted,
+        "source": hit.source.as_str(),
+        "confidence": confidence,
+        "record_id": record,
+    })
+}
+
+/// The values of each shape that were found, the first ones listed.
+fn low_confidence_groups(
+    low: &secrets::PublishedLowConfidence,
+) -> impl Iterator<Item = (secrets::Shape, usize, Vec<&secrets::Hit>)> {
+    secrets::Shape::ALL.into_iter().filter_map(|shape| {
+        let count = low.count_of(shape);
+        (count > 0).then(|| {
+            let listed = low
+                .listed
+                .iter()
+                .filter(|hit| hit.shape() == shape)
+                .collect();
+            (shape, count, listed)
+        })
+    })
+}
+
+fn low_confidence_json(low: &secrets::PublishedLowConfidence) -> serde_json::Value {
+    let groups: Vec<serde_json::Value> = low_confidence_groups(low)
+        .map(|(shape, count, listed)| {
+            let findings: Vec<serde_json::Value> = listed
+                .into_iter()
+                .map(|hit| finding_json(hit.file.as_deref().unwrap_or("?"), hit, "low", None))
+                .collect();
+            serde_json::json!({ "shape": shape.as_str(), "count": count, "findings": findings })
+        })
+        .collect();
+    serde_json::json!({
+        "count": low.count(),
+        "count_exact": low.counted_all,
+        "files_scope": "branch_tips",
+        "groups": groups,
+    })
+}
+
+fn print_low_confidence(low: &secrets::PublishedLowConfidence) {
+    let at_least = if low.counted_all { "" } else { "at least " };
+    let values = |count: usize| if count == 1 { "value" } else { "values" };
+    // A push also carries earlier versions of each file; this listing reads them as each branch
+    // holds them now, and says so under its header.
+    let files_scope = "· files are read as each branch holds them now, not their earlier versions";
+    if low.count() == 0 {
+        println!("no low-confidence values in what push publishes");
+        println!("{files_scope}");
+    } else {
+        println!(
+            "{at_least}{} low-confidence {} in what push publishes, by shape (entropy alone also matches runtime ids, hashes and encrypted carriers):",
+            low.count(),
+            values(low.count())
+        );
+        println!("{files_scope}");
+        for (shape, count, listed) in low_confidence_groups(low) {
+            println!("  {}: {at_least}{count} {}", shape.label(), values(count));
+            for hit in &listed {
+                println!(
+                    "    {}:{}  {}",
+                    hit.file.as_deref().unwrap_or("?"),
+                    hit.line,
+                    ui::dim(&hit.redacted)
+                );
+            }
+            if count > listed.len() {
+                println!("    · {} more not listed", count - listed.len());
+            }
+        }
+    }
+    let unread = &low.unscanned;
+    let mut parts: Vec<&str> = unread
+        .oversized
+        .iter()
+        .chain(&unread.oversized_files)
+        .map(|(label, _)| label.as_str())
+        .chain(unread.unsupported.iter().map(String::as_str))
+        .take(5)
+        .collect();
+    if unread.over_budget.is_some() {
+        parts.push("the rest, past the local scan budget");
+    }
+    if !parts.is_empty() {
+        ui::hint(&format!(
+            "· not read, so their low-confidence values are not counted: {}",
+            parts.join(", ")
+        ));
     }
 }
 
@@ -599,8 +673,8 @@ struct Found {
     /// High-confidence hits exist that `hits` does not list — say so.
     truncated: bool,
     count: usize,
-    /// The first entropy-only hits, labelled like `hits`.
-    low_confidence: Vec<(String, secrets::Hit)>,
+    /// Entropy-only hits the scan counted; only the warning that counting them stopped the scan
+    /// names this number.
     low_confidence_count: usize,
     /// Both counts are exact; otherwise they are lower bounds.
     counted_all: bool,
@@ -646,7 +720,6 @@ fn collect(repo: &Repo, agent: &str, allowed: &HashSet<String>) -> crate::Result
         hits: labelled(wide.hits),
         truncated: wide.truncated,
         count: wide.count,
-        low_confidence: labelled(wide.low_confidence),
         low_confidence_count: wide.low_confidence_count,
         counted_all: wide.counted_all,
         unscanned: wide.unscanned,
