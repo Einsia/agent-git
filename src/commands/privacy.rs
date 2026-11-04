@@ -26,7 +26,7 @@ pub(crate) mod unlock;
 pub(crate) fn require_native_edit(repo: &Repo, commit: &str) -> Result<()> {
     ensure!(
         unlock::envelope_bytes(repo, commit)?.is_none(),
-        "editing an encrypted publication requires a native continuation or an independent fork first"
+        "editing an encrypted publication requires a settled native continuation first"
     );
     Ok(())
 }

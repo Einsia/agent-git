@@ -38,7 +38,7 @@ agit fork szh/p1@v1.2 -b hotfix --resume --no-launch
 Verify `refs/heads/<branch>` after completion. Fork history remains in the same Agent repo and does not create a second repo.
 
 Forking an encrypted snapshot requests original access for that exact saved point. When authorized,
-the new session includes the complete recovered context and belongs to the forking account.
-Without original access it uses sanitized context and records that choice in its provenance.
-Network or key-service failures stop the fork. Later source revocation does not change the
-independent copy's ownership or grants.
+the new session includes the complete recovered context; without original access it uses sanitized
+context and records that choice in its provenance. Either way the fork can be resumed and continued
+on this computer, but it can't be pushed: a push of a session whose history includes an encrypted
+snapshot is refused, and nothing is uploaded. Network or key-service failures stop the fork.

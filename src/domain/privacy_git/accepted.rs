@@ -239,6 +239,13 @@ impl Ledger {
             .collect()
     }
 
+    /// The mappings every branch has accepted.
+    pub fn every_accepted(&self) -> impl Iterator<Item = &Mapping> {
+        self.branches
+            .values()
+            .flat_map(|state| state.accepted.values())
+    }
+
     /// The mappings this branch has accepted.
     pub fn accepted(&self, branch: &str) -> impl Iterator<Item = &Mapping> {
         self.branches

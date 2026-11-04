@@ -823,7 +823,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
             .err()
             .unwrap()
             .to_string()
-            .contains("unaccepted original ancestry")
+            .contains("was published encrypted")
     );
 }
 

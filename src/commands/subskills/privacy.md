@@ -54,8 +54,7 @@ runtime; cross-runtime conversion uses its ordinary loss warnings. Settlement re
 LOG evidence without adding LOG-only conversation to the resumed VIEW.
 
 Published encrypted snapshots are immutable. File, memory, VIEW and branch-seal edits require a
-settled native continuation or an independent fork. Resume, continue the session, and commit the
-new turn before editing, or use `agit fork` to create a new session with independent ownership.
+settled native continuation. Resume, continue the session, and commit the new turn before editing.
 
 The session owner can inspect and manage readers of an exact published snapshot:
 
