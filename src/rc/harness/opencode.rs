@@ -343,6 +343,7 @@ pub fn capability() -> RuntimeCapability {
         partial_messages: true,
         resume: true,
         commands: vec![],
+        commands_omitted: 0,
         permission_modes: vec![PermissionMode::Default],
         permission_switch: None,
     }

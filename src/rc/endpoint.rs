@@ -365,6 +365,41 @@ fn refuse(
     }
 }
 
+/// The most a machine's description may serialize to. A controller refuses a description over its
+/// own cap and the machine shows offline, so the description stays well under the smallest cap a
+/// controller in use has, whatever the machine holds.
+const DESCRIPTION_BUDGET: usize = 48 * 1024;
+
+/// `description` within [`DESCRIPTION_BUDGET`]: past it, every runtime's slash commands are left
+/// out and counted in its `commands_omitted`, which is all that grows with what a person
+/// installed.
+fn bounded_description(mut description: serde_json::Value) -> serde_json::Value {
+    if description.to_string().len() <= DESCRIPTION_BUDGET {
+        return description;
+    }
+    if let Some(capabilities) = description
+        .get_mut("capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for capability in capabilities.values_mut() {
+            let dropped = capability
+                .get("commands")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            if dropped == 0 {
+                continue;
+            }
+            let omitted = capability
+                .get("commands_omitted")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            capability["commands"] = serde_json::json!([]);
+            capability["commands_omitted"] = serde_json::json!(omitted + dropped as u64);
+        }
+    }
+    description
+}
+
 pub async fn serve(
     listener: Listener,
     outbound: super::outbound::OutboundRx,
@@ -401,6 +436,7 @@ pub async fn serve(
     description["build_id"] = serde_json::json!(daemon.build_id);
     description["rpc_features"] = serde_json::json!(daemon.rpc_features);
     description["diagnostic_log"] = serde_json::json!(diagnostics.as_ref().map(|log| log.path()));
+    let description = bounded_description(description);
     let cloud = cloud::Ingress::start(diagnostics.clone())?;
     serve_described(
         listener,
@@ -825,6 +861,47 @@ async fn serve_described(
 mod tests {
     use super::*;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// A machine's description stays within its budget whatever the machine holds: with the
+    /// largest catalog a runtime sends, bounded, it is under the budget as it is, and past the
+    /// budget every runtime's commands are left out and counted. A description that sent them
+    /// all would be refused by a controller and the machine would show offline.
+    #[test]
+    fn a_machines_description_stays_within_its_budget() {
+        let catalog: Vec<crate::protocol::SlashCommand> = (0..5000)
+            .map(|index| crate::protocol::SlashCommand {
+                name: format!("/skill-{index}"),
+                description: Some("d".repeat(2000)),
+                argument_hint: Some("h".repeat(500)),
+            })
+            .collect();
+        let mut claude = super::super::harness::capability_of("unknown");
+        claude.runtime = "claude-code".into();
+        (claude.commands, claude.commands_omitted) =
+            super::super::harness::bounded_commands(catalog.clone());
+        let describe = |claude: &crate::protocol::RuntimeCapability| {
+            serde_json::json!({
+                "protocol_version": 1,
+                "capabilities": {
+                    "claude-code": claude,
+                    "codex": super::super::harness::capability_of("codex"),
+                    "opencode": super::super::harness::capability_of("opencode"),
+                },
+                "rpc_features": vec!["a".repeat(64); 64],
+            })
+        };
+        let bounded = describe(&claude);
+        assert_eq!(bounded_description(bounded.clone()), bounded);
+        assert!(bounded.to_string().len() <= DESCRIPTION_BUDGET);
+
+        claude.commands = catalog;
+        claude.commands_omitted = 7;
+        let backstopped = bounded_description(describe(&claude));
+        assert!(backstopped.to_string().len() <= DESCRIPTION_BUDGET);
+        let capability = &backstopped["capabilities"]["claude-code"];
+        assert_eq!(capability["commands"], serde_json::json!([]));
+        assert_eq!(capability["commands_omitted"], 5007);
+    }
 
     #[tokio::test]
     async fn detached_accepted_requests_keep_the_restart_boundary_closed() {

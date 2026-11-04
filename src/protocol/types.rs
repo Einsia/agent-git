@@ -197,6 +197,11 @@ pub struct RuntimeCapability {
     /// `No goal set. Usage: /goal <condition>` with `num_turns = 0`.
     #[serde(default)]
     pub commands: Vec<SlashCommand>,
+    /// How many commands [`RuntimeCapability::commands`] leaves out to keep the machine's
+    /// description small. A command left out still works when typed; only its autocomplete entry
+    /// is missing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub commands_omitted: usize,
     /// Permission modes this runtime can actually express, in the order a UI
     /// should offer them (loosest guard first). Empty = the runtime has no
     /// notion of permission modes and the control should not be rendered.
@@ -206,6 +211,10 @@ pub struct RuntimeCapability {
     /// launch. See [`PermissionApply`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_switch: Option<PermissionApply>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// One slash command offered by a runtime. Rendered as an autocomplete entry.
