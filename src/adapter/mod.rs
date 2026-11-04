@@ -257,6 +257,149 @@ impl Event {
     }
 }
 
+/// What a native record can hold, which decides what may stay behind past the last settled turn
+/// when a branch is merged, resumed or taken to another runtime, and what the capture counts as
+/// new. One classification for all of them and for settlement ([`judge_tail`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordClass {
+    /// Runtime state only: no text, path, file body or copy of a prompt. It stays behind as
+    /// bookkeeping.
+    Metadata,
+    /// Anything that can carry text, paths, file bodies or a copy of a prompt. It is judged by the
+    /// projection settlement uses: it stays behind only where settlement would leave it too.
+    Content,
+    /// Content of a type this build does not know. It could be a turn the projection cannot read
+    /// yet, so nothing judges it settled.
+    Unknown,
+}
+
+/// What a transcript holds past its last settled turn, judged the way settlement judges it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tail {
+    /// Nothing settlement would land: it may stay behind.
+    Settled,
+    /// Work settlement would land, or a record that cannot be read whole.
+    Unsettled,
+    /// A record of a type this build does not know; its type, cut short.
+    UnknownType(String),
+}
+
+/// Whether an event is conversation, which settlement lands, as opposed to a runtime record
+/// it projects as nothing or a turn's own end.
+pub fn is_conversation(kind: EventKind) -> bool {
+    !matches!(kind, EventKind::Other | EventKind::TurnEnd)
+}
+
+/// How much of a settled transcript's end is searched first for the prompt a copy repeats.
+const SETTLED_WINDOW: usize = 64 * 1024;
+
+/// The whole records of `text` within `window` bytes of its end, or with `None` all of it.
+pub fn settled_end(text: &str, window: Option<usize>) -> &str {
+    match window {
+        Some(window) if window < text.len() => {
+            // From the byte before the window, so a record that starts right at it is whole.
+            let mut start = text.len() - window - 1;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            match text[start..].find('\n') {
+                Some(newline) => &text[start + newline + 1..],
+                None => "",
+            }
+        }
+        _ => text,
+    }
+}
+
+/// The longest record type a refusal names.
+const NAMED_TYPE: usize = 40;
+
+/// Judges what a transcript holds past what settlement has landed, by
+/// [`Adapter::record_class`] and the projection settlement uses. `added` is every record written
+/// since what was committed; `tail` is the part of it settlement would still offer, which is
+/// shorter where settlement counts records into the last settled turn. Metadata stays behind;
+/// Content in `tail` stays behind only when the projection makes no conversation of it
+/// ([`is_conversation`]). Every record of `added`, counted into a settled turn or not, is also
+/// screened: a type this build does not know is refused by name, and a copy of a prompt stays
+/// behind only when it repeats a prompt already settled. `settled` reads what precedes `tail`
+/// only when a copy of a prompt needs it: given a byte count, the whole records within that
+/// many bytes of its end, or with `None` all of it. Its end is searched first, where the prompt
+/// a copy repeats normally is, and the rest only when a copy is not found there.
+pub fn judge_tail<'a>(
+    adapter: &dyn Adapter,
+    mut settled: impl FnMut(Option<usize>) -> Result<std::borrow::Cow<'a, str>>,
+    added: &str,
+    tail: &str,
+) -> Result<Tail> {
+    let records = |text: &str| -> Option<Vec<serde_json::Value>> {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    };
+    let (Some(added), Some(offered)) = (records(added), records(tail)) else {
+        return Ok(Tail::Unsettled);
+    };
+    if !offered
+        .iter()
+        .all(|record| adapter.record_class(record) == RecordClass::Metadata)
+        && adapter
+            .parse(tail)?
+            .events
+            .iter()
+            .any(|event| is_conversation(event.kind))
+    {
+        return Ok(Tail::Unsettled);
+    }
+    if let Some(unknown) = added
+        .iter()
+        .find(|record| adapter.record_class(record) == RecordClass::Unknown)
+    {
+        let named: String = unknown["type"]
+            .as_str()
+            .unwrap_or("(none)")
+            .chars()
+            .filter(|c| c.is_ascii_graphic())
+            .take(NAMED_TYPE)
+            .collect();
+        return Ok(Tail::UnknownType(named));
+    }
+    let mut copies: std::collections::HashSet<&str> = added
+        .iter()
+        .filter_map(|record| adapter.prompt_copy(record))
+        .collect();
+    if copies.is_empty() {
+        return Ok(Tail::Settled);
+    }
+    for window in [Some(SETTLED_WINDOW), None] {
+        let settled = settled(window)?;
+        for line in settled.lines().rev() {
+            if copies.is_empty() {
+                break;
+            }
+            // Each record is projected as settlement projects it; a prompt is one record.
+            let Ok(session) = adapter.parse(line) else {
+                continue;
+            };
+            for event in &session.events {
+                if event.kind == EventKind::UserPrompt
+                    && let Some(text) = event.text.as_deref()
+                {
+                    copies.remove(text);
+                }
+            }
+        }
+        if copies.is_empty() {
+            break;
+        }
+    }
+    Ok(if copies.is_empty() {
+        Tail::Settled
+    } else {
+        Tail::Unsettled
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -637,12 +780,29 @@ pub trait Adapter {
     /// in — Codex splits directories by date and the path carries no project information.
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>>;
 
-    /// Whether one native record carries no conversation: applied settings, titles, usage
-    /// counters and similar entries the runtime writes on its own. Settlement leaves such records
-    /// after the last turn, and a runtime switch may leave them behind. A record the adapter
-    /// does not recognize is not bookkeeping.
+    /// Whether one native record carries no conversation: applied settings, usage counters and
+    /// similar entries the runtime writes on its own. Settlement leaves such records after the
+    /// last turn, and a runtime switch may leave them behind. A record the adapter does not
+    /// recognize is not bookkeeping. An adapter that classifies its records itself
+    /// ([`Self::record_class`]) does not use this.
     fn is_runtime_bookkeeping(&self, _record: &serde_json::Value) -> bool {
         false
+    }
+
+    /// What one native record can hold ([`RecordClass`]). By default a record is
+    /// [`RecordClass::Metadata`] when it is [`Self::is_runtime_bookkeeping`], and otherwise of a
+    /// type this build does not know.
+    fn record_class(&self, record: &serde_json::Value) -> RecordClass {
+        if self.is_runtime_bookkeeping(record) {
+            RecordClass::Metadata
+        } else {
+            RecordClass::Unknown
+        }
+    }
+
+    /// The prompt a record repeats, for a record that holds a copy of one the person wrote.
+    fn prompt_copy<'a>(&self, _record: &'a serde_json::Value) -> Option<&'a str> {
+        None
     }
 
     /// Human-facing choices omit runtime bookkeeping when its native provenance is known.

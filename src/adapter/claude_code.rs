@@ -669,28 +669,45 @@ impl Adapter for ClaudeCode {
     /// titles. If one is missing here, a session that merely ended after its last settlement
     /// refuses a runtime switch while `agit commit` finds nothing to settle. Attachments and the
     /// remaining `system` subtypes can carry context the model saw, so they stay unsettled work.
-    fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
+    /// Metadata is the short list of runtime state with no text, path, file body or copy of a
+    /// prompt. Everything else that Claude Code writes is Content: a hook summary can hold hook
+    /// output, a title or summary the person's words, a file-history snapshot paths of edited
+    /// files, an attachment a file's body, and `last-prompt` a copy of the prompt.
+    fn record_class(&self, record: &serde_json::Value) -> super::RecordClass {
+        use super::RecordClass::{Content, Metadata, Unknown};
         match record["type"].as_str() {
-            Some("system") => matches!(
-                record["subtype"].as_str(),
-                Some("stop_hook_summary" | "turn_duration")
-            ),
+            Some("mode" | "permission-mode" | "atis-latch" | "cost-state" | "bridge-session") => {
+                Metadata
+            }
+            Some("system") if record["subtype"] == "turn_duration" => Metadata,
             Some(
-                "file-history-snapshot"
+                "user"
+                | "assistant"
+                | "system"
+                | "queue-operation"
+                | "attachment"
+                | "last-prompt"
+                | "file-history-snapshot"
                 | "custom-title"
                 | "ai-title"
                 | "agent-name"
                 | "summary"
-                | "cost-state"
-                | "last-prompt"
-                | "mode"
-                | "permission-mode"
-                | "atis-latch"
                 | "pr-link"
-                | "bridge-session",
-            ) => true,
-            _ => false,
+                // 2.1.314: request bodies, the tools a turn used, and file contents.
+                | "api-request-shape"
+                | "api-request-blob"
+                | "api-request"
+                | "tools-used"
+                | "file-history-delta",
+            ) => Content,
+            _ => Unknown,
         }
+    }
+
+    fn prompt_copy<'a>(&self, record: &'a serde_json::Value) -> Option<&'a str> {
+        (record["type"] == "last-prompt")
+            .then(|| record["lastPrompt"].as_str())
+            .flatten()
     }
 
     /// Prefer the physical project directory, retaining lexical and global lookup for old files.
@@ -1588,6 +1605,96 @@ fn extract_paths(input: Option<&serde_json::Value>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Claude Code 2.1.311 through 2.1.314 append these records at a turn's end and at /exit (the
+    /// 2.1.311 capture's records name that version; 2.1.314 moves some before the last reply).
+    /// Each record of both whole sessions is Metadata or Content as the table has it, none is
+    /// Unknown, and each tail is settled after the turn it follows: nothing in it is a turn, and
+    /// the prompt it copies is the settled one. A type no table row names is Unknown.
+    #[test]
+    fn claude_code_2_1_311_to_2_1_314_exit_records_are_classified_and_settled() {
+        use super::ClaudeCode;
+        use crate::adapter::{Adapter as _, RecordClass, Tail, judge_tail};
+        use RecordClass::{Content, Metadata};
+        let class_of = |line: &str| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            let name = match record["subtype"].as_str() {
+                Some(subtype) => format!("system {subtype}"),
+                None => record["type"].as_str().unwrap().to_owned(),
+            };
+            (name, ClaudeCode.record_class(&record))
+        };
+        let metadata = [
+            "mode",
+            "permission-mode",
+            "atis-latch",
+            "cost-state",
+            "system turn_duration",
+        ];
+        for (session, tail) in [
+            (
+                include_str!("../../tests/fixtures/cc-2.1.311-session-sanitized.jsonl"),
+                include_str!("../../tests/fixtures/cc-2.1.311-trailing-records.jsonl"),
+            ),
+            (
+                include_str!("../../tests/fixtures/cc-2.1.314-session-sanitized.jsonl"),
+                include_str!("../../tests/fixtures/cc-2.1.314-trailing-records.jsonl"),
+            ),
+        ] {
+            assert!(session.ends_with(tail));
+            for (name, class) in session.lines().map(class_of) {
+                let expected = if metadata.contains(&name.as_str()) {
+                    Metadata
+                } else {
+                    Content
+                };
+                assert_eq!(class, expected, "{name}");
+            }
+            let settled = &session[..session.len() - tail.len()];
+            assert_eq!(
+                judge_tail(
+                    &ClaudeCode,
+                    |window| Ok(crate::adapter::settled_end(settled, window).into()),
+                    tail,
+                    tail
+                )
+                .unwrap(),
+                Tail::Settled
+            );
+        }
+        let tail = include_str!("../../tests/fixtures/cc-2.1.311-trailing-records.jsonl");
+        let classes: Vec<(String, RecordClass)> = tail.lines().map(class_of).collect();
+        let expected = [
+            ("attachment", Content),
+            ("last-prompt", Content),
+            ("mode", Metadata),
+            ("permission-mode", Metadata),
+            ("atis-latch", Metadata),
+            ("system stop_hook_summary", Content),
+            ("system turn_duration", Metadata),
+            ("cost-state", Metadata),
+            ("file-history-snapshot", Content),
+            ("last-prompt", Content),
+            ("cost-state", Metadata),
+        ];
+        assert_eq!(
+            classes,
+            expected
+                .iter()
+                .map(|(name, class)| ((*name).to_owned(), *class))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ClaudeCode.record_class(&serde_json::json!({"type":"a-type-no-row-names"})),
+            RecordClass::Unknown
+        );
+        // The end of a settled part is searched in whole records only.
+        let settled_end = crate::adapter::settled_end;
+        assert_eq!(settled_end("a\nbb\nccc\n", Some(5)), "ccc\n");
+        assert_eq!(settled_end("a\nbb\nccc\n", Some(6)), "ccc\n");
+        assert_eq!(settled_end("a\nbb\nccc\n", Some(7)), "bb\nccc\n");
+        assert_eq!(settled_end("a\nbb\nccc\n", None), "a\nbb\nccc\n");
+    }
     /// Capture cuts only where the model finished a turn. A person's interruption ends the turn, so
     /// nothing after it awaits a reply, but it is no cut of its own: one that cut there would
     /// publish what the person may have stopped in order to withhold.

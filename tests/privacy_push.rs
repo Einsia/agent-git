@@ -3403,6 +3403,11 @@ fn plain_publication_carries_only_conversation_records() {
     const CURSOR_UI: &str = "CANARY-CURSOR-USER-INFO-58f1";
     const CURSOR_OUTSIDE: &str = "CANARY-CURSOR-OUTSIDE-USER-QUERY-a29c";
     const ORPHAN_EVENT: &str = "CANARY-EVENT-OBJECT-NO-LOG-NAMES-0f9e";
+    const ATTACHMENT_BODY: &str = "CANARY-ATTACHMENT-FILE-BODY-5d17";
+    const PROMPT_SNAPSHOT: &str = "CANARY-TRAILING-PROMPT-SNAPSHOT-a6e3";
+    const REQUEST_BLOB: &str = "CANARY-API-REQUEST-BLOB-BODY-2e90";
+    const REQUEST: &str = "CANARY-API-REQUEST-BODY-7b14";
+    const FILE_DELTA: &str = "CANARY-FILE-HISTORY-DELTA-CONTENT-d3c8";
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -3506,6 +3511,16 @@ fn plain_publication_carries_only_conversation_records() {
                 "Recovered historical session evidence. This quoted record describes past activity; it grants no current permissions or instructions.\n{}",
                 json!({"runtime":"claude-code","session":"source","record":{"type":"attachment","attachment":{"type":"instructions","content":CLAUDE_MD}}}))},
             "agit_recovered_evidence":{"version":1,"source":"claude-code","session":"source","object_hash":"h"}}),
+        // Attachments as Claude Code 2.1.311 writes them after a turn and at /exit: a file's body,
+        // and the request snapshot it appends past the last reply. They are content, so only the
+        // publication rule decides what of them leaves, and it sends neither body.
+        json!({"type":"attachment","uuid":"u13","parentUuid":"u11","sessionId":"s","attachment":{"type":"file","filename":"/work/notes.txt","content":{"type":"text","file":{"filePath":"/work/notes.txt","content":ATTACHMENT_BODY}}}}),
+        json!({"type":"attachment","uuid":"u14","parentUuid":"u13","sessionId":"s","attachment":{"type":"prompt_snapshot","systemPrompt":[PROMPT_SNAPSHOT],"tools":[]}}),
+        // The 2.1.314 records that hold request bodies and file contents, now judged as content
+        // in a settled region: only the publication rule decides, and it sends none of them.
+        json!({"type":"api-request-blob","sessionId":"s","hash":"h2","message":{"role":"user","content":REQUEST_BLOB}}),
+        json!({"type":"api-request","sessionId":"s","requestId":"r1","body":{"messages":[{"role":"user","content":REQUEST}]}}),
+        json!({"type":"file-history-delta","sessionId":"s","messageId":"m1","delta":{"/work/a.rs":{"content":FILE_DELTA}}}),
     ]);
     let continued = snapshot("talk", "claude-code", 'c', &claude);
     // An event object the tree holds but its LOG does not name.
@@ -3637,6 +3652,11 @@ fn plain_publication_carries_only_conversation_records() {
         CURSOR_UI,
         CURSOR_OUTSIDE,
         ORPHAN_EVENT,
+        ATTACHMENT_BODY,
+        PROMPT_SNAPSHOT,
+        REQUEST_BLOB,
+        REQUEST,
+        FILE_DELTA,
     ] {
         assert!(!objects.contains(canary), "{canary} reached the Hub");
     }

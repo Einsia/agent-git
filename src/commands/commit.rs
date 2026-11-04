@@ -1800,7 +1800,7 @@ fn substantive_starts(region: &str, ir: &Session) -> Vec<usize> {
     let starts = line_starts(region);
     ir.events
         .iter()
-        .filter(|event| !matches!(event.kind, EventKind::Other | EventKind::TurnEnd))
+        .filter(|event| crate::adapter::is_conversation(event.kind))
         .filter_map(|event| event.line.and_then(|line| starts.get(line).copied()))
         .collect()
 }

@@ -254,6 +254,139 @@ fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
     assert_eq!(walk(&lab.home.join(".codex/sessions")).len(), 1, "{text}");
 }
 
+/// Claude Code 2.1.311 through 2.1.314 append these records at a turn's end and at /exit. In
+/// 2.1.311 (the version the first capture's records name): an attachment with the request
+/// snapshot, two copies of the last prompt, mode, permission mode, the latch, the stop-hook
+/// summary, the turn duration, two cost states and a file-history snapshot. In 2.1.314: the
+/// stop-hook summary, the turn duration, a copy of the last prompt and two cost states. Commit finds nothing new in them, so a merge and a runtime
+/// switch proceed. A turn after them still refuses the switch, a copy of a prompt never settled
+/// refuses it, and a record of a type this build does not know refuses both by its type alone,
+/// with the command that fixes it.
+#[test]
+fn claude_code_2_1_311_to_2_1_314_exit_records_leave_a_merge_free() {
+    for (version, capture, records) in [
+        (
+            "2.1.311",
+            include_str!("fixtures/cc-2.1.311-trailing-records.jsonl"),
+            11,
+        ),
+        (
+            "2.1.314",
+            include_str!("fixtures/cc-2.1.314-trailing-records.jsonl"),
+            5,
+        ),
+    ] {
+        exit_records_leave_a_merge_free(version, capture, records);
+    }
+}
+
+fn exit_records_leave_a_merge_free(version: &str, capture: &str, records: usize) {
+    let exit = |lab: &Lab, last_prompt: &str| -> String {
+        capture
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                let fields = record.as_object_mut().unwrap();
+                for key in ["sessionId", "session_id"] {
+                    if fields.contains_key(key) {
+                        fields.insert(key.into(), json!(SID));
+                    }
+                }
+                if fields.contains_key("cwd") {
+                    fields.insert("cwd".into(), json!(lab.work));
+                }
+                if fields.contains_key("lastPrompt") {
+                    fields.insert("lastPrompt".into(), json!(last_prompt));
+                }
+                format!("{record}\n")
+            })
+            .collect()
+    };
+    assert_eq!(
+        exit(&Lab::new(), "").lines().count(),
+        records,
+        "{version}: the capture's trailing records"
+    );
+
+    let lab = Lab::new();
+    lab.append(&exit(&lab, "synthetic prompt 2"));
+    let commit = lab.output(&["commit", SID]);
+    let text = combined(&commit);
+    assert!(text.contains("nothing new since"), "{version}: {text}");
+    let merged = lab.merge();
+    let text = combined(&merged);
+    assert!(merged.status.success(), "{version}: {text}");
+    assert!(
+        lab.repo().join(".git/AGIT_MERGE_TX").exists(),
+        "{version}: {text}"
+    );
+
+    let lab = Lab::new();
+    lab.append(&exit(&lab, "synthetic prompt 2"));
+    let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&switched);
+    assert!(switched.status.success(), "{version}: {text}");
+    assert!(
+        text.contains("no new turn since the last settlement"),
+        "{version}: {text}"
+    );
+
+    // A turn after the exit records is unsettled work.
+    let lab = Lab::new();
+    lab.append(&(exit(&lab, "synthetic prompt 2") + &lab.turn(3)));
+    let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&refused);
+    assert!(!refused.status.success(), "{version}: {text}");
+    assert!(
+        text.contains("already has unsettled content"),
+        "{version}: {text}"
+    );
+
+    // A copy of a prompt no settled turn holds is not left behind.
+    let lab = Lab::new();
+    lab.append(&exit(&lab, "a prompt that was never settled"));
+    let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&refused);
+    assert!(!refused.status.success(), "{version}: {text}");
+    assert!(
+        text.contains("already has unsettled content"),
+        "{version}: {text}"
+    );
+
+    // A type this build does not know is refused by its name, cut short, and nothing else of it
+    // is shown.
+    const CANARY: &str = "CANARY-UNKNOWN-RECORD-BODY-c41f";
+    let unknown = format!(
+        "{}\n",
+        json!({"type":"a-record-from-a-later-claude-code-version-x", "sessionId":SID, "body":CANARY})
+    );
+    let lab = Lab::new();
+    lab.append(&(exit(&lab, "synthetic prompt 2") + &unknown));
+    let merged = lab.merge();
+    let text = combined(&merged);
+    assert!(!merged.status.success(), "{version}: {text}");
+    for expected in [
+        "record of type `a-record-from-a-later-claude-code-versio`",
+        "run `agit upgrade`, then retry",
+    ] {
+        assert!(text.contains(expected), "{version}: {expected:?} in {text}");
+    }
+    assert!(
+        !text.contains("unsettled or unverifiable"),
+        "{version}: {text}"
+    );
+    assert!(!text.contains(CANARY), "{version}: {text}");
+    let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&switched);
+    assert!(!switched.status.success(), "{version}: {text}");
+    assert!(
+        text.contains("record of type `a-record-from-a-later-claude-code-versio`"),
+        "{version}: {text}"
+    );
+    assert!(!text.contains(CANARY), "{version}: {text}");
+}
+
 fn combined(output: &Output) -> String {
     format!(
         "{}{}",
@@ -434,7 +567,8 @@ impl Lab {
                     "totalAPIDuration":0, "totalAPIDurationWithoutRetries":0, "totalToolDuration":0,
                     "totalDuration":0, "totalLinesAdded":0, "totalLinesRemoved":0, "startTime":0,
                     "hasUnknownModelCost":false, "modelUsage":{}}),
-                "last-prompt" => json!({"type":kind, "sessionId":SID, "lastPrompt":"synthetic prompt", "leafUuid":"a"}),
+                // A copy of the last settled prompt, as Claude Code writes it.
+                "last-prompt" => json!({"type":kind, "sessionId":SID, "lastPrompt":"synthetic prompt 2", "leafUuid":"a"}),
                 "file-history-snapshot" => json!({"type":kind, "messageId":"m-tail",
                     "snapshot":{"messageId":"m-tail", "trackedFileBackups":{}, "timestamp":"2026-10-25T22:39:00.000Z"},
                     "isSnapshotUpdate":true}),
