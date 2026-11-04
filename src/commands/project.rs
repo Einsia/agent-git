@@ -2001,13 +2001,31 @@ fn changed_after(runtime: &str, path: &Path, modified: u64, length: Option<u64>)
     {
         return true;
     }
-    !added
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .is_ok_and(|record| adapter.is_runtime_bookkeeping(&record))
-        })
+    // The part before is read only when a copy of a prompt has to be found in it, from its end:
+    // the whole records within `window` bytes of it first.
+    let settled = |window: Option<usize>| -> crate::Result<std::borrow::Cow<'static, str>> {
+        // From the byte before the window, so a record that starts right at it is whole.
+        let start = window
+            .and_then(|window| length.checked_sub(window as u64 + 1))
+            .unwrap_or(0);
+        let mut file = fs::File::open(path)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+        let mut settled = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(file, length - start), &mut settled)?;
+        if start > 0 {
+            let whole = settled
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(settled.len(), |newline| newline + 1);
+            settled.drain(..whole);
+        }
+        Ok(String::from_utf8(settled)?.into())
+    };
+    // Judged as settlement judges it: what it would leave behind is not new.
+    !matches!(
+        adapter::judge_tail(adapter.as_ref(), settled, &added, &added),
+        Ok(adapter::Tail::Settled)
+    )
 }
 
 /// Whether the project policy deciding for the folder at `root` was turned off (`agit off`,

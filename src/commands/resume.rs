@@ -1660,28 +1660,48 @@ fn tail_is_bookkeeping(committed_log: &str, snap: &meta::Meta, link: &Link) -> c
     let Ok(live) = link.read() else {
         return Ok(false);
     };
-    live_tail_is_bookkeeping(committed_log, snap, link, &live)
+    Ok(match live_tail(committed_log, snap, link, &live)? {
+        adapter::Tail::Settled => true,
+        adapter::Tail::Unsettled => false,
+        adapter::Tail::UnknownType(kind) => {
+            ui::error(&unknown_record(link, &kind));
+            false
+        }
+    })
+}
+
+/// Why a claim whose tail holds a record of a type this build does not know is not left
+/// behind, and what to do: the type is all it names of the record.
+fn unknown_record(link: &Link, kind: &str) -> String {
+    format!(
+        "the {} session {} ends with a record of type `{kind}` this version of agit does not know, so it cannot tell whether it is a turn; {} retry",
+        link.source,
+        link::short(&link.session_id),
+        super::push::UPGRADE_FIRST
+    )
 }
 
 /// The tail starts where settlement stops offering records: past the baseline and the records
 /// before the next prompt for a materialized claim; past the committed envelopes, or past the
 /// head's last turn where settlement counts turns by ordinal, for a native one.
-fn live_tail_is_bookkeeping(
+fn live_tail(
     committed_log: &str,
     snap: &meta::Meta,
     link: &Link,
     live: &str,
-) -> crate::Result<bool> {
-    let tail = match link.baseline_bytes {
+) -> crate::Result<adapter::Tail> {
+    // `added` is what was written since what is committed; `tail` the part of it settlement
+    // would still offer.
+    let (added, tail) = match link.baseline_bytes {
         Some(baseline) => match usize::try_from(baseline)
             .ok()
             .and_then(|offset| live.get(offset..))
         {
             Some(region) => {
                 let turnless = super::commit::leading_turnless_len(&link.source, region)?;
-                region.get(turnless.unwrap_or(0)..)
+                (Some(region), region.get(turnless.unwrap_or(0)..))
             }
-            None => None,
+            None => (None, None),
         },
         None => {
             let runtime = if snap.runtime.is_empty() {
@@ -1689,23 +1709,24 @@ fn live_tail_is_bookkeeping(
             } else {
                 snap.runtime.as_str()
             };
-            let committed = live.len() - unsettled_native_tail(committed_log, live).len();
+            let added = unsettled_native_tail(committed_log, live);
+            let committed = live.len() - added.len();
             let counted =
                 super::commit::ordinal_settled_end(runtime, live, snap.turn.unwrap_or(0))?;
-            live.get(committed.max(counted.unwrap_or(0))..)
+            (Some(added), live.get(committed.max(counted.unwrap_or(0))..))
         }
     };
-    let Some(tail) = tail else {
-        return Ok(false);
+    let (Some(added), Some(tail)) = (added, tail) else {
+        return Ok(adapter::Tail::Unsettled);
     };
     let adapter = adapter::get(&link.source)?;
-    Ok(tail
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .is_ok_and(|record| adapter.is_runtime_bookkeeping(&record))
-        }))
+    let settled = &live[..live.len() - tail.len()];
+    adapter::judge_tail(
+        adapter.as_ref(),
+        |window| Ok(adapter::settled_end(settled, window).into()),
+        added,
+        tail,
+    )
 }
 
 /// The live text past the committed envelopes, counted with the same parseable-line ruler as
@@ -1808,10 +1829,15 @@ pub(crate) fn require_merge_claim_with_bytes(
     // Settlement leaves a bookkeeping-only tail where it was, so the check after it must accept
     // the same tail that a runtime switch accepts, or merge asks for a commit that has nothing
     // to settle.
-    if activity == ClaimActivity::Appended
-        && live_tail_is_bookkeeping(settled.log, settled.meta, claim, text)?
-    {
-        return Ok(());
+    if activity == ClaimActivity::Appended {
+        match live_tail(settled.log, settled.meta, claim, text)? {
+            adapter::Tail::Settled => return Ok(()),
+            adapter::Tail::UnknownType(kind) => anyhow::bail!(
+                "{}; nothing was merged into {slug}@{branch}",
+                unknown_record(claim, &kind)
+            ),
+            adapter::Tail::Unsettled => {}
+        }
     }
     if activity == ClaimActivity::Appended && allow_settlement {
         let region = match claim.baseline_bytes {
