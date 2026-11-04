@@ -597,6 +597,9 @@ pub mod method {
     pub const ITEM_DELTA: &str = "item.delta";
     pub const ITEM_COMPLETED: &str = "item.completed";
     pub const TURN_STARTED: &str = "turn.started";
+    /// To the asker of a turn.start or turn.steer: the session took it. Names the request; the
+    /// request's own answer, with the outcome, follows.
+    pub const TURN_ACCEPTED: &str = "turn.accepted";
     pub const TURN_STEERED: &str = "turn.steered";
     pub const TURN_COMPLETED: &str = "turn.completed";
     pub const SESSION_STATUS: &str = "session.status";
