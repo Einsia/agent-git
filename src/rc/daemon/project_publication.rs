@@ -43,6 +43,89 @@ impl std::fmt::Display for Stage {
 
 impl std::error::Error for Stage {}
 
+/// Why a project bind from the website failed, as the device says it: a fixed class, never an
+/// error's text, a path or a repository name (#307).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rc) enum Failure {
+    /// This computer holds no sign-in or enrollment for the project's Hub.
+    LoginOtherHub,
+    /// The sign-in here belongs to another account than the project's owner.
+    LoginOtherAccount,
+    /// The destination repository is not private.
+    NotPrivate,
+    /// The destination repository is not the one the project names, or not the owner's.
+    NotOwned,
+    /// The Hub refuses this account write access to the destination.
+    NotWritable,
+    TimedOut,
+    Interrupted,
+    Other,
+}
+
+impl Failure {
+    pub(in crate::rc) fn name(self) -> &'static str {
+        match self {
+            Self::LoginOtherHub => "login_other_hub",
+            Self::LoginOtherAccount => "login_other_account",
+            Self::NotPrivate => "not_private",
+            Self::NotOwned => "not_owned",
+            Self::NotWritable => "not_writable",
+            Self::TimedOut => "timed_out",
+            Self::Interrupted => "interrupted",
+            Self::Other => "other",
+        }
+    }
+
+    /// Whether retrying unchanged can succeed. The others need the person to change something.
+    fn retryable(self) -> bool {
+        matches!(self, Self::TimedOut | Self::Interrupted | Self::Other)
+    }
+
+    /// The class of `error`: one a check raised itself, else what the Hub's status says.
+    fn of(error: &anyhow::Error) -> Self {
+        if let Some(failure) = error.downcast_ref::<Failure>() {
+            return *failure;
+        }
+        for cause in error.chain() {
+            if let Some(failure) = cause.downcast_ref::<Failure>() {
+                return *failure;
+            }
+            if let Some(crate::hub::WriteRefused(access)) =
+                cause.downcast_ref::<crate::hub::WriteRefused>()
+            {
+                return match access {
+                    crate::hub::PushAccess::ReadOnly => Self::NotWritable,
+                    crate::hub::PushAccess::Missing => Self::NotOwned,
+                    crate::hub::PushAccess::Writable => Self::Other,
+                };
+            }
+            if let Some(api) = cause.downcast_ref::<crate::hub::client::ApiError>() {
+                match api.status {
+                    401 => return Self::LoginOtherHub,
+                    403 => return Self::NotWritable,
+                    404 => return Self::NotOwned,
+                    _ => {}
+                }
+            }
+        }
+        Self::Other
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// The stage a failed step was in, from the context it carries. A context is found by
+/// downcasting the error itself: walking its chain yields the context's message, not the value.
+fn stage_of(error: &anyhow::Error) -> Option<Stage> {
+    error.downcast_ref::<Stage>().copied()
+}
+
 /// Automatic publication is explicitly off for the repository on this computer. Only a request
 /// that names that setting lifts it, so an enrolment from the Hub leaves the repository, and the
 /// folder it would publish, as the person set them: lifting it would upload what they stopped.
@@ -289,9 +372,9 @@ impl Prepared {
         let canceled = Cancel(Arc::new(AtomicBool::new(false)));
         tokio::select! {
             biased;
-            _ = stop.wait_for(|stopped| *stopped) => Err(unavailable()),
+            _ = stop.wait_for(|stopped| *stopped) => Err(bind_failed(Stage::Interrupted, Failure::Interrupted)),
             result = tokio::time::timeout(std::time::Duration::from_secs(30), self.bind(daemon, canceled.0.clone())) => {
-                result.unwrap_or_else(|_| Err(unavailable()))
+                result.unwrap_or_else(|_| Err(bind_failed(Stage::Interrupted, Failure::TimedOut)))
             }
         }
     }
@@ -307,18 +390,19 @@ impl Prepared {
         let verified =
             tokio::task::spawn_blocking(move || preparation.verify_remote(&cancellation))
                 .await
-                .map_err(|_| unavailable())?
-                .map_err(|_| unavailable())?;
+                .map_err(|_| bind_failed(Stage::Interrupted, Failure::Interrupted))?
+                .map_err(|error| step_failed(Stage::RemoteBinding, &error))?;
         self.check(&*daemon.lock().await)?;
         let preparation = self.clone();
         let result = tokio::task::spawn_blocking(move || preparation.confirm(verified, &canceled))
             .await
-            .map_err(|_| unavailable())?
+            .map_err(|_| bind_failed(Stage::Interrupted, Failure::Interrupted))?
             .map_err(|error| {
-                if error.is::<AutoPushOff>() {
+                if error.is::<AutoPushOff>() || error.chain().any(|cause| cause.is::<AutoPushOff>())
+                {
                     auto_push_off()
                 } else {
-                    unavailable()
+                    step_failed(Stage::Confirmation, &error)
                 }
             })?;
         // Destination settings grant no runtime access; current project authority fences acceptance.
@@ -336,7 +420,7 @@ impl Prepared {
         );
         let grant = self.authority.owned_machine_grant()?;
         let enrollment = store::load_in(&self.credential_dir, &self.destination.hub)?
-            .context("device enrollment is missing")?;
+            .ok_or(Failure::LoginOtherHub)?;
         ensure!(
             enrollment.inbound_enabled
                 && super::publication::same_device(&enrollment.credential.device, &grant.target),
@@ -350,26 +434,31 @@ impl Prepared {
     }
 
     fn verify_remote(&self, canceled: &AtomicBool) -> crate::Result<Verified> {
-        let grant = self.current_device(canceled)?;
+        let grant = self.current_device(canceled).context(Stage::OwnedBinding)?;
         let repository =
-            local_repository::ensure_repository(&self.request.project_id, &self.directory)?;
+            local_repository::ensure_repository(&self.request.project_id, &self.directory)
+                .context(Stage::Repository)?;
         let lineage =
-            crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
-        let repo = local_repository::require(&lineage)?;
+            crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .context(Stage::Repository)?;
+        let repo = local_repository::require(&lineage).context(Stage::Repository)?;
         let selection = local_repository::publication::Selection::prepare(
             &repo,
             Some(&self.request.repository),
             &self.destination.hub,
-        )?
-        .context("project repository is not device-local")?;
+        )
+        .context(Stage::Destination)?
+        .context("project repository is not device-local")
+        .context(Stage::Destination)?;
         let consent = prepare_project_publication_consent(
             &repo,
             &self.request.repository,
             &self.destination,
             &grant.target.owner.account_id,
-        )?;
-        self.current_device(canceled)?;
-        selection.verify(&repo)?;
+        )
+        .context(Stage::Consent)?;
+        self.current_device(canceled).context(Stage::OwnedBinding)?;
+        selection.verify(&repo).context(Stage::Destination)?;
         Ok(Verified {
             repository,
             lineage,
@@ -451,19 +540,17 @@ fn prepare_project_publication_consent(
         &expected.hub,
         std::time::Duration::from_secs(15),
     );
-    ensure!(
-        client.me()?.account_id.as_deref() == Some(owner_account),
-        "publication credentials belong to another account"
-    );
+    if client.me()?.account_id.as_deref() != Some(owner_account) {
+        return Err(Failure::LoginOtherAccount.into());
+    }
     let (owner, name) = crate::commands::parse_slug(repository)?;
     let remote = client.get_agent(&owner, &name)?;
-    ensure!(
-        remote.agent_id == expected.agent_id
-            && remote.owner == owner
-            && remote.name == name
-            && remote.visibility == "private",
-        "the private publication destination changed"
-    );
+    if remote.agent_id != expected.agent_id || remote.owner != owner || remote.name != name {
+        return Err(Failure::NotOwned.into());
+    }
+    if remote.visibility != "private" {
+        return Err(Failure::NotPrivate.into());
+    }
     crate::commands::push::publication_consent_with_client(repo, repository, expected, &client)
 }
 
@@ -486,6 +573,35 @@ fn auto_push_off() -> RpcError {
     )
 }
 
+/// A failed bind as the website sees it: the stage and the class, nothing else.
+fn bind_failed(stage: Stage, failure: Failure) -> RpcError {
+    let mut error = super::classified(
+        RpcError::new(
+            ErrorCode::Internal,
+            format!(
+                "project publication is not ready ({}: {}); retain the pending archive and retry",
+                stage.name(),
+                failure.name()
+            ),
+        ),
+        failure.retryable(),
+        failure.name(),
+    );
+    if let Some(fields) = error
+        .data
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        fields.insert("stage".into(), serde_json::json!(stage.name()));
+    }
+    error
+}
+
+/// [`bind_failed`] for a step's error, in the stage it carries (else `fallback`).
+fn step_failed(fallback: Stage, error: &anyhow::Error) -> RpcError {
+    bind_failed(stage_of(error).unwrap_or(fallback), Failure::of(error))
+}
+
 fn unavailable() -> RpcError {
     RpcError::new(
         ErrorCode::Internal,
@@ -496,6 +612,107 @@ fn unavailable() -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed bind from the website names its stage and a fixed class, one per cause, and
+    /// nothing else: not the error's text, a path or a repository name (#307).
+    #[test]
+    fn a_failed_bind_names_only_its_stage_and_class() {
+        const CANARY: &str = "/Users/canary/private-folder canary-owner/canary-repo";
+        let failed = |error: anyhow::Error| step_failed(Stage::RemoteBinding, &error);
+        let cases = [
+            (
+                anyhow::Error::from(Failure::LoginOtherHub)
+                    .context(CANARY)
+                    .context(Stage::OwnedBinding),
+                "owned_binding",
+                "login_other_hub",
+                false,
+            ),
+            (
+                anyhow::Error::from(Failure::LoginOtherAccount).context(Stage::Consent),
+                "publication_consent",
+                "login_other_account",
+                false,
+            ),
+            (
+                anyhow::Error::from(Failure::NotPrivate).context(Stage::Consent),
+                "publication_consent",
+                "not_private",
+                false,
+            ),
+            (
+                anyhow::Error::from(Failure::NotOwned).context(Stage::Consent),
+                "publication_consent",
+                "not_owned",
+                false,
+            ),
+            (
+                anyhow::Error::from(crate::hub::client::ApiError::for_test(401, CANARY))
+                    .context(Stage::Consent),
+                "publication_consent",
+                "login_other_hub",
+                false,
+            ),
+            (
+                anyhow::Error::from(crate::hub::client::ApiError::for_test(403, CANARY))
+                    .context(Stage::Consent),
+                "publication_consent",
+                "not_writable",
+                false,
+            ),
+            (
+                anyhow::Error::from(crate::hub::client::ApiError::for_test(404, CANARY))
+                    .context(Stage::Destination),
+                "destination_selection",
+                "not_owned",
+                false,
+            ),
+            (
+                anyhow::Error::from(crate::hub::WriteRefused(crate::hub::PushAccess::ReadOnly))
+                    .context(CANARY)
+                    .context(Stage::Consent),
+                "publication_consent",
+                "not_writable",
+                false,
+            ),
+            (
+                anyhow::Error::from(crate::hub::WriteRefused(crate::hub::PushAccess::Missing))
+                    .context(Stage::Consent),
+                "publication_consent",
+                "not_owned",
+                false,
+            ),
+            (
+                anyhow::anyhow!("{CANARY}").context(Stage::Repository),
+                "local_repository",
+                "other",
+                true,
+            ),
+            (anyhow::anyhow!("{CANARY}"), "remote_binding", "other", true),
+        ];
+        for (error, stage, class, retryable) in cases {
+            let rpc = failed(error);
+            let data = rpc.data.clone().unwrap();
+            assert_eq!(data["stage"], stage, "{class}");
+            assert_eq!(data["reason"], class);
+            assert_eq!(data["retryable"], retryable, "{class}");
+            assert_eq!(data.as_object().unwrap().len(), 3, "{data}");
+            let text = serde_json::to_string(&rpc).unwrap();
+            assert!(!text.contains("canary"), "{text}");
+            assert!(text.contains(&format!("({stage}: {class})")), "{text}");
+        }
+        for (failure, class) in [
+            (Failure::TimedOut, "timed_out"),
+            (Failure::Interrupted, "interrupted"),
+        ] {
+            let data = bind_failed(Stage::Interrupted, failure).data.unwrap();
+            assert_eq!(
+                (data["stage"].as_str(), data["reason"].as_str()),
+                (Some("interrupted"), Some(class))
+            );
+            assert_eq!(data["retryable"], true);
+        }
+    }
 
     /// A background plan cannot outlive local folder, enrollment, or owner authority, and cannot
     /// bind an archived encrypted repository while accepting the ordinary mode a Hub reports.

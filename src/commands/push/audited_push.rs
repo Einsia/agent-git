@@ -902,13 +902,7 @@ pub(crate) fn publication_consent_with_client(
         remote.agent_id == expected.agent_id,
         "publication repository identity changed"
     );
-    ensure!(
-        matches!(
-            client.push_access(&owner, &name, &expected.agent_id)?,
-            crate::hub::PushAccess::Writable
-        ),
-        "publication write authority is unavailable"
-    );
+    client.require_push_access(&owner, &name, &expected.agent_id)?;
     let credential =
         credentials::load_checked(&expected.hub)?.context("publication account is unavailable")?;
     let account = client.session_account()?;

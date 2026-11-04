@@ -53,6 +53,19 @@ pub(crate) enum Remediation {
 }
 
 impl ApiError {
+    /// A Hub refusal with `status`, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn for_test(status: u16, detail: &str) -> Self {
+        Self {
+            status,
+            kind: String::new(),
+            detail: detail.into(),
+            base: "http://hub.invalid".into(),
+            remedies: Vec::new(),
+            refused_refs: Vec::new(),
+        }
+    }
+
     pub(crate) fn base(&self) -> &str {
         &self.base
     }
@@ -1266,6 +1279,20 @@ impl Client {
         self.push_access_with_secret_acceptance(owner, name, expected_agent_id, false)
     }
 
+    /// Writing to `owner/name` is allowed, or a [`super::WriteRefused`] that keeps which refusal
+    /// the probe answered.
+    pub(crate) fn require_push_access(
+        &self,
+        owner: &str,
+        name: &str,
+        expected_agent_id: &str,
+    ) -> Result<()> {
+        match self.push_access(owner, name, expected_agent_id)? {
+            super::PushAccess::Writable => Ok(()),
+            refused => Err(super::WriteRefused(refused).into()),
+        }
+    }
+
     /// Existing ordinary history is reconciled under the same explicit acceptance as the push.
     /// Callers must not inherit that acceptance for automatic publication or unrelated probes.
     pub(crate) fn push_access_with_secret_acceptance(
@@ -2417,6 +2444,52 @@ mod tests {
             .unwrap();
         assert_eq!(verified.entry, page.entries[0]);
         assert_eq!(hub.join().unwrap().len(), 2);
+    }
+
+    /// A push-access probe that the Hub refuses with 403 or 404 comes back as a typed refusal
+    /// that still says which, through the real probe request.
+    #[test]
+    fn a_refused_push_probe_keeps_which_refusal_it_was() {
+        let _home = CredentialTestHome::new();
+        for (status, refused) in [
+            (403, super::super::PushAccess::ReadOnly),
+            (404, super::super::PushAccess::Missing),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+                let line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                std::io::Write::write_all(
+                    &mut stream,
+                    format!("HTTP/1.1 {status} Refused\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+                )
+                .unwrap();
+                line
+            });
+            let client = Client::for_stored_hub_with_timeout(&base, Duration::from_secs(5));
+            let error = client
+                .require_push_access("owner", "repo", "agent-1")
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<super::super::WriteRefused>(),
+                Some(&super::super::WriteRefused(refused)),
+                "{status}: {error:#}"
+            );
+            assert!(
+                server
+                    .join()
+                    .unwrap()
+                    .contains("/owner/repo.git/info/refs?service=git-receive-pack"),
+                "{status}"
+            );
+        }
     }
 
     #[test]
