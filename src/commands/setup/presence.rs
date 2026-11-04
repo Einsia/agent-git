@@ -40,6 +40,25 @@ pub(crate) enum Presence {
     NoRuntime,
     /// These runtimes are here and none of them has agit's Skill.
     NotSetUp(Vec<&'static str>),
+    /// agit's Skill is set up for some runtime, but these runtimes are here with neither its Skill
+    /// nor its capture hooks, such as one installed after the last setup.
+    Partly(Vec<&'static str>),
+}
+
+/// [`UNATTENDED_LINE`] for runtimes here that the last setup did not cover.
+fn unattended_partly(runtimes: &[&str]) -> String {
+    format!(
+        "agit is not set up for {} on this computer, so their conversations are not captured. Ask the person before running `agit setup`.",
+        labels(runtimes)
+    )
+}
+
+pub(crate) fn labels(runtimes: &[&str]) -> String {
+    runtimes
+        .iter()
+        .map(|id| crate::adapter::runtime_label(id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether agit is set up here. agit counts as set up when any runtime has its Skill entrypoint,
@@ -52,17 +71,31 @@ pub(crate) enum Presence {
 /// they carry agit's hooks is kept. `agit setup` does not ask this; it installs for runtimes
 /// whether or not they have run.
 pub(crate) fn presence() -> Presence {
+    // A Skill the person turned off is a choice made in setup, not a setup still to do.
+    let off = super::skill_off::read();
+    let mut skilled = !off.is_empty();
     let mut here = Vec::new();
     for id in crate::adapter::setup_runtimes() {
         let Some(skill) = super::skill_path(id) else {
             continue;
         };
         if skill.join("SKILL.md").symlink_metadata().is_ok() {
-            return Presence::SetUp;
-        }
-        if runtime_folder(id, &skill).is_some_and(|folder| folder.symlink_metadata().is_ok()) {
+            skilled = true;
+        } else if !off.contains(id)
+            && runtime_folder(id, &skill).is_some_and(|folder| folder.symlink_metadata().is_ok())
+        {
             here.push(id);
         }
+    }
+    if skilled {
+        // After a full setup, a runtime here without agit is one it did not cover, such as one
+        // installed since; one carrying agit's hooks alone was set up that way on purpose.
+        here.retain(|id| !super::runtime_hooks_installed(id));
+        return if here.is_empty() {
+            Presence::SetUp
+        } else {
+            Presence::Partly(here)
+        };
     }
     if here.is_empty() {
         Presence::NoRuntime
@@ -71,6 +104,23 @@ pub(crate) fn presence() -> Presence {
     } else {
         Presence::NotSetUp(here)
     }
+}
+
+/// The runtimes installed on this computer, which bare `agit setup` sets up: those whose program is
+/// on PATH, or whose configuration folder exists, as it does once the runtime has run. A runtime
+/// installed later is set up by the next bare setup.
+pub(crate) fn installed() -> Vec<&'static str> {
+    crate::adapter::setup_runtimes()
+        .filter(|id| {
+            // `available` answers whether sessions can be resumed, which some adapters deny
+            // whatever is installed, so the program on PATH is asked about on its own.
+            crate::adapter::get(id).is_ok_and(|adapter| {
+                adapter.available() || crate::adapter::which(adapter.cli()).is_some()
+            }) || super::skill_path(id)
+                .and_then(|skill| runtime_folder(id, &skill))
+                .is_some_and(|folder| folder.symlink_metadata().is_ok())
+        })
+        .collect()
 }
 
 /// The folder a runtime keeps its configuration in, resolved as the runtime resolves it: the Skill
@@ -145,7 +195,10 @@ pub(crate) fn decide(
     silenced: bool,
     now: DateTime<Utc>,
 ) -> Action {
-    if silenced || record.declined_at.is_some() || !matches!(presence, Presence::NotSetUp(_)) {
+    if silenced
+        || record.declined_at.is_some()
+        || !matches!(presence, Presence::NotSetUp(_) | Presence::Partly(_))
+    {
         return Action::Nothing;
     }
     if can_ask {
@@ -213,22 +266,33 @@ fn notice(may_ask: bool) {
     match decide(&presence, &record, person, silenced, now) {
         Action::Nothing => {}
         Action::Say => {
-            eprintln!("{}", ui::dim(UNATTENDED_LINE));
+            match &presence {
+                Presence::Partly(runtimes) => {
+                    eprintln!("{}", ui::dim(&unattended_partly(runtimes)));
+                }
+                _ => eprintln!("{}", ui::dim(UNATTENDED_LINE)),
+            }
             save(&Record {
                 noticed_at: Some(now),
                 ..record
             });
         }
-        Action::Ask => ask(record, now),
+        Action::Ask => ask(&presence, record, now),
     }
 }
 
-fn ask(record: Record, now: DateTime<Utc>) {
+fn ask(presence: &Presence, record: Record, now: DateTime<Utc>) {
+    match presence {
+        Presence::Partly(runtimes) => eprintln!(
+            "agit is set up on this computer, but not for {}, so their conversations are not captured.",
+            labels(runtimes)
+        ),
+        _ => eprintln!(
+            "agit is installed but not set up on this computer: no runtime has agit's Skill or capture hooks, so no conversation is captured."
+        ),
+    }
     eprintln!(
-        "agit is installed but not set up on this computer: no runtime has agit's Skill or capture hooks, so no conversation is captured."
-    );
-    eprintln!(
-        "Setting it up writes, for every runtime agit supports, whether or not it is installed:"
+        "Setting it up writes, for the runtimes installed on this computer (`agit setup --all` writes for every runtime agit supports):"
     );
     for line in preview() {
         eprintln!("  {line}");
@@ -247,9 +311,11 @@ fn ask(record: Record, now: DateTime<Utc>) {
     }
 }
 
-/// One line per runtime a full `agit setup` writes into: the folder, and what goes there.
+/// One line per runtime a bare `agit setup` writes into, which are the runtimes installed here:
+/// the folder, and what goes there.
 fn preview() -> Vec<String> {
-    crate::adapter::setup_runtimes()
+    installed()
+        .into_iter()
         .map(|id| {
             let label = crate::adapter::runtime_label(id);
             let place = super::skill_path(id)
@@ -261,10 +327,10 @@ fn preview() -> Vec<String> {
         .collect()
 }
 
-/// What a full `agit setup` writes for a runtime, as its `install_skill`, `install_hooks` and
+/// What a bare `agit setup` writes for a runtime, as its `install_skill`, `install_hooks` and
 /// `register_mcp` decide it: the Skill for every runtime, and hooks and MCP where each of them
-/// installs them. A preview that named only the runtimes found here would hide files that "y"
-/// writes.
+/// installs them. The preview lists exactly the runtimes "y" writes for, so it neither hides a
+/// file "y" writes nor names a tool the person does not have.
 fn integrations(runtime: &str, installed: bool) -> &'static str {
     match runtime {
         "claude-code" | "workbuddy" => "Skill, hooks, MCP",

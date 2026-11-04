@@ -825,6 +825,10 @@ fn setup_row() -> (String, Check) {
         Presence::NotSetUp(runtimes) => {
             Check::Warn(setup_warning(&runtimes, presence::record().declined_at))
         }
+        Presence::Partly(runtimes) => Check::Warn(format!(
+            "not set up for {}, so their conversations are not captured. Ask the person before running `agit setup`",
+            presence::labels(&runtimes)
+        )),
     };
     ("setup".into(), row)
 }
@@ -877,8 +881,16 @@ fn codex_hooks_row() -> Option<Check> {
 
 fn skill_installation_checks() -> Vec<(String, Check)> {
     let mut checks = Vec::new();
+    let off = super::setup::skill_off::read();
     for runtime in crate::adapter::setup_runtimes() {
-        if let Some(path) = super::setup::skill_path(runtime) {
+        if off.contains(runtime) {
+            checks.push((
+                format!("skill {runtime}"),
+                Check::Ok(format!(
+                    "off, as the person chose; `agit setup --skill --runtime {runtime}` turns it back on"
+                )),
+            ));
+        } else if let Some(path) = super::setup::skill_path(runtime) {
             checks.push((format!("skill {runtime}"), check_skill_dir(&path, runtime)));
         }
         if let Some(path) = super::setup::legacy_inline_skill_path(runtime)

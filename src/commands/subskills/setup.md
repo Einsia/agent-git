@@ -15,7 +15,9 @@ agit setup [options]
 
 | Option | Meaning |
 |---|---|
-| `--runtime <all\|claude-code\|codex\|cursor\|opencode>` | Runtime to integrate |
+| `--runtime <all\|claude-code\|codex\|cursor\|opencode>` | Runtime to integrate, installed or not; plain `agit setup` integrates the runtimes installed on this computer (program on PATH, or configuration folder present) |
+| `--all` | Integrate every runtime agit supports, installed or not |
+| `--remove-skill` | Remove agit's Skill from `--runtime`'s runtime, or from every runtime, and keep it off; later setups and upgrades leave it out until `agit setup --skill --runtime <runtime>` |
 | `--hooks` | Install or update runtime hooks |
 | `--skill` | Install the progressive-disclosure AgentGit Skill bundle (`SKILL.md`, `VERSION`, and command references) in the selected runtime's native global Skill directory; does not expand the full guide into `AGENTS.md` |
 | `--installed-only` | With `--skill`, refresh only existing native or legacy Skill installations; does not change hooks, MCP, project integration, or auto-push preferences |

@@ -42,7 +42,9 @@ reported under their canonical command name.
 
 Project commands report the selected `history` enum and boolean options. Directory
 paths and destination repositories are presence-only; their values are never
-included in telemetry.
+included in telemetry. An argument whose policy is `omitted` is reviewed and never
+recorded: `agit setup --remove-skill` turns agit's Skill off by the person's choice,
+and that choice stays on this computer.
 
 | Field category | Representation |
 | --- | --- |

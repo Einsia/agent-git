@@ -78,7 +78,8 @@ The global package wires skills, hooks and MCP from its install script. npm 12 a
 skip an install script that has not been allowed, which is what `--allow-scripts` above is for;
 an organization policy (`strict-allow-scripts`, `ignore-scripts`) can block or skip it too. Under
 pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If the install
-script did not run, run `agit setup` once yourself.
+script did not run, run `agit setup` once yourself. It sets up the runtimes installed at the time,
+so run it again after installing another.
 
 The Linux artifact is **musl static-linked**, so no minimum glibc — the
 release pipeline runs every Linux binary inside an Alpine / Amazon Linux /

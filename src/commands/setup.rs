@@ -47,6 +47,7 @@ mod json_text;
 mod legacy;
 mod native;
 pub mod presence;
+pub(crate) mod skill_off;
 
 pub(crate) use codex_trust::{CodexHooks, codex_hooks};
 
@@ -56,9 +57,31 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Install for one runtime only (default: every runtime noticed).
+    /// Install for one runtime only, installed or not (default: the runtimes installed on this
+    /// computer).
     #[arg(long, value_name = "runtime")]
     pub runtime: Option<String>,
+    /// Install for every runtime agit supports, installed or not, such as before the tools are
+    /// installed.
+    #[arg(long, conflicts_with = "runtime")]
+    pub all: bool,
+    /// Remove agit's Skill from `--runtime`'s runtime, or from every runtime, and keep it off:
+    /// later setups and refreshes leave it out until `agit setup --skill --runtime <runtime>`.
+    #[arg(
+        long,
+        conflicts_with_all = ["hooks", "skill", "installed_only", "mcp", "agents_md", "remove_agents_md", "completions", "auto_push", "all"]
+    )]
+    pub remove_skill: bool,
+    /// Set up the runtimes installed here that carry neither agit's Skill nor its capture hooks
+    /// and whose Skill was not turned off, and leave the rest alone. `agit upgrade` runs it, so a
+    /// runtime installed after the last setup is set up; with no setup yet, or one the person
+    /// declined, it sets nothing up.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["runtime", "all", "hooks", "skill", "installed_only", "mcp", "agents_md", "remove_agents_md", "completions", "auto_push", "remove_skill"]
+    )]
+    pub new_runtimes: bool,
     #[arg(long)]
     pub hooks: bool,
     #[arg(long)]
@@ -94,6 +117,9 @@ impl Args {
     pub(crate) fn everything() -> Self {
         Self {
             runtime: None,
+            all: false,
+            remove_skill: false,
+            new_runtimes: false,
             hooks: false,
             skill: false,
             installed_only: false,
@@ -154,11 +180,38 @@ impl SetupReport {
     }
 }
 
-/// Runtime filter: None / all installs everything; a match returns true. An unknown value is
-/// rejected up in `run`, so whatever reaches here is valid — this decides a bool only, and the
-/// error happens once, at the entry point.
-fn wants(filter: Option<&str>, runtime: &str) -> bool {
-    matches!(filter, None | Some("all")) || filter == Some(runtime)
+/// The runtimes one setup run writes for. An unknown name is rejected up in `run`, so whatever
+/// reaches here is valid: these decide a bool only, and the error happens once, at the entry
+/// point.
+#[derive(Clone, Copy, Debug)]
+enum Targets<'a> {
+    /// Every runtime agit supports: `--all`, and the refreshes, which touch only what is there.
+    Every,
+    /// The runtimes installed on this computer: bare `agit setup`.
+    Installed(&'a [&'static str]),
+    /// What `--runtime` named: one runtime, installed or not, or `all`.
+    Named(&'a str),
+}
+
+impl Targets<'_> {
+    fn wants(self, runtime: &str) -> bool {
+        match self {
+            Targets::Every | Targets::Named("all") => true,
+            Targets::Installed(installed) => installed.contains(&runtime),
+            Targets::Named(named) => named == runtime,
+        }
+    }
+
+    /// Whether the person named `runtime` itself, so a step it cannot take there is a failure,
+    /// not a skip.
+    fn named(self, runtime: &str) -> bool {
+        matches!(self, Targets::Named(named) if named == runtime)
+    }
+
+    /// Whether `runtime` was asked for by name, alone or as `all`.
+    fn explicit(self, runtime: &str) -> bool {
+        matches!(self, Targets::Named(named) if named == runtime || named == "all")
+    }
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -201,8 +254,14 @@ fn run_setup(mut args: Args) -> CmdResult {
     if let Some(dir) = &args.remove_agents_md {
         return remove_agents_sections(dir);
     }
+    if args.remove_skill {
+        return remove_skill(match args.runtime.as_deref() {
+            Some(runtime) => Targets::Named(runtime),
+            None => Targets::Every,
+        });
+    }
 
-    if args.completions.is_none() && !args.installed_only {
+    if args.completions.is_none() && !args.installed_only && !args.new_runtimes {
         if crate::telemetry::state::onboarding().is_err() {
             eprintln!("Usage statistics remain off because their settings could not be saved.");
         }
@@ -214,7 +273,7 @@ fn run_setup(mut args: Args) -> CmdResult {
         !args.hooks && !args.skill && !args.mcp && !args.agents_md && args.completions.is_none();
     // The AGENTS.md section is a project's choice, so only `--agents-md` writes it: run from
     // wherever setup happens to start, it would land in an unrelated project or the home folder.
-    let (hooks, skill, mcp, am) = (
+    let (mut hooks, mut skill, mut mcp, am) = (
         args.hooks || all,
         args.skill || all,
         args.mcp || all,
@@ -224,6 +283,7 @@ fn run_setup(mut args: Args) -> CmdResult {
     if let Some(value) = args.auto_push {
         super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;
     } else if all
+        && !args.new_runtimes
         && !super::json::requested()
         && ui::prompt::can_ask()
         && !crate::telemetry::state::positive("AGIT_YES")
@@ -237,7 +297,40 @@ fn run_setup(mut args: Args) -> CmdResult {
         }
     }
 
-    let rt = args.runtime.as_deref();
+    // Bare setup writes only for the runtimes installed here, so it creates no configuration
+    // folder for a tool the person does not have; what an earlier setup wrote stays. A refresh
+    // touches only what is already there, so it looks at every runtime.
+    let mut installed = presence::installed();
+    if args.new_runtimes {
+        // It follows a setup that happened: with none yet, or once the person declined it at the
+        // setup notice, an upgrade sets nothing up, since upgrading agit is no answer to that.
+        let off = skill_off::read();
+        if presence::record().declined_at.is_some()
+            || (off.is_empty() && !crate::adapter::setup_runtimes().any(runtime_set_up))
+        {
+            return Ok(ExitCode::Ok);
+        }
+        installed.retain(|id| !off.contains(*id) && !runtime_set_up(id));
+        // Nothing new is no news: `agit upgrade` runs this on every upgrade.
+        if installed.is_empty() {
+            return Ok(ExitCode::Ok);
+        }
+    }
+    let rt = match args.runtime.as_deref() {
+        Some(runtime) => Targets::Named(runtime),
+        None if args.all || args.installed_only => Targets::Every,
+        None => Targets::Installed(&installed),
+    };
+    if matches!(rt, Targets::Installed([])) && (hooks || skill || mcp) {
+        ui::info(format_args!(
+            "No runtime agit sets up is installed on this computer, so nothing was written for one. Set up one with `agit setup --runtime <runtime>`, or every runtime agit supports with `agit setup --all`."
+        ));
+        // What the same request asks for outside the runtimes still happens.
+        if !am && args.completions.is_none() {
+            return Ok(ExitCode::Ok);
+        }
+        (hooks, skill, mcp) = (false, false, false);
+    }
     let mut report = SetupReport::default();
     if repairs_hooks(&args) {
         let repaired = repair_hooks(rt, &exe_str());
@@ -271,6 +364,12 @@ fn run_setup(mut args: Args) -> CmdResult {
             report.failures
         ));
         return Ok(ExitCode::Precondition);
+    }
+    if args.new_runtimes {
+        // The upgrade that runs this says which runtimes it set up.
+        presence::forget();
+        println!("{}", presence::labels(&installed));
+        return Ok(ExitCode::Ok);
     }
     if report.items > 0 {
         // A person who has now set agit up, or declined and then set it up, is past the notice.
@@ -432,11 +531,11 @@ fn hook_arguments(argv: &[&str], runtime: Option<&str>) -> String {
 
 /// Runtime hook configuration. Each runtime-owned file is merged idempotently, so one hook is
 /// never written twice, including when agit now runs from another executable path.
-fn install_hooks(runtime: Option<&str>) -> SetupReport {
+fn install_hooks(runtime: Targets<'_>) -> SetupReport {
     let mut report = SetupReport::default();
     let exe = exe_str();
 
-    if wants(runtime, "claude-code") {
+    if runtime.wants("claude-code") {
         match claude_settings() {
             Some(path) => report.merge(install_hook_file(
                 &path,
@@ -454,8 +553,8 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
         report.merge(native::claude());
     }
 
-    if wants(runtime, "codex") {
-        let explicit = matches!(runtime, Some("codex" | "all"));
+    if runtime.wants("codex") {
+        let explicit = runtime.explicit("codex");
         match codex_hooks_capability() {
             Some(capability) => match codex_home_path().map(|h| h.join("hooks.json")) {
                 Some(path) => {
@@ -487,7 +586,7 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
         }
     }
 
-    if wants(runtime, "workbuddy") {
+    if runtime.wants("workbuddy") {
         match crate::adapter::workbuddy::home() {
             Ok(root) => report.merge(install_hook_file(
                 &root.join("settings.json"),
@@ -500,8 +599,8 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
         }
     }
     for id in ["hermes", "openclaw"] {
-        if wants(runtime, id)
-            && (runtime == Some(id)
+        if runtime.wants(id)
+            && (runtime.named(id)
                 || crate::adapter::get(id).is_ok_and(|adapter| adapter.available()))
         {
             report.merge(if id == "hermes" {
@@ -586,10 +685,10 @@ fn carries_hook(settings: &serde_json::Value, event: &str, arguments: &str) -> b
 /// bare. It runs unattended (the menu bar app runs it once per new agit), so it installs nothing,
 /// touches no native integration, and leaves alone every hook that runs another program, even
 /// another agit: pointing those at this one would replace a choice the person made.
-fn repair_hooks(runtime: Option<&str>, exe: &str) -> SetupReport {
+fn repair_hooks(runtime: Targets<'_>, exe: &str) -> SetupReport {
     let mut report = SetupReport::default();
     for (id, label, path, runtime_flag) in hook_files() {
-        if wants(runtime, id)
+        if runtime.wants(id)
             && let Some(path) = path
         {
             report.merge(repair_hook_file(&path, label, exe, runtime_flag));
@@ -636,18 +735,39 @@ const HOOK_FILE_LIMIT: usize = 16 << 20;
 /// agit plugin directory. Hooks capture adopted sessions without the Skill, so such a computer is
 /// set up. Only that yes or no is used; nothing read is kept.
 pub(crate) fn hooks_installed() -> bool {
-    hook_files().into_iter().any(|(_, _, path, runtime_flag)| {
-        path.is_some_and(|path| carries_agit_hooks(&path, runtime_flag))
-    }) || crate::adapter::hermes::home().is_ok_and(|root| {
-        crate::domain::storage::read_bytes_capped(&root.join("config.yaml"), HOOK_FILE_LIMIT)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .is_some_and(|text| hermes_carries_agit_hooks(&text))
-    }) || crate::adapter::openclaw::home().is_ok_and(|root| {
-        root.join("extensions/agit/openclaw.plugin.json")
-            .symlink_metadata()
-            .is_ok()
-    })
+    crate::adapter::setup_runtimes().any(runtime_hooks_installed)
+}
+
+/// [`hooks_installed`] for one runtime: whether agit's capture hooks are in that runtime's own
+/// configuration. A runtime agit writes no hooks for has none.
+pub(crate) fn runtime_hooks_installed(runtime: &str) -> bool {
+    match runtime {
+        "hermes" => crate::adapter::hermes::home().is_ok_and(|root| {
+            crate::domain::storage::read_bytes_capped(&root.join("config.yaml"), HOOK_FILE_LIMIT)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .is_some_and(|text| hermes_carries_agit_hooks(&text))
+        }),
+        "openclaw" => crate::adapter::openclaw::home().is_ok_and(|root| {
+            root.join("extensions/agit/openclaw.plugin.json")
+                .symlink_metadata()
+                .is_ok()
+        }),
+        _ => hook_files()
+            .into_iter()
+            .filter(|(id, _, _, _)| *id == runtime)
+            .any(|(_, _, path, runtime_flag)| {
+                path.is_some_and(|path| carries_agit_hooks(&path, runtime_flag))
+            }),
+    }
+}
+
+/// Whether `runtime` carries agit at all: its Skill, an older release's inline Skill, or agit's
+/// capture hooks.
+pub(crate) fn runtime_set_up(runtime: &str) -> bool {
+    skill_path(runtime).is_some_and(|skill| skill.join("SKILL.md").symlink_metadata().is_ok())
+        || legacy_skill_installed(runtime)
+        || runtime_hooks_installed(runtime)
 }
 
 /// Whether Hermes' YAML configuration holds one of agit's hook commands, found by the arguments
@@ -1288,11 +1408,30 @@ fn upsert_hook(
 
 /// The agit skill lands in each runtime's native Skill directory. Beyond how many files were
 /// written, this also reports whether the install is complete.
-fn install_skill(runtime: Option<&str>, installed_only: bool) -> SetupReport {
+fn install_skill(runtime: Targets<'_>, installed_only: bool) -> SetupReport {
     let mut report = SetupReport::default();
+    let mut off = skill_off::read();
     for name in crate::adapter::setup_runtimes() {
-        if !wants(runtime, name) {
+        if !runtime.wants(name) {
             continue;
+        }
+        if off.contains(name) {
+            // Turned off by the person; only setting it up for this runtime by name turns it on.
+            if installed_only || !runtime.named(name) {
+                ui::info(format_args!(
+                    "  {} agit's Skill is off for {name}; skipped",
+                    ui::dim("·")
+                ));
+                continue;
+            }
+            off.remove(name);
+            if let Err(error) = skill_off::write(&off) {
+                ui::warning(&format!(
+                    "cannot record that agit's Skill is on again for {name}: {error:#}"
+                ));
+                report.merge(SetupReport::failure());
+                continue;
+            }
         }
         let Some(dir) = skill_path(name) else {
             ui::warning(&format!("cannot install {name} Skill: HOME is not set"));
@@ -1319,6 +1458,76 @@ fn install_skill(runtime: Option<&str>, installed_only: bool) -> SetupReport {
         });
     }
     report
+}
+
+/// `setup --remove-skill`: remove agit's Skill from each runtime `targets` names and keep it off.
+/// Only the files of agit's bundle go, with the folders they leave empty, and the block an older
+/// release wrote into an instruction file; files the person keeps beside them stay, and hooks and
+/// MCP stay, since they are switches of their own.
+fn remove_skill(targets: Targets<'_>) -> CmdResult {
+    let mut off = skill_off::read();
+    let mut failed = false;
+    for name in crate::adapter::setup_runtimes() {
+        if !targets.wants(name) {
+            continue;
+        }
+        if let Some(dir) = skill_path(name)
+            && let Err(error) = remove_skill_files(&dir)
+        {
+            ui::warning(&format!(
+                "cannot remove agit's Skill from {}: {error}",
+                dir.display()
+            ));
+            failed = true;
+            continue;
+        }
+        let mut legacy = remove_legacy_inline_skill(name);
+        if name == "cursor" {
+            legacy.merge(remove_legacy_home_skill());
+        }
+        if !legacy.succeeded() {
+            failed = true;
+            continue;
+        }
+        off.insert(name.to_owned());
+        ui::info(format_args!(
+            "agit's Skill is off for {name}; `agit setup --skill --runtime {name}` turns it back on"
+        ));
+    }
+    skill_off::write(&off)?;
+    Ok(if failed {
+        ExitCode::Precondition
+    } else {
+        ExitCode::Ok
+    })
+}
+
+/// Remove the files of agit's Skill bundle from `dir`, and then each of its folders that is left
+/// empty.
+fn remove_skill_files(dir: &Path) -> std::io::Result<()> {
+    let refs = dir.join(skill_bundle::REFERENCES_DIR);
+    let files = skill_bundle::SUBSKILLS
+        .iter()
+        .map(|(name, _)| refs.join(format!("{name}.md")))
+        .chain([dir.join("SKILL.md"), dir.join(skill_bundle::VERSION_FILE)]);
+    for file in files {
+        match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    let mut folder = refs.as_path();
+    while folder.starts_with(dir) {
+        // A folder that still holds the person's files stays, and so do those above it.
+        if std::fs::remove_dir(folder).is_err() {
+            break;
+        }
+        match folder.parent() {
+            Some(parent) => folder = parent,
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 fn legacy_skill_installed(runtime: &str) -> bool {
@@ -1639,15 +1848,15 @@ fn remove_marked_block_if_versioned(
 
 /// MCP registration writes each runtime's native configuration. All of it is idempotent, and a
 /// failed configuration write propagates.
-fn register_mcp(runtime: Option<&str>) -> SetupReport {
+fn register_mcp(runtime: Targets<'_>) -> SetupReport {
     let exe = exe_str();
     let mut report = SetupReport::default();
 
-    if wants(runtime, "claude-code") {
+    if runtime.wants("claude-code") {
         report.merge(claude_mcp::register(&exe));
     }
 
-    if wants(runtime, "codex") {
+    if runtime.wants("codex") {
         if let Some(p) = codex_home_path().map(|h| h.join("config.toml")) {
             report.merge(upsert_codex_mcp(&p, &exe));
         } else {
@@ -1656,7 +1865,7 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
         }
     }
 
-    if wants(runtime, "opencode") {
+    if runtime.wants("opencode") {
         if let Some(p) = home().map(|h| h.join(".config/opencode/opencode.json")) {
             report.merge(upsert_json_mcp(
                 &p,
@@ -1672,7 +1881,7 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
         }
     }
 
-    if wants(runtime, "cursor") {
+    if runtime.wants("cursor") {
         if let Some(p) = home().map(|h| h.join(".cursor/mcp.json")) {
             report.merge(upsert_json_mcp(
                 &p,
@@ -1688,16 +1897,16 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
         }
     }
 
-    if wants(runtime, "workbuddy") {
+    if runtime.wants("workbuddy") {
         report.merge(native::workbuddy_mcp(&exe));
     }
-    if wants(runtime, "hermes")
-        && (runtime == Some("hermes")
+    if runtime.wants("hermes")
+        && (runtime.named("hermes")
             || crate::adapter::get("hermes").is_ok_and(|adapter| adapter.available()))
     {
         report.merge(native::hermes(&exe, "mcp"));
     }
-    if runtime == Some("openclaw") {
+    if runtime.named("openclaw") {
         ui::info(format_args!(
             "  OpenClaw uses the native lifecycle plugin and Skill; a stdio MCP registration is not required."
         ));
@@ -2683,11 +2892,21 @@ mod tests {
 
     #[test]
     fn runtime_filter_accepts_none_all_and_exact_match() {
-        assert!(wants(None, "codex"));
-        assert!(wants(Some("all"), "cursor"));
-        assert!(wants(Some("cursor"), "cursor"));
-        assert!(!wants(Some("cursor"), "codex"));
-        assert!(!wants(Some("codex"), "all")); // a runtime name is no synonym for "all"
+        assert!(Targets::Every.wants("codex"));
+        assert!(Targets::Named("all").wants("cursor"));
+        assert!(Targets::Named("cursor").wants("cursor"));
+        assert!(!Targets::Named("cursor").wants("codex"));
+        assert!(!Targets::Named("codex").wants("all")); // a runtime name is no synonym for "all"
+        assert!(Targets::Installed(&["cursor"]).wants("cursor"));
+        assert!(!Targets::Installed(&["cursor"]).wants("codex"));
+        // Only a runtime named, alone or as `all`, makes a step it cannot take a failure.
+        assert!(
+            Targets::Named("codex").explicit("codex") && Targets::Named("all").explicit("codex")
+        );
+        assert!(
+            !Targets::Every.explicit("codex") && !Targets::Installed(&["codex"]).explicit("codex")
+        );
+        assert!(Targets::Named("hermes").named("hermes") && !Targets::Named("all").named("hermes"));
     }
 
     /// Capability presence, not a release number, decides whether writing Codex hooks is safe.
