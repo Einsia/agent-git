@@ -12,7 +12,11 @@ pub(crate) use crate::domain::privacy::detector::paths;
 pub(crate) use crate::domain::privacy::detector::placeholder;
 #[cfg(feature = "cli")]
 pub(crate) mod publication;
+#[cfg(feature = "cli")]
+mod published;
 pub use crate::domain::privacy::detector::rules;
+#[cfg(feature = "cli")]
+pub use published::{PublishedLowConfidence, published_low_confidence};
 
 use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
@@ -135,6 +139,95 @@ impl Hit {
     pub fn is_high_confidence(&self) -> bool {
         !matches!(self.rule.as_str(), "high-entropy-value" | "generic-api-key")
     }
+
+    /// The shape of the matched value.
+    pub fn shape(&self) -> Shape {
+        Shape::of(self.value.expose())
+    }
+}
+
+/// The shape of a low-confidence value. A report groups those values by it: a runtime id, a
+/// content hash and an encrypted carrier each have a shape of their own, and a credential is
+/// easier to spot outside a long run of ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Uuid,
+    Hex40,
+    Hex64,
+    Base64,
+    Other,
+}
+
+impl Shape {
+    /// Every shape, in the order a report lists them.
+    pub const ALL: [Shape; 5] = [
+        Shape::Uuid,
+        Shape::Hex40,
+        Shape::Hex64,
+        Shape::Base64,
+        Shape::Other,
+    ];
+
+    /// The shape of one value. Hex is told by its length once an id prefix (`agit-`, `sha1-`,
+    /// `sha256-`) is set aside; a base64 run uses only the base64 or base64url alphabet, with at
+    /// most two `=` of padding.
+    pub fn of(value: &str) -> Shape {
+        if is_uuid(value) {
+            return Shape::Uuid;
+        }
+        let hex = ["agit-", "sha1-", "sha256-"]
+            .iter()
+            .find_map(|prefix| value.strip_prefix(prefix))
+            .unwrap_or(value);
+        if !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return match hex.len() {
+                40 => Shape::Hex40,
+                64 => Shape::Hex64,
+                _ => Shape::Other,
+            };
+        }
+        let body = value.trim_end_matches('=');
+        if !body.is_empty()
+            && value.len() - body.len() <= 2
+            && body.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_')
+            })
+        {
+            return Shape::Base64;
+        }
+        Shape::Other
+    }
+
+    /// The name a report prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            Shape::Uuid => "uuid",
+            Shape::Hex40 => "hex-40",
+            Shape::Hex64 => "hex-64",
+            Shape::Base64 => "base64 run",
+            Shape::Other => "other",
+        }
+    }
+
+    /// A stable machine-readable name, for `--json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shape::Base64 => "base64",
+            shape => shape.label(),
+        }
+    }
+
+    fn index(self) -> usize {
+        Shape::ALL
+            .iter()
+            .position(|shape| *shape == self)
+            .unwrap_or_default()
+    }
+}
+
+/// A UUID in its hyphenated form, either case.
+pub(crate) fn is_uuid(value: &str) -> bool {
+    value.len() == 36 && uuid::Uuid::parse_str(value).is_ok()
 }
 
 /// A matched value held in memory for record lookup; wiped on drop where zeroize is linked.
@@ -256,6 +349,8 @@ struct HitCollector {
     low_confidence: Vec<Hit>,
     count: usize,
     low_confidence_count: usize,
+    /// How many of the low-confidence hits have each shape, in [`Shape::ALL`] order.
+    low_confidence_shapes: [usize; Shape::ALL.len()],
     seen: HashSet<String>,
     /// Some hits were never counted: the ceiling stopped the scan, or a carrier's own bound did.
     incomplete: bool,
@@ -269,6 +364,7 @@ impl HitCollector {
             low_confidence: Vec::new(),
             count: 0,
             low_confidence_count: 0,
+            low_confidence_shapes: [0; Shape::ALL.len()],
             seen: HashSet::new(),
             incomplete: false,
             binary_carriers: 0,
@@ -342,6 +438,7 @@ impl HitCollector {
         let (count, list) = if h.is_high_confidence() {
             (&mut self.count, &mut self.hits)
         } else {
+            self.low_confidence_shapes[h.shape().index()] += 1;
             (&mut self.low_confidence_count, &mut self.low_confidence)
         };
         *count += 1;
@@ -704,6 +801,8 @@ pub enum Source {
     /// into the working tree where that secret is simply not there, and the one way out that
     /// works (locate the blob, rewrite history) goes unmentioned.
     BlobObject,
+    /// A session record as publication carries it, located by its LOG line.
+    Record,
 }
 
 impl Source {
@@ -719,6 +818,7 @@ impl Source {
             Source::CommitObject => "commit_object",
             Source::TagObject => "tag_object",
             Source::BlobObject => "blob_object",
+            Source::Record => "session_record",
         }
     }
 }
