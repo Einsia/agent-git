@@ -391,11 +391,16 @@ pub(crate) fn covers(path: &Path) -> Result<bool> {
 
 /// Whether `path` is in the project's folder and no folder between them is set up on its own.
 fn within(project: &Project, path: &Path) -> Result<bool> {
-    if !path.starts_with(&project.root) {
+    within_root(&project.root, path)
+}
+
+/// [`within`] for a project at `root`, whether or not it exists yet.
+fn within_root(root: &Path, path: &Path) -> Result<bool> {
+    if !path.starts_with(root) {
         return Ok(false);
     }
     for ancestor in path.ancestors() {
-        if ancestor == project.root {
+        if ancestor == root {
             return Ok(true);
         }
         if read(ancestor)?.is_some() || workspace::read(ancestor).is_some() {
@@ -422,8 +427,13 @@ pub(crate) enum Via {
 /// a worktree turned on covers neither the main checkout nor its siblings, and a separate clone of
 /// the same remote or a submodule is never covered.
 fn coverage(project: &Project, path: &Path) -> Result<Option<Via>> {
-    if path.starts_with(&project.root) {
-        return Ok(within(project, path)?.then_some(Via::Folder));
+    coverage_at(&project.root, path)
+}
+
+/// [`coverage`] for a project at `root`, whether or not it exists yet.
+fn coverage_at(root: &Path, path: &Path) -> Result<Option<Via>> {
+    if path.starts_with(root) {
+        return Ok(within_root(root, path)?.then_some(Via::Folder));
     }
     let Ok(path) = path.canonicalize() else {
         return Ok(None);
@@ -437,13 +447,13 @@ fn coverage(project: &Project, path: &Path) -> Result<Option<Via>> {
     let Some(linked) = crate::domain::worktree::linked(path) else {
         return Ok(None);
     };
-    if linked.main != project.root {
+    if linked.main != root {
         return Ok(None);
     }
     let Ok(inside) = path.strip_prefix(&linked.worktree) else {
         return Ok(None);
     };
-    Ok(within(project, &linked.main.join(inside))?.then_some(Via::Worktree(linked.worktree)))
+    Ok(within_root(root, &linked.main.join(inside))?.then_some(Via::Worktree(linked.worktree)))
 }
 
 fn includes(project: &Project, path: &Path) -> Result<bool> {
@@ -525,6 +535,15 @@ fn moved_drops(root: &Path) -> Result<BTreeSet<String>> {
             path.display()
         )
     })
+}
+
+/// The linked git worktrees a policy at `root` would cover if the folder were turned on now: the
+/// ones `agit on` there names as also covered.
+pub(crate) fn worktrees_covered_from(root: &Path) -> Vec<PathBuf> {
+    crate::domain::worktree::of(root)
+        .into_iter()
+        .filter(|worktree| matches!(coverage_at(root, worktree), Ok(Some(Via::Worktree(_)))))
+        .collect()
 }
 
 /// The linked git worktrees the policy at `root` covers now.
@@ -1967,6 +1986,79 @@ fn changed_after(runtime: &str, path: &Path, modified: u64, length: Option<u64>)
 
 /// Whether the project policy deciding for the folder at `root` was turned off (`agit off`,
 /// `project unbind`).
+/// Whether no project has ever governed `root`: it has no policy of its own and no folder above
+/// it, or main checkout of a git worktree it is, decides for it. A paused or turned-off folder
+/// keeps its policy, so it is not one.
+pub(crate) fn never_bound(root: &Path) -> bool {
+    matches!(read(&policy_root(root)), Ok(None)) && matches!(governing(root), Ok(None))
+}
+
+/// Where this machine records what the person was asked about turning `root` on: `offered` once
+/// a push suggested it, `declined` once they said no. Kept beside the policies, keyed as a policy
+/// would be, and never read as one.
+fn offer_path(root: &Path) -> Result<PathBuf> {
+    Ok(state_path(root)?.with_extension("offer"))
+}
+
+/// Whether a push has suggested turning `root` on, or the person declined it.
+pub(crate) fn automatic_upload_offered(root: &Path) -> bool {
+    offer_path(root).is_ok_and(|path| path.exists())
+}
+
+/// Whether the person declined turning `root` on. Nothing suggests it there again.
+pub(crate) fn automatic_upload_declined(root: &Path) -> bool {
+    offer_path(root)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|said| said.trim() == "declined")
+}
+
+/// Takes the one chance to suggest turning `root` on: `true` only for the caller that records
+/// the offer. The check and the record are one step under the folder's offer lock, so of two
+/// pushes that both found the offer due, one says it, and a no recorded while a push waited on
+/// the Hub is never asked again.
+pub(crate) fn claim_automatic_upload_offer(root: &Path) -> Result<bool> {
+    let _guard = offer_lock(root)?;
+    if !never_bound(root) || automatic_upload_offered(root) {
+        return Ok(false);
+    }
+    write_offer(root, "offered")?;
+    Ok(true)
+}
+
+/// Records that the person declined turning `root` on. It changes nothing else: a binding, a
+/// paused folder and its local saving stay as they were.
+pub(crate) fn record_automatic_upload_declined(root: &Path) -> Result<()> {
+    let _guard = offer_lock(root)?;
+    write_offer(root, "declined")
+}
+
+/// Forgets what the person was asked about `root`, once it is on.
+pub(crate) fn forget_automatic_upload_offer(root: &Path) {
+    let Ok(_guard) = offer_lock(root) else {
+        return;
+    };
+    if let Ok(path) = offer_path(root) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn offer_lock(root: &Path) -> Result<fs::File> {
+    lock_at(
+        state_path(root)?.with_extension("offer-lock"),
+        "the folder's offer record lock",
+    )
+}
+
+fn write_offer(root: &Path, said: &str) -> Result<()> {
+    let home = home()?;
+    config::create_state_dir(&home)?;
+    let mut file = tempfile::NamedTempFile::new_in(&home)?;
+    file.write_all(said.as_bytes())?;
+    file.persist(offer_path(root)?).map_err(|e| e.error)?;
+    Ok(())
+}
+
 pub(crate) fn turned_off(root: &Path) -> bool {
     read(&policy_root(root))
         .ok()
@@ -6438,6 +6530,81 @@ mod tests {
                 .excluded
                 .contains(&key("codex", DROPPED))
         );
+    }
+
+    /// A push suggests turning a folder on once, only where no project ever governed it, never
+    /// for agit's own automatic push or under --quiet, and never again after the person's no. The
+    /// no changes nothing but its record: a paused folder keeps its binding and local saving, and
+    /// a folder's drops and earlier sessions stay as they were, so turning it on later keeps them
+    /// out. An offer due from the automatic entry would put the question to nobody who asked.
+    #[test]
+    fn a_push_offers_turning_a_folder_on_once_and_a_no_changes_nothing_else() {
+        if !isolated("a_push_offers_turning_a_folder_on_once_and_a_no_changes_nothing_else") {
+            return;
+        }
+        let due = crate::commands::front::offer_due;
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = fresh.path().canonicalize().unwrap();
+        assert!(never_bound(&fresh));
+        // A main checkout names the linked worktree `agit on` there would also cover.
+        let checkout = tempfile::tempdir().unwrap();
+        let main = checkout.path().join("main");
+        git_checkout(&main);
+        let tree = worktree(&main, &checkout.path().join("tree"));
+        let main = main.canonicalize().unwrap();
+        assert!(never_bound(&main));
+        assert_eq!(worktrees_covered_from(&main), vec![tree]);
+        assert!(!due(&fresh, true, false), "never for the automatic entry");
+        assert!(!due(&fresh, false, true), "never under --quiet");
+        assert!(due(&fresh, false, false));
+        assert!(claim_automatic_upload_offer(&fresh).unwrap());
+        assert!(!due(&fresh, false, false), "once per folder");
+        assert!(!automatic_upload_declined(&fresh));
+        // Two pushes that both found the offer due: only the first to claim it says it.
+        assert!(!claim_automatic_upload_offer(&fresh).unwrap());
+        let racing = tempfile::tempdir().unwrap();
+        let racing = racing.path().canonicalize().unwrap();
+        let claims: Vec<bool> = std::thread::scope(|scope| {
+            let pushes: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| claim_automatic_upload_offer(&racing).unwrap()))
+                .collect();
+            pushes
+                .into_iter()
+                .map(|push| push.join().unwrap())
+                .collect()
+        });
+        assert_eq!(claims.iter().filter(|claimed| **claimed).count(), 1);
+
+        // A no is recorded and outlasts a later offer; turning the folder on forgets it.
+        let declined = tempfile::tempdir().unwrap();
+        let declined = declined.path().canonicalize().unwrap();
+        // A push found the offer due, then the no was recorded while it waited on the Hub.
+        assert!(due(&declined, false, false));
+        record_automatic_upload_declined(&declined).unwrap();
+        assert!(!claim_automatic_upload_offer(&declined).unwrap());
+        assert!(automatic_upload_declined(&declined));
+        assert!(!due(&declined, false, false));
+        forget_automatic_upload_offer(&declined);
+        assert!(!automatic_upload_offered(&declined));
+
+        // A paused folder and a turned-off one are bound: no offer, and a no leaves them as they
+        // were, drops and earlier sessions included.
+        for (enabled, auto_upload) in [(true, false), (false, false)] {
+            let work = tempfile::tempdir().unwrap();
+            let mut policy = project(work.path());
+            policy.enabled = enabled;
+            policy.auto_upload = auto_upload;
+            policy.excluded.insert(key("claude-code", "dropped"));
+            policy.earlier.insert(key("claude-code", "before"));
+            save(&policy).unwrap();
+            assert!(!never_bound(&policy.root));
+            assert!(!due(&policy.root, false, false));
+            let before = serde_json::to_value(read(&policy.root).unwrap().unwrap()).unwrap();
+            record_automatic_upload_declined(&policy.root).unwrap();
+            assert!(automatic_upload_declined(&policy.root));
+            let after = serde_json::to_value(read(&policy.root).unwrap().unwrap()).unwrap();
+            assert_eq!(before, after);
+        }
     }
 
     /// Existing claims are judged without a command: a claim captured from a conversation started

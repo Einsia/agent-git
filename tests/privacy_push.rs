@@ -764,7 +764,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         },
     )
     .unwrap();
-    let run_home = |args: &[&str], automatic: bool, selected_home: &Path| {
+    let run_at = |args: &[&str], automatic: bool, selected_home: &Path, dir: &Path| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
@@ -774,7 +774,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             }
         }
         command
-            .current_dir(temp.path())
+            .current_dir(dir)
             .env("AGIT_HOME", selected_home)
             .env("CODEX_HOME", selected_home.join("codex"))
             .env("CLAUDE_CONFIG_DIR", selected_home.join("claude"))
@@ -796,6 +796,9 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
                 }
             }));
         command.output().unwrap()
+    };
+    let run_home = |args: &[&str], automatic: bool, selected_home: &Path| {
+        run_at(args, automatic, selected_home, temp.path())
     };
     let run = |args: &[&str], automatic: bool| run_home(args, automatic, &home);
     let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
@@ -892,8 +895,20 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert_eq!(hub.posts.load(Ordering::Acquire), 0);
     assert!(git(&remote, &["for-each-ref"]).is_empty());
     hub.corrupt_receipt.store(false, Ordering::Release);
-    let published = run(&create, false);
+    // Pushed from a project folder: the home directory itself is never one.
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let published = run_at(&create, false, &home, &project);
     assert_success(&published);
+    // The first push the person makes from a folder that never uploaded by itself tells their
+    // agent it could, to this repository, and to ask them first.
+    let offered = String::from_utf8_lossy(&published.stdout);
+    assert!(offered.contains("For the agent:"), "{offered}");
+    assert!(offered.contains("`agit on --repo alice/app`"), "{offered}");
+    assert!(
+        offered.contains("(private: only its members can read it)"),
+        "{offered}"
+    );
     let progress = String::from_utf8_lossy(&published.stderr);
     for stage in [
         "Preparing publication snapshots",
@@ -1261,7 +1276,18 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         false,
     );
     assert!(!partial.status.success(), "{partial:?}");
-    assert_success(&run(&["--yes", "push", "alice/app@prepublish"], false));
+    let again = run_at(
+        &["--yes", "push", "alice/app@prepublish"],
+        false,
+        &home,
+        &project,
+    );
+    assert_success(&again);
+    // Once per folder.
+    assert!(
+        !String::from_utf8_lossy(&again.stdout).contains("For the agent:"),
+        "{again:?}"
+    );
     let published = git(&remote, &["rev-parse", "refs/heads/prepublish"]);
     let publication = envelope(&published);
     let authority = publication.session_binding.as_ref().unwrap();

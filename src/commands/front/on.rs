@@ -172,6 +172,8 @@ pub(crate) fn enable(
     } else {
         (Vec::new(), None)
     };
+    // Once on, nothing is left to ask about.
+    crate::commands::project::forget_automatic_upload_offer(root);
     Ok(Enabled {
         repository: slug,
         previous: destination.replaces,
@@ -555,11 +557,19 @@ fn turn_off(args: OffArgs) -> CmdResult {
             }
             Ok(ExitCode::Ok)
         }
+        // In a folder that doesn't upload by itself, off is the person's no to turning it on: it is
+        // recorded, so nothing suggests it there again, and nothing else changes.
         _ => {
+            crate::commands::project::record_automatic_upload_declined(&root)?;
             if crate::commands::json::is_capturing() {
-                println!("{}", serde_json::json!({"folder": root, "on": false}));
+                println!(
+                    "{}",
+                    serde_json::json!({"folder": root, "on": false, "declined": true})
+                );
             } else {
-                println!("{folder} is already off");
+                println!(
+                    "{folder} stays off; agit won't suggest turning it on here again (`agit on` still turns it on)"
+                );
             }
             Ok(ExitCode::Ok)
         }

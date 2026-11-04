@@ -86,12 +86,18 @@ pub fn run() -> CmdResult {
     // An old agit section in a folder agit set up still tells agents to run agit at every session
     // start; the person removes it, as the file may be committed.
     let legacy = crate::commands::setup::legacy_folder_sections();
-    let next = next_step(account.is_some(), root.is_some(), state, total).or_else(|| {
-        (waiting > 0).then_some((
-            "agit save --all",
-            "upload the sessions that ran before this folder covered them",
-        ))
-    });
+    // After the person said no to turning this folder on, nothing suggests it again.
+    let declined = root
+        .as_deref()
+        .is_some_and(crate::commands::project::automatic_upload_declined);
+    let next = next_step(account.is_some(), root.is_some(), state, total)
+        .filter(|(command, _)| !(declined && *command == "agit on"))
+        .or_else(|| {
+            (waiting > 0).then_some((
+                "agit save --all",
+                "upload the sessions that ran before this folder covered them",
+            ))
+        });
 
     if crate::commands::json::is_capturing() {
         println!(
