@@ -29,6 +29,16 @@ const MAX_PENDING: usize = 64;
 const EVENT_CAPACITY: usize = 512;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The largest machine description a peer may answer discovery with, in bytes of its JSON. A
+/// description carries per-runtime catalogs that grow with what the person has installed, so this
+/// leaves room for a large one while staying far under the tunnel's own frame limit.
+pub const MAX_DESCRIPTION_BYTES: usize = 1024 * 1024;
+
+/// The start of a route's error when its peer's description is over [`MAX_DESCRIPTION_BYTES`]. A
+/// host recognises that refusal by this text, since the device is reachable and only its agit can
+/// make the description fit.
+pub const DESCRIPTION_TOO_LARGE: &str = "peer description exceeds the limit";
+
 #[derive(Clone)]
 pub struct Worker {
     pub executable: PathBuf,

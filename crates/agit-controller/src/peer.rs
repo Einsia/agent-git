@@ -338,9 +338,10 @@ async fn describe(
                 .is_some_and(|id| !id.is_empty()),
             "peer instance is missing"
         );
+        let size = description.to_string().len();
         ensure!(
-            description.to_string().len() <= 65536,
-            "peer description exceeds the limit"
+            size <= MAX_DESCRIPTION_BYTES,
+            "{DESCRIPTION_TOO_LARGE}: {size} bytes, at most {MAX_DESCRIPTION_BYTES}"
         );
         return Ok(description);
     }
