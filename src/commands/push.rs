@@ -256,9 +256,6 @@ pub fn run(mut args: Args) -> CmdResult {
         Ok(b) => b,
         Err(r) => {
             if r.code == ExitCode::Ok {
-                if !args.dry_run {
-                    crate::domain::privacy::service::schedule_sync(client.base());
-                }
                 ui::info(&r.msg);
                 if !ui::quiet() {
                     for hint in &r.hints {
@@ -394,15 +391,11 @@ pub fn run(mut args: Args) -> CmdResult {
         branches.retain(|branch| !unchanged.contains(branch));
         if branches.is_empty() {
             reading.finish();
-            if !args.dry_run {
-                crate::domain::privacy::service::schedule_sync(client.base());
-            }
             ui::info(format_args!("{}: already up to date.", checkout.slug()));
             return Ok(ExitCode::Ok);
         }
     }
     if !args.dry_run {
-        crate::domain::privacy::service::schedule_sync(client.base());
         // Dictionary sync runs detached, so push is where its refusals become visible.
         if let Some(refusal) = crate::domain::privacy::sync::recorded_refusal(client.base()) {
             let (said, next) = refusal.describe(chrono::Utc::now().timestamp());

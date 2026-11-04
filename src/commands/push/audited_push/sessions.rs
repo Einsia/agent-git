@@ -813,6 +813,10 @@ pub(super) fn run(
         repo = materialized;
         let hub = client.base().to_owned();
         intent.verify_remote(&destination)?;
+        // Only a destination the person confirmed and the checks above accepted is synchronized
+        // with: a refused push, or one to a Hub that failed them, contacts nothing for the
+        // dictionary. The sync runs detached, so it never holds up or fails the publication.
+        crate::domain::privacy::service::schedule_sync(&intent.hub);
         if let Some(selection) = &local_target {
             selection.bind(&repo, &destination.identity)?;
         }

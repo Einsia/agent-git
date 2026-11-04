@@ -240,7 +240,9 @@ struct HttpWorker {
 }
 
 impl HttpWorker {
-    fn start(lab: &Lab) -> Self {
+    /// A Hub answering the push as `lab` expects; without `holds_repository` it does not hold
+    /// the destination, as a Hub the person did not mean would not.
+    fn start(lab: &Lab, holds_repository: bool) -> Self {
         let listener = lab.hub.try_clone().unwrap();
         let base = lab.base.clone();
         let mode = lab.mode;
@@ -305,9 +307,10 @@ impl HttpWorker {
                 }
                 let header = String::from_utf8(bytes).unwrap();
                 let first = header.lines().next().unwrap().to_owned();
-                // Neither the privacy rule store nor published push limits are part of what these
-                // scripts pin; a Hub without them answers 404 and the CLI uses its defaults.
-                if first.contains(" /api/me/privacy/") || first.contains(" /api/hub/config ") {
+                // Published push limits are not part of what these scripts pin; a Hub without them
+                // answers 404 and the CLI uses its defaults. The privacy dictionary store is not
+                // exempt: a push that publishes nothing has no destination to synchronize with.
+                if first.contains(" /api/hub/config ") {
                     stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
                 }
@@ -318,6 +321,10 @@ impl HttpWorker {
                     })
                 }));
                 let (status, body) = match requests.len() {
+                    0 if !holds_repository => {
+                        assert_eq!(first, "GET /api/agents/other/qa HTTP/1.1");
+                        (404, r#"{"error":"repository is unavailable"}"#.to_owned())
+                    }
                     0 => {
                         assert_eq!(first, "GET /api/agents/other/qa HTTP/1.1");
                         (
@@ -329,6 +336,10 @@ impl HttpWorker {
                             })
                             .to_string(),
                         )
+                    }
+                    1 if !holds_repository => {
+                        assert_eq!(first, "GET /api/orgs/other HTTP/1.1");
+                        (404, r#"{"error":"not found"}"#.to_owned())
                     }
                     1 => {
                         assert_eq!(
@@ -426,7 +437,7 @@ fn read_only_publication_preserves_the_foreign_checkout() {
         let before = lab.state();
         eprintln!("publication mode={mode} stage=snapshot-before done");
         let refs = lab.git(&repo, &["show-ref"]);
-        let worker = HttpWorker::start(&lab);
+        let worker = HttpWorker::start(&lab, true);
         let output = lab.push(mode, false);
         let requests = worker.finish();
         assert_refusal(&output, mode);
@@ -502,4 +513,33 @@ fn audited_push_refuses_captured_stdio_before_startup_or_hub_activity() {
             other => panic!("a refused audit contacted the Hub: {other:?}"),
         }
     }
+}
+
+/// A push to a Hub that holds neither its destination nor its owner stops at those checks and
+/// contacts nothing else, not even the privacy dictionary store. A push that synchronized with
+/// whatever Hub it was pointed at before checking it would reach a mistyped or unintended Hub after
+/// the person's push had already failed there.
+#[test]
+fn a_push_to_a_hub_without_its_repository_contacts_nothing_else() {
+    let mode = "human";
+    let lab = Lab::new(mode);
+    let repo = lab.seed("other", "qa", true);
+    let before = lab.state();
+    let refs = lab.git(&repo, &["show-ref"]);
+    let worker = HttpWorker::start(&lab, false);
+    let output = lab.push(mode, false);
+    let requests = worker.finish();
+    assert!(!output.status.success(), "{output:?}");
+    // The destination checks, and nothing after them.
+    assert_eq!(
+        requests,
+        [
+            "GET /api/agents/other/qa HTTP/1.1",
+            "GET /api/orgs/other HTTP/1.1"
+        ],
+        "{output:?}"
+    );
+    assert_eq!(lab.state(), before);
+    assert_eq!(lab.git(&repo, &["show-ref"]), refs);
+    lab.no_requests();
 }
