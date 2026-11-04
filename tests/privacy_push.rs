@@ -3602,7 +3602,10 @@ fn plain_publication_carries_only_conversation_records() {
 /// that stopped after the first part leaves the branch behind the session; one that skipped the
 /// branches with no new history leaves their tags off the Hub. A part refused before it sends
 /// anything names the parts already published, and a rerun continues after them; a message that
-/// nothing was published sends the person looking for a push that did not happen.
+/// nothing was published sends the person looking for a push that did not happen. A later part,
+/// which goes out under the first part's answer without its own summary, still says how many
+/// records it adds with parts the privacy check left out; said only in a shown summary, a record
+/// first carried by a later part would go up unsaid, and no later upload says it again.
 #[test]
 fn a_session_longer_than_one_publication_is_published_in_parts() {
     use agit::domain::session_privacy::SessionPublicationManifest;
@@ -3681,7 +3684,11 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
     );
     let turns: Vec<String> = (0..9)
         .map(|index| {
-            let content = format!("turn {index}");
+            let content = if index == 8 {
+                "turn 8 [content omitted: too large for the privacy check]".to_owned()
+            } else {
+                format!("turn {index}")
+            };
             let log = transcript::wrap_lines(
                 &format!(
                     "{}\n",
@@ -3728,6 +3735,11 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
             String::from_utf8_lossy(&pushed.stderr)
         )
         .contains("in 2 parts"),
+        "{pushed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&pushed.stdout)
+            .contains("1 record in this upload has parts the privacy check left out"),
         "{pushed:?}"
     );
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), turns[8]);
@@ -5330,4 +5342,114 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
         .unwrap_or_else(|| panic!("{screen}"));
     assert!(!stopped.contains("error"), "{screen}");
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
+}
+
+/// The publication summary says how many records the upload adds that keep parts the privacy check
+/// left out, too large or with too many findings, each counted in the upload that first carries
+/// it. A session goes on publishing its whole LOG, so a count over each snapshot would repeat an
+/// old record on every later upload, and one that read only what the summary already showed would
+/// leave such a record unsaid.
+#[test]
+fn an_upload_says_once_which_records_keep_parts_left_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let hub = Hub::start(&remote_root, [28; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "d".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let mut records = Vec::new();
+    let mut upload = |added: &[serde_json::Value]| {
+        records.extend_from_slice(added);
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        let log = transcript::wrap_lines(&text, "claude-code", &session.session);
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("turn {}", records.len())).unwrap();
+        let pushed = run(&["--yes", "push", "alice/app@talk"]);
+        assert_success(&pushed);
+        String::from_utf8_lossy(&pushed.stdout).into_owned()
+    };
+    let user = |text: &str| json!({"type":"user","message":{"role":"user","content":text}});
+    let result = |text: &str| {
+        json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_1","content":text}
+        ]}})
+    };
+
+    let said = upload(&[
+        user("read the log"),
+        result("[content omitted: too large for the privacy check]"),
+    ]);
+    assert!(
+        said.contains("1 record in this upload has parts the privacy check left out"),
+        "{said}"
+    );
+    let said = upload(&[user("and the next one")]);
+    assert!(!said.contains("left out"), "{said}");
+    let said = upload(&[
+        result("[content omitted: too many findings for the privacy check]"),
+        result("[content omitted: too large for the privacy check] and more"),
+    ]);
+    assert!(
+        said.contains("2 records in this upload have parts the privacy check left out"),
+        "{said}"
+    );
 }

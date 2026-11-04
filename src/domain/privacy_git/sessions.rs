@@ -821,6 +821,7 @@ impl ProjectedHistory {
         let mut snapshots = BTreeMap::new();
         let mut preserved = BTreeSet::new();
         let mut reports = Vec::new();
+        let mut left_out = LeftOut::default();
         let mut imports = crate::commands::plumbing::CommitImports::default();
         let mut completed = BTreeSet::new();
         let mut reused = 0;
@@ -1049,7 +1050,15 @@ impl ProjectedHistory {
                         // A session snapshot publishes its conversation records only.
                         let conversation = match config {
                             Some(_) if selected.delivery.is_none() => {
-                                conversation_commit(&source, oid, &parents[oid])?
+                                let conversation =
+                                    conversation_commit(&source, oid, &parents[oid])?;
+                                count_left_out(
+                                    &repo,
+                                    &public_parents,
+                                    conversation.left_out,
+                                    &mut left_out,
+                                )?;
+                                conversation.commit
                             }
                             _ => None,
                         };
@@ -1393,6 +1402,7 @@ impl ProjectedHistory {
             policy_digest,
             additional_policies: additional.to_vec(),
             reports,
+            left_out: left_out.added.len(),
             accepted_ledger: ledger,
             candidates,
             held_boundary,
@@ -1554,14 +1564,79 @@ fn readable_fork_sources(
         .collect()
 }
 
+/// The records with parts left out that one publication has met, each counted once.
+#[derive(Default)]
+struct LeftOut {
+    /// The event paths of records this publication adds.
+    added: BTreeSet<String>,
+    /// The event paths of records a public parent already holds: published, and counted, before.
+    published: BTreeSet<String>,
+}
+
+/// Sort the records with parts left out that a snapshot publishes, `paths`, into those this
+/// publication adds and those a public parent of it already holds. A record met before in this
+/// publication is not looked up again, and the rest are looked up in one batch, so a long
+/// history of snapshots that each carry the same records costs no Git process per record.
+fn count_left_out(
+    repo: &Repo,
+    public_parents: &[String],
+    paths: BTreeSet<String>,
+    seen: &mut LeftOut,
+) -> Result<()> {
+    let unknown: Vec<String> = paths
+        .into_iter()
+        .filter(|path| !seen.added.contains(path) && !seen.published.contains(path))
+        .collect();
+    let mut held = BTreeSet::new();
+    let probes: Vec<String> = unknown
+        .iter()
+        .flat_map(|path| {
+            public_parents
+                .iter()
+                .map(move |parent| format!("{parent}:{path}"))
+        })
+        .collect();
+    let mut probe = 0;
+    repo.git_cat_file_batch_check_with_policy(
+        probes,
+        crate::domain::repo::ReadPolicy::LocalOnly,
+        |_, kind, _| {
+            if kind != "missing" {
+                held.insert(probe / public_parents.len());
+            }
+            probe += 1;
+            Ok(())
+        },
+    )?;
+    for (index, path) in unknown.into_iter().enumerate() {
+        if held.contains(&index) {
+            seen.published.insert(path);
+        } else {
+            seen.added.insert(path);
+        }
+    }
+    Ok(())
+}
+
+/// `oid` as plain publication carries it, and the records in it that keep parts the privacy check
+/// left out.
+#[derive(Debug, PartialEq, Eq)]
+struct Conversation {
+    /// `None` when every record `oid` holds is published as it is, otherwise a commit written to
+    /// the source with the same message and parents whose LOG, VIEW and events hold only what
+    /// [`publication_records`] keeps.
+    ///
+    /// [`publication_records`]: crate::domain::publication_records
+    commit: Option<String>,
+    /// The event path of each published record holding a placeholder the privacy check put where
+    /// it left something out.
+    left_out: BTreeSet<String>,
+}
+
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
-/// `oid` as plain publication carries it: `None` when every record it holds is published as it
-/// is, otherwise a commit written to `source` with the same message and parents whose LOG, VIEW
-/// and events hold only what [`publication_records`] keeps. The local commit is left as it is, so
-/// local history and resume keep the complete native transcript.
-///
-/// [`publication_records`]: crate::domain::publication_records
-fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<Option<String>> {
+/// The local commit is left as it is, so local history and resume keep the complete native
+/// transcript.
+fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<Conversation> {
     use crate::domain::{publication_records, storage, transcript::Envelope};
     let limit = storage::MAX_MATERIALIZED_BYTES;
     let (log, view) = storage::materialize_pair_local(source.root(), oid, limit, limit)?;
@@ -1637,9 +1712,21 @@ fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<O
         .flatten()
         .map(|line| meta::event_path(&storage::event_id(line)?))
         .collect::<Result<BTreeSet<_>>>()?;
+    let left_out = published
+        .values()
+        .flatten()
+        .filter(|line| {
+            use crate::domain::privacy::service::{CROWDED_TEXT, OMITTED_TEXT};
+            line.contains(OMITTED_TEXT) || line.contains(CROWDED_TEXT)
+        })
+        .map(|line| meta::event_path(&storage::event_id(line)?))
+        .collect::<Result<BTreeSet<_>>>()?;
     changed |= held.iter().any(|path| !named.contains(path));
     if !changed {
-        return Ok(None);
+        return Ok(Conversation {
+            commit: None,
+            left_out,
+        });
     }
     let mut public_view = String::new();
     for line in lines(&view) {
@@ -1683,7 +1770,14 @@ fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<O
         )?
     };
     let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
-    write_object(source, "commit", &commit_body(&tree, parents, &original)?).map(Some)
+    Ok(Conversation {
+        commit: Some(write_object(
+            source,
+            "commit",
+            &commit_body(&tree, parents, &original)?,
+        )?),
+        left_out,
+    })
 }
 
 fn plain_commit(
@@ -2538,7 +2632,13 @@ mod tests {
         git(temp.path(), &["commit", "-q", "-m", "v0 snapshot"]);
         let head = git(temp.path(), &["rev-parse", "HEAD"]);
         let repo = Repo::at(temp.path());
-        assert_eq!(conversation_commit(&repo, head.trim(), &[]).unwrap(), None);
+        assert_eq!(
+            conversation_commit(&repo, head.trim(), &[]).unwrap(),
+            Conversation {
+                commit: None,
+                left_out: BTreeSet::new(),
+            }
+        );
     }
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {

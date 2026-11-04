@@ -76,6 +76,8 @@ pub struct ProjectedHistory {
     policy_digest: String,
     additional_policies: Vec<super::privacy::mandatory::MandatoryPolicy>,
     reports: Vec<ProjectionReport>,
+    /// How many records this publication adds that keep parts the privacy check left out.
+    left_out: usize,
     accepted_ledger: accepted::Ledger,
     candidates: BTreeMap<String, accepted::Candidate>,
     /// Boundary commits mapped under their own ids because the destination's advertisement
@@ -96,6 +98,12 @@ pub(crate) enum PreviewEntry<'a> {
 }
 
 impl ProjectedHistory {
+    /// How many records this publication adds that keep parts the privacy check left out: too
+    /// large to divide, or too many findings to finish.
+    pub fn left_out_records(&self) -> usize {
+        self.left_out
+    }
+
     pub fn repo(&self) -> &Repo {
         &self.repo
     }
