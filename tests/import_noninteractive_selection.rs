@@ -1970,15 +1970,17 @@ fn imported_and_live_metadata_remain_publishable() {
 /// the privacy check is pending; once it can, the same import lands. While the device cannot load
 /// its whole policy (here an unreadable legacy vault), import commits nothing either, because a
 /// value the user blocked may be left in place. A record larger than one request still lands,
-/// with its media payload kept byte for byte and the credential beside it replaced. One that
-/// holds only short strings cannot be divided: it is refused by its size, with the step that ends
-/// the wait, and stays off the branch. An implementation that committed what the worker returned
-/// unchanged, settled under a partial policy, or could not divide a large record would put the
-/// transcript on the branch without the protection the user configured, or never put it there;
-/// one that only said "pending" would leave such a conversation waiting with no way out.
+/// with its media payload kept byte for byte and the credential beside it replaced. One whose
+/// short strings sit in a large structured tool result lands with that result left out, says so,
+/// and still has its credential replaced. One that holds only short strings the person typed
+/// cannot be divided: it is refused by its size, with the step that ends the wait, and stays off
+/// the branch. An implementation that committed what the worker returned unchanged, settled under
+/// a partial policy, or could not divide a large record would put the transcript on the branch
+/// without the protection the user configured, or never put it there; one that only said
+/// "pending" would leave such a conversation waiting with no way out.
 #[test]
 fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
-    let lab = Lab::new(4);
+    let lab = Lab::new(5);
     let repo = lab.store.join("repos/me/qa");
     let import = |source: usize, branch: &str| {
         lab.command()
@@ -2101,7 +2103,9 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     let crowded = import(3, "crowded");
     let said = String::from_utf8_lossy(&crowded.stderr);
     assert!(
-        said.contains("privacy check refused a record of") && said.contains("agit project drop"),
+        said.contains("privacy check refused a record of")
+            && said.contains("agit project drop")
+            && !said.contains("tries again"),
         "{crowded:?}"
     );
     let on_branch = Command::new("git")
@@ -2124,6 +2128,68 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
         dropped.status.success()
             && String::from_utf8_lossy(&dropped.stdout).contains("will not be uploaded"),
         "{dropped:?}"
+    );
+
+    // A line long enough to be protected on its own were it kept, and numbers written as `1e9`,
+    // which serde encodes three times as long: the record is over the request bound as written
+    // and far over it as sent.
+    let patch = [
+        "+PATCH-LINE short".to_owned(),
+        format!("+PATCH-LINE {}", "y".repeat(4096)),
+    ];
+    let sizes = vec!["1e9"; agit::domain::privacy::projector::MAX_UNIT_BYTES / 4 + 64].join(",");
+    let (id, path) = &lab.sources[4];
+    let mut transcript = fs::read_to_string(path).unwrap();
+    let first: serde_json::Value =
+        serde_json::from_str(transcript.lines().next().unwrap()).unwrap();
+    transcript.push_str(&format!(
+        "{}\n{}\n{}\n{}\n",
+        serde_json::json!({"type":"user", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-patch-ask"), "message":{"role":"user", "content":"SYNTHETIC-PATCH-ASK"}}),
+        serde_json::json!({"type":"assistant", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-patch-call"), "message":{"role":"assistant", "content":[
+            {"type":"tool_use", "id":"toolu_patch", "name":"Write", "input":{"file_path":"big.txt"}}
+        ]}}),
+        serde_json::json!({"type":"user", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-patched"), "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"toolu_patch", "content":format!("patched with {token}")}
+        ]}, "toolUseResult":{"type":"update", "filePath":"big.txt",
+            "structuredPatch":[{"oldStart":1, "lines":patch, "sizes":"SIZES"}]}})
+        .to_string()
+        .replace("\"SIZES\"", &format!("[{sizes}]")),
+        serde_json::json!({"type":"assistant", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-patched-answer"), "message":{"role":"assistant", "content":"SYNTHETIC-PATCHED"}})
+    ));
+    fs::write(path, transcript).unwrap();
+    let patched = import(4, "patched");
+    let said = String::from_utf8_lossy(&patched.stderr);
+    assert!(patched.status.success(), "{patched:?}");
+    assert!(
+        said.contains("largest parts left out of what agit saves and uploads")
+            && !said.contains("tries again"),
+        "{patched:?}"
+    );
+    let on_patched = |pattern: &str| {
+        let found = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["grep", "-l", "-F", "-e", pattern, "patched"])
+            .output()
+            .unwrap();
+        String::from_utf8(found.stdout).unwrap()
+    };
+    assert!(
+        on_patched("+PATCH-LINE").is_empty(),
+        "the left-out patch reached the branch"
+    );
+    assert!(!on_patched("content omitted: too large").is_empty());
+    assert!(
+        !on_patched("SYNTHETIC-PATCHED").is_empty(),
+        "the turn after it did not settle"
+    );
+    assert!(
+        on_patched(token).is_empty(),
+        "the credential in the rest was not replaced"
     );
 
     let vault = lab.store.join("secret-filter/vault.json");
