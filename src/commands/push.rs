@@ -314,10 +314,31 @@ pub fn run(mut args: Args) -> CmdResult {
         match verdict {
             Ok(None) => publishable.push(branch),
             Ok(Some(reason)) if asked_explicitly => {
+                // An exclusion says which one, and how to let the session in where naming it does.
+                let exclusion = if reason == super::project::Withholding::Excluded {
+                    super::project::exclusion(&checkout.slug(), &branch)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let why = match &exclusion {
+                    Some(super::project::Exclusion::Earlier { folder, session }) => format!(
+                        "it ran before agit was on in {}. To upload it: `agit save {session}` in that folder",
+                        ui::tilde(folder)
+                    ),
+                    Some(super::project::Exclusion::Dropped { folder, session }) => format!(
+                        "you stopped uploading it from {} (`agit project drop`). To upload it anyway: `agit save {session}` in that folder",
+                        ui::tilde(folder)
+                    ),
+                    Some(super::project::Exclusion::Delegated) => {
+                        "it is a delegated session, and the conversation that started it keeps those out".to_owned()
+                    }
+                    None => reason.describe().to_owned(),
+                };
                 ui::error(&format!(
-                    "`{}@{branch}` will not be uploaded from this computer: {}.",
+                    "`{}@{branch}` will not be uploaded from this computer: {why}.",
                     checkout.slug(),
-                    reason.describe()
                 ));
                 ui::hint("its local history stays; nothing was sent to the Hub");
                 if reason == super::project::Withholding::UnknownStart {

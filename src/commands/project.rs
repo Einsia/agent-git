@@ -3182,6 +3182,77 @@ pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option
     Ok(verdicts)
 }
 
+/// Which kind of exclusion keeps a branch from being published, and the session to name to let
+/// it in where naming it does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Exclusion {
+    /// The session ran in `folder` before agit was on there.
+    Earlier { folder: PathBuf, session: String },
+    /// The person stopped uploading the session from `folder`.
+    Dropped { folder: PathBuf, session: String },
+    /// The conversation that started this delegated session keeps it out.
+    Delegated,
+}
+
+/// What [`Withholding::Excluded`] stands for on `slug@branch`, read the way [`withheld_all`]
+/// decides it, so a refusal can say which and how to get past it. `None` when no exclusion is
+/// found any more.
+pub(crate) fn exclusion(slug: &str, branch: &str) -> Result<Option<Exclusion>> {
+    let (owner, agent) = super::parse_slug(slug)?;
+    let links = link::list(&Store::at(config::store_root()?));
+    let claims = recording_into(&links, &owner, &agent, branch);
+    if claims.iter().any(|claim| {
+        let candidate = Candidate {
+            runtime: claim.source.clone(),
+            session_id: claim.session_id.clone(),
+            cwd: claim.cwd.as_deref().map(PathBuf::from).unwrap_or_default(),
+        };
+        delegation_withheld(slug, &candidate, None, false).unwrap_or(true)
+    }) {
+        return Ok(Some(Exclusion::Delegated));
+    }
+    let mut sessions: Vec<String> = claims
+        .iter()
+        .map(|claim| key(&claim.source, &claim.session_id))
+        .collect();
+    if let Some(origin) = capture_origin(slug, branch)? {
+        sessions.push(key(&origin.runtime, &origin.session));
+    }
+    let records_here = |session: &String| {
+        sessions.contains(session)
+            || session
+                .split_once(':')
+                .is_some_and(|(runtime, id)| capture_branch(runtime, id) == branch)
+    };
+    let id = |session: &String| {
+        session
+            .split_once(':')
+            .map_or_else(|| session.clone(), |(_, id)| id.to_owned())
+    };
+    let projects: Vec<_> = policies()?
+        .into_iter()
+        .filter(|p| p.repository == slug)
+        .collect();
+    // The person's own drop says more than a binding's start does.
+    for project in &projects {
+        if let Some(session) = project.excluded.iter().find(|s| records_here(s)) {
+            return Ok(Some(Exclusion::Dropped {
+                folder: project.root.clone(),
+                session: id(session),
+            }));
+        }
+    }
+    for project in &projects {
+        if let Some(session) = project.earlier.iter().find(|s| records_here(s)) {
+            return Ok(Some(Exclusion::Earlier {
+                folder: project.root.clone(),
+                session: id(session),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether a project on this machine is bound to `slug`, so `project drop` can act on its branches.
 pub(crate) fn binds(slug: &str) -> bool {
     policies().is_ok_and(|projects| projects.iter().any(|p| p.repository == slug))
@@ -6455,6 +6526,52 @@ mod tests {
         assert_eq!(
             withheld("alice/app", "rename-the-tabs-7a8b").unwrap(),
             Some(Withholding::Excluded)
+        );
+    }
+
+    /// An excluded branch says which exclusion keeps it, and names the session to save where
+    /// saving lets it in: one from before the folder was on, or one the person dropped. A refusal
+    /// that only said "excluded" would leave the person no way forward.
+    #[test]
+    fn an_exclusion_says_which_and_names_the_session_to_save() {
+        if !isolated("an_exclusion_says_which_and_names_the_session_to_save") {
+            return;
+        }
+        const SESSION: &str = "dddddddd-0000-4000-8000-000000000004";
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        let branch = capture_branch("claude-code", SESSION);
+        policy.earlier.insert(key("claude-code", SESSION));
+        save(&policy).unwrap();
+        assert_eq!(
+            withheld("alice/app", &branch).unwrap(),
+            Some(Withholding::Excluded)
+        );
+        assert_eq!(
+            exclusion("alice/app", &branch).unwrap(),
+            Some(Exclusion::Earlier {
+                folder: policy.root.clone(),
+                session: SESSION.into(),
+            })
+        );
+        // Dropped as well: the person's own drop is the one told.
+        policy.excluded.insert(key("claude-code", SESSION));
+        save(&policy).unwrap();
+        assert_eq!(
+            exclusion("alice/app", &branch).unwrap(),
+            Some(Exclusion::Dropped {
+                folder: policy.root.clone(),
+                session: SESSION.into(),
+            })
+        );
+        policy.excluded.clear();
+        policy.earlier.clear();
+        save(&policy).unwrap();
+        assert_eq!(exclusion("alice/app", &branch).unwrap(), None);
+        // A capture branch no claim records into is still withheld, for its unknown start.
+        assert_eq!(
+            withheld("alice/app", &branch).unwrap(),
+            Some(Withholding::UnknownStart)
         );
     }
 
