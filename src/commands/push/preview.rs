@@ -59,6 +59,7 @@ impl Preview {
             manifest.snapshots.len() - encrypted,
             manifest.preserved_commits.len()
         )?;
+        write_left_out(&mut output, history)?;
         if let Some(display) = &mut self.display {
             display.rewind()?;
             std::io::copy(display, &mut output)?;
@@ -66,4 +67,28 @@ impl Preview {
         output.flush()?;
         Ok(())
     }
+}
+
+/// Say how many records the publication adds that keep parts the privacy check left out, for a
+/// part whose summary is not shown.
+pub(super) fn show_left_out(history: &ProjectedHistory) -> Result<()> {
+    let mut output = std::io::stdout().lock();
+    write_left_out(&mut output, history)?;
+    output.flush()?;
+    Ok(())
+}
+
+fn write_left_out(output: &mut impl Write, history: &ProjectedHistory) -> Result<()> {
+    match history.left_out_records() {
+        0 => {}
+        1 => writeln!(
+            output,
+            "1 record in this upload has parts the privacy check left out; the conversation file on this computer still has them."
+        )?,
+        records => writeln!(
+            output,
+            "{records} records in this upload have parts the privacy check left out; the conversation files on this computer still have them."
+        )?,
+    }
+    Ok(())
 }

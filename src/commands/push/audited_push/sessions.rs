@@ -652,6 +652,9 @@ pub(super) fn run(
         println!("Privacy preview: {}", preview.path.display());
         if !automatic && interactive_part {
             preview.show(&projected)?;
+        } else if !automatic {
+            // A later part goes out under the first one's answer, but what it leaves out is new.
+            super::super::preview::show_left_out(&projected)?;
         }
         let reviewed = if args.audit {
             Some(super::super::audit::review(
